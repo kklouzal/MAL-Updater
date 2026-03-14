@@ -1,0 +1,14 @@
+__pycache__/
+.venv/
+.env
+.env.*
+*.sqlite3
+*.db
+*.log
+secrets/
+data/
+state/
+cache/
+node_modules/
+target/
+.DS_Store
