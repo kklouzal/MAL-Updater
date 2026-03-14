@@ -68,3 +68,25 @@ Use `docs/` as project-specific durable memory.
 
 ### Why
 OpenClaw memory is useful, but project-specific knowledge should live with the project repo.
+
+## 2026-03-14 - First Crunchyroll adapter step
+
+### Decision
+Make the first real adapter step adapter-side auth/state conventions before attempting live fetches.
+
+### What that means
+- stage Crunchyroll refresh-token material under adapter-controlled local state
+- support optional persisted device-id material alongside it
+- track adapter-side session/debug metadata in `session.json`
+- keep the JSON snapshot contract honest until live login/fetch is actually working
+
+### Why
+This is the cleanest way to prepare for real adapter auth without pretending that Crunchyroll transport already works.
+
+## 2026-03-14 - Current Crunchyroll blocker handling
+
+### Decision
+Treat the host Rust toolchain as the current blocker for `crunchyroll-rs` and document it explicitly instead of forcing a fragile dependency pin maze.
+
+### Why
+The host is on Cargo/Rust `1.75.0`, while the relevant `crunchyroll-rs` path now needs newer Rust/Cargo. It is better to leave an honest, compilable adapter state/auth foundation plus a clear blocker note than to ship a fake or broken transport layer.

@@ -46,6 +46,19 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 ```bash
 cd <repo-root>
 PYTHONPATH=src python3 -m unittest discover -s tests -v
+cd rust/crunchyroll_adapter && cargo build
+```
+
+### Inspect Crunchyroll adapter auth-material state
+```bash
+cd <repo-root>/rust/crunchyroll_adapter
+cargo run -- auth status
+```
+
+### Stage a Crunchyroll refresh token for the adapter
+```bash
+cd <repo-root>/rust/crunchyroll_adapter
+cargo run -- auth save-refresh-token --refresh-token-file /path/to/refresh_token.txt
 ```
 
 ## MAL app settings

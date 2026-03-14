@@ -29,6 +29,7 @@ That line is intentional. The scaffold is real; the sync functionality is not be
 - `docs/DECISIONS.md` — durable architectural and policy decisions
 - `docs/CURRENT_STATUS.md` — current implemented state vs missing pieces
 - `docs/OPERATIONS.md` — local operational commands and expectations
+- `docs/CRUNCHYROLL_ADAPTER.md` — Rust adapter state/auth-material notes and current blocker
 - `docs/contracts/` — JSON schema for adapter payloads
 - `rust/crunchyroll_adapter/` — Rust adapter crate scaffold
 - `config/` — non-secret local config examples
@@ -65,6 +66,7 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
 ```
 
 Or install editable and use the console script:
@@ -74,6 +76,14 @@ pip install -e .
 mal-updater status
 mal-updater init
 mal-updater mal-auth-url
+```
+
+### Tests
+
+Run the current stdlib smoke/integration tests with:
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 ### Current behavior
@@ -100,16 +110,17 @@ mal-updater mal-auth-url
 
 ```bash
 cd rust/crunchyroll_adapter
-cargo run -- snapshot --contract-version 1.0
 cargo run -- auth status
-cargo run -- auth login
+cargo run -- auth save-refresh-token --refresh-token-file /path/to/refresh_token.txt [--device-id-file /path/to/device_id.txt]
+cargo run -- snapshot --contract-version 1.0
 ```
 
 Current adapter behavior:
-- `snapshot` emits a valid `1.0` JSON snapshot scaffold
-- `auth status` exposes the intended auth CLI shape without pretending auth exists
-- `auth login` is a deliberate placeholder that exits non-zero with a clear message
-- no command pretends to fetch live Crunchyroll data yet
+- `snapshot` emits a valid `1.0` JSON payload plus adapter-state metadata about staged Crunchyroll auth material
+- `auth status` reports the resolved adapter state paths plus refresh-token / device-id presence
+- `auth save-refresh-token` stages a local Crunchyroll refresh token (and optional device id) into the adapter state directory
+- the adapter now has a concrete local state convention under `state/crunchyroll/<profile>/`
+- live Crunchyroll login/fetch is still not claimed yet because the intended `crunchyroll-rs` path is currently blocked by the host Rust toolchain; see `docs/CRUNCHYROLL_ADAPTER.md`
 
 ## SQLite schema
 

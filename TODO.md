@@ -9,8 +9,11 @@
 - [x] Wire Python config loader to parse `config/settings.toml`
 - [x] Add JSON schema validation before ingestion
 - [x] Add Python ingestion path for adapter snapshot -> SQLite
+- [ ] Upgrade/install a newer Rust toolchain on the host so `crunchyroll-rs` can build (`cargo 1.75.0` is currently too old)
 - [ ] Integrate `crunchyroll-rs` into the Rust adapter
-- [ ] Document the Crunchyroll adapter auth/session flow once the first real implementation exists
+- [x] Add adapter-side Crunchyroll auth-material/state-dir conventions and CLI staging commands
+- [x] Document the current Crunchyroll adapter auth-material flow and toolchain blocker
+- [ ] Document the live Crunchyroll adapter auth/session flow once the first real implementation exists
 - [x] Implement local MAL loopback OAuth flow + token persistence
 - [ ] Register MAL app / complete live OAuth with real credentials
 
