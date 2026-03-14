@@ -24,8 +24,11 @@ That line is intentional. The scaffold is real; the sync functionality is not be
 - `src/mal_updater/` — Python worker package
 - `migrations/` — SQLite schema migrations
 - `docs/JSON_CONTRACT.md` — Rust ↔ Python boundary contract
-- `docs/MAL_OAUTH.md` — local OAuth assumptions and secret conventions
+- `docs/MAL_OAUTH.md` — MAL OAuth flow, callback model, and secret conventions
 - `docs/PYTHON_WORKER.md` — worker config/bootstrap notes
+- `docs/DECISIONS.md` — durable architectural and policy decisions
+- `docs/CURRENT_STATUS.md` — current implemented state vs missing pieces
+- `docs/OPERATIONS.md` — local operational commands and expectations
 - `docs/contracts/` — JSON schema for adapter payloads
 - `rust/crunchyroll_adapter/` — Rust adapter crate scaffold
 - `config/` — non-secret local config examples
@@ -80,7 +83,7 @@ mal-updater mal-auth-url
 - `validate-snapshot` checks adapter JSON shape and cross-reference sanity before ingestion work touches SQLite
 - `init` creates local directories and applies SQLite migrations
 - `mal-auth-url` generates a real PKCE pair plus MAL authorization URL
-- `mal-auth-login` starts a local loopback callback listener, exchanges the returned code for tokens, persists them under `secrets/`, and verifies the token with `GET /users/@me`
+- `mal-auth-login` starts a local callback listener bound to the configured host, exchanges the returned code for tokens, persists them under `secrets/`, and verifies the token with `GET /users/@me`
 - `mal-refresh` refreshes a persisted MAL token pair and writes updated token files back to `secrets/`
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
 - `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules

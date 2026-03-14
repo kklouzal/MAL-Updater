@@ -43,9 +43,7 @@ class MalClient:
 
     def generate_pkce_pair(self) -> OAuthPkcePair:
         verifier = secrets.token_urlsafe(64)[:96]
-        digest = hashlib.sha256(verifier.encode("utf-8")).digest()
-        challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-        return OAuthPkcePair(code_verifier=verifier, code_challenge=challenge)
+        return OAuthPkcePair(code_verifier=verifier, code_challenge=verifier)
 
     def build_authorization_url(self, code_challenge: str, state: str | None = None) -> str:
         if not self.secrets.client_id:
@@ -55,7 +53,7 @@ class MalClient:
             "client_id": self.secrets.client_id,
             "redirect_uri": self.config.mal.redirect_uri,
             "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
+            "code_challenge_method": "plain",
         }
         if state:
             query["state"] = state
@@ -113,12 +111,14 @@ class MalClient:
             raise MalApiError(f"MAL API GET /users/@me failed: {exc.reason}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
+        basic = base64.b64encode(f"{self.secrets.client_id or ''}:{self.secrets.client_secret or ''}".encode("utf-8")).decode("ascii")
         request = Request(
             url,
             data=data,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                "Authorization": f"Basic {basic}",
             },
             method="POST",
         )

@@ -101,7 +101,7 @@ def _cmd_mal_auth_login(project_root: Path | None, timeout_seconds: float, verif
     print(format_auth_flow_prompt(config, auth_url, timeout_seconds))
     try:
         callback = wait_for_oauth_callback(
-            config.mal.redirect_host,
+            config.mal.bind_host,
             config.mal.redirect_port,
             expected_state=state,
             timeout_seconds=timeout_seconds,
@@ -189,7 +189,7 @@ def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None
         payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
         source = str(snapshot_path)
     try:
-        validate_snapshot_payload(payload, config)
+        validate_snapshot_payload(payload)
     except SnapshotValidationError as exc:
         print(f"INVALID: {exc}", file=sys.stderr)
         return 1

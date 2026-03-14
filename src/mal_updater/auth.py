@@ -138,10 +138,11 @@ def format_auth_flow_prompt(config: AppConfig, authorization_url: str, timeout_s
     return "\n".join(
         [
             "Starting local MAL OAuth callback listener.",
+            f"bind_host={config.mal.bind_host}",
             f"redirect_uri={config.mal.redirect_uri}",
             f"timeout_seconds={int(timeout_seconds)}",
             "",
-            "Open this URL in a browser on the same machine:",
+            "Open this URL in a browser that can reach the redirect_uri host:",
             authorization_url,
             "",
             "Waiting for a single /callback hit...",

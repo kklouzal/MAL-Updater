@@ -15,6 +15,7 @@ DEFAULT_CONTRACT_VERSION = "1.0"
 DEFAULT_MAL_BASE_URL = "https://api.myanimelist.net/v2"
 DEFAULT_MAL_AUTH_URL = "https://myanimelist.net/v1/oauth2/authorize"
 DEFAULT_MAL_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
+DEFAULT_MAL_BIND_HOST = "0.0.0.0"
 DEFAULT_MAL_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_MAL_REDIRECT_PORT = 8765
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
@@ -31,6 +32,7 @@ class MalSettings:
     base_url: str = DEFAULT_MAL_BASE_URL
     auth_url: str = DEFAULT_MAL_AUTH_URL
     token_url: str = DEFAULT_MAL_TOKEN_URL
+    bind_host: str = DEFAULT_MAL_BIND_HOST
     redirect_host: str = DEFAULT_MAL_REDIRECT_HOST
     redirect_port: int = DEFAULT_MAL_REDIRECT_PORT
 
@@ -275,6 +277,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             base_url=os.getenv("MAL_UPDATER_MAL_BASE_URL", _get_str(mal_section, "base_url", DEFAULT_MAL_BASE_URL)),
             auth_url=os.getenv("MAL_UPDATER_MAL_AUTH_URL", _get_str(mal_section, "auth_url", DEFAULT_MAL_AUTH_URL)),
             token_url=os.getenv("MAL_UPDATER_MAL_TOKEN_URL", _get_str(mal_section, "token_url", DEFAULT_MAL_TOKEN_URL)),
+            bind_host=os.getenv("MAL_UPDATER_MAL_BIND_HOST", _get_str(mal_section, "bind_host", DEFAULT_MAL_BIND_HOST)),
             redirect_host=os.getenv("MAL_UPDATER_MAL_REDIRECT_HOST", _get_str(mal_section, "redirect_host", DEFAULT_MAL_REDIRECT_HOST)),
             redirect_port=int(os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", _get_int(mal_section, "redirect_port", DEFAULT_MAL_REDIRECT_PORT))),
         ),

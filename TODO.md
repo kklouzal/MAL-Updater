@@ -10,6 +10,7 @@
 - [x] Add JSON schema validation before ingestion
 - [x] Add Python ingestion path for adapter snapshot -> SQLite
 - [ ] Integrate `crunchyroll-rs` into the Rust adapter
+- [ ] Document the Crunchyroll adapter auth/session flow once the first real implementation exists
 - [x] Implement local MAL loopback OAuth flow + token persistence
 - [ ] Register MAL app / complete live OAuth with real credentials
 
