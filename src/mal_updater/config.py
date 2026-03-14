@@ -10,7 +10,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     tomllib = None
 
-DEFAULT_COMPLETION_THRESHOLD = 0.90
+DEFAULT_COMPLETION_THRESHOLD = 0.95
+DEFAULT_CREDITS_SKIP_WINDOW_SECONDS = 120
 DEFAULT_CONTRACT_VERSION = "1.0"
 DEFAULT_MAL_BASE_URL = "https://api.myanimelist.net/v2"
 DEFAULT_MAL_AUTH_URL = "https://myanimelist.net/v1/oauth2/authorize"
@@ -69,6 +70,7 @@ class AppConfig:
     db_path: Path
     secret_files: dict[str, Any] = field(default_factory=dict)
     completion_threshold: float = DEFAULT_COMPLETION_THRESHOLD
+    credits_skip_window_seconds: int = DEFAULT_CREDITS_SKIP_WINDOW_SECONDS
     contract_version: str = DEFAULT_CONTRACT_VERSION
     mal: MalSettings = field(default_factory=MalSettings)
     crunchyroll: CrunchyrollSettings = field(default_factory=CrunchyrollSettings)
@@ -261,6 +263,12 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         db_path=db_path,
         secret_files=secret_files_section,
         completion_threshold=float(os.getenv("MAL_UPDATER_COMPLETION_THRESHOLD", _get_float(settings, "completion_threshold", DEFAULT_COMPLETION_THRESHOLD))),
+        credits_skip_window_seconds=int(
+            os.getenv(
+                "MAL_UPDATER_CREDITS_SKIP_WINDOW_SECONDS",
+                _get_int(settings, "credits_skip_window_seconds", DEFAULT_CREDITS_SKIP_WINDOW_SECONDS),
+            )
+        ),
         contract_version=os.getenv("MAL_UPDATER_CONTRACT_VERSION", _get_str(settings, "contract_version", DEFAULT_CONTRACT_VERSION)),
         mal=MalSettings(
             base_url=os.getenv("MAL_UPDATER_MAL_BASE_URL", _get_str(mal_section, "base_url", DEFAULT_MAL_BASE_URL)),

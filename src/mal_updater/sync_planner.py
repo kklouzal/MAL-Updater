@@ -25,6 +25,16 @@ class ProviderSeriesState:
 
 
 @dataclass(slots=True)
+class EpisodeProgressState:
+    provider_episode_id: str
+    episode_number: int | None
+    completion_ratio: float | None
+    playback_position_ms: int | None
+    duration_ms: int | None
+    last_watched_at: str | None
+
+
+@dataclass(slots=True)
 class SyncProposal:
     provider_series_id: str
     crunchyroll_title: str
@@ -127,50 +137,141 @@ class ApplyResult:
 
 
 def load_provider_series_states(config: AppConfig, limit: int | None = None, provider: str = "crunchyroll") -> list[ProviderSeriesState]:
-    query = """
+    series_query = """
         SELECT
             s.provider,
             s.provider_series_id,
             s.title,
             s.season_title,
             s.season_number,
-            COUNT(DISTINCT p.provider_episode_id) AS progress_rows,
-            MAX(p.episode_number) AS max_episode_number,
-            COUNT(DISTINCT CASE WHEN p.completion_ratio >= ? THEN p.provider_episode_id END) AS completed_episode_count,
-            MAX(CASE WHEN p.completion_ratio >= ? THEN p.episode_number END) AS max_completed_episode_number,
-            MAX(p.last_watched_at) AS last_watched_at,
+            s.last_seen_at,
             w.status AS watchlist_status
         FROM provider_series s
-        LEFT JOIN provider_episode_progress p
-            ON p.provider = s.provider AND p.provider_series_id = s.provider_series_id
         LEFT JOIN provider_watchlist w
             ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
         WHERE s.provider = ?
-        GROUP BY s.provider, s.provider_series_id, s.title, s.season_title, s.season_number, w.status
-        ORDER BY COALESCE(MAX(p.last_watched_at), s.last_seen_at) DESC, s.title ASC
+        ORDER BY s.title ASC
     """
-    params: list[Any] = [config.completion_threshold, config.completion_threshold, provider]
-    if limit is not None:
-        query += " LIMIT ?"
-        params.append(limit)
+    progress_query = """
+        SELECT
+            provider_series_id,
+            provider_episode_id,
+            episode_number,
+            completion_ratio,
+            playback_position_ms,
+            duration_ms,
+            last_watched_at
+        FROM provider_episode_progress
+        WHERE provider = ?
+        ORDER BY provider_series_id ASC, episode_number ASC, last_watched_at ASC, provider_episode_id ASC
+    """
     with connect(config.db_path) as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [
-        ProviderSeriesState(
-            provider=row["provider"],
-            provider_series_id=row["provider_series_id"],
-            title=row["title"],
-            season_title=row["season_title"],
-            season_number=row["season_number"],
-            progress_rows=int(row["progress_rows"] or 0),
-            max_episode_number=row["max_episode_number"],
-            completed_episode_count=int(row["completed_episode_count"] or 0),
-            max_completed_episode_number=row["max_completed_episode_number"],
-            watchlist_status=row["watchlist_status"],
-            last_watched_at=row["last_watched_at"],
+        series_rows = conn.execute(series_query, [provider]).fetchall()
+        progress_rows = conn.execute(progress_query, [provider]).fetchall()
+
+    progress_by_series: dict[str, list[EpisodeProgressState]] = {}
+    for row in progress_rows:
+        progress_by_series.setdefault(row["provider_series_id"], []).append(
+            EpisodeProgressState(
+                provider_episode_id=row["provider_episode_id"],
+                episode_number=row["episode_number"],
+                completion_ratio=row["completion_ratio"],
+                playback_position_ms=row["playback_position_ms"],
+                duration_ms=row["duration_ms"],
+                last_watched_at=row["last_watched_at"],
+            )
         )
-        for row in rows
-    ]
+
+    states: list[tuple[str | None, str, ProviderSeriesState]] = []
+    for row in series_rows:
+        series_progress = progress_by_series.get(row["provider_series_id"], [])
+        summary = _summarize_episode_progress(series_progress, config)
+        sort_key = summary["last_watched_at"] or row["last_seen_at"]
+        states.append(
+            (
+                sort_key,
+                row["title"],
+                ProviderSeriesState(
+                    provider=row["provider"],
+                    provider_series_id=row["provider_series_id"],
+                    title=row["title"],
+                    season_title=row["season_title"],
+                    season_number=row["season_number"],
+                    progress_rows=summary["progress_rows"],
+                    max_episode_number=summary["max_episode_number"],
+                    completed_episode_count=summary["completed_episode_count"],
+                    max_completed_episode_number=summary["max_completed_episode_number"],
+                    watchlist_status=row["watchlist_status"],
+                    last_watched_at=summary["last_watched_at"],
+                ),
+            )
+        )
+
+    states.sort(key=lambda item: (item[0] is not None, item[0] or "", item[1]), reverse=True)
+    ordered = [item[2] for item in states]
+    if limit is not None:
+        return ordered[:limit]
+    return ordered
+
+
+def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppConfig) -> dict[str, Any]:
+    completed_episode_numbers: set[int] = set()
+    completed_episode_ids_without_number: set[str] = set()
+    max_episode_number: int | None = None
+    max_completed_episode_number: int | None = None
+    last_watched_at: str | None = None
+
+    for row in rows:
+        if row.episode_number is not None:
+            max_episode_number = row.episode_number if max_episode_number is None else max(max_episode_number, row.episode_number)
+        if row.last_watched_at and (last_watched_at is None or row.last_watched_at > last_watched_at):
+            last_watched_at = row.last_watched_at
+        if not _episode_counts_as_completed(row, rows, config):
+            continue
+        if row.episode_number is not None:
+            completed_episode_numbers.add(row.episode_number)
+            max_completed_episode_number = (
+                row.episode_number if max_completed_episode_number is None else max(max_completed_episode_number, row.episode_number)
+            )
+        else:
+            completed_episode_ids_without_number.add(row.provider_episode_id)
+
+    return {
+        "progress_rows": len(rows),
+        "max_episode_number": max_episode_number,
+        "completed_episode_count": len(completed_episode_numbers) + len(completed_episode_ids_without_number),
+        "max_completed_episode_number": max_completed_episode_number,
+        "last_watched_at": last_watched_at,
+    }
+
+
+def _episode_counts_as_completed(row: EpisodeProgressState, all_rows: list[EpisodeProgressState], config: AppConfig) -> bool:
+    completion_ratio = row.completion_ratio
+    if completion_ratio is not None and completion_ratio >= config.completion_threshold:
+        return True
+
+    remaining_ms = _remaining_ms(row)
+    if remaining_ms is not None and 0 <= remaining_ms <= config.credits_skip_window_seconds * 1000:
+        return True
+
+    if completion_ratio is None or completion_ratio < 0.85:
+        return False
+    if row.episode_number is None or row.last_watched_at is None:
+        return False
+
+    return any(
+        later.episode_number is not None
+        and later.episode_number > row.episode_number
+        and later.last_watched_at is not None
+        and later.last_watched_at > row.last_watched_at
+        for later in all_rows
+    )
+
+
+def _remaining_ms(row: EpisodeProgressState) -> int | None:
+    if row.duration_ms is None or row.playback_position_ms is None:
+        return None
+    return row.duration_ms - row.playback_position_ms
 
 
 def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limit: int = 5) -> list[MappingReviewItem]:
@@ -500,6 +601,8 @@ def _plan_status_update(
     crunchyroll_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
     reasons: list[str] = [
         "merge_policy=missing_data_only",
+        "completion_policy=ratio>=0.95_or_remaining<=120s_or_later_episode_progress_with_ratio>=0.85",
+        "progress_dedup=distinct_episode_number_when_available",
         "missing_meaningful_rules=status:none_missing;progress:missing_only_when_status_absent;score:0_or_null_missing;dates:null_or_empty_missing",
         f"completed_episode_count={state.completed_episode_count}",
         f"max_completed_episode_number={state.max_completed_episode_number}",

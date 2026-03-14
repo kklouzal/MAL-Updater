@@ -2,7 +2,8 @@
 # Copy to config/settings.toml and adjust as needed.
 # Paths may be absolute or relative to this file.
 
-completion_threshold = 0.90
+completion_threshold = 0.95
+credits_skip_window_seconds = 120
 contract_version = "1.0"
 
 [paths]

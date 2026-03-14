@@ -18,7 +18,7 @@
 - [x] Add durable approved-mapping persistence in `mal_series_mapping`
 - [x] Add operator review workflow for mapping approval / preservation
 - [x] Add approved-mappings-only dry-run gate for the future live executor
-- [ ] Implement completion-threshold handling for credits-skipped episodes
+- [x] Implement evidence-based credits-skipped completion handling (strict ratio + remaining-time window + later-episode evidence)
 - [x] Implement missing-data-only merge rules
 - [x] Implement conflict / ambiguity review queue generation from mapping/sync passes
 - [x] Replace ad-hoc review output with persisted `review_queue` entries once the review shape settled enough for first use

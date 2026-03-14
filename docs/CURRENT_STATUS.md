@@ -66,6 +66,11 @@
     - `start_date` is preserved because the current Crunchyroll snapshot does not prove the true first-watch date
     - `finish_date` may be filled only when Crunchyroll safely implies completion and MAL does not already have one
   - only sends the fields it intends to change, so meaningful existing MAL metadata is left alone
+- live Crunchyroll evidence is now feeding the completion policy directly:
+  - strict ratio completion defaults to `0.95`
+  - episodes with `<= 120s` remaining count as watched to cover the dominant credits-skip pattern seen in the dataset
+  - episodes in the `0.85-0.95` band also count when a later episode in the same series was watched afterwards
+  - progress is deduplicated by `episode_number` when available so alternate dub/sub variants do not inflate MAL watched counts
 
 ## Current Crunchyroll state
 
@@ -84,6 +89,6 @@ That means the active blocker is no longer Crunchyroll access itself. The remain
 ## Next practical milestone
 
 Harden the guarded MAL executor further on top of the now-live local Crunchyroll dataset:
-- credits-skipped completion handling
+- richer audit/debug surfacing for why an episode counted as completed
 - missing-data-only merge policy refinement
 - better review resolution UX

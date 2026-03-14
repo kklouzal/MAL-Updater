@@ -31,7 +31,7 @@ def sample_snapshot() -> dict:
                 "episode_title": "Example Episode",
                 "playback_position_ms": 1300000,
                 "duration_ms": 1440000,
-                "completion_ratio": 0.9,
+                "completion_ratio": 0.95,
                 "last_watched_at": "2026-03-14T20:55:00Z",
                 "audio_locale": "en-US",
                 "subtitle_locale": None,
@@ -55,7 +55,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(snapshot.provider, "crunchyroll")
         self.assertEqual(snapshot.contract_version, "1.0")
         self.assertEqual(snapshot.series[0].provider_series_id, "series-123")
-        self.assertEqual(snapshot.progress[0].completion_ratio, 0.9)
+        self.assertEqual(snapshot.progress[0].completion_ratio, 0.95)
         self.assertEqual(snapshot.watchlist[0].status, "watching")
 
     def test_validate_snapshot_payload_rejects_invalid_ratio(self) -> None:

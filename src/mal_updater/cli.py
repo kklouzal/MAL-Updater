@@ -58,6 +58,7 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"db_path={config.db_path}")
     print(f"contract_version={config.contract_version}")
     print(f"completion_threshold={config.completion_threshold}")
+    print(f"credits_skip_window_seconds={config.credits_skip_window_seconds}")
     print(f"mal.base_url={config.mal.base_url}")
     print(f"mal.auth_url={config.mal.auth_url}")
     print(f"mal.token_url={config.mal.token_url}")

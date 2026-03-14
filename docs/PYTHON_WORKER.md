@@ -31,7 +31,7 @@ Nothing here fakes Crunchyroll ingestion or live MAL writes.
 
 The loader now understands all current non-secret knobs from `config/settings.toml`:
 
-- top-level: `completion_threshold`, `contract_version`
+- top-level: `completion_threshold`, `credits_skip_window_seconds`, `contract_version`
 - `[paths]`: config/secrets/data/state/cache dirs and `db_path`
 - `[mal]`: MAL API/auth endpoints plus redirect host/port
 - `[crunchyroll]`: locale
@@ -112,6 +112,11 @@ Current behavior:
 - `dry-run-sync --persist-review-queue` replaces open `sync_review` rows in SQLite with the latest non-actionable review/skip items
 - `list-review-queue` surfaces the durable review backlog from `review_queue`
 - dry-run planning only suggests forward-safe list changes (`watching` / `completed` / `plan_to_watch` with episode counts)
+- Crunchyroll completion is now derived conservatively from the real dataset instead of a blind ratio-only rule:
+  - `completion_ratio >= 0.95`, or
+  - `duration_ms - playback_position_ms <= credits_skip_window_seconds` (default `120`), or
+  - `completion_ratio >= 0.85` plus later watched progress for a higher episode number in the same series
+- progress counting deduplicates alternate provider episode variants by `episode_number` when available so dub/sub variants do not inflate MAL watched counts
 - `apply-sync` re-fetches live MAL state, only considers approved mappings, and only writes still-safe missing-data merges (`status`, `num_watched_episodes`, and when justified `finish_date`)
 - explicit merge rules are now encoded in the planner/executor:
   - `status` is missing only when absent/null
@@ -157,5 +162,5 @@ Behavior:
 
 ## Near-term next steps
 
-- credits-skipped completion handling so near-finished Crunchyroll state can safely mark MAL as completed without overclaiming
+- persist richer audit/debug output if we want to surface *why* a specific episode counted as completed (strict threshold vs credits window vs follow-on evidence)
 - missing-data-only merge rules / richer field policy if score/start/finish dates are ever brought into scope

@@ -23,7 +23,7 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out path/
 ## Snapshot semantics
 
 - `series`: deduplicated per-provider series/season records known from Crunchyroll data
-- `progress`: per-episode playback observations with timestamps and completion ratio
+- `progress`: per-episode playback observations with timestamps, completion ratio, and raw timing needed for conservative completion inference
 - `watchlist`: explicit watchlist/library entries if Crunchyroll exposes them
 - `raw`: optional provider-specific passthrough/debug object
 
@@ -32,6 +32,7 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out path/
 - Secrets must never be written into the snapshot.
 - Missing/unknown fields must be treated as incomplete data, not proof of absence.
 - MAL mutations must only be inferred from normalized persisted state, never directly from raw passthrough blobs.
+- `playback_position_ms`, `duration_ms`, `episode_number`, and `last_watched_at` are part of the conservative completion policy; do not drop them if credits-skipped behavior still matters.
 
 ## Example payload
 
@@ -57,7 +58,7 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out path/
       "episode_title": "Example Episode",
       "playback_position_ms": 1300000,
       "duration_ms": 1440000,
-      "completion_ratio": 0.90,
+      "completion_ratio": 0.95,
       "last_watched_at": "2026-03-14T17:55:00Z",
       "audio_locale": "en-US",
       "subtitle_locale": null,

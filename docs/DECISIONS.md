@@ -45,10 +45,22 @@ This is a **missing-data-first** system.
 ## 2026-03-14 - Completion semantics
 
 ### Decision
-Episodes that are ~90-95% complete due only to skipped credits should count as watched.
+Treat Crunchyroll episodes as watched only when the evidence is strong enough to explainable justify it:
+- `completion_ratio >= 0.95`, or
+- known remaining playback time is `<= 120` seconds, or
+- the episode is at least `0.85` complete and a later episode in the same Crunchyroll series was watched afterwards.
 
-### Working default
-- completion threshold target: `0.90`
+### Why
+The real local dataset showed that a blind `0.90` ratio threshold was too hand-wavy:
+- many credit-skip cases cluster around **80-120 seconds remaining** rather than a single stable ratio
+- **725 / 775** episodes in the `0.85-0.95` band were followed by a later watched episode in the same series
+- **555 / 775** episodes in that band had `<= 120s` remaining
+- only **20 / 775** episodes in that band had neither follow-on evidence nor the short remaining-time signature, so those should stay incomplete by default
+
+### Working defaults
+- strict completion ratio: `0.95`
+- credits-skip remaining-time window: `120` seconds
+- follow-on completion floor: `0.85`
 
 ## 2026-03-14 - Recommendation priorities
 
