@@ -10,10 +10,11 @@ This repo now has an initial scaffold for:
 - a versioned JSON contract between them
 - SQLite bootstrap migrations
 - local config/secrets/data directory conventions
+- MAL OAuth + API client scaffolding on the Python side
 
 What it does **not** do yet:
 - log into Crunchyroll
-- perform MAL OAuth
+- complete a local MAL OAuth callback exchange end-to-end
 - ingest real watch data
 - write anything to MAL
 
@@ -24,6 +25,8 @@ That line is intentional. The scaffold is real; the sync functionality is not be
 - `src/mal_updater/` — Python worker package
 - `migrations/` — SQLite schema migrations
 - `docs/JSON_CONTRACT.md` — Rust ↔ Python boundary contract
+- `docs/MAL_OAUTH.md` — local OAuth assumptions and secret conventions
+- `docs/PYTHON_WORKER.md` — worker config/bootstrap notes
 - `docs/contracts/` — JSON schema for adapter payloads
 - `rust/crunchyroll_adapter/` — Rust adapter crate scaffold
 - `config/` — non-secret local config examples
@@ -55,6 +58,7 @@ Run from the repo root:
 ```bash
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli init
+PYTHONPATH=src python3 -m mal_updater.cli mal-auth-url
 ```
 
 Or install editable and use the console script:
@@ -63,12 +67,14 @@ Or install editable and use the console script:
 pip install -e .
 mal-updater status
 mal-updater init
+mal-updater mal-auth-url
 ```
 
 ### Current behavior
 
-- `status` prints resolved paths/config
+- `status` prints resolved paths/config plus MAL secret presence
 - `init` creates local directories and applies SQLite migrations
+- `mal-auth-url` generates a real PKCE pair plus MAL authorization URL
 - `sync` exists as a reserved entrypoint and exits with a clear "not implemented yet" message
 
 ## Rust adapter scaffold
@@ -82,12 +88,15 @@ mal-updater init
 ```bash
 cd rust/crunchyroll_adapter
 cargo run -- snapshot --contract-version 1.0
+cargo run -- auth status
+cargo run -- auth login
 ```
 
 Current adapter behavior:
-- emits a valid `1.0` JSON snapshot scaffold
-- clearly labels itself as scaffold/not implemented in `raw.status`
-- does **not** pretend to fetch live Crunchyroll data yet
+- `snapshot` emits a valid `1.0` JSON snapshot scaffold
+- `auth status` exposes the intended auth CLI shape without pretending auth exists
+- `auth login` is a deliberate placeholder that exits non-zero with a clear message
+- no command pretends to fetch live Crunchyroll data yet
 
 ## SQLite schema
 
