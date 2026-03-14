@@ -25,6 +25,12 @@
   - stages matching `device_id.txt`
   - updates `session.json`
   - exposes `crunchyroll-auth-login` in the CLI
+- Python-side live Crunchyroll snapshot fetching now exists:
+  - refreshes the staged Crunchyroll token via the Python transport
+  - uses browser-TLS impersonation when optional `curl_cffi` is installed
+  - fetches `GET /accounts/v1/me`, `GET /content/v2/{account_id}/watch-history`, and `GET /content/v2/discover/{account_id}/watchlist`
+  - normalizes the live responses into the existing `1.0` snapshot contract
+  - exposes `crunchyroll-fetch-snapshot` in the CLI, with optional direct ingestion
 - Crunchyroll Rust toolchain blocker is cleared:
   - user-local `rustup` toolchain `1.88.0` installed without sudo
   - repo-local `rust-toolchain.toml` pins the adapter to the required toolchain
@@ -39,8 +45,8 @@
 
 ## Not implemented yet
 
-- fully verified live Crunchyroll snapshot against real staged credentials on this machine
 - a transport path for the Rust adapter that survives Crunchyroll's current Cloudflare/anti-bot checks on this host
+- Crunchyroll -> MAL decisioning / mapping / guarded MAL writeback
 - title mapping to MAL IDs
 - dry-run MAL sync proposals
 - guarded live MAL writes
@@ -56,6 +62,11 @@ What was verified on this machine:
 - Crunchyroll username/password secrets are staged locally
 - Python credential login can mint a real refresh token when using browser-like TLS impersonation (`curl_cffi`)
 - the minted refresh token also refreshes successfully through the same Python impersonated transport
+- the new Python fetch path can retrieve real live Crunchyroll data on this host and normalize it honestly
+- a live snapshot was validated and ingested into SQLite with:
+  - `series_count=219`
+  - `progress_count=4311`
+  - `watchlist_count=10`
 - the current Rust adapter still fails its refresh-token login attempt with `invalid_grant`
 
 That strongly suggests the remaining blocker is the Rust-side transport / anti-bot path rather than just missing auth material or missing device id.
@@ -64,4 +75,4 @@ See `docs/CRUNCHYROLL_ADAPTER.md` for the concrete notes.
 
 ## Next practical milestone
 
-Either move Crunchyroll fetching onto the proven Python impersonated transport, or teach the Rust side to use an impersonation-capable HTTP client. After that, run the first live snapshot and push it into Python ingestion.
+The shortest path is now clear: keep using the proven Python impersonated transport for live Crunchyroll fetches, and treat the Rust adapter as a secondary/future path until its transport is fixed. The next milestone is MAL mapping + guarded write planning on top of the now-live local Crunchyroll dataset.

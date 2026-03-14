@@ -1,210 +1,260 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig
+from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
 
 
 class SnapshotValidationError(ValueError):
     pass
 
 
-_ALLOWED_TOP_LEVEL_KEYS = {
-    "contract_version",
-    "generated_at",
-    "provider",
-    "account_id_hint",
-    "series",
-    "progress",
-    "watchlist",
-    "raw",
-}
-
-_ALLOWED_SERIES_KEYS = {
-    "provider_series_id",
-    "title",
-    "season_title",
-    "season_number",
-}
-
-_ALLOWED_PROGRESS_KEYS = {
-    "provider_episode_id",
-    "provider_series_id",
-    "episode_number",
-    "episode_title",
-    "playback_position_ms",
-    "duration_ms",
-    "completion_ratio",
-    "last_watched_at",
-    "audio_locale",
-    "subtitle_locale",
-    "rating",
-}
-
-_ALLOWED_WATCHLIST_KEYS = {
-    "provider_series_id",
-    "added_at",
-    "status",
-}
+ISO_SUFFIX = "Z"
 
 
-def _expect_type(value: Any, expected: type | tuple[type, ...], path: str) -> None:
+def _is_iso_datetime(value: str) -> bool:
+    if not isinstance(value, str) or "T" not in value:
+        return False
+    return value.endswith(ISO_SUFFIX) or "+" in value[10:]
+
+
+def _expect_type(value: Any, expected: type | tuple[type, ...], field: str) -> None:
     if not isinstance(value, expected):
         if isinstance(expected, tuple):
-            expected_name = ", ".join(t.__name__ for t in expected)
+            names = ", ".join(t.__name__ for t in expected)
         else:
-            expected_name = expected.__name__
-        raise SnapshotValidationError(f"{path} must be {expected_name}")
+            names = expected.__name__
+        raise SnapshotValidationError(f"{field} must be {names}")
 
 
-def _expect_optional_type(value: Any, expected: type | tuple[type, ...], path: str) -> None:
+def _expect_optional_type(value: Any, expected: type | tuple[type, ...], field: str) -> None:
+    if value is not None:
+        _expect_type(value, expected, field)
+
+
+def _expect_non_negative_int(value: Any, field: str) -> None:
+    _expect_optional_type(value, int, field)
+    if isinstance(value, int) and value < 0:
+        raise SnapshotValidationError(f"{field} must be >= 0")
+
+
+def _expect_ratio(value: Any, field: str) -> None:
     if value is None:
         return
-    _expect_type(value, expected, path)
+    _expect_type(value, (int, float), field)
+    numeric = float(value)
+    if numeric < 0 or numeric > 1:
+        raise SnapshotValidationError(f"{field} must be between 0 and 1")
 
 
-def _expect_object_keys(obj: dict[str, Any], allowed: set[str], required: set[str], path: str) -> None:
-    extra = sorted(set(obj) - allowed)
-    if extra:
-        raise SnapshotValidationError(f"{path} has unexpected keys: {', '.join(extra)}")
-    missing = sorted(required - set(obj))
+def _validate_series_item(item: Any, index: int) -> SeriesRef:
+    field = f"series[{index}]"
+    _expect_type(item, dict, field)
+    provider_series_id = item.get("provider_series_id")
+    title = item.get("title")
+    season_title = item.get("season_title")
+    season_number = item.get("season_number")
+
+    _expect_type(provider_series_id, str, f"{field}.provider_series_id")
+    _expect_type(title, str, f"{field}.title")
+    _expect_optional_type(season_title, str, f"{field}.season_title")
+    _expect_optional_type(season_number, int, f"{field}.season_number")
+
+    allowed = {"provider_series_id", "title", "season_title", "season_number"}
+    extras = sorted(set(item) - allowed)
+    if extras:
+        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
+
+    return SeriesRef(
+        provider_series_id=provider_series_id,
+        title=title,
+        season_title=season_title,
+        season_number=season_number,
+    )
+
+
+def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
+    field = f"progress[{index}]"
+    _expect_type(item, dict, field)
+
+    required = {
+        "provider_episode_id",
+        "provider_series_id",
+        "episode_number",
+        "episode_title",
+        "playback_position_ms",
+        "duration_ms",
+        "completion_ratio",
+        "last_watched_at",
+        "audio_locale",
+        "subtitle_locale",
+        "rating",
+    }
+    missing = sorted(required - set(item))
     if missing:
-        raise SnapshotValidationError(f"{path} is missing required keys: {', '.join(missing)}")
+        raise SnapshotValidationError(f"{field} is missing keys: {', '.join(missing)}")
+    extras = sorted(set(item) - required)
+    if extras:
+        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
 
+    _expect_type(item["provider_episode_id"], str, f"{field}.provider_episode_id")
+    _expect_type(item["provider_series_id"], str, f"{field}.provider_series_id")
+    _expect_optional_type(item["episode_number"], int, f"{field}.episode_number")
+    _expect_optional_type(item["episode_title"], str, f"{field}.episode_title")
+    _expect_non_negative_int(item["playback_position_ms"], f"{field}.playback_position_ms")
+    _expect_non_negative_int(item["duration_ms"], f"{field}.duration_ms")
+    _expect_ratio(item["completion_ratio"], f"{field}.completion_ratio")
+    _expect_optional_type(item["audio_locale"], str, f"{field}.audio_locale")
+    _expect_optional_type(item["subtitle_locale"], str, f"{field}.subtitle_locale")
+    _expect_optional_type(item["rating"], str, f"{field}.rating")
+    last_watched_at = item["last_watched_at"]
+    if last_watched_at is not None and not _is_iso_datetime(last_watched_at):
+        raise SnapshotValidationError(f"{field}.last_watched_at must be an ISO-8601 datetime string")
 
-def _expect_iso_datetime(value: str | None, path: str) -> None:
-    if value is None:
-        return
-    _expect_type(value, str, path)
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise SnapshotValidationError(f"{path} must be an ISO-8601 datetime") from exc
-
-
-def _validate_series_entry(entry: Any, index: int) -> str:
-    path = f"series[{index}]"
-    _expect_type(entry, dict, path)
-    _expect_object_keys(entry, _ALLOWED_SERIES_KEYS, {"provider_series_id", "title"}, path)
-    _expect_type(entry["provider_series_id"], str, f"{path}.provider_series_id")
-    _expect_type(entry["title"], str, f"{path}.title")
-    _expect_optional_type(entry.get("season_title"), str, f"{path}.season_title")
-    _expect_optional_type(entry.get("season_number"), int, f"{path}.season_number")
-    return entry["provider_series_id"]
-
-
-def _validate_progress_entry(entry: Any, index: int, known_series_ids: set[str]) -> None:
-    path = f"progress[{index}]"
-    _expect_type(entry, dict, path)
-    _expect_object_keys(
-        entry,
-        _ALLOWED_PROGRESS_KEYS,
-        {
-            "provider_episode_id",
-            "provider_series_id",
-            "episode_number",
-            "episode_title",
-            "playback_position_ms",
-            "duration_ms",
-            "completion_ratio",
-            "last_watched_at",
-            "audio_locale",
-            "subtitle_locale",
-            "rating",
-        },
-        path,
+    return EpisodeProgress(
+        provider_episode_id=item["provider_episode_id"],
+        provider_series_id=item["provider_series_id"],
+        episode_number=item["episode_number"],
+        episode_title=item["episode_title"],
+        playback_position_ms=item["playback_position_ms"],
+        duration_ms=item["duration_ms"],
+        completion_ratio=float(item["completion_ratio"]) if item["completion_ratio"] is not None else None,
+        last_watched_at=last_watched_at,
+        audio_locale=item["audio_locale"],
+        subtitle_locale=item["subtitle_locale"],
+        rating=item["rating"],
     )
-    _expect_type(entry["provider_episode_id"], str, f"{path}.provider_episode_id")
-    _expect_type(entry["provider_series_id"], str, f"{path}.provider_series_id")
-    if entry["provider_series_id"] not in known_series_ids:
-        raise SnapshotValidationError(
-            f"{path}.provider_series_id references unknown series id: {entry['provider_series_id']}"
-        )
-    _expect_optional_type(entry.get("episode_number"), int, f"{path}.episode_number")
-    _expect_optional_type(entry.get("episode_title"), str, f"{path}.episode_title")
-    _expect_optional_type(entry.get("playback_position_ms"), int, f"{path}.playback_position_ms")
-    _expect_optional_type(entry.get("duration_ms"), int, f"{path}.duration_ms")
-    if entry.get("playback_position_ms") is not None and entry["playback_position_ms"] < 0:
-        raise SnapshotValidationError(f"{path}.playback_position_ms must be >= 0")
-    if entry.get("duration_ms") is not None and entry["duration_ms"] < 0:
-        raise SnapshotValidationError(f"{path}.duration_ms must be >= 0")
-    _expect_optional_type(entry.get("completion_ratio"), (int, float), f"{path}.completion_ratio")
-    if entry.get("completion_ratio") is not None and not 0 <= float(entry["completion_ratio"]) <= 1:
-        raise SnapshotValidationError(f"{path}.completion_ratio must be between 0 and 1")
-    _expect_iso_datetime(entry.get("last_watched_at"), f"{path}.last_watched_at")
-    _expect_optional_type(entry.get("audio_locale"), str, f"{path}.audio_locale")
-    _expect_optional_type(entry.get("subtitle_locale"), str, f"{path}.subtitle_locale")
-    _expect_optional_type(entry.get("rating"), str, f"{path}.rating")
 
 
-def _validate_watchlist_entry(entry: Any, index: int, known_series_ids: set[str]) -> None:
-    path = f"watchlist[{index}]"
-    _expect_type(entry, dict, path)
-    _expect_object_keys(entry, _ALLOWED_WATCHLIST_KEYS, {"provider_series_id", "added_at", "status"}, path)
-    _expect_type(entry["provider_series_id"], str, f"{path}.provider_series_id")
-    if entry["provider_series_id"] not in known_series_ids:
-        raise SnapshotValidationError(
-            f"{path}.provider_series_id references unknown series id: {entry['provider_series_id']}"
-        )
-    _expect_iso_datetime(entry.get("added_at"), f"{path}.added_at")
-    _expect_optional_type(entry.get("status"), str, f"{path}.status")
+def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
+    field = f"watchlist[{index}]"
+    _expect_type(item, dict, field)
+    required = {"provider_series_id", "added_at", "status"}
+    missing = sorted(required - set(item))
+    if missing:
+        raise SnapshotValidationError(f"{field} is missing keys: {', '.join(missing)}")
+    extras = sorted(set(item) - required)
+    if extras:
+        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
+
+    provider_series_id = item["provider_series_id"]
+    added_at = item["added_at"]
+    status = item["status"]
+    _expect_type(provider_series_id, str, f"{field}.provider_series_id")
+    _expect_optional_type(added_at, str, f"{field}.added_at")
+    if added_at is not None and not _is_iso_datetime(added_at):
+        raise SnapshotValidationError(f"{field}.added_at must be an ISO-8601 datetime string")
+    _expect_optional_type(status, str, f"{field}.status")
+
+    return WatchlistEntry(
+        provider_series_id=provider_series_id,
+        added_at=added_at,
+        status=status,
+    )
 
 
-def validate_snapshot_payload(payload: Any, config: AppConfig) -> dict[str, Any]:
+def validate_snapshot_payload(payload: Any) -> CrunchyrollSnapshot:
     _expect_type(payload, dict, "snapshot")
-    _expect_object_keys(
-        payload,
-        _ALLOWED_TOP_LEVEL_KEYS,
-        {"contract_version", "generated_at", "provider", "series", "progress", "watchlist", "raw"},
-        "snapshot",
-    )
 
-    _expect_type(payload["contract_version"], str, "snapshot.contract_version")
-    if payload["contract_version"] != config.contract_version:
-        raise SnapshotValidationError(
-            f"snapshot.contract_version must match configured version {config.contract_version!r}"
-        )
+    required = {
+        "contract_version",
+        "generated_at",
+        "provider",
+        "series",
+        "progress",
+        "watchlist",
+        "raw",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise SnapshotValidationError(f"snapshot is missing keys: {', '.join(missing)}")
 
-    _expect_iso_datetime(payload["generated_at"], "snapshot.generated_at")
-    _expect_type(payload["provider"], str, "snapshot.provider")
-    if payload["provider"] != "crunchyroll":
+    allowed = required | {"account_id_hint"}
+    extras = sorted(set(payload) - allowed)
+    if extras:
+        raise SnapshotValidationError(f"snapshot contains unexpected keys: {', '.join(extras)}")
+
+    contract_version = payload["contract_version"]
+    generated_at = payload["generated_at"]
+    provider = payload["provider"]
+    account_id_hint = payload.get("account_id_hint")
+    series = payload["series"]
+    progress = payload["progress"]
+    watchlist = payload["watchlist"]
+    raw = payload["raw"]
+
+    _expect_type(contract_version, str, "snapshot.contract_version")
+    if contract_version != "1.0":
+        raise SnapshotValidationError("snapshot.contract_version must be '1.0'")
+    _expect_type(generated_at, str, "snapshot.generated_at")
+    if not _is_iso_datetime(generated_at):
+        raise SnapshotValidationError("snapshot.generated_at must be an ISO-8601 datetime string")
+    _expect_type(provider, str, "snapshot.provider")
+    if provider != "crunchyroll":
         raise SnapshotValidationError("snapshot.provider must be 'crunchyroll'")
-    _expect_optional_type(payload.get("account_id_hint"), str, "snapshot.account_id_hint")
+    _expect_optional_type(account_id_hint, str, "snapshot.account_id_hint")
+    _expect_type(series, list, "snapshot.series")
+    _expect_type(progress, list, "snapshot.progress")
+    _expect_type(watchlist, list, "snapshot.watchlist")
+    _expect_type(raw, dict, "snapshot.raw")
 
-    _expect_type(payload["series"], list, "snapshot.series")
-    _expect_type(payload["progress"], list, "snapshot.progress")
-    _expect_type(payload["watchlist"], list, "snapshot.watchlist")
-    _expect_type(payload["raw"], dict, "snapshot.raw")
+    validated_series = [_validate_series_item(item, index) for index, item in enumerate(series)]
+    validated_progress = [_validate_progress_item(item, index) for index, item in enumerate(progress)]
+    validated_watchlist = [_validate_watchlist_item(item, index) for index, item in enumerate(watchlist)]
 
     known_series_ids: set[str] = set()
-    for index, entry in enumerate(payload["series"]):
-        series_id = _validate_series_entry(entry, index)
-        if series_id in known_series_ids:
-            raise SnapshotValidationError(f"series[{index}].provider_series_id is duplicated: {series_id}")
-        known_series_ids.add(series_id)
+    for index, item in enumerate(validated_series):
+        if item.provider_series_id in known_series_ids:
+            raise SnapshotValidationError(
+                f"series[{index}].provider_series_id duplicates an earlier series id: {item.provider_series_id}"
+            )
+        known_series_ids.add(item.provider_series_id)
 
     seen_episode_ids: set[str] = set()
-    for index, entry in enumerate(payload["progress"]):
-        _validate_progress_entry(entry, index, known_series_ids)
-        episode_id = entry["provider_episode_id"]
-        if episode_id in seen_episode_ids:
-            raise SnapshotValidationError(f"progress[{index}].provider_episode_id is duplicated: {episode_id}")
-        seen_episode_ids.add(episode_id)
+    for index, item in enumerate(validated_progress):
+        if item.provider_episode_id in seen_episode_ids:
+            raise SnapshotValidationError(
+                f"progress[{index}].provider_episode_id duplicates an earlier episode id: {item.provider_episode_id}"
+            )
+        seen_episode_ids.add(item.provider_episode_id)
+        if item.provider_series_id not in known_series_ids:
+            raise SnapshotValidationError(
+                f"progress[{index}].provider_series_id references unknown series id: {item.provider_series_id}"
+            )
 
-    seen_watchlist_series: set[str] = set()
-    for index, entry in enumerate(payload["watchlist"]):
-        _validate_watchlist_entry(entry, index, known_series_ids)
-        series_id = entry["provider_series_id"]
-        if series_id in seen_watchlist_series:
-            raise SnapshotValidationError(f"watchlist[{index}].provider_series_id is duplicated: {series_id}")
-        seen_watchlist_series.add(series_id)
+    seen_watchlist_series_ids: set[str] = set()
+    for index, item in enumerate(validated_watchlist):
+        if item.provider_series_id in seen_watchlist_series_ids:
+            raise SnapshotValidationError(
+                f"watchlist[{index}].provider_series_id duplicates an earlier watchlist entry: {item.provider_series_id}"
+            )
+        seen_watchlist_series_ids.add(item.provider_series_id)
+        if item.provider_series_id not in known_series_ids:
+            raise SnapshotValidationError(
+                f"watchlist[{index}].provider_series_id references unknown series id: {item.provider_series_id}"
+            )
 
-    return payload
+    return CrunchyrollSnapshot(
+        contract_version=contract_version,
+        generated_at=generated_at,
+        provider=provider,
+        account_id_hint=account_id_hint,
+        series=validated_series,
+        progress=validated_progress,
+        watchlist=validated_watchlist,
+        raw=raw,
+    )
 
 
-def load_and_validate_snapshot(path: Path, config: AppConfig) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return validate_snapshot_payload(payload, config)
+def validate_snapshot_json_text(text: str) -> CrunchyrollSnapshot:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SnapshotValidationError(f"invalid JSON: {exc}") from exc
+    return validate_snapshot_payload(payload)
+
+
+def validate_snapshot_file(path: Path) -> CrunchyrollSnapshot:
+    return validate_snapshot_json_text(path.read_text(encoding="utf-8"))

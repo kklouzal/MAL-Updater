@@ -13,9 +13,9 @@ This repo now has an initial scaffold for:
 - MAL OAuth + API client scaffolding on the Python side
 
 What it does **not** do yet:
-- verify a successful live Crunchyroll login on this machine with real staged credentials
 - complete end-to-end Crunchyroll -> MAL sync behavior
 - write sync updates back to MAL
+- do title mapping / review-queue / guarded MAL writeback
 
 That line is intentional. The scaffold is real, and the remaining live integration gaps are not being faked.
 
@@ -66,6 +66,8 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
 ```
@@ -100,6 +102,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - `mal-refresh` refreshes a persisted MAL token pair and writes updated token files back to `secrets/`
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
 - `crunchyroll-auth-login` uses local Crunchyroll username/password secrets to fetch a real refresh token + device id and stage them into `state/crunchyroll/<profile>/`; if optional `curl_cffi` support is installed, it uses browser-TLS impersonation to get through Crunchyroll's Cloudflare layer
+- `crunchyroll-fetch-snapshot` is now the practical live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, normalizes it into the JSON contract, and can write a snapshot file and/or ingest it directly
+- a real live run on this host now succeeds through the Python path and ingests into SQLite (`series_count=219`, `progress_count=4311`, `watchlist_count=10`)
 - `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `sync` exists as a reserved entrypoint and exits with a clear "not implemented yet" message

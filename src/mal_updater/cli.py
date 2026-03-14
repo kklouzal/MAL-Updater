@@ -13,6 +13,12 @@ from .crunchyroll_auth import (
     load_crunchyroll_credentials,
     resolve_crunchyroll_state_paths,
 )
+from .crunchyroll_snapshot import (
+    CrunchyrollSnapshotError,
+    fetch_snapshot,
+    snapshot_to_dict,
+    write_snapshot_file,
+)
 from .db import bootstrap_database
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
@@ -242,6 +248,30 @@ def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None
     return 0
 
 
+def _cmd_crunchyroll_fetch_snapshot(project_root: Path | None, profile: str, out_path: Path | None, ingest: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    try:
+        result = fetch_snapshot(config, profile=profile)
+    except (CrunchyrollAuthError, CrunchyrollSnapshotError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    payload = snapshot_to_dict(result.snapshot)
+    target_path = out_path
+    if target_path is not None:
+        write_snapshot_file(target_path, result.snapshot)
+        print(f"Wrote Crunchyroll snapshot to {target_path}")
+
+    if ingest:
+        summary = ingest_snapshot_payload(payload, config)
+        print(json.dumps(summary.as_dict(), indent=2))
+        return 0
+
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -280,6 +310,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crunchyroll_auth_login.add_argument("--profile", default="default", help="Crunchyroll adapter profile name")
     crunchyroll_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /accounts/v1/me token check")
+    crunchyroll_fetch_snapshot = subparsers.add_parser(
+        "crunchyroll-fetch-snapshot",
+        help="Use the Python Crunchyroll transport to fetch a live normalized snapshot",
+    )
+    crunchyroll_fetch_snapshot.add_argument("--profile", default="default", help="Crunchyroll state profile name")
+    crunchyroll_fetch_snapshot.add_argument("--out", type=Path, default=None, help="Optional JSON file path to write the fetched snapshot")
+    crunchyroll_fetch_snapshot.add_argument("--ingest", action="store_true", help="Immediately validate and ingest the fetched snapshot into SQLite")
     validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a Crunchyroll snapshot JSON payload")
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a Crunchyroll snapshot into SQLite")
@@ -305,6 +342,8 @@ def main() -> int:
         return _cmd_mal_whoami(args.project_root)
     if args.command == "crunchyroll-auth-login":
         return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
+    if args.command == "crunchyroll-fetch-snapshot":
+        return _cmd_crunchyroll_fetch_snapshot(args.project_root, args.profile, args.out, args.ingest)
     if args.command == "validate-snapshot":
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":

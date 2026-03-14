@@ -1,0 +1,479 @@
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+
+try:
+    from curl_cffi import requests as curl_requests
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    curl_requests = None
+
+from .auth import write_secret_file
+from .config import AppConfig, _read_secret_file
+from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
+from .crunchyroll_auth import (
+    CRUNCHYROLL_BASIC_AUTH_TOKEN,
+    CRUNCHYROLL_ME_URL,
+    CRUNCHYROLL_TOKEN_URL,
+    CrunchyrollAuthError,
+    CrunchyrollStatePaths,
+    resolve_crunchyroll_state_paths,
+)
+
+
+class CrunchyrollSnapshotError(RuntimeError):
+    pass
+
+
+DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
+
+
+@dataclass(slots=True)
+class CrunchyrollAccessToken:
+    access_token: str
+    refresh_token: str
+    account_id: str | None
+    device_id: str
+    device_type: str
+
+
+@dataclass(slots=True)
+class CrunchyrollFetchResult:
+    snapshot: CrunchyrollSnapshot
+    state_paths: CrunchyrollStatePaths
+    account_email: str | None
+
+
+def _now_string() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float):
+    if curl_requests is not None:
+        return curl_requests.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
+    return requests.post(url, data=data, headers=headers, timeout=timeout_seconds)
+
+
+def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, params: dict[str, Any] | None = None):
+    if curl_requests is not None:
+        return curl_requests.get(url, headers=headers, timeout=timeout_seconds, params=params, impersonate="chrome124")
+    return requests.get(url, headers=headers, timeout=timeout_seconds, params=params)
+
+
+def _write_session_state(
+    *,
+    state_paths: CrunchyrollStatePaths,
+    profile: str,
+    locale: str,
+    device_type: str,
+    account_id: str | None,
+    last_error: str | None,
+    success: bool,
+    phase: str,
+) -> None:
+    state_paths.root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "profile": profile,
+        "locale": locale,
+        "refresh_token_present": state_paths.refresh_token_path.exists(),
+        "device_id_present": state_paths.device_id_path.exists(),
+        "device_type_hint": device_type,
+        "last_login_attempt_at": _now_string(),
+        "last_login_success_at": _now_string() if success else None,
+        "last_account_id_hint": account_id,
+        "last_error": last_error,
+        "adapter_phase": phase,
+    }
+    state_paths.session_state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    state_paths.session_state_path.chmod(0o600)
+
+
+def _read_device_id(state_paths: CrunchyrollStatePaths) -> str:
+    return _read_secret_file(state_paths.device_id_path) or str(uuid.uuid4())
+
+
+def refresh_access_token(
+    config: AppConfig,
+    *,
+    profile: str = "default",
+    timeout_seconds: float = 30.0,
+) -> tuple[CrunchyrollAccessToken, CrunchyrollStatePaths]:
+    state_paths = resolve_crunchyroll_state_paths(config, profile=profile)
+    refresh_token = _read_secret_file(state_paths.refresh_token_path)
+    if not refresh_token:
+        raise CrunchyrollAuthError(f"Missing Crunchyroll refresh token at {state_paths.refresh_token_path}")
+
+    device_id = _read_device_id(state_paths)
+    device_type = DEFAULT_CRUNCHYROLL_DEVICE_TYPE
+    body = {
+        "grant_type": "refresh_token",
+        "scope": "offline_access",
+        "refresh_token": refresh_token,
+        "device_id": device_id,
+        "device_type": device_type,
+    }
+    headers = {
+        "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "ETP-Anonymous-ID": device_id,
+    }
+    response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds)
+    if response.status_code >= 400:
+        message = f"Crunchyroll refresh-token login failed: HTTP {response.status_code}"
+        if response.status_code == 403 and curl_requests is None:
+            message += " (likely blocked by Cloudflare; install optional curl_cffi support for browser-TLS impersonation)"
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            error_description = payload.get("error_description")
+            if error or error_description:
+                message = f"Crunchyroll refresh-token login failed: {error or 'unknown_error'} - {error_description or 'no description'}"
+        _write_session_state(
+            state_paths=state_paths,
+            profile=profile,
+            locale=config.crunchyroll.locale,
+            device_type=device_type,
+            account_id=None,
+            last_error=message,
+            success=False,
+            phase="auth_failed",
+        )
+        raise CrunchyrollAuthError(message)
+
+    token_payload = response.json()
+    access_token = token_payload.get("access_token")
+    new_refresh_token = token_payload.get("refresh_token")
+    account_id = token_payload.get("account_id")
+    if not access_token or not new_refresh_token:
+        message = "Crunchyroll refresh-token login succeeded but did not return both access_token and refresh_token"
+        _write_session_state(
+            state_paths=state_paths,
+            profile=profile,
+            locale=config.crunchyroll.locale,
+            device_type=device_type,
+            account_id=account_id,
+            last_error=message,
+            success=False,
+            phase="auth_failed",
+        )
+        raise CrunchyrollAuthError(message)
+
+    write_secret_file(state_paths.refresh_token_path, new_refresh_token)
+    write_secret_file(state_paths.device_id_path, device_id)
+    return (
+        CrunchyrollAccessToken(
+            access_token=access_token,
+            refresh_token=new_refresh_token,
+            account_id=str(account_id) if account_id else None,
+            device_id=device_id,
+            device_type=device_type,
+        ),
+        state_paths,
+    )
+
+
+def _authorized_json_get(
+    url: str,
+    *,
+    access_token: str,
+    timeout_seconds: float,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    response = _http_get(
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout_seconds=timeout_seconds,
+        params=params,
+    )
+    if response.status_code >= 400:
+        raise CrunchyrollSnapshotError(f"Crunchyroll GET failed for {url}: HTTP {response.status_code}")
+    return response.json()
+
+
+def _panel_metadata(panel: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(panel.get("episode_metadata"), dict):
+        return panel["episode_metadata"]
+    if isinstance(panel.get("movie_metadata"), dict):
+        return panel["movie_metadata"]
+    return panel
+
+
+def _pick_subtitle_locale(panel: dict[str, Any]) -> str | None:
+    metadata = _panel_metadata(panel)
+    locales = metadata.get("subtitle_locales")
+    if isinstance(locales, list) and locales:
+        first = locales[0]
+        return str(first) if first else None
+    return None
+
+
+def _series_from_panel(panel: dict[str, Any]) -> SeriesRef | None:
+    panel_type = panel.get("type")
+    metadata = _panel_metadata(panel)
+    if panel_type == "episode":
+        provider_series_id = metadata.get("series_id")
+        title = metadata.get("series_title") or provider_series_id
+        season_title = metadata.get("season_title")
+        season_number = metadata.get("season_number")
+    elif panel_type == "movie":
+        provider_series_id = metadata.get("movie_listing_id")
+        title = metadata.get("movie_listing_title") or panel.get("title") or provider_series_id
+        season_title = None
+        season_number = None
+    elif panel_type == "series":
+        provider_series_id = panel.get("id")
+        title = panel.get("title") or provider_series_id
+        season_title = None
+        season_number = None
+    elif panel_type == "movie_listing":
+        provider_series_id = panel.get("id")
+        title = panel.get("title") or provider_series_id
+        season_title = None
+        season_number = None
+    else:
+        return None
+
+    if not provider_series_id:
+        return None
+    return SeriesRef(
+        provider_series_id=str(provider_series_id),
+        title=str(title or provider_series_id),
+        season_title=str(season_title) if season_title not in (None, "") else None,
+        season_number=int(season_number) if isinstance(season_number, int) else None,
+    )
+
+
+def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | None:
+    panel = entry.get("panel")
+    if not isinstance(panel, dict):
+        return None
+
+    panel_type = panel.get("type")
+    metadata = _panel_metadata(panel)
+    playhead = entry.get("playhead")
+    fully_watched = bool(entry.get("fully_watched"))
+    last_watched_at = entry.get("date_played")
+
+    if panel_type == "episode":
+        duration_ms = int(metadata.get("duration_ms")) if isinstance(metadata.get("duration_ms"), int) else None
+        playback_position_ms = int(playhead) if isinstance(playhead, int) else None
+        if playback_position_ms is not None and duration_ms and playback_position_ms <= max(60000, duration_ms // 100):
+            playback_position_ms *= 1000
+        
+        provider_series_id = metadata.get("series_id")
+        provider_episode_id = panel.get("id")
+        if not provider_series_id or not provider_episode_id:
+            return None
+        completion_ratio = None
+        if duration_ms and playback_position_ms is not None and duration_ms > 0:
+            completion_ratio = max(0.0, min(1.0, playback_position_ms / duration_ms))
+        elif fully_watched:
+            completion_ratio = 1.0
+        episode_number = metadata.get("episode_number")
+        return EpisodeProgress(
+            provider_episode_id=str(provider_episode_id),
+            provider_series_id=str(provider_series_id),
+            episode_number=int(episode_number) if isinstance(episode_number, int) else None,
+            episode_title=str(panel.get("title")) if panel.get("title") else None,
+            playback_position_ms=playback_position_ms,
+            duration_ms=duration_ms,
+            completion_ratio=completion_ratio,
+            last_watched_at=str(last_watched_at) if last_watched_at else None,
+            audio_locale=str(metadata.get("audio_locale")) if metadata.get("audio_locale") else None,
+            subtitle_locale=_pick_subtitle_locale(panel),
+            rating=None,
+        )
+
+    if panel_type == "movie":
+        duration_ms = int(metadata.get("duration_ms")) if isinstance(metadata.get("duration_ms"), int) else None
+        playback_position_ms = int(playhead) if isinstance(playhead, int) else None
+        if playback_position_ms is not None and duration_ms and playback_position_ms <= max(60000, duration_ms // 100):
+            playback_position_ms *= 1000
+        provider_series_id = metadata.get("movie_listing_id")
+        provider_episode_id = panel.get("id")
+        if not provider_series_id or not provider_episode_id:
+            return None
+        completion_ratio = None
+        if duration_ms and playback_position_ms is not None and duration_ms > 0:
+            completion_ratio = max(0.0, min(1.0, playback_position_ms / duration_ms))
+        elif fully_watched:
+            completion_ratio = 1.0
+        return EpisodeProgress(
+            provider_episode_id=str(provider_episode_id),
+            provider_series_id=str(provider_series_id),
+            episode_number=None,
+            episode_title=str(panel.get("title")) if panel.get("title") else None,
+            playback_position_ms=playback_position_ms,
+            duration_ms=duration_ms,
+            completion_ratio=completion_ratio,
+            last_watched_at=str(last_watched_at) if last_watched_at else None,
+            audio_locale=None,
+            subtitle_locale=None,
+            rating="movie",
+        )
+
+    return None
+
+
+def _watchlist_from_entry(entry: dict[str, Any]) -> tuple[SeriesRef | None, WatchlistEntry | None]:
+    panel = entry.get("panel")
+    if not isinstance(panel, dict):
+        return None, None
+    series_ref = _series_from_panel(panel)
+    if series_ref is None:
+        return None, None
+    if entry.get("fully_watched") is True:
+        status = "fully_watched"
+    elif entry.get("never_watched") is True:
+        status = "never_watched"
+    else:
+        status = "in_progress"
+    added_at = entry.get("date_added")
+    return (
+        series_ref,
+        WatchlistEntry(
+            provider_series_id=series_ref.provider_series_id,
+            added_at=str(added_at) if added_at else None,
+            status=status,
+        ),
+    )
+
+
+def _dedupe_series(series_items: list[SeriesRef]) -> list[SeriesRef]:
+    by_id: dict[str, SeriesRef] = {}
+    for item in series_items:
+        by_id.setdefault(item.provider_series_id, item)
+    return list(by_id.values())
+
+
+def fetch_snapshot(
+    config: AppConfig,
+    *,
+    profile: str = "default",
+    timeout_seconds: float = 30.0,
+) -> CrunchyrollFetchResult:
+    token, state_paths = refresh_access_token(config, profile=profile, timeout_seconds=timeout_seconds)
+    account_payload = _authorized_json_get(
+        CRUNCHYROLL_ME_URL,
+        access_token=token.access_token,
+        timeout_seconds=timeout_seconds,
+    )
+    if not isinstance(account_payload, dict):
+        raise CrunchyrollSnapshotError("Crunchyroll account response was not a JSON object")
+    account_id = str(account_payload.get("account_id") or token.account_id or "") or None
+    if not account_id:
+        raise CrunchyrollSnapshotError("Crunchyroll account response did not include account_id")
+
+    history_entries: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        history_payload = _authorized_json_get(
+            f"https://www.crunchyroll.com/content/v2/{account_id}/watch-history",
+            access_token=token.access_token,
+            timeout_seconds=timeout_seconds,
+            params={"page": page, "page_size": 100, "locale": config.crunchyroll.locale},
+        )
+        if not isinstance(history_payload, dict):
+            raise CrunchyrollSnapshotError("Crunchyroll watch-history response was not a JSON object")
+        data = history_payload.get("data")
+        if not isinstance(data, list):
+            raise CrunchyrollSnapshotError("Crunchyroll watch-history response did not include a data list")
+        batch = [item for item in data if isinstance(item, dict)]
+        history_entries.extend(batch)
+        total = history_payload.get("total")
+        if len(batch) < 100:
+            break
+        if isinstance(total, int) and len(history_entries) >= total:
+            break
+        page += 1
+
+    watchlist_payload = _authorized_json_get(
+        f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist",
+        access_token=token.access_token,
+        timeout_seconds=timeout_seconds,
+        params={"locale": config.crunchyroll.locale},
+    )
+    if not isinstance(watchlist_payload, dict):
+        raise CrunchyrollSnapshotError("Crunchyroll watchlist response was not a JSON object")
+    watchlist_data = watchlist_payload.get("data")
+    if not isinstance(watchlist_data, list):
+        raise CrunchyrollSnapshotError("Crunchyroll watchlist response did not include a data list")
+
+    progress = [item for item in (_progress_from_history_entry(entry) for entry in history_entries) if item is not None]
+    history_series = [item for item in (_series_from_panel(entry.get("panel")) for entry in history_entries if isinstance(entry.get("panel"), dict)) if item is not None]
+
+    watchlist_series: list[SeriesRef] = []
+    watchlist_entries: list[WatchlistEntry] = []
+    for entry in watchlist_data:
+        if not isinstance(entry, dict):
+            continue
+        series_ref, watchlist_entry = _watchlist_from_entry(entry)
+        if series_ref is not None:
+            watchlist_series.append(series_ref)
+        if watchlist_entry is not None:
+            watchlist_entries.append(watchlist_entry)
+
+    snapshot = CrunchyrollSnapshot(
+        contract_version=config.contract_version,
+        generated_at=_now_string(),
+        provider="crunchyroll",
+        account_id_hint=account_id,
+        series=_dedupe_series(history_series + watchlist_series),
+        progress=progress,
+        watchlist=watchlist_entries,
+        raw={
+            "status": "ok",
+            "profile": profile,
+            "state_root": str(state_paths.root),
+            "session_state_path": str(state_paths.session_state_path),
+            "refresh_token_present": state_paths.refresh_token_path.exists(),
+            "device_id_present": state_paths.device_id_path.exists(),
+            "device_type_hint": token.device_type,
+            "history_count": len(history_entries),
+            "watchlist_count": len(watchlist_entries),
+            "transport": "curl_cffi:chrome124" if curl_requests is not None else "requests",
+        },
+    )
+    _write_session_state(
+        state_paths=state_paths,
+        profile=profile,
+        locale=config.crunchyroll.locale,
+        device_type=token.device_type,
+        account_id=account_id,
+        last_error=None,
+        success=True,
+        phase="python_live_snapshot",
+    )
+    return CrunchyrollFetchResult(
+        snapshot=snapshot,
+        state_paths=state_paths,
+        account_email=str(account_payload.get("email")) if account_payload.get("email") else None,
+    )
+
+
+def snapshot_to_dict(snapshot: CrunchyrollSnapshot) -> dict[str, Any]:
+    return {
+        "contract_version": snapshot.contract_version,
+        "generated_at": snapshot.generated_at,
+        "provider": snapshot.provider,
+        "account_id_hint": snapshot.account_id_hint,
+        "series": [asdict(item) for item in snapshot.series],
+        "progress": [asdict(item) for item in snapshot.progress],
+        "watchlist": [asdict(item) for item in snapshot.watchlist],
+        "raw": snapshot.raw,
+    }
+
+
+def write_snapshot_file(path: Path, snapshot: CrunchyrollSnapshot) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot_to_dict(snapshot), indent=2) + "\n", encoding="utf-8")
+    return path

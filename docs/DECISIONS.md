@@ -90,3 +90,14 @@ Treat the host Rust toolchain as the current blocker for `crunchyroll-rs` and do
 
 ### Why
 The host is on Cargo/Rust `1.75.0`, while the relevant `crunchyroll-rs` path now needs newer Rust/Cargo. It is better to leave an honest, compilable adapter state/auth foundation plus a clear blocker note than to ship a fake or broken transport layer.
+
+## 2026-03-14 - Crunchyroll live transport pivot
+
+### Decision
+Use the Python-side impersonated transport as the primary live Crunchyroll fetch path for now.
+
+### Why
+- it is the first path that produced real live account/history/watchlist data on this host
+- it reuses the already-proven `curl_cffi` browser-TLS impersonation workaround
+- it gets real data into the local pipeline now instead of waiting on Rust transport recovery
+- it keeps the JSON contract and downstream pipeline honest while leaving the Rust path optional/future

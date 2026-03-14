@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,24 +31,24 @@ class IngestionSummary:
 
 
 def ingest_snapshot_payload(payload: Any, config: AppConfig) -> IngestionSummary:
-    snapshot = validate_snapshot_payload(payload, config)
+    snapshot = validate_snapshot_payload(payload)
     bootstrap_database(config.db_path)
 
-    provider = snapshot["provider"]
-    contract_version = snapshot["contract_version"]
+    provider = snapshot.provider
+    contract_version = snapshot.contract_version
 
     with connect(config.db_path) as conn:
         sync_run_id = _insert_sync_run(conn, provider, contract_version)
         try:
-            _upsert_series(conn, provider, snapshot["series"])
-            _upsert_progress(conn, provider, snapshot["progress"])
-            _upsert_watchlist(conn, provider, snapshot["watchlist"])
+            _upsert_series(conn, provider, snapshot.series)
+            _upsert_progress(conn, provider, snapshot.progress)
+            _upsert_watchlist(conn, provider, snapshot.watchlist)
             summary = IngestionSummary(
                 provider=provider,
                 contract_version=contract_version,
-                series_count=len(snapshot["series"]),
-                progress_count=len(snapshot["progress"]),
-                watchlist_count=len(snapshot["watchlist"]),
+                series_count=len(snapshot.series),
+                progress_count=len(snapshot.progress),
+                watchlist_count=len(snapshot.watchlist),
                 sync_run_id=sync_run_id,
             )
             _complete_sync_run(conn, sync_run_id, "completed", summary.as_dict())
@@ -87,8 +87,9 @@ def _complete_sync_run(conn, sync_run_id: int, status: str, summary: dict[str, A
     )
 
 
-def _upsert_series(conn, provider: str, series_entries: list[dict[str, Any]]) -> None:
+def _upsert_series(conn, provider: str, series_entries: list[Any]) -> None:
     for entry in series_entries:
+        raw_entry = asdict(entry)
         conn.execute(
             """
             INSERT INTO provider_series (
@@ -110,17 +111,18 @@ def _upsert_series(conn, provider: str, series_entries: list[dict[str, Any]]) ->
             """,
             (
                 provider,
-                entry["provider_series_id"],
-                entry["title"],
-                entry.get("season_title"),
-                entry.get("season_number"),
-                json.dumps(entry, sort_keys=True),
+                entry.provider_series_id,
+                entry.title,
+                entry.season_title,
+                entry.season_number,
+                json.dumps(raw_entry, sort_keys=True),
             ),
         )
 
 
-def _upsert_progress(conn, provider: str, progress_entries: list[dict[str, Any]]) -> None:
+def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
     for entry in progress_entries:
+        raw_entry = asdict(entry)
         conn.execute(
             """
             INSERT INTO provider_episode_progress (
@@ -156,24 +158,25 @@ def _upsert_progress(conn, provider: str, progress_entries: list[dict[str, Any]]
             """,
             (
                 provider,
-                entry["provider_episode_id"],
-                entry["provider_series_id"],
-                entry.get("episode_number"),
-                entry.get("episode_title"),
-                entry.get("playback_position_ms"),
-                entry.get("duration_ms"),
-                float(entry["completion_ratio"]) if entry.get("completion_ratio") is not None else None,
-                entry.get("last_watched_at"),
-                entry.get("audio_locale"),
-                entry.get("subtitle_locale"),
-                entry.get("rating"),
-                json.dumps(entry, sort_keys=True),
+                entry.provider_episode_id,
+                entry.provider_series_id,
+                entry.episode_number,
+                entry.episode_title,
+                entry.playback_position_ms,
+                entry.duration_ms,
+                entry.completion_ratio,
+                entry.last_watched_at,
+                entry.audio_locale,
+                entry.subtitle_locale,
+                entry.rating,
+                json.dumps(raw_entry, sort_keys=True),
             ),
         )
 
 
-def _upsert_watchlist(conn, provider: str, watchlist_entries: list[dict[str, Any]]) -> None:
+def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None:
     for entry in watchlist_entries:
+        raw_entry = asdict(entry)
         conn.execute(
             """
             INSERT INTO provider_watchlist (
@@ -193,9 +196,9 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[dict[str, Any
             """,
             (
                 provider,
-                entry["provider_series_id"],
-                entry.get("added_at"),
-                entry.get("status"),
-                json.dumps(entry, sort_keys=True),
+                entry.provider_series_id,
+                entry.added_at,
+                entry.status,
+                json.dumps(raw_entry, sort_keys=True),
             ),
         )

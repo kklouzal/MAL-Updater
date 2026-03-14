@@ -99,8 +99,26 @@ Notes:
 - `mal-refresh` reuses the persisted refresh token and overwrites the access token file with the new token
 - `mal-whoami` is the cheapest honest sanity check after auth succeeds
 
+## Live Crunchyroll fetch path
+
+The fastest honest live path is now Python-side rather than Rust-side.
+
+Use:
+
+```bash
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
+```
+
+Behavior:
+- refreshes the staged Crunchyroll refresh token from `state/crunchyroll/<profile>/`
+- uses `curl_cffi` browser-TLS impersonation when available
+- fetches real account / watch-history / watchlist data
+- normalizes the result into the existing `1.0` snapshot contract
+- can immediately validate + ingest into SQLite
+
 ## Near-term next steps
 
 - conflict/review queue generation from ingestion + mapping passes
-- real Crunchyroll adapter integration
 - MAL-side write planning/dry-run sync pipeline
+- optional future Rust transport recovery if it becomes worth the effort

@@ -73,9 +73,19 @@ That is enough to bootstrap honest auth material, but not yet enough to guarante
 
 ## Next step
 
-1. keep the new Python credential bootstrap path as the honest way to mint/stage refresh-token auth material
-2. either:
-   - move Crunchyroll fetch/snapshot work onto the Python impersonated transport, or
-   - replace/augment the Rust HTTP transport with something impersonation-capable
-3. rerun the live snapshot once the transport layer is fixed
-4. once a real snapshot exists, push it through Python ingestion and tighten normalization details
+The practical pivot is now real:
+
+1. keep the Python credential bootstrap path as the honest way to mint/stage refresh-token auth material
+2. use the Python impersonated transport as the current live snapshot path via `crunchyroll-fetch-snapshot`
+3. treat the Rust adapter as a secondary path until its transport layer is made impersonation-capable
+4. build MAL mapping / write planning on top of the now-live Python-ingested Crunchyroll dataset
+
+### Verified pivot outcome
+
+A live Python-side snapshot now succeeds on this host and was ingested into SQLite with real data:
+
+- `series_count=219`
+- `progress_count=4311`
+- `watchlist_count=10`
+
+That means the remaining blocker is no longer "can we get real Crunchyroll data locally?" — we can. The remaining work is downstream mapping/sync logic and, separately, whether the Rust transport is worth salvaging.
