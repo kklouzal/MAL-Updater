@@ -2,16 +2,15 @@
 
 ## Phase 0 - Repo / project setup
 - [x] Python project layout
-- [x] Rust adapter layout
-- [x] shared JSON contract between Rust and Python
+- [x] shared JSON contract
 - [x] config / secrets layout
 - [x] SQLite bootstrap
 
 ## Phase 1 - Feasibility spike
 - MAL OAuth works locally
 - MAL API client can read and update test list entries
-- Rust adapter can authenticate to Crunchyroll and fetch small watch sample
-- normalized sample inserted into SQLite
+- Python Crunchyroll auth works locally
+- normalized live sample inserts into SQLite
 
 ## Phase 2 - Read-only ingestion
 - ingest Crunchyroll watch history

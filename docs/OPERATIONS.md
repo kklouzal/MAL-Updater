@@ -46,7 +46,19 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 ```bash
 cd <repo-root>
 PYTHONPATH=src python3 -m unittest discover -s tests -v
-cd rust/crunchyroll_adapter && cargo build
+```
+
+### Stage Crunchyroll auth material from local credentials
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
+```
+
+### Fetch and optionally ingest a live Crunchyroll snapshot
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
 ```
 
 ### Inspect MAL mapping candidates
@@ -80,18 +92,6 @@ PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 ```
 
 Use the stdlib `unittest` invocation above as the baseline Python test command. Do not assume `pytest` is installed on the host.
-
-### Inspect Crunchyroll adapter auth-material state
-```bash
-cd <repo-root>/rust/crunchyroll_adapter
-cargo run -- auth status
-```
-
-### Stage a Crunchyroll refresh token for the adapter
-```bash
-cd <repo-root>/rust/crunchyroll_adapter
-cargo run -- auth save-refresh-token --refresh-token-file /path/to/refresh_token.txt
-```
 
 ## MAL app settings
 

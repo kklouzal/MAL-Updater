@@ -12,7 +12,6 @@ data_dir = "../data"
 state_dir = "../state"
 cache_dir = "../cache"
 db_path = "../data/mal_updater.sqlite3"
-crunchyroll_adapter_bin = "../rust/crunchyroll_adapter/target/debug/crunchyroll-adapter"
 
 [mal]
 base_url = "https://api.myanimelist.net/v2"

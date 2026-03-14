@@ -120,7 +120,7 @@ def _write_session_state(
         "last_login_success_at": _now_string() if success else None,
         "last_account_id_hint": account_id,
         "last_error": last_error,
-        "adapter_phase": "ready" if success else "auth_failed",
+        "crunchyroll_phase": "ready" if success else "auth_failed",
     }
     state_paths.session_state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     os.chmod(state_paths.session_state_path, 0o600)

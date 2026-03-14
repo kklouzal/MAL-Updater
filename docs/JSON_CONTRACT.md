@@ -1,38 +1,37 @@
-# Rust ↔ Python JSON contract
+# Crunchyroll snapshot JSON contract
 
-The Rust Crunchyroll adapter is responsible for collecting provider data and emitting a single normalized JSON snapshot to stdout.
-The Python worker owns validation, persistence, mapping, sync policy, and review-queue generation.
+The live Crunchyroll fetch path produces a single normalized JSON snapshot.
+The rest of the Python application owns validation, persistence, mapping, sync policy, and review-queue generation.
 
-## Command boundary
+## Contract boundary
 
-Planned invocation shape:
+Current producer shape:
 
 ```bash
-crunchyroll-adapter snapshot --contract-version 1.0
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out path/to/snapshot.json
 ```
 
-- stdout: JSON payload matching `docs/contracts/crunchyroll_snapshot.schema.json`
-- stderr: human-readable logs/errors only
-- exit code `0`: snapshot produced
-- non-zero exit: adapter failure, no snapshot should be trusted
+- output JSON matches `docs/contracts/crunchyroll_snapshot.schema.json`
+- the snapshot is normalized provider data, not direct MAL mutation intent
+- any future producer must emit the same contract if it wants to plug into the existing ingestion path
 
 ## Contract versioning
 
 - Current version: `1.0`
-- Any breaking change requires a new contract version string and coordinated Python/Rust updates.
+- Any breaking change requires a new contract version string and coordinated validation/ingestion updates.
 
 ## Snapshot semantics
 
-- `series`: deduplicated per-provider series/season records known to the adapter
+- `series`: deduplicated per-provider series/season records known from Crunchyroll data
 - `progress`: per-episode playback observations with timestamps and completion ratio
-- `watchlist`: explicit watchlist/library entries if the provider exposes them
-- `raw`: optional provider-specific passthrough object for debugging/auditing
+- `watchlist`: explicit watchlist/library entries if Crunchyroll exposes them
+- `raw`: optional provider-specific passthrough/debug object
 
 ## Required safety expectations
 
-- Rust must not write secrets into the snapshot.
-- Python must treat missing/unknown fields as incomplete data, not as proof of absence.
-- Python must not infer MAL mutations directly from raw payloads; only from normalized persisted state.
+- Secrets must never be written into the snapshot.
+- Missing/unknown fields must be treated as incomplete data, not proof of absence.
+- MAL mutations must only be inferred from normalized persisted state, never directly from raw passthrough blobs.
 
 ## Example payload
 

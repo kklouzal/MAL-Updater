@@ -4,7 +4,7 @@ This project uses a **local callback listener on the Orin** plus a browser-based
 
 ## Current model
 
-- MAL OAuth is handled by the Python worker, not the Rust adapter.
+- MAL OAuth is handled by the Python worker.
 - The listener can bind to `0.0.0.0` so the Orin can receive callbacks from another machine on the LAN.
 - The redirect URI registered in the MAL app must point to a **real reachable Orin address**, for example:
   - `http://192.168.1.117:8765/callback`

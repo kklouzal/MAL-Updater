@@ -4,15 +4,16 @@
 
 ### Decision
 Build MAL-Updater as a local Orin-hosted integration using:
-- Python worker/orchestrator
-- Rust Crunchyroll adapter
+- Python application/worker
 - SQLite state database
 - official MAL OAuth + REST API
+- Python-side Crunchyroll auth + live fetches
 
 ### Why
-- Crunchyroll access is the brittle/unofficial half and benefits from a stronger client library boundary.
-- Python is better for orchestration, mapping logic, sync policy, and future recommendation work.
-- SQLite is sufficient and simple for local state.
+- the working Crunchyroll path on this host is Python-side
+- Python is better for orchestration, mapping logic, sync policy, and future recommendation work
+- SQLite is sufficient and simple for local state
+- keeping the implementation in one language leaves the repo smaller and easier to maintain
 
 ## 2026-03-14 - Sync direction
 
@@ -20,9 +21,9 @@ Build MAL-Updater as a local Orin-hosted integration using:
 One-way sync first: Crunchyroll -> MyAnimeList.
 
 ### Why
-- Crunchyroll is the behavioral source of truth for watched progress.
-- MAL should be updated conservatively as the public-facing tracking layer.
-- Two-way reconciliation adds unnecessary risk early.
+- Crunchyroll is the behavioral source of truth for watched progress
+- MAL should be updated conservatively as the public-facing tracking layer
+- two-way reconciliation adds unnecessary risk early
 
 ## 2026-03-14 - Sync policy
 
@@ -69,35 +70,13 @@ Use `docs/` as project-specific durable memory.
 ### Why
 OpenClaw memory is useful, but project-specific knowledge should live with the project repo.
 
-## 2026-03-14 - First Crunchyroll adapter step
+## 2026-03-14 - Crunchyroll implementation choice
 
 ### Decision
-Make the first real adapter step adapter-side auth/state conventions before attempting live fetches.
-
-### What that means
-- stage Crunchyroll refresh-token material under adapter-controlled local state
-- support optional persisted device-id material alongside it
-- track adapter-side session/debug metadata in `session.json`
-- keep the JSON snapshot contract honest until live login/fetch is actually working
+Use the Python-side impersonated transport as the primary Crunchyroll auth and live fetch path.
 
 ### Why
-This is the cleanest way to prepare for real adapter auth without pretending that Crunchyroll transport already works.
-
-## 2026-03-14 - Current Crunchyroll blocker handling
-
-### Decision
-Treat the host Rust toolchain as the current blocker for `crunchyroll-rs` and document it explicitly instead of forcing a fragile dependency pin maze.
-
-### Why
-The host is on Cargo/Rust `1.75.0`, while the relevant `crunchyroll-rs` path now needs newer Rust/Cargo. It is better to leave an honest, compilable adapter state/auth foundation plus a clear blocker note than to ship a fake or broken transport layer.
-
-## 2026-03-14 - Crunchyroll live transport pivot
-
-### Decision
-Use the Python-side impersonated transport as the primary live Crunchyroll fetch path for now.
-
-### Why
-- it is the first path that produced real live account/history/watchlist data on this host
-- it reuses the already-proven `curl_cffi` browser-TLS impersonation workaround
-- it gets real data into the local pipeline now instead of waiting on Rust transport recovery
-- it keeps the JSON contract and downstream pipeline honest while leaving the Rust path optional/future
+- it is the path that produced real live account/history/watchlist data on this host
+- it reuses the already-proven `curl_cffi` browser-TLS impersonation workaround when needed
+- it gets real data into the local pipeline now instead of blocking on alternative transport ideas
+- it keeps the repo architecture coherent and smaller

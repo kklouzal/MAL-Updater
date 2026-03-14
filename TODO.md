@@ -2,21 +2,15 @@
 
 ## Immediate next build steps
 - [x] Create Python project scaffold
-- [x] Create Rust adapter scaffold
-- [x] Define JSON contract between adapter and Python worker
+- [x] Define normalized snapshot contract
 - [x] Define SQLite schema
 - [x] Decide config/secrets directory layout
 - [x] Wire Python config loader to parse `config/settings.toml`
 - [x] Add JSON schema validation before ingestion
-- [x] Add Python ingestion path for adapter snapshot -> SQLite
-- [x] Upgrade/install a newer Rust toolchain on the host so `crunchyroll-rs` can build
-- [x] Integrate `crunchyroll-rs` into the Rust adapter
-- [x] Add adapter-side Crunchyroll auth-material/state-dir conventions and CLI staging commands
-- [x] Document the current Crunchyroll adapter auth-material flow and toolchain blocker
+- [x] Add Python ingestion path for snapshot -> SQLite
 - [x] Verify a real Crunchyroll credential login + refresh-token bootstrap on this machine with staged credentials
-- [ ] Get the first real Crunchyroll snapshot on this machine past the current Rust-side transport / Cloudflare blocker
-- [ ] Decide whether to finish Crunchyroll fetches in Python (`curl_cffi` transport) or to rework the Rust HTTP client path
-- [ ] Document the live Crunchyroll adapter auth/session flow once the first real snapshot implementation exists
+- [x] Get the first real live Crunchyroll snapshot on this machine
+- [x] Keep the working live Crunchyroll path in Python (`curl_cffi` transport when available)
 - [x] Implement local MAL loopback OAuth flow + token persistence
 - [ ] Register MAL app / complete live OAuth with real credentials
 

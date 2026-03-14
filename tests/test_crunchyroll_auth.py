@@ -85,7 +85,7 @@ class CrunchyrollAuthTests(unittest.TestCase):
             self.assertEqual(state_paths.refresh_token_path.read_text(encoding="utf-8"), "refresh-xyz\n")
             self.assertEqual(state_paths.device_id_path.read_text(encoding="utf-8").strip(), result.device_id)
             session_payload = json.loads(state_paths.session_state_path.read_text(encoding="utf-8"))
-            self.assertEqual(session_payload["adapter_phase"], "ready")
+            self.assertEqual(session_payload["crunchyroll_phase"], "ready")
             self.assertEqual(session_payload["last_account_id_hint"], "acct-42")
             self.assertIsNone(session_payload["last_error"])
             self.assertEqual(result.account_email, "user@example.com")
@@ -118,7 +118,7 @@ class CrunchyrollAuthTests(unittest.TestCase):
 
             state_paths = resolve_crunchyroll_state_paths(config)
             session_payload = json.loads(state_paths.session_state_path.read_text(encoding="utf-8"))
-            self.assertEqual(session_payload["adapter_phase"], "auth_failed")
+            self.assertEqual(session_payload["crunchyroll_phase"], "auth_failed")
             self.assertIn("invalid_grant", session_payload["last_error"])
 
 

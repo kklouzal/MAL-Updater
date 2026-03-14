@@ -58,7 +58,6 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"db_path={config.db_path}")
     print(f"contract_version={config.contract_version}")
     print(f"completion_threshold={config.completion_threshold}")
-    print(f"crunchyroll_adapter_bin={config.crunchyroll_adapter_bin}")
     print(f"mal.base_url={config.mal.base_url}")
     print(f"mal.auth_url={config.mal.auth_url}")
     print(f"mal.token_url={config.mal.token_url}")
@@ -513,9 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("mal-whoami", help="Call MAL GET /users/@me with the currently configured access token")
     crunchyroll_auth_login = subparsers.add_parser(
         "crunchyroll-auth-login",
-        help="Use local Crunchyroll username/password secrets to stage adapter refresh-token auth material",
+        help="Use local Crunchyroll username/password secrets to stage Crunchyroll refresh-token auth material",
     )
-    crunchyroll_auth_login.add_argument("--profile", default="default", help="Crunchyroll adapter profile name")
+    crunchyroll_auth_login.add_argument("--profile", default="default", help="Crunchyroll state profile name")
     crunchyroll_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /accounts/v1/me token check")
     crunchyroll_fetch_snapshot = subparsers.add_parser(
         "crunchyroll-fetch-snapshot",

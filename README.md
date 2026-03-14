@@ -1,44 +1,40 @@
 # MAL-Updater
 
-Local Crunchyroll → MyAnimeList sync and recommendation integration for OpenClaw on the Orin.
+Local Crunchyroll → MyAnimeList sync and recommendation groundwork for OpenClaw on the Orin.
 
 ## Current status
 
-This repo now has an initial scaffold for:
-- a Python worker/orchestrator
-- a Rust Crunchyroll adapter boundary
-- a versioned JSON contract between them
-- SQLite bootstrap migrations
-- local config/secrets/data directory conventions
-- MAL OAuth + API client scaffolding on the Python side
+This repo is now a **Python-only** implementation.
+
+What it does today:
+- real MAL OAuth and MAL API reads/writes
+- real Crunchyroll auth bootstrap from local username/password secrets
+- real live Crunchyroll snapshot fetches through the Python transport
+- strict snapshot validation
+- SQLite ingestion of Crunchyroll watch history/watchlist data
+- conservative MAL mapping review workflows
+- guarded dry-run sync planning
+- a first live MAL executor that only applies approved, forward-safe updates
 
 What it does **not** do yet:
-- complete end-to-end unattended Crunchyroll -> MAL sync behavior
+- complete unattended end-to-end sync behavior
 - auto-resolve ambiguous mappings
-- perform reckless or broad MAL mutations
+- perform broad or reckless MAL mutations
+- ship recommendation features yet
 
-What it can do now beyond ingestion:
-- search MAL for conservative mapping candidates from the ingested Crunchyroll SQLite dataset
-- persist unresolved mapping/sync review items into `review_queue`
-- generate guarded dry-run sync proposals
-- run a first live MAL executor path that only uses approved mappings and only applies forward-safe updates
-- explicitly skip any proposal that would decrease MAL progress or downgrade a completed entry
-
-That line is intentional. The scaffold is real, and the remaining live integration gaps are not being faked.
+That line is intentional. The working path is real, and the remaining gaps are not being faked.
 
 ## Repository layout
 
-- `src/mal_updater/` — Python worker package
+- `src/mal_updater/` — Python application package
 - `migrations/` — SQLite schema migrations
-- `docs/JSON_CONTRACT.md` — Rust ↔ Python boundary contract
+- `docs/JSON_CONTRACT.md` — normalized Crunchyroll snapshot contract
 - `docs/MAL_OAUTH.md` — MAL OAuth flow, callback model, and secret conventions
-- `docs/PYTHON_WORKER.md` — worker config/bootstrap notes
+- `docs/PYTHON_WORKER.md` — worker/config/bootstrap notes
 - `docs/DECISIONS.md` — durable architectural and policy decisions
 - `docs/CURRENT_STATUS.md` — current implemented state vs missing pieces
 - `docs/OPERATIONS.md` — local operational commands and expectations
-- `docs/CRUNCHYROLL_ADAPTER.md` — Rust adapter state/auth-material notes and current blocker
-- `docs/contracts/` — JSON schema for adapter payloads
-- `rust/crunchyroll_adapter/` — Rust adapter crate scaffold
+- `docs/contracts/` — JSON schema for snapshot payloads
 - `config/` — non-secret local config examples
 - `secrets/` — local-only secret material (ignored by git)
 - `examples/` — environment override examples
@@ -55,7 +51,7 @@ Safe defaults are relative to the repo root:
 
 Optional environment overrides are documented in `examples/env.example`.
 
-## Python worker scaffold
+## Python application
 
 ### Requirements
 
@@ -113,51 +109,24 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 
 - `status` prints resolved paths/config plus MAL and Crunchyroll secret/state presence
 - `config/settings.toml` can define path layout, MAL endpoint settings, Crunchyroll locale, and secret file locations
-- `validate-snapshot` checks adapter JSON shape and cross-reference sanity before ingestion work touches SQLite
+- `validate-snapshot` checks normalized Crunchyroll JSON shape and cross-reference sanity before ingestion work touches SQLite
 - `init` creates local directories and applies SQLite migrations
 - `mal-auth-url` generates a real PKCE pair plus MAL authorization URL
 - `mal-auth-login` starts a local callback listener bound to the configured host, exchanges the returned code for tokens, persists them under `secrets/`, and verifies the token with `GET /users/@me`
 - `mal-refresh` refreshes a persisted MAL token pair and writes updated token files back to `secrets/`
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
 - `crunchyroll-auth-login` uses local Crunchyroll username/password secrets to fetch a real refresh token + device id and stage them into `state/crunchyroll/<profile>/`; if optional `curl_cffi` support is installed, it uses browser-TLS impersonation to get through Crunchyroll's Cloudflare layer
-- `crunchyroll-fetch-snapshot` is now the practical live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, normalizes it into the JSON contract, and can write a snapshot file and/or ingest it directly
-- a real live run on this host now succeeds through the Python path and ingests into SQLite (`series_count=219`, `progress_count=4311`, `watchlist_count=10`)
-- `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
+- `crunchyroll-fetch-snapshot` is the live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, normalizes it into the JSON contract, and can write a snapshot file and/or ingest it directly
+- a real live run on this host succeeds through the Python path and ingests into SQLite (`series_count=219`, `progress_count=4311`, `watchlist_count=10`)
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses
 - `review-mappings` turns those candidates into an operator-facing review list, preserves already approved mappings, and can replace open `mapping_review` rows in `review_queue`
 - `list-mappings` shows the durable Crunchyroll -> MAL mappings already stored in SQLite
 - `approve-mapping` persists an explicit user-approved mapping into `mal_series_mapping`
-- `dry-run-sync` now prefers approved persisted mappings first, can optionally require approved mappings only, still only suggests forward-safe updates, and can replace open `sync_review` rows in `review_queue`
+- `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, only suggests forward-safe updates, and can replace open `sync_review` rows in `review_queue`
 - `list-review-queue` exposes the durable unresolved review backlog stored in SQLite
 - `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes approved mappings, only submits forward-safe status/episode updates, and only sends the fields it intends to change
 - `sync` remains a reserved umbrella entrypoint and points at the explicit review/apply commands
-
-## Rust adapter scaffold
-
-### Requirements
-
-- Rust `1.88.0` for the adapter crate
-- `rustup` recommended on the Orin; the repo pins the adapter locally with `rust/crunchyroll_adapter/rust-toolchain.toml`
-
-### Commands
-
-```bash
-cd rust/crunchyroll_adapter
-cargo run -- auth status
-cargo run -- auth save-refresh-token --refresh-token-file /path/to/refresh_token.txt [--device-id-file /path/to/device_id.txt]
-cargo run -- snapshot --contract-version 1.0
-```
-
-Current adapter behavior:
-- `auth status` reports the resolved adapter state paths plus refresh-token / device-id presence
-- `auth save-refresh-token` stages a local Crunchyroll refresh token (and optional device id) into the adapter state directory
-- the adapter has a concrete local state convention under `state/crunchyroll/<profile>/`
-- `snapshot` now attempts a real `crunchyroll-rs` refresh-token login when auth material is present
-- `snapshot` honestly returns `auth_material_missing`, `auth_failed`, or `ok` in `raw.status`
-- on success, the adapter fetches account/watch-history/watchlist data and normalizes it into the current JSON contract
-- direct credential login is supported by `crunchyroll-rs`, but on this host the practical live bootstrap path is currently Python-side `crunchyroll-auth-login` with optional `curl_cffi`; plain `requests` gets a Cloudflare 403 interstitial, while `curl_cffi` succeeds in minting a refresh token
-- the currently built Rust adapter still fails its follow-up refresh-token login on this host, so the remaining blocker looks transport/anti-bot related rather than missing credentials alone; see `docs/CRUNCHYROLL_ADAPTER.md`
 
 ## SQLite schema
 
@@ -172,7 +141,7 @@ Current tables:
 - `sync_runs`
 - `schema_migrations`
 
-This is enough to start read-only ingestion and later add mapping + review workflows without redesigning the repo layout.
+This is enough to support read-only ingestion, durable mapping review, guarded sync planning, and the first safe MAL apply path.
 
 ## JSON contract
 
@@ -183,8 +152,8 @@ See:
 - `docs/contracts/crunchyroll_snapshot.schema.json`
 
 Boundary rule:
-- Rust produces normalized provider snapshots
-- Python validates/persists them and owns all MAL-side decision making
+- the Python Crunchyroll fetch path produces normalized provider snapshots
+- the rest of the Python app validates, persists, maps, and decides MAL-side actions
 
 ## Security notes
 
@@ -195,8 +164,8 @@ Boundary rule:
 
 ## Planned architecture
 
+- Python Crunchyroll auth + live fetch path
 - Python orchestration worker
-- Rust Crunchyroll adapter (`crunchyroll-rs` later)
 - SQLite state database
 - MAL official OAuth/API client
 - Safe dry-run sync before live writes

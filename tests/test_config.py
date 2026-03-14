@@ -24,10 +24,6 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.state_dir, (root / "state").resolve())
             self.assertEqual(config.cache_dir, (root / "cache").resolve())
             self.assertEqual(config.db_path, (root / "data" / "mal_updater.sqlite3").resolve())
-            self.assertEqual(
-                config.crunchyroll_adapter_bin,
-                (root / "rust" / "crunchyroll_adapter" / "target" / "debug" / "crunchyroll-adapter").resolve(),
-            )
             self.assertEqual(config.mal.bind_host, "0.0.0.0")
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.1:8765/callback")
             self.assertEqual(secrets.client_id_path, (root / "secrets" / "mal_client_id.txt").resolve())
@@ -49,7 +45,6 @@ class ConfigLoadingTests(unittest.TestCase):
                     state_dir = "../var/state"
                     cache_dir = "../var/cache"
                     db_path = "../var/custom.sqlite3"
-                    crunchyroll_adapter_bin = "../bin/crunchyroll-adapter"
 
                     [mal]
                     bind_host = "127.0.0.1"
@@ -75,7 +70,6 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.state_dir, (root / "var" / "state").resolve())
             self.assertEqual(config.cache_dir, (root / "var" / "cache").resolve())
             self.assertEqual(config.db_path, (root / "var" / "custom.sqlite3").resolve())
-            self.assertEqual(config.crunchyroll_adapter_bin, (root / "bin" / "crunchyroll-adapter").resolve())
             self.assertEqual(config.mal.bind_host, "127.0.0.1")
             self.assertEqual(config.mal.redirect_uri, "http://192.168.1.50:9999/callback")
             self.assertEqual(secrets.client_id_path, (root / "private" / "ids" / "client-id.txt").resolve())

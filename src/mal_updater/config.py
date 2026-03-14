@@ -23,7 +23,6 @@ DEFAULT_MAL_CLIENT_ID_FILE = "mal_client_id.txt"
 DEFAULT_MAL_CLIENT_SECRET_FILE = "mal_client_secret.txt"
 DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
 DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
-DEFAULT_CRUNCHYROLL_ADAPTER_BIN = Path("rust") / "crunchyroll_adapter" / "target" / "debug" / "crunchyroll-adapter"
 DEFAULT_DB_FILE = "mal_updater.sqlite3"
 
 
@@ -68,7 +67,6 @@ class AppConfig:
     state_dir: Path
     cache_dir: Path
     db_path: Path
-    crunchyroll_adapter_bin: Path
     secret_files: dict[str, Any] = field(default_factory=dict)
     completion_threshold: float = DEFAULT_COMPLETION_THRESHOLD
     contract_version: str = DEFAULT_CONTRACT_VERSION
@@ -252,14 +250,6 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         base_dir=settings_dir,
         default=data_dir / DEFAULT_DB_FILE,
     )
-    crunchyroll_adapter_bin = _resolve_path_setting(
-        "MAL_UPDATER_CRUNCHYROLL_ADAPTER",
-        paths_section,
-        "crunchyroll_adapter_bin",
-        base_dir=settings_dir,
-        default=root / DEFAULT_CRUNCHYROLL_ADAPTER_BIN,
-    )
-
     app_config = AppConfig(
         project_root=root,
         settings_path=settings_path,
@@ -269,7 +259,6 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         state_dir=state_dir,
         cache_dir=cache_dir,
         db_path=db_path,
-        crunchyroll_adapter_bin=crunchyroll_adapter_bin,
         secret_files=secret_files_section,
         completion_threshold=float(os.getenv("MAL_UPDATER_COMPLETION_THRESHOLD", _get_float(settings, "completion_threshold", DEFAULT_COMPLETION_THRESHOLD))),
         contract_version=os.getenv("MAL_UPDATER_CONTRACT_VERSION", _get_str(settings, "contract_version", DEFAULT_CONTRACT_VERSION)),

@@ -32,7 +32,7 @@ Nothing here fakes Crunchyroll ingestion or live MAL writes.
 The loader now understands all current non-secret knobs from `config/settings.toml`:
 
 - top-level: `completion_threshold`, `contract_version`
-- `[paths]`: config/secrets/data/state/cache dirs, `db_path`, `crunchyroll_adapter_bin`
+- `[paths]`: config/secrets/data/state/cache dirs and `db_path`
 - `[mal]`: MAL API/auth endpoints plus redirect host/port
 - `[crunchyroll]`: locale
 - `[secret_files]`: filenames or paths for MAL client/token files
@@ -51,7 +51,7 @@ This is the clean entrypoint used by the CLI and should stay the main schema-ini
 
 ## Snapshot validation
 
-Use the CLI to validate a Crunchyroll adapter payload before ingestion work lands:
+Use the CLI to validate a normalized Crunchyroll snapshot payload before ingestion work lands:
 
 ```bash
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
@@ -68,7 +68,7 @@ Current validation is Python-side and intentionally strict:
 
 ## Snapshot ingestion
 
-Use the CLI to validate and persist a normalized adapter snapshot:
+Use the CLI to validate and persist a normalized Crunchyroll snapshot:
 
 ```bash
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
@@ -133,7 +133,7 @@ Notes:
 
 ## Live Crunchyroll fetch path
 
-The fastest honest live path is now Python-side rather than Rust-side.
+The live Crunchyroll path is Python-side.
 
 Use:
 
@@ -153,4 +153,3 @@ Behavior:
 
 - credits-skipped completion handling so near-finished Crunchyroll state can safely mark MAL as completed without overclaiming
 - missing-data-only merge rules / richer field policy if score/start/finish dates are ever brought into scope
-- optional future Rust transport recovery if it becomes worth the effort

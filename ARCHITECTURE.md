@@ -4,7 +4,7 @@
 
 Create a local Orin-hosted integration that:
 - reads Crunchyroll watch history and watchlist
-- syncs missing progress/status/date/score data into MyAnimeList
+- syncs missing progress/status data into MyAnimeList
 - never overwrites meaningful existing MAL data automatically
 - records ambiguity/conflicts for user review
 - later generates tailored anime recommendations
@@ -16,12 +16,15 @@ Create a local Orin-hosted integration that:
 - **Missing-data first:** fill gaps, do not clobber existing MAL data
 - **Safety before automation:** ambiguous mappings or conflicts go to review queue
 - **Local-first:** run on the Orin, outbound-only
-- **Provider boundary:** Crunchyroll access is isolated behind a narrow adapter
+- **Python-only implementation:** Crunchyroll fetch, MAL sync logic, and persistence all live in one Python codebase
 - **Recommendation quality comes after sync trustworthiness**
 
 ## Stack
 
 ### Python owns
+- Crunchyroll credential bootstrap
+- Crunchyroll session refresh and live fetches
+- normalized snapshot generation
 - orchestration
 - sync policy
 - MAL OAuth + API client
@@ -30,12 +33,6 @@ Create a local Orin-hosted integration that:
 - review queue generation
 - recommendation engine
 - future OpenClaw skill integration
-
-### Rust owns
-- Crunchyroll adapter using `crunchyroll-rs`
-- login/session handling
-- fetching watchlist / history / progress metadata
-- outputting normalized JSON to Python
 
 ## Initial sync policy
 
@@ -48,8 +45,8 @@ MyAnimeList is the managed tracking layer.
 ### Allowed automatic writes (after dry-run phase)
 - watched episode count
 - status (`watching`, `completed`, etc.)
-- dates if confidently inferable
-- score from Crunchyroll rating if available and MAL score is missing
+- dates if confidently inferable later
+- score only if a future policy explicitly allows it and MAL score is missing
 
 ### Forbidden automatic writes
 - decreasing watched episode count
