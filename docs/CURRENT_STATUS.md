@@ -19,27 +19,36 @@
   - `refresh_token.txt` / optional `device_id.txt` conventions
   - `session.json` adapter-side state tracking
   - `auth status` and `auth save-refresh-token` commands
-  - `snapshot` now reports state-aware adapter metadata instead of a pure blind scaffold
+- Crunchyroll Rust toolchain blocker is cleared:
+  - user-local `rustup` toolchain `1.88.0` installed without sudo
+  - repo-local `rust-toolchain.toml` pins the adapter to the required toolchain
+  - `cargo build` now succeeds for the adapter on the Orin
+- the adapter now attempts real Crunchyroll refresh-token login via `crunchyroll-rs`
+- `snapshot` now honestly reports one of:
+  - `auth_material_missing`
+  - `auth_failed`
+  - `ok`
 
 ## Not implemented yet
 
-- real Crunchyroll login/session handling
-- real Crunchyroll snapshot fetching
+- fully verified live Crunchyroll snapshot against real staged credentials on this machine
+- stronger device-identifier persistence beyond the current `device_id.txt` + device-type hint path
 - title mapping to MAL IDs
 - dry-run MAL sync proposals
 - guarded live MAL writes
 - recommendation engine
 - OpenClaw skill wrapper for the integration
 
-## Current Crunchyroll blocker
+## Current Crunchyroll state
 
-The intended next Rust step is `crunchyroll-rs`, but the current host toolchain is too old for the relevant crate versions:
+The adapter is no longer blocked on Rust/Cargo. The next real dependency is now auth material:
 
-- host Rust/Cargo: `1.75.0`
-- current `crunchyroll-rs` path now requires newer Rust/Cargo (`edition = 2024`, recent releases declaring `rust_version` 1.85+)
+- a real staged Crunchyroll refresh token is required
+- a matching device id may also be required for successful refresh-token login
+- if login still fails, the next likely fix is storing the exact full device identifier used to mint the token
 
-That blocker was verified directly during implementation rather than assumed. See `docs/CRUNCHYROLL_ADAPTER.md` for the concrete notes.
+See `docs/CRUNCHYROLL_ADAPTER.md` for the concrete notes.
 
 ## Next practical milestone
 
-After a Rust toolchain upgrade, bind the staged adapter auth material to `crunchyroll-rs`, perform the first real Crunchyroll login, and push the first authenticated snapshot into the Python ingestion pipeline.
+Stage real Crunchyroll auth material, run the live adapter snapshot, and push the first authenticated snapshot into the Python ingestion pipeline.

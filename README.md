@@ -13,11 +13,11 @@ This repo now has an initial scaffold for:
 - MAL OAuth + API client scaffolding on the Python side
 
 What it does **not** do yet:
-- log into Crunchyroll
-- ingest real watch data from Crunchyroll
+- verify a successful live Crunchyroll login on this machine with real staged credentials
+- complete end-to-end Crunchyroll -> MAL sync behavior
 - write sync updates back to MAL
 
-That line is intentional. The scaffold is real; the sync functionality is not being faked.
+That line is intentional. The scaffold is real, and the remaining live integration gaps are not being faked.
 
 ## Repository layout
 
@@ -104,7 +104,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### Requirements
 
-- Rust stable toolchain
+- Rust `1.88.0` for the adapter crate
+- `rustup` recommended on the Orin; the repo pins the adapter locally with `rust/crunchyroll_adapter/rust-toolchain.toml`
 
 ### Commands
 
@@ -116,11 +117,13 @@ cargo run -- snapshot --contract-version 1.0
 ```
 
 Current adapter behavior:
-- `snapshot` emits a valid `1.0` JSON payload plus adapter-state metadata about staged Crunchyroll auth material
 - `auth status` reports the resolved adapter state paths plus refresh-token / device-id presence
 - `auth save-refresh-token` stages a local Crunchyroll refresh token (and optional device id) into the adapter state directory
-- the adapter now has a concrete local state convention under `state/crunchyroll/<profile>/`
-- live Crunchyroll login/fetch is still not claimed yet because the intended `crunchyroll-rs` path is currently blocked by the host Rust toolchain; see `docs/CRUNCHYROLL_ADAPTER.md`
+- the adapter has a concrete local state convention under `state/crunchyroll/<profile>/`
+- `snapshot` now attempts a real `crunchyroll-rs` refresh-token login when auth material is present
+- `snapshot` honestly returns `auth_material_missing`, `auth_failed`, or `ok` in `raw.status`
+- on success, the adapter fetches account/watch-history/watchlist data and normalizes it into the current JSON contract
+- real success still depends on staging valid Crunchyroll auth material that matches Crunchyroll's device-identity expectations; see `docs/CRUNCHYROLL_ADAPTER.md`
 
 ## SQLite schema
 
