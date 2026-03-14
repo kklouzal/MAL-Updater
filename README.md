@@ -65,6 +65,7 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-auth-url
 PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
 ```
@@ -73,6 +74,8 @@ Or install editable and use the console script:
 
 ```bash
 pip install -e .
+# optional but currently practical for Crunchyroll auth on this host:
+pip install -e '.[crunchyroll]'
 mal-updater status
 mal-updater init
 mal-updater mal-auth-url
@@ -88,7 +91,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### Current behavior
 
-- `status` prints resolved paths/config plus MAL secret presence
+- `status` prints resolved paths/config plus MAL and Crunchyroll secret/state presence
 - `config/settings.toml` can define path layout, MAL endpoint settings, Crunchyroll locale, and secret file locations
 - `validate-snapshot` checks adapter JSON shape and cross-reference sanity before ingestion work touches SQLite
 - `init` creates local directories and applies SQLite migrations
@@ -96,6 +99,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - `mal-auth-login` starts a local callback listener bound to the configured host, exchanges the returned code for tokens, persists them under `secrets/`, and verifies the token with `GET /users/@me`
 - `mal-refresh` refreshes a persisted MAL token pair and writes updated token files back to `secrets/`
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
+- `crunchyroll-auth-login` uses local Crunchyroll username/password secrets to fetch a real refresh token + device id and stage them into `state/crunchyroll/<profile>/`; if optional `curl_cffi` support is installed, it uses browser-TLS impersonation to get through Crunchyroll's Cloudflare layer
 - `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `sync` exists as a reserved entrypoint and exits with a clear "not implemented yet" message
@@ -123,7 +127,8 @@ Current adapter behavior:
 - `snapshot` now attempts a real `crunchyroll-rs` refresh-token login when auth material is present
 - `snapshot` honestly returns `auth_material_missing`, `auth_failed`, or `ok` in `raw.status`
 - on success, the adapter fetches account/watch-history/watchlist data and normalizes it into the current JSON contract
-- real success still depends on staging valid Crunchyroll auth material that matches Crunchyroll's device-identity expectations; see `docs/CRUNCHYROLL_ADAPTER.md`
+- direct credential login is supported by `crunchyroll-rs`, but on this host the practical live bootstrap path is currently Python-side `crunchyroll-auth-login` with optional `curl_cffi`; plain `requests` gets a Cloudflare 403 interstitial, while `curl_cffi` succeeds in minting a refresh token
+- the currently built Rust adapter still fails its follow-up refresh-token login on this host, so the remaining blocker looks transport/anti-bot related rather than missing credentials alone; see `docs/CRUNCHYROLL_ADAPTER.md`
 
 ## SQLite schema
 

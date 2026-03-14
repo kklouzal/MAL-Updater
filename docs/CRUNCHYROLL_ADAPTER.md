@@ -11,6 +11,7 @@ The Rust adapter now has a real local state/auth-material convention and a real 
 - optional `device_id.txt` staging is supported alongside the refresh token
 - `snapshot` now attempts a live `crunchyroll-rs` refresh-token login when auth material is present
 - session metadata is tracked in `session.json`
+- the Python worker now also has `crunchyroll-auth-login`, which can mint and stage adapter-compatible auth material from local username/password secrets
 
 Default state layout relative to the adapter working directory:
 
@@ -33,6 +34,11 @@ That path is now in place and `cargo build` succeeds for the adapter with the ne
 
 ## Current live behavior
 
+Two important live facts are now verified on this host:
+
+- `crunchyroll-rs` really does support direct credential login (`login_with_credentials`), so credential-based programmatic auth is not imaginary
+- Crunchyroll currently puts a Cloudflare interstitial in front of plain Python `requests` to `auth/v1/token`, but browser-TLS impersonation via optional `curl_cffi` succeeds for both password-grant login and refresh-token exchange
+
 `snapshot` now has three honest modes:
 
 1. `auth_material_missing`
@@ -47,22 +53,29 @@ That path is now in place and `cargo build` succeeds for the adapter with the ne
 
 ## Important current limitation
 
-For refresh-token login, Crunchyroll can be picky about the device identity used when the token was created.
+The next blocker no longer looks like missing credentials alone.
 
-Right now the adapter persists:
+What was observed directly:
+
+- Python `crunchyroll-auth-login` can mint a real refresh token and stage it locally
+- the same staged refresh token successfully refreshes again when sent through Python `curl_cffi` impersonated transport
+- the current Rust adapter still fails the refresh-token login path with `invalid_grant`
+
+That points more strongly at transport / anti-bot behavior on the current Rust path than at simple device-id staging gaps.
+
+The adapter currently persists:
 
 - refresh token
-- optional device id
+- device id
 - a device-type hint in `session.json` (defaulting to `ANDROIDTV`)
 
-That is enough to make real login attempts, but a token created with a different device identity may still fail until the adapter stores the exact full device identifier more explicitly.
-
-So the adapter now does **real** login attempts, but success still depends on the staged auth material matching what Crunchyroll expects.
+That is enough to bootstrap honest auth material, but not yet enough to guarantee the Rust-side transport is accepted by Crunchyroll on this host.
 
 ## Next step
 
-1. stage a real Crunchyroll refresh token (and matching device id if available)
-2. run `cargo run -- snapshot --contract-version 1.0`
-3. inspect whether login succeeds or an honest `auth_failed` reason is returned
-4. if needed, extend staged device-identifier handling beyond `device_id.txt`
-5. once a real snapshot exists, push it through Python ingestion and tighten normalization details
+1. keep the new Python credential bootstrap path as the honest way to mint/stage refresh-token auth material
+2. either:
+   - move Crunchyroll fetch/snapshot work onto the Python impersonated transport, or
+   - replace/augment the Rust HTTP transport with something impersonation-capable
+3. rerun the live snapshot once the transport layer is fixed
+4. once a real snapshot exists, push it through Python ingestion and tighten normalization details

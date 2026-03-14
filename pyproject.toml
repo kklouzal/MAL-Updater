@@ -15,6 +15,9 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = []
+crunchyroll = [
+  "curl_cffi>=0.14.0"
+]
 
 [project.scripts]
 mal-updater = "mal_updater.cli:main"

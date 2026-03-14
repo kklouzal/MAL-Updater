@@ -7,6 +7,12 @@ from pathlib import Path
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
 from .config import ensure_directories, load_config, load_mal_secrets
+from .crunchyroll_auth import (
+    CrunchyrollAuthError,
+    crunchyroll_login_with_credentials,
+    load_crunchyroll_credentials,
+    resolve_crunchyroll_state_paths,
+)
 from .db import bootstrap_database
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
@@ -25,6 +31,8 @@ def _cmd_init(project_root: Path | None) -> int:
 def _cmd_status(project_root: Path | None) -> int:
     config = load_config(project_root)
     secrets = load_mal_secrets(config)
+    crunchyroll_credentials = load_crunchyroll_credentials(config)
+    crunchyroll_state = resolve_crunchyroll_state_paths(config)
     print(f"project_root={config.project_root}")
     print(f"settings_path={config.settings_path}")
     print(f"config_dir={config.config_dir}")
@@ -39,8 +47,19 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.base_url={config.mal.base_url}")
     print(f"mal.auth_url={config.mal.auth_url}")
     print(f"mal.token_url={config.mal.token_url}")
+    print(f"mal.bind_host={config.mal.bind_host}")
     print(f"mal.redirect_uri={config.mal.redirect_uri}")
     print(f"crunchyroll.locale={config.crunchyroll.locale}")
+    print(f"crunchyroll.username_present={bool(crunchyroll_credentials.username)}")
+    print(f"crunchyroll.password_present={bool(crunchyroll_credentials.password)}")
+    print(f"crunchyroll.username_path={crunchyroll_credentials.username_path}")
+    print(f"crunchyroll.password_path={crunchyroll_credentials.password_path}")
+    print(f"crunchyroll.state_root={crunchyroll_state.root}")
+    print(f"crunchyroll.refresh_token_path={crunchyroll_state.refresh_token_path}")
+    print(f"crunchyroll.device_id_path={crunchyroll_state.device_id_path}")
+    print(f"crunchyroll.session_state_path={crunchyroll_state.session_state_path}")
+    print(f"crunchyroll.refresh_token_present={crunchyroll_state.refresh_token_path.exists()}")
+    print(f"crunchyroll.device_id_present={crunchyroll_state.device_id_path.exists()}")
     print(f"mal.client_id_present={bool(secrets.client_id)}")
     print(f"mal.client_secret_present={bool(secrets.client_secret)}")
     print(f"mal.access_token_present={bool(secrets.access_token)}")
@@ -180,6 +199,32 @@ def _cmd_mal_whoami(project_root: Path | None) -> int:
     return 0
 
 
+def _cmd_crunchyroll_auth_login(project_root: Path | None, profile: str, no_verify: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    try:
+        result = crunchyroll_login_with_credentials(
+            config,
+            profile=profile,
+            verify_account=not no_verify,
+        )
+    except CrunchyrollAuthError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"Staged Crunchyroll refresh token to {result.refresh_token_path}")
+    print(f"Staged Crunchyroll device id to {result.device_id_path}")
+    print(f"Updated session state at {result.session_state_path}")
+    if result.account_id:
+        print(f"Crunchyroll account_id={result.account_id}")
+    if result.account_email:
+        print(f"Crunchyroll account_email={result.account_email}")
+    print(f"profile={result.profile}")
+    print(f"locale={result.locale}")
+    print(f"device_type={result.device_type}")
+    return 0
+
+
 def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
     config = load_config(project_root)
     if snapshot_path is None:
@@ -229,6 +274,12 @@ def build_parser() -> argparse.ArgumentParser:
     mal_refresh = subparsers.add_parser("mal-refresh", help="Refresh the persisted MAL access token using the local refresh token")
     mal_refresh.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /users/@me token check")
     subparsers.add_parser("mal-whoami", help="Call MAL GET /users/@me with the currently configured access token")
+    crunchyroll_auth_login = subparsers.add_parser(
+        "crunchyroll-auth-login",
+        help="Use local Crunchyroll username/password secrets to stage adapter refresh-token auth material",
+    )
+    crunchyroll_auth_login.add_argument("--profile", default="default", help="Crunchyroll adapter profile name")
+    crunchyroll_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /accounts/v1/me token check")
     validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a Crunchyroll snapshot JSON payload")
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a Crunchyroll snapshot into SQLite")
@@ -252,6 +303,8 @@ def main() -> int:
         return _cmd_mal_refresh(args.project_root, verify_whoami=not args.no_verify)
     if args.command == "mal-whoami":
         return _cmd_mal_whoami(args.project_root)
+    if args.command == "crunchyroll-auth-login":
+        return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
     if args.command == "validate-snapshot":
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":

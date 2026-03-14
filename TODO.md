@@ -13,9 +13,10 @@
 - [x] Integrate `crunchyroll-rs` into the Rust adapter
 - [x] Add adapter-side Crunchyroll auth-material/state-dir conventions and CLI staging commands
 - [x] Document the current Crunchyroll adapter auth-material flow and toolchain blocker
-- [ ] Verify the first real Crunchyroll refresh-token login + snapshot on this machine with staged credentials
-- [ ] Tighten device-identifier staging if Crunchyroll rejects the current refresh-token/device-id path
-- [ ] Document the live Crunchyroll adapter auth/session flow once the first real implementation exists
+- [x] Verify a real Crunchyroll credential login + refresh-token bootstrap on this machine with staged credentials
+- [ ] Get the first real Crunchyroll snapshot on this machine past the current Rust-side transport / Cloudflare blocker
+- [ ] Decide whether to finish Crunchyroll fetches in Python (`curl_cffi` transport) or to rework the Rust HTTP client path
+- [ ] Document the live Crunchyroll adapter auth/session flow once the first real snapshot implementation exists
 - [x] Implement local MAL loopback OAuth flow + token persistence
 - [ ] Register MAL app / complete live OAuth with real credentials
 
