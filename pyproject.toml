@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mal-updater"
+version = "0.1.0"
+description = "Local Crunchyroll -> MyAnimeList sync worker"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "MAL-Updater contributors" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+mal-updater = "mal_updater.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

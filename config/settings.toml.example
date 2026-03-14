@@ -1,0 +1,13 @@
+# Non-secret local configuration.
+# Copy to config/settings.toml and adjust as needed.
+
+completion_threshold = 0.90
+contract_version = "1.0"
+
+[mal]
+base_url = "https://api.myanimelist.net/v2"
+redirect_host = "127.0.0.1"
+redirect_port = 8765
+
+[crunchyroll]
+locale = "en-US"

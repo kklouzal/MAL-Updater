@@ -1,11 +1,11 @@
 # Implementation Plan
 
 ## Phase 0 - Repo / project setup
-- Python project layout
-- Rust adapter layout
-- shared JSON contract between Rust and Python
-- config / secrets layout
-- SQLite bootstrap
+- [x] Python project layout
+- [x] Rust adapter layout
+- [x] shared JSON contract between Rust and Python
+- [x] config / secrets layout
+- [x] SQLite bootstrap
 
 ## Phase 1 - Feasibility spike
 - MAL OAuth works locally

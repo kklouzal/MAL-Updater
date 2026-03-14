@@ -5,7 +5,9 @@ __pycache__/
 *.sqlite3
 *.db
 *.log
-secrets/
+config/settings.toml
+secrets/*
+!secrets/README.md
 data/
 state/
 cache/
