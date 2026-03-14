@@ -13,13 +13,15 @@ This repo now has an initial scaffold for:
 - MAL OAuth + API client scaffolding on the Python side
 
 What it does **not** do yet:
-- complete end-to-end Crunchyroll -> MAL sync behavior
-- write sync updates back to MAL
-- blindly auto-resolve mappings or perform live MAL mutations
+- complete end-to-end unattended Crunchyroll -> MAL sync behavior
+- auto-resolve ambiguous mappings
+- perform reckless or broad MAL mutations
 
 What it can do now beyond ingestion:
 - search MAL for conservative mapping candidates from the ingested Crunchyroll SQLite dataset
-- generate guarded read-only dry-run sync proposals
+- persist unresolved mapping/sync review items into `review_queue`
+- generate guarded dry-run sync proposals
+- run a first live MAL executor path that only uses approved mappings and only applies forward-safe updates
 - explicitly skip any proposal that would decrease MAL progress or downgrade a completed entry
 
 That line is intentional. The scaffold is real, and the remaining live integration gaps are not being faked.
@@ -76,11 +78,14 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
-PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 ```
 
 Or install editable and use the console script:
@@ -120,11 +125,13 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses
-- `review-mappings` turns those candidates into an operator-facing review list and preserves already approved mappings instead of recomputing them every time
+- `review-mappings` turns those candidates into an operator-facing review list, preserves already approved mappings, and can replace open `mapping_review` rows in `review_queue`
 - `list-mappings` shows the durable Crunchyroll -> MAL mappings already stored in SQLite
 - `approve-mapping` persists an explicit user-approved mapping into `mal_series_mapping`
-- `dry-run-sync` now prefers approved persisted mappings first, can optionally require approved mappings only, and still only suggests forward-safe updates
-- `sync` exists as a reserved entrypoint and exits with a clear message pointing at `dry-run-sync`; live MAL writes are still disabled on purpose
+- `dry-run-sync` now prefers approved persisted mappings first, can optionally require approved mappings only, still only suggests forward-safe updates, and can replace open `sync_review` rows in `review_queue`
+- `list-review-queue` exposes the durable unresolved review backlog stored in SQLite
+- `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes approved mappings, only submits forward-safe status/episode updates, and only sends the fields it intends to change
+- `sync` remains a reserved umbrella entrypoint and points at the explicit review/apply commands
 
 ## Rust adapter scaffold
 

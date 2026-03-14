@@ -55,19 +55,28 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
 ```
 
-### Build a mapping review queue and preserve approved mappings
+### Build and persist a mapping review queue
 ```bash
 cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
 ```
 
-### Generate guarded read-only sync proposals
+### Generate and persist guarded sync review results
 ```bash
 cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type sync_review
+```
+
+### Revalidate and apply approved safe MAL updates
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 ```
 
 Use the stdlib `unittest` invocation above as the baseline Python test command. Do not assume `pytest` is installed on the host.

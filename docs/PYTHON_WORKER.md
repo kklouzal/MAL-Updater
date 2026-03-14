@@ -90,24 +90,31 @@ Use:
 
 ```bash
 PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
-PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type sync_review
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 ```
 
 Current behavior:
 - `map-series` reads recently seen Crunchyroll series from SQLite and searches MAL for candidate matches
 - title scoring is intentionally conservative and reports `exact`, `strong`, `ambiguous`, `weak`, or `no_candidates`
-- `review-mappings` produces an approval queue: approved mappings are preserved, strong matches are marked `ready_for_approval`, and ambiguous/weak cases stay review-only
+- `review-mappings` produces an approval queue: approved mappings are preserved, strong matches are marked `ready_for_approval`, ambiguous/weak cases stay review-only, and `--persist-review-queue` replaces open `mapping_review` rows in SQLite with the unresolved items from the latest pass
 - `approve-mapping` persists an explicit Crunchyroll -> MAL choice into `mal_series_mapping`
 - `list-mappings` shows the durable mapping cache already saved in SQLite
 - `dry-run-sync` prefers approved persisted mappings before doing fresh search work
-- `dry-run-sync --approved-mappings-only` is the safe future-executor gate: it refuses to plan anything that lacks explicit approval
+- `dry-run-sync --approved-mappings-only` is the executor safety gate: it refuses to plan anything that lacks explicit approval
+- `dry-run-sync --persist-review-queue` replaces open `sync_review` rows in SQLite with the latest non-actionable review/skip items
+- `list-review-queue` surfaces the durable review backlog from `review_queue`
 - dry-run planning only suggests forward-safe list changes (`watching` / `completed` / `plan_to_watch` with episode counts)
-- it refuses to decrease MAL episode counts or downgrade a `completed` MAL entry
-- live MAL writes are still out of scope for this pass
+- `apply-sync` re-fetches live MAL state, only considers approved mappings, and only writes `status` / `num_watched_episodes` when the proposal is still forward-safe
+- the planner/executor refuses to decrease MAL episode counts or downgrade a `completed` MAL entry
+- meaningful existing MAL metadata is preserved because the executor only submits the fields it explicitly intends to change
 
 ## MAL auth commands
 
@@ -144,6 +151,6 @@ Behavior:
 
 ## Near-term next steps
 
-- conflict/review queue generation from ingestion + mapping passes
-- MAL-side write planning/dry-run sync pipeline
+- credits-skipped completion handling so near-finished Crunchyroll state can safely mark MAL as completed without overclaiming
+- missing-data-only merge rules / richer field policy if score/start/finish dates are ever brought into scope
 - optional future Rust transport recovery if it becomes worth the effort

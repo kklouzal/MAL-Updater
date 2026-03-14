@@ -46,8 +46,7 @@
 ## Not implemented yet
 
 - a transport path for the Rust adapter that survives Crunchyroll's current Cloudflare/anti-bot checks on this host
-- live MAL writes
-- persisted `review_queue` rows for mapping/sync review items (the first approval workflow is now implemented, but review results are still emitted directly rather than stored in `review_queue`)
+- unattended/full-fidelity MAL sync beyond the first guarded executor
 - recommendation engine
 - OpenClaw skill wrapper for the integration
 
@@ -61,10 +60,18 @@
   - `approve-mapping`
   - `dry-run-sync`
 - `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
-- `review-mappings` now provides the first durable operator workflow: preserved approved mappings stay fixed, strong suggestions are surfaced for explicit approval, and weaker cases remain review-only
+- `review-mappings` now provides the first durable operator workflow: preserved approved mappings stay fixed, strong suggestions are surfaced for explicit approval, weaker cases remain review-only, and unresolved items can now be persisted into `review_queue`
 - `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
-- `dry-run-sync` now prefers approved persisted mappings before falling back to live MAL search, and `--approved-mappings-only` gives a future-safe gate for eventual write execution
-- the planner explicitly refuses to:
+- `dry-run-sync` now prefers approved persisted mappings before falling back to live MAL search, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can now be persisted into `review_queue`
+- `list-review-queue` exposes the durable backlog from SQLite for operator follow-up
+- `apply-sync` is now the first guarded live-write path:
+  - only consumes user-approved mappings
+  - revalidates live MAL state immediately before acting
+  - only applies proposals that remain forward-safe
+  - never decreases MAL watched-episode counts
+  - never downgrades a `completed` MAL entry
+  - only sends the status / episode fields it intends to change, so meaningful existing MAL metadata is left alone
+- the planner/executor explicitly refuses to:
   - decrease MAL watched-episode counts
   - downgrade a `completed` MAL entry
   - auto-act on ambiguous mappings
@@ -92,4 +99,4 @@ See `docs/CRUNCHYROLL_ADAPTER.md` for the concrete notes.
 
 ## Next practical milestone
 
-The shortest path is now clear: keep using the proven Python impersonated transport for live Crunchyroll fetches, and treat the Rust adapter as a secondary/future path until its transport is fixed. The next milestone is MAL mapping + guarded write planning on top of the now-live local Crunchyroll dataset.
+The shortest path is now clear: keep using the proven Python impersonated transport for live Crunchyroll fetches, and treat the Rust adapter as a secondary/future path until its transport is fixed. The next milestone is to harden the guarded MAL executor further (credits-skipped completion handling, missing-data-only merge policy, and better review resolution UX) on top of the now-live local Crunchyroll dataset.

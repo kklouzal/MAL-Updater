@@ -130,6 +130,32 @@ class MalClient:
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
 
+    def update_my_list_status(self, anime_id: int, *, status: str, num_watched_episodes: int) -> dict[str, Any]:
+        form = {
+            "status": status,
+            "num_watched_episodes": str(int(num_watched_episodes)),
+        }
+        payload = urlencode(form).encode("utf-8")
+        request = Request(
+            f"{self.config.mal.base_url}/anime/{anime_id}/my_list_status",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.secrets.access_token}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            method="PUT",
+        )
+        try:
+            with urlopen(request) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else {"status": status, "num_episodes_watched": num_watched_episodes}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise MalApiError(f"MAL API update my_list_status failed for anime_id={anime_id}: HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise MalApiError(f"MAL API update my_list_status failed for anime_id={anime_id}: {exc.reason}") from exc
+
     def _get_json(self, path_or_url: str, *, headers: dict[str, str], error_context: str) -> dict[str, Any]:
         url = path_or_url if path_or_url.startswith("http") else f"{self.config.mal.base_url}{path_or_url}"
         request = Request(url, headers=headers, method="GET")

@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import MalSecrets, load_config
-from mal_updater.db import list_series_mappings, upsert_series_mapping
+from mal_updater.db import list_review_queue_entries, list_series_mappings, upsert_series_mapping
 from mal_updater.ingestion import ingest_snapshot_payload
 from mal_updater.mal_client import MalClient
 from mal_updater.mapping import SeriesMappingInput, map_series, normalize_title
-from mal_updater.sync_planner import build_dry_run_sync_plan, build_mapping_review
+from mal_updater.sync_planner import (
+    build_dry_run_sync_plan,
+    build_mapping_review,
+    execute_approved_sync,
+    persist_mapping_review_queue,
+    persist_sync_review_queue,
+)
 from tests.test_validation_ingestion import sample_snapshot
 
 
@@ -283,6 +290,197 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(len(proposals), 1)
         self.assertEqual(proposals[0].decision, "review")
         self.assertTrue(any(reason == "approved_mappings_only_enabled" for reason in proposals[0].reasons))
+
+    def test_persist_mapping_review_queue_only_keeps_unresolved_items(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                items = build_mapping_review(config, limit=5, mapping_limit=3)
+            persist_mapping_review_queue(config, items)
+            rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].severity, "error")
+        self.assertEqual(rows[0].payload["decision"], "needs_manual_match")
+
+    def test_persist_sync_review_queue_keeps_review_and_skip_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["completion_ratio"] = 0.95
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+            persist_sync_review_queue(config, proposals)
+            rows = list_review_queue_entries(config.db_path, status="open", issue_type="sync_review")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].payload["decision"], "skip")
+
+    def test_execute_approved_sync_dry_run_only_targets_approved_safe_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 4
+            payload["progress"][0]["completion_ratio"] = 0.95
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            upsert_series_mapping(
+                config.db_path,
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                mal_anime_id=888,
+                confidence=1.0,
+                mapping_source="user_approved",
+                approved_by_user=True,
+                notes=None,
+            )
+
+            with patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 888,
+                    "title": "Approved Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "watching", "num_episodes_watched": 2, "score": 9},
+                },
+            ), patch.object(MalClient, "update_my_list_status", side_effect=AssertionError("dry-run should not write")):
+                results = execute_approved_sync(config, limit=5, dry_run=True)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].applied)
+        self.assertEqual(results[0].proposal_decision, "propose_update")
+        self.assertEqual(results[0].requested_status, {"status": "watching", "num_watched_episodes": 4})
+        self.assertIn("executor_dry_run", results[0].reasons)
+
+    def test_execute_approved_sync_performs_live_write_when_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 4
+            payload["progress"][0]["completion_ratio"] = 0.95
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            upsert_series_mapping(
+                config.db_path,
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                mal_anime_id=888,
+                confidence=1.0,
+                mapping_source="user_approved",
+                approved_by_user=True,
+                notes=None,
+            )
+
+            with patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 888,
+                    "title": "Approved Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "watching", "num_episodes_watched": 2, "score": 9},
+                },
+            ), patch.object(
+                MalClient,
+                "update_my_list_status",
+                return_value={"status": "watching", "num_episodes_watched": 4, "score": 9},
+            ) as update_mock:
+                results = execute_approved_sync(config, limit=5, dry_run=False)
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].applied)
+        update_mock.assert_called_once_with(888, status="watching", num_watched_episodes=4)
+        self.assertEqual(results[0].response_status["score"], 9)
+
+    def test_execute_approved_sync_skips_non_forward_safe_completed_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 3
+            payload["progress"][0]["completion_ratio"] = 0.95
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            upsert_series_mapping(
+                config.db_path,
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                mal_anime_id=888,
+                confidence=1.0,
+                mapping_source="user_approved",
+                approved_by_user=True,
+                notes=None,
+            )
+
+            with patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 888,
+                    "title": "Approved Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+                },
+            ), patch.object(MalClient, "update_my_list_status", side_effect=AssertionError("unsafe proposal should not write")):
+                results = execute_approved_sync(config, limit=5, dry_run=False)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].applied)
+        self.assertEqual(results[0].proposal_decision, "skip")
+        self.assertTrue(any("refusing_to_decrease_mal_progress" in reason or "refusing_to_downgrade_completed_mal_entry" in reason for reason in results[0].reasons))
 
 
 if __name__ == "__main__":

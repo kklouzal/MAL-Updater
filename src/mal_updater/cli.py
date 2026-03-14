@@ -19,11 +19,18 @@ from .crunchyroll_snapshot import (
     snapshot_to_dict,
     write_snapshot_file,
 )
-from .db import bootstrap_database, list_series_mappings, upsert_series_mapping
+from .db import bootstrap_database, list_review_queue_entries, list_series_mappings, upsert_series_mapping
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series
-from .sync_planner import build_dry_run_sync_plan, build_mapping_review, load_provider_series_states
+from .sync_planner import (
+    build_dry_run_sync_plan,
+    build_mapping_review,
+    execute_approved_sync,
+    load_provider_series_states,
+    persist_mapping_review_queue,
+    persist_sync_review_queue,
+)
 from .validation import SnapshotValidationError, validate_snapshot_payload
 
 
@@ -234,7 +241,7 @@ def _cmd_crunchyroll_auth_login(project_root: Path | None, profile: str, no_veri
 
 
 def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
-    config = load_config(project_root)
+    load_config(project_root)
     if snapshot_path is None:
         payload = json.load(sys.stdin)
         source = "stdin"
@@ -292,17 +299,21 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
     client = MalClient(config, load_mal_secrets(config))
     results = []
     for state in states:
-        mapping = map_series(
-            client,
-            SeriesMappingInput(
-                provider=state.provider,
-                provider_series_id=state.provider_series_id,
-                title=state.title,
-                season_title=state.season_title,
-                season_number=state.season_number,
-            ),
-            limit=mapping_limit,
-        )
+        try:
+            mapping = map_series(
+                client,
+                SeriesMappingInput(
+                    provider=state.provider,
+                    provider_series_id=state.provider_series_id,
+                    title=state.title,
+                    season_title=state.season_title,
+                    season_number=state.season_number,
+                ),
+                limit=mapping_limit,
+            )
+        except MalApiError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         results.append(
             {
                 "provider_series_id": state.provider_series_id,
@@ -336,15 +347,26 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
     return 0
 
 
-def _cmd_review_mappings(project_root: Path | None, limit: int, mapping_limit: int) -> int:
+def _cmd_review_mappings(project_root: Path | None, limit: int, mapping_limit: int, persist_queue: bool) -> int:
     config = load_config(project_root)
-    items = build_mapping_review(config, limit=limit, mapping_limit=mapping_limit)
-    print(json.dumps([item.as_dict() for item in items], indent=2))
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    try:
+        items = build_mapping_review(config, limit=limit, mapping_limit=mapping_limit)
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    payload: dict[str, object] = {"items": [item.as_dict() for item in items]}
+    if persist_queue:
+        payload["review_queue"] = persist_mapping_review_queue(config, items)
+    print(json.dumps(payload, indent=2))
     return 0
 
 
 def _cmd_list_mappings(project_root: Path | None, approved_only: bool) -> int:
     config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
     items = list_series_mappings(config.db_path, provider="crunchyroll", approved_only=approved_only)
     print(
         json.dumps(
@@ -407,21 +429,71 @@ def _cmd_approve_mapping(
     return 0
 
 
-def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int, approved_mappings_only: bool) -> int:
+def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int, approved_mappings_only: bool, persist_queue: bool) -> int:
     config = load_config(project_root)
-    proposals = build_dry_run_sync_plan(
-        config,
-        limit=limit,
-        mapping_limit=mapping_limit,
-        approved_mappings_only=approved_mappings_only,
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    try:
+        proposals = build_dry_run_sync_plan(
+            config,
+            limit=limit,
+            mapping_limit=mapping_limit,
+            approved_mappings_only=approved_mappings_only,
+        )
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    payload: dict[str, object] = {"proposals": [proposal.as_dict() for proposal in proposals]}
+    if persist_queue:
+        payload["review_queue"] = persist_sync_review_queue(config, proposals)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_list_review_queue(project_root: Path | None, status: str, issue_type: str | None) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    items = list_review_queue_entries(config.db_path, status=status, issue_type=issue_type)
+    print(
+        json.dumps(
+            [
+                {
+                    "id": item.id,
+                    "provider": item.provider,
+                    "provider_series_id": item.provider_series_id,
+                    "provider_episode_id": item.provider_episode_id,
+                    "issue_type": item.issue_type,
+                    "severity": item.severity,
+                    "status": item.status,
+                    "created_at": item.created_at,
+                    "resolved_at": item.resolved_at,
+                    "payload": item.payload,
+                }
+                for item in items
+            ],
+            indent=2,
+        )
     )
-    print(json.dumps([proposal.as_dict() for proposal in proposals], indent=2))
+    return 0
+
+
+def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, execute: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    try:
+        results = execute_approved_sync(config, limit=limit, mapping_limit=mapping_limit, dry_run=not execute)
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps([item.as_dict() for item in results], indent=2))
     return 0
 
 
 def _cmd_sync(_: Path | None) -> int:
     raise SystemExit(
-        "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals. Live MAL writes are still intentionally disabled."
+        "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals or 'apply-sync' for the approved-mapping-only executor."
     )
 
 
@@ -465,6 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_mappings.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     review_mappings.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
+    review_mappings.add_argument("--persist-review-queue", action="store_true", help="Replace the open mapping_review queue rows with this run's unresolved items")
     list_mappings = subparsers.add_parser("list-mappings", help="List persisted Crunchyroll -> MAL mappings from SQLite")
     list_mappings.add_argument("--approved-only", action="store_true", help="Only include mappings explicitly approved by the user")
     approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved Crunchyroll -> MAL series mapping")
@@ -480,6 +553,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only produce proposals for series with explicit user-approved persisted mappings",
     )
+    dry_run_sync.add_argument("--persist-review-queue", action="store_true", help="Replace the open sync_review queue rows with this run's non-actionable items")
+    list_review_queue = subparsers.add_parser("list-review-queue", help="List persisted review_queue rows from SQLite")
+    list_review_queue.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to show")
+    list_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
+    apply_sync = subparsers.add_parser("apply-sync", help="Guarded MAL executor that only operates on approved mappings and forward-safe proposals")
+    apply_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
+    apply_sync.add_argument("--mapping-limit", type=int, default=5, help="Reserved for parity with dry-run planning")
+    apply_sync.add_argument("--execute", action="store_true", help="Actually write MAL updates; otherwise revalidate and print what would be applied")
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -510,13 +591,17 @@ def main() -> int:
     if args.command == "map-series":
         return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
     if args.command == "review-mappings":
-        return _cmd_review_mappings(args.project_root, args.limit, args.mapping_limit)
+        return _cmd_review_mappings(args.project_root, args.limit, args.mapping_limit, args.persist_review_queue)
     if args.command == "list-mappings":
         return _cmd_list_mappings(args.project_root, args.approved_only)
     if args.command == "approve-mapping":
         return _cmd_approve_mapping(args.project_root, args.provider_series_id, args.mal_anime_id, args.confidence, args.notes)
     if args.command == "dry-run-sync":
-        return _cmd_dry_run_sync(args.project_root, args.limit, args.mapping_limit, args.approved_mappings_only)
+        return _cmd_dry_run_sync(args.project_root, args.limit, args.mapping_limit, args.approved_mappings_only, args.persist_review_queue)
+    if args.command == "list-review-queue":
+        return _cmd_list_review_queue(args.project_root, args.status, args.issue_type)
+    if args.command == "apply-sync":
+        return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.execute)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")
