@@ -22,6 +22,8 @@ from .crunchyroll_snapshot import (
 from .db import bootstrap_database
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
+from .mapping import SeriesMappingInput, map_series
+from .sync_planner import build_dry_run_sync_plan, load_provider_series_states
 from .validation import SnapshotValidationError, validate_snapshot_payload
 
 
@@ -284,9 +286,66 @@ def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) 
     return 0
 
 
+def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -> int:
+    config = load_config(project_root)
+    states = load_provider_series_states(config, limit=limit)
+    client = MalClient(config, load_mal_secrets(config))
+    results = []
+    for state in states:
+        mapping = map_series(
+            client,
+            SeriesMappingInput(
+                provider=state.provider,
+                provider_series_id=state.provider_series_id,
+                title=state.title,
+                season_title=state.season_title,
+                season_number=state.season_number,
+            ),
+            limit=mapping_limit,
+        )
+        results.append(
+            {
+                "provider_series_id": state.provider_series_id,
+                "title": state.title,
+                "season_title": state.season_title,
+                "mapping_status": mapping.status,
+                "confidence": mapping.confidence,
+                "rationale": mapping.rationale,
+                "chosen_candidate": None
+                if not mapping.chosen_candidate
+                else {
+                    "mal_anime_id": mapping.chosen_candidate.mal_anime_id,
+                    "title": mapping.chosen_candidate.title,
+                    "score": mapping.chosen_candidate.score,
+                    "matched_query": mapping.chosen_candidate.matched_query,
+                    "match_reasons": mapping.chosen_candidate.match_reasons,
+                },
+                "candidates": [
+                    {
+                        "mal_anime_id": candidate.mal_anime_id,
+                        "title": candidate.title,
+                        "score": candidate.score,
+                        "matched_query": candidate.matched_query,
+                        "media_type": candidate.media_type,
+                    }
+                    for candidate in mapping.candidates
+                ],
+            }
+        )
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int) -> int:
+    config = load_config(project_root)
+    proposals = build_dry_run_sync_plan(config, limit=limit, mapping_limit=mapping_limit)
+    print(json.dumps([proposal.as_dict() for proposal in proposals], indent=2))
+    return 0
+
+
 def _cmd_sync(_: Path | None) -> int:
     raise SystemExit(
-        "Sync pipeline not implemented yet. This scaffold provides config loading, validation, ingestion, MAL OAuth prep, and DB bootstrap only."
+        "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals. Live MAL writes are still intentionally disabled."
     )
 
 
@@ -321,6 +380,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a Crunchyroll snapshot into SQLite")
     ingest_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
+    map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested Crunchyroll series")
+    map_series_cmd.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
+    map_series_cmd.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
+    dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested Crunchyroll data")
+    dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
+    dry_run_sync.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -348,6 +413,10 @@ def main() -> int:
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":
         return _cmd_ingest_snapshot(args.project_root, args.snapshot)
+    if args.command == "map-series":
+        return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
+    if args.command == "dry-run-sync":
+        return _cmd_dry_run_sync(args.project_root, args.limit, args.mapping_limit)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")

@@ -84,6 +84,24 @@ Current ingestion behavior:
 - records an `ingest_snapshot` row in `sync_runs` with a JSON summary
 - does **not** delete missing rows or infer MAL-side mutations yet
 
+## MAL mapping and dry-run planning
+
+Use:
+
+```bash
+PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+```
+
+Current behavior:
+- `map-series` reads recently seen Crunchyroll series from SQLite and searches MAL for candidate matches
+- title scoring is intentionally conservative and reports `exact`, `strong`, `ambiguous`, `weak`, or `no_candidates`
+- ambiguous/weak cases stay proposals only; they are not silently written into `mal_series_mapping`
+- `dry-run-sync` fetches MAL anime details plus current `my_list_status` for only the `exact` / `strong` matches
+- dry-run planning only suggests forward-safe list changes (`watching` / `completed` / `plan_to_watch` with episode counts)
+- it refuses to decrease MAL episode counts or downgrade a `completed` MAL entry
+- live MAL writes are still out of scope for this pass
+
 ## MAL auth commands
 
 ```bash

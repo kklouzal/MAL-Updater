@@ -38,6 +38,18 @@ class MalClient:
         self.config = config
         self.secrets = secrets
 
+    def _build_auth_headers(self, require_user: bool = False) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.secrets.access_token:
+            headers["Authorization"] = f"Bearer {self.secrets.access_token}"
+        elif require_user:
+            raise MalApiError("MAL access_token is not configured")
+        elif self.secrets.client_id:
+            headers["X-MAL-CLIENT-ID"] = self.secrets.client_id
+        else:
+            raise MalApiError("MAL client_id is not configured")
+        return headers
+
     def generate_state(self) -> str:
         return secrets.token_urlsafe(32)
 
@@ -94,21 +106,41 @@ class MalClient:
         token = access_token or self.secrets.access_token
         if not token:
             raise MalApiError("MAL access_token is not configured")
-        request = Request(
-            f"{self.config.mal.base_url}/users/@me",
+        return self._get_json(
+            f"/users/@me",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
             },
-            method="GET",
+            error_context="MAL API GET /users/@me failed",
         )
+
+    def search_anime(self, query: str, *, limit: int = 5, fields: str = "id,title,alternative_titles,media_type,status,num_episodes") -> dict[str, Any]:
+        encoded_query = urlencode({"q": query, "limit": limit, "fields": fields})
+        return self._get_json(
+            f"/anime?{encoded_query}",
+            headers=self._build_auth_headers(require_user=False),
+            error_context=f"MAL API anime search failed for query={query!r}",
+        )
+
+    def get_anime_details(self, anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:
+        return self._get_json(
+            f"/anime/{anime_id}?{urlencode({'fields': fields})}",
+            headers=self._build_auth_headers(require_user=True),
+            error_context=f"MAL API anime details failed for anime_id={anime_id}",
+        )
+
+    def _get_json(self, path_or_url: str, *, headers: dict[str, str], error_context: str) -> dict[str, Any]:
+        url = path_or_url if path_or_url.startswith("http") else f"{self.config.mal.base_url}{path_or_url}"
+        request = Request(url, headers=headers, method="GET")
         try:
             with urlopen(request) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            raise MalApiError(f"MAL API GET /users/@me failed: HTTP {exc.code}") from exc
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            raise MalApiError(f"MAL API GET /users/@me failed: {exc.reason}") from exc
+            raise MalApiError(f"{error_context}: {exc.reason}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
         basic = base64.b64encode(f"{self.secrets.client_id or ''}:{self.secrets.client_secret or ''}".encode("utf-8")).decode("ascii")

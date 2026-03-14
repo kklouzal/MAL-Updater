@@ -15,7 +15,12 @@ This repo now has an initial scaffold for:
 What it does **not** do yet:
 - complete end-to-end Crunchyroll -> MAL sync behavior
 - write sync updates back to MAL
-- do title mapping / review-queue / guarded MAL writeback
+- blindly auto-resolve mappings or perform live MAL mutations
+
+What it can do now beyond ingestion:
+- search MAL for conservative mapping candidates from the ingested Crunchyroll SQLite dataset
+- generate guarded read-only dry-run sync proposals
+- explicitly skip any proposal that would decrease MAL progress or downgrade a completed entry
 
 That line is intentional. The scaffold is real, and the remaining live integration gaps are not being faked.
 
@@ -70,6 +75,8 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
 ```
 
 Or install editable and use the console script:
@@ -91,6 +98,8 @@ Run the current stdlib smoke/integration tests with:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+This repo currently relies on the built-in `unittest` runner for local verification; `pytest` is not required or assumed to be installed on the host.
+
 ### Current behavior
 
 - `status` prints resolved paths/config plus MAL and Crunchyroll secret/state presence
@@ -106,7 +115,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - a real live run on this host now succeeds through the Python path and ingests into SQLite (`series_count=219`, `progress_count=4311`, `watchlist_count=10`)
 - `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
-- `sync` exists as a reserved entrypoint and exits with a clear "not implemented yet" message
+- `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses
+- `dry-run-sync` builds read-only MAL list proposals from ingested Crunchyroll progress plus MAL list state, and only suggests forward-safe updates
+- `sync` exists as a reserved entrypoint and exits with a clear message pointing at `dry-run-sync`; live MAL writes are still disabled on purpose
 
 ## Rust adapter scaffold
 

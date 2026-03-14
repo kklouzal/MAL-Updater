@@ -49,6 +49,20 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 cd rust/crunchyroll_adapter && cargo build
 ```
 
+### Inspect MAL mapping candidates
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
+```
+
+### Generate guarded read-only sync proposals
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+```
+
+Use the stdlib `unittest` invocation above as the baseline Python test command. Do not assume `pytest` is installed on the host.
+
 ### Inspect Crunchyroll adapter auth-material state
 ```bash
 cd <repo-root>/rust/crunchyroll_adapter

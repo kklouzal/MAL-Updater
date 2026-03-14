@@ -46,12 +46,23 @@
 ## Not implemented yet
 
 - a transport path for the Rust adapter that survives Crunchyroll's current Cloudflare/anti-bot checks on this host
-- Crunchyroll -> MAL decisioning / mapping / guarded MAL writeback
-- title mapping to MAL IDs
-- dry-run MAL sync proposals
-- guarded live MAL writes
+- live MAL writes
+- durable approval/review workflows around persisted mappings
 - recommendation engine
 - OpenClaw skill wrapper for the integration
+
+## Newly added downstream progress
+
+- MAL-side search + candidate scoring now exists on top of the ingested Crunchyroll SQLite dataset
+- the Python CLI now exposes:
+  - `map-series`
+  - `dry-run-sync`
+- `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
+- `dry-run-sync` now builds read-only MAL list proposals for high-confidence mappings by comparing Crunchyroll-derived progress with MAL `my_list_status`
+- the planner explicitly refuses to:
+  - decrease MAL watched-episode counts
+  - downgrade a `completed` MAL entry
+  - auto-act on ambiguous mappings
 
 ## Current Crunchyroll state
 
