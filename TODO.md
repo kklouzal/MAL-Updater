@@ -21,9 +21,13 @@
 - [ ] Register MAL app / complete live OAuth with real credentials
 
 ## Sync policy
+- [x] Add durable approved-mapping persistence in `mal_series_mapping`
+- [x] Add operator review workflow for mapping approval / preservation
+- [x] Add approved-mappings-only dry-run gate for the future live executor
 - [ ] Implement completion-threshold handling for credits-skipped episodes
 - [ ] Implement missing-data-only merge rules
 - [ ] Implement conflict / ambiguity review queue generation from ingestion/sync passes
+- [ ] Replace ad-hoc review output with persisted `review_queue` entries once the review shape settles
 
 ## Recommendations
 - [ ] New dubbed episode alerts

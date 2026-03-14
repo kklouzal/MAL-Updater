@@ -19,11 +19,11 @@ from .crunchyroll_snapshot import (
     snapshot_to_dict,
     write_snapshot_file,
 )
-from .db import bootstrap_database
+from .db import bootstrap_database, list_series_mappings, upsert_series_mapping
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series
-from .sync_planner import build_dry_run_sync_plan, load_provider_series_states
+from .sync_planner import build_dry_run_sync_plan, build_mapping_review, load_provider_series_states
 from .validation import SnapshotValidationError, validate_snapshot_payload
 
 
@@ -336,9 +336,85 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
     return 0
 
 
-def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int) -> int:
+def _cmd_review_mappings(project_root: Path | None, limit: int, mapping_limit: int) -> int:
     config = load_config(project_root)
-    proposals = build_dry_run_sync_plan(config, limit=limit, mapping_limit=mapping_limit)
+    items = build_mapping_review(config, limit=limit, mapping_limit=mapping_limit)
+    print(json.dumps([item.as_dict() for item in items], indent=2))
+    return 0
+
+
+def _cmd_list_mappings(project_root: Path | None, approved_only: bool) -> int:
+    config = load_config(project_root)
+    items = list_series_mappings(config.db_path, provider="crunchyroll", approved_only=approved_only)
+    print(
+        json.dumps(
+            [
+                {
+                    "provider": item.provider,
+                    "provider_series_id": item.provider_series_id,
+                    "mal_anime_id": item.mal_anime_id,
+                    "confidence": item.confidence,
+                    "mapping_source": item.mapping_source,
+                    "approved_by_user": item.approved_by_user,
+                    "notes": item.notes,
+                    "created_at": item.created_at,
+                    "updated_at": item.updated_at,
+                }
+                for item in items
+            ],
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_approve_mapping(
+    project_root: Path | None,
+    provider_series_id: str,
+    mal_anime_id: int,
+    confidence: float | None,
+    notes: str | None,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    mapping = upsert_series_mapping(
+        config.db_path,
+        provider="crunchyroll",
+        provider_series_id=provider_series_id,
+        mal_anime_id=mal_anime_id,
+        confidence=confidence,
+        mapping_source="user_approved",
+        approved_by_user=True,
+        notes=notes,
+    )
+    print(
+        json.dumps(
+            {
+                "provider": mapping.provider,
+                "provider_series_id": mapping.provider_series_id,
+                "mal_anime_id": mapping.mal_anime_id,
+                "confidence": mapping.confidence,
+                "mapping_source": mapping.mapping_source,
+                "approved_by_user": mapping.approved_by_user,
+                "notes": mapping.notes,
+                "created_at": mapping.created_at,
+                "updated_at": mapping.updated_at,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int, approved_mappings_only: bool) -> int:
+    config = load_config(project_root)
+    proposals = build_dry_run_sync_plan(
+        config,
+        limit=limit,
+        mapping_limit=mapping_limit,
+        approved_mappings_only=approved_mappings_only,
+    )
     print(json.dumps([proposal.as_dict() for proposal in proposals], indent=2))
     return 0
 
@@ -383,9 +459,27 @@ def build_parser() -> argparse.ArgumentParser:
     map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested Crunchyroll series")
     map_series_cmd.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     map_series_cmd.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
+    review_mappings = subparsers.add_parser(
+        "review-mappings",
+        help="Build a mapping review list that preserves existing approved mappings and flags the rest for approval or manual review",
+    )
+    review_mappings.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
+    review_mappings.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
+    list_mappings = subparsers.add_parser("list-mappings", help="List persisted Crunchyroll -> MAL mappings from SQLite")
+    list_mappings.add_argument("--approved-only", action="store_true", help="Only include mappings explicitly approved by the user")
+    approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved Crunchyroll -> MAL series mapping")
+    approve_mapping.add_argument("provider_series_id", help="Crunchyroll provider_series_id to approve")
+    approve_mapping.add_argument("mal_anime_id", type=int, help="Chosen MAL anime id")
+    approve_mapping.add_argument("--confidence", type=float, default=None, help="Optional confidence score to store alongside the approval")
+    approve_mapping.add_argument("--notes", default=None, help="Optional operator note explaining the approval")
     dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested Crunchyroll data")
     dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     dry_run_sync.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
+    dry_run_sync.add_argument(
+        "--approved-mappings-only",
+        action="store_true",
+        help="Only produce proposals for series with explicit user-approved persisted mappings",
+    )
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -415,8 +509,14 @@ def main() -> int:
         return _cmd_ingest_snapshot(args.project_root, args.snapshot)
     if args.command == "map-series":
         return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
+    if args.command == "review-mappings":
+        return _cmd_review_mappings(args.project_root, args.limit, args.mapping_limit)
+    if args.command == "list-mappings":
+        return _cmd_list_mappings(args.project_root, args.approved_only)
+    if args.command == "approve-mapping":
+        return _cmd_approve_mapping(args.project_root, args.provider_series_id, args.mal_anime_id, args.confidence, args.notes)
     if args.command == "dry-run-sync":
-        return _cmd_dry_run_sync(args.project_root, args.limit, args.mapping_limit)
+        return _cmd_dry_run_sync(args.project_root, args.limit, args.mapping_limit, args.approved_mappings_only)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")

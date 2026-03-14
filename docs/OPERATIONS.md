@@ -55,10 +55,19 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
 ```
 
+### Build a mapping review queue and preserve approved mappings
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
+PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
+```
+
 ### Generate guarded read-only sync proposals
 ```bash
 cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
 ```
 
 Use the stdlib `unittest` invocation above as the baseline Python test command. Do not assume `pytest` is installed on the host.

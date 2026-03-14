@@ -76,7 +76,11 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
+PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
 ```
 
 Or install editable and use the console script:
@@ -116,7 +120,10 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses
-- `dry-run-sync` builds read-only MAL list proposals from ingested Crunchyroll progress plus MAL list state, and only suggests forward-safe updates
+- `review-mappings` turns those candidates into an operator-facing review list and preserves already approved mappings instead of recomputing them every time
+- `list-mappings` shows the durable Crunchyroll -> MAL mappings already stored in SQLite
+- `approve-mapping` persists an explicit user-approved mapping into `mal_series_mapping`
+- `dry-run-sync` now prefers approved persisted mappings first, can optionally require approved mappings only, and still only suggests forward-safe updates
 - `sync` exists as a reserved entrypoint and exits with a clear message pointing at `dry-run-sync`; live MAL writes are still disabled on purpose
 
 ## Rust adapter scaffold

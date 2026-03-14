@@ -47,7 +47,7 @@
 
 - a transport path for the Rust adapter that survives Crunchyroll's current Cloudflare/anti-bot checks on this host
 - live MAL writes
-- durable approval/review workflows around persisted mappings
+- persisted `review_queue` rows for mapping/sync review items (the first approval workflow is now implemented, but review results are still emitted directly rather than stored in `review_queue`)
 - recommendation engine
 - OpenClaw skill wrapper for the integration
 
@@ -56,13 +56,19 @@
 - MAL-side search + candidate scoring now exists on top of the ingested Crunchyroll SQLite dataset
 - the Python CLI now exposes:
   - `map-series`
+  - `review-mappings`
+  - `list-mappings`
+  - `approve-mapping`
   - `dry-run-sync`
 - `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
-- `dry-run-sync` now builds read-only MAL list proposals for high-confidence mappings by comparing Crunchyroll-derived progress with MAL `my_list_status`
+- `review-mappings` now provides the first durable operator workflow: preserved approved mappings stay fixed, strong suggestions are surfaced for explicit approval, and weaker cases remain review-only
+- `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
+- `dry-run-sync` now prefers approved persisted mappings before falling back to live MAL search, and `--approved-mappings-only` gives a future-safe gate for eventual write execution
 - the planner explicitly refuses to:
   - decrease MAL watched-episode counts
   - downgrade a `completed` MAL entry
   - auto-act on ambiguous mappings
+  - auto-plan unapproved mappings when `--approved-mappings-only` is enabled
 
 ## Current Crunchyroll state
 

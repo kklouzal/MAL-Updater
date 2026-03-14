@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import AppConfig, load_mal_secrets
-from .db import connect
+from .db import PersistedSeriesMapping, connect, get_series_mapping
 from .mal_client import MalClient
 from .mapping import SeriesMappingInput, map_series
 
@@ -35,6 +35,8 @@ class SyncProposal:
     current_my_list_status: dict[str, Any] | None
     proposed_my_list_status: dict[str, Any] | None
     decision: str
+    mapping_source: str | None = None
+    persisted_mapping_approved: bool = False
     reasons: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -48,7 +50,53 @@ class SyncProposal:
             "current_my_list_status": self.current_my_list_status,
             "proposed_my_list_status": self.proposed_my_list_status,
             "decision": self.decision,
+            "mapping_source": self.mapping_source,
+            "persisted_mapping_approved": self.persisted_mapping_approved,
             "reasons": self.reasons,
+        }
+
+
+@dataclass(slots=True)
+class MappingReviewItem:
+    provider: str
+    provider_series_id: str
+    title: str
+    season_title: str | None
+    existing_mapping: PersistedSeriesMapping | None
+    suggested_mal_anime_id: int | None
+    suggested_mal_title: str | None
+    mapping_status: str
+    confidence: float
+    decision: str
+    reasons: list[str] = field(default_factory=list)
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "provider_series_id": self.provider_series_id,
+            "title": self.title,
+            "season_title": self.season_title,
+            "existing_mapping": None
+            if not self.existing_mapping
+            else {
+                "provider": self.existing_mapping.provider,
+                "provider_series_id": self.existing_mapping.provider_series_id,
+                "mal_anime_id": self.existing_mapping.mal_anime_id,
+                "confidence": self.existing_mapping.confidence,
+                "mapping_source": self.existing_mapping.mapping_source,
+                "approved_by_user": self.existing_mapping.approved_by_user,
+                "notes": self.existing_mapping.notes,
+                "created_at": self.existing_mapping.created_at,
+                "updated_at": self.existing_mapping.updated_at,
+            },
+            "suggested_mal_anime_id": self.suggested_mal_anime_id,
+            "suggested_mal_title": self.suggested_mal_title,
+            "mapping_status": self.mapping_status,
+            "confidence": self.confidence,
+            "decision": self.decision,
+            "reasons": self.reasons,
+            "candidates": self.candidates,
         }
 
 
@@ -101,11 +149,31 @@ def load_provider_series_states(config: AppConfig, limit: int | None = None, pro
 
 
 
-def build_dry_run_sync_plan(config: AppConfig, limit: int | None = 20, mapping_limit: int = 5) -> list[SyncProposal]:
+def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limit: int = 5) -> list[MappingReviewItem]:
     states = load_provider_series_states(config, limit=limit)
     client = MalClient(config, load_mal_secrets(config))
-    proposals: list[SyncProposal] = []
+    items: list[MappingReviewItem] = []
     for state in states:
+        existing = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
+        if existing and existing.approved_by_user:
+            items.append(
+                MappingReviewItem(
+                    provider=state.provider,
+                    provider_series_id=state.provider_series_id,
+                    title=state.title,
+                    season_title=state.season_title,
+                    existing_mapping=existing,
+                    suggested_mal_anime_id=existing.mal_anime_id,
+                    suggested_mal_title=None,
+                    mapping_status="approved",
+                    confidence=float(existing.confidence or 1.0),
+                    decision="preserved",
+                    reasons=["using_user_approved_mapping"],
+                    candidates=[],
+                )
+            )
+            continue
+
         mapping = map_series(
             client,
             SeriesMappingInput(
@@ -117,35 +185,147 @@ def build_dry_run_sync_plan(config: AppConfig, limit: int | None = 20, mapping_l
             ),
             limit=mapping_limit,
         )
-        if mapping.status not in {"exact", "strong"} or not mapping.chosen_candidate:
-            reasons = list(mapping.rationale)
-            if mapping.candidates:
-                reasons.append(
-                    "top_candidates="
-                    + ", ".join(f"{candidate.mal_anime_id}:{candidate.title}:{candidate.score:.3f}" for candidate in mapping.candidates[:3])
-                )
+        reasons = list(mapping.rationale)
+        if existing:
+            reasons.append(
+                f"existing_mapping={existing.mal_anime_id}:{existing.mapping_source}:approved={int(existing.approved_by_user)}"
+            )
+        if mapping.status in {"exact", "strong"} and mapping.chosen_candidate:
+            decision = "ready_for_approval"
+        elif mapping.status == "no_candidates":
+            decision = "needs_manual_match"
+        else:
+            decision = "needs_review"
+        items.append(
+            MappingReviewItem(
+                provider=state.provider,
+                provider_series_id=state.provider_series_id,
+                title=state.title,
+                season_title=state.season_title,
+                existing_mapping=existing,
+                suggested_mal_anime_id=mapping.chosen_candidate.mal_anime_id if mapping.chosen_candidate else None,
+                suggested_mal_title=mapping.chosen_candidate.title if mapping.chosen_candidate else None,
+                mapping_status=mapping.status,
+                confidence=mapping.confidence,
+                decision=decision,
+                reasons=reasons,
+                candidates=[
+                    {
+                        "mal_anime_id": candidate.mal_anime_id,
+                        "title": candidate.title,
+                        "score": candidate.score,
+                        "matched_query": candidate.matched_query,
+                        "match_reasons": candidate.match_reasons,
+                        "media_type": candidate.media_type,
+                    }
+                    for candidate in mapping.candidates
+                ],
+            )
+        )
+    return items
+
+
+
+def build_dry_run_sync_plan(
+    config: AppConfig,
+    limit: int | None = 20,
+    mapping_limit: int = 5,
+    approved_mappings_only: bool = False,
+) -> list[SyncProposal]:
+    states = load_provider_series_states(config, limit=limit)
+    client = MalClient(config, load_mal_secrets(config))
+    proposals: list[SyncProposal] = []
+    for state in states:
+        persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
+        chosen_anime_id: int | None = None
+        mapping_status = "unmapped"
+        confidence = 0.0
+        mapping_source: str | None = None
+        mapping_reasons: list[str] = []
+
+        if persisted and persisted.approved_by_user:
+            chosen_anime_id = persisted.mal_anime_id
+            mapping_status = "approved"
+            confidence = float(persisted.confidence or 1.0)
+            mapping_source = persisted.mapping_source
+            mapping_reasons.append("using_user_approved_mapping")
+        elif approved_mappings_only:
             proposals.append(
                 SyncProposal(
                     provider_series_id=state.provider_series_id,
                     crunchyroll_title=state.title,
-                    mapping_status=mapping.status,
-                    confidence=mapping.confidence,
-                    mal_anime_id=mapping.chosen_candidate.mal_anime_id if mapping.chosen_candidate else None,
-                    mal_title=mapping.chosen_candidate.title if mapping.chosen_candidate else None,
+                    mapping_status="unapproved",
+                    confidence=0.0,
+                    mal_anime_id=persisted.mal_anime_id if persisted else None,
+                    mal_title=None,
                     current_my_list_status=None,
                     proposed_my_list_status=None,
                     decision="review",
-                    reasons=reasons,
+                    mapping_source=persisted.mapping_source if persisted else None,
+                    persisted_mapping_approved=False,
+                    reasons=["approved_mappings_only_enabled", "no_user_approved_mapping"],
                 )
             )
             continue
+        else:
+            mapping = map_series(
+                client,
+                SeriesMappingInput(
+                    provider=state.provider,
+                    provider_series_id=state.provider_series_id,
+                    title=state.title,
+                    season_title=state.season_title,
+                    season_number=state.season_number,
+                ),
+                limit=mapping_limit,
+            )
+            mapping_status = mapping.status
+            confidence = mapping.confidence
+            mapping_reasons.extend(mapping.rationale)
+            if persisted:
+                mapping_source = persisted.mapping_source
+                mapping_reasons.append(
+                    f"existing_mapping={persisted.mal_anime_id}:{persisted.mapping_source}:approved={int(persisted.approved_by_user)}"
+                )
+            if mapping.status not in {"exact", "strong"} or not mapping.chosen_candidate:
+                if mapping.candidates:
+                    mapping_reasons.append(
+                        "top_candidates="
+                        + ", ".join(f"{candidate.mal_anime_id}:{candidate.title}:{candidate.score:.3f}" for candidate in mapping.candidates[:3])
+                    )
+                proposals.append(
+                    SyncProposal(
+                        provider_series_id=state.provider_series_id,
+                        crunchyroll_title=state.title,
+                        mapping_status=mapping.status,
+                        confidence=mapping.confidence,
+                        mal_anime_id=mapping.chosen_candidate.mal_anime_id if mapping.chosen_candidate else None,
+                        mal_title=mapping.chosen_candidate.title if mapping.chosen_candidate else None,
+                        current_my_list_status=None,
+                        proposed_my_list_status=None,
+                        decision="review",
+                        mapping_source=mapping_source,
+                        persisted_mapping_approved=False,
+                        reasons=mapping_reasons,
+                    )
+                )
+                continue
+            chosen_anime_id = mapping.chosen_candidate.mal_anime_id
+            mapping_source = "live_search"
 
         detail = client.get_anime_details(
-            mapping.chosen_candidate.mal_anime_id,
+            chosen_anime_id,
             fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
         )
-        current_status = detail.get("my_list_status") or None
-        proposal = _plan_status_update(state, detail, mapping.status, mapping.confidence)
+        proposal = _plan_status_update(
+            state,
+            detail,
+            mapping_status,
+            confidence,
+            mapping_source=mapping_source,
+            persisted_mapping_approved=bool(persisted and persisted.approved_by_user),
+            extra_reasons=mapping_reasons,
+        )
         proposals.append(proposal)
     return proposals
 
@@ -156,6 +336,10 @@ def _plan_status_update(
     detail: dict[str, Any],
     mapping_status: str,
     confidence: float,
+    *,
+    mapping_source: str | None,
+    persisted_mapping_approved: bool,
+    extra_reasons: list[str] | None = None,
 ) -> SyncProposal:
     mal_title = str(detail.get("title") or "")
     mal_anime_id = int(detail["id"])
@@ -167,6 +351,8 @@ def _plan_status_update(
         f"max_completed_episode_number={state.max_completed_episode_number}",
         f"progress_rows={state.progress_rows}",
     ]
+    if extra_reasons:
+        reasons = list(extra_reasons) + reasons
 
     proposed_status: dict[str, Any] | None = None
     if crunchyroll_watched_episodes > 0:
@@ -195,6 +381,8 @@ def _plan_status_update(
             current_my_list_status=current_status,
             proposed_my_list_status=None,
             decision="skip",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
             reasons=reasons + ["no_actionable_crunchyroll_state"],
         )
 
@@ -213,6 +401,8 @@ def _plan_status_update(
             current_my_list_status=current_status,
             proposed_my_list_status=None,
             decision="skip",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
             reasons=reasons + [f"refusing_to_decrease_mal_progress current={current_watched} proposed={proposed_watched}"],
         )
 
@@ -227,6 +417,8 @@ def _plan_status_update(
             current_my_list_status=current_status,
             proposed_my_list_status=None,
             decision="skip",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
             reasons=reasons + ["mal_already_matches_or_exceeds_proposal"],
         )
 
@@ -241,6 +433,8 @@ def _plan_status_update(
             current_my_list_status=current_status,
             proposed_my_list_status=None,
             decision="skip",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
             reasons=reasons + ["refusing_to_downgrade_completed_mal_entry"],
         )
 
@@ -259,5 +453,7 @@ def _plan_status_update(
         current_my_list_status=current_status,
         proposed_my_list_status=proposed_status,
         decision="propose_update",
+        mapping_source=mapping_source,
+        persisted_mapping_approved=persisted_mapping_approved,
         reasons=reasons,
     )
