@@ -19,7 +19,7 @@
 - [x] Add operator review workflow for mapping approval / preservation
 - [x] Add approved-mappings-only dry-run gate for the future live executor
 - [ ] Implement completion-threshold handling for credits-skipped episodes
-- [ ] Implement missing-data-only merge rules
+- [x] Implement missing-data-only merge rules
 - [x] Implement conflict / ambiguity review queue generation from mapping/sync passes
 - [x] Replace ad-hoc review output with persisted `review_queue` entries once the review shape settled enough for first use
 - [x] Build the first guarded live MAL apply path for approved forward-safe proposals

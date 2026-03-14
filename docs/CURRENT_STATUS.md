@@ -59,7 +59,13 @@
   - only applies proposals that remain forward-safe
   - never decreases MAL watched-episode counts
   - never downgrades a `completed` MAL entry
-  - only sends the status / episode fields it intends to change, so meaningful existing MAL metadata is left alone
+  - now uses explicit missing-data-only field rules:
+    - `status` is only filled when MAL has no status yet
+    - progress is only filled when MAL has no status yet, so `plan_to_watch` + `0` is preserved as meaningful
+    - `score` is treated as meaningful whenever it is non-zero and is never overwritten by Crunchyroll today
+    - `start_date` is preserved because the current Crunchyroll snapshot does not prove the true first-watch date
+    - `finish_date` may be filled only when Crunchyroll safely implies completion and MAL does not already have one
+  - only sends the fields it intends to change, so meaningful existing MAL metadata is left alone
 
 ## Current Crunchyroll state
 

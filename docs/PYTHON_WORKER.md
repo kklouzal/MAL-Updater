@@ -112,7 +112,13 @@ Current behavior:
 - `dry-run-sync --persist-review-queue` replaces open `sync_review` rows in SQLite with the latest non-actionable review/skip items
 - `list-review-queue` surfaces the durable review backlog from `review_queue`
 - dry-run planning only suggests forward-safe list changes (`watching` / `completed` / `plan_to_watch` with episode counts)
-- `apply-sync` re-fetches live MAL state, only considers approved mappings, and only writes `status` / `num_watched_episodes` when the proposal is still forward-safe
+- `apply-sync` re-fetches live MAL state, only considers approved mappings, and only writes still-safe missing-data merges (`status`, `num_watched_episodes`, and when justified `finish_date`)
+- explicit merge rules are now encoded in the planner/executor:
+  - `status` is missing only when absent/null
+  - progress is missing only when list status is absent
+  - `score` is missing only when null/absent/`0`, but Crunchyroll does not supply a trustworthy score yet so it is preserved
+  - `start_date` is preserved because Crunchyroll currently exposes only a last-watch timestamp, not a proven first-watch date
+  - `finish_date` can be filled from Crunchyroll `last_watched_at` only when completion is otherwise safely inferred
 - the planner/executor refuses to decrease MAL episode counts or downgrade a `completed` MAL entry
 - meaningful existing MAL metadata is preserved because the executor only submits the fields it explicitly intends to change
 

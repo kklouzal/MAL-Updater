@@ -130,11 +130,26 @@ class MalClient:
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
 
-    def update_my_list_status(self, anime_id: int, *, status: str, num_watched_episodes: int) -> dict[str, Any]:
+    def update_my_list_status(
+        self,
+        anime_id: int,
+        *,
+        status: str,
+        num_watched_episodes: int,
+        score: int | None = None,
+        start_date: str | None = None,
+        finish_date: str | None = None,
+    ) -> dict[str, Any]:
         form = {
             "status": status,
             "num_watched_episodes": str(int(num_watched_episodes)),
         }
+        if score is not None:
+            form["score"] = str(int(score))
+        if start_date:
+            form["start_date"] = start_date
+        if finish_date:
+            form["finish_date"] = finish_date
         payload = urlencode(form).encode("utf-8")
         request = Request(
             f"{self.config.mal.base_url}/anime/{anime_id}/my_list_status",

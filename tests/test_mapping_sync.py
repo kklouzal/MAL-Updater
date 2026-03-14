@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +157,7 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(proposal.decision, "propose_update")
         self.assertEqual(proposal.proposed_my_list_status, {"status": "watching", "num_watched_episodes": 3})
         self.assertEqual(proposal.mapping_source, "live_search")
+        self.assertIn("preserve_meaningful_score", proposal.reasons)
 
     def test_build_dry_run_sync_plan_refuses_to_decrease_existing_progress(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -357,6 +357,147 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].payload["decision"], "skip")
 
+    def test_build_dry_run_sync_plan_fills_missing_finish_date_only_when_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 12
+            payload["progress"][0]["completion_ratio"] = 0.95
+            payload["progress"][0]["last_watched_at"] = "2026-03-14T22:10:00Z"
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12, "finish_date": None},
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+
+        self.assertEqual(proposals[0].decision, "propose_update")
+        self.assertEqual(
+            proposals[0].proposed_my_list_status,
+            {"status": "completed", "num_watched_episodes": 12, "finish_date": "2026-03-14"},
+        )
+        self.assertIn("fill_missing_finish_date", proposals[0].reasons)
+        self.assertIn("preserve_meaningful_start_date", proposals[0].reasons)
+
+    def test_build_dry_run_sync_plan_preserves_existing_finish_date(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 12
+            payload["progress"][0]["completion_ratio"] = 0.95
+            payload["progress"][0]["last_watched_at"] = "2026-03-14T22:10:00Z"
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12, "finish_date": "2025-01-01"},
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+
+        self.assertEqual(proposals[0].decision, "skip")
+        self.assertTrue(any(reason == "mal_already_matches_or_exceeds_proposal" for reason in proposals[0].reasons))
+
+    def test_build_dry_run_sync_plan_preserves_meaningful_zero_progress_on_plan_to_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"] = []
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "plan_to_watch", "num_episodes_watched": 0},
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+
+        self.assertEqual(proposals[0].decision, "skip")
+        self.assertIn("mal_already_matches_or_exceeds_proposal", proposals[0].reasons)
+
     def test_execute_approved_sync_dry_run_only_targets_approved_safe_updates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -439,8 +580,59 @@ class DryRunPlannerTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].applied)
-        update_mock.assert_called_once_with(888, status="watching", num_watched_episodes=4)
+        update_mock.assert_called_once_with(888, status="watching", num_watched_episodes=4, score=None, start_date=None, finish_date=None)
         self.assertEqual(results[0].response_status["score"], 9)
+
+    def test_execute_approved_sync_includes_missing_finish_date_when_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 12
+            payload["progress"][0]["completion_ratio"] = 0.95
+            payload["progress"][0]["last_watched_at"] = "2026-03-14T22:10:00Z"
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            upsert_series_mapping(
+                config.db_path,
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                mal_anime_id=888,
+                confidence=1.0,
+                mapping_source="user_approved",
+                approved_by_user=True,
+                notes=None,
+            )
+
+            with patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 888,
+                    "title": "Approved Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12, "finish_date": None, "score": 9},
+                },
+            ), patch.object(
+                MalClient,
+                "update_my_list_status",
+                return_value={"status": "completed", "num_episodes_watched": 12, "finish_date": "2026-03-14", "score": 9},
+            ) as update_mock:
+                results = execute_approved_sync(config, limit=5, dry_run=False)
+
+        self.assertTrue(results[0].applied)
+        update_mock.assert_called_once_with(
+            888,
+            status="completed",
+            num_watched_episodes=12,
+            score=None,
+            start_date=None,
+            finish_date="2026-03-14",
+        )
+        self.assertEqual(results[0].requested_status["finish_date"], "2026-03-14")
 
     def test_execute_approved_sync_skips_non_forward_safe_completed_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -123,9 +123,9 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `review-mappings` turns those candidates into an operator-facing review list, preserves already approved mappings, and can replace open `mapping_review` rows in `review_queue`
 - `list-mappings` shows the durable Crunchyroll -> MAL mappings already stored in SQLite
 - `approve-mapping` persists an explicit user-approved mapping into `mal_series_mapping`
-- `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, only suggests forward-safe updates, and can replace open `sync_review` rows in `review_queue`
+- `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, only suggests forward-safe updates, applies explicit missing-data-only merge rules, and can replace open `sync_review` rows in `review_queue`
 - `list-review-queue` exposes the durable unresolved review backlog stored in SQLite
-- `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes approved mappings, only submits forward-safe status/episode updates, and only sends the fields it intends to change
+- `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes approved mappings, only submits forward-safe updates, and only fills MAL fields that are still genuinely missing
 - `sync` remains a reserved umbrella entrypoint and points at the explicit review/apply commands
 
 ## SQLite schema
