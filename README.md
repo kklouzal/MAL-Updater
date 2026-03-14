@@ -14,9 +14,8 @@ This repo now has an initial scaffold for:
 
 What it does **not** do yet:
 - log into Crunchyroll
-- complete a local MAL OAuth callback exchange end-to-end
-- ingest real watch data
-- write anything to MAL
+- ingest real watch data from Crunchyroll
+- write sync updates back to MAL
 
 That line is intentional. The scaffold is real; the sync functionality is not being faked.
 
@@ -59,6 +58,10 @@ Run from the repo root:
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli mal-auth-url
+PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
+PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
+PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
+PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 ```
 
 Or install editable and use the console script:
@@ -73,8 +76,15 @@ mal-updater mal-auth-url
 ### Current behavior
 
 - `status` prints resolved paths/config plus MAL secret presence
+- `config/settings.toml` can define path layout, MAL endpoint settings, Crunchyroll locale, and secret file locations
+- `validate-snapshot` checks adapter JSON shape and cross-reference sanity before ingestion work touches SQLite
 - `init` creates local directories and applies SQLite migrations
 - `mal-auth-url` generates a real PKCE pair plus MAL authorization URL
+- `mal-auth-login` starts a local loopback callback listener, exchanges the returned code for tokens, persists them under `secrets/`, and verifies the token with `GET /users/@me`
+- `mal-refresh` refreshes a persisted MAL token pair and writes updated token files back to `secrets/`
+- `mal-whoami` exercises the current access token against MAL `GET /users/@me`
+- `validate-snapshot` strictly validates a Crunchyroll snapshot payload against the current Python-side contract rules
+- `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `sync` exists as a reserved entrypoint and exits with a clear "not implemented yet" message
 
 ## Rust adapter scaffold

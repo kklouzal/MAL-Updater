@@ -6,11 +6,12 @@
 - [x] Define JSON contract between adapter and Python worker
 - [x] Define SQLite schema
 - [x] Decide config/secrets directory layout
-- [ ] Wire Python config loader to parse `config/settings.toml`
-- [ ] Add JSON schema validation before ingestion
-- [ ] Add Python ingestion path for adapter snapshot -> SQLite
+- [x] Wire Python config loader to parse `config/settings.toml`
+- [x] Add JSON schema validation before ingestion
+- [x] Add Python ingestion path for adapter snapshot -> SQLite
 - [ ] Integrate `crunchyroll-rs` into the Rust adapter
-- [ ] Register MAL app / complete OAuth flow locally
+- [x] Implement local MAL loopback OAuth flow + token persistence
+- [ ] Register MAL app / complete live OAuth with real credentials
 
 ## Sync policy
 - [ ] Implement completion-threshold handling for credits-skipped episodes

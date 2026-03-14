@@ -22,6 +22,8 @@ DEFAULT_MAL_CLIENT_ID_FILE = "mal_client_id.txt"
 DEFAULT_MAL_CLIENT_SECRET_FILE = "mal_client_secret.txt"
 DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
 DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
+DEFAULT_CRUNCHYROLL_ADAPTER_BIN = Path("rust") / "crunchyroll_adapter" / "target" / "debug" / "crunchyroll-adapter"
+DEFAULT_DB_FILE = "mal_updater.sqlite3"
 
 
 @dataclass(slots=True)
@@ -57,6 +59,7 @@ class MalSecrets:
 @dataclass(slots=True)
 class AppConfig:
     project_root: Path
+    settings_path: Path
     config_dir: Path
     secrets_dir: Path
     data_dir: Path
@@ -64,15 +67,72 @@ class AppConfig:
     cache_dir: Path
     db_path: Path
     crunchyroll_adapter_bin: Path
+    secret_files: dict[str, Any] = field(default_factory=dict)
     completion_threshold: float = DEFAULT_COMPLETION_THRESHOLD
     contract_version: str = DEFAULT_CONTRACT_VERSION
     mal: MalSettings = field(default_factory=MalSettings)
     crunchyroll: CrunchyrollSettings = field(default_factory=CrunchyrollSettings)
 
 
-def _resolve_dir(env_name: str, default: Path) -> Path:
-    value = os.getenv(env_name)
-    return Path(value).expanduser().resolve() if value else default.resolve()
+def _resolve_from(base_dir: Path, raw_value: str | Path) -> Path:
+    path = Path(raw_value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def _get_table(data: dict[str, Any], name: str) -> dict[str, Any]:
+    value = data.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _get_str(data: dict[str, Any], key: str, default: str) -> str:
+    value = data.get(key, default)
+    return str(value)
+
+
+def _get_float(data: dict[str, Any], key: str, default: float) -> float:
+    value = data.get(key, default)
+    return float(value)
+
+
+def _get_int(data: dict[str, Any], key: str, default: int) -> int:
+    value = data.get(key, default)
+    return int(value)
+
+
+def _resolve_path_setting(
+    env_name: str,
+    settings: dict[str, Any],
+    key: str,
+    *,
+    base_dir: Path,
+    default: Path,
+) -> Path:
+    env_value = os.getenv(env_name)
+    if env_value:
+        return _resolve_from(Path.cwd(), env_value)
+    raw_value = settings.get(key)
+    if raw_value is None:
+        return _resolve_from(base_dir, default)
+    return _resolve_from(base_dir, str(raw_value))
+
+
+def _resolve_secret_path(
+    env_name: str,
+    settings: dict[str, Any],
+    key: str,
+    *,
+    secrets_dir: Path,
+    default_file: str,
+) -> Path:
+    env_value = os.getenv(env_name)
+    if env_value:
+        return _resolve_from(Path.cwd(), env_value)
+    raw_value = settings.get(key)
+    if raw_value is None:
+        return (secrets_dir / default_file).resolve()
+    return _resolve_from(secrets_dir, str(raw_value))
 
 
 def _parse_toml_scalar(raw_value: str) -> Any:
@@ -134,29 +194,73 @@ def _read_secret_file(path: Path) -> str | None:
 
 def load_config(project_root: Path | None = None) -> AppConfig:
     root = (project_root or Path(__file__).resolve().parents[2]).resolve()
-    config_dir = _resolve_dir("MAL_UPDATER_CONFIG_DIR", root / "config")
-    secrets_dir = _resolve_dir("MAL_UPDATER_SECRETS_DIR", root / "secrets")
-    data_dir = _resolve_dir("MAL_UPDATER_DATA_DIR", root / "data")
-    state_dir = _resolve_dir("MAL_UPDATER_STATE_DIR", root / "state")
-    cache_dir = _resolve_dir("MAL_UPDATER_CACHE_DIR", root / "cache")
-    settings_path = Path(os.getenv("MAL_UPDATER_SETTINGS_PATH", str(config_dir / "settings.toml"))).expanduser().resolve()
+
+    default_config_dir = (root / "config").resolve()
+    settings_path = _resolve_from(
+        Path.cwd(),
+        os.getenv("MAL_UPDATER_SETTINGS_PATH", str(default_config_dir / "settings.toml")),
+    )
     settings = _read_toml_file(settings_path)
 
-    mal_section = settings.get("mal") if isinstance(settings.get("mal"), dict) else {}
-    crunchyroll_section = settings.get("crunchyroll") if isinstance(settings.get("crunchyroll"), dict) else {}
+    paths_section = _get_table(settings, "paths")
+    mal_section = _get_table(settings, "mal")
+    crunchyroll_section = _get_table(settings, "crunchyroll")
+    secret_files_section = _get_table(settings, "secret_files")
+    settings_dir = settings_path.parent
 
-    db_path = Path(
-        os.getenv("MAL_UPDATER_DB_PATH", str(data_dir / "mal_updater.sqlite3"))
-    ).expanduser().resolve()
-    crunchyroll_adapter_bin = Path(
-        os.getenv(
-            "MAL_UPDATER_CRUNCHYROLL_ADAPTER",
-            str(root / "rust" / "crunchyroll_adapter" / "target" / "debug" / "crunchyroll-adapter"),
-        )
-    ).expanduser().resolve()
+    config_dir = _resolve_path_setting(
+        "MAL_UPDATER_CONFIG_DIR",
+        paths_section,
+        "config_dir",
+        base_dir=settings_dir,
+        default=root / "config",
+    )
+    secrets_dir = _resolve_path_setting(
+        "MAL_UPDATER_SECRETS_DIR",
+        paths_section,
+        "secrets_dir",
+        base_dir=settings_dir,
+        default=root / "secrets",
+    )
+    data_dir = _resolve_path_setting(
+        "MAL_UPDATER_DATA_DIR",
+        paths_section,
+        "data_dir",
+        base_dir=settings_dir,
+        default=root / "data",
+    )
+    state_dir = _resolve_path_setting(
+        "MAL_UPDATER_STATE_DIR",
+        paths_section,
+        "state_dir",
+        base_dir=settings_dir,
+        default=root / "state",
+    )
+    cache_dir = _resolve_path_setting(
+        "MAL_UPDATER_CACHE_DIR",
+        paths_section,
+        "cache_dir",
+        base_dir=settings_dir,
+        default=root / "cache",
+    )
+    db_path = _resolve_path_setting(
+        "MAL_UPDATER_DB_PATH",
+        paths_section,
+        "db_path",
+        base_dir=settings_dir,
+        default=data_dir / DEFAULT_DB_FILE,
+    )
+    crunchyroll_adapter_bin = _resolve_path_setting(
+        "MAL_UPDATER_CRUNCHYROLL_ADAPTER",
+        paths_section,
+        "crunchyroll_adapter_bin",
+        base_dir=settings_dir,
+        default=root / DEFAULT_CRUNCHYROLL_ADAPTER_BIN,
+    )
 
-    return AppConfig(
+    app_config = AppConfig(
         project_root=root,
+        settings_path=settings_path,
         config_dir=config_dir,
         secrets_dir=secrets_dir,
         data_dir=data_dir,
@@ -164,26 +268,53 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         cache_dir=cache_dir,
         db_path=db_path,
         crunchyroll_adapter_bin=crunchyroll_adapter_bin,
-        completion_threshold=float(os.getenv("MAL_UPDATER_COMPLETION_THRESHOLD", settings.get("completion_threshold", DEFAULT_COMPLETION_THRESHOLD))),
-        contract_version=str(os.getenv("MAL_UPDATER_CONTRACT_VERSION", settings.get("contract_version", DEFAULT_CONTRACT_VERSION))),
+        secret_files=secret_files_section,
+        completion_threshold=float(os.getenv("MAL_UPDATER_COMPLETION_THRESHOLD", _get_float(settings, "completion_threshold", DEFAULT_COMPLETION_THRESHOLD))),
+        contract_version=os.getenv("MAL_UPDATER_CONTRACT_VERSION", _get_str(settings, "contract_version", DEFAULT_CONTRACT_VERSION)),
         mal=MalSettings(
-            base_url=str(os.getenv("MAL_UPDATER_MAL_BASE_URL", mal_section.get("base_url", DEFAULT_MAL_BASE_URL))),
-            auth_url=str(os.getenv("MAL_UPDATER_MAL_AUTH_URL", mal_section.get("auth_url", DEFAULT_MAL_AUTH_URL))),
-            token_url=str(os.getenv("MAL_UPDATER_MAL_TOKEN_URL", mal_section.get("token_url", DEFAULT_MAL_TOKEN_URL))),
-            redirect_host=str(os.getenv("MAL_UPDATER_MAL_REDIRECT_HOST", mal_section.get("redirect_host", DEFAULT_MAL_REDIRECT_HOST))),
-            redirect_port=int(os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", mal_section.get("redirect_port", DEFAULT_MAL_REDIRECT_PORT))),
+            base_url=os.getenv("MAL_UPDATER_MAL_BASE_URL", _get_str(mal_section, "base_url", DEFAULT_MAL_BASE_URL)),
+            auth_url=os.getenv("MAL_UPDATER_MAL_AUTH_URL", _get_str(mal_section, "auth_url", DEFAULT_MAL_AUTH_URL)),
+            token_url=os.getenv("MAL_UPDATER_MAL_TOKEN_URL", _get_str(mal_section, "token_url", DEFAULT_MAL_TOKEN_URL)),
+            redirect_host=os.getenv("MAL_UPDATER_MAL_REDIRECT_HOST", _get_str(mal_section, "redirect_host", DEFAULT_MAL_REDIRECT_HOST)),
+            redirect_port=int(os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", _get_int(mal_section, "redirect_port", DEFAULT_MAL_REDIRECT_PORT))),
         ),
         crunchyroll=CrunchyrollSettings(
-            locale=str(os.getenv("MAL_UPDATER_CRUNCHYROLL_LOCALE", crunchyroll_section.get("locale", DEFAULT_CRUNCHYROLL_LOCALE)))
+            locale=os.getenv("MAL_UPDATER_CRUNCHYROLL_LOCALE", _get_str(crunchyroll_section, "locale", DEFAULT_CRUNCHYROLL_LOCALE))
         ),
     )
+    return app_config
 
 
 def load_mal_secrets(config: AppConfig) -> MalSecrets:
-    client_id_path = Path(os.getenv("MAL_UPDATER_MAL_CLIENT_ID_FILE", str(config.secrets_dir / DEFAULT_MAL_CLIENT_ID_FILE))).expanduser().resolve()
-    client_secret_path = Path(os.getenv("MAL_UPDATER_MAL_CLIENT_SECRET_FILE", str(config.secrets_dir / DEFAULT_MAL_CLIENT_SECRET_FILE))).expanduser().resolve()
-    access_token_path = Path(os.getenv("MAL_UPDATER_MAL_ACCESS_TOKEN_FILE", str(config.secrets_dir / DEFAULT_MAL_ACCESS_TOKEN_FILE))).expanduser().resolve()
-    refresh_token_path = Path(os.getenv("MAL_UPDATER_MAL_REFRESH_TOKEN_FILE", str(config.secrets_dir / DEFAULT_MAL_REFRESH_TOKEN_FILE))).expanduser().resolve()
+    secret_files_section = config.secret_files
+    client_id_path = _resolve_secret_path(
+        "MAL_UPDATER_MAL_CLIENT_ID_FILE",
+        secret_files_section,
+        "mal_client_id",
+        secrets_dir=config.secrets_dir,
+        default_file=DEFAULT_MAL_CLIENT_ID_FILE,
+    )
+    client_secret_path = _resolve_secret_path(
+        "MAL_UPDATER_MAL_CLIENT_SECRET_FILE",
+        secret_files_section,
+        "mal_client_secret",
+        secrets_dir=config.secrets_dir,
+        default_file=DEFAULT_MAL_CLIENT_SECRET_FILE,
+    )
+    access_token_path = _resolve_secret_path(
+        "MAL_UPDATER_MAL_ACCESS_TOKEN_FILE",
+        secret_files_section,
+        "mal_access_token",
+        secrets_dir=config.secrets_dir,
+        default_file=DEFAULT_MAL_ACCESS_TOKEN_FILE,
+    )
+    refresh_token_path = _resolve_secret_path(
+        "MAL_UPDATER_MAL_REFRESH_TOKEN_FILE",
+        secret_files_section,
+        "mal_refresh_token",
+        secrets_dir=config.secrets_dir,
+        default_file=DEFAULT_MAL_REFRESH_TOKEN_FILE,
+    )
 
     return MalSecrets(
         client_id=os.getenv("MAL_UPDATER_MAL_CLIENT_ID") or _read_secret_file(client_id_path),

@@ -6,6 +6,7 @@ import json
 import secrets
 from dataclasses import dataclass
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -37,6 +38,9 @@ class MalClient:
         self.config = config
         self.secrets = secrets
 
+    def generate_state(self) -> str:
+        return secrets.token_urlsafe(32)
+
     def generate_pkce_pair(self) -> OAuthPkcePair:
         verifier = secrets.token_urlsafe(64)[:96]
         digest = hashlib.sha256(verifier.encode("utf-8")).digest()
@@ -60,18 +64,16 @@ class MalClient:
     def exchange_code(self, code: str, code_verifier: str) -> TokenResponse:
         if not self.secrets.client_id:
             raise MalApiError("MAL client_id is not configured")
-        if not self.secrets.client_secret:
-            raise MalApiError("MAL client_secret is not configured")
-        payload = urlencode(
-            {
-                "grant_type": "authorization_code",
-                "client_id": self.secrets.client_id,
-                "client_secret": self.secrets.client_secret,
-                "code": code,
-                "code_verifier": code_verifier,
-                "redirect_uri": self.config.mal.redirect_uri,
-            }
-        ).encode("utf-8")
+        form = {
+            "grant_type": "authorization_code",
+            "client_id": self.secrets.client_id,
+            "code": code,
+            "code_verifier": code_verifier,
+            "redirect_uri": self.config.mal.redirect_uri,
+        }
+        if self.secrets.client_secret:
+            form["client_secret"] = self.secrets.client_secret
+        payload = urlencode(form).encode("utf-8")
         return self._post_form(self.config.mal.token_url, payload)
 
     def refresh_access_token(self, refresh_token: str | None = None) -> TokenResponse:
@@ -80,16 +82,14 @@ class MalClient:
             raise MalApiError("MAL refresh_token is not configured")
         if not self.secrets.client_id:
             raise MalApiError("MAL client_id is not configured")
-        if not self.secrets.client_secret:
-            raise MalApiError("MAL client_secret is not configured")
-        payload = urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": token,
-                "client_id": self.secrets.client_id,
-                "client_secret": self.secrets.client_secret,
-            }
-        ).encode("utf-8")
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": token,
+            "client_id": self.secrets.client_id,
+        }
+        if self.secrets.client_secret:
+            form["client_secret"] = self.secrets.client_secret
+        payload = urlencode(form).encode("utf-8")
         return self._post_form(self.config.mal.token_url, payload)
 
     def get_my_user(self, access_token: str | None = None) -> dict[str, Any]:
@@ -104,8 +104,13 @@ class MalClient:
             },
             method="GET",
         )
-        with urlopen(request) as response:
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(request) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise MalApiError(f"MAL API GET /users/@me failed: HTTP {exc.code}") from exc
+        except URLError as exc:
+            raise MalApiError(f"MAL API GET /users/@me failed: {exc.reason}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
         request = Request(
@@ -117,8 +122,14 @@ class MalClient:
             },
             method="POST",
         )
-        with urlopen(request) as response:
-            raw = json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(request) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise MalApiError(f"MAL token request failed: HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise MalApiError(f"MAL token request failed: {exc.reason}") from exc
         return TokenResponse(
             access_token=raw["access_token"],
             token_type=raw.get("token_type", "Bearer"),

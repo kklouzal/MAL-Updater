@@ -1,8 +1,18 @@
 # Non-secret local configuration.
 # Copy to config/settings.toml and adjust as needed.
+# Paths may be absolute or relative to this file.
 
 completion_threshold = 0.90
 contract_version = "1.0"
+
+[paths]
+config_dir = "./"
+secrets_dir = "../secrets"
+data_dir = "../data"
+state_dir = "../state"
+cache_dir = "../cache"
+db_path = "../data/mal_updater.sqlite3"
+crunchyroll_adapter_bin = "../rust/crunchyroll_adapter/target/debug/crunchyroll-adapter"
 
 [mal]
 base_url = "https://api.myanimelist.net/v2"
@@ -13,3 +23,9 @@ redirect_port = 8765
 
 [crunchyroll]
 locale = "en-US"
+
+[secret_files]
+mal_client_id = "mal_client_id.txt"
+mal_client_secret = "mal_client_secret.txt"
+mal_access_token = "mal_access_token.txt"
+mal_refresh_token = "mal_refresh_token.txt"

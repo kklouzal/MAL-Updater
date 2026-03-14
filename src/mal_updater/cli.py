@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
+from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
 from .config import ensure_directories, load_config, load_mal_secrets
 from .db import bootstrap_database
-from .mal_client import MalClient
+from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
+from .mal_client import MalApiError, MalClient
+from .validation import SnapshotValidationError, validate_snapshot_payload
 
 
 def _cmd_init(project_root: Path | None) -> int:
@@ -22,6 +26,7 @@ def _cmd_status(project_root: Path | None) -> int:
     config = load_config(project_root)
     secrets = load_mal_secrets(config)
     print(f"project_root={config.project_root}")
+    print(f"settings_path={config.settings_path}")
     print(f"config_dir={config.config_dir}")
     print(f"secrets_dir={config.secrets_dir}")
     print(f"data_dir={config.data_dir}")
@@ -52,7 +57,11 @@ def _cmd_mal_auth_url(project_root: Path | None, emit_json: bool) -> int:
     ensure_directories(config)
     client = MalClient(config, load_mal_secrets(config))
     pkce = client.generate_pkce_pair()
-    auth_url = client.build_authorization_url(code_challenge=pkce.code_challenge)
+    try:
+        auth_url = client.build_authorization_url(code_challenge=pkce.code_challenge)
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if emit_json:
         print(
             json.dumps(
@@ -76,9 +85,133 @@ def _cmd_mal_auth_url(project_root: Path | None, emit_json: bool) -> int:
     return 0
 
 
+def _cmd_mal_auth_login(project_root: Path | None, timeout_seconds: float, verify_whoami: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    secrets = load_mal_secrets(config)
+    client = MalClient(config, secrets)
+    pkce = client.generate_pkce_pair()
+    state = client.generate_state()
+    try:
+        auth_url = client.build_authorization_url(code_challenge=pkce.code_challenge, state=state)
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(format_auth_flow_prompt(config, auth_url, timeout_seconds))
+    try:
+        callback = wait_for_oauth_callback(
+            config.mal.redirect_host,
+            config.mal.redirect_port,
+            expected_state=state,
+            timeout_seconds=timeout_seconds,
+        )
+        token = client.exchange_code(callback.code, pkce.code_verifier)
+        persisted = persist_token_response(token, secrets)
+    except OSError as exc:
+        print(f"Unable to start MAL callback listener on {config.mal.redirect_uri}: {exc}", file=sys.stderr)
+        return 1
+    except TimeoutError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except (OAuthCallbackError, MalApiError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print()
+    print(f"Persisted access token to {persisted.access_token_path}")
+    if token.refresh_token:
+        print(f"Persisted refresh token to {persisted.refresh_token_path}")
+    else:
+        print("No refresh token returned by MAL; existing refresh token file left untouched")
+
+    if not verify_whoami:
+        return 0
+
+    try:
+        whoami = client.get_my_user(access_token=token.access_token)
+    except MalApiError as exc:
+        print(f"Token exchange succeeded, but /users/@me verification failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Authenticated MAL user: {json.dumps(whoami, indent=2)}")
+    return 0
+
+
+def _cmd_mal_refresh(project_root: Path | None, verify_whoami: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    secrets = load_mal_secrets(config)
+    client = MalClient(config, secrets)
+    try:
+        token = client.refresh_access_token()
+        persisted = persist_token_response(token, secrets)
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"Persisted access token to {persisted.access_token_path}")
+    if token.refresh_token:
+        print(f"Persisted refresh token to {persisted.refresh_token_path}")
+
+    if not verify_whoami:
+        return 0
+
+    try:
+        whoami = client.get_my_user(access_token=token.access_token)
+    except MalApiError as exc:
+        print(f"Refresh succeeded, but /users/@me verification failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Authenticated MAL user: {json.dumps(whoami, indent=2)}")
+    return 0
+
+
+def _cmd_mal_whoami(project_root: Path | None) -> int:
+    config = load_config(project_root)
+    secrets = load_mal_secrets(config)
+    client = MalClient(config, secrets)
+    try:
+        whoami = client.get_my_user()
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(whoami, indent=2))
+    return 0
+
+
+def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
+    config = load_config(project_root)
+    if snapshot_path is None:
+        payload = json.load(sys.stdin)
+        source = "stdin"
+    else:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        source = str(snapshot_path)
+    try:
+        validate_snapshot_payload(payload, config)
+    except SnapshotValidationError as exc:
+        print(f"INVALID: {exc}", file=sys.stderr)
+        return 1
+    print(f"VALID: {source}")
+    return 0
+
+
+def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    if snapshot_path is None:
+        payload = json.load(sys.stdin)
+        summary = ingest_snapshot_payload(payload, config)
+    else:
+        summary = ingest_snapshot_file(snapshot_path, config)
+    print(json.dumps(summary.as_dict(), indent=2))
+    return 0
+
+
 def _cmd_sync(_: Path | None) -> int:
     raise SystemExit(
-        "Sync pipeline not implemented yet. This scaffold provides config loading, MAL OAuth prep, and DB bootstrap only."
+        "Sync pipeline not implemented yet. This scaffold provides config loading, validation, ingestion, MAL OAuth prep, and DB bootstrap only."
     )
 
 
@@ -90,6 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="Print resolved config, paths, and secret presence")
     mal_auth = subparsers.add_parser("mal-auth-url", help="Generate a MAL OAuth authorization URL + PKCE verifier")
     mal_auth.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    mal_auth_login = subparsers.add_parser("mal-auth-login", help="Run a local loopback MAL OAuth flow and persist returned tokens")
+    mal_auth_login.add_argument("--timeout-seconds", type=float, default=300.0, help="How long to wait for the local callback before failing")
+    mal_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /users/@me token check")
+    mal_refresh = subparsers.add_parser("mal-refresh", help="Refresh the persisted MAL access token using the local refresh token")
+    mal_refresh.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /users/@me token check")
+    subparsers.add_parser("mal-whoami", help="Call MAL GET /users/@me with the currently configured access token")
+    validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a Crunchyroll snapshot JSON payload")
+    validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
+    ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a Crunchyroll snapshot into SQLite")
+    ingest_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -103,6 +246,16 @@ def main() -> int:
         return _cmd_status(args.project_root)
     if args.command == "mal-auth-url":
         return _cmd_mal_auth_url(args.project_root, args.json)
+    if args.command == "mal-auth-login":
+        return _cmd_mal_auth_login(args.project_root, args.timeout_seconds, verify_whoami=not args.no_verify)
+    if args.command == "mal-refresh":
+        return _cmd_mal_refresh(args.project_root, verify_whoami=not args.no_verify)
+    if args.command == "mal-whoami":
+        return _cmd_mal_whoami(args.project_root)
+    if args.command == "validate-snapshot":
+        return _cmd_validate_snapshot(args.project_root, args.snapshot)
+    if args.command == "ingest-snapshot":
+        return _cmd_ingest_snapshot(args.project_root, args.snapshot)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")

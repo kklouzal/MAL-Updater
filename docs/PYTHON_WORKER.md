@@ -10,9 +10,11 @@
 - MAL API client scaffold for:
   - PKCE generation
   - authorization URL building
+  - local loopback callback capture
   - token exchange
   - refresh flow
   - `GET /users/@me`
+  - atomic token persistence back into `secrets/`
 
 ## Important boundary
 
@@ -25,6 +27,18 @@ Nothing here fakes Crunchyroll ingestion or live MAL writes.
 2. local `config/settings.toml`
 3. code defaults
 
+## `settings.toml` coverage
+
+The loader now understands all current non-secret knobs from `config/settings.toml`:
+
+- top-level: `completion_threshold`, `contract_version`
+- `[paths]`: config/secrets/data/state/cache dirs, `db_path`, `crunchyroll_adapter_bin`
+- `[mal]`: MAL API/auth endpoints plus redirect host/port
+- `[crunchyroll]`: locale
+- `[secret_files]`: filenames or paths for MAL client/token files
+
+Path values in `settings.toml` may be absolute or relative to the settings file location.
+
 ## DB bootstrap path
 
 Use:
@@ -35,9 +49,58 @@ from mal_updater.db import bootstrap_database
 
 This is the clean entrypoint used by the CLI and should stay the main schema-init path unless migrations become more sophisticated.
 
+## Snapshot validation
+
+Use the CLI to validate a Crunchyroll adapter payload before ingestion work lands:
+
+```bash
+PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
+# or
+cat path/to/snapshot.json | PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot
+```
+
+Current validation is Python-side and intentionally strict:
+- enforces the current contract version
+- rejects unexpected keys
+- checks basic field types and datetime strings
+- verifies progress/watchlist entries reference known series ids
+- rejects duplicate series, episode, and watchlist identifiers
+
+## Snapshot ingestion
+
+Use the CLI to validate and persist a normalized adapter snapshot:
+
+```bash
+PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
+# or
+cat path/to/snapshot.json | PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot
+```
+
+Current ingestion behavior:
+- validates the payload before any DB writes
+- bootstraps the SQLite schema if needed
+- upserts `provider_series`, `provider_episode_progress`, and `provider_watchlist`
+- stores per-row normalized `raw_json` payloads for audit/debugging
+- records an `ingest_snapshot` row in `sync_runs` with a JSON summary
+- does **not** delete missing rows or infer MAL-side mutations yet
+
+## MAL auth commands
+
+```bash
+PYTHONPATH=src python3 -m mal_updater.cli mal-auth-url
+PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
+PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
+PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
+```
+
+Notes:
+- `mal-auth-login` is the real local loopback flow and waits for one callback hit on the configured redirect port
+- token files are written to the configured `secret_files` targets with private `0600` permissions
+- `mal-refresh` reuses the persisted refresh token and overwrites the access token file with the new token
+- `mal-whoami` is the cheapest honest sanity check after auth succeeds
+
 ## Near-term next steps
 
-- callback listener for OAuth code capture
-- token persistence helper with safe file permissions
-- JSON schema validation on adapter snapshots
-- provider snapshot ingestion into SQLite
+- conflict/review queue generation from ingestion + mapping passes
+- real Crunchyroll adapter integration
+- MAL-side write planning/dry-run sync pipeline
