@@ -3,9 +3,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from mal_updater.config import load_config
+from mal_updater import crunchyroll_snapshot as crunchyroll_snapshot_module
 from mal_updater.crunchyroll_snapshot import fetch_snapshot, refresh_access_token, snapshot_to_dict
 
 
@@ -47,6 +49,7 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text("[crunchyroll]\nrequest_spacing_seconds = 0\n", encoding="utf-8")
             (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
             (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
             (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
@@ -127,6 +130,7 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text("[crunchyroll]\nrequest_spacing_seconds = 0\n", encoding="utf-8")
             (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
             (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
             (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
@@ -173,12 +177,104 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
 
 
 
-    def test_fetch_snapshot_respects_configured_request_spacing(self) -> None:
+    def test_fetch_snapshot_rebootstraps_after_watch_history_401(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text("[crunchyroll]\nrequest_spacing_seconds = 0\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
+            (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
+            (root / "secrets").mkdir()
+            (root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / "secrets" / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+            config = load_config(root)
+
+            state_paths = crunchyroll_snapshot_module.resolve_crunchyroll_state_paths(config)
+            (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-2\n", encoding="utf-8")
+            with patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token",
+                return_value=(
+                    crunchyroll_snapshot_module.CrunchyrollAccessToken(
+                        access_token="access-refresh",
+                        refresh_token="refresh-1",
+                        account_id="acct-1",
+                        device_id="device-123",
+                        device_type="ANDROIDTV",
+                    ),
+                    state_paths,
+                ),
+            ) as refresh_mock, patch(
+                "mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials",
+                return_value=SimpleNamespace(
+                    access_token="access-bootstrap",
+                    refresh_token="refresh-2",
+                    account_id="acct-1",
+                    account_email="user@example.com",
+                    device_id="device-123",
+                    device_type="ANDROIDTV",
+                ),
+            ) as bootstrap_mock, patch("mal_updater.crunchyroll_snapshot._http_get") as mock_get:
+                mock_get.side_effect = [
+                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+                    _FakeResponse(401, {"message": "Unauthorized"}),
+                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                ]
+
+                result = fetch_snapshot(config)
+
+            self.assertEqual(result.snapshot.raw["auth_source"], "credential_rebootstrap")
+            refresh_mock.assert_called_once()
+            bootstrap_mock.assert_called_once()
+            self.assertEqual((root / "state" / "crunchyroll" / "default" / "refresh_token.txt").read_text(encoding="utf-8"), "refresh-2\n")
+
+    def test_fetch_snapshot_rebootstraps_after_refresh_token_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text("[crunchyroll]\nrequest_spacing_seconds = 0\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
+            (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
+            (root / "secrets").mkdir()
+            (root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / "secrets" / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+            config = load_config(root)
+
+            with patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token",
+                side_effect=crunchyroll_snapshot_module.CrunchyrollAuthError("expired refresh token"),
+            ) as refresh_mock, patch(
+                "mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials",
+                return_value=SimpleNamespace(
+                    access_token="access-bootstrap",
+                    refresh_token="refresh-2",
+                    account_id="acct-1",
+                    account_email="user@example.com",
+                    device_id="device-123",
+                    device_type="ANDROIDTV",
+                ),
+            ) as bootstrap_mock, patch("mal_updater.crunchyroll_snapshot._http_get") as mock_get:
+                mock_get.side_effect = [
+                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                ]
+
+                result = fetch_snapshot(config)
+
+            self.assertEqual(result.snapshot.raw["auth_source"], "credential_rebootstrap")
+            refresh_mock.assert_called_once()
+            bootstrap_mock.assert_called_once()
+
+    def test_fetch_snapshot_respects_configured_request_spacing_with_jitter(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "config").mkdir()
             (root / "config" / "settings.toml").write_text(
-                "[crunchyroll]\nrequest_spacing_seconds = 10\n",
+                "[crunchyroll]\nrequest_spacing_seconds = 10\nrequest_spacing_jitter_seconds = 3\n",
                 encoding="utf-8",
             )
             (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
@@ -188,9 +284,11 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
 
             with patch("mal_updater.crunchyroll_snapshot._http_post") as mock_post, patch(
                 "mal_updater.crunchyroll_snapshot._http_get"
-            ) as mock_get, patch("mal_updater.crunchyroll_snapshot.time.sleep") as sleep_mock, patch(
+            ) as mock_get, patch.object(crunchyroll_snapshot_module.random, "uniform", side_effect=[13.0, 9.0, 12.0, 7.0]), patch(
+                "mal_updater.crunchyroll_snapshot.time.sleep"
+            ) as sleep_mock, patch(
                 "mal_updater.crunchyroll_snapshot.time.monotonic",
-                side_effect=[0.0, 1.0, 10.0, 12.0, 20.0, 21.0, 30.0],
+                side_effect=[0.0, 1.0, 13.0, 15.0, 24.0, 26.0, 33.0],
             ):
                 mock_post.return_value = _FakeResponse(
                     200,
@@ -205,7 +303,8 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
                 result = fetch_snapshot(config)
 
             self.assertEqual(result.snapshot.raw["request_spacing_seconds"], 10.0)
-            self.assertEqual(sleep_mock.call_args_list, [call(9.0), call(8.0), call(9.0)])
+            self.assertEqual(result.snapshot.raw["request_spacing_jitter_seconds"], 3.0)
+            self.assertEqual(sleep_mock.call_args_list, [call(8.0), call(10.0), call(5.0)])
 
 
 if __name__ == "__main__":

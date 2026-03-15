@@ -57,6 +57,8 @@ class CrunchyrollBootstrapResult:
     session_state_path: Path
     account_id: str | None
     account_email: str | None
+    access_token: str
+    refresh_token: str
     device_id: str
     device_type: str
 
@@ -260,6 +262,8 @@ def crunchyroll_login_with_credentials(
         session_state_path=state_paths.session_state_path,
         account_id=account_id,
         account_email=account_email,
+        access_token=str(access_token),
+        refresh_token=str(refresh_token),
         device_id=device_id,
         device_type=device_type,
     )

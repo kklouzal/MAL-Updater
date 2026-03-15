@@ -30,6 +30,7 @@ Safety properties:
 - logs per run under `state/logs/`
 - live MAL writes remain constrained by the guarded executor
 - exact-only currently means approved mappings whose persisted `mapping_source` is `auto_exact` or `user_exact`
+- Crunchyroll auth recovery is bounded and conservative: the fetch path first tries the staged refresh token, and if Crunchyroll still answers `401` on the content API (or the refresh token itself has expired), it performs one credential rebootstrap from the locally staged secrets and retries once instead of looping or hammering the service
 
 ## Crunchyroll pacing
 
@@ -39,16 +40,17 @@ Safety properties:
 [crunchyroll]
 locale = "en-US"
 request_spacing_seconds = 10.0
+request_spacing_jitter_seconds = 3.0
 ```
 
-The live fetch path spaces individual Crunchyroll HTTP requests by roughly this amount. With the current flow, a normal run usually issues:
+The live fetch path spaces individual Crunchyroll HTTP requests by roughly this amount (default: `10 ± 3s`). With the current flow, a normal run usually issues:
 
 1. refresh-token request
 2. account lookup
 3. watch-history request(s)
 4. watchlist request(s)
 
-So larger histories/watchlists will naturally take longer than the minimum 6-hour cadence.
+So larger histories/watchlists will naturally take longer than the minimum 6-10 hour cadence envelope.
 
 ## User systemd timer
 
@@ -70,6 +72,6 @@ systemctl --user list-timers mal-updater-exact-approved-sync.timer
 
 Timer behavior:
 
-- subsequent runs about every 6 hours after the previous run finishes
+- subsequent runs land on an intentionally conservative jittered cadence of about 8 hours on average, implemented as `OnUnitInactiveSec=6h` plus `RandomizedDelaySec=4h` (effective spread: roughly 6-10 hours after the previous run finishes)
 - because the timer is based on `OnUnitInactiveSec=6h`, a brand-new install does not force an immediate catch-up run by itself; start the service manually once if you want an immediate first cycle
 - `Persistent=true` so missed intervals catch up once when the machine/user manager comes back

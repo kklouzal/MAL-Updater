@@ -25,6 +25,7 @@
   - fetches `GET /accounts/v1/me`, `GET /content/v2/{account_id}/watch-history`, and `GET /content/v2/discover/{account_id}/watchlist`
   - normalizes the live responses into the existing `1.0` snapshot contract
   - exposes `crunchyroll-fetch-snapshot` in the CLI, with optional direct ingestion
+  - now treats Crunchyroll `401` responses as auth-state failures instead of terminal fetch failures: one fresh credential rebootstrap is attempted from the staged local secrets, then the snapshot fetch is retried once and stops there
 - the Python fetch path has produced real live Crunchyroll data on this host
 - a live snapshot was validated and ingested into SQLite with:
   - `series_count=245`
@@ -114,5 +115,5 @@ Keep reducing the genuinely ambiguous mapping residue on top of the now-live loc
   - scope: fetch + ingest + `apply-sync --limit 0 --exact-approved-only --execute`
   - overlap guard: `flock` lock file under `state/locks/`
   - logs: `state/logs/`
-  - user-level systemd units checked in under `ops/systemd-user/` for a persistent ~6-hour cadence
-- the live Crunchyroll fetch path now spaces individual Crunchyroll requests by `request_spacing_seconds` (default `10.0`)
+  - user-level systemd units checked in under `ops/systemd-user/` for a persistent jittered ~8-hour average cadence (effective spread: roughly 6-10 hours)
+- the live Crunchyroll fetch path now spaces individual Crunchyroll requests by `request_spacing_seconds ± request_spacing_jitter_seconds` (default `10.0 ± 3.0`, so about 7-13 seconds)
