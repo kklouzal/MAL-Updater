@@ -55,7 +55,7 @@ Optional environment overrides are documented in `examples/env.example`.
 
 ### Requirements
 
-- Python 3.11+
+- Python 3.10+
 
 ### Commands
 
