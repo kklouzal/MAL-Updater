@@ -89,6 +89,7 @@ PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type sync_re
 cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
 ```
 
 Use the stdlib `unittest` invocation above as the baseline Python test command. Do not assume `pytest` is installed on the host.
@@ -108,3 +109,14 @@ If the Orin's LAN IP changes, this must be updated both:
 - keep raw secrets only in `secrets/`
 - token files should remain mode `0600`
 - do not paste secrets into GitHub issues or docs
+
+## Unattended exact-approved cadence
+
+Use the repo wrapper for the first narrow unattended run path:
+
+```bash
+cd <repo-root>
+./scripts/run_exact_approved_sync_cycle.sh
+```
+
+Install the user-level systemd timer from `ops/systemd-user/` as documented in `docs/AUTOMATION.md`.

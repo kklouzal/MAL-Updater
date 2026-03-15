@@ -71,6 +71,7 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
+./scripts/run_exact_approved_sync_cycle.sh
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 5
@@ -117,6 +118,7 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
 - `crunchyroll-auth-login` uses local Crunchyroll username/password secrets to fetch a real refresh token + device id and stage them into `state/crunchyroll/<profile>/`; if optional `curl_cffi` support is installed, it uses browser-TLS impersonation to get through Crunchyroll's Cloudflare layer
 - `crunchyroll-fetch-snapshot` is the live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, normalizes it into the JSON contract, and can write a snapshot file and/or ingest it directly
+- the live Crunchyroll fetch path now intentionally spaces individual Crunchyroll HTTP requests by `crunchyroll.request_spacing_seconds` (default `10.0`) so the first unattended cadence stays conservative
 - a real live run on this host succeeds through the Python path and ingests into SQLite (`series_count=245`, `progress_count=4311`, `watchlist_count=197` on the latest local snapshot)
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses; it now expands generic Crunchyroll labels like `Season 2`, `Part 2`, `2nd Cour`, or `Final Season` into `Title ...` queries and scores explicit installment hints (season numbers, ordinal seasons, roman numerals, parts, cours, split indexes, `Final Season`)
@@ -127,6 +129,7 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, auto-promotes truly exact/unique season-consistent matches into durable `auto_exact` approvals, only suggests forward-safe updates, applies explicit missing-data-only merge rules, and can replace open `sync_review` rows in `review_queue`
 - `list-review-queue` exposes the durable unresolved review backlog stored in SQLite
 - `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes durably approved mappings (`user_approved` or safe `auto_exact`), only submits forward-safe updates, and only fills MAL fields that are still genuinely missing
+- `apply-sync --exact-approved-only --limit 0 --execute` is the unattended-safe executor gate for the first recurring cadence; today that means persisted approved mappings whose source is `auto_exact` or `user_exact`
 - `sync` remains a reserved umbrella entrypoint and points at the explicit review/apply commands
 
 ## SQLite schema
@@ -150,6 +153,7 @@ Current version: `1.0`
 
 See:
 - `docs/JSON_CONTRACT.md`
+- `docs/AUTOMATION.md`
 - `docs/contracts/crunchyroll_snapshot.schema.json`
 
 Boundary rule:

@@ -9,6 +9,17 @@ from .mal_client import MalClient
 from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
 
 
+EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
+
+
+def _is_approved_mapping_eligible(persisted: PersistedSeriesMapping | None, *, exact_approved_only: bool = False) -> bool:
+    if not (persisted and persisted.approved_by_user):
+        return False
+    if exact_approved_only and persisted.mapping_source not in EXACT_APPROVED_MAPPING_SOURCES:
+        return False
+    return True
+
+
 @dataclass(slots=True)
 class ProviderSeriesState:
     provider: str
@@ -137,6 +148,8 @@ class ApplyResult:
 
 
 def load_provider_series_states(config: AppConfig, limit: int | None = None, provider: str = "crunchyroll") -> list[ProviderSeriesState]:
+    if limit is not None and limit <= 0:
+        limit = None
     series_query = """
         SELECT
             s.provider,
@@ -395,13 +408,21 @@ def build_dry_run_sync_plan(
     limit: int | None = 20,
     mapping_limit: int = 5,
     approved_mappings_only: bool = False,
+    exact_approved_only: bool = False,
 ) -> list[SyncProposal]:
     states = load_provider_series_states(config, limit=limit)
     client = MalClient(config, load_mal_secrets(config))
     proposals: list[SyncProposal] = []
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
-        if approved_mappings_only and not (persisted and persisted.approved_by_user):
+        if approved_mappings_only and not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
+            reasons = ["approved_mappings_only_enabled"]
+            if exact_approved_only:
+                reasons.append("exact_approved_only_enabled")
+            if not (persisted and persisted.approved_by_user):
+                reasons.append("no_user_approved_mapping")
+            else:
+                reasons.append(f"mapping_source_not_exact={persisted.mapping_source}")
             proposals.append(
                 SyncProposal(
                     provider_series_id=state.provider_series_id,
@@ -415,7 +436,7 @@ def build_dry_run_sync_plan(
                     decision="review",
                     mapping_source=persisted.mapping_source if persisted else None,
                     persisted_mapping_approved=False,
-                    reasons=["approved_mappings_only_enabled", "no_user_approved_mapping"],
+                    reasons=reasons,
                 )
             )
             continue
@@ -488,6 +509,7 @@ def execute_approved_sync(
     config: AppConfig,
     limit: int | None = 20,
     mapping_limit: int = 5,
+    exact_approved_only: bool = False,
     dry_run: bool = True,
 ) -> list[ApplyResult]:
     states = load_provider_series_states(config, limit=limit)
@@ -495,7 +517,7 @@ def execute_approved_sync(
     results: list[ApplyResult] = []
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
-        if not (persisted and persisted.approved_by_user):
+        if not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
             continue
         detail = client.get_anime_details(
             persisted.mal_anime_id,
@@ -508,7 +530,11 @@ def execute_approved_sync(
             confidence=float(persisted.confidence or 1.0),
             mapping_source=persisted.mapping_source,
             persisted_mapping_approved=True,
-            extra_reasons=["using_user_approved_mapping", "executor_revalidated_live_mal_state"],
+            extra_reasons=[
+                "using_user_approved_mapping",
+                "executor_revalidated_live_mal_state",
+                *(["exact_approved_only_enabled"] if exact_approved_only else []),
+            ],
         )
         if proposal.decision != "propose_update":
             results.append(

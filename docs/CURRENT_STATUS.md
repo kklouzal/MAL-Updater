@@ -34,7 +34,7 @@
 
 ## Not implemented yet
 
-- unattended/full-fidelity MAL sync beyond the first guarded executor
+- broad unattended/full-fidelity MAL sync beyond the first narrow exact-approved cadence
 - recommendation engine
 - OpenClaw skill wrapper for the integration
 
@@ -108,3 +108,11 @@ Keep reducing the genuinely ambiguous mapping residue on top of the now-live loc
 - continue tightening same-franchise low-margin ties with explainable canonical-entry cues (today: auxiliary/special penalties are stronger when Crunchyroll clearly looks like the main multi-episode series)
 - continue decomposing combined Crunchyroll entries more honestly for split-cour / multi-season / movie-shell cases (today: aggregate numbering is softened when explicit installment cues align and only the raw numbering looks inflated)
 - investigate episode-title matching only if a trustworthy episode-metadata source can be used without turning the mapper into an opaque scraper; the current official MAL API surface does not expose episode-title data directly enough to justify pretending this is solved
+
+- the first recurring local automation path now exists:
+  - wrapper: `scripts/run_exact_approved_sync_cycle.sh`
+  - scope: fetch + ingest + `apply-sync --limit 0 --exact-approved-only --execute`
+  - overlap guard: `flock` lock file under `state/locks/`
+  - logs: `state/logs/`
+  - user-level systemd units checked in under `ops/systemd-user/` for a persistent ~6-hour cadence
+- the live Crunchyroll fetch path now spaces individual Crunchyroll requests by `request_spacing_seconds` (default `10.0`)

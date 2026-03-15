@@ -21,6 +21,8 @@ DEFAULT_MAL_BIND_HOST = "0.0.0.0"
 DEFAULT_MAL_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_MAL_REDIRECT_PORT = 8765
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
+DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 10.0
+DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 3.0
 DEFAULT_MAL_CLIENT_ID_FILE = "mal_client_id.txt"
 DEFAULT_MAL_CLIENT_SECRET_FILE = "mal_client_secret.txt"
 DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
@@ -45,6 +47,7 @@ class MalSettings:
 @dataclass(slots=True)
 class CrunchyrollSettings:
     locale: str = DEFAULT_CRUNCHYROLL_LOCALE
+    request_spacing_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS
 
 
 @dataclass(slots=True)
@@ -284,7 +287,13 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             redirect_port=int(os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", _get_int(mal_section, "redirect_port", DEFAULT_MAL_REDIRECT_PORT))),
         ),
         crunchyroll=CrunchyrollSettings(
-            locale=os.getenv("MAL_UPDATER_CRUNCHYROLL_LOCALE", _get_str(crunchyroll_section, "locale", DEFAULT_CRUNCHYROLL_LOCALE))
+            locale=os.getenv("MAL_UPDATER_CRUNCHYROLL_LOCALE", _get_str(crunchyroll_section, "locale", DEFAULT_CRUNCHYROLL_LOCALE)),
+            request_spacing_seconds=float(
+                os.getenv(
+                    "MAL_UPDATER_CRUNCHYROLL_REQUEST_SPACING_SECONDS",
+                    _get_float(crunchyroll_section, "request_spacing_seconds", DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS),
+                )
+            ),
         ),
     )
     return app_config

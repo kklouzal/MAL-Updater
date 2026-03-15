@@ -66,6 +66,7 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.bind_host={config.mal.bind_host}")
     print(f"mal.redirect_uri={config.mal.redirect_uri}")
     print(f"crunchyroll.locale={config.crunchyroll.locale}")
+    print(f"crunchyroll.request_spacing_seconds={config.crunchyroll.request_spacing_seconds}")
     print(f"crunchyroll.username_present={bool(crunchyroll_credentials.username)}")
     print(f"crunchyroll.password_present={bool(crunchyroll_credentials.password)}")
     print(f"crunchyroll.username_path={crunchyroll_credentials.username_path}")
@@ -440,7 +441,14 @@ def _cmd_approve_mapping(
     return 0
 
 
-def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int, approved_mappings_only: bool, persist_queue: bool) -> int:
+def _cmd_dry_run_sync(
+    project_root: Path | None,
+    limit: int,
+    mapping_limit: int,
+    approved_mappings_only: bool,
+    exact_approved_only: bool,
+    persist_queue: bool,
+) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
@@ -454,6 +462,7 @@ def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int,
             limit=normalized_limit,
             mapping_limit=mapping_limit,
             approved_mappings_only=approved_mappings_only,
+            exact_approved_only=exact_approved_only,
         )
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
@@ -493,12 +502,18 @@ def _cmd_list_review_queue(project_root: Path | None, status: str, issue_type: s
     return 0
 
 
-def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, execute: bool) -> int:
+def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
     try:
-        results = execute_approved_sync(config, limit=limit, mapping_limit=mapping_limit, dry_run=not execute)
+        results = execute_approved_sync(
+            config,
+            limit=_normalize_limit(limit),
+            mapping_limit=mapping_limit,
+            exact_approved_only=exact_approved_only,
+            dry_run=not execute,
+        )
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -569,12 +584,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only produce proposals for series with explicit user-approved persisted mappings",
     )
     dry_run_sync.add_argument("--persist-review-queue", action="store_true", help="Replace the open sync_review queue rows with this run's non-actionable items")
+    dry_run_sync.add_argument(
+        "--exact-approved-only",
+        action="store_true",
+        help="When using approved mappings, restrict planning to exact approved mappings only (currently auto_exact/user_exact)",
+    )
     list_review_queue = subparsers.add_parser("list-review-queue", help="List persisted review_queue rows from SQLite")
     list_review_queue.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to show")
     list_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
     apply_sync = subparsers.add_parser("apply-sync", help="Guarded MAL executor that only operates on approved mappings and forward-safe proposals")
     apply_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     apply_sync.add_argument("--mapping-limit", type=int, default=5, help="Reserved for parity with dry-run planning")
+    apply_sync.add_argument(
+        "--exact-approved-only",
+        action="store_true",
+        help="Only operate on exact approved mappings (currently auto_exact/user_exact)",
+    )
     apply_sync.add_argument("--execute", action="store_true", help="Actually write MAL updates; otherwise revalidate and print what would be applied")
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
@@ -612,11 +637,18 @@ def main() -> int:
     if args.command == "approve-mapping":
         return _cmd_approve_mapping(args.project_root, args.provider_series_id, args.mal_anime_id, args.confidence, args.notes)
     if args.command == "dry-run-sync":
-        return _cmd_dry_run_sync(args.project_root, args.limit, args.mapping_limit, args.approved_mappings_only, args.persist_review_queue)
+        return _cmd_dry_run_sync(
+            args.project_root,
+            args.limit,
+            args.mapping_limit,
+            args.approved_mappings_only,
+            args.exact_approved_only,
+            args.persist_review_queue,
+        )
     if args.command == "list-review-queue":
         return _cmd_list_review_queue(args.project_root, args.status, args.issue_type)
     if args.command == "apply-sync":
-        return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.execute)
+        return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")

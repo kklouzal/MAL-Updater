@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -48,6 +49,25 @@ class CrunchyrollFetchResult:
     snapshot: CrunchyrollSnapshot
     state_paths: CrunchyrollStatePaths
     account_email: str | None
+
+
+@dataclass(slots=True)
+class _CrunchyrollRequestPacer:
+    spacing_seconds: float
+    last_request_started_at: float | None = None
+
+    def wait_turn(self) -> None:
+        if self.spacing_seconds <= 0:
+            self.last_request_started_at = time.monotonic()
+            return
+        now = time.monotonic()
+        if self.last_request_started_at is not None:
+            remaining = self.spacing_seconds - (now - self.last_request_started_at)
+            if remaining > 0:
+                time.sleep(remaining)
+                now = time.monotonic()
+        self.last_request_started_at = now
+
 
 
 def _now_string() -> str:
@@ -103,6 +123,7 @@ def refresh_access_token(
     *,
     profile: str = "default",
     timeout_seconds: float = 30.0,
+    pacer: _CrunchyrollRequestPacer | None = None,
 ) -> tuple[CrunchyrollAccessToken, CrunchyrollStatePaths]:
     state_paths = resolve_crunchyroll_state_paths(config, profile=profile)
     refresh_token = _read_secret_file(state_paths.refresh_token_path)
@@ -123,6 +144,8 @@ def refresh_access_token(
         "Content-Type": "application/x-www-form-urlencoded",
         "ETP-Anonymous-ID": device_id,
     }
+    if pacer is not None:
+        pacer.wait_turn()
     response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds)
     if response.status_code >= 400:
         message = f"Crunchyroll refresh-token login failed: HTTP {response.status_code}"
@@ -187,7 +210,10 @@ def _authorized_json_get(
     access_token: str,
     timeout_seconds: float,
     params: dict[str, Any] | None = None,
+    pacer: _CrunchyrollRequestPacer | None = None,
 ) -> Any:
+    if pacer is not None:
+        pacer.wait_turn()
     response = _http_get(
         url,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -361,11 +387,13 @@ def fetch_snapshot(
     profile: str = "default",
     timeout_seconds: float = 30.0,
 ) -> CrunchyrollFetchResult:
-    token, state_paths = refresh_access_token(config, profile=profile, timeout_seconds=timeout_seconds)
+    pacer = _CrunchyrollRequestPacer(config.crunchyroll.request_spacing_seconds)
+    token, state_paths = refresh_access_token(config, profile=profile, timeout_seconds=timeout_seconds, pacer=pacer)
     account_payload = _authorized_json_get(
         CRUNCHYROLL_ME_URL,
         access_token=token.access_token,
         timeout_seconds=timeout_seconds,
+        pacer=pacer,
     )
     if not isinstance(account_payload, dict):
         raise CrunchyrollSnapshotError("Crunchyroll account response was not a JSON object")
@@ -381,6 +409,7 @@ def fetch_snapshot(
             access_token=token.access_token,
             timeout_seconds=timeout_seconds,
             params={"page": page, "page_size": 100, "locale": config.crunchyroll.locale},
+            pacer=pacer,
         )
         if not isinstance(history_payload, dict):
             raise CrunchyrollSnapshotError("Crunchyroll watch-history response was not a JSON object")
@@ -405,6 +434,7 @@ def fetch_snapshot(
             access_token=token.access_token,
             timeout_seconds=timeout_seconds,
             params={"locale": config.crunchyroll.locale, "n": 100, "start": watchlist_start},
+            pacer=pacer,
         )
         if not isinstance(watchlist_payload, dict):
             raise CrunchyrollSnapshotError("Crunchyroll watchlist response was not a JSON object")
@@ -457,6 +487,7 @@ def fetch_snapshot(
             "history_count": len(history_entries),
             "watchlist_count": len(watchlist_entries),
             "transport": "curl_cffi:chrome124" if curl_requests is not None else "requests",
+            "request_spacing_seconds": config.crunchyroll.request_spacing_seconds,
         },
     )
     _write_session_state(

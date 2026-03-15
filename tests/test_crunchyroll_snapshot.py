@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from mal_updater.config import load_config
 from mal_updater.crunchyroll_snapshot import fetch_snapshot, refresh_access_token, snapshot_to_dict
@@ -170,6 +170,42 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
             self.assertEqual(mock_get.call_args_list[2].kwargs["params"]["n"], 100)
             self.assertEqual(mock_get.call_args_list[2].kwargs["params"]["start"], 0)
             self.assertEqual(mock_get.call_args_list[3].kwargs["params"]["start"], 100)
+
+
+
+    def test_fetch_snapshot_respects_configured_request_spacing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text(
+                "[crunchyroll]\nrequest_spacing_seconds = 10\n",
+                encoding="utf-8",
+            )
+            (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
+            (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
+            config = load_config(root)
+
+            with patch("mal_updater.crunchyroll_snapshot._http_post") as mock_post, patch(
+                "mal_updater.crunchyroll_snapshot._http_get"
+            ) as mock_get, patch("mal_updater.crunchyroll_snapshot.time.sleep") as sleep_mock, patch(
+                "mal_updater.crunchyroll_snapshot.time.monotonic",
+                side_effect=[0.0, 1.0, 10.0, 12.0, 20.0, 21.0, 30.0],
+            ):
+                mock_post.return_value = _FakeResponse(
+                    200,
+                    {"access_token": "access-1", "refresh_token": "refresh-new", "account_id": "acct-1"},
+                )
+                mock_get.side_effect = [
+                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                ]
+
+                result = fetch_snapshot(config)
+
+            self.assertEqual(result.snapshot.raw["request_spacing_seconds"], 10.0)
+            self.assertEqual(sleep_mock.call_args_list, [call(9.0), call(8.0), call(9.0)])
 
 
 if __name__ == "__main__":

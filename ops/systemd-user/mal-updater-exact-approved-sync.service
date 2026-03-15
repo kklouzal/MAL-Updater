@@ -1,0 +1,9 @@
+[Unit]
+Description=MAL-Updater exact-approved sync cycle
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=<repo-root>
+ExecStart=<repo-root>/scripts/run_exact_approved_sync_cycle.sh

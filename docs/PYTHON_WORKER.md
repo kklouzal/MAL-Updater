@@ -34,7 +34,7 @@ The loader now understands all current non-secret knobs from `config/settings.to
 - top-level: `completion_threshold`, `credits_skip_window_seconds`, `contract_version`
 - `[paths]`: config/secrets/data/state/cache dirs and `db_path`
 - `[mal]`: MAL API/auth endpoints plus redirect host/port
-- `[crunchyroll]`: locale
+- `[crunchyroll]`: locale, request_spacing_seconds
 - `[secret_files]`: filenames or paths for MAL client/token files
 
 Path values in `settings.toml` may be absolute or relative to the settings file location.
@@ -99,6 +99,7 @@ PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type sync_review
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
 ```
 
 Current behavior:
@@ -121,6 +122,7 @@ Current behavior:
   - `completion_ratio >= 0.85` plus later watched progress for a higher episode number in the same series
 - progress counting deduplicates alternate provider episode variants by `episode_number` when available so dub/sub variants do not inflate MAL watched counts
 - `apply-sync` re-fetches live MAL state, only considers approved mappings, and only writes still-safe missing-data merges (`status`, `num_watched_episodes`, and when justified `finish_date`)
+- `apply-sync --exact-approved-only` narrows execution further to exact approved mappings only (`auto_exact` / `user_exact`) for the first unattended cadence
 - explicit merge rules are now encoded in the planner/executor:
   - `status` is missing only when absent/null
   - progress is missing only when list status is absent
@@ -160,6 +162,7 @@ Behavior:
 - refreshes the staged Crunchyroll refresh token from `state/crunchyroll/<profile>/`
 - uses `curl_cffi` browser-TLS impersonation when available
 - fetches real account / watch-history / watchlist data
+- spaces individual Crunchyroll requests by `crunchyroll.request_spacing_seconds` (default `10.0`)
 - paginates Crunchyroll watchlists with the provider's `n` + `start` parameters so large libraries are ingested completely
 - normalizes the result into the existing `1.0` snapshot contract
 - can immediately validate + ingest into SQLite

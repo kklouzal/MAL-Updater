@@ -77,6 +77,25 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(secrets.client_id_path, (root / "secrets" / "custom_client_id.txt").resolve())
 
 
+
+    def test_load_config_reads_crunchyroll_request_spacing_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text(
+                textwrap.dedent(
+                    """
+                    [crunchyroll]
+                    request_spacing_seconds = 12.5
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(root)
+
+            self.assertEqual(config.crunchyroll.request_spacing_seconds, 12.5)
+
 class AuthHelperTests(unittest.TestCase):
     def test_format_auth_flow_prompt_includes_bind_host_and_redirect_uri(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -190,7 +209,14 @@ class AuthHelperTests(unittest.TestCase):
             stderr = io.StringIO()
 
             with redirect_stderr(stderr):
-                code = _cmd_dry_run_sync(root, limit=20, mapping_limit=5, approved_mappings_only=False, persist_queue=True)
+                code = _cmd_dry_run_sync(
+                    root,
+                    limit=20,
+                    mapping_limit=5,
+                    approved_mappings_only=False,
+                    exact_approved_only=False,
+                    persist_queue=True,
+                )
 
             self.assertEqual(code, 2)
             self.assertIn("requires a full scan", stderr.getvalue())
