@@ -318,13 +318,49 @@ def _has_non_base_installment_hint(hints: set[str]) -> bool:
     for hint in hints:
         if hint == "final":
             return True
-        if hint.startswith(("season:", "part:", "roman:")):
+        if hint.startswith(("season:", "part:", "roman:", "cour:", "split:")):
             try:
                 if int(hint.split(":", 1)[1]) > 1:
                     return True
             except ValueError:
                 continue
     return False
+
+
+def _provider_title_hints(series: SeriesMappingInput) -> set[str]:
+    hints: set[str] = set()
+    for value in (series.season_title, series.title):
+        hints.update(_extract_title_hints(value))
+    return hints
+
+
+def _provider_auxiliary_markers(series: SeriesMappingInput) -> set[str]:
+    return {
+        marker
+        for value in (series.season_title, series.title)
+        for marker in [_title_has_auxiliary_marker(value)]
+        if marker
+    }
+
+
+def _provider_episode_numbering_may_be_aggregated(
+    series: SeriesMappingInput,
+    provider_hints: set[str],
+    candidate_hints: set[str],
+    candidate_num_episodes: int,
+) -> bool:
+    if series.max_episode_number is None or series.max_episode_number <= candidate_num_episodes:
+        return False
+    if series.completed_episode_count is None or series.completed_episode_count > candidate_num_episodes:
+        return False
+    if not _has_non_base_installment_hint(provider_hints):
+        return False
+    if not candidate_hints:
+        return False
+    shared_installment_hints = provider_hints & candidate_hints
+    if not shared_installment_hints:
+        return False
+    return True
 
 
 def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
@@ -403,9 +439,7 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
                 f"provider:{provider_season_number};candidate:{','.join(str(number) for number in sorted(candidate_season_numbers))}"
             )
 
-    provider_hints = set()
-    for value in (series.season_title, series.title):
-        provider_hints.update(_extract_title_hints(value))
+    provider_hints = _provider_title_hints(series)
     candidate_hints = _candidate_title_hints(node)
     shared_hints = sorted(provider_hints & candidate_hints)
     conflicting_hints: list[str] = []
@@ -464,12 +498,7 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score -= penalty
         reasons.append(f"installment_hint_conflict={','.join(conflicting_hints)}")
 
-    provider_auxiliary_markers = {
-        marker
-        for value in (series.season_title, series.title)
-        for marker in [_title_has_auxiliary_marker(value)]
-        if marker
-    }
+    provider_auxiliary_markers = _provider_auxiliary_markers(series)
     candidate_auxiliary_markers = _candidate_auxiliary_markers(node)
     extra_auxiliary_markers = sorted(candidate_auxiliary_markers - provider_auxiliary_markers)
     if extra_auxiliary_markers:
@@ -479,10 +508,16 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     candidate_num_episodes = node.get("num_episodes")
     if isinstance(candidate_num_episodes, int) and candidate_num_episodes > 0:
         if series.max_episode_number is not None and series.max_episode_number > candidate_num_episodes:
-            score -= 0.12
-            reasons.append(
-                f"episode_evidence_exceeds_candidate_count={series.max_episode_number}>{candidate_num_episodes}"
-            )
+            if _provider_episode_numbering_may_be_aggregated(series, provider_hints, candidate_hints, candidate_num_episodes):
+                score -= 0.03
+                reasons.append(
+                    f"aggregated_episode_numbering_suspected={series.max_episode_number}>{candidate_num_episodes}"
+                )
+            else:
+                score -= 0.12
+                reasons.append(
+                    f"episode_evidence_exceeds_candidate_count={series.max_episode_number}>{candidate_num_episodes}"
+                )
         elif series.completed_episode_count is not None and series.completed_episode_count > candidate_num_episodes:
             score -= 0.12
             reasons.append(
@@ -490,6 +525,21 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             )
 
     media_type = node.get("media_type")
+    if (
+        media_type == "special"
+        and not provider_auxiliary_markers
+        and (series.completed_episode_count or 0) > 1
+    ):
+        score -= 0.10
+        reasons.append("special_penalty_for_multi_episode_series")
+    elif (
+        media_type in {"ova", "ona"}
+        and candidate_num_episodes == 1
+        and not provider_auxiliary_markers
+        and (series.completed_episode_count or 0) > 1
+    ):
+        score -= 0.06
+        reasons.append(f"single_episode_{media_type}_penalty_for_multi_episode_series")
     if media_type == "movie":
         if best_strict_norm == query_strict_norm and best_strict_norm:
             reasons.append("movie_type_allowed_for_exact_title")

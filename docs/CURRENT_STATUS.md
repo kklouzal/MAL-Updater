@@ -71,7 +71,7 @@
     - `start_date` is preserved because the current Crunchyroll snapshot does not prove the true first-watch date
     - `finish_date` may be filled only when Crunchyroll safely implies completion and MAL does not already have one
   - only sends the fields it intends to change, so meaningful existing MAL metadata is left alone
-- candidate scoring now also suppresses two noisy-but-explainable false-near-ties: sequel/spin-off entries with extra installment hints are penalized when the Crunchyroll title has no such hint, and obvious auxiliary titles (`PV`, `extras`, `picture drama`, etc.) are penalized unless the provider title explicitly asks for them
+- candidate scoring now also suppresses several noisy-but-explainable false-near-ties: sequel/spin-off entries with extra installment hints are penalized when the Crunchyroll title has no such hint, obvious auxiliary titles (`PV`, `extras`, `picture drama`, etc.) are penalized unless the provider title explicitly asks for them, single-episode `special`/`OVA` candidates are penalized harder when Crunchyroll clearly looks like a normal multi-episode mainline series, and `max_episode_number > MAL num_episodes` is no longer treated as a full contradiction when explicit later-season installment hints match and the Crunchyroll completed-episode count still fits inside the candidate cleanly (`aggregated_episode_numbering_suspected`)
 - live Crunchyroll evidence is now feeding the completion policy directly:
   - strict ratio completion defaults to `0.95`
   - episodes with `<= 120s` remaining count as watched to cover the dominant credits-skip pattern seen in the dataset
@@ -105,5 +105,6 @@ Keep reducing the genuinely ambiguous mapping residue on top of the now-live loc
 - richer audit/debug surfacing for why an episode counted as completed
 - better review resolution UX for the remaining hard buckets
 - targeted handling for subtitle/arc-title variants and franchise/movie collection naming that still need human review when the provider title is not explicit enough
-- investigate whether some of the remaining same-franchise low-margin ties can be promoted safely by distinguishing canonical series entries from OVAs/recaps/specials without relying on opaque scoring
-- investigate whether aggregated Crunchyroll episode counts can be decomposed more honestly for split-cour / multi-season / movie-shell entries before using them as blockers
+- continue tightening same-franchise low-margin ties with explainable canonical-entry cues (today: auxiliary/special penalties are stronger when Crunchyroll clearly looks like the main multi-episode series)
+- continue decomposing combined Crunchyroll entries more honestly for split-cour / multi-season / movie-shell cases (today: aggregate numbering is softened when explicit installment cues align and only the raw numbering looks inflated)
+- investigate episode-title matching only if a trustworthy episode-metadata source can be used without turning the mapper into an opaque scraper; the current official MAL API surface does not expose episode-title data directly enough to justify pretending this is solved

@@ -32,5 +32,6 @@
 ## Later
 - [ ] Build OpenClaw skill wrapper
 - [ ] Periodic health-check/maintenance loop
-- [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (OVA/recap/special discrimination, canonical-entry cues)
-- [ ] Decompose combined Crunchyroll entries before treating aggregate episode counts as hard blockers for season/movie matching
+- [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (today: stronger single-episode special/OVA discrimination landed; still missing harder canonical-entry/side-story cases)
+- [ ] Decompose combined Crunchyroll entries before treating aggregate episode counts as hard blockers for season/movie matching (today: aligned later-season matches can downgrade raw max-episode conflicts into `aggregated_episode_numbering_suspected` instead of a full blocker)
+- [ ] Decide whether episode-title matching can be added from a trustworthy metadata source without pulling the project into brittle scraping or confidence theater

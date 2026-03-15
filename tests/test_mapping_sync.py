@@ -642,6 +642,134 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 600)
         self.assertIn("split_installment_match=split:2", result.rationale)
 
+    def test_map_series_softens_aggregate_episode_numbering_when_installment_and_completion_evidence_align(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 700,
+                                "title": "Example Show Season 2",
+                                "alternative_titles": {"synonyms": ["Example Show Season 2 (English Dub)"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 600,
+                                "title": "Example Show Season 1",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Example Show",
+                        season_title="Example Show Season 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=25,
+                        completed_episode_count=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 700)
+        self.assertTrue(any(reason == "aggregated_episode_numbering_suspected=25>13" for reason in result.rationale))
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_penalizes_single_special_when_provider_looks_like_multi_episode_main_series(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 710,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 711,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "special",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Example Show",
+                        season_title="Example Show",
+                        season_number=1,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 710)
+        self.assertIn("special_penalty_for_multi_episode_series", result.candidates[1].match_reasons)
+
     def test_map_series_prefers_title_season_hint_when_provider_metadata_is_noisy(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
