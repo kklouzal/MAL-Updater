@@ -108,3 +108,21 @@ Use the Python-side impersonated transport as the primary Crunchyroll auth and l
 - it reuses the already-proven `curl_cffi` browser-TLS impersonation workaround when needed
 - it gets real data into the local pipeline now instead of blocking on alternative transport ideas
 - it keeps the repo architecture coherent and smaller
+
+## 2026-03-14 - Crunchyroll incremental boundary posture
+
+### Decision
+Treat repeated Crunchyroll fetches as incremental by default.
+
+### Rules
+- Persist a local `sync_boundary.json` checkpoint under `state/crunchyroll/<profile>/` only after a successful snapshot fetch completes.
+- Store only lightweight leading-page markers for watch-history and watchlist, not a second shadow database.
+- On the next fetch, stop paging once a previously seen marker appears in the current page; keep the current page, but do not keep walking older pages.
+- If the stored boundary belongs to a different Crunchyroll account, ignore it.
+- Provide an explicit operator escape hatch (`crunchyroll-fetch-snapshot --full-refresh`) for full pagination when needed.
+- Prefer explainable overlap-based stopping over more aggressive heuristics about dates/count deltas/order stability.
+
+### Why
+- the recurring durability problem is still fresh full-cycle Crunchyroll paging, especially `watch-history` returning `401` before the run finishes
+- an overlap checkpoint directly reduces request count on repeated runs without pretending deleted/reordered remote history is solved
+- keeping the boundary file small and local makes the behavior auditable and easy to reset

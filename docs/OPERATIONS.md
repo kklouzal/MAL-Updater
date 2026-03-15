@@ -7,7 +7,7 @@ Expected local directories relative to repo root:
 - `config/` - non-secret local configuration
 - `secrets/` - credentials/tokens only (gitignored)
 - `data/` - SQLite database and durable local data (gitignored)
-- `state/` - transient state/checkpoints (gitignored)
+- `state/` - transient state/checkpoints (gitignored), including Crunchyroll auth/session material and the incremental `sync_boundary.json` overlap checkpoint
 - `cache/` - fetch/cache scratch space (gitignored)
 
 ## Useful commands
@@ -59,6 +59,7 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --full-refresh
 ```
 
 ### Inspect MAL mapping candidates

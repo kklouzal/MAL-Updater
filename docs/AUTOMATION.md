@@ -31,6 +31,7 @@ Safety properties:
 - live MAL writes remain constrained by the guarded executor
 - exact-only currently means approved mappings whose persisted `mapping_source` is `auto_exact` or `user_exact`
 - Crunchyroll auth recovery is bounded and conservative: the fetch path first tries the staged refresh token, and if Crunchyroll answers `401` on the content API mid-run (or the refresh token itself has expired), it performs one credential rebootstrap from the locally staged secrets, retries the failed request, and resumes the same fetch cycle instead of restarting from scratch or looping indefinitely
+- successful fetches now update `state/crunchyroll/<profile>/sync_boundary.json`, so later unattended runs can stop history/watchlist paging once they hit already-synced overlap instead of walking the full older tail every time
 - if a fresh fetch still cannot be salvaged, the exact-approved wrapper now continues with the most recent already-ingested Crunchyroll state instead of aborting the entire MAL apply pass
 
 ## Crunchyroll pacing

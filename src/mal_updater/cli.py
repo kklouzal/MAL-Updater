@@ -76,8 +76,10 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"crunchyroll.refresh_token_path={crunchyroll_state.refresh_token_path}")
     print(f"crunchyroll.device_id_path={crunchyroll_state.device_id_path}")
     print(f"crunchyroll.session_state_path={crunchyroll_state.session_state_path}")
+    print(f"crunchyroll.sync_boundary_path={crunchyroll_state.sync_boundary_path}")
     print(f"crunchyroll.refresh_token_present={crunchyroll_state.refresh_token_path.exists()}")
     print(f"crunchyroll.device_id_present={crunchyroll_state.device_id_path.exists()}")
+    print(f"crunchyroll.sync_boundary_present={crunchyroll_state.sync_boundary_path.exists()}")
     print(f"mal.client_id_present={bool(secrets.client_id)}")
     print(f"mal.client_secret_present={bool(secrets.client_secret)}")
     print(f"mal.access_token_present={bool(secrets.access_token)}")
@@ -260,11 +262,17 @@ def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None
     return 0
 
 
-def _cmd_crunchyroll_fetch_snapshot(project_root: Path | None, profile: str, out_path: Path | None, ingest: bool) -> int:
+def _cmd_crunchyroll_fetch_snapshot(
+    project_root: Path | None,
+    profile: str,
+    out_path: Path | None,
+    ingest: bool,
+    full_refresh: bool,
+) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     try:
-        result = fetch_snapshot(config, profile=profile)
+        result = fetch_snapshot(config, profile=profile, use_incremental_boundary=not full_refresh)
     except (CrunchyrollAuthError, CrunchyrollSnapshotError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -556,6 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
     crunchyroll_fetch_snapshot.add_argument("--profile", default="default", help="Crunchyroll state profile name")
     crunchyroll_fetch_snapshot.add_argument("--out", type=Path, default=None, help="Optional JSON file path to write the fetched snapshot")
     crunchyroll_fetch_snapshot.add_argument("--ingest", action="store_true", help="Immediately validate and ingest the fetched snapshot into SQLite")
+    crunchyroll_fetch_snapshot.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="Ignore the local incremental sync boundary and fetch the full currently reachable Crunchyroll history/watchlist pages",
+    )
     validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a Crunchyroll snapshot JSON payload")
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a Crunchyroll snapshot into SQLite")
@@ -630,7 +643,7 @@ def main() -> int:
     if args.command == "crunchyroll-auth-login":
         return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
     if args.command == "crunchyroll-fetch-snapshot":
-        return _cmd_crunchyroll_fetch_snapshot(args.project_root, args.profile, args.out, args.ingest)
+        return _cmd_crunchyroll_fetch_snapshot(args.project_root, args.profile, args.out, args.ingest, args.full_refresh)
     if args.command == "validate-snapshot":
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":

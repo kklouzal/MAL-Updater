@@ -71,6 +71,7 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --full-refresh
 ./scripts/run_exact_approved_sync_cycle.sh
 PYTHONPATH=src python3 -m mal_updater.cli validate-snapshot path/to/snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli ingest-snapshot path/to/snapshot.json
@@ -119,6 +120,7 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
 - `crunchyroll-auth-login` uses local Crunchyroll username/password secrets to fetch a real refresh token + device id and stage them into `state/crunchyroll/<profile>/`; if optional `curl_cffi` support is installed, it uses browser-TLS impersonation to get through Crunchyroll's Cloudflare layer
 - `crunchyroll-fetch-snapshot` is the live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, and if a Crunchyroll `401` happens mid-run it performs one bounded credential rebootstrap, retries the failed request in place, and continues the same fetch cycle before normalizing the result into the JSON contract; it can write a snapshot file and/or ingest it directly
+- successful fetches now persist a lightweight `state/crunchyroll/<profile>/sync_boundary.json` checkpoint containing leading watch-history/watchlist markers; later runs use that checkpoint to stop paging once already-seen overlap is reached, while `--full-refresh` intentionally bypasses the checkpoint and walks the full currently reachable pages
 - the live Crunchyroll fetch path now intentionally spaces individual Crunchyroll HTTP requests by `crunchyroll.request_spacing_seconds` with `crunchyroll.request_spacing_jitter_seconds` (default: `22.5 ± 7.5s`, i.e. randomized 15-30 seconds between requests) so the unattended cadence stays conservative
 - a real live run on this host succeeds through the Python path and ingests into SQLite (`series_count=245`, `progress_count=4311`, `watchlist_count=197` on the latest local snapshot)
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`

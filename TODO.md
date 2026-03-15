@@ -30,7 +30,8 @@
 - [ ] Genre/studio/VA/taste feature ideas
 
 ## Later
-- [ ] Re-stabilize fresh live Crunchyroll fetches after the current `watch-history` HTTP 401 regression (credential re-login succeeds, but full snapshot fetch now fails before ingestion)
+- [ ] Re-stabilize fresh live Crunchyroll fetches after the current `watch-history` HTTP 401 regression (credential re-login succeeds, but full snapshot fetch still depends on `watch-history` surviving at least until the incremental overlap boundary is reached)
+- [x] Add a conservative incremental Crunchyroll sync boundary/checkpoint so repeated runs can stop history/watchlist paging once already-synced overlap is detected
 - [ ] Build OpenClaw skill wrapper
 - [ ] Periodic health-check/maintenance loop
 - [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (today: stronger single-episode special/OVA discrimination landed; still missing harder canonical-entry/side-story cases)

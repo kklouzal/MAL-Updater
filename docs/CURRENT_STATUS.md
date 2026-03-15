@@ -26,6 +26,7 @@
   - normalizes the live responses into the existing `1.0` snapshot contract
   - exposes `crunchyroll-fetch-snapshot` in the CLI, with optional direct ingestion
   - now treats Crunchyroll `401` responses as auth-state failures instead of terminal fetch failures: one fresh credential rebootstrap is attempted from the staged local secrets, then the snapshot fetch is retried once and stops there
+  - now persists an incremental `sync_boundary.json` checkpoint under `state/crunchyroll/<profile>/` after successful fetches and uses it on later runs to stop history/watchlist paging once already-seen overlap is reached; `--full-refresh` bypasses that checkpoint deliberately
 - the Python fetch path has produced real live Crunchyroll data on this host
 - a live snapshot was validated and ingested into SQLite with:
   - `series_count=245`
@@ -104,7 +105,7 @@ What was verified locally:
 - that means `168 / 245` series are now durably auto-approvable/preserved without human intervention, versus `156 / 245` before the latest rule pass
 - the remaining review residue is now concentrated in a few honest buckets: same-franchise low-margin ties, aggregated-episode-count conflicts across multi-cour/combined Crunchyroll entries, weak MAL search/alt-title gaps, and movie/collection shells where the title is clear but provider episode evidence still spans more than one MAL entry
 
-Current blocker note: a fresh live Crunchyroll fetch is presently failing reproducibly at `watch-history` with HTTP 401 even after a fresh credential-based re-login, so the latest successful exact-approved MAL apply had to run from the most recent already-ingested real live snapshot (`sync_runs.id=5`, 245 series / 4311 progress / 197 watchlist) rather than from a brand-new fetch.
+Current blocker note: a fresh live Crunchyroll fetch is presently failing reproducibly at `watch-history` with HTTP 401 even after a fresh credential-based re-login. The new incremental boundary should reduce how often later pages are needed on repeated successful runs, but it does **not** eliminate the need for `watch-history` to survive long enough to return at least the overlap page. So the latest successful exact-approved MAL apply still had to run from the most recent already-ingested real live snapshot (`sync_runs.id=5`, 245 series / 4311 progress / 197 watchlist) rather than from a brand-new fetch.
 
 That means the remaining work is now split between: (1) re-stabilizing the fresh Crunchyroll fetch path, and (2) continuing downstream sync-policy hardening, review UX, and recommendation work.
 

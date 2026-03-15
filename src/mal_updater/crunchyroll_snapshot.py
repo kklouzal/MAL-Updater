@@ -43,6 +43,9 @@ class CrunchyrollUnauthorizedError(CrunchyrollSnapshotError):
 
 
 DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
+SYNC_BOUNDARY_SCHEMA_VERSION = 1
+HISTORY_BOUNDARY_MARKER_LIMIT = 200
+WATCHLIST_BOUNDARY_MARKER_LIMIT = 200
 
 
 @dataclass(slots=True)
@@ -59,6 +62,14 @@ class CrunchyrollFetchResult:
     snapshot: CrunchyrollSnapshot
     state_paths: CrunchyrollStatePaths
     account_email: str | None
+
+
+@dataclass(slots=True)
+class _SyncBoundary:
+    generated_at: str | None
+    account_id_hint: str | None
+    history_markers: list[str]
+    watchlist_markers: list[str]
 
 
 @dataclass(slots=True)
@@ -471,6 +482,108 @@ def _dedupe_series(series_items: list[SeriesRef]) -> list[SeriesRef]:
     return list(by_id.values())
 
 
+def _history_entry_fingerprint(entry: dict[str, Any]) -> str | None:
+    panel = entry.get("panel")
+    if not isinstance(panel, dict):
+        return None
+    metadata = _panel_metadata(panel)
+    provider_episode_id = panel.get("id")
+    provider_series_id = metadata.get("series_id") or metadata.get("movie_listing_id")
+    panel_type = panel.get("type")
+    last_watched_at = entry.get("date_played")
+    playhead = entry.get("playhead")
+    fully_watched = entry.get("fully_watched")
+    if not provider_episode_id or not provider_series_id or not panel_type:
+        return None
+    return "|".join(
+        [
+            str(panel_type),
+            str(provider_series_id),
+            str(provider_episode_id),
+            str(last_watched_at or ""),
+            str(playhead if playhead is not None else ""),
+            str(bool(fully_watched)),
+        ]
+    )
+
+
+def _watchlist_entry_fingerprint(entry: dict[str, Any]) -> str | None:
+    series_ref, watchlist_entry = _watchlist_from_entry(entry)
+    if series_ref is None or watchlist_entry is None:
+        return None
+    return "|".join(
+        [
+            str(series_ref.provider_series_id),
+            str(watchlist_entry.status),
+            str(watchlist_entry.added_at or ""),
+        ]
+    )
+
+
+def _load_sync_boundary(state_paths: CrunchyrollStatePaths) -> _SyncBoundary | None:
+    path = state_paths.sync_boundary_path
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("schema_version") or 0) != SYNC_BOUNDARY_SCHEMA_VERSION:
+        return None
+    history = payload.get("history") if isinstance(payload.get("history"), dict) else {}
+    watchlist = payload.get("watchlist") if isinstance(payload.get("watchlist"), dict) else {}
+    return _SyncBoundary(
+        generated_at=str(payload.get("generated_at")) if payload.get("generated_at") else None,
+        account_id_hint=str(payload.get("account_id_hint")) if payload.get("account_id_hint") else None,
+        history_markers=[str(item) for item in history.get("first_seen", []) if item],
+        watchlist_markers=[str(item) for item in watchlist.get("first_seen", []) if item],
+    )
+
+
+def _write_sync_boundary(
+    *,
+    state_paths: CrunchyrollStatePaths,
+    generated_at: str,
+    account_id_hint: str | None,
+    history_entries: list[dict[str, Any]],
+    watchlist_entries: list[dict[str, Any]],
+) -> None:
+    state_paths.root.mkdir(parents=True, exist_ok=True)
+    history_markers = []
+    for entry in history_entries:
+        fingerprint = _history_entry_fingerprint(entry)
+        if fingerprint and fingerprint not in history_markers:
+            history_markers.append(fingerprint)
+        if len(history_markers) >= HISTORY_BOUNDARY_MARKER_LIMIT:
+            break
+    watchlist_markers = []
+    for entry in watchlist_entries:
+        fingerprint = _watchlist_entry_fingerprint(entry)
+        if fingerprint and fingerprint not in watchlist_markers:
+            watchlist_markers.append(fingerprint)
+        if len(watchlist_markers) >= WATCHLIST_BOUNDARY_MARKER_LIMIT:
+            break
+    payload = {
+        "schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
+        "generated_at": generated_at,
+        "account_id_hint": account_id_hint,
+        "history": {
+            "marker_limit": HISTORY_BOUNDARY_MARKER_LIMIT,
+            "retained_count": len(history_markers),
+            "first_seen": history_markers,
+        },
+        "watchlist": {
+            "marker_limit": WATCHLIST_BOUNDARY_MARKER_LIMIT,
+            "retained_count": len(watchlist_markers),
+            "first_seen": watchlist_markers,
+        },
+    }
+    state_paths.sync_boundary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    state_paths.sync_boundary_path.chmod(0o600)
+
+
 def _token_from_bootstrap(result: CrunchyrollBootstrapResult) -> CrunchyrollAccessToken:
     return CrunchyrollAccessToken(
         access_token=result.access_token,
@@ -520,7 +633,11 @@ def _start_auth_session(
         )
 
 
-def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchResult:
+def _fetch_snapshot_once(
+    session: _CrunchyrollAuthSession,
+    *,
+    use_incremental_boundary: bool = True,
+) -> CrunchyrollFetchResult:
     config = session.config
     account_payload = session.authorized_json_get(CRUNCHYROLL_ME_URL)
     if not isinstance(account_payload, dict):
@@ -532,13 +649,22 @@ def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchRe
     if account_payload.get("email"):
         session.account_email = str(account_payload.get("email"))
 
+    boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
+    if boundary and boundary.account_id_hint and boundary.account_id_hint != account_id:
+        boundary = None
+    history_markers = set(boundary.history_markers) if boundary else set()
+    watchlist_markers = set(boundary.watchlist_markers) if boundary else set()
+
     history_entries: list[dict[str, Any]] = []
+    history_pages_fetched = 0
+    history_stopped_early = False
     page = 1
     while True:
         history_payload = session.authorized_json_get(
             f"https://www.crunchyroll.com/content/v2/{account_id}/watch-history",
             params={"page": page, "page_size": 100, "locale": config.crunchyroll.locale},
         )
+        history_pages_fetched += 1
         if not isinstance(history_payload, dict):
             raise CrunchyrollSnapshotError("Crunchyroll watch-history response was not a JSON object")
         data = history_payload.get("data")
@@ -546,6 +672,9 @@ def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchRe
             raise CrunchyrollSnapshotError("Crunchyroll watch-history response did not include a data list")
         batch = [item for item in data if isinstance(item, dict)]
         history_entries.extend(batch)
+        if history_markers and any((_history_entry_fingerprint(item) in history_markers) for item in batch):
+            history_stopped_early = True
+            break
         total = history_payload.get("total")
         if len(batch) < 100:
             break
@@ -555,12 +684,15 @@ def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchRe
 
     watchlist_data: list[dict[str, Any]] = []
     watchlist_total: int | None = None
+    watchlist_pages_fetched = 0
+    watchlist_stopped_early = False
     watchlist_start = 0
     while True:
         watchlist_payload = session.authorized_json_get(
             f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist",
             params={"locale": config.crunchyroll.locale, "n": 100, "start": watchlist_start},
         )
+        watchlist_pages_fetched += 1
         if not isinstance(watchlist_payload, dict):
             raise CrunchyrollSnapshotError("Crunchyroll watchlist response was not a JSON object")
         data = watchlist_payload.get("data")
@@ -568,6 +700,9 @@ def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchRe
             raise CrunchyrollSnapshotError("Crunchyroll watchlist response did not include a data list")
         batch = [item for item in data if isinstance(item, dict)]
         watchlist_data.extend(batch)
+        if watchlist_markers and any((_watchlist_entry_fingerprint(item) in watchlist_markers) for item in batch):
+            watchlist_stopped_early = True
+            break
         total = watchlist_payload.get("total")
         if isinstance(total, int):
             watchlist_total = total
@@ -593,9 +728,10 @@ def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchRe
         if watchlist_entry is not None:
             watchlist_entries.append(watchlist_entry)
 
+    generated_at = _now_string()
     snapshot = CrunchyrollSnapshot(
         contract_version=config.contract_version,
-        generated_at=_now_string(),
+        generated_at=generated_at,
         provider="crunchyroll",
         account_id_hint=account_id,
         series=_dedupe_series(history_series + watchlist_series),
@@ -606,16 +742,34 @@ def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchRe
             "profile": session.profile,
             "state_root": str(session.state_paths.root),
             "session_state_path": str(session.state_paths.session_state_path),
+            "sync_boundary_path": str(session.state_paths.sync_boundary_path),
+            "sync_boundary_present": boundary is not None,
+            "sync_boundary_mode": "incremental" if use_incremental_boundary else "full_refresh",
+            "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
+            "sync_boundary_account_match": None if boundary is None else boundary.account_id_hint == account_id,
             "refresh_token_present": session.state_paths.refresh_token_path.exists(),
             "device_id_present": session.state_paths.device_id_path.exists(),
             "device_type_hint": session.token.device_type,
             "history_count": len(history_entries),
+            "history_pages_fetched": history_pages_fetched,
+            "history_stopped_early": history_stopped_early,
+            "history_boundary_marker_count": len(history_markers),
             "watchlist_count": len(watchlist_entries),
+            "watchlist_pages_fetched": watchlist_pages_fetched,
+            "watchlist_stopped_early": watchlist_stopped_early,
+            "watchlist_boundary_marker_count": len(watchlist_markers),
             "transport": "curl_cffi:chrome124" if curl_requests is not None else "requests",
             "request_spacing_seconds": config.crunchyroll.request_spacing_seconds,
             "request_spacing_jitter_seconds": config.crunchyroll.request_spacing_jitter_seconds,
             "auth_source": session.auth_source,
         },
+    )
+    _write_sync_boundary(
+        state_paths=session.state_paths,
+        generated_at=generated_at,
+        account_id_hint=account_id,
+        history_entries=history_entries,
+        watchlist_entries=watchlist_data,
     )
     _write_session_state(
         state_paths=session.state_paths,
@@ -639,6 +793,7 @@ def fetch_snapshot(
     *,
     profile: str = "default",
     timeout_seconds: float = 30.0,
+    use_incremental_boundary: bool = True,
 ) -> CrunchyrollFetchResult:
     pacer = _CrunchyrollRequestPacer(
         config.crunchyroll.request_spacing_seconds,
@@ -650,7 +805,7 @@ def fetch_snapshot(
         timeout_seconds=timeout_seconds,
         pacer=pacer,
     )
-    return _fetch_snapshot_once(session)
+    return _fetch_snapshot_once(session, use_incremental_boundary=use_incremental_boundary)
 
 
 def snapshot_to_dict(snapshot: CrunchyrollSnapshot) -> dict[str, Any]:

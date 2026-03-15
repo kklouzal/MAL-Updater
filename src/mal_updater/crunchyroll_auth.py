@@ -44,6 +44,7 @@ class CrunchyrollStatePaths:
     refresh_token_path: Path
     device_id_path: Path
     session_state_path: Path
+    sync_boundary_path: Path
 
 
 @dataclass(slots=True)
@@ -74,6 +75,7 @@ def resolve_crunchyroll_state_paths(config: AppConfig, profile: str = "default")
         refresh_token_path=root / "refresh_token.txt",
         device_id_path=root / "device_id.txt",
         session_state_path=root / "session.json",
+        sync_boundary_path=root / "sync_boundary.json",
     )
 
 
