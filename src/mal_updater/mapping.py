@@ -19,6 +19,9 @@ _TITLE_CLEANUPS = [
     re.compile(r"\(english dub\)", re.IGNORECASE),
     re.compile(r"\(dub\)", re.IGNORECASE),
     re.compile(r"\benglish dub\b", re.IGNORECASE),
+    re.compile(r"\bfrench dub\b", re.IGNORECASE),
+    re.compile(r"\bbroadcast version\b", re.IGNORECASE),
+    re.compile(r"\buncensored\b", re.IGNORECASE),
     re.compile(r"\bseason\s+\d+\b", re.IGNORECASE),
     re.compile(r"\bpart\s+\d+\b", re.IGNORECASE),
 ]
@@ -83,6 +86,32 @@ _ROMAN_TO_NUMBER = {
     "viii": 8,
     "ix": 9,
     "x": 10,
+}
+
+_NUMBER_TO_ORDINAL = {
+    1: "1st",
+    2: "2nd",
+    3: "3rd",
+    4: "4th",
+    5: "5th",
+    6: "6th",
+    7: "7th",
+    8: "8th",
+    9: "9th",
+    10: "10th",
+}
+
+_NUMBER_TO_ROMAN = {
+    1: "I",
+    2: "II",
+    3: "III",
+    4: "IV",
+    5: "V",
+    6: "VI",
+    7: "VII",
+    8: "VIII",
+    9: "IX",
+    10: "X",
 }
 
 
@@ -182,6 +211,20 @@ def _fallback_queries(query: str) -> list[str]:
     return variants
 
 
+def _season_number_query_variants(title: str, season_number: int | None) -> list[str]:
+    if not title or season_number is None or season_number < 2:
+        return []
+    variants = [
+        f"{title} Season {season_number}",
+        f"{title} {_NUMBER_TO_ORDINAL.get(season_number, f'{season_number}th')} Season",
+        f"{title} {season_number}",
+    ]
+    roman = _NUMBER_TO_ROMAN.get(season_number)
+    if roman:
+        variants.append(f"{title} {roman}")
+    return variants
+
+
 def build_search_queries(series: SeriesMappingInput) -> list[str]:
     queries: list[str] = []
 
@@ -198,6 +241,8 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
     add_query(series.season_title)
     if series.season_title and _season_title_needs_base_title(series.title, series.season_title):
         add_query(f"{series.title} {series.season_title}")
+    for variant in _season_number_query_variants(series.title, series.season_number):
+        add_query(variant)
     add_query(series.title)
     return queries or [_search_query_cleanup(series.title)]
 
@@ -550,6 +595,99 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     return score, reasons
 
 
+def _candidate_positive_signal_count(candidate: MappingCandidate) -> int:
+    return sum(
+        1
+        for reason in candidate.match_reasons
+        if reason == "exact_normalized_title"
+        or reason.startswith(
+            (
+                "season_number_match=",
+                "part_hint_match=",
+                "split_installment_match=",
+                "roman_installment_match=",
+                "installment_hint_match=",
+            )
+        )
+        or reason == "final_season_hint_match"
+        or reason == "movie_type_allowed_for_exact_title"
+    )
+
+
+def _candidate_penalty_count(candidate: MappingCandidate) -> int:
+    penalty_prefixes = (
+        "season_number_mismatch=",
+        "installment_hint_conflict=",
+        "candidate_missing_installment_hint",
+        "candidate_extra_installment_hint",
+        "candidate_auxiliary_content=",
+        "episode_evidence_exceeds_candidate_count=",
+        "completed_evidence_exceeds_candidate_count=",
+    )
+    penalty_reasons = sum(1 for reason in candidate.match_reasons if reason.startswith(penalty_prefixes))
+    if candidate.media_type in {"special", "pv"}:
+        penalty_reasons += 1
+    return penalty_reasons
+
+
+def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, str, int]:
+    return (
+        candidate.score,
+        int("exact_normalized_title" in candidate.match_reasons),
+        _candidate_positive_signal_count(candidate),
+        -_candidate_penalty_count(candidate),
+        len(normalize_title_strict(candidate.matched_query)),
+        candidate.title.lower(),
+        -candidate.mal_anime_id,
+    )
+
+
+def _candidate_is_explainably_weaker(series: SeriesMappingInput, candidate: MappingCandidate) -> bool:
+    weaker_prefixes = (
+        "season_number_mismatch=",
+        "installment_hint_conflict=",
+        "candidate_missing_installment_hint",
+        "candidate_extra_installment_hint",
+        "candidate_auxiliary_content=",
+        "episode_evidence_exceeds_candidate_count=",
+        "completed_evidence_exceeds_candidate_count=",
+    )
+    if any(reason.startswith(weaker_prefixes) for reason in candidate.match_reasons):
+        return True
+    if candidate.media_type in {"special", "pv"}:
+        return True
+    if candidate.media_type in {"ova", "ona"} and candidate.num_episodes == 1 and (series.completed_episode_count or 0) > 1:
+        return True
+    return False
+
+
+def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
+    if second is None:
+        return top.score >= 0.99
+    if top.score >= 0.99 and top.score - second.score >= 0.05:
+        return True
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
+
+    reasons = list(top.match_reasons)
+    if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons):
+        return False
+
+    top_query_norm = normalize_title_strict(top.matched_query)
+    base_query_norm = normalize_title_strict(series.title)
+    second_query_norm = normalize_title_strict(second.matched_query)
+    has_specific_installment_context = (series.season_number or 0) >= 2 and top_query_norm != base_query_norm
+    if not has_specific_installment_context or top.score < 0.99:
+        return False
+    if _candidate_is_explainably_weaker(series, second):
+        return True
+    if "exact_normalized_title" not in second.match_reasons:
+        return True
+    if second_query_norm == base_query_norm and top_query_norm != base_query_norm:
+        return True
+    return False
+
+
 def should_auto_approve_mapping(result: MappingResult) -> bool:
     if result.status != "exact" or result.chosen_candidate is None:
         return False
@@ -603,7 +741,7 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
                 previous = by_id.get(candidate.mal_anime_id)
                 if previous is None or candidate.score > previous.score:
                     by_id[candidate.mal_anime_id] = candidate
-    candidates = sorted(by_id.values(), key=lambda item: (-item.score, item.title.lower(), item.mal_anime_id))
+    candidates = sorted(by_id.values(), key=_candidate_sort_key, reverse=True)
     top = candidates[0] if candidates else None
     second = candidates[1] if len(candidates) > 1 else None
     rationale: list[str] = []
@@ -613,7 +751,7 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
     rationale.append(f"top_score={top.score:.3f}")
     rationale.append(f"margin={margin:.3f}")
     rationale.extend(top.match_reasons)
-    if top.score >= 0.99 and margin >= 0.05:
+    if _supports_exact_classification(series, top, second):
         status = "exact"
     elif top.score >= 0.90 and margin >= 0.05:
         status = "strong"

@@ -67,6 +67,7 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.redirect_uri={config.mal.redirect_uri}")
     print(f"crunchyroll.locale={config.crunchyroll.locale}")
     print(f"crunchyroll.request_spacing_seconds={config.crunchyroll.request_spacing_seconds}")
+    print(f"crunchyroll.request_spacing_jitter_seconds={config.crunchyroll.request_spacing_jitter_seconds}")
     print(f"crunchyroll.username_present={bool(crunchyroll_credentials.username)}")
     print(f"crunchyroll.password_present={bool(crunchyroll_credentials.password)}")
     print(f"crunchyroll.username_path={crunchyroll_credentials.username_path}")
@@ -408,6 +409,7 @@ def _cmd_approve_mapping(
     mal_anime_id: int,
     confidence: float | None,
     notes: str | None,
+    exact: bool,
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -418,7 +420,7 @@ def _cmd_approve_mapping(
         provider_series_id=provider_series_id,
         mal_anime_id=mal_anime_id,
         confidence=confidence,
-        mapping_source="user_approved",
+        mapping_source="user_exact" if exact else "user_approved",
         approved_by_user=True,
         notes=notes,
     )
@@ -575,6 +577,11 @@ def build_parser() -> argparse.ArgumentParser:
     approve_mapping.add_argument("mal_anime_id", type=int, help="Chosen MAL anime id")
     approve_mapping.add_argument("--confidence", type=float, default=None, help="Optional confidence score to store alongside the approval")
     approve_mapping.add_argument("--notes", default=None, help="Optional operator note explaining the approval")
+    approve_mapping.add_argument(
+        "--exact",
+        action="store_true",
+        help="Mark this manual approval as exact-safe so the unattended exact-approved executor may use it",
+    )
     dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested Crunchyroll data")
     dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect (use 0 for all; required when persisting review_queue)")
     dry_run_sync.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
@@ -635,7 +642,14 @@ def main() -> int:
     if args.command == "list-mappings":
         return _cmd_list_mappings(args.project_root, args.approved_only)
     if args.command == "approve-mapping":
-        return _cmd_approve_mapping(args.project_root, args.provider_series_id, args.mal_anime_id, args.confidence, args.notes)
+        return _cmd_approve_mapping(
+            args.project_root,
+            args.provider_series_id,
+            args.mal_anime_id,
+            args.confidence,
+            args.notes,
+            args.exact,
+        )
     if args.command == "dry-run-sync":
         return _cmd_dry_run_sync(
             args.project_root,

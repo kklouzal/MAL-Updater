@@ -81,7 +81,7 @@
 
 ## Current Crunchyroll state
 
-The practical live Crunchyroll path is working on this machine.
+The practical live Crunchyroll path has worked on this machine, but is not fully stable yet.
 
 What was verified locally:
 
@@ -90,6 +90,12 @@ What was verified locally:
 - the minted refresh token also refreshes successfully through the same Python impersonated transport
 - the Python fetch path can retrieve real live Crunchyroll data on this host and normalize it honestly
 - validated live snapshots ingest cleanly into SQLite
+- the first real guarded exact-approved MAL apply run was executed against the latest successfully ingested live Crunchyroll dataset on 2026-03-15:
+  - 179 exact-approved mappings considered
+  - 126 MAL entries updated successfully
+  - applied status mix: 78 `completed`, 36 `watching`, 12 `plan_to_watch`
+  - 46 entries were skipped by the forward-safe rules
+  - 7 entries remained unapplied due to recoverable live API issues (6 MAL detail timeouts, 1 MAL update redirect/error)
 - latest live mapping audit over the current 245-series Crunchyroll dataset now lands at:
   - `83` preserved already-approved mappings
   - `85` fresh safe `auto_exact` mappings
@@ -98,7 +104,9 @@ What was verified locally:
 - that means `168 / 245` series are now durably auto-approvable/preserved without human intervention, versus `156 / 245` before the latest rule pass
 - the remaining review residue is now concentrated in a few honest buckets: same-franchise low-margin ties, aggregated-episode-count conflicts across multi-cour/combined Crunchyroll entries, weak MAL search/alt-title gaps, and movie/collection shells where the title is clear but provider episode evidence still spans more than one MAL entry
 
-That means the active blocker is no longer Crunchyroll access itself. The remaining work is downstream sync policy hardening, review UX, and recommendation work.
+Current blocker note: a fresh live Crunchyroll fetch is presently failing reproducibly at `watch-history` with HTTP 401 even after a fresh credential-based re-login, so the latest successful exact-approved MAL apply had to run from the most recent already-ingested real live snapshot (`sync_runs.id=5`, 245 series / 4311 progress / 197 watchlist) rather than from a brand-new fetch.
+
+That means the remaining work is now split between: (1) re-stabilizing the fresh Crunchyroll fetch path, and (2) continuing downstream sync-policy hardening, review UX, and recommendation work.
 
 ## Next practical milestone
 

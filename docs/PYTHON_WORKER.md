@@ -109,7 +109,7 @@ Current behavior:
 - noisy provider `season_number` metadata is no longer blindly trusted when `season_title` contains a conflicting explicit season number; the title cue wins and the conflict is surfaced in rationale
 - exact movie-title matches are allowed even when Crunchyroll grouped the item under a movie/collection shell, but movies are still penalized by default when that exact title evidence is absent
 - `review-mappings` produces an approval queue: approved mappings are preserved, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` rows, strong-but-not-exact matches are marked `ready_for_approval`, explicit installment-hint conflicts block auto-approval, ambiguous/weak cases stay review-only, and `--persist-review-queue` replaces open `mapping_review` rows in SQLite with the unresolved items from the latest pass
-- `approve-mapping` persists an explicit Crunchyroll -> MAL choice into `mal_series_mapping`
+- `approve-mapping` persists an explicit Crunchyroll -> MAL choice into `mal_series_mapping`; `--exact` records a manual exact-safe approval as `user_exact`
 - `list-mappings` shows the durable mapping cache already saved in SQLite
 - `dry-run-sync` prefers approved persisted mappings before doing fresh search work and can auto-promote the same safe exact matches into durable `auto_exact` approvals
 - `dry-run-sync --approved-mappings-only` is the executor safety gate: it refuses to plan anything that lacks durable approval
@@ -162,7 +162,7 @@ Behavior:
 - refreshes the staged Crunchyroll refresh token from `state/crunchyroll/<profile>/`
 - uses `curl_cffi` browser-TLS impersonation when available
 - fetches real account / watch-history / watchlist data
-- spaces individual Crunchyroll requests by `crunchyroll.request_spacing_seconds` (default `10.0`)
+- spaces individual Crunchyroll requests by `crunchyroll.request_spacing_seconds ± crunchyroll.request_spacing_jitter_seconds` (default `10.0 ± 3.0`, so about 7-13 seconds)
 - paginates Crunchyroll watchlists with the provider's `n` + `start` parameters so large libraries are ingested completely
 - normalizes the result into the existing `1.0` snapshot contract
 - can immediately validate + ingest into SQLite
@@ -171,3 +171,6 @@ Behavior:
 
 - persist richer audit/debug output if we want to surface *why* a specific episode counted as completed (strict threshold vs credits window vs follow-on evidence)
 - missing-data-only merge rules / richer field policy if score/start/finish dates are ever brought into scope
+f score/start/finish dates are ever brought into scope
+ into scope
+f score/start/finish dates are ever brought into scope

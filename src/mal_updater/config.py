@@ -48,6 +48,7 @@ class MalSettings:
 class CrunchyrollSettings:
     locale: str = DEFAULT_CRUNCHYROLL_LOCALE
     request_spacing_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS
+    request_spacing_jitter_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS
 
 
 @dataclass(slots=True)
@@ -292,6 +293,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 os.getenv(
                     "MAL_UPDATER_CRUNCHYROLL_REQUEST_SPACING_SECONDS",
                     _get_float(crunchyroll_section, "request_spacing_seconds", DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS),
+                )
+            ),
+            request_spacing_jitter_seconds=float(
+                os.getenv(
+                    "MAL_UPDATER_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS",
+                    _get_float(
+                        crunchyroll_section,
+                        "request_spacing_jitter_seconds",
+                        DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS,
+                    ),
                 )
             ),
         ),

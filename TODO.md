@@ -30,6 +30,7 @@
 - [ ] Genre/studio/VA/taste feature ideas
 
 ## Later
+- [ ] Re-stabilize fresh live Crunchyroll fetches after the current `watch-history` HTTP 401 regression (credential re-login succeeds, but full snapshot fetch now fails before ingestion)
 - [ ] Build OpenClaw skill wrapper
 - [ ] Periodic health-check/maintenance loop
 - [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (today: stronger single-episode special/OVA discrimination landed; still missing harder canonical-entry/side-story cases)
@@ -38,4 +39,4 @@
 
 - [x] Add conservative Crunchyroll request spacing to the live fetch path
 - [x] Add an exact-approved-only executor gate for unattended runs
-- [x] Add a lock-protected exact-approved sync wrapper + checked-in user systemd timer units for ~6-hour local cadence
+- [x] Add a lock-protected exact-approved sync wrapper + checked-in user systemd timer units for a jittered ~8-hour-average local cadence

@@ -10,8 +10,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.auth import format_auth_flow_prompt, persist_token_response, write_secret_file
-from mal_updater.cli import _cmd_dry_run_sync, _cmd_review_mappings
+from mal_updater.cli import _cmd_approve_mapping, _cmd_dry_run_sync, _cmd_review_mappings
 from mal_updater.config import load_config, load_mal_secrets
+from mal_updater.db import bootstrap_database, get_series_mapping
+from mal_updater.ingestion import ingest_snapshot_payload
+from tests.test_validation_ingestion import sample_snapshot
 from mal_updater.mal_client import MalApiError, MalClient, TokenResponse
 
 
@@ -78,7 +81,7 @@ class ConfigTests(unittest.TestCase):
 
 
 
-    def test_load_config_reads_crunchyroll_request_spacing_seconds(self) -> None:
+    def test_load_config_reads_crunchyroll_request_spacing_and_jitter_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "config").mkdir()
@@ -87,6 +90,7 @@ class ConfigTests(unittest.TestCase):
                     """
                     [crunchyroll]
                     request_spacing_seconds = 12.5
+                    request_spacing_jitter_seconds = 2.25
                     """
                 ),
                 encoding="utf-8",
@@ -95,6 +99,7 @@ class ConfigTests(unittest.TestCase):
             config = load_config(root)
 
             self.assertEqual(config.crunchyroll.request_spacing_seconds, 12.5)
+            self.assertEqual(config.crunchyroll.request_spacing_jitter_seconds, 2.25)
 
 class AuthHelperTests(unittest.TestCase):
     def test_format_auth_flow_prompt_includes_bind_host_and_redirect_uri(self) -> None:
@@ -220,6 +225,30 @@ class AuthHelperTests(unittest.TestCase):
 
             self.assertEqual(code, 2)
             self.assertIn("requires a full scan", stderr.getvalue())
+
+    def test_approve_mapping_exact_flag_persists_user_exact_source(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            ingest_snapshot_payload(sample_snapshot(), config)
+
+            code = _cmd_approve_mapping(
+                root,
+                provider_series_id="series-123",
+                mal_anime_id=123,
+                confidence=1.0,
+                notes="manual exact approval",
+                exact=True,
+            )
+
+            self.assertEqual(code, 0)
+            mapping = get_series_mapping(config.db_path, "crunchyroll", "series-123")
+            self.assertIsNotNone(mapping)
+            assert mapping is not None
+            self.assertEqual(mapping.mapping_source, "user_exact")
+            self.assertTrue(mapping.approved_by_user)
 
 
 if __name__ == "__main__":

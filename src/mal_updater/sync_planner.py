@@ -5,7 +5,7 @@ from typing import Any
 
 from .config import AppConfig, load_mal_secrets
 from .db import PersistedSeriesMapping, connect, get_series_mapping, replace_review_queue_entries, upsert_series_mapping
-from .mal_client import MalClient
+from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
 
 
@@ -468,10 +468,29 @@ def build_dry_run_sync_plan(
             )
             continue
 
-        detail = client.get_anime_details(
-            chosen_anime_id,
-            fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
-        )
+        try:
+            detail = client.get_anime_details(
+                chosen_anime_id,
+                fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
+            )
+        except MalApiError as exc:
+            proposals.append(
+                SyncProposal(
+                    provider_series_id=state.provider_series_id,
+                    crunchyroll_title=state.title,
+                    mapping_status=mapping_status,
+                    confidence=confidence,
+                    mal_anime_id=chosen_anime_id,
+                    mal_title=None,
+                    current_my_list_status=None,
+                    proposed_my_list_status=None,
+                    decision="review",
+                    mapping_source=mapping_source,
+                    persisted_mapping_approved=approved,
+                    reasons=mapping_reasons + [f"mal_details_lookup_failed:{exc}"],
+                )
+            )
+            continue
         proposals.append(
             _plan_status_update(
                 state,
@@ -519,10 +538,30 @@ def execute_approved_sync(
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
         if not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
             continue
-        detail = client.get_anime_details(
-            persisted.mal_anime_id,
-            fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
-        )
+        try:
+            detail = client.get_anime_details(
+                persisted.mal_anime_id,
+                fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
+            )
+        except MalApiError as exc:
+            results.append(
+                ApplyResult(
+                    provider=state.provider,
+                    provider_series_id=state.provider_series_id,
+                    mal_anime_id=persisted.mal_anime_id,
+                    mal_title=None,
+                    applied=False,
+                    proposal_decision="error",
+                    requested_status=None,
+                    response_status=None,
+                    reasons=[
+                        "using_user_approved_mapping",
+                        *(["exact_approved_only_enabled"] if exact_approved_only else []),
+                        f"mal_details_lookup_failed:{exc}",
+                    ],
+                )
+            )
+            continue
         proposal = _plan_status_update(
             state,
             detail,
@@ -558,14 +597,31 @@ def execute_approved_sync(
             reasons.append("executor_dry_run")
         else:
             requested = proposal.proposed_my_list_status or {}
-            response = client.update_my_list_status(
-                persisted.mal_anime_id,
-                status=str(requested["status"]),
-                num_watched_episodes=int(requested.get("num_watched_episodes") or 0),
-                score=_coerce_optional_int(requested.get("score")),
-                start_date=_coerce_optional_str(requested.get("start_date")),
-                finish_date=_coerce_optional_str(requested.get("finish_date")),
-            )
+            try:
+                response = client.update_my_list_status(
+                    persisted.mal_anime_id,
+                    status=str(requested["status"]),
+                    num_watched_episodes=int(requested.get("num_watched_episodes") or 0),
+                    score=_coerce_optional_int(requested.get("score")),
+                    start_date=_coerce_optional_str(requested.get("start_date")),
+                    finish_date=_coerce_optional_str(requested.get("finish_date")),
+                )
+            except MalApiError as exc:
+                reasons.append(f"mal_update_failed:{exc}")
+                results.append(
+                    ApplyResult(
+                        provider=state.provider,
+                        provider_series_id=state.provider_series_id,
+                        mal_anime_id=persisted.mal_anime_id,
+                        mal_title=proposal.mal_title,
+                        applied=False,
+                        proposal_decision="error",
+                        requested_status=proposal.proposed_my_list_status,
+                        response_status=None,
+                        reasons=reasons,
+                    )
+                )
+                continue
             response_status = response
             applied = True
             reasons.append("applied_to_mal")

@@ -44,14 +44,14 @@ class MappingTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            queries,
-            [
-                "Season 2",
-                "Campfire Cooking in Another World with My Absurd Skill Season 2",
-                "Campfire Cooking in Another World with My Absurd Skill",
-            ],
-        )
+        self.assertEqual(queries[0:2], [
+            "Season 2",
+            "Campfire Cooking in Another World with My Absurd Skill Season 2",
+        ])
+        self.assertIn("Campfire Cooking in Another World with My Absurd Skill 2nd Season", queries)
+        self.assertIn("Campfire Cooking in Another World with My Absurd Skill 2", queries)
+        self.assertIn("Campfire Cooking in Another World with My Absurd Skill II", queries)
+        self.assertEqual(queries[-1], "Campfire Cooking in Another World with My Absurd Skill")
 
     def test_build_search_queries_normalizes_missing_spacing_in_installment_markers(self) -> None:
         queries = build_search_queries(
@@ -64,14 +64,149 @@ class MappingTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            queries,
-            [
-                "The Saint's Magic Power is Omnipotent Season2 (English Dub)",
-                "The Saint's Magic Power is Omnipotent Season 2",
-                "The Saint's Magic Power is Omnipotent",
-            ],
-        )
+        self.assertEqual(queries[0:2], [
+            "The Saint's Magic Power is Omnipotent Season2 (English Dub)",
+            "The Saint's Magic Power is Omnipotent Season 2",
+        ])
+        self.assertIn("The Saint's Magic Power is Omnipotent 2nd Season", queries)
+        self.assertIn("The Saint's Magic Power is Omnipotent 2", queries)
+        self.assertIn("The Saint's Magic Power is Omnipotent II", queries)
+        self.assertEqual(queries[-1], "The Saint's Magic Power is Omnipotent")
+
+    def test_map_series_prefers_exact_specific_installment_over_base_title_tie(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            responses = {
+                "Restaurant to Another World 2 (English Dub)": {
+                    "data": [
+                        {
+                            "node": {
+                                "id": 48804,
+                                "title": "Isekai Shokudou 2",
+                                "alternative_titles": {"en": "Restaurant to Another World 2"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+                "Restaurant to Another World": {
+                    "data": [
+                        {
+                            "node": {
+                                "id": 34012,
+                                "title": "Isekai Shokudou",
+                                "alternative_titles": {"en": "Restaurant to Another World"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            }
+
+            with patch.object(MalClient, "search_anime", side_effect=lambda query, limit=5: responses.get(query, {"data": []})):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Restaurant to Another World",
+                        season_title="Restaurant to Another World 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 48804)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_uses_roman_query_variant_for_later_season_search(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                if query == "Classroom of the Elite III":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 51180,
+                                    "title": "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e 3rd Season",
+                                    "alternative_titles": {"en": "Classroom of the Elite III"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 51096,
+                                    "title": "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e 2nd Season",
+                                    "alternative_titles": {"en": "Classroom of the Elite II"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            },
+                        ]
+                    }
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Classroom of the Elite",
+                        season_title="Classroom of the Elite Season 3 (English Dub)",
+                        season_number=3,
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 51180)
+        self.assertTrue(should_auto_approve_mapping(result))
 
     def test_map_series_classifies_exact_match_conservatively(self) -> None:
         with tempfile.TemporaryDirectory() as td:

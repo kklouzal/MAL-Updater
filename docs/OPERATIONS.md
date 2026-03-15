@@ -74,6 +74,7 @@ PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-l
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
+PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-456 5114 --exact --confidence 1.0 --notes "manual exact approval"
 ```
 
 ### Generate and persist guarded sync review results

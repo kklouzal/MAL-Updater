@@ -78,6 +78,7 @@ PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
+PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-456 5114 --exact --confidence 1.0 --notes "manual exact approval"
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
@@ -118,7 +119,7 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `mal-whoami` exercises the current access token against MAL `GET /users/@me`
 - `crunchyroll-auth-login` uses local Crunchyroll username/password secrets to fetch a real refresh token + device id and stage them into `state/crunchyroll/<profile>/`; if optional `curl_cffi` support is installed, it uses browser-TLS impersonation to get through Crunchyroll's Cloudflare layer
 - `crunchyroll-fetch-snapshot` is the live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, normalizes it into the JSON contract, and can write a snapshot file and/or ingest it directly
-- the live Crunchyroll fetch path now intentionally spaces individual Crunchyroll HTTP requests by `crunchyroll.request_spacing_seconds` (default `10.0`) so the first unattended cadence stays conservative
+- the live Crunchyroll fetch path now intentionally spaces individual Crunchyroll HTTP requests by `crunchyroll.request_spacing_seconds` with `crunchyroll.request_spacing_jitter_seconds` (default: `10.0 ± 3.0s`, so about 7-13 seconds between requests) so the first unattended cadence stays conservative
 - a real live run on this host succeeds through the Python path and ingests into SQLite (`series_count=245`, `progress_count=4311`, `watchlist_count=197` on the latest local snapshot)
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
 - `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses; it now expands generic Crunchyroll labels like `Season 2`, `Part 2`, `2nd Cour`, or `Final Season` into `Title ...` queries and scores explicit installment hints (season numbers, ordinal seasons, roman numerals, parts, cours, split indexes, `Final Season`)
@@ -174,3 +175,5 @@ Boundary rule:
 - SQLite state database
 - MAL official OAuth/API client
 - Safe dry-run sync before live writes
+es
+-run sync before live writes

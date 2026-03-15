@@ -1,11 +1,12 @@
 [Unit]
-Description=Run MAL-Updater exact-approved sync every 6 hours
+Description=Run MAL-Updater exact-approved sync about every 8 hours with jitter
 
 [Timer]
 Unit=mal-updater-exact-approved-sync.service
 OnUnitInactiveSec=6h
+RandomizedDelaySec=4h
 Persistent=true
-AccuracySec=15min
+AccuracySec=5min
 
 [Install]
 WantedBy=timers.target
