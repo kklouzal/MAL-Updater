@@ -60,6 +60,7 @@
 - `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
 - `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, can auto-promote the same safe exact matches into durable `auto_exact` approvals, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
 - `list-review-queue` exposes the durable backlog from SQLite for operator follow-up
+- MAL client traffic is now rate-shaped locally at roughly `1.0 ± 0.2s` between requests by default, and timeout-prone reads/writes get one bounded retry before the caller turns the failure into normal review/error residue
 - `apply-sync` is the first guarded live-write path:
   - only consumes durably approved mappings (`user_approved` or safe `auto_exact`)
   - revalidates live MAL state immediately before acting

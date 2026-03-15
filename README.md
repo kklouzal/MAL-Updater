@@ -111,7 +111,7 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 ### Current behavior
 
 - `status` prints resolved paths/config plus MAL and Crunchyroll secret/state presence
-- `config/settings.toml` can define path layout, MAL endpoint settings, Crunchyroll locale, and secret file locations
+- `config/settings.toml` can define path layout, MAL endpoint settings (including polite MAL request pacing), Crunchyroll locale, and secret file locations
 - `validate-snapshot` checks normalized Crunchyroll JSON shape and cross-reference sanity before ingestion work touches SQLite
 - `init` creates local directories and applies SQLite migrations
 - `mal-auth-url` generates a real PKCE pair plus MAL authorization URL
@@ -129,6 +129,8 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `review-mappings` turns those candidates into an operator-facing review list, preserves already approved mappings, auto-approves truly exact/unique season-consistent matches as `auto_exact`, blocks auto-approval when installment hints conflict, can replace open `mapping_review` rows in `review_queue`, and now survives per-series MAL search timeouts instead of aborting the entire audit
 - `list-mappings` shows the durable Crunchyroll -> MAL mappings already stored in SQLite
 - `approve-mapping` persists an explicit user-approved mapping into `mal_series_mapping`
+- MAL API traffic is now paced politely by `mal.request_spacing_seconds ± mal.request_spacing_jitter_seconds` (default `1.0 ± 0.2s`) so repeated detail/search/update calls stay explainable and bounded instead of hammering the API
+- MAL reads/writes now do one bounded retry on timeout before surfacing a normal per-title error/review residue, so a single transient detail timeout no longer has to stall an entire sync cycle
 - `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, auto-promotes truly exact/unique season-consistent matches into durable `auto_exact` approvals, only suggests forward-safe updates, applies explicit missing-data-only merge rules, and can replace open `sync_review` rows in `review_queue`
 - `list-review-queue` exposes the durable unresolved review backlog stored in SQLite
 - `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes durably approved mappings (`user_approved` or safe `auto_exact`), only submits forward-safe updates, and only fills MAL fields that are still genuinely missing

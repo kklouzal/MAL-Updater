@@ -58,6 +58,26 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.request_timeout_seconds, 7.5)
 
+    def test_load_config_reads_mal_request_spacing_and_jitter_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text(
+                textwrap.dedent(
+                    """
+                    [mal]
+                    request_spacing_seconds = 1.1
+                    request_spacing_jitter_seconds = 0.15
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(root)
+
+            self.assertEqual(config.mal.request_spacing_seconds, 1.1)
+            self.assertEqual(config.mal.request_spacing_jitter_seconds, 0.15)
+
     def test_load_mal_secrets_reads_secret_file_overrides_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -180,6 +200,73 @@ class AuthHelperTests(unittest.TestCase):
 
             self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 7.5)
 
+    def test_mal_client_paces_requests_using_configured_spacing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text(
+                textwrap.dedent(
+                    """
+                    [mal]
+                    request_spacing_seconds = 1.0
+                    request_spacing_jitter_seconds = 0.0
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (root / "secrets").mkdir()
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            config = load_config(root)
+            client = MalClient(config, load_mal_secrets(config))
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return b'{"data": []}'
+
+            with patch("mal_updater.mal_client.urlopen", return_value=_Response()), patch(
+                "mal_updater.mal_client.time.monotonic",
+                side_effect=[100.0, 100.0, 100.4, 100.4],
+            ), patch("mal_updater.mal_client.time.sleep") as sleep_mock:
+                client.search_anime("Example")
+                client.search_anime("Example Again")
+
+            sleep_mock.assert_called_once()
+            self.assertAlmostEqual(sleep_mock.call_args.args[0], 0.6, places=6)
+
+    def test_mal_client_retries_timeout_once_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "secrets").mkdir()
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            config = load_config(root)
+            client = MalClient(config, load_mal_secrets(config))
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return b'{"data": []}'
+
+            with patch(
+                "mal_updater.mal_client.urlopen",
+                side_effect=[TimeoutError("timed out"), _Response()],
+            ) as urlopen_mock, patch("mal_updater.mal_client.time.sleep"):
+                response = client.search_anime("Example")
+
+            self.assertEqual(response, {"data": []})
+            self.assertEqual(urlopen_mock.call_count, 2)
+
     def test_mal_client_wraps_timeout_errors_as_mal_api_errors(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -189,10 +276,13 @@ class AuthHelperTests(unittest.TestCase):
             config = load_config(root)
             client = MalClient(config, load_mal_secrets(config))
 
-            with patch("mal_updater.mal_client.urlopen", side_effect=TimeoutError("timed out")):
+            with patch("mal_updater.mal_client.urlopen", side_effect=TimeoutError("timed out")), patch(
+                "mal_updater.mal_client.time.sleep"
+            ):
                 with self.assertRaises(MalApiError) as exc:
                     client.search_anime("Example")
 
+            self.assertIn("timeout after 2 attempts", str(exc.exception))
             self.assertIn("timed out", str(exc.exception))
 
     def test_review_mappings_rejects_partial_queue_replacement(self) -> None:

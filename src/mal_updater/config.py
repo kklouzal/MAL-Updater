@@ -20,6 +20,8 @@ DEFAULT_MAL_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
 DEFAULT_MAL_BIND_HOST = "0.0.0.0"
 DEFAULT_MAL_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_MAL_REDIRECT_PORT = 8765
+DEFAULT_MAL_REQUEST_SPACING_SECONDS = 1.0
+DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS = 0.2
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 22.5
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 7.5
@@ -38,6 +40,8 @@ class MalSettings:
     bind_host: str = DEFAULT_MAL_BIND_HOST
     redirect_host: str = DEFAULT_MAL_REDIRECT_HOST
     redirect_port: int = DEFAULT_MAL_REDIRECT_PORT
+    request_spacing_seconds: float = DEFAULT_MAL_REQUEST_SPACING_SECONDS
+    request_spacing_jitter_seconds: float = DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS
 
     @property
     def redirect_uri(self) -> str:
@@ -286,6 +290,18 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             bind_host=os.getenv("MAL_UPDATER_MAL_BIND_HOST", _get_str(mal_section, "bind_host", DEFAULT_MAL_BIND_HOST)),
             redirect_host=os.getenv("MAL_UPDATER_MAL_REDIRECT_HOST", _get_str(mal_section, "redirect_host", DEFAULT_MAL_REDIRECT_HOST)),
             redirect_port=int(os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", _get_int(mal_section, "redirect_port", DEFAULT_MAL_REDIRECT_PORT))),
+            request_spacing_seconds=float(
+                os.getenv(
+                    "MAL_UPDATER_MAL_REQUEST_SPACING_SECONDS",
+                    _get_float(mal_section, "request_spacing_seconds", DEFAULT_MAL_REQUEST_SPACING_SECONDS),
+                )
+            ),
+            request_spacing_jitter_seconds=float(
+                os.getenv(
+                    "MAL_UPDATER_MAL_REQUEST_SPACING_JITTER_SECONDS",
+                    _get_float(mal_section, "request_spacing_jitter_seconds", DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS),
+                )
+            ),
         ),
         crunchyroll=CrunchyrollSettings(
             locale=os.getenv("MAL_UPDATER_CRUNCHYROLL_LOCALE", _get_str(crunchyroll_section, "locale", DEFAULT_CRUNCHYROLL_LOCALE)),

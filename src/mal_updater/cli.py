@@ -65,6 +65,8 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.token_url={config.mal.token_url}")
     print(f"mal.bind_host={config.mal.bind_host}")
     print(f"mal.redirect_uri={config.mal.redirect_uri}")
+    print(f"mal.request_spacing_seconds={config.mal.request_spacing_seconds}")
+    print(f"mal.request_spacing_jitter_seconds={config.mal.request_spacing_jitter_seconds}")
     print(f"crunchyroll.locale={config.crunchyroll.locale}")
     print(f"crunchyroll.request_spacing_seconds={config.crunchyroll.request_spacing_seconds}")
     print(f"crunchyroll.request_spacing_jitter_seconds={config.crunchyroll.request_spacing_jitter_seconds}")

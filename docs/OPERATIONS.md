@@ -36,6 +36,8 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 ```
 
+MAL request pacing defaults to `~1.0s ± 0.2s` between requests (`[mal] request_spacing_seconds` / `request_spacing_jitter_seconds` in `config/settings.toml`). Timeout-prone MAL reads/writes retry once, then degrade back into the existing per-title skip/review behavior.
+
 ### Refresh MAL token
 ```bash
 cd <repo-root>

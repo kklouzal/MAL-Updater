@@ -21,6 +21,8 @@ token_url = "https://myanimelist.net/v1/oauth2/token"
 bind_host = "0.0.0.0"
 redirect_host = "192.168.1.117"
 redirect_port = 8765
+request_spacing_seconds = 1.0
+request_spacing_jitter_seconds = 0.2
 
 [crunchyroll]
 locale = "en-US"
