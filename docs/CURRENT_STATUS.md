@@ -50,13 +50,13 @@
   - `list-review-queue`
   - `apply-sync`
 - `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
-- mapping now leans on deeper Crunchyroll evidence when available: explicit season-title/season-number cues and episode-count evidence can break ties between similarly named seasons/sequels
-- `review-mappings` provides the first durable operator workflow: preserved approved mappings stay fixed, strong suggestions are surfaced for explicit approval, weaker cases remain review-only, and unresolved items can be persisted into `review_queue`
+- mapping now leans on deeper Crunchyroll evidence when available: explicit season-title/season-number cues, generic `Season N` query expansion, installment-hint matching (`Season 2`, `Second Season`, roman numerals, parts, `Final Season`), and episode-count evidence can break ties between similarly named seasons/sequels
+- `review-mappings` provides the first durable operator workflow: preserved approved mappings stay fixed, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` mappings, explicit installment conflicts block auto-approval, strong-but-not-exact suggestions are surfaced for explicit approval, weaker cases remain review-only, and unresolved items can be persisted into `review_queue`
 - `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
-- `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
+- `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, can auto-promote the same safe exact matches into durable `auto_exact` approvals, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
 - `list-review-queue` exposes the durable backlog from SQLite for operator follow-up
 - `apply-sync` is the first guarded live-write path:
-  - only consumes user-approved mappings
+  - only consumes durably approved mappings (`user_approved` or safe `auto_exact`)
   - revalidates live MAL state immediately before acting
   - only applies proposals that remain forward-safe
   - never decreases MAL watched-episode counts
@@ -85,6 +85,7 @@ What was verified locally:
 - the minted refresh token also refreshes successfully through the same Python impersonated transport
 - the Python fetch path can retrieve real live Crunchyroll data on this host and normalize it honestly
 - validated live snapshots ingest cleanly into SQLite
+- latest live mapping audit over 245 Crunchyroll series found 160 safe `auto_exact` matches, cutting manual mapping decisions down to 85; the remaining manual work is concentrated in ambiguous sequel/alt-title/no-candidate cases
 
 That means the active blocker is no longer Crunchyroll access itself. The remaining work is downstream sync policy hardening, review UX, and recommendation work.
 

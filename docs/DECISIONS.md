@@ -41,6 +41,9 @@ This is a **missing-data-first** system.
 - Treat MAL `start_date` / `finish_date` as missing only when null/empty.
 - Only fill dates when the source evidence is trustworthy enough; currently that means `finish_date` may be filled from Crunchyroll `last_watched_at` only when Crunchyroll-derived status is `completed`.
 - Do not auto-resolve ambiguous mappings.
+- Only auto-approve mappings when the top MAL candidate is an exact normalized-title match, clearly ahead of the runner-up, and there is no contradictory season/episode/installment evidence.
+- Expand generic Crunchyroll season labels like `Season 2` / `Part 2` into `Title Season 2` / `Title Part 2` search queries before giving up.
+- Treat explicit installment cues (season numbers, ordinal seasons, roman numerals, parts, `Final Season`) as explainable matching evidence; matching cues can promote a result, conflicting cues must block auto-approval.
 - Queue conflicts for review.
 - Dry-run before live writes.
 

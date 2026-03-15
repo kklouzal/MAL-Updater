@@ -103,12 +103,12 @@ PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 
 Current behavior:
 - `map-series` reads recently seen Crunchyroll series from SQLite and searches MAL for candidate matches
-- title scoring is intentionally conservative and reports `exact`, `strong`, `ambiguous`, `weak`, or `no_candidates`
-- `review-mappings` produces an approval queue: approved mappings are preserved, strong matches are marked `ready_for_approval`, ambiguous/weak cases stay review-only, and `--persist-review-queue` replaces open `mapping_review` rows in SQLite with the unresolved items from the latest pass
+- title scoring is intentionally conservative and reports `exact`, `strong`, `ambiguous`, `weak`, or `no_candidates`; generic Crunchyroll labels like `Season 2` are expanded into `Title Season 2` search queries, and explicit installment hints (season numbers, ordinal seasons, roman numerals, parts, `Final Season`) are scored as explainable evidence instead of opaque confidence bumps
+- `review-mappings` produces an approval queue: approved mappings are preserved, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` rows, strong-but-not-exact matches are marked `ready_for_approval`, explicit installment-hint conflicts block auto-approval, ambiguous/weak cases stay review-only, and `--persist-review-queue` replaces open `mapping_review` rows in SQLite with the unresolved items from the latest pass
 - `approve-mapping` persists an explicit Crunchyroll -> MAL choice into `mal_series_mapping`
 - `list-mappings` shows the durable mapping cache already saved in SQLite
-- `dry-run-sync` prefers approved persisted mappings before doing fresh search work
-- `dry-run-sync --approved-mappings-only` is the executor safety gate: it refuses to plan anything that lacks explicit approval
+- `dry-run-sync` prefers approved persisted mappings before doing fresh search work and can auto-promote the same safe exact matches into durable `auto_exact` approvals
+- `dry-run-sync --approved-mappings-only` is the executor safety gate: it refuses to plan anything that lacks durable approval
 - `dry-run-sync --persist-review-queue` replaces open `sync_review` rows in SQLite with the latest non-actionable review/skip items
 - `list-review-queue` surfaces the durable review backlog from `review_queue`
 - dry-run planning only suggests forward-safe list changes (`watching` / `completed` / `plan_to_watch` with episode counts)

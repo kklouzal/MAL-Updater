@@ -119,13 +119,13 @@ This repo currently relies on the built-in `unittest` runner for local verificat
 - `crunchyroll-fetch-snapshot` is the live Crunchyroll path: it refreshes auth through the Python impersonated transport, fetches account/history/watchlist data, normalizes it into the JSON contract, and can write a snapshot file and/or ingest it directly
 - a real live run on this host succeeds through the Python path and ingests into SQLite (`series_count=219`, `progress_count=4311`, `watchlist_count=10`)
 - `ingest-snapshot` validates then upserts normalized snapshot data into SQLite, recording a summary row in `sync_runs`
-- `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses
-- `review-mappings` turns those candidates into an operator-facing review list, preserves already approved mappings, and can replace open `mapping_review` rows in `review_queue`
+- `map-series` searches MAL for conservative candidate matches for recently seen Crunchyroll series and reports confidence / ambiguity instead of silently persisting guesses; it now also expands generic Crunchyroll season labels like `Season 2` into `Title Season 2` queries and scores explicit installment hints (season numbers, ordinal seasons, roman numerals, parts, `Final Season`)
+- `review-mappings` turns those candidates into an operator-facing review list, preserves already approved mappings, auto-approves truly exact/unique season-consistent matches as `auto_exact`, blocks auto-approval when installment hints conflict, and can replace open `mapping_review` rows in `review_queue`
 - `list-mappings` shows the durable Crunchyroll -> MAL mappings already stored in SQLite
 - `approve-mapping` persists an explicit user-approved mapping into `mal_series_mapping`
-- `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, only suggests forward-safe updates, applies explicit missing-data-only merge rules, and can replace open `sync_review` rows in `review_queue`
+- `dry-run-sync` prefers approved persisted mappings first, can optionally require approved mappings only, auto-promotes truly exact/unique season-consistent matches into durable `auto_exact` approvals, only suggests forward-safe updates, applies explicit missing-data-only merge rules, and can replace open `sync_review` rows in `review_queue`
 - `list-review-queue` exposes the durable unresolved review backlog stored in SQLite
-- `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes approved mappings, only submits forward-safe updates, and only fills MAL fields that are still genuinely missing
+- `apply-sync` is the first guarded live executor: it revalidates live MAL state, only consumes durably approved mappings (`user_approved` or safe `auto_exact`), only submits forward-safe updates, and only fills MAL fields that are still genuinely missing
 - `sync` remains a reserved umbrella entrypoint and points at the explicit review/apply commands
 
 ## SQLite schema
