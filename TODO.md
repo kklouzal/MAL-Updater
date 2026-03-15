@@ -32,3 +32,5 @@
 ## Later
 - [ ] Build OpenClaw skill wrapper
 - [ ] Periodic health-check/maintenance loop
+- [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (OVA/recap/special discrimination, canonical-entry cues)
+- [ ] Decompose combined Crunchyroll entries before treating aggregate episode counts as hard blockers for season/movie matching

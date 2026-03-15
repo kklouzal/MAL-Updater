@@ -7,6 +7,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
+from socket import timeout as SocketTimeout
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -182,6 +183,8 @@ class MalClient:
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise MalApiError(f"{error_context}: {exc.reason}") from exc
+        except (TimeoutError, SocketTimeout) as exc:
+            raise MalApiError(f"{error_context}: {exc}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
         basic = base64.b64encode(f"{self.secrets.client_id or ''}:{self.secrets.client_secret or ''}".encode("utf-8")).decode("ascii")

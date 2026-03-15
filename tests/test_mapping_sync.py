@@ -53,6 +53,26 @@ class MappingTests(unittest.TestCase):
             ],
         )
 
+    def test_build_search_queries_normalizes_missing_spacing_in_installment_markers(self) -> None:
+        queries = build_search_queries(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                title="The Saint's Magic Power is Omnipotent",
+                season_title="The Saint's Magic Power is Omnipotent Season2 (English Dub)",
+                season_number=2,
+            )
+        )
+
+        self.assertEqual(
+            queries,
+            [
+                "The Saint's Magic Power is Omnipotent Season2 (English Dub)",
+                "The Saint's Magic Power is Omnipotent Season 2",
+                "The Saint's Magic Power is Omnipotent",
+            ],
+        )
+
     def test_map_series_classifies_exact_match_conservatively(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -169,6 +189,68 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 200)
         self.assertTrue(any("season_number_match=2" == reason for reason in result.rationale))
 
+    def test_map_series_penalizes_candidate_with_extra_installment_hint_when_provider_has_none(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 666,
+                                "title": "JoJo no Kimyou na Bouken",
+                                "alternative_titles": {"en": "JoJo's Bizarre Adventure"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 26,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 20899,
+                                "title": "JoJo no Kimyou na Bouken Part 3: Stardust Crusaders",
+                                "alternative_titles": {"en": "JoJo's Bizarre Adventure: Stardust Crusaders"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 24,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="JoJo's Bizarre Adventure",
+                        season_title="JoJo's Bizarre Adventure",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 666)
+        self.assertIn("candidate_extra_installment_hint", result.candidates[1].match_reasons)
+
     def test_should_auto_approve_exact_unique_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -231,6 +313,68 @@ class MappingTests(unittest.TestCase):
 
         self.assertEqual(result.status, "exact")
         self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_penalizes_auxiliary_candidates_even_with_exact_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 28677,
+                                "title": "Yamada-kun to 7-nin no Majo",
+                                "alternative_titles": {"en": "Yamada-kun and the Seven Witches"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 20359,
+                                "title": "Yamada-kun to 7-nin no Majo PV",
+                                "alternative_titles": {"en": "Yamada-kun and the Seven Witches"},
+                                "media_type": "special",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Yamada-kun and the Seven Witches",
+                        season_title="Yamada-kun and the Seven Witches",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 28677)
+        self.assertIn("candidate_auxiliary_content=pv", result.candidates[1].match_reasons)
 
     def test_should_not_auto_approve_when_season_evidence_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from mal_updater.auth import format_auth_flow_prompt, persist_token_response, write_secret_file
 from mal_updater.cli import _cmd_dry_run_sync, _cmd_review_mappings
 from mal_updater.config import load_config, load_mal_secrets
-from mal_updater.mal_client import MalClient, TokenResponse
+from mal_updater.mal_client import MalApiError, MalClient, TokenResponse
 
 
 class ConfigTests(unittest.TestCase):
@@ -155,6 +155,21 @@ class AuthHelperTests(unittest.TestCase):
                 client.search_anime("Example")
 
             self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 7.5)
+
+    def test_mal_client_wraps_timeout_errors_as_mal_api_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "secrets").mkdir()
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            config = load_config(root)
+            client = MalClient(config, load_mal_secrets(config))
+
+            with patch("mal_updater.mal_client.urlopen", side_effect=TimeoutError("timed out")):
+                with self.assertRaises(MalApiError) as exc:
+                    client.search_anime("Example")
+
+            self.assertIn("timed out", str(exc.exception))
 
     def test_review_mappings_rejects_partial_queue_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as td:

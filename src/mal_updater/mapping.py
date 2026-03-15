@@ -24,6 +24,21 @@ _TITLE_CLEANUPS = [
 ]
 _QUERY_CLEANUPS = _TITLE_CLEANUPS[:3]
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_SEARCH_SPACING_REWRITES = (
+    (re.compile(r"\bseason\s*(\d+)\b", re.IGNORECASE), r"Season \1"),
+    (re.compile(r"\bpart\s*(\d+)\b", re.IGNORECASE), r"Part \1"),
+    (re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE), r"Cour \1"),
+)
+_AUXILIARY_TITLE_PATTERNS = (
+    (re.compile(r"\bpv\b", re.IGNORECASE), "pv"),
+    (re.compile(r"\bpromo\b", re.IGNORECASE), "promo"),
+    (re.compile(r"\bcommercial\b", re.IGNORECASE), "commercial"),
+    (re.compile(r"\bcm\b", re.IGNORECASE), "cm"),
+    (re.compile(r"\brecaps?\b", re.IGNORECASE), "recap"),
+    (re.compile(r"\bextras?\b", re.IGNORECASE), "extra"),
+    (re.compile(r"\bpicture\s+drama\b", re.IGNORECASE), "picture_drama"),
+    (re.compile(r"\brelay\s+pvs?\b", re.IGNORECASE), "relay_pv"),
+)
 _ROMAN_TOKEN_RE = re.compile(r"\b(i|ii|iii|iv|v|vi|vii|viii|ix|x)\b", re.IGNORECASE)
 _ORDINAL_SEASON_RE = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season\b",
@@ -33,7 +48,7 @@ _ORDINAL_COUR_RE = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour\b",
     re.IGNORECASE,
 )
-_COUR_NUMBER_RE = re.compile(r"\bcour\s+(\d+)\b", re.IGNORECASE)
+_COUR_NUMBER_RE = re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE)
 _FINAL_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
 _SEASON_RANGE_RE = re.compile(r"\bseasons?\s+\d+\s*[-/]\s*\d+\b", re.IGNORECASE)
 _STANDALONE_SEASON_RE = re.compile(r"^season\s+\d+$", re.IGNORECASE)
@@ -129,9 +144,11 @@ def normalize_title_strict(value: str | None) -> str:
 
 
 def _search_query_cleanup(value: str) -> str:
-    cleaned = value.replace("’", "'")
+    cleaned = unicodedata.normalize("NFKC", value).replace("’", "'")
     for pattern in _QUERY_CLEANUPS:
         cleaned = pattern.sub(" ", cleaned)
+    for pattern, replacement in _SEARCH_SPACING_REWRITES:
+        cleaned = pattern.sub(replacement, cleaned)
     return " ".join(cleaned.split()).strip()
 
 
@@ -190,7 +207,7 @@ def _extract_season_number(value: str | None) -> int | None:
         return None
     if _SEASON_RANGE_RE.search(value):
         return None
-    match = re.search(r"\bseason\s+(\d+)\b", value, re.IGNORECASE)
+    match = re.search(r"\bseason\s*(\d+)\b", value, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return None
@@ -199,7 +216,7 @@ def _extract_season_number(value: str | None) -> int | None:
 def _extract_part_number(value: str | None) -> int | None:
     if not value:
         return None
-    match = re.search(r"\bpart\s+(\d+)\b", value, re.IGNORECASE)
+    match = re.search(r"\bpart\s*(\d+)\b", value, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return None
@@ -277,6 +294,24 @@ def _candidate_title_hints(node: dict[str, Any]) -> set[str]:
     for title in _extract_titles_from_node(node):
         hints.update(_extract_title_hints(title))
     return hints
+
+
+def _title_has_auxiliary_marker(value: str | None) -> str | None:
+    if not value:
+        return None
+    for pattern, label in _AUXILIARY_TITLE_PATTERNS:
+        if pattern.search(value):
+            return label
+    return None
+
+
+def _candidate_auxiliary_markers(node: dict[str, Any]) -> set[str]:
+    markers: set[str] = set()
+    for title in _extract_titles_from_node(node):
+        marker = _title_has_auxiliary_marker(title)
+        if marker:
+            markers.add(marker)
+    return markers
 
 
 def _has_non_base_installment_hint(hints: set[str]) -> bool:
@@ -375,9 +410,14 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     shared_hints = sorted(provider_hints & candidate_hints)
     conflicting_hints: list[str] = []
 
-    if _has_non_base_installment_hint(provider_hints) and not candidate_hints:
+    provider_has_non_base_installment_hint = _has_non_base_installment_hint(provider_hints)
+    candidate_has_non_base_installment_hint = _has_non_base_installment_hint(candidate_hints)
+    if provider_has_non_base_installment_hint and not candidate_hints:
         score -= 0.06
         reasons.append("candidate_missing_installment_hint")
+    elif not provider_has_non_base_installment_hint and candidate_has_non_base_installment_hint:
+        score -= 0.06
+        reasons.append("candidate_extra_installment_hint")
 
     provider_parts = {hint for hint in provider_hints if hint.startswith("part:")}
     candidate_parts = {hint for hint in candidate_hints if hint.startswith("part:")}
@@ -423,6 +463,18 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             penalty = 0.16
         score -= penalty
         reasons.append(f"installment_hint_conflict={','.join(conflicting_hints)}")
+
+    provider_auxiliary_markers = {
+        marker
+        for value in (series.season_title, series.title)
+        for marker in [_title_has_auxiliary_marker(value)]
+        if marker
+    }
+    candidate_auxiliary_markers = _candidate_auxiliary_markers(node)
+    extra_auxiliary_markers = sorted(candidate_auxiliary_markers - provider_auxiliary_markers)
+    if extra_auxiliary_markers:
+        score -= 0.08
+        reasons.append(f"candidate_auxiliary_content={','.join(extra_auxiliary_markers)}")
 
     candidate_num_episodes = node.get("num_episodes")
     if isinstance(candidate_num_episodes, int) and candidate_num_episodes > 0:
