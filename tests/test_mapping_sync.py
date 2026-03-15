@@ -415,6 +415,206 @@ class MappingTests(unittest.TestCase):
         self.assertIn("roman_installment_match=roman:3", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_build_search_queries_combines_generic_cour_title_with_base_title(self) -> None:
+        queries = build_search_queries(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                title="Example Show",
+                season_title="2nd Cour",
+                season_number=1,
+            )
+        )
+
+        self.assertEqual(
+            queries,
+            [
+                "2nd Cour",
+                "Example Show 2nd Cour",
+                "Example Show",
+            ],
+        )
+
+    def test_map_series_uses_split_installment_match_for_part_vs_cour(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 500,
+                                "title": "Example Show Final Season Part 1",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 600,
+                                "title": "Example Show The Final Season 2nd Cour",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Example Show",
+                        season_title="Example Show Final Season Part 2 (English Dub)",
+                        season_number=4,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 600)
+        self.assertIn("split_installment_match=split:2", result.rationale)
+
+    def test_map_series_prefers_title_season_hint_when_provider_metadata_is_noisy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 700,
+                                "title": "Example Show Season 2",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 800,
+                                "title": "Example Show Season 3",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Example Show",
+                        season_title="Example Show Season 2",
+                        season_number=3,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 700)
+        self.assertIn("provider_season_metadata_conflict=metadata:3;title:2", result.rationale)
+
+    def test_map_series_does_not_penalize_exact_movie_title_inside_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 900,
+                                "title": "Dragon Ball Super: Super Hero",
+                                "alternative_titles": {"synonyms": ["Dragon Ball Super: Super Hero (English Dub)"]},
+                                "media_type": "movie",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        }
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Dragon Ball Movies",
+                        season_title="Dragon Ball Super: Super Hero (English Dub)",
+                        season_number=2115,
+                        max_episode_number=1,
+                        completed_episode_count=1,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 900)
+        self.assertIn("movie_type_allowed_for_exact_title", result.rationale)
+
 
 class PersistedMappingTests(unittest.TestCase):
     def test_upsert_and_list_series_mappings(self) -> None:

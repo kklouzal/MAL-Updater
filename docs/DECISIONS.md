@@ -42,8 +42,11 @@ This is a **missing-data-first** system.
 - Only fill dates when the source evidence is trustworthy enough; currently that means `finish_date` may be filled from Crunchyroll `last_watched_at` only when Crunchyroll-derived status is `completed`.
 - Do not auto-resolve ambiguous mappings.
 - Only auto-approve mappings when the top MAL candidate is an exact normalized-title match, clearly ahead of the runner-up, and there is no contradictory season/episode/installment evidence.
-- Expand generic Crunchyroll season labels like `Season 2` / `Part 2` into `Title Season 2` / `Title Part 2` search queries before giving up.
-- Treat explicit installment cues (season numbers, ordinal seasons, roman numerals, parts, `Final Season`) as explainable matching evidence; matching cues can promote a result, conflicting cues must block auto-approval.
+- Expand generic Crunchyroll season labels like `Season 2` / `Part 2` / `2nd Cour` / `Final Season` into `Title ...` search queries before giving up.
+- Treat explicit installment cues (season numbers, ordinal seasons, roman numerals, parts, cours, split indexes, `Final Season`) as explainable matching evidence; matching cues can promote a result, conflicting cues must block auto-approval.
+- Use stricter exact-title normalization than the similarity scorer so installment-bearing titles like `Part 1` and `Part 2` do not collapse into the same "exact" match.
+- When Crunchyroll `season_number` metadata conflicts with an explicit season number inside `season_title`, prefer the human-readable title cue and surface the conflict in rationale instead of silently trusting the integer.
+- Keep a default penalty on MAL movie candidates, but waive it when the provider season title itself is an exact movie title; this handles provider collection shells conservatively without making movies broadly preferred.
 - Queue conflicts for review.
 - Dry-run before live writes.
 

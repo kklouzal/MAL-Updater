@@ -103,7 +103,10 @@ PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 
 Current behavior:
 - `map-series` reads recently seen Crunchyroll series from SQLite and searches MAL for candidate matches
-- title scoring is intentionally conservative and reports `exact`, `strong`, `ambiguous`, `weak`, or `no_candidates`; generic Crunchyroll labels like `Season 2` are expanded into `Title Season 2` search queries, and explicit installment hints (season numbers, ordinal seasons, roman numerals, parts, `Final Season`) are scored as explainable evidence instead of opaque confidence bumps
+- title scoring is intentionally conservative and reports `exact`, `strong`, `ambiguous`, `weak`, or `no_candidates`; generic Crunchyroll labels like `Season 2`, `Part 2`, `2nd Cour`, or `Final Season` are expanded into `Title ...` search queries, and explicit installment hints (season numbers, ordinal seasons, roman numerals, parts, cours, split indexes, `Final Season`) are scored as explainable evidence instead of opaque confidence bumps
+- exact-title checks are stricter than the broader similarity score so `Part 1` and `Part 2` are no longer treated as the same exact title just because the base show name matches after cleanup
+- noisy provider `season_number` metadata is no longer blindly trusted when `season_title` contains a conflicting explicit season number; the title cue wins and the conflict is surfaced in rationale
+- exact movie-title matches are allowed even when Crunchyroll grouped the item under a movie/collection shell, but movies are still penalized by default when that exact title evidence is absent
 - `review-mappings` produces an approval queue: approved mappings are preserved, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` rows, strong-but-not-exact matches are marked `ready_for_approval`, explicit installment-hint conflicts block auto-approval, ambiguous/weak cases stay review-only, and `--persist-review-queue` replaces open `mapping_review` rows in SQLite with the unresolved items from the latest pass
 - `approve-mapping` persists an explicit Crunchyroll -> MAL choice into `mal_series_mapping`
 - `list-mappings` shows the durable mapping cache already saved in SQLite

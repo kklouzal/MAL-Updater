@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import AppConfig, load_mal_secrets
-from .db import PersistedSeriesMapping, connect, get_series_mapping, replace_review_queue_entries
+from .db import PersistedSeriesMapping, connect, get_series_mapping, replace_review_queue_entries, upsert_series_mapping
 from .mal_client import MalClient
-from .mapping import SeriesMappingInput, map_series
+from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
 
 
 @dataclass(slots=True)
@@ -274,6 +274,31 @@ def _remaining_ms(row: EpisodeProgressState) -> int | None:
     return row.duration_ms - row.playback_position_ms
 
 
+def _auto_approve_mapping(config: AppConfig, state: ProviderSeriesState, mapping_confidence: float, mal_anime_id: int) -> PersistedSeriesMapping:
+    return upsert_series_mapping(
+        config.db_path,
+        provider=state.provider,
+        provider_series_id=state.provider_series_id,
+        mal_anime_id=mal_anime_id,
+        confidence=mapping_confidence,
+        mapping_source="auto_exact",
+        approved_by_user=True,
+        notes="auto-approved: exact normalized title with no contradictory season/episode evidence",
+    )
+
+
+def _build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInput:
+    return SeriesMappingInput(
+        provider=state.provider,
+        provider_series_id=state.provider_series_id,
+        title=state.title,
+        season_title=state.season_title,
+        season_number=state.season_number,
+        max_episode_number=state.max_episode_number,
+        completed_episode_count=state.completed_episode_count,
+    )
+
+
 def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limit: int = 5) -> list[MappingReviewItem]:
     states = load_provider_series_states(config, limit=limit)
     client = MalClient(config, load_mal_secrets(config))
@@ -299,40 +324,36 @@ def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limi
             )
             continue
 
-        mapping = map_series(
-            client,
-            SeriesMappingInput(
-                provider=state.provider,
-                provider_series_id=state.provider_series_id,
-                title=state.title,
-                season_title=state.season_title,
-                season_number=state.season_number,
-                max_episode_number=state.max_episode_number,
-                completed_episode_count=state.completed_episode_count,
-            ),
-            limit=mapping_limit,
-        )
+        mapping = map_series(client, _build_series_mapping_input(state), limit=mapping_limit)
         reasons = list(mapping.rationale)
         if existing:
             reasons.append(
                 f"existing_mapping={existing.mal_anime_id}:{existing.mapping_source}:approved={int(existing.approved_by_user)}"
             )
-        if mapping.status in {"exact", "strong"} and mapping.chosen_candidate:
+
+        effective_mapping = existing
+        effective_status = mapping.status
+        decision = "needs_review"
+        if should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
+            effective_mapping = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)
+            effective_status = "approved"
+            decision = "auto_approved"
+            reasons.append("auto_approved_exact_unique_match")
+        elif mapping.status in {"exact", "strong"} and mapping.chosen_candidate:
             decision = "ready_for_approval"
         elif mapping.status == "no_candidates":
             decision = "needs_manual_match"
-        else:
-            decision = "needs_review"
+
         items.append(
             MappingReviewItem(
                 provider=state.provider,
                 provider_series_id=state.provider_series_id,
                 title=state.title,
                 season_title=state.season_title,
-                existing_mapping=existing,
+                existing_mapping=effective_mapping,
                 suggested_mal_anime_id=mapping.chosen_candidate.mal_anime_id if mapping.chosen_candidate else None,
                 suggested_mal_title=mapping.chosen_candidate.title if mapping.chosen_candidate else None,
-                mapping_status=mapping.status,
+                mapping_status=effective_status,
                 confidence=mapping.confidence,
                 decision=decision,
                 reasons=reasons,
@@ -355,7 +376,7 @@ def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limi
 def persist_mapping_review_queue(config: AppConfig, items: list[MappingReviewItem]) -> dict[str, int]:
     queue_entries = []
     for item in items:
-        if item.decision in {"preserved", "ready_for_approval"}:
+        if item.decision in {"preserved", "auto_approved", "ready_for_approval"}:
             continue
         severity = "error" if item.decision == "needs_manual_match" else "warning"
         queue_entries.append(
@@ -559,24 +580,23 @@ def _resolve_mapping_for_sync(
     if not allow_live_search:
         return ("unapproved", 0.0, None, persisted.mapping_source if persisted else None, False, ["live_search_disabled"])
 
-    mapping = map_series(
-        client,
-        SeriesMappingInput(
-            provider=state.provider,
-            provider_series_id=state.provider_series_id,
-            title=state.title,
-            season_title=state.season_title,
-            season_number=state.season_number,
-            max_episode_number=state.max_episode_number,
-            completed_episode_count=state.completed_episode_count,
-        ),
-        limit=mapping_limit,
-    )
+    mapping = map_series(client, _build_series_mapping_input(state), limit=mapping_limit)
     mapping_reasons = list(mapping.rationale)
     mapping_source: str | None = persisted.mapping_source if persisted else None
     if persisted:
         mapping_reasons.append(
             f"existing_mapping={persisted.mal_anime_id}:{persisted.mapping_source}:approved={int(persisted.approved_by_user)}"
+        )
+    if should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
+        persisted = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)
+        mapping_reasons.append("auto_approved_exact_unique_match")
+        return (
+            "approved",
+            mapping.confidence,
+            persisted.mal_anime_id,
+            persisted.mapping_source,
+            True,
+            mapping_reasons,
         )
     if mapping.status not in {"exact", "strong"} or not mapping.chosen_candidate:
         if mapping.candidates:

@@ -29,9 +29,20 @@ _ORDINAL_SEASON_RE = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season\b",
     re.IGNORECASE,
 )
-_FINAL_SEASON_RE = re.compile(r"\bfinal\s+season\b", re.IGNORECASE)
+_ORDINAL_COUR_RE = re.compile(
+    r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour\b",
+    re.IGNORECASE,
+)
+_COUR_NUMBER_RE = re.compile(r"\bcour\s+(\d+)\b", re.IGNORECASE)
+_FINAL_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
+_SEASON_RANGE_RE = re.compile(r"\bseasons?\s+\d+\s*[-/]\s*\d+\b", re.IGNORECASE)
 _STANDALONE_SEASON_RE = re.compile(r"^season\s+\d+$", re.IGNORECASE)
 _STANDALONE_PART_RE = re.compile(r"^part\s+\d+$", re.IGNORECASE)
+_STANDALONE_COUR_RE = re.compile(
+    r"^(?:cour\s+\d+|(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour)$",
+    re.IGNORECASE,
+)
+_STANDALONE_FINAL_SEASON_RE = re.compile(r"^final\s+season(?:\s+part\s+\d+)?$", re.IGNORECASE)
 
 _ORDINAL_TO_NUMBER = {
     "first": 1,
@@ -96,17 +107,25 @@ class MappingResult:
 
 
 
-def normalize_title(value: str | None) -> str:
+def _normalize_with_cleanup_patterns(value: str | None, cleanup_patterns: list[re.Pattern[str]]) -> str:
     if not value:
         return ""
     normalized = unicodedata.normalize("NFKD", value)
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     lowered = normalized.lower().replace("’", "'")
-    for pattern in _TITLE_CLEANUPS:
+    for pattern in cleanup_patterns:
         lowered = pattern.sub(" ", lowered)
     lowered = lowered.replace("&", " and ")
     lowered = _NON_ALNUM_RE.sub(" ", lowered)
     return " ".join(lowered.split())
+
+
+def normalize_title(value: str | None) -> str:
+    return _normalize_with_cleanup_patterns(value, _TITLE_CLEANUPS)
+
+
+def normalize_title_strict(value: str | None) -> str:
+    return _normalize_with_cleanup_patterns(value, _QUERY_CLEANUPS)
 
 
 def _search_query_cleanup(value: str) -> str:
@@ -123,7 +142,12 @@ def _season_title_needs_base_title(title: str, season_title: str) -> bool:
         return False
     if title_norm in normalize_title(season_title):
         return False
-    return bool(_STANDALONE_SEASON_RE.fullmatch(season_norm) or _STANDALONE_PART_RE.fullmatch(season_norm))
+    return bool(
+        _STANDALONE_SEASON_RE.fullmatch(season_norm)
+        or _STANDALONE_PART_RE.fullmatch(season_norm)
+        or _STANDALONE_COUR_RE.fullmatch(season_norm)
+        or _STANDALONE_FINAL_SEASON_RE.fullmatch(season_norm)
+    )
 
 
 def _fallback_queries(query: str) -> list[str]:
@@ -164,6 +188,8 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
 def _extract_season_number(value: str | None) -> int | None:
     if not value:
         return None
+    if _SEASON_RANGE_RE.search(value):
+        return None
     match = re.search(r"\bseason\s+(\d+)\b", value, re.IGNORECASE)
     if match:
         return int(match.group(1))
@@ -198,6 +224,28 @@ def _extract_ordinal_season_number(value: str | None) -> int | None:
     return _ORDINAL_TO_NUMBER.get(match.group(1).lower())
 
 
+def _parse_ordinal_token(value: str) -> int | None:
+    lowered = value.lower()
+    if lowered in _ORDINAL_TO_NUMBER:
+        return _ORDINAL_TO_NUMBER[lowered]
+    match = re.fullmatch(r"(\d+)(?:st|nd|rd|th)", lowered)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_cour_number(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = _COUR_NUMBER_RE.search(value)
+    if match:
+        return int(match.group(1))
+    match = _ORDINAL_COUR_RE.search(value)
+    if not match:
+        return None
+    return _parse_ordinal_token(match.group(1))
+
+
 def _extract_title_hints(value: str | None) -> set[str]:
     hints: set[str] = set()
     if not value:
@@ -211,6 +259,11 @@ def _extract_title_hints(value: str | None) -> set[str]:
     part_number = _extract_part_number(value)
     if part_number is not None:
         hints.add(f"part:{part_number}")
+        hints.add(f"split:{part_number}")
+    cour_number = _extract_cour_number(value)
+    if cour_number is not None:
+        hints.add(f"cour:{cour_number}")
+        hints.add(f"split:{cour_number}")
     roman_number = _extract_roman_installment_number(value)
     if roman_number is not None:
         hints.add(f"roman:{roman_number}")
@@ -247,6 +300,19 @@ def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
     return numbers
 
 
+def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str | None]:
+    title_season_number = _extract_season_number(series.season_title)
+    metadata_season_number = series.season_number
+    if title_season_number is not None and metadata_season_number is not None and title_season_number != metadata_season_number:
+        return (
+            title_season_number,
+            f"provider_season_metadata_conflict=metadata:{metadata_season_number};title:{title_season_number}",
+        )
+    if title_season_number is not None:
+        return title_season_number, None
+    return metadata_season_number, None
+
+
 def _extract_titles_from_node(node: dict[str, Any]) -> list[str]:
     titles = [str(node.get("title") or "")]
     alternative_titles = node.get("alternative_titles") or {}
@@ -263,6 +329,7 @@ def _extract_titles_from_node(node: dict[str, Any]) -> list[str]:
 def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any]) -> tuple[float, list[str]]:
     titles = _extract_titles_from_node(node)
     query_norm = normalize_title(query)
+    query_strict_norm = normalize_title_strict(query)
     best_ratio = 0.0
     best_title = ""
     for title in titles:
@@ -276,14 +343,19 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     reasons: list[str] = []
     score = best_ratio
     best_norm = normalize_title(best_title)
-    if best_norm == query_norm and best_norm:
+    best_strict_norm = normalize_title_strict(best_title)
+    if best_strict_norm == query_strict_norm and best_strict_norm:
         score = max(score, 0.995)
         reasons.append("exact_normalized_title")
-    elif query_norm and best_norm and (query_norm in best_norm or best_norm in query_norm):
+    elif query_strict_norm and best_strict_norm and (
+        query_strict_norm in best_strict_norm or best_strict_norm in query_strict_norm
+    ):
         score += 0.03
         reasons.append("substring_title_match")
 
-    provider_season_number = series.season_number if series.season_number is not None else _extract_season_number(series.season_title)
+    provider_season_number, provider_season_conflict_reason = _provider_season_number(series)
+    if provider_season_conflict_reason:
+        reasons.append(provider_season_conflict_reason)
     candidate_season_numbers = _candidate_season_numbers(node)
     if provider_season_number is not None and candidate_season_numbers:
         if provider_season_number in candidate_season_numbers:
@@ -316,6 +388,15 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         else:
             conflicting_hints.extend(sorted(provider_parts | candidate_parts))
 
+    provider_splits = {hint for hint in provider_hints if hint.startswith("split:")}
+    candidate_splits = {hint for hint in candidate_hints if hint.startswith("split:")}
+    if provider_splits and candidate_splits:
+        if provider_splits & candidate_splits:
+            reasons.append(f"split_installment_match={','.join(sorted(provider_splits & candidate_splits))}")
+            score += 0.06
+        else:
+            conflicting_hints.extend(sorted(provider_splits | candidate_splits))
+
     provider_romans = {hint for hint in provider_hints if hint.startswith("roman:")}
     candidate_romans = {hint for hint in candidate_hints if hint.startswith("roman:")}
     if provider_romans and candidate_romans:
@@ -337,7 +418,10 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         reasons.append(f"installment_hint_match={','.join(non_season_shared_hints)}")
 
     if conflicting_hints:
-        score -= 0.08
+        penalty = 0.08
+        if any(hint.startswith(("part:", "cour:", "split:")) for hint in conflicting_hints):
+            penalty = 0.16
+        score -= penalty
         reasons.append(f"installment_hint_conflict={','.join(conflicting_hints)}")
 
     candidate_num_episodes = node.get("num_episodes")
@@ -355,8 +439,11 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
 
     media_type = node.get("media_type")
     if media_type == "movie":
-        score -= 0.05
-        reasons.append("movie_penalty")
+        if best_strict_norm == query_strict_norm and best_strict_norm:
+            reasons.append("movie_type_allowed_for_exact_title")
+        else:
+            score -= 0.05
+            reasons.append("movie_penalty")
     score = max(0.0, min(score, 1.0))
     return score, reasons
 
@@ -367,9 +454,7 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
     if "exact_normalized_title" not in result.chosen_candidate.match_reasons:
         return False
 
-    provider_season_number = result.series.season_number
-    if provider_season_number is None:
-        provider_season_number = _extract_season_number(result.series.season_title)
+    provider_season_number, _ = _provider_season_number(result.series)
     candidate_season_numbers = _candidate_season_numbers(result.chosen_candidate.raw)
     if provider_season_number is not None and candidate_season_numbers and candidate_season_numbers != {provider_season_number}:
         return False

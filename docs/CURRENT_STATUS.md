@@ -50,7 +50,10 @@
   - `list-review-queue`
   - `apply-sync`
 - `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
-- mapping now leans on deeper Crunchyroll evidence when available: explicit season-title/season-number cues, generic `Season N` query expansion, installment-hint matching (`Season 2`, `Second Season`, roman numerals, parts, `Final Season`), and episode-count evidence can break ties between similarly named seasons/sequels
+- mapping now leans on deeper Crunchyroll evidence when available: explicit season-title/season-number cues, generic `Season N` / `Part N` / `Nth Cour` / `Final Season` query expansion, installment-hint matching (`Season 2`, `Second Season`, roman numerals, parts, cours, shared split indexes, `Final Season`), and episode-count evidence can break ties between similarly named seasons/sequels
+- exact-title logic is stricter than the similarity scorer on purpose: it still strips dub noise, but it no longer collapses installment-bearing titles like `Part 1` vs `Part 2` into the same "exact" match
+- provider season metadata is now treated as fallible: when Crunchyroll's `season_number` conflicts with an explicit season number inside `season_title`, the title cue wins for matching and the conflict is surfaced in rationale instead of silently trusting the provider integer
+- movie candidates are still penalized by default, but that penalty is waived when the provider season title itself is an exact movie title; this keeps collection shells like `Dragon Ball Movies` from hiding a clearly named movie match
 - `review-mappings` provides the first durable operator workflow: preserved approved mappings stay fixed, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` mappings, explicit installment conflicts block auto-approval, strong-but-not-exact suggestions are surfaced for explicit approval, weaker cases remain review-only, and unresolved items can be persisted into `review_queue`
 - `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
 - `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, can auto-promote the same safe exact matches into durable `auto_exact` approvals, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
@@ -91,7 +94,7 @@ That means the active blocker is no longer Crunchyroll access itself. The remain
 
 ## Next practical milestone
 
-Harden the guarded MAL executor further on top of the now-live local Crunchyroll dataset:
+Keep reducing the genuinely ambiguous mapping residue on top of the now-live local Crunchyroll dataset:
 - richer audit/debug surfacing for why an episode counted as completed
-- missing-data-only merge policy refinement
-- better review resolution UX
+- better review resolution UX for the remaining hard buckets
+- targeted handling for subtitle/arc-title variants and franchise/movie collection naming that still need human review when the provider title is not explicit enough
