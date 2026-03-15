@@ -13,6 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 DEFAULT_COMPLETION_THRESHOLD = 0.95
 DEFAULT_CREDITS_SKIP_WINDOW_SECONDS = 120
 DEFAULT_CONTRACT_VERSION = "1.0"
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAL_BASE_URL = "https://api.myanimelist.net/v2"
 DEFAULT_MAL_AUTH_URL = "https://myanimelist.net/v1/oauth2/authorize"
 DEFAULT_MAL_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
@@ -72,6 +73,7 @@ class AppConfig:
     completion_threshold: float = DEFAULT_COMPLETION_THRESHOLD
     credits_skip_window_seconds: int = DEFAULT_CREDITS_SKIP_WINDOW_SECONDS
     contract_version: str = DEFAULT_CONTRACT_VERSION
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     mal: MalSettings = field(default_factory=MalSettings)
     crunchyroll: CrunchyrollSettings = field(default_factory=CrunchyrollSettings)
 
@@ -270,6 +272,9 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             )
         ),
         contract_version=os.getenv("MAL_UPDATER_CONTRACT_VERSION", _get_str(settings, "contract_version", DEFAULT_CONTRACT_VERSION)),
+        request_timeout_seconds=float(
+            os.getenv("MAL_UPDATER_REQUEST_TIMEOUT_SECONDS", _get_float(settings, "request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS))
+        ),
         mal=MalSettings(
             base_url=os.getenv("MAL_UPDATER_MAL_BASE_URL", _get_str(mal_section, "base_url", DEFAULT_MAL_BASE_URL)),
             auth_url=os.getenv("MAL_UPDATER_MAL_AUTH_URL", _get_str(mal_section, "auth_url", DEFAULT_MAL_AUTH_URL)),

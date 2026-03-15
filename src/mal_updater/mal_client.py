@@ -162,7 +162,7 @@ class MalClient:
             method="PUT",
         )
         try:
-            with urlopen(request) as response:
+            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
                 body = response.read().decode("utf-8")
                 return json.loads(body) if body else {"status": status, "num_episodes_watched": num_watched_episodes}
         except HTTPError as exc:
@@ -175,7 +175,7 @@ class MalClient:
         url = path_or_url if path_or_url.startswith("http") else f"{self.config.mal.base_url}{path_or_url}"
         request = Request(url, headers=headers, method="GET")
         try:
-            with urlopen(request) as response:
+            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -196,7 +196,7 @@ class MalClient:
             method="POST",
         )
         try:
-            with urlopen(request) as response:
+            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
                 raw = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")

@@ -5,10 +5,11 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mal_updater.auth import format_auth_flow_prompt, persist_token_response, write_secret_file
 from mal_updater.config import load_config, load_mal_secrets
-from mal_updater.mal_client import TokenResponse
+from mal_updater.mal_client import MalClient, TokenResponse
 
 
 class ConfigTests(unittest.TestCase):
@@ -33,6 +34,23 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.mal.bind_host, "192.168.1.50")
             self.assertEqual(config.mal.redirect_host, "animebox.local")
             self.assertEqual(config.mal.redirect_uri, "http://animebox.local:9999/callback")
+
+    def test_load_config_reads_request_timeout_seconds_from_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text(
+                textwrap.dedent(
+                    """
+                    request_timeout_seconds = 7.5
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(root)
+
+            self.assertEqual(config.request_timeout_seconds, 7.5)
 
     def test_load_mal_secrets_reads_secret_file_overrides_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -109,6 +127,31 @@ class AuthHelperTests(unittest.TestCase):
 
             self.assertEqual(persisted.access_token_path.read_text(encoding="utf-8"), "access-abc\n")
             self.assertEqual(persisted.refresh_token_path.read_text(encoding="utf-8"), "refresh-xyz\n")
+
+    def test_mal_client_uses_configured_request_timeout_for_get_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text("request_timeout_seconds = 7.5\n", encoding="utf-8")
+            (root / "secrets").mkdir()
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            config = load_config(root)
+            client = MalClient(config, load_mal_secrets(config))
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return b'{"data": []}'
+
+            with patch("mal_updater.mal_client.urlopen", return_value=_Response()) as urlopen_mock:
+                client.search_anime("Example")
+
+            self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 7.5)
 
 
 if __name__ == "__main__":
