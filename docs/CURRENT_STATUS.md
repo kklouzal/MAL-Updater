@@ -124,4 +124,4 @@ Keep reducing the genuinely ambiguous mapping residue on top of the now-live loc
   - overlap guard: `flock` lock file under `state/locks/`
   - logs: `state/logs/`
   - user-level systemd units checked in under `ops/systemd-user/` for a persistent jittered ~8-hour average cadence (effective spread: roughly 6-10 hours)
-- the live Crunchyroll fetch path now spaces individual Crunchyroll requests by `request_spacing_seconds ± request_spacing_jitter_seconds` (default `10.0 ± 3.0`, so about 7-13 seconds)
+- the live Crunchyroll fetch path now spaces individual Crunchyroll requests by `request_spacing_seconds ± request_spacing_jitter_seconds` (default `22.5 ± 7.5`, i.e. randomized 15-30 seconds)

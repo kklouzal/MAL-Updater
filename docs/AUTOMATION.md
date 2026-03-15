@@ -30,7 +30,8 @@ Safety properties:
 - logs per run under `state/logs/`
 - live MAL writes remain constrained by the guarded executor
 - exact-only currently means approved mappings whose persisted `mapping_source` is `auto_exact` or `user_exact`
-- Crunchyroll auth recovery is bounded and conservative: the fetch path first tries the staged refresh token, and if Crunchyroll still answers `401` on the content API (or the refresh token itself has expired), it performs one credential rebootstrap from the locally staged secrets and retries once instead of looping or hammering the service
+- Crunchyroll auth recovery is bounded and conservative: the fetch path first tries the staged refresh token, and if Crunchyroll answers `401` on the content API mid-run (or the refresh token itself has expired), it performs one credential rebootstrap from the locally staged secrets, retries the failed request, and resumes the same fetch cycle instead of restarting from scratch or looping indefinitely
+- if a fresh fetch still cannot be salvaged, the exact-approved wrapper now continues with the most recent already-ingested Crunchyroll state instead of aborting the entire MAL apply pass
 
 ## Crunchyroll pacing
 
@@ -39,11 +40,11 @@ Safety properties:
 ```toml
 [crunchyroll]
 locale = "en-US"
-request_spacing_seconds = 10.0
-request_spacing_jitter_seconds = 3.0
+request_spacing_seconds = 22.5
+request_spacing_jitter_seconds = 7.5
 ```
 
-The live fetch path spaces individual Crunchyroll HTTP requests by roughly this amount (default: `10 ± 3s`). With the current flow, a normal run usually issues:
+The live fetch path spaces individual Crunchyroll HTTP requests by roughly this amount (default: `22.5 ± 7.5s`, i.e. randomized 15-30 seconds). With the current flow, a normal run usually issues:
 
 1. refresh-token request
 2. account lookup
@@ -75,3 +76,4 @@ Timer behavior:
 - subsequent runs land on an intentionally conservative jittered cadence of about 8 hours on average, implemented as `OnUnitInactiveSec=6h` plus `RandomizedDelaySec=4h` (effective spread: roughly 6-10 hours after the previous run finishes)
 - because the timer is based on `OnUnitInactiveSec=6h`, a brand-new install does not force an immediate catch-up run by itself; start the service manually once if you want an immediate first cycle
 - `Persistent=true` so missed intervals catch up once when the machine/user manager comes back
+he machine/user manager comes back

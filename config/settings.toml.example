@@ -24,8 +24,8 @@ redirect_port = 8765
 
 [crunchyroll]
 locale = "en-US"
-request_spacing_seconds = 10.0
-request_spacing_jitter_seconds = 3.0
+request_spacing_seconds = 22.5
+request_spacing_jitter_seconds = 7.5
 
 [secret_files]
 mal_client_id = "mal_client_id.txt"

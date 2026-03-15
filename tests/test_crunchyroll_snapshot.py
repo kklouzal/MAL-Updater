@@ -218,7 +218,6 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
                 mock_get.side_effect = [
                     _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
                     _FakeResponse(401, {"message": "Unauthorized"}),
-                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
                     _FakeResponse(200, {"total": 0, "data": []}),
                     _FakeResponse(200, {"total": 0, "data": []}),
                 ]
@@ -229,6 +228,113 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
             refresh_mock.assert_called_once()
             bootstrap_mock.assert_called_once()
             self.assertEqual((root / "state" / "crunchyroll" / "default" / "refresh_token.txt").read_text(encoding="utf-8"), "refresh-2\n")
+
+    def test_fetch_snapshot_resumes_same_history_page_after_midrun_401(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "config" / "settings.toml").write_text("[crunchyroll]\nrequest_spacing_seconds = 0\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
+            (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
+            (root / "secrets").mkdir()
+            (root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / "secrets" / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+            config = load_config(root)
+
+            history_page_1 = {
+                "total": 150,
+                "data": [
+                    {
+                        "id": f"ep-{index}",
+                        "date_played": "2026-03-14T22:10:00Z",
+                        "playhead": 1200000,
+                        "fully_watched": True,
+                        "panel": {
+                            "type": "episode",
+                            "id": f"ep-{index}",
+                            "series_id": "series-1",
+                            "series_title": "Example Show",
+                            "season_title": "Season 1",
+                            "season_number": 1,
+                            "episode_number": index,
+                            "title": f"Episode {index}",
+                            "duration_ms": 1440000,
+                            "audio_locale": "en-US",
+                            "subtitle_locales": ["en-US"],
+                        },
+                    }
+                    for index in range(1, 101)
+                ],
+            }
+            history_page_2 = {
+                "total": 150,
+                "data": [
+                    {
+                        "id": f"ep-{index}",
+                        "date_played": "2026-03-15T00:10:00Z",
+                        "playhead": 1200000,
+                        "fully_watched": True,
+                        "panel": {
+                            "type": "episode",
+                            "id": f"ep-{index}",
+                            "series_id": "series-1",
+                            "series_title": "Example Show",
+                            "season_title": "Season 1",
+                            "season_number": 1,
+                            "episode_number": index,
+                            "title": f"Episode {index}",
+                            "duration_ms": 1440000,
+                            "audio_locale": "en-US",
+                            "subtitle_locales": ["en-US"],
+                        },
+                    }
+                    for index in range(101, 151)
+                ],
+            }
+
+            state_paths = crunchyroll_snapshot_module.resolve_crunchyroll_state_paths(config)
+            with patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token",
+                return_value=(
+                    crunchyroll_snapshot_module.CrunchyrollAccessToken(
+                        access_token="access-refresh",
+                        refresh_token="refresh-1",
+                        account_id="acct-1",
+                        device_id="device-123",
+                        device_type="ANDROIDTV",
+                    ),
+                    state_paths,
+                ),
+            ) as refresh_mock, patch(
+                "mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials",
+                return_value=SimpleNamespace(
+                    access_token="access-bootstrap",
+                    refresh_token="refresh-2",
+                    account_id="acct-1",
+                    account_email="user@example.com",
+                    device_id="device-123",
+                    device_type="ANDROIDTV",
+                ),
+            ) as bootstrap_mock, patch("mal_updater.crunchyroll_snapshot._http_get") as mock_get:
+                mock_get.side_effect = [
+                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+                    _FakeResponse(200, history_page_1),
+                    _FakeResponse(401, {"message": "Unauthorized"}),
+                    _FakeResponse(200, history_page_2),
+                    _FakeResponse(200, {"total": 0, "data": []}),
+                ]
+
+                result = fetch_snapshot(config)
+
+            payload = snapshot_to_dict(result.snapshot)
+            self.assertEqual(payload["raw"]["auth_source"], "credential_rebootstrap")
+            self.assertEqual(payload["raw"]["history_count"], 150)
+            self.assertEqual(len(payload["progress"]), 150)
+            refresh_mock.assert_called_once()
+            bootstrap_mock.assert_called_once()
+            self.assertEqual(mock_get.call_args_list[2].kwargs["params"]["page"], 2)
+            self.assertEqual(mock_get.call_args_list[3].kwargs["params"]["page"], 2)
 
     def test_fetch_snapshot_rebootstraps_after_refresh_token_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:

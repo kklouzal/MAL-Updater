@@ -90,6 +90,73 @@ class _CrunchyrollRequestPacer:
         self.last_request_started_at = now
 
 
+@dataclass(slots=True)
+class _CrunchyrollAuthSession:
+    config: AppConfig
+    profile: str
+    timeout_seconds: float
+    pacer: _CrunchyrollRequestPacer
+    state_paths: CrunchyrollStatePaths
+    token: CrunchyrollAccessToken
+    auth_source: str
+    account_email: str | None = None
+    credential_rebootstrap_attempted: bool = False
+
+    def authorized_json_get(self, url: str, *, params: dict[str, Any] | None = None) -> Any:
+        try:
+            return _authorized_json_get(
+                url,
+                access_token=self.token.access_token,
+                timeout_seconds=self.timeout_seconds,
+                params=params,
+                pacer=self.pacer,
+            )
+        except CrunchyrollUnauthorizedError as exc:
+            if self.credential_rebootstrap_attempted:
+                _write_session_state(
+                    state_paths=self.state_paths,
+                    profile=self.profile,
+                    locale=self.config.crunchyroll.locale,
+                    device_type=self.token.device_type,
+                    account_id=self.token.account_id,
+                    last_error=f"{exc}; credential rebootstrap already used for this run",
+                    success=False,
+                    phase="auth_failed",
+                )
+                raise
+            self._rebootstrap_with_credentials(exc)
+            return _authorized_json_get(
+                url,
+                access_token=self.token.access_token,
+                timeout_seconds=self.timeout_seconds,
+                params=params,
+                pacer=self.pacer,
+            )
+
+    def _rebootstrap_with_credentials(self, exc: CrunchyrollUnauthorizedError) -> None:
+        _write_session_state(
+            state_paths=self.state_paths,
+            profile=self.profile,
+            locale=self.config.crunchyroll.locale,
+            device_type=self.token.device_type,
+            account_id=self.token.account_id,
+            last_error=f"{exc}; retrying once with credential rebootstrap",
+            success=False,
+            phase="auth_retrying_with_credentials",
+        )
+        bootstrap = crunchyroll_login_with_credentials(
+            self.config,
+            profile=self.profile,
+            timeout_seconds=self.timeout_seconds,
+            verify_account=True,
+        )
+        self.token = _token_from_bootstrap(bootstrap)
+        self.state_paths = resolve_crunchyroll_state_paths(self.config, profile=self.profile)
+        self.auth_source = "credential_rebootstrap"
+        self.account_email = bootstrap.account_email
+        self.credential_rebootstrap_attempted = True
+
+
 
 def _now_string() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -317,7 +384,7 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
         playback_position_ms = int(playhead) if isinstance(playhead, int) else None
         if playback_position_ms is not None and duration_ms and playback_position_ms <= max(60000, duration_ms // 100):
             playback_position_ms *= 1000
-        
+
         provider_series_id = metadata.get("series_id")
         provider_episode_id = panel.get("id")
         if not provider_series_id or not provider_episode_id:
@@ -414,37 +481,63 @@ def _token_from_bootstrap(result: CrunchyrollBootstrapResult) -> CrunchyrollAcce
     )
 
 
-def _fetch_snapshot_once(
+def _start_auth_session(
     config: AppConfig,
     *,
     profile: str,
     timeout_seconds: float,
     pacer: _CrunchyrollRequestPacer,
-    token: CrunchyrollAccessToken,
-    state_paths: CrunchyrollStatePaths,
-    auth_source: str,
-) -> CrunchyrollFetchResult:
-    account_payload = _authorized_json_get(
-        CRUNCHYROLL_ME_URL,
-        access_token=token.access_token,
-        timeout_seconds=timeout_seconds,
-        pacer=pacer,
-    )
+) -> _CrunchyrollAuthSession:
+    state_paths = resolve_crunchyroll_state_paths(config, profile=profile)
+    try:
+        token, state_paths = refresh_access_token(config, profile=profile, timeout_seconds=timeout_seconds, pacer=pacer)
+        return _CrunchyrollAuthSession(
+            config=config,
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            pacer=pacer,
+            state_paths=state_paths,
+            token=token,
+            auth_source="refresh_token",
+        )
+    except CrunchyrollAuthError:
+        bootstrap = crunchyroll_login_with_credentials(
+            config,
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            verify_account=True,
+        )
+        return _CrunchyrollAuthSession(
+            config=config,
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            pacer=pacer,
+            state_paths=resolve_crunchyroll_state_paths(config, profile=profile),
+            token=_token_from_bootstrap(bootstrap),
+            auth_source="credential_rebootstrap",
+            account_email=bootstrap.account_email,
+            credential_rebootstrap_attempted=True,
+        )
+
+
+def _fetch_snapshot_once(session: _CrunchyrollAuthSession) -> CrunchyrollFetchResult:
+    config = session.config
+    account_payload = session.authorized_json_get(CRUNCHYROLL_ME_URL)
     if not isinstance(account_payload, dict):
         raise CrunchyrollSnapshotError("Crunchyroll account response was not a JSON object")
-    account_id = str(account_payload.get("account_id") or token.account_id or "") or None
+    account_id = str(account_payload.get("account_id") or session.token.account_id or "") or None
     if not account_id:
         raise CrunchyrollSnapshotError("Crunchyroll account response did not include account_id")
+    session.token.account_id = account_id
+    if account_payload.get("email"):
+        session.account_email = str(account_payload.get("email"))
 
     history_entries: list[dict[str, Any]] = []
     page = 1
     while True:
-        history_payload = _authorized_json_get(
+        history_payload = session.authorized_json_get(
             f"https://www.crunchyroll.com/content/v2/{account_id}/watch-history",
-            access_token=token.access_token,
-            timeout_seconds=timeout_seconds,
             params={"page": page, "page_size": 100, "locale": config.crunchyroll.locale},
-            pacer=pacer,
         )
         if not isinstance(history_payload, dict):
             raise CrunchyrollSnapshotError("Crunchyroll watch-history response was not a JSON object")
@@ -464,12 +557,9 @@ def _fetch_snapshot_once(
     watchlist_total: int | None = None
     watchlist_start = 0
     while True:
-        watchlist_payload = _authorized_json_get(
+        watchlist_payload = session.authorized_json_get(
             f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist",
-            access_token=token.access_token,
-            timeout_seconds=timeout_seconds,
             params={"locale": config.crunchyroll.locale, "n": 100, "start": watchlist_start},
-            pacer=pacer,
         )
         if not isinstance(watchlist_payload, dict):
             raise CrunchyrollSnapshotError("Crunchyroll watchlist response was not a JSON object")
@@ -513,25 +603,25 @@ def _fetch_snapshot_once(
         watchlist=watchlist_entries,
         raw={
             "status": "ok",
-            "profile": profile,
-            "state_root": str(state_paths.root),
-            "session_state_path": str(state_paths.session_state_path),
-            "refresh_token_present": state_paths.refresh_token_path.exists(),
-            "device_id_present": state_paths.device_id_path.exists(),
-            "device_type_hint": token.device_type,
+            "profile": session.profile,
+            "state_root": str(session.state_paths.root),
+            "session_state_path": str(session.state_paths.session_state_path),
+            "refresh_token_present": session.state_paths.refresh_token_path.exists(),
+            "device_id_present": session.state_paths.device_id_path.exists(),
+            "device_type_hint": session.token.device_type,
             "history_count": len(history_entries),
             "watchlist_count": len(watchlist_entries),
             "transport": "curl_cffi:chrome124" if curl_requests is not None else "requests",
             "request_spacing_seconds": config.crunchyroll.request_spacing_seconds,
             "request_spacing_jitter_seconds": config.crunchyroll.request_spacing_jitter_seconds,
-            "auth_source": auth_source,
+            "auth_source": session.auth_source,
         },
     )
     _write_session_state(
-        state_paths=state_paths,
-        profile=profile,
+        state_paths=session.state_paths,
+        profile=session.profile,
         locale=config.crunchyroll.locale,
-        device_type=token.device_type,
+        device_type=session.token.device_type,
         account_id=account_id,
         last_error=None,
         success=True,
@@ -539,8 +629,8 @@ def _fetch_snapshot_once(
     )
     return CrunchyrollFetchResult(
         snapshot=snapshot,
-        state_paths=state_paths,
-        account_email=str(account_payload.get("email")) if account_payload.get("email") else None,
+        state_paths=session.state_paths,
+        account_email=session.account_email,
     )
 
 
@@ -554,61 +644,13 @@ def fetch_snapshot(
         config.crunchyroll.request_spacing_seconds,
         jitter_seconds=config.crunchyroll.request_spacing_jitter_seconds,
     )
-    state_paths = resolve_crunchyroll_state_paths(config, profile=profile)
-
-    try:
-        token, state_paths = refresh_access_token(config, profile=profile, timeout_seconds=timeout_seconds, pacer=pacer)
-        return _fetch_snapshot_once(
-            config,
-            profile=profile,
-            timeout_seconds=timeout_seconds,
-            pacer=pacer,
-            token=token,
-            state_paths=state_paths,
-            auth_source="refresh_token",
-        )
-    except CrunchyrollUnauthorizedError as exc:
-        _write_session_state(
-            state_paths=state_paths,
-            profile=profile,
-            locale=config.crunchyroll.locale,
-            device_type=DEFAULT_CRUNCHYROLL_DEVICE_TYPE,
-            account_id=None,
-            last_error=f"{exc}; retrying once with credential rebootstrap",
-            success=False,
-            phase="auth_retrying_with_credentials",
-        )
-    except CrunchyrollAuthError:
-        pass
-
-    bootstrap = crunchyroll_login_with_credentials(
+    session = _start_auth_session(
         config,
         profile=profile,
         timeout_seconds=timeout_seconds,
-        verify_account=True,
+        pacer=pacer,
     )
-    try:
-        return _fetch_snapshot_once(
-            config,
-            profile=profile,
-            timeout_seconds=timeout_seconds,
-            pacer=pacer,
-            token=_token_from_bootstrap(bootstrap),
-            state_paths=resolve_crunchyroll_state_paths(config, profile=profile),
-            auth_source="credential_rebootstrap",
-        )
-    except CrunchyrollUnauthorizedError as exc:
-        _write_session_state(
-            state_paths=resolve_crunchyroll_state_paths(config, profile=profile),
-            profile=profile,
-            locale=config.crunchyroll.locale,
-            device_type=bootstrap.device_type,
-            account_id=bootstrap.account_id,
-            last_error=f"{exc}; credential rebootstrap also failed",
-            success=False,
-            phase="auth_failed",
-        )
-        raise
+    return _fetch_snapshot_once(session)
 
 
 def snapshot_to_dict(snapshot: CrunchyrollSnapshot) -> dict[str, Any]:

@@ -26,7 +26,13 @@ echo "snapshot=$SNAPSHOT_PATH"
 
 cd "$ROOT_DIR"
 PYTHONPATH=src python3 -m mal_updater.cli init >/dev/null
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out "$SNAPSHOT_PATH" --ingest
+
+if PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out "$SNAPSHOT_PATH" --ingest; then
+  echo "[$(date -Is)] fresh Crunchyroll fetch+ingest completed"
+else
+  echo "[$(date -Is)] WARNING: fresh Crunchyroll fetch+ingest failed; continuing with the most recent already-ingested Crunchyroll state"
+fi
+
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
 
 echo "[$(date -Is)] exact-approved MAL sync cycle completed"
