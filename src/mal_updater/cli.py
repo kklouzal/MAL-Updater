@@ -308,6 +308,8 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
                     title=state.title,
                     season_title=state.season_title,
                     season_number=state.season_number,
+                    max_episode_number=state.max_episode_number,
+                    completed_episode_count=state.completed_episode_count,
                 ),
                 limit=mapping_limit,
             )

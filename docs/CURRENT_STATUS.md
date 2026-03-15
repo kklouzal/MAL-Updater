@@ -27,9 +27,10 @@
   - exposes `crunchyroll-fetch-snapshot` in the CLI, with optional direct ingestion
 - the Python fetch path has produced real live Crunchyroll data on this host
 - a live snapshot was validated and ingested into SQLite with:
-  - `series_count=219`
+  - `series_count=245`
   - `progress_count=4311`
-  - `watchlist_count=10`
+  - `watchlist_count=197`
+- the Crunchyroll watchlist path was corrected to use the provider's actual pagination shape (`n` + `start`) instead of assuming page/page_size semantics; the prior `watchlist_count=10` was incomplete
 
 ## Not implemented yet
 
@@ -49,6 +50,7 @@
   - `list-review-queue`
   - `apply-sync`
 - `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
+- mapping now leans on deeper Crunchyroll evidence when available: explicit season-title/season-number cues and episode-count evidence can break ties between similarly named seasons/sequels
 - `review-mappings` provides the first durable operator workflow: preserved approved mappings stay fixed, strong suggestions are surfaced for explicit approval, weaker cases remain review-only, and unresolved items can be persisted into `review_queue`
 - `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
 - `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
@@ -60,8 +62,8 @@
   - never decreases MAL watched-episode counts
   - never downgrades a `completed` MAL entry
   - now uses explicit missing-data-only field rules:
-    - `status` is only filled when MAL has no status yet
-    - progress is only filled when MAL has no status yet, so `plan_to_watch` + `0` is preserved as meaningful
+    - `status` is only filled when MAL has no status yet, except that an existing MAL `plan_to_watch` may be upgraded when Crunchyroll proves completed episode progress
+    - progress is only filled when the proposal is backed by completed-episode evidence; `watching + 0 episodes` proposals are suppressed entirely
     - `score` is treated as meaningful whenever it is non-zero and is never overwritten by Crunchyroll today
     - `start_date` is preserved because the current Crunchyroll snapshot does not prove the true first-watch date
     - `finish_date` may be filled only when Crunchyroll safely implies completion and MAL does not already have one

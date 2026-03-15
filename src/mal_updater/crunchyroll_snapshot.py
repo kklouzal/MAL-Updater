@@ -396,17 +396,33 @@ def fetch_snapshot(
             break
         page += 1
 
-    watchlist_payload = _authorized_json_get(
-        f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist",
-        access_token=token.access_token,
-        timeout_seconds=timeout_seconds,
-        params={"locale": config.crunchyroll.locale},
-    )
-    if not isinstance(watchlist_payload, dict):
-        raise CrunchyrollSnapshotError("Crunchyroll watchlist response was not a JSON object")
-    watchlist_data = watchlist_payload.get("data")
-    if not isinstance(watchlist_data, list):
-        raise CrunchyrollSnapshotError("Crunchyroll watchlist response did not include a data list")
+    watchlist_data: list[dict[str, Any]] = []
+    watchlist_total: int | None = None
+    watchlist_start = 0
+    while True:
+        watchlist_payload = _authorized_json_get(
+            f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist",
+            access_token=token.access_token,
+            timeout_seconds=timeout_seconds,
+            params={"locale": config.crunchyroll.locale, "n": 100, "start": watchlist_start},
+        )
+        if not isinstance(watchlist_payload, dict):
+            raise CrunchyrollSnapshotError("Crunchyroll watchlist response was not a JSON object")
+        data = watchlist_payload.get("data")
+        if not isinstance(data, list):
+            raise CrunchyrollSnapshotError("Crunchyroll watchlist response did not include a data list")
+        batch = [item for item in data if isinstance(item, dict)]
+        watchlist_data.extend(batch)
+        total = watchlist_payload.get("total")
+        if isinstance(total, int):
+            watchlist_total = total
+        if not batch:
+            break
+        watchlist_start += len(batch)
+        if len(batch) < 100:
+            break
+        if watchlist_total is not None and len(watchlist_data) >= watchlist_total:
+            break
 
     progress = [item for item in (_progress_from_history_entry(entry) for entry in history_entries) if item is not None]
     history_series = [item for item in (_series_from_panel(entry.get("panel")) for entry in history_entries if isinstance(entry.get("panel"), dict)) if item is not None]

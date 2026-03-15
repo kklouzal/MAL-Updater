@@ -307,6 +307,8 @@ def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limi
                 title=state.title,
                 season_title=state.season_title,
                 season_number=state.season_number,
+                max_episode_number=state.max_episode_number,
+                completed_episode_count=state.completed_episode_count,
             ),
             limit=mapping_limit,
         )
@@ -565,6 +567,8 @@ def _resolve_mapping_for_sync(
             title=state.title,
             season_title=state.season_title,
             season_number=state.season_number,
+            max_episode_number=state.max_episode_number,
+            completed_episode_count=state.completed_episode_count,
         ),
         limit=mapping_limit,
     )
@@ -617,12 +621,12 @@ def _plan_status_update(
             "status": "watching",
             "num_watched_episodes": crunchyroll_watched_episodes,
         }
+        reasons.append("crunchyroll_completed_episode_evidence_present")
         if num_episodes and crunchyroll_watched_episodes >= int(num_episodes):
             proposed_status["status"] = "completed"
             reasons.append("crunchyroll_completion_reached_known_episode_count")
     elif state.progress_rows > 0:
-        proposed_status = {"status": "watching", "num_watched_episodes": 0}
-        reasons.append("started_but_no_completed_episodes")
+        reasons.append("partial_crunchyroll_activity_without_completed_episode")
     elif state.watchlist_status:
         proposed_status = {"status": "plan_to_watch", "num_watched_episodes": 0}
         reasons.append("watchlist_only")
@@ -646,6 +650,9 @@ def _plan_status_update(
     current_watched = int((current_status or {}).get("num_episodes_watched") or 0)
     current_list_status = _coerce_optional_str((current_status or {}).get("status"))
     proposed_watched = int(proposed_status.get("num_watched_episodes") or 0)
+
+    if current_list_status == "plan_to_watch" and proposed_watched > 0:
+        reasons.append("override_plan_to_watch_due_to_crunchyroll_watch_evidence")
 
     if current_watched > proposed_watched:
         return SyncProposal(

@@ -157,6 +157,7 @@ Behavior:
 - refreshes the staged Crunchyroll refresh token from `state/crunchyroll/<profile>/`
 - uses `curl_cffi` browser-TLS impersonation when available
 - fetches real account / watch-history / watchlist data
+- paginates Crunchyroll watchlists with the provider's `n` + `start` parameters so large libraries are ingested completely
 - normalizes the result into the existing `1.0` snapshot contract
 - can immediately validate + ingest into SQLite
 

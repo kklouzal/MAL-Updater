@@ -79,6 +79,70 @@ class MappingTests(unittest.TestCase):
         self.assertIsNotNone(result.chosen_candidate)
         self.assertEqual(result.chosen_candidate.mal_anime_id, 42)
 
+    def test_map_series_uses_season_and_episode_evidence_to_avoid_wrong_sequel(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 100,
+                                "title": "Example Show Season 1",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 200,
+                                "title": "Example Show Season 2",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Example Show",
+                        season_title="Example Show Season 2",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 200)
+        self.assertTrue(any("season_number_match=2" == reason for reason in result.rationale))
+
 
 class PersistedMappingTests(unittest.TestCase):
     def test_upsert_and_list_series_mappings(self) -> None:
@@ -497,6 +561,99 @@ class DryRunPlannerTests(unittest.TestCase):
 
         self.assertEqual(proposals[0].decision, "skip")
         self.assertIn("mal_already_matches_or_exceeds_proposal", proposals[0].reasons)
+
+    def test_build_dry_run_sync_plan_overrides_plan_to_watch_when_crunchyroll_has_completed_episode_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 2
+            payload["progress"][0]["completion_ratio"] = 0.95
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "plan_to_watch", "num_episodes_watched": 0},
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+
+        self.assertEqual(proposals[0].decision, "propose_update")
+        self.assertEqual(proposals[0].proposed_my_list_status, {"status": "watching", "num_watched_episodes": 2})
+        self.assertIn("override_plan_to_watch_due_to_crunchyroll_watch_evidence", proposals[0].reasons)
+
+    def test_build_dry_run_sync_plan_suppresses_watching_zero_episode_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["completion_ratio"] = 0.40
+            payload["progress"][0]["episode_number"] = 1
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": None,
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+
+        self.assertEqual(proposals[0].decision, "skip")
+        self.assertIsNone(proposals[0].proposed_my_list_status)
+        self.assertIn("partial_crunchyroll_activity_without_completed_episode", proposals[0].reasons)
+        self.assertIn("no_actionable_crunchyroll_state", proposals[0].reasons)
 
     def test_build_dry_run_sync_plan_counts_follow_on_near_complete_episode_as_watched(self) -> None:
         with tempfile.TemporaryDirectory() as td:

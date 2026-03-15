@@ -77,6 +77,7 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
                 ],
             }
             watchlist_payload = {
+                "total": 1,
                 "data": [
                     {
                         "never_watched": False,
@@ -121,6 +122,54 @@ class CrunchyrollSnapshotTests(unittest.TestCase):
             self.assertEqual(payload["watchlist"][0]["status"], "in_progress")
             self.assertEqual(payload["raw"]["history_count"], 1)
             self.assertEqual(payload["raw"]["watchlist_count"], 1)
+
+    def test_fetch_snapshot_paginates_watchlist_with_n_and_start(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "state" / "crunchyroll" / "default").mkdir(parents=True)
+            (root / "state" / "crunchyroll" / "default" / "refresh_token.txt").write_text("refresh-old\n", encoding="utf-8")
+            (root / "state" / "crunchyroll" / "default" / "device_id.txt").write_text("device-123\n", encoding="utf-8")
+            config = load_config(root)
+
+            history_payload = {"total": 0, "data": []}
+            watchlist_page_1 = {
+                "total": 197,
+                "data": [
+                    {"never_watched": False, "fully_watched": False, "panel": {"type": "series", "id": f"series-{index}", "title": f"Show {index}"}}
+                    for index in range(100)
+                ],
+            }
+            watchlist_page_2 = {
+                "total": 197,
+                "data": [
+                    {"never_watched": False, "fully_watched": False, "panel": {"type": "series", "id": f"series-{index}", "title": f"Show {index}"}}
+                    for index in range(100, 197)
+                ],
+            }
+
+            with patch("mal_updater.crunchyroll_snapshot._http_post") as mock_post, patch(
+                "mal_updater.crunchyroll_snapshot._http_get"
+            ) as mock_get:
+                mock_post.return_value = _FakeResponse(
+                    200,
+                    {"access_token": "access-1", "refresh_token": "refresh-new", "account_id": "acct-1"},
+                )
+                mock_get.side_effect = [
+                    _FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+                    _FakeResponse(200, history_payload),
+                    _FakeResponse(200, watchlist_page_1),
+                    _FakeResponse(200, watchlist_page_2),
+                ]
+
+                result = fetch_snapshot(config)
+
+            payload = snapshot_to_dict(result.snapshot)
+            self.assertEqual(len(payload["watchlist"]), 197)
+            self.assertEqual(payload["raw"]["watchlist_count"], 197)
+            self.assertEqual(mock_get.call_args_list[2].kwargs["params"]["n"], 100)
+            self.assertEqual(mock_get.call_args_list[2].kwargs["params"]["start"], 0)
+            self.assertEqual(mock_get.call_args_list[3].kwargs["params"]["start"], 100)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ class SeriesMappingInput:
     title: str
     season_title: str | None = None
     season_number: int | None = None
+    max_episode_number: int | None = None
+    completed_episode_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -92,10 +94,31 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
     for value in (series.season_title, series.title):
         if not value:
             continue
+        raw = " ".join(str(value).split()).strip()
+        if raw and raw not in queries:
+            queries.append(raw)
         cleaned = _search_query_cleanup(value)
         if cleaned and cleaned not in queries:
             queries.append(cleaned)
     return queries or [_search_query_cleanup(series.title)]
+
+
+def _extract_season_number(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.search(r"\bseason\s+(\d+)\b", value, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
+    numbers: set[int] = set()
+    for title in _extract_titles_from_node(node):
+        extracted = _extract_season_number(title)
+        if extracted is not None:
+            numbers.add(extracted)
+    return numbers
 
 
 def _extract_titles_from_node(node: dict[str, Any]) -> list[str]:
@@ -111,7 +134,7 @@ def _extract_titles_from_node(node: dict[str, Any]) -> list[str]:
     return [title for title in titles if title]
 
 
-def _score_candidate(query: str, node: dict[str, Any]) -> tuple[float, list[str]]:
+def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any]) -> tuple[float, list[str]]:
     titles = _extract_titles_from_node(node)
     query_norm = normalize_title(query)
     best_ratio = 0.0
@@ -133,6 +156,33 @@ def _score_candidate(query: str, node: dict[str, Any]) -> tuple[float, list[str]
     elif query_norm and best_norm and (query_norm in best_norm or best_norm in query_norm):
         score += 0.03
         reasons.append("substring_title_match")
+
+    provider_season_number = series.season_number if series.season_number is not None else _extract_season_number(series.season_title)
+    candidate_season_numbers = _candidate_season_numbers(node)
+    if provider_season_number is not None and candidate_season_numbers:
+        if provider_season_number in candidate_season_numbers:
+            score += 0.05
+            reasons.append(f"season_number_match={provider_season_number}")
+        else:
+            score -= 0.08
+            reasons.append(
+                "season_number_mismatch="
+                f"provider:{provider_season_number};candidate:{','.join(str(number) for number in sorted(candidate_season_numbers))}"
+            )
+
+    candidate_num_episodes = node.get("num_episodes")
+    if isinstance(candidate_num_episodes, int) and candidate_num_episodes > 0:
+        if series.max_episode_number is not None and series.max_episode_number > candidate_num_episodes:
+            score -= 0.12
+            reasons.append(
+                f"episode_evidence_exceeds_candidate_count={series.max_episode_number}>{candidate_num_episodes}"
+            )
+        elif series.completed_episode_count is not None and series.completed_episode_count > candidate_num_episodes:
+            score -= 0.12
+            reasons.append(
+                f"completed_evidence_exceeds_candidate_count={series.completed_episode_count}>{candidate_num_episodes}"
+            )
+
     media_type = node.get("media_type")
     if media_type == "movie":
         score -= 0.05
@@ -160,7 +210,7 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
                 anime_id = node.get("id")
                 if anime_id is None:
                     continue
-                score, reasons = _score_candidate(query, node)
+                score, reasons = _score_candidate(series, query, node)
                 alternative_titles = _extract_titles_from_node(node)[1:]
                 candidate = MappingCandidate(
                     mal_anime_id=int(anime_id),

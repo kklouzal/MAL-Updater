@@ -12,7 +12,7 @@
 - [x] Get the first real live Crunchyroll snapshot on this machine
 - [x] Keep the working live Crunchyroll path in Python (`curl_cffi` transport when available)
 - [x] Implement local MAL loopback OAuth flow + token persistence
-- [ ] Register MAL app / complete live OAuth with real credentials
+- [x] Register MAL app / complete live OAuth with real credentials
 
 ## Sync policy
 - [x] Add durable approved-mapping persistence in `mal_series_mapping`

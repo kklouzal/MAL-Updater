@@ -35,6 +35,8 @@ This is a **missing-data-first** system.
 - Do not overwrite meaningful existing MAL data automatically.
 - Treat MAL `status` as missing only when absent/null.
 - Treat MAL watched-progress as missing only when list status is absent; `plan_to_watch` + `0` is meaningful and should be preserved.
+- Exception: if Crunchyroll proves completed episode progress (`> 0` watched episodes), a MAL `plan_to_watch` entry may be upgraded forward to `watching` or `completed`.
+- Suppress `watching` proposals with `0` watched episodes entirely; partial playback without at least one completed episode is not honest enough to auto-write.
 - Treat MAL `score` as missing only when null/absent/`0`.
 - Treat MAL `start_date` / `finish_date` as missing only when null/empty.
 - Only fill dates when the source evidence is trustworthy enough; currently that means `finish_date` may be filled from Crunchyroll `last_watched_at` only when Crunchyroll-derived status is `completed`.
