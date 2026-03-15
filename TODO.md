@@ -25,8 +25,8 @@
 - [x] Build the first guarded live MAL apply path for approved forward-safe proposals
 
 ## Recommendations
-- [ ] New dubbed episode alerts
-- [ ] New season alerts for completed shows
+- [x] New dubbed episode alerts
+- [x] New season alerts for completed shows
 - [ ] Genre/studio/VA/taste feature ideas
 
 ## Later

@@ -15,12 +15,13 @@ What it does today:
 - conservative MAL mapping review workflows
 - guarded dry-run sync planning
 - a first live MAL executor that only applies approved, forward-safe updates
+- a first local recommendation pass for dubbed episode and later-season alerts
 
 What it does **not** do yet:
 - complete unattended end-to-end sync behavior
 - auto-resolve ambiguous mappings
 - perform broad or reckless MAL mutations
-- ship recommendation features yet
+- ship a richer taste-model / metadata-heavy recommendation engine yet
 
 That line is intentional. The working path is real, and the remaining gaps are not being faked.
 
@@ -85,6 +86,7 @@ PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-map
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
+PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 ```
 
 Or install editable and use the console script:
@@ -179,5 +181,5 @@ Boundary rule:
 - SQLite state database
 - MAL official OAuth/API client
 - Safe dry-run sync before live writes
-es
--run sync before live writes
+- Conservative live apply path for approved mappings
+- Local recommendation and alert layer on top of the ingested state

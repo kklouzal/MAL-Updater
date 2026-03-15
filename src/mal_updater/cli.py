@@ -23,6 +23,7 @@ from .db import bootstrap_database, list_review_queue_entries, list_series_mappi
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series
+from .recommendations import build_recommendations
 from .sync_planner import (
     build_dry_run_sync_plan,
     build_mapping_review,
@@ -533,6 +534,15 @@ def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, e
     return 0
 
 
+def _cmd_recommend(project_root: Path | None, limit: int) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    results = build_recommendations(config, limit=_normalize_limit(limit))
+    print(json.dumps([item.as_dict() for item in results], indent=2))
+    return 0
+
+
 def _cmd_sync(_: Path | None) -> int:
     raise SystemExit(
         "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals or 'apply-sync' for the approved-mapping-only executor."
@@ -623,6 +633,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only operate on exact approved mappings (currently auto_exact/user_exact)",
     )
     apply_sync.add_argument("--execute", action="store_true", help="Actually write MAL updates; otherwise revalidate and print what would be applied")
+    recommend = subparsers.add_parser(
+        "recommend",
+        help="Generate local recommendations from the ingested Crunchyroll dataset (new seasons + dubbed episode availability)",
+    )
+    recommend.add_argument("--limit", type=int, default=20, help="How many recommendations to emit (use 0 for all)")
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -678,6 +693,8 @@ def main() -> int:
         return _cmd_list_review_queue(args.project_root, args.status, args.issue_type)
     if args.command == "apply-sync":
         return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
+    if args.command == "recommend":
+        return _cmd_recommend(args.project_root, args.limit)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")

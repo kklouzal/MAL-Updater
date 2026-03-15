@@ -114,44 +114,82 @@ class _CrunchyrollAuthSession:
     credential_rebootstrap_attempted: bool = False
 
     def authorized_json_get(self, url: str, *, params: dict[str, Any] | None = None) -> Any:
-        try:
-            return _authorized_json_get(
-                url,
-                access_token=self.token.access_token,
-                timeout_seconds=self.timeout_seconds,
-                params=params,
-                pacer=self.pacer,
-            )
-        except CrunchyrollUnauthorizedError as exc:
-            if self.credential_rebootstrap_attempted:
+        last_unauthorized: CrunchyrollUnauthorizedError | None = None
+        refresh_error: CrunchyrollAuthError | None = None
+        for attempt in range(3):
+            try:
+                return _authorized_json_get(
+                    url,
+                    access_token=self.token.access_token,
+                    timeout_seconds=self.timeout_seconds,
+                    params=params,
+                    pacer=self.pacer,
+                )
+            except CrunchyrollUnauthorizedError as exc:
+                last_unauthorized = exc
+                if attempt == 0:
+                    try:
+                        self._refresh_with_refresh_token(exc)
+                        continue
+                    except CrunchyrollAuthError as refresh_exc:
+                        refresh_error = refresh_exc
+                if not self.credential_rebootstrap_attempted:
+                    self._rebootstrap_with_credentials(exc, refresh_error=refresh_error)
+                    continue
+                detail = f"{exc}; refresh-token recovery failed"
+                if refresh_error is not None:
+                    detail += f" ({refresh_error})"
+                detail += "; credential rebootstrap already used for this run"
                 _write_session_state(
                     state_paths=self.state_paths,
                     profile=self.profile,
                     locale=self.config.crunchyroll.locale,
                     device_type=self.token.device_type,
                     account_id=self.token.account_id,
-                    last_error=f"{exc}; credential rebootstrap already used for this run",
+                    last_error=detail,
                     success=False,
                     phase="auth_failed",
                 )
                 raise
-            self._rebootstrap_with_credentials(exc)
-            return _authorized_json_get(
-                url,
-                access_token=self.token.access_token,
-                timeout_seconds=self.timeout_seconds,
-                params=params,
-                pacer=self.pacer,
-            )
+        raise last_unauthorized or CrunchyrollSnapshotError(f"Crunchyroll authorization failed for {url}")
 
-    def _rebootstrap_with_credentials(self, exc: CrunchyrollUnauthorizedError) -> None:
+    def _refresh_with_refresh_token(self, exc: CrunchyrollUnauthorizedError) -> None:
         _write_session_state(
             state_paths=self.state_paths,
             profile=self.profile,
             locale=self.config.crunchyroll.locale,
             device_type=self.token.device_type,
             account_id=self.token.account_id,
-            last_error=f"{exc}; retrying once with credential rebootstrap",
+            last_error=f"{exc}; retrying with refresh-token renewal",
+            success=False,
+            phase="auth_retrying_with_refresh_token",
+        )
+        token, state_paths = refresh_access_token(
+            self.config,
+            profile=self.profile,
+            timeout_seconds=self.timeout_seconds,
+            pacer=self.pacer,
+        )
+        self.token = token
+        self.state_paths = state_paths
+        self.auth_source = "refresh_token_recovery"
+
+    def _rebootstrap_with_credentials(
+        self,
+        exc: CrunchyrollUnauthorizedError,
+        *,
+        refresh_error: CrunchyrollAuthError | None = None,
+    ) -> None:
+        message = f"{exc}; retrying once with credential rebootstrap"
+        if refresh_error is not None:
+            message += f" after refresh-token recovery failed ({refresh_error})"
+        _write_session_state(
+            state_paths=self.state_paths,
+            profile=self.profile,
+            locale=self.config.crunchyroll.locale,
+            device_type=self.token.device_type,
+            account_id=self.token.account_id,
+            last_error=message,
             success=False,
             phase="auth_retrying_with_credentials",
         )

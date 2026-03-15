@@ -5,7 +5,7 @@ import stat
 import tempfile
 import textwrap
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -323,15 +323,17 @@ class AuthHelperTests(unittest.TestCase):
             config = load_config(root)
             bootstrap_database(config.db_path)
             ingest_snapshot_payload(sample_snapshot(), config)
+            stdout = io.StringIO()
 
-            code = _cmd_approve_mapping(
-                root,
-                provider_series_id="series-123",
-                mal_anime_id=123,
-                confidence=1.0,
-                notes="manual exact approval",
-                exact=True,
-            )
+            with redirect_stdout(stdout):
+                code = _cmd_approve_mapping(
+                    root,
+                    provider_series_id="series-123",
+                    mal_anime_id=123,
+                    confidence=1.0,
+                    notes="manual exact approval",
+                    exact=True,
+                )
 
             self.assertEqual(code, 0)
             mapping = get_series_mapping(config.db_path, "crunchyroll", "series-123")

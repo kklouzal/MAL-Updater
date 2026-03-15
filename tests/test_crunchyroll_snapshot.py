@@ -8,14 +8,180 @@ from unittest.mock import patch
 
 from mal_updater.config import load_config
 from mal_updater.crunchyroll_auth import resolve_crunchyroll_state_paths
+from mal_updater.crunchyroll_auth import CrunchyrollAuthError, CrunchyrollBootstrapResult
 from mal_updater.crunchyroll_snapshot import (
     CRUNCHYROLL_ME_URL,
     CrunchyrollAccessToken,
+    CrunchyrollUnauthorizedError,
     _CrunchyrollAuthSession,
     _CrunchyrollRequestPacer,
     _fetch_snapshot_once,
     _write_sync_boundary,
 )
+
+
+class CrunchyrollAuthRecoveryTests(unittest.TestCase):
+    def _build_session(self, root: Path) -> _CrunchyrollAuthSession:
+        config = load_config(root)
+        state_paths = resolve_crunchyroll_state_paths(config)
+        return _CrunchyrollAuthSession(
+            config=config,
+            profile="default",
+            timeout_seconds=5.0,
+            pacer=_CrunchyrollRequestPacer(0.0, 0.0),
+            state_paths=state_paths,
+            token=CrunchyrollAccessToken(
+                access_token="access-token",
+                refresh_token="refresh-token",
+                account_id="acct-123",
+                device_id="device-123",
+                device_type="ANDROIDTV",
+            ),
+            auth_source="refresh_token",
+        )
+
+    def test_authorized_json_get_recovers_401_by_refreshing_access_token(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            session = self._build_session(root)
+            calls: list[str] = []
+
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None):
+                calls.append(access_token)
+                if len(calls) == 1:
+                    raise CrunchyrollUnauthorizedError(url, 401)
+                return {"ok": True, "token_used": access_token}
+
+            with patch("mal_updater.crunchyroll_snapshot._authorized_json_get", side_effect=fake_authorized_get), patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token"
+            ) as mock_refresh, patch("mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials") as mock_login:
+                mock_refresh.return_value = (
+                    CrunchyrollAccessToken(
+                        access_token="refreshed-access-token",
+                        refresh_token="refreshed-refresh-token",
+                        account_id="acct-123",
+                        device_id="device-123",
+                        device_type="ANDROIDTV",
+                    ),
+                    session.state_paths,
+                )
+
+                payload = session.authorized_json_get("https://example.invalid/history")
+
+            self.assertEqual(payload["token_used"], "refreshed-access-token")
+            self.assertEqual(calls, ["access-token", "refreshed-access-token"])
+            self.assertEqual(session.auth_source, "refresh_token_recovery")
+            self.assertFalse(session.credential_rebootstrap_attempted)
+            mock_refresh.assert_called_once()
+            mock_login.assert_not_called()
+
+    def test_authorized_json_get_falls_back_to_credentials_when_refresh_recovery_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            session = self._build_session(root)
+            calls: list[str] = []
+
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None):
+                calls.append(access_token)
+                if len(calls) == 1:
+                    raise CrunchyrollUnauthorizedError(url, 401)
+                return {"ok": True, "token_used": access_token}
+
+            with patch("mal_updater.crunchyroll_snapshot._authorized_json_get", side_effect=fake_authorized_get), patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token",
+                side_effect=CrunchyrollAuthError("refresh failed"),
+            ) as mock_refresh, patch(
+                "mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials"
+            ) as mock_login:
+                mock_login.return_value = CrunchyrollBootstrapResult(
+                    profile="default",
+                    locale="en-US",
+                    username_path=root / "secrets" / "crunchyroll_username.txt",
+                    password_path=root / "secrets" / "crunchyroll_password.txt",
+                    refresh_token_path=session.state_paths.refresh_token_path,
+                    device_id_path=session.state_paths.device_id_path,
+                    session_state_path=session.state_paths.session_state_path,
+                    account_id="acct-123",
+                    account_email="user@example.com",
+                    access_token="credential-access-token",
+                    refresh_token="credential-refresh-token",
+                    device_id="device-123",
+                    device_type="ANDROIDTV",
+                )
+
+                payload = session.authorized_json_get("https://example.invalid/history")
+
+            self.assertEqual(payload["token_used"], "credential-access-token")
+            self.assertEqual(calls, ["access-token", "credential-access-token"])
+            self.assertEqual(session.auth_source, "credential_rebootstrap")
+            self.assertTrue(session.credential_rebootstrap_attempted)
+            mock_refresh.assert_called_once()
+            mock_login.assert_called_once()
+
+    def test_authorized_json_get_stops_cleanly_after_refresh_and_credential_retry_are_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            session = self._build_session(root)
+            calls: list[tuple[str, dict[str, object] | None]] = []
+
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None):
+                calls.append((access_token, params))
+                raise CrunchyrollUnauthorizedError(url, 401)
+
+            with patch("mal_updater.crunchyroll_snapshot._authorized_json_get", side_effect=fake_authorized_get), patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token"
+            ) as mock_refresh, patch("mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials") as mock_login:
+                mock_refresh.return_value = (
+                    CrunchyrollAccessToken(
+                        access_token="refreshed-access-token",
+                        refresh_token="refreshed-refresh-token",
+                        account_id="acct-123",
+                        device_id="device-123",
+                        device_type="ANDROIDTV",
+                    ),
+                    session.state_paths,
+                )
+                mock_login.return_value = CrunchyrollBootstrapResult(
+                    profile="default",
+                    locale="en-US",
+                    username_path=root / "secrets" / "crunchyroll_username.txt",
+                    password_path=root / "secrets" / "crunchyroll_password.txt",
+                    refresh_token_path=session.state_paths.refresh_token_path,
+                    device_id_path=session.state_paths.device_id_path,
+                    session_state_path=session.state_paths.session_state_path,
+                    account_id="acct-123",
+                    account_email="user@example.com",
+                    access_token="credential-access-token",
+                    refresh_token="credential-refresh-token",
+                    device_id="device-123",
+                    device_type="ANDROIDTV",
+                )
+
+                with self.assertRaises(CrunchyrollUnauthorizedError):
+                    session.authorized_json_get(
+                        "https://example.invalid/history",
+                        params={"page": 7, "page_size": 100},
+                    )
+
+            self.assertEqual(
+                calls,
+                [
+                    ("access-token", {"page": 7, "page_size": 100}),
+                    ("refreshed-access-token", {"page": 7, "page_size": 100}),
+                    ("credential-access-token", {"page": 7, "page_size": 100}),
+                ],
+            )
+            self.assertEqual(session.auth_source, "credential_rebootstrap")
+            self.assertTrue(session.credential_rebootstrap_attempted)
+            mock_refresh.assert_called_once()
+            mock_login.assert_called_once()
+
+            session_state = json.loads(session.state_paths.session_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(session_state["crunchyroll_phase"], "auth_failed")
+            self.assertIn("credential rebootstrap already used", session_state["last_error"])
 
 
 class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
@@ -71,6 +237,94 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                 "title": f"Watchlist Show {idx}",
             },
         }
+
+    def test_fetch_snapshot_recovers_watch_history_401_via_refresh_then_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            session = self._build_session(root)
+            calls: list[tuple[str, str, dict[str, object] | None]] = []
+            history_page = [self._history_entry(1)]
+            watchlist_page = [self._watchlist_entry(1)]
+
+            def fake_authorized_get(
+                url: str,
+                *,
+                access_token: str,
+                timeout_seconds: float,
+                params=None,
+                pacer=None,
+            ):
+                calls.append((url, access_token, params))
+                if url == CRUNCHYROLL_ME_URL:
+                    self.assertEqual(access_token, "access-token")
+                    return {"account_id": "acct-123", "email": "user@example.com"}
+                if url.endswith("/watch-history"):
+                    if access_token == "access-token":
+                        raise CrunchyrollUnauthorizedError(url, 401)
+                    self.assertEqual(access_token, "refreshed-access-token")
+                    return {"total": 1, "data": history_page}
+                if url.endswith("/watchlist"):
+                    self.assertEqual(access_token, "refreshed-access-token")
+                    return {"total": 1, "data": watchlist_page}
+                raise AssertionError(url)
+
+            with patch("mal_updater.crunchyroll_snapshot._authorized_json_get", side_effect=fake_authorized_get), patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token"
+            ) as mock_refresh, patch("mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials") as mock_login:
+                mock_refresh.return_value = (
+                    CrunchyrollAccessToken(
+                        access_token="refreshed-access-token",
+                        refresh_token="refreshed-refresh-token",
+                        account_id="acct-123",
+                        device_id="device-123",
+                        device_type="ANDROIDTV",
+                    ),
+                    session.state_paths,
+                )
+
+                result = _fetch_snapshot_once(session, use_incremental_boundary=True)
+
+            self.assertEqual(
+                calls,
+                [
+                    (CRUNCHYROLL_ME_URL, "access-token", None),
+                    (
+                        "https://www.crunchyroll.com/content/v2/acct-123/watch-history",
+                        "access-token",
+                        {"page": 1, "page_size": 100, "locale": "en-US"},
+                    ),
+                    (
+                        "https://www.crunchyroll.com/content/v2/acct-123/watch-history",
+                        "refreshed-access-token",
+                        {"page": 1, "page_size": 100, "locale": "en-US"},
+                    ),
+                    (
+                        "https://www.crunchyroll.com/content/v2/discover/acct-123/watchlist",
+                        "refreshed-access-token",
+                        {"locale": "en-US", "n": 100, "start": 0},
+                    ),
+                ],
+            )
+            self.assertEqual(session.auth_source, "refresh_token_recovery")
+            self.assertEqual(session.token.access_token, "refreshed-access-token")
+            self.assertEqual(session.token.refresh_token, "refreshed-refresh-token")
+            self.assertEqual(session.account_email, "user@example.com")
+            self.assertFalse(session.credential_rebootstrap_attempted)
+            self.assertEqual(result.account_email, "user@example.com")
+            self.assertEqual(result.snapshot.account_id_hint, "acct-123")
+            self.assertEqual(result.snapshot.raw["auth_source"], "refresh_token_recovery")
+            self.assertEqual(result.snapshot.raw["history_count"], 1)
+            self.assertEqual(result.snapshot.raw["watchlist_count"], 1)
+            self.assertFalse(result.snapshot.raw["history_stopped_early"])
+            self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
+            mock_refresh.assert_called_once()
+            mock_login.assert_not_called()
+
+            session_state = json.loads(session.state_paths.session_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(session_state["crunchyroll_phase"], "python_live_snapshot")
+            self.assertIsNone(session_state["last_error"])
+            self.assertEqual(session_state["last_account_id_hint"], "acct-123")
 
     def test_fetch_snapshot_uses_incremental_boundary_to_stop_history_and_watchlist_early(self) -> None:
         with tempfile.TemporaryDirectory() as td:

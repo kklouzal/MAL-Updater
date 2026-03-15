@@ -37,7 +37,7 @@
 ## Not implemented yet
 
 - broad unattended/full-fidelity MAL sync beyond the first narrow exact-approved cadence
-- recommendation engine
+- richer metadata/taste-model recommendation work beyond the first local alert engine
 - OpenClaw skill wrapper for the integration
 
 ## Newly added downstream progress
@@ -80,6 +80,10 @@
   - episodes with `<= 120s` remaining count as watched to cover the dominant credits-skip pattern seen in the dataset
   - episodes in the `0.85-0.95` band also count when a later episode in the same series was watched afterwards
   - progress is deduplicated by `episode_number` when available so alternate dub/sub variants do not inflate MAL watched counts
+- the first local recommendation pass now exists via `recommend`:
+  - surfaces dubbed-episode availability when completed progress lags the highest seen released episode
+  - surfaces dubbed later-season availability when an earlier franchise season appears completed locally
+  - stays local/read-only and does not pretend to do richer genre/studio/VA/taste ranking yet
 
 ## Current Crunchyroll state
 
