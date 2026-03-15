@@ -350,12 +350,20 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
     return 0
 
 
+def _normalize_limit(limit: int) -> int | None:
+    return None if limit <= 0 else limit
+
+
 def _cmd_review_mappings(project_root: Path | None, limit: int, mapping_limit: int, persist_queue: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
+    normalized_limit = _normalize_limit(limit)
+    if persist_queue and normalized_limit is not None:
+        print("--persist-review-queue requires a full scan; rerun with --limit 0", file=sys.stderr)
+        return 2
     try:
-        items = build_mapping_review(config, limit=limit, mapping_limit=mapping_limit)
+        items = build_mapping_review(config, limit=normalized_limit, mapping_limit=mapping_limit)
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -436,10 +444,14 @@ def _cmd_dry_run_sync(project_root: Path | None, limit: int, mapping_limit: int,
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
+    normalized_limit = _normalize_limit(limit)
+    if persist_queue and normalized_limit is not None:
+        print("--persist-review-queue requires a full scan; rerun with --limit 0", file=sys.stderr)
+        return 2
     try:
         proposals = build_dry_run_sync_plan(
             config,
-            limit=limit,
+            limit=normalized_limit,
             mapping_limit=mapping_limit,
             approved_mappings_only=approved_mappings_only,
         )
@@ -538,7 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
         "review-mappings",
         help="Build a mapping review list that preserves existing approved mappings and flags the rest for approval or manual review",
     )
-    review_mappings.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
+    review_mappings.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect (use 0 for all; required when persisting review_queue)")
     review_mappings.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     review_mappings.add_argument("--persist-review-queue", action="store_true", help="Replace the open mapping_review queue rows with this run's unresolved items")
     list_mappings = subparsers.add_parser("list-mappings", help="List persisted Crunchyroll -> MAL mappings from SQLite")
@@ -549,7 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_mapping.add_argument("--confidence", type=float, default=None, help="Optional confidence score to store alongside the approval")
     approve_mapping.add_argument("--notes", default=None, help="Optional operator note explaining the approval")
     dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested Crunchyroll data")
-    dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
+    dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect (use 0 for all; required when persisting review_queue)")
     dry_run_sync.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     dry_run_sync.add_argument(
         "--approved-mappings-only",

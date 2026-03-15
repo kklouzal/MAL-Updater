@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import stat
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.auth import format_auth_flow_prompt, persist_token_response, write_secret_file
+from mal_updater.cli import _cmd_dry_run_sync, _cmd_review_mappings
 from mal_updater.config import load_config, load_mal_secrets
 from mal_updater.mal_client import MalClient, TokenResponse
 
@@ -152,6 +155,30 @@ class AuthHelperTests(unittest.TestCase):
                 client.search_anime("Example")
 
             self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 7.5)
+
+    def test_review_mappings_rejects_partial_queue_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                code = _cmd_review_mappings(root, limit=20, mapping_limit=5, persist_queue=True)
+
+            self.assertEqual(code, 2)
+            self.assertIn("requires a full scan", stderr.getvalue())
+
+    def test_dry_run_sync_rejects_partial_queue_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                code = _cmd_dry_run_sync(root, limit=20, mapping_limit=5, approved_mappings_only=False, persist_queue=True)
+
+            self.assertEqual(code, 2)
+            self.assertIn("requires a full scan", stderr.getvalue())
 
 
 if __name__ == "__main__":
