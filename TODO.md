@@ -27,6 +27,9 @@
 ## Recommendations
 - [x] New dubbed episode alerts
 - [x] New season alerts for completed shows
+- [x] Keep later-season installment heuristics conservative (`Part N` only counts with explicit season-style wording)
+- [x] Suppress obvious skipped-episode / fully-watched false positives in local episode alerts
+- [x] Add recency-aware ranking bias to local episode alerts
 - [ ] Genre/studio/VA/taste feature ideas
 
 ## Later

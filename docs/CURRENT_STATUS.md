@@ -81,8 +81,10 @@
   - episodes in the `0.85-0.95` band also count when a later episode in the same series was watched afterwards
   - progress is deduplicated by `episode_number` when available so alternate dub/sub variants do not inflate MAL watched counts
 - the first local recommendation pass now exists via `recommend`:
-  - surfaces dubbed-episode availability when completed progress lags the highest seen released episode
+  - surfaces dubbed-episode alerts only when there is a **contiguous tail gap** beyond completed progress, which suppresses many skipped-episode/progress-artifact false positives
   - surfaces dubbed later-season availability when an earlier franchise season appears completed locally
+  - sequel/installment hints stay deliberately conservative: bare `Part N` wording only counts as later-season evidence when the same title text also carries explicit season-style wording such as `Season 2`, `Second Season`, or `Final Season Part 2`
+  - episode alerts now rank with stronger recency and `in_progress` bias instead of mostly alphabetical tie behavior
   - stays local/read-only and does not pretend to do richer genre/studio/VA/taste ranking yet
 
 ## Current Crunchyroll state

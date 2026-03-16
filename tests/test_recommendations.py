@@ -73,7 +73,7 @@ class RecommendationTests(unittest.TestCase):
             )
             conn.commit()
 
-    def test_new_dubbed_episode_recommendation_detects_unwatched_progress_gap(self) -> None:
+    def test_new_dubbed_episode_recommendation_detects_contiguous_tail_gap(self) -> None:
         self._insert_series(
             "series-1",
             title="Example Show",
@@ -91,7 +91,7 @@ class RecommendationTests(unittest.TestCase):
         item = results[0]
         self.assertEqual("new_dubbed_episode", item.kind)
         self.assertEqual("series-1", item.provider_series_id)
-        self.assertEqual(1, item.context["unwatched_episode_count"])
+        self.assertEqual(1, item.context["contiguous_tail_gap"])
 
     def test_new_season_recommendation_detects_completed_predecessor(self) -> None:
         self._insert_series(
@@ -119,6 +119,195 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("new_season", item.kind)
         self.assertEqual("season-2", item.provider_series_id)
         self.assertEqual("season-1", item.context["predecessor_provider_series_id"])
+
+    def test_new_season_recommendation_detects_roman_numeral_installments(self) -> None:
+        self._insert_series(
+            "overlord-2",
+            title="Overlord",
+            season_title="Overlord II (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("overlord-2", "ol2-ep-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_progress("overlord-2", "ol2-ep-2", episode_number=2, completion_ratio=1.0, last_watched_at="2026-03-01T02:00:00Z")
+
+        self._insert_series(
+            "overlord-3",
+            title="Overlord",
+            season_title="Overlord III (English Dub)",
+            watchlist_status="never_watched",
+        )
+
+        results = build_recommendations(self.config, limit=0)
+
+        roman_items = [item for item in results if item.provider_series_id == "overlord-3"]
+        self.assertEqual(1, len(roman_items))
+        item = roman_items[0]
+        self.assertEqual("new_season", item.kind)
+        self.assertEqual("overlord-2", item.context["predecessor_provider_series_id"])
+        self.assertEqual(3, item.context["installment_index"])
+
+    def test_new_season_recommendation_detects_ordinal_season_naming(self) -> None:
+        self._insert_series(
+            "show-1",
+            title="Ordinal Show",
+            season_title="Ordinal Show (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("show-1", "show1-ep-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._insert_progress("show-1", "show1-ep-2", episode_number=2, completion_ratio=1.0, last_watched_at="2026-03-02T02:00:00Z")
+
+        self._insert_series(
+            "show-2",
+            title="Ordinal Show",
+            season_title="Ordinal Show Second Season (English Dub)",
+            watchlist_status="never_watched",
+        )
+
+        results = build_recommendations(self.config, limit=0)
+
+        ordinal_items = [item for item in results if item.provider_series_id == "show-2"]
+        self.assertEqual(1, len(ordinal_items))
+        item = ordinal_items[0]
+        self.assertEqual("new_season", item.kind)
+        self.assertEqual("show-1", item.context["predecessor_provider_series_id"])
+        self.assertEqual(2, item.context["installment_index"])
+
+    def test_new_season_recommendation_detects_part_style_names_only_with_season_context(self) -> None:
+        self._insert_series(
+            "final-part-1",
+            title="Split Show",
+            season_title="Split Show Final Season Part 1 (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress(
+            "final-part-1",
+            "split-ep-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-03T01:00:00Z",
+        )
+        self._insert_progress(
+            "final-part-1",
+            "split-ep-2",
+            episode_number=2,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-03T02:00:00Z",
+        )
+
+        self._insert_series(
+            "final-part-2",
+            title="Split Show",
+            season_title="Split Show Final Season Part 2 (English Dub)",
+            watchlist_status="never_watched",
+        )
+        self._insert_series(
+            "bare-part-2",
+            title="Split Show",
+            season_title="Split Show Part 2 (English Dub)",
+            watchlist_status="never_watched",
+        )
+
+        results = build_recommendations(self.config, limit=0)
+
+        final_items = [item for item in results if item.provider_series_id == "final-part-2"]
+        self.assertEqual(1, len(final_items))
+        item = final_items[0]
+        self.assertEqual("new_season", item.kind)
+        self.assertEqual("final-part-1", item.context["predecessor_provider_series_id"])
+        self.assertEqual(2, item.context["installment_index"])
+
+        bare_items = [item for item in results if item.provider_series_id == "bare-part-2"]
+        self.assertEqual([], bare_items)
+
+    def test_part_style_detection_ignores_titles_that_only_contain_season_word(self) -> None:
+        self._insert_series(
+            "title-season-part-1",
+            title="Split Season Show",
+            season_title="Split Season Show Final Season Part 1 (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress(
+            "title-season-part-1",
+            "title-season-ep-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-04T01:00:00Z",
+        )
+        self._insert_progress(
+            "title-season-part-1",
+            "title-season-ep-2",
+            episode_number=2,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-04T02:00:00Z",
+        )
+
+        self._insert_series(
+            "title-season-bare-part-2",
+            title="Split Season Show",
+            season_title="Split Season Show Part 2 (English Dub)",
+            watchlist_status="never_watched",
+        )
+
+        results = build_recommendations(self.config, limit=0)
+
+        bare_items = [item for item in results if item.provider_series_id == "title-season-bare-part-2"]
+        self.assertEqual([], bare_items)
+
+    def test_suppresses_skipped_episode_artifacts_that_are_not_tail_gaps(self) -> None:
+        self._insert_series(
+            "series-skip",
+            title="Skip Show",
+            season_title="Skip Show (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("series-skip", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-10T01:00:00Z")
+        self._insert_progress("series-skip", "ep-2", episode_number=2, completion_ratio=0.1, last_watched_at="2026-03-10T02:00:00Z")
+        self._insert_progress("series-skip", "ep-3", episode_number=3, completion_ratio=1.0, last_watched_at="2026-03-10T03:00:00Z")
+
+        results = build_recommendations(self.config, limit=0)
+
+        self.assertEqual([], [item for item in results if item.provider_series_id == "series-skip"])
+
+    def test_suppresses_fully_watched_series_when_latest_episode_is_effectively_complete(self) -> None:
+        self._insert_series(
+            "series-complete",
+            title="Complete Show",
+            season_title="Complete Show (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("series-complete", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-10T01:00:00Z")
+        self._insert_progress("series-complete", "ep-2", episode_number=2, completion_ratio=0.99995, last_watched_at="2026-03-10T02:00:00Z")
+
+        results = build_recommendations(self.config, limit=0)
+
+        self.assertEqual([], [item for item in results if item.provider_series_id == "series-complete"])
+
+    def test_more_recent_in_progress_tail_gap_ranks_above_stale_one(self) -> None:
+        self._insert_series(
+            "recent-show",
+            title="Recent Show",
+            season_title="Recent Show (English Dub)",
+            watchlist_status="in_progress",
+        )
+        self._insert_progress("recent-show", "r1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-14T01:00:00Z")
+        self._insert_progress("recent-show", "r2", episode_number=2, completion_ratio=0.2, last_watched_at="2026-03-14T02:00:00Z")
+
+        self._insert_series(
+            "stale-show",
+            title="Stale Show",
+            season_title="Stale Show (English Dub)",
+            watchlist_status="in_progress",
+        )
+        self._insert_progress("stale-show", "s1", episode_number=1, completion_ratio=1.0, last_watched_at="2020-03-10T01:00:00Z")
+        self._insert_progress("stale-show", "s2", episode_number=2, completion_ratio=0.2, last_watched_at="2020-03-10T02:00:00Z")
+
+        results = build_recommendations(self.config, limit=0)
+
+        ids = [item.provider_series_id for item in results if item.kind == "new_dubbed_episode"]
+        self.assertEqual(["recent-show", "stale-show"], ids)
 
     def test_filters_out_non_english_dub_candidates(self) -> None:
         self._insert_series(

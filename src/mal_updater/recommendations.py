@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig
@@ -15,6 +16,7 @@ _ORDINAL_SEASON_RE = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+season\b",
     re.IGNORECASE,
 )
+_FINAL_SEASON_RE = re.compile(r"\bfinal\s+season\b", re.IGNORECASE)
 _PART_RE = re.compile(r"\bpart\s*(\d+)\b", re.IGNORECASE)
 _ROMAN_END_RE = re.compile(r"\b([ivx]{1,5})\b(?=\s*(?:\(|$))", re.IGNORECASE)
 
@@ -87,19 +89,18 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
             continue
         if state.max_episode_number is None:
             continue
-        if state.completed_episode_count >= state.max_episode_number:
+
+        tail_gap = _contiguous_tail_gap(state)
+        if tail_gap is None or tail_gap <= 0:
             continue
 
-        unwatched_count = state.max_episode_number - state.completed_episode_count
         reasons = [
             "English dub is available",
-            f"{unwatched_count} episode(s) are available beyond completed progress",
+            f"{tail_gap} contiguous episode(s) appear beyond your completed tail progress",
         ]
         if state.last_watched_at:
             reasons.append(f"most recent watch activity: {state.last_watched_at}")
-        priority = 70 - min(unwatched_count, 10)
-        if unwatched_count == 1:
-            priority += 8
+        priority = _episode_recommendation_priority(state, tail_gap)
         items.append(
             Recommendation(
                 kind="new_dubbed_episode",
@@ -111,13 +112,56 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
                 context={
                     "completed_episode_count": state.completed_episode_count,
                     "max_episode_number": state.max_episode_number,
-                    "unwatched_episode_count": unwatched_count,
+                    "max_completed_episode_number": state.max_completed_episode_number,
+                    "contiguous_tail_gap": tail_gap,
                     "watchlist_status": state.watchlist_status,
                     "last_watched_at": state.last_watched_at,
                 },
             )
         )
     return items
+
+
+def _contiguous_tail_gap(state: ProviderSeriesState) -> int | None:
+    if state.max_episode_number is None or state.max_completed_episode_number is None:
+        return None
+    if state.max_completed_episode_number >= state.max_episode_number:
+        return None
+    if state.completed_episode_count != state.max_completed_episode_number:
+        return None
+    return state.max_episode_number - state.max_completed_episode_number
+
+
+def _episode_recommendation_priority(state: ProviderSeriesState, tail_gap: int) -> int:
+    priority = 55 - min(tail_gap, 10)
+    if tail_gap == 1:
+        priority += 10
+    if state.watchlist_status == "in_progress":
+        priority += 12
+    elif state.watchlist_status == "fully_watched":
+        priority -= 20
+    priority += _freshness_boost(state.last_watched_at)
+    return priority
+
+
+def _freshness_boost(last_watched_at: str | None) -> int:
+    if not last_watched_at:
+        return -8
+    try:
+        watched = datetime.fromisoformat(last_watched_at.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    now = datetime.now(timezone.utc)
+    days = max((now - watched).days, 0)
+    if days <= 7:
+        return 10
+    if days <= 30:
+        return 6
+    if days <= 90:
+        return 2
+    if days <= 365:
+        return -4
+    return -12
 
 
 def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list[Recommendation]:
@@ -206,6 +250,12 @@ def _is_english_dub_series(state: ProviderSeriesState) -> bool:
     return bool(_ENGLISH_DUB_RE.search(joined))
 
 
+def _has_explicit_season_style_evidence(text: str) -> bool:
+    return bool(
+        _SEASON_NUMBER_RE.search(text) or _ORDINAL_SEASON_RE.search(text) or _FINAL_SEASON_RE.search(text)
+    )
+
+
 def _series_installment_index(state: ProviderSeriesState) -> int | None:
     candidates: list[int] = []
     if state.season_number is not None and state.season_number > 0:
@@ -226,7 +276,7 @@ def _series_installment_index(state: ProviderSeriesState) -> int | None:
                 if digits:
                     candidates.append(int(digits))
         part_match = _PART_RE.search(text)
-        if part_match and "season" in text.lower():
+        if part_match and _has_explicit_season_style_evidence(text):
             candidates.append(int(part_match.group(1)))
         roman_match = _ROMAN_END_RE.search(text)
         if roman_match:
