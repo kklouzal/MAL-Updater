@@ -85,6 +85,7 @@
   - now splits stale tail gaps into a separate `resume_backlog` lane so old backlog is no longer mislabeled as a fresh episode alert
   - surfaces dubbed later-season availability when an earlier franchise season appears completed locally
   - sequel/installment hints stay deliberately conservative: bare `Part N` wording only counts as later-season evidence when the same title text also carries explicit season-style wording such as `Season 2`, `Second Season`, or `Final Season Part 2`
+  - now has a local MAL metadata/relation cache plus `recommend-refresh-metadata`, so continuation detection can progressively lean on real MAL relation edges instead of title grouping alone when cache coverage exists
   - episode alerts now rank with stronger recency and `in_progress` bias instead of mostly alphabetical tie behavior
   - stays local/read-only and does not pretend to do richer genre/studio/VA/taste ranking yet
 

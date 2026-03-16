@@ -31,6 +31,7 @@
 - [x] Suppress obvious skipped-episode / fully-watched false positives in local episode alerts
 - [x] Add recency-aware ranking bias to local episode alerts
 - [x] Split stale tail gaps into `resume_backlog` instead of labeling them as fresh episode alerts
+- [x] Add a local MAL metadata/relation cache and refresh command for richer continuation evidence
 - [ ] Genre/studio/VA/taste feature ideas
 
 ## Later

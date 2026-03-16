@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from mal_updater.config import load_config
-from mal_updater.db import bootstrap_database, connect
+from mal_updater.db import bootstrap_database, connect, replace_mal_anime_relations, upsert_mal_anime_metadata, upsert_series_mapping
 from mal_updater.recommendations import build_recommendations
 
 
@@ -73,6 +73,38 @@ class RecommendationTests(unittest.TestCase):
             )
             conn.commit()
 
+    def _map_series(self, provider_series_id: str, mal_anime_id: int) -> None:
+        upsert_series_mapping(
+            self.config.db_path,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            mal_anime_id=mal_anime_id,
+            confidence=1.0,
+            mapping_source="user_approved",
+            approved_by_user=True,
+            notes=None,
+        )
+
+    def _cache_metadata(self, mal_anime_id: int, *, title: str) -> None:
+        upsert_mal_anime_metadata(
+            self.config.db_path,
+            mal_anime_id=mal_anime_id,
+            title=title,
+            title_english=None,
+            title_japanese=None,
+            alternative_titles=[],
+            media_type="tv",
+            status="finished_airing",
+            num_episodes=12,
+            mean=None,
+            popularity=None,
+            start_season=None,
+            raw={"id": mal_anime_id, "title": title},
+        )
+
+    def _cache_relations(self, mal_anime_id: int, relations: list[dict]) -> None:
+        replace_mal_anime_relations(self.config.db_path, mal_anime_id=mal_anime_id, relations=relations)
+
     def test_new_dubbed_episode_recommendation_detects_contiguous_tail_gap(self) -> None:
         self._insert_series(
             "series-1",
@@ -119,6 +151,45 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("new_season", item.kind)
         self.assertEqual("season-2", item.provider_series_id)
         self.assertEqual("season-1", item.context["predecessor_provider_series_id"])
+
+    def test_relation_backed_new_season_recommendation_detects_title_drift(self) -> None:
+        self._insert_series(
+            "sg",
+            title="Steins;Gate",
+            season_title="Steins;Gate (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("sg", "sg-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_progress("sg", "sg-2", episode_number=2, completion_ratio=1.0, last_watched_at="2026-03-01T02:00:00Z")
+        self._insert_series(
+            "sg0",
+            title="Steins;Gate 0",
+            season_title="Steins;Gate 0 (English Dub)",
+            watchlist_status="never_watched",
+        )
+        self._map_series("sg", 9253)
+        self._map_series("sg0", 30484)
+        self._cache_metadata(9253, title="Steins;Gate")
+        self._cache_metadata(30484, title="Steins;Gate 0")
+        self._cache_relations(
+            9253,
+            [
+                {
+                    "related_mal_anime_id": 30484,
+                    "relation_type": "sequel",
+                    "relation_type_formatted": "Sequel",
+                    "related_title": "Steins;Gate 0",
+                    "raw": {"relation_type": "sequel", "node": {"id": 30484, "title": "Steins;Gate 0"}},
+                }
+            ],
+        )
+
+        results = build_recommendations(self.config, limit=0)
+
+        items = [item for item in results if item.provider_series_id == "sg0" and item.kind == "new_season"]
+        self.assertEqual(1, len(items))
+        self.assertTrue(items[0].context["relation_backed"])
+        self.assertEqual("sg", items[0].context["predecessor_provider_series_id"])
 
     def test_new_season_recommendation_detects_roman_numeral_installments(self) -> None:
         self._insert_series(

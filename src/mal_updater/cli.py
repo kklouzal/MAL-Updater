@@ -23,6 +23,7 @@ from .db import bootstrap_database, list_review_queue_entries, list_series_mappi
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series
+from .recommendation_metadata import refresh_recommendation_metadata
 from .recommendations import build_recommendations
 from .sync_planner import (
     build_dry_run_sync_plan,
@@ -543,6 +544,15 @@ def _cmd_recommend(project_root: Path | None, limit: int) -> int:
     return 0
 
 
+def _cmd_recommend_refresh_metadata(project_root: Path | None, limit: int) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    summary = refresh_recommendation_metadata(config, limit=_normalize_limit(limit))
+    print(json.dumps(summary.as_dict(), indent=2))
+    return 0
+
+
 def _cmd_sync(_: Path | None) -> int:
     raise SystemExit(
         "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals or 'apply-sync' for the approved-mapping-only executor."
@@ -638,6 +648,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate local recommendations from the ingested Crunchyroll dataset (new seasons + dubbed episode availability)",
     )
     recommend.add_argument("--limit", type=int, default=20, help="How many recommendations to emit (use 0 for all)")
+    recommend_refresh = subparsers.add_parser(
+        "recommend-refresh-metadata",
+        help="Refresh MAL metadata/relation cache for mapped anime so recommendations can use richer continuation evidence",
+    )
+    recommend_refresh.add_argument("--limit", type=int, default=0, help="How many mapped MAL anime to refresh (use 0 for all)")
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -695,6 +710,8 @@ def main() -> int:
         return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
     if args.command == "recommend":
         return _cmd_recommend(args.project_root, args.limit)
+    if args.command == "recommend-refresh-metadata":
+        return _cmd_recommend_refresh_metadata(args.project_root, args.limit)
     if args.command == "sync":
         return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")
