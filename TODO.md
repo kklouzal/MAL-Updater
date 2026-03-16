@@ -30,6 +30,7 @@
 - [x] Keep later-season installment heuristics conservative (`Part N` only counts with explicit season-style wording)
 - [x] Suppress obvious skipped-episode / fully-watched false positives in local episode alerts
 - [x] Add recency-aware ranking bias to local episode alerts
+- [x] Split stale tail gaps into `resume_backlog` instead of labeling them as fresh episode alerts
 - [ ] Genre/studio/VA/taste feature ideas
 
 ## Later

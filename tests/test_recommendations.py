@@ -306,8 +306,30 @@ class RecommendationTests(unittest.TestCase):
 
         results = build_recommendations(self.config, limit=0)
 
-        ids = [item.provider_series_id for item in results if item.kind == "new_dubbed_episode"]
-        self.assertEqual(["recent-show", "stale-show"], ids)
+        recent = [item for item in results if item.provider_series_id == "recent-show"][0]
+        stale = [item for item in results if item.provider_series_id == "stale-show"][0]
+        self.assertEqual("new_dubbed_episode", recent.kind)
+        self.assertEqual("resume_backlog", stale.kind)
+        self.assertGreater(recent.priority, stale.priority)
+
+    def test_stale_tail_gap_is_classified_as_resume_backlog(self) -> None:
+        self._insert_series(
+            "backlog-show",
+            title="Backlog Show",
+            season_title="Backlog Show (English Dub)",
+            season_number=1,
+            watchlist_status="in_progress",
+        )
+        self._insert_progress("backlog-show", "b1", episode_number=1, completion_ratio=1.0, last_watched_at="2020-01-10T01:00:00Z")
+        self._insert_progress("backlog-show", "b2", episode_number=2, completion_ratio=0.2, last_watched_at="2020-01-10T02:00:00Z")
+
+        results = build_recommendations(self.config, limit=0)
+
+        self.assertEqual(1, len(results))
+        item = results[0]
+        self.assertEqual("resume_backlog", item.kind)
+        self.assertIn("backlog continuation", " ".join(item.reasons))
+        self.assertEqual(1, item.context["contiguous_tail_gap"])
 
     def test_filters_out_non_english_dub_candidates(self) -> None:
         self._insert_series(

@@ -82,6 +82,7 @@
   - progress is deduplicated by `episode_number` when available so alternate dub/sub variants do not inflate MAL watched counts
 - the first local recommendation pass now exists via `recommend`:
   - surfaces dubbed-episode alerts only when there is a **contiguous tail gap** beyond completed progress, which suppresses many skipped-episode/progress-artifact false positives
+  - now splits stale tail gaps into a separate `resume_backlog` lane so old backlog is no longer mislabeled as a fresh episode alert
   - surfaces dubbed later-season availability when an earlier franchise season appears completed locally
   - sequel/installment hints stay deliberately conservative: bare `Part N` wording only counts as later-season evidence when the same title text also carries explicit season-style wording such as `Season 2`, `Second Season`, or `Final Season Part 2`
   - episode alerts now rank with stronger recency and `in_progress` bias instead of mostly alphabetical tie behavior

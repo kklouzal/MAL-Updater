@@ -94,16 +94,21 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
         if tail_gap is None or tail_gap <= 0:
             continue
 
+        days_since_watch = _days_since(state.last_watched_at)
+        is_recent = days_since_watch is not None and days_since_watch <= 90
+        kind = "new_dubbed_episode" if is_recent else "resume_backlog"
         reasons = [
             "English dub is available",
             f"{tail_gap} contiguous episode(s) appear beyond your completed tail progress",
         ]
+        if kind == "resume_backlog":
+            reasons.append("this looks more like a backlog continuation than a fresh release alert")
         if state.last_watched_at:
             reasons.append(f"most recent watch activity: {state.last_watched_at}")
-        priority = _episode_recommendation_priority(state, tail_gap)
+        priority = _episode_recommendation_priority(state, tail_gap, kind)
         items.append(
             Recommendation(
-                kind="new_dubbed_episode",
+                kind=kind,
                 priority=priority,
                 provider_series_id=state.provider_series_id,
                 title=state.title,
@@ -116,6 +121,7 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
                     "contiguous_tail_gap": tail_gap,
                     "watchlist_status": state.watchlist_status,
                     "last_watched_at": state.last_watched_at,
+                    "days_since_last_watch": days_since_watch,
                 },
             )
         )
@@ -132,36 +138,43 @@ def _contiguous_tail_gap(state: ProviderSeriesState) -> int | None:
     return state.max_episode_number - state.max_completed_episode_number
 
 
-def _episode_recommendation_priority(state: ProviderSeriesState, tail_gap: int) -> int:
-    priority = 55 - min(tail_gap, 10)
+def _episode_recommendation_priority(state: ProviderSeriesState, tail_gap: int, kind: str) -> int:
+    base = 55 if kind == "new_dubbed_episode" else 30
+    priority = base - min(tail_gap, 10)
     if tail_gap == 1:
         priority += 10
     if state.watchlist_status == "in_progress":
         priority += 12
     elif state.watchlist_status == "fully_watched":
         priority -= 20
-    priority += _freshness_boost(state.last_watched_at)
+    priority += _freshness_boost(state.last_watched_at, kind)
     return priority
 
 
-def _freshness_boost(last_watched_at: str | None) -> int:
+def _days_since(last_watched_at: str | None) -> int | None:
     if not last_watched_at:
-        return -8
+        return None
     try:
         watched = datetime.fromisoformat(last_watched_at.replace("Z", "+00:00"))
     except ValueError:
-        return 0
+        return None
     now = datetime.now(timezone.utc)
-    days = max((now - watched).days, 0)
+    return max((now - watched).days, 0)
+
+
+def _freshness_boost(last_watched_at: str | None, kind: str) -> int:
+    days = _days_since(last_watched_at)
+    if days is None:
+        return -8 if kind == "new_dubbed_episode" else -2
     if days <= 7:
-        return 10
+        return 10 if kind == "new_dubbed_episode" else 3
     if days <= 30:
-        return 6
+        return 6 if kind == "new_dubbed_episode" else 1
     if days <= 90:
-        return 2
+        return 2 if kind == "new_dubbed_episode" else 0
     if days <= 365:
-        return -4
-    return -12
+        return -4 if kind == "new_dubbed_episode" else -2
+    return -12 if kind == "new_dubbed_episode" else -4
 
 
 def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list[Recommendation]:
