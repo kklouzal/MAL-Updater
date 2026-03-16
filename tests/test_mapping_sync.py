@@ -912,9 +912,12 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
+        self.assertEqual(result.status, "exact")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 45576)
         self.assertIn("season_to_split_match=part:2,split:2", result.rationale)
         self.assertTrue(any(reason == "aggregated_episode_numbering_suspected=24>12" for reason in result.rationale))
+        self.assertNotIn("episode_evidence_exceeds_candidate_count=24>12", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
 
     def test_map_series_penalizes_single_special_when_provider_looks_like_multi_episode_main_series(self) -> None:
         with tempfile.TemporaryDirectory() as td:

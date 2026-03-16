@@ -396,23 +396,27 @@ def _provider_episode_numbering_may_be_aggregated(
 ) -> bool:
     if series.max_episode_number is None or series.max_episode_number <= candidate_num_episodes:
         return False
-    if series.completed_episode_count is None or series.completed_episode_count > candidate_num_episodes:
-        return False
     if not _has_non_base_installment_hint(provider_hints):
         return False
     if not candidate_hints:
         return False
     shared_installment_hints = provider_hints & candidate_hints
-    if shared_installment_hints:
+    if shared_installment_hints and (series.completed_episode_count is None or series.completed_episode_count <= candidate_num_episodes):
         return True
 
     provider_seasons = {hint for hint in provider_hints if hint.startswith('season:')}
     candidate_split_hints = {hint for hint in candidate_hints if hint.startswith(('part:', 'split:', 'cour:'))}
+    split_aligned = False
     for season_hint in provider_seasons:
         suffix = season_hint.split(':', 1)[1]
         if any(hint.endswith(f':{suffix}') for hint in candidate_split_hints):
-            return True
-    return False
+            split_aligned = True
+            break
+    if not split_aligned:
+        return False
+    if series.max_episode_number % candidate_num_episodes != 0:
+        return False
+    return True
 
 
 def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
@@ -686,8 +690,6 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
         return top.score >= 0.99
     if top.score >= 0.99 and top.score - second.score >= 0.05:
         return True
-    if "exact_normalized_title" not in top.match_reasons:
-        return False
 
     reasons = list(top.match_reasons)
     if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons):
@@ -697,6 +699,15 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
     base_query_norm = normalize_title_strict(series.title)
     second_query_norm = normalize_title_strict(second.matched_query)
     has_specific_installment_context = (series.season_number or 0) >= 2 and top_query_norm != base_query_norm
+
+    if "season_to_split_match=" in " ".join(top.match_reasons):
+        if top.score >= 0.95 and _candidate_is_explainably_weaker(series, second):
+            return True
+        if top.score >= 0.95 and any(reason.startswith('season_number_mismatch=') for reason in second.match_reasons):
+            return True
+
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
     if not has_specific_installment_context or top.score < 0.99:
         return False
     if _candidate_is_explainably_weaker(series, second):
@@ -711,7 +722,10 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
 def should_auto_approve_mapping(result: MappingResult) -> bool:
     if result.status != "exact" or result.chosen_candidate is None:
         return False
-    if "exact_normalized_title" not in result.chosen_candidate.match_reasons:
+    reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
+    has_exact_title = "exact_normalized_title" in result.chosen_candidate.match_reasons
+    has_split_cour_match = any(reason.startswith("season_to_split_match=") for reason in reasons)
+    if not has_exact_title and not has_split_cour_match:
         return False
 
     provider_season_number, _ = _provider_season_number(result.series)
@@ -719,7 +733,6 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
     if provider_season_number is not None and candidate_season_numbers and candidate_season_numbers != {provider_season_number}:
         return False
 
-    reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
     if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons):
         return False
     return True
