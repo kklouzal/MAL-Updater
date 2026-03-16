@@ -9,6 +9,7 @@ from typing import Any
 MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "001_initial.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "002_mal_metadata_cache.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "003_mal_recommendation_edges.sql",
 ]
 
 
@@ -64,6 +65,18 @@ class MalAnimeRelation:
     relation_type: str
     relation_type_formatted: str | None
     related_title: str | None
+    raw: dict[str, Any]
+    fetched_at: str
+
+
+@dataclass(slots=True)
+class MalRecommendationEdge:
+    source_mal_anime_id: int
+    target_mal_anime_id: int
+    target_title: str | None
+    num_recommendations: int | None
+    hop_distance: int
+    source_kind: str
     raw: dict[str, Any]
     fetched_at: str
 
@@ -428,6 +441,77 @@ def get_mal_anime_relations_map(db_path: Path) -> dict[int, list[MalAnimeRelatio
                 relation_type=str(row["relation_type"]),
                 relation_type_formatted=row["relation_type_formatted"],
                 related_title=row["related_title"],
+                raw=json.loads(row["raw_json"]),
+                fetched_at=str(row["fetched_at"]),
+            )
+        )
+    return result
+
+
+def replace_mal_recommendation_edges(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    hop_distance: int,
+    edges: list[dict[str, Any]],
+) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM mal_anime_recommendations WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'",
+            (int(source_mal_anime_id),),
+        )
+        for edge in edges:
+            conn.execute(
+                """
+                INSERT INTO mal_anime_recommendations (
+                    source_mal_anime_id,
+                    target_mal_anime_id,
+                    target_title,
+                    num_recommendations,
+                    hop_distance,
+                    source_kind,
+                    raw_json
+                ) VALUES (?, ?, ?, ?, ?, 'mal_recommendation', ?)
+                """,
+                (
+                    int(source_mal_anime_id),
+                    int(edge["target_mal_anime_id"]),
+                    edge.get("target_title"),
+                    edge.get("num_recommendations"),
+                    int(hop_distance),
+                    json.dumps(edge["raw"], ensure_ascii=False, sort_keys=True),
+                ),
+            )
+        conn.commit()
+
+
+def get_mal_recommendation_edges_map(db_path: Path) -> dict[int, list[MalRecommendationEdge]]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                source_mal_anime_id,
+                target_mal_anime_id,
+                target_title,
+                num_recommendations,
+                hop_distance,
+                source_kind,
+                raw_json,
+                fetched_at
+            FROM mal_anime_recommendations
+            ORDER BY source_mal_anime_id ASC, num_recommendations DESC, target_mal_anime_id ASC
+            """
+        ).fetchall()
+    result: dict[int, list[MalRecommendationEdge]] = {}
+    for row in rows:
+        result.setdefault(int(row["source_mal_anime_id"]), []).append(
+            MalRecommendationEdge(
+                source_mal_anime_id=int(row["source_mal_anime_id"]),
+                target_mal_anime_id=int(row["target_mal_anime_id"]),
+                target_title=row["target_title"],
+                num_recommendations=None if row["num_recommendations"] is None else int(row["num_recommendations"]),
+                hop_distance=int(row["hop_distance"]),
+                source_kind=str(row["source_kind"]),
                 raw=json.loads(row["raw_json"]),
                 fetched_at=str(row["fetched_at"]),
             )

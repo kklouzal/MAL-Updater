@@ -17,6 +17,7 @@ What it does today:
 - a first live MAL executor that only applies approved, forward-safe updates
 - a first local recommendation pass for dubbed episode and later-season alerts (kept deliberately conservative: bare `Part N` wording only counts as sequel evidence when the same title also carries explicit season-style wording like `Season 2`, `Second Season`, or `Final Season Part 2`; episode alerts now require a contiguous tail gap, use basic recency-aware ranking, and split stale tail gaps into `resume_backlog` instead of pretending they are fresh releases)
 - a local MAL metadata/relation cache for mapped anime, plus `recommend-refresh-metadata`, so continuation recommendations can progressively move beyond title-only heuristics
+- a first graph-backed discovery lane from cached MAL recommendation edges, scored by convergence across watched/mapped seed titles
 
 What it does **not** do yet:
 - complete unattended end-to-end sync behavior

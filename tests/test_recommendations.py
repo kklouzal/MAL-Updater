@@ -5,7 +5,14 @@ import unittest
 from pathlib import Path
 
 from mal_updater.config import load_config
-from mal_updater.db import bootstrap_database, connect, replace_mal_anime_relations, upsert_mal_anime_metadata, upsert_series_mapping
+from mal_updater.db import (
+    bootstrap_database,
+    connect,
+    replace_mal_anime_relations,
+    replace_mal_recommendation_edges,
+    upsert_mal_anime_metadata,
+    upsert_series_mapping,
+)
 from mal_updater.recommendations import build_recommendations
 
 
@@ -104,6 +111,9 @@ class RecommendationTests(unittest.TestCase):
 
     def _cache_relations(self, mal_anime_id: int, relations: list[dict]) -> None:
         replace_mal_anime_relations(self.config.db_path, mal_anime_id=mal_anime_id, relations=relations)
+
+    def _cache_recommendations(self, mal_anime_id: int, edges: list[dict]) -> None:
+        replace_mal_recommendation_edges(self.config.db_path, source_mal_anime_id=mal_anime_id, hop_distance=1, edges=edges)
 
     def test_new_dubbed_episode_recommendation_detects_contiguous_tail_gap(self) -> None:
         self._insert_series(
@@ -382,6 +392,38 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("new_dubbed_episode", recent.kind)
         self.assertEqual("resume_backlog", stale.kind)
         self.assertGreater(recent.priority, stale.priority)
+
+    def test_discovery_candidate_aggregates_recommendation_support(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-b",
+            title="Seed B",
+            season_title="Seed B (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._map_series("seed-b", 200)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(200, title="Seed B")
+        self._cache_metadata(300, title="Discovery Hit")
+        self._cache_recommendations(100, [{"target_mal_anime_id": 300, "target_title": "Discovery Hit", "num_recommendations": 20, "raw": {}}])
+        self._cache_recommendations(200, [{"target_mal_anime_id": 300, "target_title": "Discovery Hit", "num_recommendations": 15, "raw": {}}])
+
+        results = build_recommendations(self.config, limit=0)
+
+        discovery = [item for item in results if item.kind == "discovery_candidate"]
+        self.assertEqual(1, len(discovery))
+        item = discovery[0]
+        self.assertEqual("mal:300", item.provider_series_id)
+        self.assertEqual(2, item.context["supporting_source_count"])
+        self.assertEqual(35, item.context["aggregated_recommendation_votes"])
 
     def test_stale_tail_gap_is_classified_as_resume_backlog(self) -> None:
         self._insert_series(

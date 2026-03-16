@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig
-from .db import get_mal_anime_metadata_map, get_mal_anime_relations_map, list_series_mappings
+from .db import get_mal_anime_metadata_map, get_mal_anime_relations_map, get_mal_recommendation_edges_map, list_series_mappings
 from .mapping import normalize_title
 from .sync_planner import ProviderSeriesState, load_provider_series_states
 
@@ -79,6 +79,7 @@ def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Rec
     }
     metadata_by_id = get_mal_anime_metadata_map(config.db_path)
     relations_by_id = get_mal_anime_relations_map(config.db_path)
+    recommendation_edges_by_id = get_mal_recommendation_edges_map(config.db_path)
 
     recommendations: list[Recommendation] = []
     recommendations.extend(
@@ -91,6 +92,14 @@ def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Rec
         )
     )
     recommendations.extend(_build_new_season_recommendations(states))
+    recommendations.extend(
+        _build_discovery_recommendations(
+            states,
+            mapping_by_series=mapping_by_series,
+            metadata_by_id=metadata_by_id,
+            recommendation_edges_by_id=recommendation_edges_by_id,
+        )
+    )
     recommendations.extend(_build_new_episode_recommendations(states))
     recommendations = _dedupe_recommendations(recommendations)
     recommendations.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
@@ -204,6 +213,99 @@ def _dedupe_recommendations(items: list[Recommendation]) -> list[Recommendation]
         if existing is None or item.priority > existing.priority:
             best[key] = item
     return list(best.values())
+
+
+def _build_discovery_recommendations(
+    states: list[ProviderSeriesState],
+    *,
+    mapping_by_series: dict[str, int],
+    metadata_by_id: dict[int, Any],
+    recommendation_edges_by_id: dict[int, list[Any]],
+) -> list[Recommendation]:
+    seed_weights: dict[int, int] = {}
+    for state in states:
+        mal_anime_id = mapping_by_series.get(state.provider_series_id)
+        if mal_anime_id is None:
+            continue
+        if state.watchlist_status == "fully_watched":
+            seed_weights[mal_anime_id] = 3
+        elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or _days_since(state.last_watched_at) in range(0, 91)):
+            seed_weights[mal_anime_id] = 2
+
+    candidate_scores: dict[int, dict[str, Any]] = {}
+    watched_ids = set(seed_weights)
+    mapped_ids = set(mapping_by_series.values())
+    for source_id, weight in seed_weights.items():
+        for edge in recommendation_edges_by_id.get(source_id, [])[:15]:
+            target_id = edge.target_mal_anime_id
+            if target_id in watched_ids or target_id in mapped_ids:
+                continue
+            bucket = candidate_scores.setdefault(
+                target_id,
+                {
+                    "supporting_sources": set(),
+                    "raw_score": 0.0,
+                    "votes": 0,
+                    "title": edge.target_title,
+                },
+            )
+            votes = edge.num_recommendations or 0
+            bucket["supporting_sources"].add(source_id)
+            bucket["votes"] += votes
+            bucket["raw_score"] += weight * min(votes, 40)
+
+    items: list[Recommendation] = []
+    for target_id, bucket in candidate_scores.items():
+        meta = metadata_by_id.get(target_id)
+        support_count = len(bucket["supporting_sources"])
+        if support_count <= 0:
+            continue
+        if meta is not None and meta.media_type not in (None, "tv", "movie", "ova", "ona", "special"):
+            continue
+        mean = meta.mean if meta is not None else None
+        popularity = meta.popularity if meta is not None else None
+        popularity_bonus = 0
+        if popularity is not None:
+            if popularity <= 100:
+                popularity_bonus = 6
+            elif popularity <= 500:
+                popularity_bonus = 3
+            elif popularity <= 2000:
+                popularity_bonus = 1
+        priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
+        priority += popularity_bonus
+        reasons = [
+            f"recommended by {support_count} watched/mapped seed title(s)",
+        ]
+        if bucket["votes"]:
+            reasons.append(f"aggregated MAL recommendation votes: {bucket['votes']}")
+        if mean is not None:
+            reasons.append(f"MAL mean score: {mean}")
+        if meta is None:
+            reasons.append("full MAL metadata for this discovery candidate is not cached yet")
+        title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
+        items.append(
+            Recommendation(
+                kind="discovery_candidate",
+                priority=priority,
+                provider_series_id=f"mal:{target_id}",
+                title=title,
+                season_title=None,
+                reasons=reasons,
+                context={
+                    "mal_anime_id": target_id,
+                    "supporting_source_count": support_count,
+                    "supporting_mal_anime_ids": sorted(bucket["supporting_sources"]),
+                    "aggregated_recommendation_votes": bucket["votes"],
+                    "mean": mean,
+                    "popularity": popularity,
+                    "media_type": meta.media_type if meta is not None else None,
+                    "num_episodes": meta.num_episodes if meta is not None else None,
+                    "metadata_cached": meta is not None,
+                },
+            )
+        )
+    return items
 
 
 def _build_relation_backed_new_season_recommendations(

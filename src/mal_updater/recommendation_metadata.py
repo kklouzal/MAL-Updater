@@ -4,11 +4,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig, load_mal_secrets
-from .db import list_series_mappings, replace_mal_anime_relations, upsert_mal_anime_metadata
+from .db import (
+    list_series_mappings,
+    replace_mal_anime_relations,
+    replace_mal_recommendation_edges,
+    upsert_mal_anime_metadata,
+)
 from .mal_client import MalClient
 
 DETAIL_FIELDS = (
-    "id,title,alternative_titles,media_type,status,num_episodes,mean,popularity,start_season,related_anime"
+    "id,title,alternative_titles,media_type,status,num_episodes,mean,popularity,start_season,related_anime,recommendations"
 )
 
 
@@ -79,5 +84,29 @@ def refresh_recommendation_metadata(config: AppConfig, *, limit: int | None = No
                 }
             )
         replace_mal_anime_relations(config.db_path, mal_anime_id=anime_id, relations=relations_payload)
+
+        recommendation_edges: list[dict[str, Any]] = []
+        for rec in details.get("recommendations") or []:
+            if not isinstance(rec, dict):
+                continue
+            node = rec.get("node") or {}
+            if not isinstance(node, dict) or not isinstance(node.get("id"), int):
+                continue
+            recommendation_edges.append(
+                {
+                    "target_mal_anime_id": int(node["id"]),
+                    "target_title": node.get("title") if isinstance(node.get("title"), str) else None,
+                    "num_recommendations": int(rec["num_recommendations"])
+                    if isinstance(rec.get("num_recommendations"), int)
+                    else None,
+                    "raw": rec,
+                }
+            )
+        replace_mal_recommendation_edges(
+            config.db_path,
+            source_mal_anime_id=anime_id,
+            hop_distance=1,
+            edges=recommendation_edges,
+        )
         refreshed += 1
     return MetadataRefreshSummary(considered=len(anime_ids), refreshed=refreshed)
