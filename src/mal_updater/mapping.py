@@ -403,9 +403,16 @@ def _provider_episode_numbering_may_be_aggregated(
     if not candidate_hints:
         return False
     shared_installment_hints = provider_hints & candidate_hints
-    if not shared_installment_hints:
-        return False
-    return True
+    if shared_installment_hints:
+        return True
+
+    provider_seasons = {hint for hint in provider_hints if hint.startswith('season:')}
+    candidate_split_hints = {hint for hint in candidate_hints if hint.startswith(('part:', 'split:', 'cour:'))}
+    for season_hint in provider_seasons:
+        suffix = season_hint.split(':', 1)[1]
+        if any(hint.endswith(f':{suffix}') for hint in candidate_split_hints):
+            return True
+    return False
 
 
 def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
@@ -516,6 +523,18 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         else:
             conflicting_hints.extend(sorted(provider_splits | candidate_splits))
 
+    provider_seasons = {hint for hint in provider_hints if hint.startswith("season:")}
+    if provider_seasons:
+        season_to_split_matches = []
+        for season_hint in provider_seasons:
+            suffix = season_hint.split(":", 1)[1]
+            cross_matches = [hint for hint in candidate_hints if hint.endswith(f":{suffix}") and hint.startswith(("part:", "split:", "cour:"))]
+            if cross_matches:
+                season_to_split_matches.extend(cross_matches)
+        if season_to_split_matches:
+            reasons.append(f"season_to_split_match={','.join(sorted(set(season_to_split_matches)))}")
+            score += 0.05
+
     provider_romans = {hint for hint in provider_hints if hint.startswith("roman:")}
     candidate_romans = {hint for hint in candidate_hints if hint.startswith("roman:")}
     if provider_romans and candidate_romans:
@@ -605,6 +624,7 @@ def _candidate_positive_signal_count(candidate: MappingCandidate) -> int:
                 "season_number_match=",
                 "part_hint_match=",
                 "split_installment_match=",
+                "season_to_split_match=",
                 "roman_installment_match=",
                 "installment_hint_match=",
             )

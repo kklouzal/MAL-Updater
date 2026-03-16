@@ -842,6 +842,80 @@ class MappingTests(unittest.TestCase):
         self.assertTrue(any(reason == "aggregated_episode_numbering_suspected=25>13" for reason in result.rationale))
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_prefers_part_two_candidate_for_aggregated_second_season(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 59193,
+                                "title": "Mushoku Tensei III: Isekai Ittara Honki Dasu",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "currently_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 45576,
+                                "title": "Mushoku Tensei: Isekai Ittara Honki Dasu Part 2",
+                                "alternative_titles": {"synonyms": ["Mushoku Tensei: Jobless Reincarnation Part 2"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 39535,
+                                "title": "Mushoku Tensei: Isekai Ittara Honki Dasu",
+                                "alternative_titles": {"synonyms": ["Mushoku Tensei: Jobless Reincarnation"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 11,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Mushoku Tensei: Jobless Reincarnation",
+                        season_title="Mushoku Tensei: Jobless Reincarnation Season 2",
+                        season_number=2,
+                        max_episode_number=24,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 45576)
+        self.assertIn("season_to_split_match=part:2,split:2", result.rationale)
+        self.assertTrue(any(reason == "aggregated_episode_numbering_suspected=24>12" for reason in result.rationale))
+
     def test_map_series_penalizes_single_special_when_provider_looks_like_multi_episode_main_series(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
