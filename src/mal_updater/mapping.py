@@ -124,6 +124,7 @@ class SeriesMappingInput:
     season_number: int | None = None
     max_episode_number: int | None = None
     completed_episode_count: int | None = None
+    max_completed_episode_number: int | None = None
 
 
 @dataclass(slots=True)
@@ -400,9 +401,21 @@ def _provider_episode_numbering_may_be_aggregated(
         return False
     if not candidate_hints:
         return False
-    shared_installment_hints = provider_hints & candidate_hints
-    if shared_installment_hints and (series.completed_episode_count is None or series.completed_episode_count <= candidate_num_episodes):
-        return True
+
+    completion_aligned = False
+    max_completed = series.max_completed_episode_number
+    if max_completed is not None and max_completed <= candidate_num_episodes:
+        completion_aligned = True
+    elif (
+        series.completed_episode_count is not None
+        and series.completed_episode_count <= candidate_num_episodes
+    ):
+        completion_aligned = True
+
+    if completion_aligned:
+        shared_installment_hints = provider_hints & candidate_hints
+        if shared_installment_hints:
+            return True
 
     provider_seasons = {hint for hint in provider_hints if hint.startswith('season:')}
     candidate_split_hints = {hint for hint in candidate_hints if hint.startswith(('part:', 'split:', 'cour:'))}
@@ -417,6 +430,33 @@ def _provider_episode_numbering_may_be_aggregated(
     if series.max_episode_number % candidate_num_episodes != 0:
         return False
     return True
+
+
+def _provider_episode_evidence_may_have_minor_overflow(
+    series: SeriesMappingInput,
+    provider_hints: set[str],
+    candidate_hints: set[str],
+    candidate_num_episodes: int,
+) -> bool:
+    provider_episode_evidence = series.max_completed_episode_number or series.max_episode_number
+    if provider_episode_evidence is None or provider_episode_evidence <= candidate_num_episodes:
+        return False
+    overflow = provider_episode_evidence - candidate_num_episodes
+    if overflow != 1:
+        return False
+    if series.completed_episode_count is not None and series.completed_episode_count > candidate_num_episodes + 1:
+        return False
+
+    shared_installment_hints = provider_hints & candidate_hints
+    if any(hint.startswith(("season:", "part:", "split:", "cour:", "roman:")) for hint in shared_installment_hints):
+        return True
+
+    provider_seasons = {hint for hint in provider_hints if hint.startswith("season:")}
+    for season_hint in provider_seasons:
+        suffix = season_hint.split(":", 1)[1]
+        if any(hint.endswith(f":{suffix}") for hint in candidate_hints if hint.startswith(("part:", "split:", "cour:"))):
+            return True
+    return False
 
 
 def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
@@ -509,6 +549,14 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score -= 0.06
         reasons.append("candidate_extra_installment_hint")
 
+    if provider_has_non_base_installment_hint and not candidate_has_non_base_installment_hint:
+        provider_season_number_for_penalty, _ = _provider_season_number(series)
+        if provider_season_number_for_penalty is not None and provider_season_number_for_penalty >= 2:
+            candidate_season_numbers_for_penalty = _candidate_season_numbers(node)
+            if not candidate_season_numbers_for_penalty or candidate_season_numbers_for_penalty == {1}:
+                score -= 0.05
+                reasons.append("base_installment_penalty_for_explicit_later_season")
+
     provider_parts = {hint for hint in provider_hints if hint.startswith("part:")}
     candidate_parts = {hint for hint in candidate_hints if hint.startswith("part:")}
     if provider_parts and candidate_parts:
@@ -575,22 +623,39 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
 
     candidate_num_episodes = node.get("num_episodes")
     if isinstance(candidate_num_episodes, int) and candidate_num_episodes > 0:
-        if series.max_episode_number is not None and series.max_episode_number > candidate_num_episodes:
+        provider_episode_evidence = series.max_completed_episode_number or series.max_episode_number
+        if provider_episode_evidence is not None and provider_episode_evidence > candidate_num_episodes:
             if _provider_episode_numbering_may_be_aggregated(series, provider_hints, candidate_hints, candidate_num_episodes):
                 score -= 0.03
                 reasons.append(
-                    f"aggregated_episode_numbering_suspected={series.max_episode_number}>{candidate_num_episodes}"
+                    f"aggregated_episode_numbering_suspected={provider_episode_evidence}>{candidate_num_episodes}"
+                )
+            elif _provider_episode_evidence_may_have_minor_overflow(series, provider_hints, candidate_hints, candidate_num_episodes):
+                score -= 0.03
+                reasons.append(
+                    f"minor_episode_overflow_suspected={provider_episode_evidence}>{candidate_num_episodes}"
                 )
             else:
                 score -= 0.12
                 reasons.append(
-                    f"episode_evidence_exceeds_candidate_count={series.max_episode_number}>{candidate_num_episodes}"
+                    f"episode_evidence_exceeds_candidate_count={provider_episode_evidence}>{candidate_num_episodes}"
                 )
         elif series.completed_episode_count is not None and series.completed_episode_count > candidate_num_episodes:
-            score -= 0.12
-            reasons.append(
-                f"completed_evidence_exceeds_candidate_count={series.completed_episode_count}>{candidate_num_episodes}"
-            )
+            if series.completed_episode_count == candidate_num_episodes + 1 and _provider_episode_evidence_may_have_minor_overflow(
+                series,
+                provider_hints,
+                candidate_hints,
+                candidate_num_episodes,
+            ):
+                score -= 0.03
+                reasons.append(
+                    f"minor_completed_episode_overflow_suspected={series.completed_episode_count}>{candidate_num_episodes}"
+                )
+            else:
+                score -= 0.12
+                reasons.append(
+                    f"completed_evidence_exceeds_candidate_count={series.completed_episode_count}>{candidate_num_episodes}"
+                )
 
     media_type = node.get("media_type")
     if (
@@ -644,6 +709,7 @@ def _candidate_penalty_count(candidate: MappingCandidate) -> int:
         "installment_hint_conflict=",
         "candidate_missing_installment_hint",
         "candidate_extra_installment_hint",
+        "base_installment_penalty_for_explicit_later_season",
         "candidate_auxiliary_content=",
         "episode_evidence_exceeds_candidate_count=",
         "completed_evidence_exceeds_candidate_count=",
@@ -672,6 +738,7 @@ def _candidate_is_explainably_weaker(series: SeriesMappingInput, candidate: Mapp
         "installment_hint_conflict=",
         "candidate_missing_installment_hint",
         "candidate_extra_installment_hint",
+        "base_installment_penalty_for_explicit_later_season",
         "candidate_auxiliary_content=",
         "episode_evidence_exceeds_candidate_count=",
         "completed_evidence_exceeds_candidate_count=",
@@ -706,6 +773,21 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
         if top.score >= 0.95 and any(reason.startswith('season_number_mismatch=') for reason in second.match_reasons):
             return True
 
+    if (
+        any(reason.startswith('season_number_match=') for reason in top.match_reasons)
+        and any(
+            reason.startswith((
+                'aggregated_episode_numbering_suspected=',
+                'minor_episode_overflow_suspected=',
+                'minor_completed_episode_overflow_suspected=',
+            ))
+            for reason in top.match_reasons
+        )
+        and top.score >= 0.95
+        and _candidate_is_explainably_weaker(series, second)
+    ):
+        return True
+
     if "exact_normalized_title" not in top.match_reasons:
         return False
     if not has_specific_installment_context or top.score < 0.99:
@@ -725,7 +807,18 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
     reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
     has_exact_title = "exact_normalized_title" in result.chosen_candidate.match_reasons
     has_split_cour_match = any(reason.startswith("season_to_split_match=") for reason in reasons)
-    if not has_exact_title and not has_split_cour_match:
+    has_explainable_episode_drift_match = (
+        any(reason.startswith("season_number_match=") for reason in reasons)
+        and any(
+            reason.startswith((
+                "aggregated_episode_numbering_suspected=",
+                "minor_episode_overflow_suspected=",
+                "minor_completed_episode_overflow_suspected=",
+            ))
+            for reason in reasons
+        )
+    )
+    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match:
         return False
 
     provider_season_number, _ = _provider_season_number(result.series)

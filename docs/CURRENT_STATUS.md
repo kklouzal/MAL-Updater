@@ -59,7 +59,7 @@
 - `review-mappings` provides the first durable operator workflow: preserved approved mappings stay fixed, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` mappings, explicit installment conflicts block auto-approval, strong-but-not-exact suggestions are surfaced for explicit approval, weaker cases remain review-only, unresolved items can be persisted into `review_queue`, and per-series MAL search timeouts now degrade into local review residue instead of aborting the full scan
 - `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
 - `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, can auto-promote the same safe exact matches into durable `auto_exact` approvals, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
-- `list-review-queue` exposes the durable backlog from SQLite for operator follow-up
+- `list-review-queue` exposes the durable backlog from SQLite for operator follow-up, and `--summary` now gives a compact triage view grouped by severity/decision with top repeated reasons plus a few example rows per decision/reason; when the review payload itself lacks a usable title, those summary examples now fall back to the stored provider-series title/season title so the operator can still recognize what needs attention without opening the full row, the summary now also reports repeated title/franchise clusters plus repeated decision+reason fix-strategy patterns so residue can be batched by likely family or remediation shape, and `--title-cluster` / `--fix-strategy` can now slice the queue directly to one of those batched buckets for follow-up
 - MAL client traffic is now rate-shaped locally at roughly `1.0 ± 0.2s` between requests by default, and timeout-prone reads/writes get one bounded retry before the caller turns the failure into normal review/error residue
 - `apply-sync` is the first guarded live-write path:
   - only consumes durably approved mappings (`user_approved` or safe `auto_exact`)
@@ -74,7 +74,7 @@
     - `start_date` is preserved because the current Crunchyroll snapshot does not prove the true first-watch date
     - `finish_date` may be filled only when Crunchyroll safely implies completion and MAL does not already have one
   - only sends the fields it intends to change, so meaningful existing MAL metadata is left alone
-- candidate scoring now also suppresses several noisy-but-explainable false-near-ties: sequel/spin-off entries with extra installment hints are penalized when the Crunchyroll title has no such hint, obvious auxiliary titles (`PV`, `extras`, `picture drama`, etc.) are penalized unless the provider title explicitly asks for them, single-episode `special`/`OVA` candidates are penalized harder when Crunchyroll clearly looks like a normal multi-episode mainline series, and `max_episode_number > MAL num_episodes` is no longer treated as a full contradiction when explicit later-season installment hints match and the Crunchyroll completed-episode count still fits inside the candidate cleanly (`aggregated_episode_numbering_suspected`)
+- candidate scoring now also suppresses several noisy-but-explainable false-near-ties: sequel/spin-off entries with extra installment hints are penalized when the Crunchyroll title has no such hint, obvious auxiliary titles (`PV`, `extras`, `picture drama`, etc.) are penalized unless the provider title explicitly asks for them, single-episode `special`/`OVA` candidates are penalized harder when Crunchyroll clearly looks like a normal multi-episode mainline series, explicitly later-season Crunchyroll titles now also penalize base-installment candidates that do not carry later-season evidence, and `max_episode_number > MAL num_episodes` is no longer treated as a full contradiction when explicit later-season installment hints match and the Crunchyroll completed-episode count still fits inside the candidate cleanly (`aggregated_episode_numbering_suspected`)
 - live Crunchyroll evidence is now feeding the completion policy directly:
   - strict ratio completion defaults to `0.95`
   - episodes with `<= 120s` remaining count as watched to cover the dominant credits-skip pattern seen in the dataset
@@ -82,12 +82,19 @@
   - progress is deduplicated by `episode_number` when available so alternate dub/sub variants do not inflate MAL watched counts
 - the first local recommendation pass now exists via `recommend`:
   - surfaces dubbed-episode alerts only when there is a **contiguous tail gap** beyond completed progress, which suppresses many skipped-episode/progress-artifact false positives
-  - now splits stale tail gaps into a separate `resume_backlog` lane so old backlog is no longer mislabeled as a fresh episode alert
+  - now splits stale tail gaps into a separate `resume_backlog` lane so old backlog is no longer mislabeled as a fresh episode alert, and the `fresh_dubbed_episodes` lane is now capped to roughly the last 3 weeks of watch activity instead of keeping month-old backlog-ish gaps in the "fresh" bucket
   - surfaces dubbed later-season availability when an earlier franchise season appears completed locally
   - sequel/installment hints stay deliberately conservative: bare `Part N` wording only counts as later-season evidence when the same title text also carries explicit season-style wording such as `Season 2`, `Second Season`, or `Final Season Part 2`
   - now has a local MAL metadata/relation cache plus `recommend-refresh-metadata`, so continuation detection can progressively lean on real MAL relation edges instead of title grouping alone when cache coverage exists
   - now also has a first graph-backed `discovery_candidate` lane fed by cached MAL user-recommendation edges with convergence scoring across watched/mapped seed titles
+  - `recommend-refresh-metadata` can now optionally hydrate top discovery-target metadata (including `my_list_status`) so discovery suggestions can suppress titles that are already somewhere on the MAL list
+  - discovery candidates now also get small cached genre-overlap, studio-overlap, **and source-material-overlap** bias/reasons against the watched seed set when MAL metadata is present, so equal graph hits can lean a bit more toward demonstrated taste instead of only raw vote/popularity signals
+  - discovery candidates now suppress direct same-franchise MAL relation targets (`sequel`, `prequel`, `side_story`, etc.) from watched seed titles, and that suppression now applies globally across the watched seed set instead of only when the same seed emitted the recommendation edge; this keeps the discovery lane closer to novel finds instead of recycling franchise-adjacent follow-ons through cross-seed graph paths
+  - discovery candidates also suppress targets whose MAL title/aliases already match something in the current Crunchyroll catalog, preventing rediscovery noise for titles that are already locally present but not mapped yet
+  - when `recommend-refresh-metadata --include-discovery-targets` is limited, discovery-target hydration now prioritizes aggregate multi-seed support first (support count, then summed recommendation votes) instead of just whichever target happened to have the single largest edge
+  - recommendation CLI output is now grouped into category sections (`continue_next`, `fresh_dubbed_episodes`, `discovery_candidates`, `resume_backlog`) by default, with `--flat` retained for legacy single-list JSON consumers
   - episode alerts now rank with stronger recency and `in_progress` bias instead of mostly alphabetical tie behavior
+  - sync planning now carries a `completion_audit` payload so dry-run/review output can show how completed-episode counts were derived (`ratio_threshold`, `credits_window`, `later_episode_evidence`) plus a few concrete episode examples for debugging borderline cases
   - stays local/read-only and does not pretend to do a finished taste-model yet
 
 ## Current Crunchyroll state
@@ -122,7 +129,6 @@ That means the remaining work is now split between: (1) re-stabilizing the fresh
 ## Next practical milestone
 
 Keep reducing the genuinely ambiguous mapping residue on top of the now-live local Crunchyroll dataset:
-- richer audit/debug surfacing for why an episode counted as completed
 - better review resolution UX for the remaining hard buckets
 - targeted handling for subtitle/arc-title variants and franchise/movie collection naming that still need human review when the provider title is not explicit enough
 - continue tightening same-franchise low-margin ties with explainable canonical-entry cues (today: auxiliary/special penalties are stronger when Crunchyroll clearly looks like the main multi-episode series)

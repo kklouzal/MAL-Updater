@@ -919,6 +919,146 @@ class MappingTests(unittest.TestCase):
         self.assertNotIn("episode_evidence_exceeds_candidate_count=24>12", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_softens_single_episode_overflow_when_later_season_hint_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 44037,
+                                "title": "Shin no Nakama ja Nai to Yuusha no Party wo Oidasareta node, Henkyou de Slow Life suru Koto ni Shimashita",
+                                "alternative_titles": {
+                                    "en": "Banished from the Hero's Party, I Decided to Live a Quiet Life in the Countryside"
+                                },
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 53488,
+                                "title": "Shin no Nakama ja Nai to Yuusha no Party wo Oidasareta node, Henkyou de Slow Life suru Koto ni Shimashita 2nd",
+                                "alternative_titles": {
+                                    "en": "Banished from the Hero's Party, I Decided to Live a Quiet Life in the Countryside Season 2"
+                                },
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Banished from the Hero's Party, I Decided to Live a Quiet Life in the Countryside",
+                        season_title="Banished from the Hero's Party, I Decided to Live a Quiet Life in the Countryside Season2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                        max_completed_episode_number=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 53488)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertTrue(any(reason == "minor_episode_overflow_suspected=13>12" for reason in result.rationale))
+        self.assertNotIn("episode_evidence_exceeds_candidate_count=13>12", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_penalizes_base_installment_candidate_when_provider_explicitly_targets_later_season(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 710,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 711,
+                                "title": "Example Show 2nd Season",
+                                "alternative_titles": {"en": "Example Show Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Example Show",
+                        season_title="Example Show Season 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                        max_completed_episode_number=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 711)
+        self.assertIn("season_number_match=2", result.rationale)
+        weaker = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 710)
+        self.assertIn("base_installment_penalty_for_explicit_later_season", weaker.match_reasons)
+        self.assertTrue(should_auto_approve_mapping(result))
+
     def test_map_series_penalizes_single_special_when_provider_looks_like_multi_episode_main_series(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1724,9 +1864,9 @@ class DryRunPlannerTests(unittest.TestCase):
                     **payload["progress"][0],
                     "provider_episode_id": "episode-1",
                     "episode_number": 1,
-                    "playback_position_ms": 1322000,
+                    "playback_position_ms": 1300000,
                     "duration_ms": 1440024,
-                    "completion_ratio": 0.9180402548846408,
+                    "completion_ratio": 0.9027610239707948,
                     "last_watched_at": "2026-03-14T20:00:00Z",
                 },
                 {
@@ -1776,6 +1916,56 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(proposals[0].decision, "propose_update")
         self.assertEqual(proposals[0].proposed_my_list_status, {"status": "watching", "num_watched_episodes": 2})
         self.assertIn("completion_policy=ratio>=0.95_or_remaining<=120s_or_later_episode_progress_with_ratio>=0.85", proposals[0].reasons)
+        self.assertEqual(1, proposals[0].completion_audit["completed_by"]["later_episode_evidence"])
+        self.assertEqual(1, proposals[0].completion_audit["completed_by"]["ratio_threshold"])
+        self.assertIn("ep1@ratio=0.903", proposals[0].completion_audit["completed_examples"]["later_episode_evidence"][0])
+
+    def test_sync_proposal_as_dict_includes_completion_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["progress"][0]["episode_number"] = 12
+            payload["progress"][0]["completion_ratio"] = 0.95
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 123,
+                                "title": "Example Show",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 123,
+                    "title": "Example Show",
+                    "num_episodes": 12,
+                    "my_list_status": {"status": "watching", "num_episodes_watched": 0},
+                },
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3)
+
+        payload_dict = proposals[0].as_dict()
+        self.assertIn("completion_audit", payload_dict)
+        self.assertEqual(1, payload_dict["completion_audit"]["completed_by"]["ratio_threshold"])
+        self.assertEqual([], payload_dict["completion_audit"]["incomplete_examples"])
 
     def test_build_dry_run_sync_plan_counts_last_episode_within_credits_window_as_completed(self) -> None:
         with tempfile.TemporaryDirectory() as td:

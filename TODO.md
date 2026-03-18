@@ -31,17 +31,19 @@
 - [x] Suppress obvious skipped-episode / fully-watched false positives in local episode alerts
 - [x] Add recency-aware ranking bias to local episode alerts
 - [x] Split stale tail gaps into `resume_backlog` instead of labeling them as fresh episode alerts
+- [x] Tighten the `fresh_dubbed_episodes` window so 3-4 week old tail gaps stop crowding the fresh-alert lane
 - [x] Add a local MAL metadata/relation cache and refresh command for richer continuation evidence
 - [x] Add a first graph-backed `discovery_candidate` recommendation lane from cached MAL recommendation edges
-- [ ] Group recommendation output into clearer category sections instead of a single flat list
-- [ ] Genre/studio/VA/taste feature ideas
+- [x] Group recommendation output into clearer category sections instead of a single flat list
+- [~] Genre/studio/source/VA/taste feature ideas (started with cached genre+studio+source overlap bias for discovery candidates plus suppression of direct-franchise and already-in-provider-catalog rediscovery; VA/taste-model work still open)
 
 ## Later
 - [ ] Re-stabilize fresh live Crunchyroll fetches after the current `watch-history` HTTP 401 regression (credential re-login succeeds, but full snapshot fetch still depends on `watch-history` surviving at least until the incremental overlap boundary is reached)
 - [x] Add a conservative incremental Crunchyroll sync boundary/checkpoint so repeated runs can stop history/watchlist paging once already-synced overlap is detected
 - [ ] Build OpenClaw skill wrapper
+- [~] Add one-shot queue triage helpers for the remaining ambiguous mapping buckets once enough real review residue patterns are captured (done: summary now clusters repeated title/franchise buckets and repeated fix-strategy signatures, and `list-review-queue` can now drill directly into a chosen `--title-cluster` or `--fix-strategy`; still open: deeper per-franchise/fix-action drilldowns and more guided helper commands)
 - [ ] Periodic health-check/maintenance loop
-- [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (today: stronger single-episode special/OVA discrimination landed; still missing harder canonical-entry/side-story cases)
+- [ ] Reduce the remaining same-franchise low-margin residue without weakening explainability (today: stronger single-episode special/OVA discrimination landed, later-season/base-installment collisions now get an explicit base-installment penalty, but harder canonical-entry/side-story cases still remain)
 - [ ] Decompose combined Crunchyroll entries before treating aggregate episode counts as hard blockers for season/movie matching (today: aligned later-season matches can downgrade raw max-episode conflicts into `aggregated_episode_numbering_suspected` instead of a full blocker)
 - [ ] Decide whether episode-title matching can be added from a trustworthy metadata source without pulling the project into brittle scraping or confidence theater
 

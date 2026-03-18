@@ -4,7 +4,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "001_initial.sql",
@@ -517,6 +517,32 @@ def get_mal_recommendation_edges_map(db_path: Path) -> dict[int, list[MalRecomme
             )
         )
     return result
+
+
+def get_provider_series_title_map(
+    db_path: Path,
+    *,
+    provider: str,
+    provider_series_ids: Iterable[str],
+) -> dict[str, dict[str, str | None]]:
+    normalized_ids = sorted({value for value in provider_series_ids if isinstance(value, str) and value})
+    if not normalized_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    query = f"""
+        SELECT provider_series_id, title, season_title
+        FROM provider_series
+        WHERE provider = ? AND provider_series_id IN ({placeholders})
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(query, [provider, *normalized_ids]).fetchall()
+    return {
+        str(row["provider_series_id"]): {
+            "title": row["title"],
+            "season_title": row["season_title"],
+        }
+        for row in rows
+    }
 
 
 def list_review_queue_entries(

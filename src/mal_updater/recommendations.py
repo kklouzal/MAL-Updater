@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,6 +48,8 @@ _ROMAN = {
     "x": 10,
 }
 
+_FRESH_DUBBED_EPISODE_WINDOW_DAYS = 21
+
 
 @dataclass(slots=True)
 class Recommendation:
@@ -68,6 +71,87 @@ class Recommendation:
             "reasons": self.reasons,
             "context": self.context,
         }
+
+
+@dataclass(slots=True, frozen=True)
+class RecommendationSectionDefinition:
+    key: str
+    title: str
+    kinds: tuple[str, ...]
+    description: str
+
+
+_RECOMMENDATION_SECTIONS: tuple[RecommendationSectionDefinition, ...] = (
+    RecommendationSectionDefinition(
+        key="continue_next",
+        title="Continue next",
+        kinds=("new_season",),
+        description="Later-season continuations that look ready because an earlier installment appears completed.",
+    ),
+    RecommendationSectionDefinition(
+        key="fresh_dubbed_episodes",
+        title="Fresh dubbed episodes",
+        kinds=("new_dubbed_episode",),
+        description="Recent contiguous tail gaps that look like actual new dubbed episode availability.",
+    ),
+    RecommendationSectionDefinition(
+        key="discovery_candidates",
+        title="Discovery candidates",
+        kinds=("discovery_candidate",),
+        description="Unmapped titles supported by cached MAL recommendation-graph evidence.",
+    ),
+    RecommendationSectionDefinition(
+        key="resume_backlog",
+        title="Resume backlog",
+        kinds=("resume_backlog",),
+        description="Older tail gaps that look more like backlog continuation than fresh release alerts.",
+    ),
+)
+
+
+def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
+    items_by_kind: dict[str, list[Recommendation]] = defaultdict(list)
+    for item in items:
+        items_by_kind[item.kind].append(item)
+
+    sections: list[dict[str, Any]] = []
+    consumed_kinds: set[str] = set()
+    for section in _RECOMMENDATION_SECTIONS:
+        section_items: list[Recommendation] = []
+        for kind in section.kinds:
+            section_items.extend(items_by_kind.get(kind, []))
+            consumed_kinds.add(kind)
+        if not section_items:
+            continue
+        section_items.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
+        sections.append(
+            {
+                "key": section.key,
+                "title": section.title,
+                "description": section.description,
+                "kinds": list(section.kinds),
+                "count": len(section_items),
+                "items": [item.as_dict() for item in section_items],
+            }
+        )
+
+    remaining_items: list[Recommendation] = []
+    for item in items:
+        if item.kind not in consumed_kinds:
+            remaining_items.append(item)
+    if remaining_items:
+        remaining_items.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
+        sections.append(
+            {
+                "key": "other",
+                "title": "Other",
+                "description": "Recommendation kinds that do not yet have a dedicated named section.",
+                "kinds": sorted({item.kind for item in remaining_items}),
+                "count": len(remaining_items),
+                "items": [item.as_dict() for item in remaining_items],
+            }
+        )
+    return sections
 
 
 def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Recommendation]:
@@ -97,6 +181,7 @@ def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Rec
             states,
             mapping_by_series=mapping_by_series,
             metadata_by_id=metadata_by_id,
+            relations_by_id=relations_by_id,
             recommendation_edges_by_id=recommendation_edges_by_id,
         )
     )
@@ -123,7 +208,7 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
             continue
 
         days_since_watch = _days_since(state.last_watched_at)
-        is_recent = days_since_watch is not None and days_since_watch <= 90
+        is_recent = days_since_watch is not None and days_since_watch <= _FRESH_DUBBED_EPISODE_WINDOW_DAYS
         kind = "new_dubbed_episode" if is_recent else "resume_backlog"
         reasons = [
             "English dub is available",
@@ -215,11 +300,97 @@ def _dedupe_recommendations(items: list[Recommendation]) -> list[Recommendation]
     return list(best.values())
 
 
+def _metadata_named_list_values(meta: Any, field: str) -> set[str]:
+    if meta is None or not isinstance(getattr(meta, "raw", None), dict):
+        return set()
+    values: set[str] = set()
+    for item in meta.raw.get(field) or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            values.add(name.strip())
+    return values
+
+
+def _metadata_genre_names(meta: Any) -> set[str]:
+    return _metadata_named_list_values(meta, "genres")
+
+
+def _metadata_studio_names(meta: Any) -> set[str]:
+    return _metadata_named_list_values(meta, "studios")
+
+
+def _metadata_source_value(meta: Any) -> str | None:
+    raw = meta.raw if meta is not None and isinstance(getattr(meta, "raw", None), dict) else None
+    value = raw.get("source") if isinstance(raw, dict) else None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _normalized_title_aliases(*values: str | None) -> set[str]:
+    aliases: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = normalize_title(value)
+        if normalized:
+            aliases.add(normalized)
+    return aliases
+
+
+def _metadata_title_aliases(meta: Any) -> set[str]:
+    if meta is None:
+        return set()
+    raw = meta.raw if isinstance(getattr(meta, "raw", None), dict) else {}
+    aliases = _normalized_title_aliases(
+        getattr(meta, "title", None),
+        getattr(meta, "title_english", None),
+        getattr(meta, "title_japanese", None),
+    )
+    for alt in getattr(meta, "alternative_titles", []) or []:
+        aliases.update(_normalized_title_aliases(alt))
+    if isinstance(raw, dict):
+        alternative_titles = raw.get("alternative_titles")
+        if isinstance(alternative_titles, dict):
+            aliases.update(_normalized_title_aliases(alternative_titles.get("en"), alternative_titles.get("ja")))
+            synonyms = alternative_titles.get("synonyms")
+            if isinstance(synonyms, list):
+                for synonym in synonyms:
+                    aliases.update(_normalized_title_aliases(synonym))
+    return aliases
+
+
+def _provider_catalog_title_aliases(states: list[ProviderSeriesState]) -> set[str]:
+    aliases: set[str] = set()
+    for state in states:
+        aliases.update(_normalized_title_aliases(state.title, state.season_title))
+    return aliases
+
+
+_DISCOVERY_FRANCHISE_RELATION_TYPES = frozenset(
+    {
+        "sequel",
+        "prequel",
+        "parent_story",
+        "side_story",
+        "alternative_setting",
+        "alternative_version",
+        "spin_off",
+        "summary",
+        "full_story",
+    }
+)
+
+
 def _build_discovery_recommendations(
     states: list[ProviderSeriesState],
     *,
     mapping_by_series: dict[str, int],
     metadata_by_id: dict[int, Any],
+    relations_by_id: dict[int, list[Any]],
     recommendation_edges_by_id: dict[int, list[Any]],
 ) -> list[Recommendation]:
     seed_weights: dict[int, int] = {}
@@ -232,13 +403,41 @@ def _build_discovery_recommendations(
         elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or _days_since(state.last_watched_at) in range(0, 91)):
             seed_weights[mal_anime_id] = 2
 
+    seed_genre_weights: dict[str, int] = {}
+    seed_studio_weights: dict[str, int] = {}
+    seed_source_weights: dict[str, int] = {}
+    for mal_anime_id, weight in seed_weights.items():
+        meta = metadata_by_id.get(mal_anime_id)
+        for genre in _metadata_genre_names(meta):
+            seed_genre_weights[genre] = seed_genre_weights.get(genre, 0) + weight
+        for studio in _metadata_studio_names(meta):
+            seed_studio_weights[studio] = seed_studio_weights.get(studio, 0) + weight
+        source = _metadata_source_value(meta)
+        if source is not None:
+            seed_source_weights[source] = seed_source_weights.get(source, 0) + weight
+
     candidate_scores: dict[int, dict[str, Any]] = {}
     watched_ids = set(seed_weights)
     mapped_ids = set(mapping_by_series.values())
+    provider_catalog_aliases = _provider_catalog_title_aliases(states)
+    direct_franchise_relation_targets_by_source: dict[int, set[int]] = {}
+    globally_related_franchise_targets: set[int] = set()
+    for source_id in seed_weights:
+        direct_targets = {
+            relation.related_mal_anime_id
+            for relation in relations_by_id.get(source_id, [])
+            if relation.relation_type in _DISCOVERY_FRANCHISE_RELATION_TYPES
+        }
+        direct_franchise_relation_targets_by_source[source_id] = direct_targets
+        globally_related_franchise_targets.update(direct_targets)
     for source_id, weight in seed_weights.items():
         for edge in recommendation_edges_by_id.get(source_id, [])[:15]:
             target_id = edge.target_mal_anime_id
             if target_id in watched_ids or target_id in mapped_ids:
+                continue
+            if target_id in globally_related_franchise_targets:
+                continue
+            if target_id in direct_franchise_relation_targets_by_source.get(source_id, set()):
                 continue
             bucket = candidate_scores.setdefault(
                 target_id,
@@ -262,6 +461,19 @@ def _build_discovery_recommendations(
             continue
         if meta is not None and meta.media_type not in (None, "tv", "movie", "ova", "ona", "special"):
             continue
+        if meta is not None:
+            my_list_status = meta.raw.get("my_list_status") if isinstance(meta.raw, dict) else None
+            if isinstance(my_list_status, dict):
+                status_value = my_list_status.get("status")
+                watched_count = my_list_status.get("num_episodes_watched")
+                if status_value in {"completed", "watching", "on_hold", "dropped", "plan_to_watch"}:
+                    continue
+                if isinstance(watched_count, int) and watched_count > 0:
+                    continue
+        candidate_title_aliases = _metadata_title_aliases(meta)
+        candidate_title_aliases.update(_normalized_title_aliases(bucket.get("title")))
+        if candidate_title_aliases & provider_catalog_aliases:
+            continue
         mean = meta.mean if meta is not None else None
         popularity = meta.popularity if meta is not None else None
         popularity_bonus = 0
@@ -272,13 +484,30 @@ def _build_discovery_recommendations(
                 popularity_bonus = 3
             elif popularity <= 2000:
                 popularity_bonus = 1
+        candidate_genres = _metadata_genre_names(meta)
+        shared_genres = sorted(candidate_genres & set(seed_genre_weights), key=lambda genre: (-seed_genre_weights[genre], genre))
+        genre_overlap_score = sum(seed_genre_weights[genre] for genre in shared_genres)
+        genre_bonus = min(genre_overlap_score * 3, 18)
+        candidate_studios = _metadata_studio_names(meta)
+        shared_studios = sorted(candidate_studios & set(seed_studio_weights), key=lambda studio: (-seed_studio_weights[studio], studio))
+        studio_overlap_score = sum(seed_studio_weights[studio] for studio in shared_studios)
+        studio_bonus = min(studio_overlap_score * 2, 10)
+        candidate_source = _metadata_source_value(meta)
+        source_overlap_score = seed_source_weights.get(candidate_source, 0) if candidate_source is not None else 0
+        source_bonus = min(source_overlap_score * 2, 6)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
-        priority += popularity_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
         if bucket["votes"]:
             reasons.append(f"aggregated MAL recommendation votes: {bucket['votes']}")
+        if shared_genres:
+            reasons.append("shared seed genres: " + ", ".join(shared_genres[:3]))
+        if shared_studios:
+            reasons.append("shared seed studios: " + ", ".join(shared_studios[:2]))
+        if source_overlap_score > 0 and candidate_source is not None:
+            reasons.append(f"shared seed source material: {candidate_source}")
         if mean is not None:
             reasons.append(f"MAL mean score: {mean}")
         if meta is None:
@@ -297,6 +526,12 @@ def _build_discovery_recommendations(
                     "supporting_source_count": support_count,
                     "supporting_mal_anime_ids": sorted(bucket["supporting_sources"]),
                     "aggregated_recommendation_votes": bucket["votes"],
+                    "shared_genres": shared_genres,
+                    "genre_overlap_score": genre_overlap_score,
+                    "shared_studios": shared_studios,
+                    "studio_overlap_score": studio_overlap_score,
+                    "source": candidate_source,
+                    "source_overlap_score": source_overlap_score,
                     "mean": mean,
                     "popularity": popularity,
                     "media_type": meta.media_type if meta is not None else None,

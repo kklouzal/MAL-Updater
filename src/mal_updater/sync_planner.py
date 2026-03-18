@@ -33,6 +33,7 @@ class ProviderSeriesState:
     max_completed_episode_number: int | None
     watchlist_status: str | None
     last_watched_at: str | None
+    completion_audit: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -58,6 +59,7 @@ class SyncProposal:
     decision: str
     mapping_source: str | None = None
     persisted_mapping_approved: bool = False
+    completion_audit: dict[str, Any] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -73,6 +75,7 @@ class SyncProposal:
             "decision": self.decision,
             "mapping_source": self.mapping_source,
             "persisted_mapping_approved": self.persisted_mapping_approved,
+            "completion_audit": self.completion_audit,
             "reasons": self.reasons,
         }
 
@@ -216,6 +219,7 @@ def load_provider_series_states(config: AppConfig, limit: int | None = None, pro
                     max_completed_episode_number=summary["max_completed_episode_number"],
                     watchlist_status=row["watchlist_status"],
                     last_watched_at=summary["last_watched_at"],
+                    completion_audit=summary["completion_audit"],
                 ),
             )
         )
@@ -233,14 +237,32 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     max_episode_number: int | None = None
     max_completed_episode_number: int | None = None
     last_watched_at: str | None = None
+    completion_reason_counts: dict[str, int] = {
+        "ratio_threshold": 0,
+        "credits_window": 0,
+        "later_episode_evidence": 0,
+    }
+    completion_reason_examples: dict[str, list[str]] = {
+        "ratio_threshold": [],
+        "credits_window": [],
+        "later_episode_evidence": [],
+    }
+    incomplete_examples: list[str] = []
 
     for row in rows:
         if row.episode_number is not None:
             max_episode_number = row.episode_number if max_episode_number is None else max(max_episode_number, row.episode_number)
         if row.last_watched_at and (last_watched_at is None or row.last_watched_at > last_watched_at):
             last_watched_at = row.last_watched_at
-        if not _episode_counts_as_completed(row, rows, config):
+        completion_reason = _completion_reason(row, rows, config)
+        if completion_reason is None:
+            if len(incomplete_examples) < 5:
+                incomplete_examples.append(_episode_audit_label(row))
             continue
+        completion_reason_counts[completion_reason] = completion_reason_counts.get(completion_reason, 0) + 1
+        examples = completion_reason_examples.setdefault(completion_reason, [])
+        if len(examples) < 5:
+            examples.append(_episode_audit_label(row))
         if row.episode_number is not None:
             completed_episode_numbers.add(row.episode_number)
             max_completed_episode_number = (
@@ -255,30 +277,49 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
         "completed_episode_count": len(completed_episode_numbers) + len(completed_episode_ids_without_number),
         "max_completed_episode_number": max_completed_episode_number,
         "last_watched_at": last_watched_at,
+        "completion_audit": {
+            "completed_by": completion_reason_counts,
+            "completed_examples": completion_reason_examples,
+            "incomplete_examples": incomplete_examples,
+        },
     }
 
 
-def _episode_counts_as_completed(row: EpisodeProgressState, all_rows: list[EpisodeProgressState], config: AppConfig) -> bool:
+def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgressState], config: AppConfig) -> str | None:
     completion_ratio = row.completion_ratio
     if completion_ratio is not None and completion_ratio >= config.completion_threshold:
-        return True
+        return "ratio_threshold"
 
     remaining_ms = _remaining_ms(row)
     if remaining_ms is not None and 0 <= remaining_ms <= config.credits_skip_window_seconds * 1000:
-        return True
+        return "credits_window"
 
     if completion_ratio is None or completion_ratio < 0.85:
-        return False
+        return None
     if row.episode_number is None or row.last_watched_at is None:
-        return False
+        return None
 
-    return any(
+    if any(
         later.episode_number is not None
         and later.episode_number > row.episode_number
         and later.last_watched_at is not None
         and later.last_watched_at > row.last_watched_at
         for later in all_rows
-    )
+    ):
+        return "later_episode_evidence"
+    return None
+
+
+def _episode_audit_label(row: EpisodeProgressState) -> str:
+    episode_fragment = f"ep{row.episode_number}" if row.episode_number is not None else row.provider_episode_id
+    ratio_fragment = "unknown"
+    if row.completion_ratio is not None:
+        ratio_fragment = f"{row.completion_ratio:.3f}"
+    remaining_ms = _remaining_ms(row)
+    remaining_fragment = "unknown"
+    if remaining_ms is not None:
+        remaining_fragment = str(remaining_ms)
+    return f"{episode_fragment}@ratio={ratio_fragment},remaining_ms={remaining_fragment}"
 
 
 def _remaining_ms(row: EpisodeProgressState) -> int | None:
@@ -309,6 +350,7 @@ def _build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInpu
         season_number=state.season_number,
         max_episode_number=state.max_episode_number,
         completed_episode_count=state.completed_episode_count,
+        max_completed_episode_number=state.max_completed_episode_number,
     )
 
 
@@ -713,6 +755,14 @@ def _plan_status_update(
         f"completed_episode_count={state.completed_episode_count}",
         f"max_completed_episode_number={state.max_completed_episode_number}",
         f"progress_rows={state.progress_rows}",
+        "completion_audit="
+        + ",".join(
+            [
+                f"ratio={state.completion_audit.get('completed_by', {}).get('ratio_threshold', 0)}",
+                f"credits={state.completion_audit.get('completed_by', {}).get('credits_window', 0)}",
+                f"follow_on={state.completion_audit.get('completed_by', {}).get('later_episode_evidence', 0)}",
+            ]
+        ),
     ]
     if extra_reasons:
         reasons = list(extra_reasons) + reasons
@@ -746,6 +796,7 @@ def _plan_status_update(
             decision="skip",
             mapping_source=mapping_source,
             persisted_mapping_approved=persisted_mapping_approved,
+            completion_audit=state.completion_audit,
             reasons=reasons + ["no_actionable_crunchyroll_state"],
         )
 
@@ -769,6 +820,7 @@ def _plan_status_update(
             decision="skip",
             mapping_source=mapping_source,
             persisted_mapping_approved=persisted_mapping_approved,
+            completion_audit=state.completion_audit,
             reasons=reasons + [f"refusing_to_decrease_mal_progress current={current_watched} proposed={proposed_watched}"],
         )
 
@@ -787,6 +839,7 @@ def _plan_status_update(
                 decision="skip",
                 mapping_source=mapping_source,
                 persisted_mapping_approved=persisted_mapping_approved,
+                completion_audit=state.completion_audit,
                 reasons=reasons + ["mal_already_matches_or_exceeds_proposal"],
             )
         proposed_status = {
@@ -813,6 +866,7 @@ def _plan_status_update(
             decision="skip",
             mapping_source=mapping_source,
             persisted_mapping_approved=persisted_mapping_approved,
+            completion_audit=state.completion_audit,
             reasons=reasons + ["refusing_to_downgrade_completed_mal_entry"],
         )
 
@@ -833,6 +887,7 @@ def _plan_status_update(
         decision="propose_update",
         mapping_source=mapping_source,
         persisted_mapping_approved=persisted_mapping_approved,
+        completion_audit=state.completion_audit,
         reasons=reasons,
     )
 
