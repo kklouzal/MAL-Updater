@@ -32,6 +32,7 @@ _SEARCH_SPACING_REWRITES = (
     (re.compile(r"\bpart\s*(\d+)\b", re.IGNORECASE), r"Part \1"),
     (re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE), r"Cour \1"),
 )
+_NON_INSTALLMENT_SUBTITLE_SPLIT_RE = re.compile(r"\s*(?::|\||[–—]|\s-\s)\s*")
 _AUXILIARY_TITLE_PATTERNS = (
     (re.compile(r"\bpv\b", re.IGNORECASE), "pv"),
     (re.compile(r"\bpromo\b", re.IGNORECASE), "promo"),
@@ -199,7 +200,7 @@ def _season_title_needs_base_title(title: str, season_title: str) -> bool:
 
 def _fallback_queries(query: str) -> list[str]:
     variants: list[str] = []
-    for delimiter in (":", "-", "("):
+    for delimiter in (":", "|", " – ", " — ", " - ", "("):
         if delimiter in query:
             shortened = query.split(delimiter, 1)[0].strip()
             if shortened and shortened not in variants:
@@ -210,6 +211,30 @@ def _fallback_queries(query: str) -> list[str]:
         if shortened and shortened not in variants:
             variants.append(shortened)
     return variants
+
+
+def _trim_non_installment_subtitle(value: str | None) -> str:
+    if not value:
+        return ""
+    cleaned = _search_query_cleanup(value)
+    if not cleaned:
+        return ""
+    match = _NON_INSTALLMENT_SUBTITLE_SPLIT_RE.search(cleaned)
+    if not match:
+        return ""
+    base = cleaned[: match.start()].strip()
+    suffix = cleaned[match.end() :].strip()
+    if not base or not suffix:
+        return ""
+    if _extract_title_hints(suffix):
+        return ""
+    if any(pattern.search(suffix) for pattern, _ in _AUXILIARY_TITLE_PATTERNS):
+        return ""
+    if re.search(r"\b(movie|film|ova|ona|special|edition|collection|compilation)\b", suffix, re.IGNORECASE):
+        return ""
+    if len(normalize_title_strict(base).split()) < 2:
+        return ""
+    return normalize_title_strict(base)
 
 
 def _season_number_query_variants(title: str, season_number: int | None) -> list[str]:
@@ -520,6 +545,16 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score += 0.03
         reasons.append("substring_title_match")
 
+    trimmed_query_strict_norm = _trim_non_installment_subtitle(query)
+    if (
+        trimmed_query_strict_norm
+        and best_strict_norm
+        and trimmed_query_strict_norm == best_strict_norm
+        and best_strict_norm != query_strict_norm
+    ):
+        score = max(score, 0.91)
+        reasons.append("exact_base_title_after_subtitle_trim")
+
     provider_season_number, provider_season_conflict_reason = _provider_season_number(series)
     if provider_season_conflict_reason:
         reasons.append(provider_season_conflict_reason)
@@ -687,7 +722,7 @@ def _candidate_positive_signal_count(candidate: MappingCandidate) -> int:
     return sum(
         1
         for reason in candidate.match_reasons
-        if reason == "exact_normalized_title"
+        if reason in {"exact_normalized_title", "exact_base_title_after_subtitle_trim"}
         or reason.startswith(
             (
                 "season_number_match=",

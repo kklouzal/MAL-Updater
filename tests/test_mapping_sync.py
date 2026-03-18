@@ -33,6 +33,184 @@ class MappingTests(unittest.TestCase):
             "bofuri i don t want to get hurt so i ll max out my defense",
         )
 
+    def test_map_series_boosts_base_title_match_when_provider_title_only_adds_arc_subtitle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                if query == "One Piece":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 21,
+                                    "title": "One Piece",
+                                    "alternative_titles": {},
+                                    "media_type": "tv",
+                                    "status": "currently_airing",
+                                    "num_episodes": 9999,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 22,
+                                    "title": "One Room",
+                                    "alternative_titles": {},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            },
+                        ]
+                    }
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-arc",
+                        title="One Piece: Egghead Arc (English Dub)",
+                        max_episode_number=1122,
+                        completed_episode_count=1120,
+                    ),
+                )
+
+        self.assertEqual(result.status, "strong")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 21)
+        self.assertIn("exact_base_title_after_subtitle_trim", result.rationale)
+        self.assertFalse(should_auto_approve_mapping(result))
+
+    def test_map_series_does_not_trim_installment_subtitle_into_false_base_match(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 42,
+                                "title": "Attack on Titan",
+                                "alternative_titles": {},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 25,
+                            }
+                        }
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-installment",
+                        title="Attack on Titan: Season 2",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertNotIn("exact_base_title_after_subtitle_trim", result.rationale)
+        self.assertNotEqual(result.status, "exact")
+
+    def test_map_series_falls_back_to_base_title_for_pipe_or_dash_arc_subtitles(self) -> None:
+        for title in (
+            "One Piece | Egghead Arc (English Dub)",
+            "One Piece — Egghead Arc (English Dub)",
+            "One Piece – Egghead Arc (English Dub)",
+        ):
+            with self.subTest(title=title):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    (root / "config").mkdir()
+                    config = load_config(root)
+                    client = MalClient(
+                        config,
+                        MalSecrets(
+                            client_id="client-id",
+                            client_secret=None,
+                            access_token="access-token",
+                            refresh_token=None,
+                            client_id_path=root / "secrets" / "mal_client_id.txt",
+                            client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                            access_token_path=root / "secrets" / "mal_access_token.txt",
+                            refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                        ),
+                    )
+
+                    def fake_search(query: str, limit: int = 5) -> dict:
+                        if query == "One Piece":
+                            return {
+                                "data": [
+                                    {
+                                        "node": {
+                                            "id": 21,
+                                            "title": "One Piece",
+                                            "alternative_titles": {},
+                                            "media_type": "tv",
+                                            "status": "currently_airing",
+                                            "num_episodes": 9999,
+                                        }
+                                    }
+                                ]
+                            }
+                        return {"data": []}
+
+                    with patch.object(MalClient, "search_anime", side_effect=fake_search) as search_mock:
+                        result = map_series(
+                            client,
+                            SeriesMappingInput(
+                                provider="crunchyroll",
+                                provider_series_id="series-arc-delimited",
+                                title=title,
+                                max_episode_number=1122,
+                                completed_episode_count=1120,
+                            ),
+                        )
+
+                attempted_queries = [call.args[0] for call in search_mock.call_args_list]
+                self.assertIn("One Piece", attempted_queries)
+                self.assertEqual(result.status, "strong")
+                self.assertEqual(result.chosen_candidate.mal_anime_id, 21)
+                self.assertIn("exact_base_title_after_subtitle_trim", result.rationale)
+
     def test_build_search_queries_combines_generic_season_title_with_base_title(self) -> None:
         queries = build_search_queries(
             SeriesMappingInput(
