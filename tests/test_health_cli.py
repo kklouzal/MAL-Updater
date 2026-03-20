@@ -46,34 +46,22 @@ class HealthCheckCliTests(unittest.TestCase):
     def _provision_repo_owned_automation_assets(self) -> None:
         source_dir = self.project_root / "ops" / "systemd-user"
         source_dir.mkdir(parents=True, exist_ok=True)
-        for unit_name in (
-            "mal-updater-exact-approved-sync.service",
-            "mal-updater-exact-approved-sync.timer",
-            "mal-updater-health-check.service",
-            "mal-updater-health-check.timer",
-        ):
-            (source_dir / unit_name).write_text(f"[Unit]\nDescription={unit_name}\n", encoding="utf-8")
+        (source_dir / "mal-updater.service").write_text(
+            "[Unit]\nDescription=mal-updater.service\n\n[Service]\nExecStart=python3 -m mal_updater.cli service-run\n",
+            encoding="utf-8",
+        )
         scripts_dir = self.project_root / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         install_script = scripts_dir / "install_user_systemd_units.sh"
         install_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         install_script.chmod(0o755)
 
-    def _install_repo_owned_automation_assets(self, *, enable_timers: bool = True) -> Path:
+    def _install_repo_owned_automation_assets(self) -> Path:
         self._provision_repo_owned_automation_assets()
         target_dir = self.project_root / ".config" / "systemd" / "user"
         target_dir.mkdir(parents=True, exist_ok=True)
-        source_dir = self.project_root / "ops" / "systemd-user"
-        for unit_path in source_dir.iterdir():
-            (target_dir / unit_path.name).write_text(unit_path.read_text(encoding="utf-8"), encoding="utf-8")
-        if enable_timers:
-            wants_dir = target_dir / "timers.target.wants"
-            wants_dir.mkdir(parents=True, exist_ok=True)
-            for timer_name in (
-                "mal-updater-exact-approved-sync.timer",
-                "mal-updater-health-check.timer",
-            ):
-                (wants_dir / timer_name).symlink_to(target_dir / timer_name)
+        source_path = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        (target_dir / source_path.name).write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
         return target_dir
 
     def test_health_check_flags_missing_auth_and_missing_completed_snapshot(self) -> None:
@@ -119,30 +107,15 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("automation_units_missing", warning_codes)
         automation = payload["automation"]
         self.assertFalse(automation["all_units_installed"])
-        self.assertEqual(
-            [
-                "mal-updater-exact-approved-sync.service",
-                "mal-updater-exact-approved-sync.timer",
-                "mal-updater-health-check.service",
-                "mal-updater-health-check.timer",
-            ],
-            automation["missing_units"],
-        )
+        self.assertEqual(["mal-updater.service"], automation["missing_units"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("install_user_systemd_units", maintenance_commands[0]["reason_code"])
-        self.assertEqual(
-            [str(self.project_root / "scripts" / "install_user_systemd_units.sh")],
-            maintenance_commands[0]["command_args"],
-        )
-        self.assertEqual(
-            shlex.quote(str(self.project_root / "scripts" / "install_user_systemd_units.sh")),
-            maintenance_commands[0]["command"],
-        )
+        self.assertEqual("install_user_systemd_service", maintenance_commands[0]["reason_code"])
+        self.assertEqual([str(self.project_root / "scripts" / "install_user_systemd_units.sh")], maintenance_commands[0]["command_args"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
 
     def test_health_check_warns_when_installed_repo_owned_automation_units_are_outdated(self) -> None:
         target_dir = self._install_repo_owned_automation_assets()
-        (target_dir / "mal-updater-health-check.timer").write_text("[Timer]\nOnUnitInactiveSec=999h\n", encoding="utf-8")
+        (target_dir / "mal-updater.service").write_text("[Unit]\nDescription=stale\n", encoding="utf-8")
 
         exit_code, payload = self._run_health_check()
 
@@ -153,142 +126,63 @@ class HealthCheckCliTests(unittest.TestCase):
         automation = payload["automation"]
         self.assertTrue(automation["all_units_installed"])
         self.assertFalse(automation["all_units_current"])
-        self.assertTrue(automation["all_timers_enabled"])
-        self.assertEqual(["mal-updater-health-check.timer"], automation["outdated_units"])
+        self.assertEqual(["mal-updater.service"], automation["outdated_units"])
         self.assertEqual([], automation["missing_units"])
-        self.assertEqual([], automation["disabled_timers"])
-        self.assertFalse(automation["units"]["mal-updater-health-check.timer"]["content_matches_repo"])
+        self.assertFalse(automation["unit"]["content_matches_repo"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("install_user_systemd_units", maintenance_commands[0]["reason_code"])
-        self.assertEqual(
-            "Reinstall/update the repo-owned user systemd timers so installed automation matches the current repo versions",
-            maintenance_commands[0]["detail"],
-        )
-        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
+        self.assertEqual("install_user_systemd_service", maintenance_commands[0]["reason_code"])
 
-    def test_health_check_warns_when_repo_owned_timers_are_installed_but_not_enabled(self) -> None:
-        self._install_repo_owned_automation_assets(enable_timers=False)
-
-        exit_code, payload = self._run_health_check()
-
-        self.assertEqual(0, exit_code)
-        self.assertFalse(payload["healthy"])
-        warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("automation_timers_disabled", warning_codes)
-        automation = payload["automation"]
-        self.assertTrue(automation["all_units_installed"])
-        self.assertTrue(automation["all_units_current"])
-        self.assertFalse(automation["all_timers_enabled"])
-        self.assertEqual(
-            [
-                "mal-updater-exact-approved-sync.timer",
-                "mal-updater-health-check.timer",
-            ],
-            automation["disabled_timers"],
-        )
-        self.assertFalse(automation["units"]["mal-updater-health-check.timer"]["enabled"])
-        self.assertIsNone(automation["units"]["mal-updater-health-check.timer"]["enablement_points_to_target"])
-        maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("install_user_systemd_units", maintenance_commands[0]["reason_code"])
-        self.assertEqual(
-            "Enable the repo-owned user systemd timers so the installed automation actually runs unattended",
-            maintenance_commands[0]["detail"],
-        )
-        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
-
-    def test_health_check_warns_when_timer_enablement_symlink_points_to_wrong_target(self) -> None:
-        target_dir = self._install_repo_owned_automation_assets()
-        wants_dir = target_dir / "timers.target.wants"
-        wrong_target = target_dir / "mal-updater-exact-approved-sync.timer"
-        health_timer_link = wants_dir / "mal-updater-health-check.timer"
-        health_timer_link.unlink()
-        health_timer_link.symlink_to(wrong_target)
-
-        exit_code, payload = self._run_health_check()
-
-        self.assertEqual(0, exit_code)
-        self.assertFalse(payload["healthy"])
-        warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("automation_timers_disabled", warning_codes)
-        automation = payload["automation"]
-        self.assertFalse(automation["all_timers_enabled"])
-        self.assertEqual(["mal-updater-health-check.timer"], automation["disabled_timers"])
-        self.assertFalse(automation["units"]["mal-updater-health-check.timer"]["enabled"])
-        self.assertFalse(automation["units"]["mal-updater-health-check.timer"]["enablement_points_to_target"])
-        self.assertTrue(automation["units"]["mal-updater-exact-approved-sync.timer"]["enabled"])
-        self.assertTrue(automation["units"]["mal-updater-exact-approved-sync.timer"]["enablement_points_to_target"])
-        maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("install_user_systemd_units", maintenance_commands[0]["reason_code"])
-        self.assertEqual(
-            "Enable the repo-owned user systemd timers so the installed automation actually runs unattended",
-            maintenance_commands[0]["detail"],
-        )
-        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
-
-    def test_health_check_warns_when_enabled_timer_is_not_active_in_runtime(self) -> None:
+    def test_health_check_warns_when_repo_owned_service_is_installed_but_not_enabled(self) -> None:
         self._install_repo_owned_automation_assets()
 
         def fake_systemctl_run(command: list[str], **kwargs):
-            unit_name = command[3]
-            stdout_by_unit = {
-                "mal-updater-exact-approved-sync.timer": "ActiveState=active\nSubState=waiting\nUnitFileState=enabled\nNextElapseUSecRealtime=1760000000000000\nLastTriggerUSec=1759990000000000\nResult=success\n",
-                "mal-updater-health-check.timer": "ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\nNextElapseUSecRealtime=0\nLastTriggerUSec=1759995000000000\nResult=success\n",
-            }
-            return unittest.mock.Mock(returncode=0, stdout=stdout_by_unit[unit_name], stderr="")
+            return unittest.mock.Mock(returncode=0, stdout="ActiveState=active\nSubState=running\nUnitFileState=disabled\nResult=success\n", stderr="")
 
         with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, payload = self._run_health_check()
 
         self.assertEqual(0, exit_code)
-        self.assertFalse(payload["healthy"])
         warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("automation_timers_inactive", warning_codes)
+        self.assertIn("automation_service_disabled", warning_codes)
         automation = payload["automation"]
-        self.assertTrue(automation["runtime_state_available"])
-        self.assertEqual(["mal-updater-health-check.timer"], automation["inactive_timers"])
-        health_timer_runtime = automation["units"]["mal-updater-health-check.timer"]["runtime_state"]
-        self.assertEqual("inactive", health_timer_runtime["active_state"])
-        self.assertIsNone(health_timer_runtime["next_elapse_at"])
-        sync_timer_runtime = automation["units"]["mal-updater-exact-approved-sync.timer"]["runtime_state"]
-        self.assertEqual("active", sync_timer_runtime["active_state"])
-        self.assertEqual("2025-10-09T08:53:20Z", sync_timer_runtime["next_elapse_at"])
-        maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("install_user_systemd_units", maintenance_commands[0]["reason_code"])
-        self.assertEqual(
-            "Reinstall/restart the repo-owned user systemd timers so the enabled automation is actually active in the user runtime",
-            maintenance_commands[0]["detail"],
-        )
-        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
+        self.assertEqual(["mal-updater.service"], automation["disabled_services"])
+        self.assertFalse(automation["service_enabled"])
+
+    def test_health_check_warns_when_enabled_service_is_not_active_in_runtime(self) -> None:
+        self._install_repo_owned_automation_assets()
+
+        def fake_systemctl_run(command: list[str], **kwargs):
+            return unittest.mock.Mock(returncode=0, stdout="ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\nResult=success\n", stderr="")
+
+        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+            exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("automation_service_inactive", warning_codes)
+        automation = payload["automation"]
+        self.assertEqual(["mal-updater.service"], automation["inactive_services"])
+        self.assertFalse(automation["service_active"])
 
     def test_health_check_parses_systemctl_show_key_value_output_without_assuming_field_order(self) -> None:
         self._install_repo_owned_automation_assets()
 
         def fake_systemctl_run(command: list[str], **kwargs):
-            unit_name = command[3]
-            stdout_by_unit = {
-                "mal-updater-exact-approved-sync.timer": "NextElapseUSecRealtime=1760000000000000\nResult=success\nActiveState=active\nSubState=waiting\nUnitFileState=enabled\nLastTriggerUSec=1759990000000000\n",
-                "mal-updater-health-check.timer": "Result=success\nLastTriggerUSec=1759995000000000\nActiveState=active\nUnitFileState=enabled\nSubState=waiting\nNextElapseUSecRealtime=1760003600000000\n",
-            }
-            return unittest.mock.Mock(returncode=0, stdout=stdout_by_unit[unit_name], stderr="")
+            return unittest.mock.Mock(returncode=0, stdout="Result=success\nUnitFileState=enabled\nSubState=running\nActiveState=active\n", stderr="")
 
         with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, payload = self._run_health_check()
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertNotIn("automation_timers_inactive", warning_codes)
+        self.assertNotIn("automation_service_inactive", warning_codes)
         automation = payload["automation"]
         self.assertTrue(automation["runtime_state_available"])
-        self.assertEqual([], automation["inactive_timers"])
-        sync_timer_runtime = automation["units"]["mal-updater-exact-approved-sync.timer"]["runtime_state"]
-        self.assertEqual("active", sync_timer_runtime["active_state"])
-        self.assertEqual("waiting", sync_timer_runtime["sub_state"])
-        self.assertEqual("enabled", sync_timer_runtime["unit_file_state"])
-        self.assertEqual("2025-10-09T08:53:20Z", sync_timer_runtime["next_elapse_at"])
-        self.assertEqual("2025-10-09T06:06:40Z", sync_timer_runtime["last_trigger_at"])
-        health_timer_runtime = automation["units"]["mal-updater-health-check.timer"]["runtime_state"]
-        self.assertEqual("active", health_timer_runtime["active_state"])
-        self.assertEqual("2025-10-09T09:53:20Z", health_timer_runtime["next_elapse_at"])
+        self.assertEqual([], automation["inactive_services"])
+        service_runtime = automation["unit"]["runtime_state"]
+        self.assertEqual("active", service_runtime["active_state"])
+        self.assertEqual("running", service_runtime["sub_state"])
+        self.assertEqual("enabled", service_runtime["unit_file_state"])
 
     def test_health_check_reports_recent_completed_snapshot_and_counts(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
@@ -704,7 +598,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("install_user_systemd_units", maintenance_commands[0]["reason_code"])
+        self.assertEqual("install_user_systemd_service", maintenance_commands[0]["reason_code"])
         self.assertEqual("refresh_mapping_review_backlog", maintenance_commands[1]["reason_code"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
@@ -1020,14 +914,14 @@ class HealthCheckCliTests(unittest.TestCase):
 
     def test_health_check_summary_format_surfaces_automation_drift_hint_when_units_are_outdated(self) -> None:
         target_dir = self._install_repo_owned_automation_assets()
-        (target_dir / "mal-updater-health-check.service").write_text("[Service]\nExecStart=/tmp/stale\n", encoding="utf-8")
+        (target_dir / "mal-updater.service").write_text("[Service]\nExecStart=/tmp/stale\n", encoding="utf-8")
 
         exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=True", stdout)
         self.assertIn("automation_all_units_current=False", stdout)
-        self.assertIn("automation_outdated_units=mal-updater-health-check.service", stdout)
+        self.assertIn("automation_outdated_units=mal-updater.service", stdout)
         self.assertIn(
             "automation_install_command=" + shlex.quote(str(self.project_root / "scripts" / "install_user_systemd_units.sh")),
             stdout,
@@ -1041,7 +935,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=False", stdout)
         self.assertIn(
-            "automation_missing_units=mal-updater-exact-approved-sync.service, mal-updater-exact-approved-sync.timer, mal-updater-health-check.service, mal-updater-health-check.timer",
+            "automation_missing_units=mal-updater.service",
             stdout,
         )
         self.assertIn(
@@ -1050,16 +944,16 @@ class HealthCheckCliTests(unittest.TestCase):
         )
 
     def test_health_check_summary_format_surfaces_disabled_timer_hint_when_units_are_not_enabled(self) -> None:
-        self._install_repo_owned_automation_assets(enable_timers=False)
+        self._install_repo_owned_automation_assets()
 
         exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=True", stdout)
         self.assertIn("automation_all_units_current=True", stdout)
-        self.assertIn("automation_all_timers_enabled=False", stdout)
+        self.assertIn("automation_service_enabled=False", stdout)
         self.assertIn(
-            "automation_disabled_timers=mal-updater-exact-approved-sync.timer, mal-updater-health-check.timer",
+            "automation_disabled_services=mal-updater.service",
             stdout,
         )
         self.assertIn(
@@ -1069,18 +963,16 @@ class HealthCheckCliTests(unittest.TestCase):
 
     def test_health_check_summary_format_surfaces_wrong_timer_symlink_as_disabled(self) -> None:
         target_dir = self._install_repo_owned_automation_assets()
-        wants_dir = target_dir / "timers.target.wants"
-        health_timer_link = wants_dir / "mal-updater-health-check.timer"
-        health_timer_link.unlink()
-        health_timer_link.symlink_to(target_dir / "mal-updater-exact-approved-sync.timer")
+        (target_dir / "mal-updater.service").write_text("[Unit]\nDescription=stale\n", encoding="utf-8")
 
         exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=True", stdout)
-        self.assertIn("automation_all_units_current=True", stdout)
-        self.assertIn("automation_all_timers_enabled=False", stdout)
-        self.assertIn("automation_disabled_timers=mal-updater-health-check.timer", stdout)
+        self.assertIn("automation_all_units_current=False", stdout)
+        self.assertIn("automation_service_enabled=False", stdout)
+        self.assertIn("automation_outdated_units=mal-updater.service", stdout)
+        self.assertIn("automation_disabled_services=mal-updater.service", stdout)
         self.assertIn(
             "automation_install_command=" + shlex.quote(str(self.project_root / "scripts" / "install_user_systemd_units.sh")),
             stdout,
@@ -1090,22 +982,14 @@ class HealthCheckCliTests(unittest.TestCase):
         self._install_repo_owned_automation_assets()
 
         def fake_systemctl_run(command: list[str], **kwargs):
-            unit_name = command[3]
-            stdout_by_unit = {
-                "mal-updater-exact-approved-sync.timer": "ActiveState=active\nSubState=waiting\nUnitFileState=enabled\nNextElapseUSecRealtime=1760000000000000\nLastTriggerUSec=1759990000000000\nResult=success\n",
-                "mal-updater-health-check.timer": "ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\nNextElapseUSecRealtime=0\nLastTriggerUSec=1759995000000000\nResult=success\n",
-            }
-            return unittest.mock.Mock(returncode=0, stdout=stdout_by_unit[unit_name], stderr="")
+            return unittest.mock.Mock(returncode=0, stdout="ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\nResult=success\n", stderr="")
 
         with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
-        self.assertIn("automation_inactive_timers=mal-updater-health-check.timer", stdout)
-        self.assertIn(
-            "automation_timer_runtime=mal-updater-exact-approved-sync.timer | active=active | next=2025-10-09T08:53:20Z | last=2025-10-09T06:06:40Z; mal-updater-health-check.timer | active=inactive | last=2025-10-09T07:30:00Z",
-            stdout,
-        )
+        self.assertIn("automation_inactive_services=mal-updater.service", stdout)
+        self.assertIn("automation_service_runtime=mal-updater.service | active=inactive | sub=dead", stdout)
         self.assertIn(
             "maintenance_recommended_auto_command=" + shlex.quote(str(self.project_root / "scripts" / "install_user_systemd_units.sh")),
             stdout,

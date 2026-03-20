@@ -17,6 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
 
 from .auth import write_secret_file
 from .config import AppConfig, _read_secret_file, _resolve_secret_path
+from .request_tracking import record_api_request_event
 
 CRUNCHYROLL_TOKEN_URL = "https://www.crunchyroll.com/auth/v1/token"
 CRUNCHYROLL_ME_URL = "https://www.crunchyroll.com/accounts/v1/me"

@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
 
 from .auth import write_secret_file
 from .config import AppConfig, _read_secret_file
+from .request_tracking import record_api_request_event
 from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
 from .crunchyroll_auth import (
     CRUNCHYROLL_BASIC_AUTH_TOKEN,
@@ -212,15 +213,29 @@ def _now_string() -> str:
 
 
 def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float):
-    if curl_requests is not None:
-        return curl_requests.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
-    return requests.post(url, data=data, headers=headers, timeout=timeout_seconds)
+    try:
+        if curl_requests is not None:
+            response = curl_requests.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
+        else:
+            response = requests.post(url, data=data, headers=headers, timeout=timeout_seconds)
+        record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code)
+        return response
+    except requests.RequestException as exc:
+        record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="request_error", error=str(exc))
+        raise
 
 
 def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, params: dict[str, Any] | None = None):
-    if curl_requests is not None:
-        return curl_requests.get(url, headers=headers, timeout=timeout_seconds, params=params, impersonate="chrome124")
-    return requests.get(url, headers=headers, timeout=timeout_seconds, params=params)
+    try:
+        if curl_requests is not None:
+            response = curl_requests.get(url, headers=headers, timeout=timeout_seconds, params=params, impersonate="chrome124")
+        else:
+            response = requests.get(url, headers=headers, timeout=timeout_seconds, params=params)
+        record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code)
+        return response
+    except requests.RequestException as exc:
+        record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="request_error", error=str(exc))
+        raise
 
 
 def _write_session_state(

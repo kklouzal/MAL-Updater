@@ -10,10 +10,11 @@ This repository is the skill package.
 - The Python CLI under `src/mal_updater/` contains the real business logic.
 - Runtime state lives **outside** the skill tree under the workspace runtime root `.MAL-Updater/` by default.
 - The repo keeps code, docs, scripts, templates, tests, and references bundled so third parties can audit the whole artifact.
+- Background work now centers on a **long-lived user-level systemd daemon**, not user timers or OpenClaw cron.
 
 ## Default runtime layout
 
-MAL-Updater now externalizes runtime state to the workspace root:
+MAL-Updater externalizes runtime state to the workspace root:
 
 - `.MAL-Updater/config/`
 - `.MAL-Updater/secrets/`
@@ -42,7 +43,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 - MAL client id / token presence
 - Crunchyroll credentials / staged auth-state presence
 - current MAL redirect URI
-- whether unattended user-systemd automation can be installed on this host
+- whether the repo-owned **user-systemd daemon service** can be installed on this host
 
 ## Bootstrap / onboarding flow
 
@@ -53,7 +54,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 5. Run `mal-auth-login` to persist MAL access/refresh tokens
 6. Stage Crunchyroll username/password in `.MAL-Updater/secrets/`
 7. Run `crunchyroll-auth-login` to mint the staged Crunchyroll refresh token/device id
-8. Install unattended automation with `scripts/install_user_systemd_units.sh` when the host supports user systemd
+8. Install the unattended daemon with `scripts/install_user_systemd_units.sh` when the host supports user systemd
 
 See `references/bootstrap-onboarding.md` for the detailed agent-facing flow.
 
@@ -64,7 +65,8 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
 PYTHONPATH=src python3 -m mal_updater.cli health-check
-PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
+PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
@@ -75,15 +77,19 @@ The full command cookbook lives in `references/cli-recipes.md`.
 
 ## Automation model
 
-Repo-owned wrapper scripts live under `scripts/`:
+Repo-owned automation/runtime files live under:
 
-- `run_exact_approved_sync_cycle.sh`
-- `run_health_check_cycle.sh`
-- `install_user_systemd_units.sh`
+- `scripts/install_user_systemd_units.sh`
+- `src/mal_updater/service_manager.py`
+- `src/mal_updater/service_runtime.py`
+- `ops/systemd-user/mal-updater.service`
 
-Repo-owned systemd templates live under `ops/systemd-user/`.
+The installed daemon is a **user-level systemd service** that runs `mal_updater.cli service-run` in the foreground and owns its own internal loop cadence for:
 
-Those unit files are now **rendered at install time** so the committed templates stay portable and do not contain host-specific absolute paths.
+- MAL token refresh
+- exact-approved sync passes
+- recurring health-check/report generation
+- API request logging / budget awareness
 
 ## Security / boundaries
 

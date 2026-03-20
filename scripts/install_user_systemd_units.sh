@@ -4,27 +4,27 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_DIR="$ROOT_DIR/ops/systemd-user"
 TARGET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-HEALTH_ENV_SOURCE="$SOURCE_DIR/mal-updater-health-check.env.example"
-HEALTH_ENV_TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/mal-updater-health-check.env"
-ENABLE_TIMERS=1
+SERVICE_ENV_SOURCE="$SOURCE_DIR/mal-updater-service.env.example"
+SERVICE_ENV_TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/mal-updater-service.env"
+ENABLE_SERVICE=1
 RELOAD_DAEMON=1
-START_SERVICES=0
-COPY_HEALTH_ENV=1
+START_SERVICE=0
+COPY_SERVICE_ENV=1
 DRY_RUN=0
 
 usage() {
   cat <<'EOF'
 Usage: scripts/install_user_systemd_units.sh [options]
 
-Render and install the repo-owned user-level systemd units for MAL-Updater.
+Render and install the repo-owned user-level MAL-Updater daemon service.
 
 Options:
   --target-dir PATH           Override the systemd user unit target directory.
-  --health-env-target PATH    Override where the optional health-check env file is copied.
-  --no-enable                 Copy/update unit files but do not enable timers.
-  --start-services            After install/reload, start both services once immediately.
+  --service-env-target PATH   Override where the optional service env file is copied.
+  --no-enable                 Copy/update the service unit but do not enable it.
+  --start-service             After install/reload, start the service immediately.
   --no-daemon-reload          Skip `systemctl --user daemon-reload`.
-  --no-health-env             Do not copy the example health-check env file.
+  --no-service-env            Do not copy the example service env file.
   --dry-run                   Print planned actions without changing anything.
   -h, --help                  Show this help.
 EOF
@@ -32,18 +32,6 @@ EOF
 
 log() {
   printf '%s\n' "$*"
-}
-
-join_by_comma_space() {
-  local first=1
-  for item in "$@"; do
-    if [[ "$first" == "1" ]]; then
-      printf '%s' "$item"
-      first=0
-    else
-      printf ', %s' "$item"
-    fi
-  done
 }
 
 run_cmd() {
@@ -76,16 +64,18 @@ render_unit() {
     printf '[dry-run] render %q -> %q\n' "$source_path" "$target_path"
     return 0
   fi
-  python3 - "$source_path" "$target_path" "$ROOT_DIR" "$HEALTH_ENV_TARGET" <<'PY'
+  python3 - "$source_path" "$target_path" "$ROOT_DIR" "$SERVICE_ENV_TARGET" <<'PY'
 from pathlib import Path
 import sys
 source_path = Path(sys.argv[1])
 target_path = Path(sys.argv[2])
-repo_root = sys.argv[3]
-health_env_target = sys.argv[4]
+repo_root = Path(sys.argv[3]).resolve()
+service_env_target = sys.argv[4]
+workspace_root = repo_root.parent.resolve()
 text = source_path.read_text(encoding='utf-8')
-text = text.replace('__MAL_UPDATER_REPO_ROOT__', repo_root)
-text = text.replace('__MAL_UPDATER_HEALTH_ENV_FILE__', health_env_target)
+text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
+text = text.replace('__MAL_UPDATER_WORKSPACE_ROOT__', str(workspace_root))
+text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
 target_path.parent.mkdir(parents=True, exist_ok=True)
 target_path.write_text(text, encoding='utf-8')
 PY
@@ -98,25 +88,25 @@ while [[ $# -gt 0 ]]; do
       TARGET_DIR="$2"
       shift 2
       ;;
-    --health-env-target)
+    --service-env-target)
       [[ $# -ge 2 ]] || { echo "missing value for $1" >&2; exit 2; }
-      HEALTH_ENV_TARGET="$2"
+      SERVICE_ENV_TARGET="$2"
       shift 2
       ;;
     --no-enable)
-      ENABLE_TIMERS=0
+      ENABLE_SERVICE=0
       shift
       ;;
-    --start-services)
-      START_SERVICES=1
+    --start-service)
+      START_SERVICE=1
       shift
       ;;
     --no-daemon-reload)
       RELOAD_DAEMON=0
       shift
       ;;
-    --no-health-env)
-      COPY_HEALTH_ENV=0
+    --no-service-env)
+      COPY_SERVICE_ENV=0
       shift
       ;;
     --dry-run)
@@ -135,95 +125,72 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -d "$SOURCE_DIR" ]]; then
-  echo "missing source unit directory: $SOURCE_DIR" >&2
+UNIT_NAME="mal-updater.service"
+SOURCE_PATH="$SOURCE_DIR/$UNIT_NAME"
+TARGET_PATH="$TARGET_DIR/$UNIT_NAME"
+
+if [[ ! -f "$SOURCE_PATH" ]]; then
+  echo "missing source unit file: $SOURCE_PATH" >&2
   exit 1
 fi
-
-UNITS=(
-  mal-updater-exact-approved-sync.service
-  mal-updater-exact-approved-sync.timer
-  mal-updater-health-check.service
-  mal-updater-health-check.timer
-)
 
 log "repo_root=$ROOT_DIR"
 log "source_dir=$SOURCE_DIR"
 log "target_dir=$TARGET_DIR"
-log "health_env_target=$HEALTH_ENV_TARGET"
+log "service_env_target=$SERVICE_ENV_TARGET"
 
-installed_units=()
-updated_units=()
-unchanged_units=()
-for unit in "${UNITS[@]}"; do
-  source_path="$SOURCE_DIR/$unit"
-  target_path="$TARGET_DIR/$unit"
-
-  rendered_content="$(python3 - "$source_path" "$ROOT_DIR" "$HEALTH_ENV_TARGET" <<'PY'
+rendered_content="$(python3 - "$SOURCE_PATH" "$ROOT_DIR" "$SERVICE_ENV_TARGET" <<'PY'
 from pathlib import Path
 import sys
 source_path = Path(sys.argv[1])
-repo_root = sys.argv[2]
-health_env_target = sys.argv[3]
+repo_root = Path(sys.argv[2]).resolve()
+service_env_target = sys.argv[3]
+workspace_root = repo_root.parent.resolve()
 text = source_path.read_text(encoding='utf-8')
-text = text.replace('__MAL_UPDATER_REPO_ROOT__', repo_root)
-text = text.replace('__MAL_UPDATER_HEALTH_ENV_FILE__', health_env_target)
+text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
+text = text.replace('__MAL_UPDATER_WORKSPACE_ROOT__', str(workspace_root))
+text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
 print(text, end='')
 PY
 )"
 
-  if [[ ! -e "$target_path" ]]; then
-    installed_units+=("$unit")
-  elif [[ "$(cat "$target_path")" == "$rendered_content" ]]; then
-    unchanged_units+=("$unit")
-  else
-    updated_units+=("$unit")
-  fi
-  render_unit "$source_path" "$target_path"
-done
+if [[ ! -e "$TARGET_PATH" ]]; then
+  log "installed_units=$UNIT_NAME"
+elif [[ "$(cat "$TARGET_PATH")" == "$rendered_content" ]]; then
+  log "unchanged_units=$UNIT_NAME"
+else
+  log "updated_units=$UNIT_NAME"
+fi
+render_unit "$SOURCE_PATH" "$TARGET_PATH"
 
-if [[ ${#installed_units[@]} -gt 0 ]]; then
-  log "installed_units=$(join_by_comma_space "${installed_units[@]}")"
-fi
-if [[ ${#updated_units[@]} -gt 0 ]]; then
-  log "updated_units=$(join_by_comma_space "${updated_units[@]}")"
-fi
-if [[ ${#unchanged_units[@]} -gt 0 ]]; then
-  log "unchanged_units=$(join_by_comma_space "${unchanged_units[@]}")"
-fi
-
-health_env_action="skipped"
-if [[ "$COPY_HEALTH_ENV" == "1" ]]; then
-  if [[ -e "$HEALTH_ENV_TARGET" ]]; then
-    health_env_action="preserved"
-    log "health env already exists; leaving it untouched: $HEALTH_ENV_TARGET"
+service_env_action="skipped"
+if [[ "$COPY_SERVICE_ENV" == "1" ]]; then
+  if [[ -e "$SERVICE_ENV_TARGET" ]]; then
+    service_env_action="preserved"
+    log "service env already exists; leaving it untouched: $SERVICE_ENV_TARGET"
   else
-    health_env_action="installed"
-    copy_file "$HEALTH_ENV_SOURCE" "$HEALTH_ENV_TARGET"
+    service_env_action="installed"
+    copy_file "$SERVICE_ENV_SOURCE" "$SERVICE_ENV_TARGET"
   fi
 fi
-log "health_env_action=$health_env_action"
+log "service_env_action=$service_env_action"
 
 if [[ "$RELOAD_DAEMON" == "1" ]]; then
   run_cmd systemctl --user daemon-reload
 fi
 
-if [[ "$ENABLE_TIMERS" == "1" ]]; then
-  run_cmd systemctl --user enable --now \
-    mal-updater-exact-approved-sync.timer \
-    mal-updater-health-check.timer
+if [[ "$ENABLE_SERVICE" == "1" ]]; then
+  run_cmd systemctl --user enable "$UNIT_NAME"
 else
-  log "timer enable/start skipped (--no-enable)"
+  log "service enable skipped (--no-enable)"
 fi
 
-if [[ "$START_SERVICES" == "1" ]]; then
-  run_cmd systemctl --user start \
-    mal-updater-exact-approved-sync.service \
-    mal-updater-health-check.service
+if [[ "$START_SERVICE" == "1" ]]; then
+  run_cmd systemctl --user restart "$UNIT_NAME"
 fi
 
-run_cmd systemctl --user list-timers \
-  mal-updater-exact-approved-sync.timer \
-  mal-updater-health-check.timer
+if ! run_cmd systemctl --user status "$UNIT_NAME" --no-pager; then
+  log "service status probe failed; continuing"
+fi
 
-log "user-level MAL-Updater systemd unit install completed"
+log "user-level MAL-Updater systemd service install completed"

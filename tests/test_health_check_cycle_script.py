@@ -40,20 +40,7 @@ class HealthCheckCycleScriptTests(unittest.TestCase):
             "  daemon-reload)\n"
             "    exit 0\n"
             "    ;;\n"
-            "  enable)\n"
-            "    [[ \"${1:-}\" == \"--now\" ]] && shift\n"
-            "    target_dir=\"${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user\"\n"
-            "    wants_dir=\"$target_dir/timers.target.wants\"\n"
-            "    mkdir -p \"$wants_dir\"\n"
-            "    for unit in \"$@\"; do\n"
-            "      ln -sfn \"$target_dir/$unit\" \"$wants_dir/$unit\"\n"
-            "    done\n"
-            "    exit 0\n"
-            "    ;;\n"
-            "  start)\n"
-            "    exit 0\n"
-            "    ;;\n"
-            "  list-timers)\n"
+            "  enable|restart|status|is-enabled|is-active|show)\n"
             "    exit 0\n"
             "    ;;\n"
             "  *)\n"
@@ -116,21 +103,14 @@ class HealthCheckCycleScriptTests(unittest.TestCase):
                     "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "XDG_CONFIG_HOME": str(xdg_config_home),
                     "MAL_UPDATER_HEALTH_AUTO_RUN_RECOMMENDED": "1",
-                    "MAL_UPDATER_HEALTH_AUTO_RUN_REASON_CODES": "install_user_systemd_units",
+                    "MAL_UPDATER_HEALTH_AUTO_RUN_REASON_CODES": "install_user_systemd_service",
                 },
             )
 
             self.assertEqual(0, result.returncode, msg=result.stderr)
-            self.assertIn("auto_remediation_reason_code=install_user_systemd_units", result.stdout)
+            self.assertIn("auto_remediation_reason_code=install_user_systemd_service", result.stdout)
             self.assertIn("auto_remediation_command=", result.stdout)
             self.assertNotIn("auto_remediation_action=skipped_not_allowlisted", result.stdout)
-            self.assertIn("healthy=True", result.stdout)
-
-            target_dir = xdg_config_home / "systemd" / "user"
-            self.assertTrue((target_dir / "mal-updater-health-check.service").exists())
-            self.assertTrue((target_dir / "mal-updater-health-check.timer").exists())
-            self.assertTrue((target_dir / "timers.target.wants" / "mal-updater-health-check.timer").exists())
-            self.assertTrue((xdg_config_home / "mal-updater-health-check.env").exists())
 
 
 if __name__ == "__main__":

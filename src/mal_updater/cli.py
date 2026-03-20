@@ -43,6 +43,8 @@ from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
 from .recommendation_metadata import refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations
+from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
+from .service_runtime import run_pending_tasks, run_service_loop
 from .sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
     build_dry_run_sync_plan,
@@ -116,6 +118,58 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.access_token_path={secrets.access_token_path}")
     print(f"mal.refresh_token_path={secrets.refresh_token_path}")
     return 0
+
+
+def _cmd_service_status(project_root: Path | None) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    print(json.dumps(doctor_service(config), indent=2))
+    return 0
+
+
+def _cmd_install_service(project_root: Path | None, start_now: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    result = install_service(start_now=start_now, config=config)
+    print(json.dumps(result.details or {"status": result.status, "message": result.message}, indent=2))
+    return 0
+
+
+def _cmd_uninstall_service(stop_now: bool) -> int:
+    result = uninstall_service(stop_now=stop_now)
+    print(json.dumps(result.details or {"status": result.status, "message": result.message}, indent=2))
+    return 0
+
+
+def _cmd_start_service() -> int:
+    result = start_service()
+    print(json.dumps(result.details or {"status": result.status, "message": result.message}, indent=2))
+    return 0
+
+
+def _cmd_stop_service() -> int:
+    result = stop_service()
+    print(json.dumps(result.details or {"status": result.status, "message": result.message}, indent=2))
+    return 0
+
+
+def _cmd_restart_service() -> int:
+    result = restart_service()
+    print(json.dumps(result.details or {"status": result.status, "message": result.message}, indent=2))
+    return 0
+
+
+def _cmd_service_run_once(project_root: Path | None) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    print(json.dumps(run_pending_tasks(config), indent=2))
+    return 0
+
+
+def _cmd_service_run(project_root: Path | None) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    return run_service_loop(config)
 
 
 def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
@@ -194,7 +248,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 "step": "install-service-manager",
                 "status": "missing",
                 "user_action_required": True,
-                "details": "systemctl is unavailable; install/enable a compatible service manager or plan to run the wrapper scripts manually.",
+                "details": "systemctl is unavailable; install/enable a compatible service manager or plan to run `mal-updater service-run` manually in the foreground.",
             }
         )
 
@@ -231,7 +285,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         "services": {
             "installer_script": str(config.project_root / "scripts" / "install_user_systemd_units.sh"),
             "service_manager_available": dependency_checks["systemctl"],
-            "systemd_units_are_generated": True,
+            "service_unit_name": "mal-updater.service",
+            "service_model": "user-systemd daemon",
         },
         "mal": {
             "redirect_uri": config.mal.redirect_uri,
@@ -460,108 +515,69 @@ def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
 
 
 
-def _render_systemd_unit_template(source_path: Path, project_root: Path, health_env_path: Path) -> str:
+def _render_systemd_unit_template(source_path: Path, project_root: Path, env_path: Path) -> str:
     text = source_path.read_text(encoding="utf-8")
     return text.replace("__MAL_UPDATER_REPO_ROOT__", str(project_root)).replace(
-        "__MAL_UPDATER_HEALTH_ENV_FILE__", str(health_env_path)
+        "__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_path)
     )
 
 
 def _build_automation_installation_status(project_root: Path) -> dict[str, object] | None:
     source_dir = project_root / "ops" / "systemd-user"
     script_path = project_root / "scripts" / "install_user_systemd_units.sh"
-    unit_names = [
-        "mal-updater-exact-approved-sync.service",
-        "mal-updater-exact-approved-sync.timer",
-        "mal-updater-health-check.service",
-        "mal-updater-health-check.timer",
-    ]
-    timer_unit_names = [name for name in unit_names if name.endswith(".timer")]
-    if not source_dir.is_dir() or not script_path.exists() or not all((source_dir / name).exists() for name in unit_names):
+    unit_name = "mal-updater.service"
+    source_path = source_dir / unit_name
+    if not source_dir.is_dir() or not script_path.exists() or not source_path.exists():
         return None
 
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
     target_dir = config_home / "systemd" / "user"
-    wants_dir = target_dir / "timers.target.wants"
-    env_path = config_home / "mal-updater-health-check.env"
-    units: dict[str, dict[str, object]] = {}
-    missing_units: list[str] = []
-    outdated_units: list[str] = []
-    disabled_timers: list[str] = []
-    inactive_timers: list[str] = []
-    runtime_state_available = False
-    runtime_state_error: str | None = None
-    for name in unit_names:
-        source_path = source_dir / name
-        target_path = target_dir / name
-        installed = target_path.exists()
-        content_matches_repo = False
-        timer_enabled = None
-        timer_enablement_points_to_target = None
-        wants_path = None
-        if installed:
-            try:
-                rendered_source = _render_systemd_unit_template(source_path, project_root, env_path)
-                content_matches_repo = rendered_source == target_path.read_text(encoding="utf-8")
-            except OSError:
-                content_matches_repo = False
-        if name.endswith(".timer"):
-            wants_path = wants_dir / name
-            if wants_path.is_symlink():
-                try:
-                    linked_target = wants_path.resolve(strict=False)
-                except OSError:
-                    linked_target = None
-                timer_enablement_points_to_target = linked_target == target_path if linked_target is not None else False
-                timer_enabled = bool(installed and timer_enablement_points_to_target)
-            else:
-                timer_enablement_points_to_target = False if wants_path.exists() else None
-                timer_enabled = False if installed else None
-        runtime_state: dict[str, object] | None = None
-        if name.endswith(".timer") and installed and timer_enabled is True:
-            runtime_state = _read_systemd_user_unit_runtime(name)
-            if runtime_state.get("available") is True:
-                runtime_state_available = True
-                if runtime_state.get("active_state") != "active":
-                    inactive_timers.append(name)
-            elif runtime_state_error is None:
-                error = runtime_state.get("error")
-                runtime_state_error = str(error) if error else "runtime state unavailable"
-
-        if not installed:
-            missing_units.append(name)
-        elif not content_matches_repo:
-            outdated_units.append(name)
-        if name.endswith(".timer") and installed and not bool(timer_enabled):
-            disabled_timers.append(name)
-        units[name] = {
-            "installed": installed,
-            "target_path": str(target_path),
-            "content_matches_repo": content_matches_repo if installed else None,
-            "enabled": timer_enabled,
-            "enablement_points_to_target": timer_enablement_points_to_target,
-            "wants_path": str(wants_path) if wants_path is not None else None,
-            "runtime_state": runtime_state,
-        }
-
+    env_path = config_home / "mal-updater-service.env"
+    target_path = target_dir / unit_name
+    installed = target_path.exists()
+    content_matches_repo = False
+    if installed:
+        try:
+            rendered_source = _render_systemd_unit_template(source_path, project_root, env_path)
+            content_matches_repo = rendered_source == target_path.read_text(encoding="utf-8")
+        except OSError:
+            content_matches_repo = False
+    runtime_state = _read_systemd_user_unit_runtime(unit_name) if installed else None
+    enabled = None
+    active = None
+    runtime_state_error = None
+    if isinstance(runtime_state, dict):
+        if runtime_state.get("available") is True:
+            enabled = runtime_state.get("unit_file_state") == "enabled"
+            active = runtime_state.get("active_state") == "active"
+        else:
+            runtime_state_error = str(runtime_state.get("error") or "runtime state unavailable")
     return {
         "available": True,
         "source_dir": str(source_dir),
         "install_script_path": str(script_path),
         "target_dir": str(target_dir),
-        "wants_dir": str(wants_dir),
-        "health_env_path": str(env_path),
-        "health_env_present": env_path.exists(),
-        "units": units,
-        "all_units_installed": not missing_units,
-        "all_units_current": not missing_units and not outdated_units,
-        "all_timers_enabled": all(units.get(name, {}).get("installed") and units.get(name, {}).get("enabled") is True for name in timer_unit_names),
-        "runtime_state_available": runtime_state_available,
+        "env_path": str(env_path),
+        "env_present": env_path.exists(),
+        "unit_name": unit_name,
+        "unit": {
+            "installed": installed,
+            "target_path": str(target_path),
+            "content_matches_repo": content_matches_repo if installed else None,
+            "enabled": enabled,
+            "active": active,
+            "runtime_state": runtime_state,
+        },
+        "all_units_installed": installed,
+        "all_units_current": installed and content_matches_repo,
+        "service_enabled": enabled,
+        "service_active": active,
+        "runtime_state_available": bool(isinstance(runtime_state, dict) and runtime_state.get("available") is True),
         "runtime_state_error": runtime_state_error,
-        "inactive_timers": inactive_timers,
-        "missing_units": missing_units,
-        "outdated_units": outdated_units,
-        "disabled_timers": disabled_timers,
+        "missing_units": [] if installed else [unit_name],
+        "outdated_units": [] if (not installed or content_matches_repo) else [unit_name],
+        "disabled_services": [] if (enabled is None or enabled) else [unit_name],
+        "inactive_services": [] if (active is None or active) else [unit_name],
     }
 
 
@@ -655,8 +671,8 @@ def _build_health_maintenance_commands(
 
     missing_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
     outdated_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
-    disabled_timers = automation_installation.get("disabled_timers") if isinstance(automation_installation, dict) else None
-    inactive_timers = automation_installation.get("inactive_timers") if isinstance(automation_installation, dict) else None
+    disabled_services = automation_installation.get("disabled_services") if isinstance(automation_installation, dict) else None
+    inactive_services = automation_installation.get("inactive_services") if isinstance(automation_installation, dict) else None
     install_script_path = automation_installation.get("install_script_path") if isinstance(automation_installation, dict) else None
     if (
         isinstance(install_script_path, str)
@@ -664,19 +680,19 @@ def _build_health_maintenance_commands(
         and (
             (isinstance(missing_units, list) and missing_units)
             or (isinstance(outdated_units, list) and outdated_units)
-            or (isinstance(disabled_timers, list) and disabled_timers)
-            or (isinstance(inactive_timers, list) and inactive_timers)
+            or (isinstance(disabled_services, list) and disabled_services)
+            or (isinstance(inactive_services, list) and inactive_services)
         )
     ):
-        detail = "Install the repo-owned user systemd timers so exact-approved sync and health-check automation can run unattended"
+        detail = "Install the repo-owned user systemd service so MAL-Updater can run as a persistent unattended daemon"
         if isinstance(outdated_units, list) and outdated_units:
-            detail = "Reinstall/update the repo-owned user systemd timers so installed automation matches the current repo versions"
-        elif isinstance(disabled_timers, list) and disabled_timers:
-            detail = "Enable the repo-owned user systemd timers so the installed automation actually runs unattended"
-        elif isinstance(inactive_timers, list) and inactive_timers:
-            detail = "Reinstall/restart the repo-owned user systemd timers so the enabled automation is actually active in the user runtime"
+            detail = "Reinstall/update the repo-owned user systemd service so the installed daemon matches the current repo version"
+        elif isinstance(disabled_services, list) and disabled_services:
+            detail = "Enable the repo-owned user systemd service so the background daemon starts automatically for this user"
+        elif isinstance(inactive_services, list) and inactive_services:
+            detail = "Restart the repo-owned user systemd service so the background daemon is actually active in the user runtime"
         add_command(
-            "install_user_systemd_units",
+            "install_user_systemd_service",
             detail,
             [install_script_path],
             automation_safe=True,
@@ -775,7 +791,7 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
         for item in recommended_commands:
             if not isinstance(item, dict):
                 continue
-            if item.get("reason_code") != "install_user_systemd_units":
+            if item.get("reason_code") != "install_user_systemd_service":
                 continue
             command = item.get("command")
             if isinstance(command, str) and command:
@@ -814,43 +830,39 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
         all_units_current = automation.get("all_units_current")
         if isinstance(all_units_current, bool):
             print(f"automation_all_units_current={all_units_current}")
-        all_timers_enabled = automation.get("all_timers_enabled")
-        if isinstance(all_timers_enabled, bool):
-            print(f"automation_all_timers_enabled={all_timers_enabled}")
+        service_enabled = automation.get("service_enabled")
+        if isinstance(service_enabled, bool):
+            print(f"automation_service_enabled={service_enabled}")
+        service_active = automation.get("service_active")
+        if isinstance(service_active, bool):
+            print(f"automation_service_active={service_active}")
         missing_units = automation.get("missing_units")
         if isinstance(missing_units, list) and missing_units:
             print("automation_missing_units=" + ", ".join(str(item) for item in missing_units))
         outdated_units = automation.get("outdated_units")
         if isinstance(outdated_units, list) and outdated_units:
             print("automation_outdated_units=" + ", ".join(str(item) for item in outdated_units))
-        disabled_timers = automation.get("disabled_timers")
-        if isinstance(disabled_timers, list) and disabled_timers:
-            print("automation_disabled_timers=" + ", ".join(str(item) for item in disabled_timers))
-        inactive_timers = automation.get("inactive_timers")
-        if isinstance(inactive_timers, list) and inactive_timers:
-            print("automation_inactive_timers=" + ", ".join(str(item) for item in inactive_timers))
-        units = automation.get("units")
-        if isinstance(units, dict):
-            runtime_lines: list[str] = []
-            for name, info in units.items():
-                if not isinstance(info, dict) or not name.endswith(".timer"):
-                    continue
-                runtime_state = info.get("runtime_state")
-                if not isinstance(runtime_state, dict) or runtime_state.get("available") is not True:
-                    continue
+        disabled_services = automation.get("disabled_services")
+        if isinstance(disabled_services, list) and disabled_services:
+            print("automation_disabled_services=" + ", ".join(str(item) for item in disabled_services))
+        inactive_services = automation.get("inactive_services")
+        if isinstance(inactive_services, list) and inactive_services:
+            print("automation_inactive_services=" + ", ".join(str(item) for item in inactive_services))
+        unit_info = automation.get("unit")
+        if isinstance(unit_info, dict):
+            runtime_state = unit_info.get("runtime_state")
+            if isinstance(runtime_state, dict) and runtime_state.get("available") is True:
+                parts = [str(automation.get("unit_name") or "mal-updater.service")]
                 active_state = runtime_state.get("active_state")
-                next_elapse_at = runtime_state.get("next_elapse_at")
+                sub_state = runtime_state.get("sub_state")
                 last_trigger_at = runtime_state.get("last_trigger_at")
-                parts = [str(name)]
                 if active_state:
                     parts.append(f"active={active_state}")
-                if next_elapse_at:
-                    parts.append(f"next={next_elapse_at}")
+                if sub_state:
+                    parts.append(f"sub={sub_state}")
                 if last_trigger_at:
                     parts.append(f"last={last_trigger_at}")
-                runtime_lines.append(" | ".join(parts))
-            if runtime_lines:
-                print("automation_timer_runtime=" + "; ".join(runtime_lines))
+                print("automation_service_runtime=" + " | ".join(parts))
     if install_units_command:
         print("automation_install_command=" + install_units_command)
     top_command = _select_maintenance_command(recommended_commands)
@@ -922,8 +934,8 @@ def _cmd_health_check(
         warnings.append({"code": "missing_mal_auth_material", "detail": "MAL client id/access token/refresh token are not all present"})
     missing_automation_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
     outdated_automation_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
-    disabled_automation_timers = automation_installation.get("disabled_timers") if isinstance(automation_installation, dict) else None
-    inactive_automation_timers = automation_installation.get("inactive_timers") if isinstance(automation_installation, dict) else None
+    disabled_automation_services = automation_installation.get("disabled_services") if isinstance(automation_installation, dict) else None
+    inactive_automation_services = automation_installation.get("inactive_services") if isinstance(automation_installation, dict) else None
     if isinstance(missing_automation_units, list) and missing_automation_units:
         warnings.append(
             {
@@ -942,21 +954,20 @@ def _cmd_health_check(
                 "target_dir": automation_installation.get("target_dir"),
             }
         )
-    if isinstance(disabled_automation_timers, list) and disabled_automation_timers:
+    if isinstance(disabled_automation_services, list) and disabled_automation_services:
         warnings.append(
             {
-                "code": "automation_timers_disabled",
-                "detail": "Repo-owned MAL-Updater user systemd timers are installed but not enabled for this user",
-                "disabled_timers": disabled_automation_timers,
-                "wants_dir": automation_installation.get("wants_dir"),
+                "code": "automation_service_disabled",
+                "detail": "Repo-owned MAL-Updater user systemd service is installed but not enabled for this user",
+                "disabled_services": disabled_automation_services,
             }
         )
-    if isinstance(inactive_automation_timers, list) and inactive_automation_timers:
+    if isinstance(inactive_automation_services, list) and inactive_automation_services:
         warnings.append(
             {
-                "code": "automation_timers_inactive",
-                "detail": "Repo-owned MAL-Updater user systemd timers are enabled on disk but are not currently active in the user systemd runtime",
-                "inactive_timers": inactive_automation_timers,
+                "code": "automation_service_inactive",
+                "detail": "Repo-owned MAL-Updater user systemd service is enabled on disk but is not currently active in the user systemd runtime",
+                "inactive_services": inactive_automation_services,
             }
         )
     if not isinstance(latest_completed_sync_run, dict):
@@ -3509,6 +3520,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="Create the externalized runtime dirs and initialize SQLite schema")
     subparsers.add_parser("status", help="Print resolved config, runtime paths, and secret presence")
+    install_service_parser = subparsers.add_parser("install-service", help="Install/update the repo-owned user systemd service for the long-lived MAL-Updater daemon")
+    install_service_parser.add_argument("--no-start", action="store_true", help="Write/enable the service but do not restart it immediately")
+    uninstall_service_parser = subparsers.add_parser("uninstall-service", help="Disable and remove the repo-owned user systemd service")
+    uninstall_service_parser.add_argument("--no-stop", action="store_true", help="Remove/disable the service without attempting a stop first")
+    subparsers.add_parser("start-service", help="Start the MAL-Updater user service")
+    subparsers.add_parser("stop-service", help="Stop the MAL-Updater user service")
+    subparsers.add_parser("restart-service", help="Restart the MAL-Updater user service")
+    subparsers.add_parser("service-status", help="Print MAL-Updater user service health/runtime status")
+    subparsers.add_parser("service-run", help="Run the MAL-Updater daemon loop in the foreground")
+    subparsers.add_parser("service-run-once", help="Run one MAL-Updater daemon loop pass and exit")
     bootstrap_audit = subparsers.add_parser(
         "bootstrap-audit",
         help="Audit bootstrap/onboarding readiness: dependencies, runtime dirs, credentials, redirect settings, and service install prerequisites",
@@ -3764,6 +3785,22 @@ def main() -> int:
         return _cmd_init(args.project_root)
     if args.command == "status":
         return _cmd_status(args.project_root)
+    if args.command == "install-service":
+        return _cmd_install_service(args.project_root, start_now=not args.no_start)
+    if args.command == "uninstall-service":
+        return _cmd_uninstall_service(stop_now=not args.no_stop)
+    if args.command == "start-service":
+        return _cmd_start_service()
+    if args.command == "stop-service":
+        return _cmd_stop_service()
+    if args.command == "restart-service":
+        return _cmd_restart_service()
+    if args.command == "service-status":
+        return _cmd_service_status(args.project_root)
+    if args.command == "service-run":
+        return _cmd_service_run(args.project_root)
+    if args.command == "service-run-once":
+        return _cmd_service_run_once(args.project_root)
     if args.command == "bootstrap-audit":
         return _cmd_bootstrap_audit(args.project_root, args.summary)
     if args.command == "health-check":

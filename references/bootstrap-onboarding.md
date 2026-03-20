@@ -30,7 +30,7 @@ Use `--summary` for terse line-oriented output.
 - runtime path layout
 - whether `python3`, `flock`, `systemctl`, and optional `curl_cffi` are available
 - whether MAL client id, MAL auth tokens, Crunchyroll credentials, and Crunchyroll staged auth state exist
-- whether user-level systemd automation can be installed
+- whether the user-level systemd daemon can be installed
 - the current MAL redirect URI that the user must configure in their MAL app
 
 ## Required user-facing bootstrap steps
@@ -38,9 +38,9 @@ Use `--summary` for terse line-oriented output.
 ### 1. Dependency check
 
 - Require `python3`
-- Require `flock` for the wrapper scripts
+- Require `flock` for the wrapper scripts the daemon still reuses for some guarded lanes
 - Treat `curl_cffi` as strongly recommended for live Crunchyroll auth/fetch reliability
-- Treat `systemctl` as required only for the unattended user-systemd automation path
+- Treat `systemctl` as required only for the unattended user-systemd daemon path
 
 If missing:
 - explain what is missing
@@ -89,28 +89,26 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 
 This creates the long-lived staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.
 
-### 6. Install unattended automation if supported
+### 6. Install the unattended daemon if supported
 
 ```bash
 cd {baseDir}
 scripts/install_user_systemd_units.sh
 ```
 
-That installer renders host-specific unit files from repo templates, preserving relative repo semantics while avoiding committed hardcoded paths.
+That installer renders a host-specific `mal-updater.service` unit from the repo template, preserving repo portability while still producing a valid installed daemon service.
 
-## Verification sequence
-
-After bootstrap:
+### 7. Verify daemon health
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
-PYTHONPATH=src python3 -m mal_updater.cli status
+PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
 
 ## Non-goals
 
 - Do not copy runtime state back into the repo.
-- Do not claim unattended automation is healthy unless bootstrap-audit/status/health-check all agree.
+- Do not claim unattended automation is healthy unless bootstrap-audit/status/service-status/health-check all agree.
 - Do not invent an installer outside the documented bootstrap flow.

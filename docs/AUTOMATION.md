@@ -1,49 +1,27 @@
 # Automation
 
-MAL-Updater ships repo-owned automation wrappers plus portable systemd templates.
+MAL-Updater now uses a **long-lived user-systemd daemon** rather than timer-driven one-shot jobs as the primary unattended model.
 
-## Exact-approved recurring sync
+## Daemon model
 
-```bash
-cd <repo-root>
-./scripts/run_exact_approved_sync_cycle.sh
-```
-
-Current flow:
+The installed service runs:
 
 ```bash
-PYTHONPATH=src python3 -m mal_updater.cli init
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
-PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
+python3 -m mal_updater.cli --project-root <repo-root> service-run
 ```
 
-Behavior:
-- external lock file under `.MAL-Updater/state/locks/`
-- per-run logs under `.MAL-Updater/state/logs/`
-- snapshot artifact under `.MAL-Updater/cache/`
-- guarded MAL apply path only
-- bounded Crunchyroll auth recovery
+That foreground process owns its own internal loop cadence and recurring lanes for:
 
-## Health-check recurring maintenance
-
-```bash
-cd <repo-root>
-./scripts/run_health_check_cycle.sh
-```
-
-Behavior:
-- external lock file under `.MAL-Updater/state/locks/`
-- per-run logs under `.MAL-Updater/state/logs/`
-- archived JSON snapshots under `.MAL-Updater/state/health/`
-- `latest-health-check.json` maintained under the same runtime tree
-- optional strict mode via `MAL_UPDATER_HEALTH_STRICT=1`
-- optional allowlisted self-remediation for safe maintenance commands
+- MAL token refresh
+- exact-approved sync passes
+- recurring health-check/report generation
+- API request logging / budget awareness
 
 ## User systemd install
 
 Repo-owned templates live in `ops/systemd-user/`.
 
-Install them with:
+Install the daemon with:
 
 ```bash
 cd <repo-root>
@@ -51,24 +29,45 @@ scripts/install_user_systemd_units.sh
 ```
 
 Important:
-- the committed `.service` files are templates, not host-bound final units
-- the installer renders the current repo root and health env path into the installed copies
-- this keeps the repo portable while still producing valid host-specific units at bootstrap time
+- the committed `.service` file is a template, not a host-bound final unit
+- the installer renders the current repo root, workspace root, and service env path into the installed copy
+- this keeps the repo portable while still producing a valid host-specific user daemon
 
 Useful variants:
 
 ```bash
 scripts/install_user_systemd_units.sh --dry-run
 scripts/install_user_systemd_units.sh --no-enable
-scripts/install_user_systemd_units.sh --start-services
+scripts/install_user_systemd_units.sh --start-service
 ```
+
+## Direct service commands
+
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli install-service
+PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli restart-service
+PYTHONPATH=src python3 -m mal_updater.cli service-run-once
+```
+
+## Legacy wrappers still reused by the daemon
+
+The daemon currently reuses these guarded wrapper scripts for some lanes:
+
+- `scripts/run_exact_approved_sync_cycle.sh`
+- `scripts/run_health_check_cycle.sh`
+
+Those still write runtime artifacts under `.MAL-Updater/state/` and `.MAL-Updater/cache/`, but they are now subordinate to the daemon-first orchestration model.
 
 ## Recommended bootstrap order
 
 1. `bootstrap-audit`
 2. `init`
 3. MAL / Crunchyroll auth setup
-4. `health-check --format summary`
-5. `scripts/install_user_systemd_units.sh`
+4. `scripts/install_user_systemd_units.sh`
+5. `service-status`
+6. `service-run-once`
+7. `health-check --format summary`
 
-Do not claim unattended automation is installed or healthy until the install script and health-check both agree.
+Do not claim unattended automation is installed or healthy until the installer, service-status, and health-check all agree.

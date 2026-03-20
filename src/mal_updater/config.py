@@ -31,6 +31,14 @@ DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
 DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
 DEFAULT_DB_FILE = "mal_updater.sqlite3"
 DEFAULT_RUNTIME_DIR_NAME = ".MAL-Updater"
+DEFAULT_SERVICE_SYNC_EVERY_SECONDS = 6 * 60 * 60
+DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 12 * 60 * 60
+DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 6 * 60 * 60
+DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
+DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
+DEFAULT_SERVICE_MAL_HOURLY_LIMIT = 120
+DEFAULT_SERVICE_WARN_RATIO = 0.8
+DEFAULT_SERVICE_CRITICAL_RATIO = 0.95
 WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 
 
@@ -55,6 +63,18 @@ class CrunchyrollSettings:
     locale: str = DEFAULT_CRUNCHYROLL_LOCALE
     request_spacing_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS
     request_spacing_jitter_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS
+
+
+@dataclass(slots=True)
+class ServiceSettings:
+    sync_every_seconds: int = DEFAULT_SERVICE_SYNC_EVERY_SECONDS
+    health_every_seconds: int = DEFAULT_SERVICE_HEALTH_EVERY_SECONDS
+    mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
+    loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
+    crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
+    mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
+    warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
+    critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
 
 
 @dataclass(slots=True)
@@ -88,6 +108,23 @@ class AppConfig:
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     mal: MalSettings = field(default_factory=MalSettings)
     crunchyroll: CrunchyrollSettings = field(default_factory=CrunchyrollSettings)
+    service: ServiceSettings = field(default_factory=ServiceSettings)
+
+    @property
+    def service_log_path(self) -> Path:
+        return self.state_dir / "logs" / "service.log"
+
+    @property
+    def service_state_path(self) -> Path:
+        return self.state_dir / "service-state.json"
+
+    @property
+    def api_request_events_path(self) -> Path:
+        return self.state_dir / "api-request-events.jsonl"
+
+    @property
+    def health_latest_json_path(self) -> Path:
+        return self.state_dir / "health" / "latest-health-check.json"
 
 
 def _resolve_from(base_dir: Path, raw_value: str | Path) -> Path:
@@ -245,6 +282,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     paths_section = _get_table(settings, "paths")
     mal_section = _get_table(settings, "mal")
     crunchyroll_section = _get_table(settings, "crunchyroll")
+    service_section = _get_table(settings, "service")
     secret_files_section = _get_table(settings, "secret_files")
     settings_dir = settings_path.parent
 
@@ -352,6 +390,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 )
             ),
         ),
+        service=ServiceSettings(
+            sync_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_SYNC_EVERY_SECONDS", _get_int(service_section, "sync_every_seconds", DEFAULT_SERVICE_SYNC_EVERY_SECONDS))),
+            health_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_EVERY_SECONDS", _get_int(service_section, "health_every_seconds", DEFAULT_SERVICE_HEALTH_EVERY_SECONDS))),
+            mal_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_MAL_REFRESH_EVERY_SECONDS", _get_int(service_section, "mal_refresh_every_seconds", DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS))),
+            loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
+            crunchyroll_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_CRUNCHYROLL_HOURLY_LIMIT", _get_int(service_section, "crunchyroll_hourly_limit", DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT))),
+            mal_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_MAL_HOURLY_LIMIT", _get_int(service_section, "mal_hourly_limit", DEFAULT_SERVICE_MAL_HOURLY_LIMIT))),
+            warn_ratio=float(os.getenv("MAL_UPDATER_SERVICE_WARN_RATIO", _get_float(service_section, "warn_ratio", DEFAULT_SERVICE_WARN_RATIO))),
+            critical_ratio=float(os.getenv("MAL_UPDATER_SERVICE_CRITICAL_RATIO", _get_float(service_section, "critical_ratio", DEFAULT_SERVICE_CRITICAL_RATIO))),
+        ),
     )
     return app_config
 
@@ -400,5 +448,14 @@ def load_mal_secrets(config: AppConfig) -> MalSecrets:
 
 
 def ensure_directories(config: AppConfig) -> None:
-    for path in (config.runtime_root, config.config_dir, config.secrets_dir, config.data_dir, config.state_dir, config.cache_dir):
+    for path in (
+        config.runtime_root,
+        config.config_dir,
+        config.secrets_dir,
+        config.data_dir,
+        config.state_dir,
+        config.cache_dir,
+        config.service_log_path.parent,
+        config.health_latest_json_path.parent,
+    ):
         path.mkdir(parents=True, exist_ok=True)

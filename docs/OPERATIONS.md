@@ -21,6 +21,7 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
 PYTHONPATH=src python3 -m mal_updater.cli status
+PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
@@ -62,24 +63,18 @@ PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-map
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
 ```
 
-## Recommendations
-
-```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
-PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata
-```
-
-## User-systemd automation
+## User-systemd daemon
 
 ```bash
 cd <repo-root>
 scripts/install_user_systemd_units.sh
-./scripts/run_exact_approved_sync_cycle.sh
-./scripts/run_health_check_cycle.sh
+PYTHONPATH=src python3 -m mal_updater.cli install-service
+PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli restart-service
+PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
 
-The installer renders host-specific unit files from the repo templates under `ops/systemd-user/` and avoids committed absolute paths.
+The installer renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/`.
 
 ## MAL redirect configuration
 
