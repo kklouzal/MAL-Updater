@@ -6,11 +6,19 @@
 - [x] Externalize default runtime state to `.MAL-Updater/`
 - [x] Add `bootstrap-audit` as the first install/onboarding readiness check
 - [x] Replace committed absolute-path systemd units with install-time rendered templates
+- [x] Replace timer-first unattended automation with a user-level daemon-first model
 - [ ] Keep tightening the bootstrap/onboarding UX for new OpenClaw installs
+- [ ] Consider whether bootstrap/install metadata should become more machine-readable beyond the current CLI audit surface
 
-## Product / operations
+## Daemon / operations
+
+- [ ] Tighten daemon control loops and per-lane state tracking
+- [ ] Improve request-budget accounting / backoff behavior for MAL and Crunchyroll
+- [ ] Decide whether to retire the remaining transitional wrapper scripts after more daemon logic moves in-process
+- [ ] Add richer service-state/observability surfaces for debugging unattended failures
+
+## Product / sync quality
 
 - [ ] Continue reducing genuinely ambiguous mapping residue
 - [ ] Continue stabilizing fresh Crunchyroll fetches on auth-fragile hosts
 - [ ] Keep improving recommendation quality and review UX
-- [ ] Decide whether more bootstrap metadata should become machine-readable beyond the current CLI audit surface

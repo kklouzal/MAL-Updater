@@ -29,6 +29,16 @@ locale = "en-US"
 request_spacing_seconds = 22.5
 request_spacing_jitter_seconds = 7.5
 
+[service]
+sync_every_seconds = 21600
+health_every_seconds = 43200
+mal_refresh_every_seconds = 21600
+loop_sleep_seconds = 30
+crunchyroll_hourly_limit = 180
+mal_hourly_limit = 120
+warn_ratio = 0.8
+critical_ratio = 0.95
+
 [secret_files]
 mal_client_id = "mal_client_id.txt"
 mal_client_secret = "mal_client_secret.txt"

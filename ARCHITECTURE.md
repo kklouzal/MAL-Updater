@@ -5,7 +5,7 @@
 MAL-Updater is a **skill-first repository**:
 
 - `SKILL.md` at the repo root is the canonical skill entrypoint
-- `src/mal_updater/` contains the Python application and CLI
+- `src/mal_updater/` contains the Python application, CLI, daemon runtime, and service management code
 - `references/` contains agent-facing bootstrap/operation references
 - `scripts/` contains deterministic wrappers/install helpers
 - `ops/systemd-user/` contains portable systemd templates
@@ -21,12 +21,44 @@ Live runtime state is external to the repo tree by default and resolves under `.
 - `.MAL-Updater/state/`
 - `.MAL-Updater/cache/`
 
+Notable daemon/runtime files inside the external state tree include:
+
+- `.MAL-Updater/state/service-state.json`
+- `.MAL-Updater/state/logs/service.log`
+- `.MAL-Updater/state/api-request-events.jsonl`
+- `.MAL-Updater/state/health/latest-health-check.json`
+
 ## Execution model
 
-- Use the repo-local Python CLI for business logic.
-- Use `bootstrap-audit` as the first install/onboarding compatibility check.
-- Use the wrapper scripts for unattended exact-approved sync and health-check cycles.
-- Render host-specific systemd units from repo templates at install time; do not commit absolute host paths.
+### CLI
+
+Use the repo-local Python CLI for business logic and operator workflows.
+
+### Daemon
+
+The unattended model is a **long-lived user-level systemd daemon**.
+
+The installed unit runs:
+
+```bash
+python3 -m mal_updater.cli --project-root <repo-root> service-run
+```
+
+That foreground daemon owns internal recurring lanes for:
+
+- MAL token refresh
+- exact-approved sync passes
+- recurring health-check/report generation
+- API request logging and budget-aware gating
+
+### Transitional wrappers
+
+The daemon currently still reuses:
+
+- `scripts/run_exact_approved_sync_cycle.sh`
+- `scripts/run_health_check_cycle.sh`
+
+Those wrappers are subordinate helpers now, not the primary scheduling model.
 
 ## Bootstrap model
 
@@ -37,7 +69,8 @@ A new OpenClaw instance should be able to:
 3. detect missing dependencies and user-provided inputs
 4. guide the user through MAL app creation / redirect configuration
 5. stage secrets into the external runtime tree
-6. install rendered long-lived services/timers when supported
+6. install the rendered long-lived user daemon when supported
+7. verify daemon health via `service-status`, `service-run-once`, and `health-check`
 
 ## Guardrails
 
@@ -45,3 +78,4 @@ A new OpenClaw instance should be able to:
 - keep runtime out of the skill tree
 - avoid host-specific assumptions in committed files
 - preserve full-repo auditability for third parties
+- prefer the daemon-first runtime model over ad-hoc timers or OpenClaw cron
