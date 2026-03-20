@@ -41,7 +41,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_does_not_treat_stylized_single_x_as_roman_installment_hint(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -50,10 +50,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -106,7 +106,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_flags_exact_title_overflow_as_possible_multi_entry_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -115,10 +115,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -177,7 +177,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_flags_exact_title_overflow_as_bundle_even_when_later_season_companion_scores_low(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -186,10 +186,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -275,7 +275,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_flags_exact_title_overflow_as_possible_three_entry_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -284,10 +284,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -353,7 +353,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_multi_entry_bundle_prefers_later_seasons_over_higher_scoring_sidecar_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -362,10 +362,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -454,7 +454,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_flags_explicit_later_season_overflow_as_possible_multi_entry_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -463,10 +463,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -531,7 +531,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_boosts_base_title_match_when_provider_title_only_adds_arc_subtitle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -540,10 +540,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -596,7 +596,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_does_not_trim_installment_subtitle_into_false_base_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -605,10 +605,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -654,7 +654,7 @@ class MappingTests(unittest.TestCase):
             with self.subTest(title=title):
                 with tempfile.TemporaryDirectory() as td:
                     root = Path(td)
-                    (root / "config").mkdir()
+                    (root / ".MAL-Updater" / "config").mkdir(parents=True)
                     config = load_config(root)
                     client = MalClient(
                         config,
@@ -663,10 +663,10 @@ class MappingTests(unittest.TestCase):
                             client_secret=None,
                             access_token="access-token",
                             refresh_token=None,
-                            client_id_path=root / "secrets" / "mal_client_id.txt",
-                            client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                            access_token_path=root / "secrets" / "mal_access_token.txt",
-                            refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                            client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                            client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                            access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                            refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                         ),
                     )
 
@@ -709,7 +709,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_penalizes_related_non_tv_sidecar_when_provider_has_explicit_season_context(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -718,10 +718,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -877,7 +877,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_boosts_parenthetical_english_alias_to_base_title_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -886,10 +886,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -942,7 +942,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_prefers_exact_specific_installment_over_base_title_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -951,10 +951,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1011,7 +1011,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_uses_roman_query_variant_for_later_season_search(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1020,10 +1020,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1077,7 +1077,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_expands_related_anime_to_recover_hidden_tv_sequel(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1086,10 +1086,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1223,7 +1223,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_expands_related_anime_for_suffix_residue_without_installment_context(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1232,10 +1232,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1313,7 +1313,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_prioritizes_promising_relation_chains_before_low_value_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1322,10 +1322,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1453,7 +1453,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_does_not_expand_relations_for_plain_season_one_tv_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1462,10 +1462,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1507,7 +1507,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_classifies_exact_match_conservatively(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1516,10 +1516,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1559,7 +1559,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_uses_season_and_episode_evidence_to_avoid_wrong_sequel(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1568,10 +1568,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1623,7 +1623,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_penalizes_candidate_with_extra_installment_hint_when_provider_has_none(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1632,10 +1632,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1685,7 +1685,7 @@ class MappingTests(unittest.TestCase):
     def test_should_auto_approve_exact_unique_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1694,10 +1694,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1748,7 +1748,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_penalizes_auxiliary_candidates_even_with_exact_title(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1757,10 +1757,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1810,7 +1810,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_promotes_exact_tv_match_over_near_single_episode_ova_review_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1819,10 +1819,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1875,7 +1875,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_promotes_exact_tv_match_over_near_extra_suffix_franchise_entry_without_episode_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1884,10 +1884,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1937,7 +1937,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_promotes_exact_base_series_over_sequel_suffix_variant(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -1946,10 +1946,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -1999,7 +1999,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_promotes_exact_base_series_over_non_exact_tv_suffix_variants(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2008,10 +2008,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2072,7 +2072,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_promotes_exact_tv_match_over_tv_special_when_title_only_differs_by_digit_spacing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2081,10 +2081,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2135,7 +2135,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_promotes_exact_tv_match_over_non_exact_ona_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2144,10 +2144,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2198,7 +2198,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_does_not_promote_exact_ova_match_over_base_tv_series(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2207,10 +2207,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2261,7 +2261,7 @@ class MappingTests(unittest.TestCase):
     def test_should_not_auto_approve_when_season_evidence_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2270,10 +2270,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2324,7 +2324,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_combined_generic_season_query_promotes_safe_exact_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2333,10 +2333,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2379,7 +2379,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_uses_roman_installment_hint_to_break_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2388,10 +2388,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2464,7 +2464,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_uses_split_installment_match_for_part_vs_cour(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2473,10 +2473,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2527,7 +2527,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_softens_aggregate_episode_numbering_when_installment_and_completion_evidence_align(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2536,10 +2536,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2592,7 +2592,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_prefers_part_two_candidate_for_aggregated_second_season(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2601,10 +2601,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2669,7 +2669,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_prefers_split_specific_candidate_over_broader_same_season_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2678,10 +2678,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2748,7 +2748,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_softens_single_episode_overflow_when_later_season_hint_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2757,10 +2757,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2820,7 +2820,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_softens_single_episode_overflow_for_exact_base_title_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2829,10 +2829,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2888,7 +2888,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_penalizes_base_installment_candidate_when_provider_explicitly_targets_later_season(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2897,10 +2897,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -2956,7 +2956,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_penalizes_single_special_when_provider_looks_like_multi_episode_main_series(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -2965,10 +2965,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -3019,7 +3019,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_prefers_title_season_hint_when_provider_metadata_is_noisy(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -3028,10 +3028,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -3082,7 +3082,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_does_not_penalize_exact_movie_title_inside_collection(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -3091,10 +3091,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -3136,7 +3136,7 @@ class MappingTests(unittest.TestCase):
     def test_map_series_prefers_tv_bundle_over_exact_movie_and_prologue_sidecars_for_multi_episode_series(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             client = MalClient(
                 config,
@@ -3145,10 +3145,10 @@ class MappingTests(unittest.TestCase):
                     client_secret=None,
                     access_token="access-token",
                     refresh_token=None,
-                    client_id_path=root / "secrets" / "mal_client_id.txt",
-                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
-                    access_token_path=root / "secrets" / "mal_access_token.txt",
-                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
                 ),
             )
 
@@ -3230,7 +3230,7 @@ class PersistedMappingTests(unittest.TestCase):
     def test_upsert_and_list_series_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             ingest_snapshot_payload(payload, config)
@@ -3257,7 +3257,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_proposes_forward_only_update(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["series"][0]["title"] = "Example Show"
@@ -3265,9 +3265,9 @@ class DryRunPlannerTests(unittest.TestCase):
             payload["progress"][0]["episode_number"] = 3
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3309,14 +3309,14 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_refuses_to_decrease_existing_progress(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3353,13 +3353,13 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_mapping_review_preserves_user_approved_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
             upsert_series_mapping(
                 config.db_path,
                 provider="crunchyroll",
@@ -3382,7 +3382,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_mapping_review_auto_approves_exact_unique_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["series"][0]["title"] = "Example Show"
@@ -3391,9 +3391,9 @@ class DryRunPlannerTests(unittest.TestCase):
             payload["progress"][0]["episode_number"] = 12
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3428,7 +3428,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_mapping_review_surfaces_bundle_companion_for_multi_entry_residue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["series"][0]["title"] = "The Melancholy of Haruhi Suzumiya"
@@ -3444,9 +3444,9 @@ class DryRunPlannerTests(unittest.TestCase):
                 item["completion_ratio"] = 1.0
                 payload["progress"].append(item)
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3495,7 +3495,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_mapping_review_surfaces_all_bundle_companions_for_three_entry_residue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["series"][0]["provider_series_id"] = "series-123b"
@@ -3513,9 +3513,9 @@ class DryRunPlannerTests(unittest.TestCase):
                 item["completion_ratio"] = 1.0
                 payload["progress"].append(item)
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3565,15 +3565,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_uses_user_approved_mapping_without_search(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 2
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
             upsert_series_mapping(
                 config.db_path,
                 provider="crunchyroll",
@@ -3606,7 +3606,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_auto_approves_exact_unique_match_for_sync(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["series"][0]["title"] = "Example Show"
@@ -3615,9 +3615,9 @@ class DryRunPlannerTests(unittest.TestCase):
             payload["progress"][0]["episode_number"] = 12
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3661,13 +3661,13 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_can_require_approved_mappings_only(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(MalClient, "search_anime", side_effect=AssertionError("approved-only should not live search")):
                 proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=3, approved_mappings_only=True)
@@ -3679,13 +3679,13 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_persist_mapping_review_queue_only_keeps_unresolved_items(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(MalClient, "search_anime", return_value={"data": []}):
                 items = build_mapping_review(config, limit=5, mapping_limit=3)
@@ -3699,14 +3699,14 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_persist_sync_review_queue_keeps_review_and_skip_rows(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3745,16 +3745,16 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_fills_missing_finish_date_only_when_completed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 12
             payload["progress"][0]["completion_ratio"] = 0.95
             payload["progress"][0]["last_watched_at"] = "2026-03-14T22:10:00Z"
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3796,16 +3796,16 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_preserves_existing_finish_date(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 12
             payload["progress"][0]["completion_ratio"] = 0.95
             payload["progress"][0]["last_watched_at"] = "2026-03-14T22:10:00Z"
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3842,14 +3842,14 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_preserves_meaningful_zero_progress_on_plan_to_watch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"] = []
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3886,15 +3886,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_overrides_plan_to_watch_when_crunchyroll_has_completed_episode_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 2
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3932,15 +3932,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_suppresses_watching_zero_episode_proposals(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["completion_ratio"] = 0.40
             payload["progress"][0]["episode_number"] = 1
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -3979,7 +3979,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_counts_follow_on_near_complete_episode_as_watched(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"] = [
@@ -4003,9 +4003,9 @@ class DryRunPlannerTests(unittest.TestCase):
                 },
             ]
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -4046,15 +4046,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_sync_proposal_as_dict_includes_completion_audit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 12
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -4093,7 +4093,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_counts_last_episode_within_credits_window_as_completed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 12
@@ -4101,9 +4101,9 @@ class DryRunPlannerTests(unittest.TestCase):
             payload["progress"][0]["duration_ms"] = 1440024
             payload["progress"][0]["completion_ratio"] = 0.9180402548846408
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -4143,7 +4143,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_leaves_ambiguous_near_complete_episode_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"] = [
@@ -4167,9 +4167,9 @@ class DryRunPlannerTests(unittest.TestCase):
                 },
             ]
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -4206,7 +4206,7 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_build_dry_run_sync_plan_deduplicates_alternate_episode_variants_by_episode_number(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"] = [
@@ -4239,9 +4239,9 @@ class DryRunPlannerTests(unittest.TestCase):
                 },
             ]
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
 
             with patch.object(
                 MalClient,
@@ -4278,15 +4278,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_execute_approved_sync_dry_run_only_targets_approved_safe_updates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 4
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
             upsert_series_mapping(
                 config.db_path,
                 provider="crunchyroll",
@@ -4319,15 +4319,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_execute_approved_sync_performs_live_write_when_safe(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 4
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
             upsert_series_mapping(
                 config.db_path,
                 provider="crunchyroll",
@@ -4363,16 +4363,16 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_execute_approved_sync_includes_missing_finish_date_when_safe(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 12
             payload["progress"][0]["completion_ratio"] = 0.95
             payload["progress"][0]["last_watched_at"] = "2026-03-14T22:10:00Z"
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
             upsert_series_mapping(
                 config.db_path,
                 provider="crunchyroll",
@@ -4414,15 +4414,15 @@ class DryRunPlannerTests(unittest.TestCase):
     def test_execute_approved_sync_skips_non_forward_safe_completed_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             payload = sample_snapshot()
             payload["progress"][0]["episode_number"] = 3
             payload["progress"][0]["completion_ratio"] = 0.95
             ingest_snapshot_payload(payload, config)
-            (root / "secrets").mkdir(exist_ok=True)
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
-            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
             upsert_series_mapping(
                 config.db_path,
                 provider="crunchyroll",

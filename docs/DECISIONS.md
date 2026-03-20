@@ -115,7 +115,7 @@ Use the Python-side impersonated transport as the primary Crunchyroll auth and l
 Treat repeated Crunchyroll fetches as incremental by default.
 
 ### Rules
-- Persist a local `sync_boundary.json` checkpoint under `state/crunchyroll/<profile>/` only after a successful snapshot fetch completes.
+- Persist a local `sync_boundary.json` checkpoint under the resolved runtime state tree (`.MAL-Updater/state/crunchyroll/<profile>/` by default) only after a successful snapshot fetch completes.
 - Store only lightweight leading-page markers for watch-history and watchlist, not a second shadow database.
 - On the next fetch, stop paging once a previously seen marker appears in the current page; keep the current page, but do not keep walking older pages.
 - If the stored boundary belongs to a different Crunchyroll account, ignore it.

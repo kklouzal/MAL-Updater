@@ -16,7 +16,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/install_user_systemd_units.sh [options]
 
-Install or update the repo-owned user-level systemd units for MAL-Updater.
+Render and install the repo-owned user-level systemd units for MAL-Updater.
 
 Options:
   --target-dir PATH           Override the systemd user unit target directory.
@@ -67,6 +67,28 @@ copy_file() {
     return 0
   fi
   install -D -m "$mode" "$source_path" "$target_path"
+}
+
+render_unit() {
+  local source_path="$1"
+  local target_path="$2"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[dry-run] render %q -> %q\n' "$source_path" "$target_path"
+    return 0
+  fi
+  python3 - "$source_path" "$target_path" "$ROOT_DIR" "$HEALTH_ENV_TARGET" <<'PY'
+from pathlib import Path
+import sys
+source_path = Path(sys.argv[1])
+target_path = Path(sys.argv[2])
+repo_root = sys.argv[3]
+health_env_target = sys.argv[4]
+text = source_path.read_text(encoding='utf-8')
+text = text.replace('__MAL_UPDATER_REPO_ROOT__', repo_root)
+text = text.replace('__MAL_UPDATER_HEALTH_ENV_FILE__', health_env_target)
+target_path.parent.mkdir(parents=True, exist_ok=True)
+target_path.write_text(text, encoding='utf-8')
+PY
 }
 
 while [[ $# -gt 0 ]]; do
@@ -136,14 +158,28 @@ unchanged_units=()
 for unit in "${UNITS[@]}"; do
   source_path="$SOURCE_DIR/$unit"
   target_path="$TARGET_DIR/$unit"
+
+  rendered_content="$(python3 - "$source_path" "$ROOT_DIR" "$HEALTH_ENV_TARGET" <<'PY'
+from pathlib import Path
+import sys
+source_path = Path(sys.argv[1])
+repo_root = sys.argv[2]
+health_env_target = sys.argv[3]
+text = source_path.read_text(encoding='utf-8')
+text = text.replace('__MAL_UPDATER_REPO_ROOT__', repo_root)
+text = text.replace('__MAL_UPDATER_HEALTH_ENV_FILE__', health_env_target)
+print(text, end='')
+PY
+)"
+
   if [[ ! -e "$target_path" ]]; then
     installed_units+=("$unit")
-  elif cmp -s "$source_path" "$target_path"; then
+  elif [[ "$(cat "$target_path")" == "$rendered_content" ]]; then
     unchanged_units+=("$unit")
   else
     updated_units+=("$unit")
   fi
-  copy_file "$source_path" "$target_path"
+  render_unit "$source_path" "$target_path"
 done
 
 if [[ ${#installed_units[@]} -gt 0 ]]; then

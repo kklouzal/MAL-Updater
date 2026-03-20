@@ -1,0 +1,116 @@
+# Bootstrap / onboarding
+
+Use this when MAL-Updater is being installed, reviewed for portability, or prepared on a new OpenClaw instance.
+
+## Goal
+
+Turn this repo into a working MAL-Updater installation without storing runtime state inside the skill tree.
+
+Default runtime layout lives under the workspace root:
+- `.MAL-Updater/config/`
+- `.MAL-Updater/secrets/`
+- `.MAL-Updater/data/`
+- `.MAL-Updater/state/`
+- `.MAL-Updater/cache/`
+
+Override only when the operator explicitly wants a different layout.
+
+## First command
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
+```
+
+Use `--summary` for terse line-oriented output.
+
+## What bootstrap-audit tells you
+
+- resolved skill root, workspace root, and runtime root
+- runtime path layout
+- whether `python3`, `flock`, `systemctl`, and optional `curl_cffi` are available
+- whether MAL client id, MAL auth tokens, Crunchyroll credentials, and Crunchyroll staged auth state exist
+- whether user-level systemd automation can be installed
+- the current MAL redirect URI that the user must configure in their MAL app
+
+## Required user-facing bootstrap steps
+
+### 1. Dependency check
+
+- Require `python3`
+- Require `flock` for the wrapper scripts
+- Treat `curl_cffi` as strongly recommended for live Crunchyroll auth/fetch reliability
+- Treat `systemctl` as required only for the unattended user-systemd automation path
+
+If missing:
+- explain what is missing
+- remediate if safe and available
+- otherwise tell the user exactly what must be installed
+
+### 2. Initialize runtime dirs / DB
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli init
+```
+
+This creates the external runtime tree and SQLite database.
+
+### 3. MAL app setup
+
+The user must create a MyAnimeList app and configure the redirect URI reported by:
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli status
+```
+
+Specifically use `mal.redirect_uri`.
+
+Then store the MAL client id in the runtime secrets dir.
+
+### 4. MAL OAuth bootstrap
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
+```
+
+This persists MAL access/refresh tokens under the runtime secrets dir.
+
+### 5. Crunchyroll credentials
+
+Stage the user’s Crunchyroll username/password in the runtime secrets dir, then run:
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
+```
+
+This creates the long-lived staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.
+
+### 6. Install unattended automation if supported
+
+```bash
+cd {baseDir}
+scripts/install_user_systemd_units.sh
+```
+
+That installer renders host-specific unit files from repo templates, preserving relative repo semantics while avoiding committed hardcoded paths.
+
+## Verification sequence
+
+After bootstrap:
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
+PYTHONPATH=src python3 -m mal_updater.cli status
+PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
+```
+
+## Non-goals
+
+- Do not copy runtime state back into the repo.
+- Do not claim unattended automation is healthy unless bootstrap-audit/status/health-check all agree.
+- Do not invent an installer outside the documented bootstrap flow.

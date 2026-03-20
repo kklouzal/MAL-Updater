@@ -5,6 +5,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=-%h/.config/mal-updater-health-check.env
-WorkingDirectory=<repo-root>
-ExecStart=<repo-root>/scripts/run_health_check_cycle.sh
+EnvironmentFile=-__MAL_UPDATER_HEALTH_ENV_FILE__
+WorkingDirectory=__MAL_UPDATER_REPO_ROOT__
+ExecStart=__MAL_UPDATER_REPO_ROOT__/scripts/run_health_check_cycle.sh

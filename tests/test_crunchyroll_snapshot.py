@@ -43,7 +43,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
     def test_authorized_json_get_recovers_401_by_refreshing_access_token(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             session = self._build_session(root)
             calls: list[str] = []
 
@@ -79,7 +79,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
     def test_authorized_json_get_falls_back_to_credentials_when_refresh_recovery_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             session = self._build_session(root)
             calls: list[str] = []
 
@@ -98,8 +98,8 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
                 mock_login.return_value = CrunchyrollBootstrapResult(
                     profile="default",
                     locale="en-US",
-                    username_path=root / "secrets" / "crunchyroll_username.txt",
-                    password_path=root / "secrets" / "crunchyroll_password.txt",
+                    username_path=root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt",
+                    password_path=root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt",
                     refresh_token_path=session.state_paths.refresh_token_path,
                     device_id_path=session.state_paths.device_id_path,
                     session_state_path=session.state_paths.session_state_path,
@@ -123,7 +123,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
     def test_authorized_json_get_stops_cleanly_after_refresh_and_credential_retry_are_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             session = self._build_session(root)
             calls: list[tuple[str, dict[str, object] | None]] = []
 
@@ -147,8 +147,8 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
                 mock_login.return_value = CrunchyrollBootstrapResult(
                     profile="default",
                     locale="en-US",
-                    username_path=root / "secrets" / "crunchyroll_username.txt",
-                    password_path=root / "secrets" / "crunchyroll_password.txt",
+                    username_path=root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt",
+                    password_path=root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt",
                     refresh_token_path=session.state_paths.refresh_token_path,
                     device_id_path=session.state_paths.device_id_path,
                     session_state_path=session.state_paths.session_state_path,
@@ -241,7 +241,7 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
     def test_fetch_snapshot_recovers_watch_history_401_via_refresh_then_completes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             session = self._build_session(root)
             calls: list[tuple[str, str, dict[str, object] | None]] = []
             history_page = [self._history_entry(1)]
@@ -329,7 +329,7 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
     def test_fetch_snapshot_uses_incremental_boundary_to_stop_history_and_watchlist_early(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             session = self._build_session(root)
 
             previous_history = [self._history_entry(500), self._history_entry(499)]
@@ -375,7 +375,7 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
     def test_fetch_snapshot_full_refresh_ignores_existing_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             session = self._build_session(root)
 
             previous_history = [self._history_entry(500)]

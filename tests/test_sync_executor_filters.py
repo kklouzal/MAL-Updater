@@ -17,7 +17,7 @@ class SyncExecutorFilterTests(unittest.TestCase):
     def test_exact_approved_only_skips_non_exact_approved_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             bootstrap_database(config.db_path)
             ingest_snapshot_payload(sample_snapshot(), config)
@@ -41,7 +41,7 @@ class SyncExecutorFilterTests(unittest.TestCase):
     def test_exact_approved_only_allows_auto_exact_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             bootstrap_database(config.db_path)
             ingest_snapshot_payload(sample_snapshot(), config)
@@ -75,7 +75,7 @@ class SyncExecutorFilterTests(unittest.TestCase):
     def test_dry_run_sync_keeps_going_when_one_mal_detail_lookup_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             bootstrap_database(config.db_path)
             ingest_snapshot_payload(sample_snapshot(), config)
@@ -103,7 +103,7 @@ class SyncExecutorFilterTests(unittest.TestCase):
     def test_execute_sync_keeps_going_when_mal_detail_lookup_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             bootstrap_database(config.db_path)
             ingest_snapshot_payload(sample_snapshot(), config)

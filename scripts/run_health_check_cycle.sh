@@ -2,9 +2,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCK_DIR="$ROOT_DIR/state/locks"
-LOG_DIR="$ROOT_DIR/state/logs"
-HEALTH_DIR="$ROOT_DIR/state/health"
+cd "$ROOT_DIR"
+
+eval "$(PYTHONPATH=src python3 - <<'PY'
+from shlex import quote
+from mal_updater.config import load_config
+config = load_config()
+print(f"RUNTIME_ROOT={quote(str(config.runtime_root))}")
+print(f"LOCK_DIR={quote(str(config.state_dir / 'locks'))}")
+print(f"LOG_DIR={quote(str(config.state_dir / 'logs'))}")
+print(f"HEALTH_DIR={quote(str(config.state_dir / 'health'))}")
+PY
+)"
+
 LOCK_FILE="$LOCK_DIR/health-check.lock"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="$LOG_DIR/health-check-$STAMP.log"
@@ -32,13 +42,13 @@ run_health_check() {
 
 echo "[$(date -Is)] starting MAL-Updater health-check cycle"
 echo "root=$ROOT_DIR"
+echo "runtime_root=$RUNTIME_ROOT"
 echo "log=$RUN_LOG"
 echo "health_json=$RUN_JSON"
 echo "stale_hours=$STALE_HOURS"
 echo "auto_run_recommended=$AUTO_RUN_RECOMMENDED"
 echo "auto_run_reason_codes=$AUTO_RUN_REASON_CODES"
 
-cd "$ROOT_DIR"
 PYTHONPATH=src python3 -m mal_updater.cli init >/dev/null
 run_health_check
 

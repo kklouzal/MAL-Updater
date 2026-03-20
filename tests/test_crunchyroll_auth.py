@@ -29,9 +29,9 @@ class CrunchyrollAuthTests(unittest.TestCase):
     def test_load_crunchyroll_credentials_reads_secret_file_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "secrets").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [secret_files]
@@ -41,23 +41,23 @@ class CrunchyrollAuthTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / "secrets" / "custom_username.txt").write_text("user@example.com\n", encoding="utf-8")
-            (root / "secrets" / "custom_password.txt").write_text("hunter2\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "custom_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "custom_password.txt").write_text("hunter2\n", encoding="utf-8")
 
             credentials = load_crunchyroll_credentials(load_config(root))
 
             self.assertEqual(credentials.username, "user@example.com")
             self.assertEqual(credentials.password, "hunter2")
-            self.assertEqual(credentials.username_path, (root / "secrets" / "custom_username.txt").resolve())
-            self.assertEqual(credentials.password_path, (root / "secrets" / "custom_password.txt").resolve())
+            self.assertEqual(credentials.username_path, (root / ".MAL-Updater" / "secrets" / "custom_username.txt").resolve())
+            self.assertEqual(credentials.password_path, (root / ".MAL-Updater" / "secrets" / "custom_password.txt").resolve())
 
     def test_crunchyroll_login_with_credentials_persists_refresh_token_and_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "secrets").mkdir()
-            (root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
-            (root / "secrets" / "crunchyroll_password.txt").write_text("pw-123\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt").write_text("pw-123\n", encoding="utf-8")
             config = load_config(root)
 
             with patch("mal_updater.crunchyroll_auth._http_post") as mock_post, patch(
@@ -98,10 +98,10 @@ class CrunchyrollAuthTests(unittest.TestCase):
     def test_crunchyroll_login_with_credentials_records_failure_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "secrets").mkdir()
-            (root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
-            (root / "secrets" / "crunchyroll_password.txt").write_text("pw-123\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt").write_text("pw-123\n", encoding="utf-8")
             config = load_config(root)
 
             with patch("mal_updater.crunchyroll_auth._http_post") as mock_post:

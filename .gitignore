@@ -5,12 +5,12 @@ __pycache__/
 *.sqlite3
 *.db
 *.log
+.MAL-Updater/
 config/settings.toml
-secrets/*
-!secrets/README.md
+cache/
 data/
 state/
-cache/
+secrets/
 node_modules/
 target/
 1/

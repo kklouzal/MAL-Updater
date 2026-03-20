@@ -9,7 +9,10 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+import importlib.util
+import platform
 import re
+import shutil
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
 from .config import ensure_directories, load_config, load_mal_secrets
@@ -56,8 +59,10 @@ def _cmd_init(project_root: Path | None) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
-    print(f"Initialized MAL-Updater scaffold at {config.project_root}")
-    print(f"SQLite database: {config.db_path}")
+    print(f"project_root={config.project_root}")
+    print(f"workspace_root={config.workspace_root}")
+    print(f"runtime_root={config.runtime_root}")
+    print(f"db_path={config.db_path}")
     return 0
 
 
@@ -67,6 +72,8 @@ def _cmd_status(project_root: Path | None) -> int:
     crunchyroll_credentials = load_crunchyroll_credentials(config)
     crunchyroll_state = resolve_crunchyroll_state_paths(config)
     print(f"project_root={config.project_root}")
+    print(f"workspace_root={config.workspace_root}")
+    print(f"runtime_root={config.runtime_root}")
     print(f"settings_path={config.settings_path}")
     print(f"config_dir={config.config_dir}")
     print(f"secrets_dir={config.secrets_dir}")
@@ -108,6 +115,145 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.client_secret_path={secrets.client_secret_path}")
     print(f"mal.access_token_path={secrets.access_token_path}")
     print(f"mal.refresh_token_path={secrets.refresh_token_path}")
+    return 0
+
+
+def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
+    config = load_config(project_root)
+    secrets = load_mal_secrets(config)
+    crunchyroll_credentials = load_crunchyroll_credentials(config)
+    crunchyroll_state = resolve_crunchyroll_state_paths(config)
+
+    dependency_checks = {
+        "python3": shutil.which("python3") is not None,
+        "systemctl": shutil.which("systemctl") is not None,
+        "flock": shutil.which("flock") is not None,
+        "curl_cffi": importlib.util.find_spec("curl_cffi") is not None,
+    }
+    missing_dependencies = [name for name, present in dependency_checks.items() if not present]
+
+    onboarding_steps: list[dict[str, object]] = []
+    if not dependency_checks["python3"]:
+        onboarding_steps.append(
+            {
+                "step": "install-python",
+                "status": "missing",
+                "user_action_required": True,
+                "details": "Install Python 3.10+ so the mal-updater console script and CLI can run.",
+            }
+        )
+    if not dependency_checks["curl_cffi"]:
+        onboarding_steps.append(
+            {
+                "step": "install-optional-crunchyroll-transport",
+                "status": "missing",
+                "user_action_required": False,
+                "details": "Install the optional crunchyroll extra (`pip install -e '.[crunchyroll]'`) for browser-TLS impersonation against Crunchyroll.",
+            }
+        )
+
+    if not secrets.client_id:
+        onboarding_steps.append(
+            {
+                "step": "create-mal-app",
+                "status": "missing",
+                "user_action_required": True,
+                "details": f"Create a MyAnimeList API app and record its client id at {secrets.client_id_path}. Configure redirect URI {config.mal.redirect_uri} in the MAL app settings.",
+            }
+        )
+    if not secrets.access_token or not secrets.refresh_token:
+        onboarding_steps.append(
+            {
+                "step": "complete-mal-oauth",
+                "status": "missing",
+                "user_action_required": True,
+                "details": "Run `mal-updater mal-auth-login` after the MAL app exists so the skill can persist access and refresh tokens.",
+            }
+        )
+    if not crunchyroll_credentials.username or not crunchyroll_credentials.password:
+        onboarding_steps.append(
+            {
+                "step": "stage-crunchyroll-credentials",
+                "status": "missing",
+                "user_action_required": True,
+                "details": f"Store Crunchyroll credentials at {crunchyroll_credentials.username_path} and {crunchyroll_credentials.password_path}.",
+            }
+        )
+    if not crunchyroll_state.refresh_token_path.exists():
+        onboarding_steps.append(
+            {
+                "step": "bootstrap-crunchyroll-session",
+                "status": "missing",
+                "user_action_required": False,
+                "details": "Run `mal-updater crunchyroll-auth-login` to mint and stage the long-lived Crunchyroll refresh token/device id pair.",
+            }
+        )
+    if not dependency_checks["systemctl"]:
+        onboarding_steps.append(
+            {
+                "step": "install-service-manager",
+                "status": "missing",
+                "user_action_required": True,
+                "details": "systemctl is unavailable; install/enable a compatible service manager or plan to run the wrapper scripts manually.",
+            }
+        )
+
+    payload = {
+        "project_root": str(config.project_root),
+        "workspace_root": str(config.workspace_root),
+        "runtime_root": str(config.runtime_root),
+        "settings_path": str(config.settings_path),
+        "runtime_paths": {
+            "config_dir": str(config.config_dir),
+            "secrets_dir": str(config.secrets_dir),
+            "data_dir": str(config.data_dir),
+            "state_dir": str(config.state_dir),
+            "cache_dir": str(config.cache_dir),
+            "db_path": str(config.db_path),
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+        },
+        "dependencies": {
+            "checks": dependency_checks,
+            "missing": missing_dependencies,
+        },
+        "credentials": {
+            "mal_client_id_present": bool(secrets.client_id),
+            "mal_access_token_present": bool(secrets.access_token),
+            "mal_refresh_token_present": bool(secrets.refresh_token),
+            "crunchyroll_username_present": bool(crunchyroll_credentials.username),
+            "crunchyroll_password_present": bool(crunchyroll_credentials.password),
+            "crunchyroll_refresh_token_present": crunchyroll_state.refresh_token_path.exists(),
+            "crunchyroll_device_id_present": crunchyroll_state.device_id_path.exists(),
+        },
+        "services": {
+            "installer_script": str(config.project_root / "scripts" / "install_user_systemd_units.sh"),
+            "service_manager_available": dependency_checks["systemctl"],
+            "systemd_units_are_generated": True,
+        },
+        "mal": {
+            "redirect_uri": config.mal.redirect_uri,
+            "bind_host": config.mal.bind_host,
+            "redirect_host": config.mal.redirect_host,
+            "redirect_port": config.mal.redirect_port,
+        },
+        "onboarding_steps": onboarding_steps,
+        "ready": not onboarding_steps and not missing_dependencies,
+    }
+
+    if summary_only:
+        print(f"ready={payload['ready']}")
+        print(f"runtime_root={config.runtime_root}")
+        print(f"settings_path={config.settings_path}")
+        if missing_dependencies:
+            print("missing_dependencies=" + ", ".join(missing_dependencies))
+        for item in onboarding_steps:
+            print(f"next_step={item['step']}: {item['details']}")
+        return 0
+
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 
@@ -314,6 +460,13 @@ def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
 
 
 
+def _render_systemd_unit_template(source_path: Path, project_root: Path, health_env_path: Path) -> str:
+    text = source_path.read_text(encoding="utf-8")
+    return text.replace("__MAL_UPDATER_REPO_ROOT__", str(project_root)).replace(
+        "__MAL_UPDATER_HEALTH_ENV_FILE__", str(health_env_path)
+    )
+
+
 def _build_automation_installation_status(project_root: Path) -> dict[str, object] | None:
     source_dir = project_root / "ops" / "systemd-user"
     script_path = project_root / "scripts" / "install_user_systemd_units.sh"
@@ -348,7 +501,8 @@ def _build_automation_installation_status(project_root: Path) -> dict[str, objec
         wants_path = None
         if installed:
             try:
-                content_matches_repo = source_path.read_text(encoding="utf-8") == target_path.read_text(encoding="utf-8")
+                rendered_source = _render_systemd_unit_template(source_path, project_root, env_path)
+                content_matches_repo = rendered_source == target_path.read_text(encoding="utf-8")
             except OSError:
                 content_matches_repo = False
         if name.endswith(".timer"):
@@ -422,6 +576,7 @@ def _build_health_maintenance_commands(
     latest_completed_sync_run: dict[str, object] | None,
     latest_completed_age_seconds: float | None,
     stale_hours: float,
+    snapshot_output_path: Path,
     partial_sync_coverage: dict[str, object] | None = None,
     mapping_coverage: dict[str, object] | None = None,
     mapping_coverage_threshold: float | None = None,
@@ -485,7 +640,7 @@ def _build_health_maintenance_commands(
         add_command(
             "refresh_full_snapshot",
             "Run a full-refresh Crunchyroll ingest so untouched older rows are refreshed instead of only the incremental overlap page",
-            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", "cache/live-crunchyroll-snapshot.json", "--ingest"],
+            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", str(snapshot_output_path), "--ingest"],
             automation_safe=True,
             requires_auth_interaction=False,
         )
@@ -493,7 +648,7 @@ def _build_health_maintenance_commands(
         add_command(
             "refresh_ingested_snapshot",
             "Fetch a fresh Crunchyroll snapshot and ingest it so health state is current again",
-            ["crunchyroll-fetch-snapshot", "--out", "cache/live-crunchyroll-snapshot.json", "--ingest"],
+            ["crunchyroll-fetch-snapshot", "--out", str(snapshot_output_path), "--ingest"],
             automation_safe=True,
             requires_auth_interaction=False,
         )
@@ -968,6 +1123,7 @@ def _cmd_health_check(
         latest_completed_sync_run=latest_completed_sync_run if isinstance(latest_completed_sync_run, dict) else None,
         latest_completed_age_seconds=latest_completed_age_seconds,
         stale_hours=stale_hours,
+        snapshot_output_path=Path(os.path.relpath(config.cache_dir / "live-crunchyroll-snapshot.json", config.project_root)),
         partial_sync_coverage=partial_sync_coverage,
         mapping_coverage=mapping_coverage,
         mapping_coverage_threshold=mapping_coverage_threshold,
@@ -3351,8 +3507,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mal-updater")
     parser.add_argument("--project-root", type=Path, default=None, help="Override project root")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("init", help="Create local dirs and initialize SQLite schema")
-    subparsers.add_parser("status", help="Print resolved config, paths, and secret presence")
+    subparsers.add_parser("init", help="Create the externalized runtime dirs and initialize SQLite schema")
+    subparsers.add_parser("status", help="Print resolved config, runtime paths, and secret presence")
+    bootstrap_audit = subparsers.add_parser(
+        "bootstrap-audit",
+        help="Audit bootstrap/onboarding readiness: dependencies, runtime dirs, credentials, redirect settings, and service install prerequisites",
+    )
+    bootstrap_audit.add_argument("--summary", action="store_true", help="Emit terse line-oriented output instead of JSON")
     health_check = subparsers.add_parser("health-check", help="Emit a local operational health summary for auth material, snapshot freshness, mappings, and review backlog")
     health_check.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
     health_check.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present, while still printing the JSON payload")
@@ -3603,6 +3764,8 @@ def main() -> int:
         return _cmd_init(args.project_root)
     if args.command == "status":
         return _cmd_status(args.project_root)
+    if args.command == "bootstrap-audit":
+        return _cmd_bootstrap_audit(args.project_root, args.summary)
     if args.command == "health-check":
         return _cmd_health_check(
             args.project_root,

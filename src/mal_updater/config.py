@@ -30,6 +30,8 @@ DEFAULT_MAL_CLIENT_SECRET_FILE = "mal_client_secret.txt"
 DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
 DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
 DEFAULT_DB_FILE = "mal_updater.sqlite3"
+DEFAULT_RUNTIME_DIR_NAME = ".MAL-Updater"
+WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 
 
 @dataclass(slots=True)
@@ -70,6 +72,8 @@ class MalSecrets:
 @dataclass(slots=True)
 class AppConfig:
     project_root: Path
+    workspace_root: Path
+    runtime_root: Path
     settings_path: Path
     config_dir: Path
     secrets_dir: Path
@@ -91,6 +95,29 @@ def _resolve_from(base_dir: Path, raw_value: str | Path) -> Path:
     if not path.is_absolute():
         path = base_dir / path
     return path.resolve()
+
+
+def _discover_workspace_root(project_root: Path) -> Path:
+    env_override = os.getenv("MAL_UPDATER_WORKSPACE_DIR") or os.getenv("OPENCLAW_WORKSPACE_DIR")
+    if env_override:
+        return _resolve_from(Path.cwd(), env_override)
+
+    for candidate in (project_root, *project_root.parents):
+        for marker in WORKSPACE_MARKER_FILES:
+            if (candidate / marker).exists():
+                return candidate.resolve()
+
+    if project_root.parent.name == "skills" and project_root.parent.parent.exists():
+        return project_root.parent.parent.resolve()
+
+    return project_root.resolve()
+
+
+def _default_runtime_root(workspace_root: Path) -> Path:
+    env_override = os.getenv("MAL_UPDATER_RUNTIME_ROOT")
+    if env_override:
+        return _resolve_from(Path.cwd(), env_override)
+    return (workspace_root / DEFAULT_RUNTIME_DIR_NAME).resolve()
 
 
 def _get_table(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -206,8 +233,9 @@ def _read_secret_file(path: Path) -> str | None:
 
 def load_config(project_root: Path | None = None) -> AppConfig:
     root = (project_root or Path(__file__).resolve().parents[2]).resolve()
-
-    default_config_dir = (root / "config").resolve()
+    workspace_root = _discover_workspace_root(root)
+    runtime_root = _default_runtime_root(workspace_root)
+    default_config_dir = (runtime_root / "config").resolve()
     settings_path = _resolve_from(
         Path.cwd(),
         os.getenv("MAL_UPDATER_SETTINGS_PATH", str(default_config_dir / "settings.toml")),
@@ -225,35 +253,35 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         paths_section,
         "config_dir",
         base_dir=settings_dir,
-        default=root / "config",
+        default=runtime_root / "config",
     )
     secrets_dir = _resolve_path_setting(
         "MAL_UPDATER_SECRETS_DIR",
         paths_section,
         "secrets_dir",
         base_dir=settings_dir,
-        default=root / "secrets",
+        default=runtime_root / "secrets",
     )
     data_dir = _resolve_path_setting(
         "MAL_UPDATER_DATA_DIR",
         paths_section,
         "data_dir",
         base_dir=settings_dir,
-        default=root / "data",
+        default=runtime_root / "data",
     )
     state_dir = _resolve_path_setting(
         "MAL_UPDATER_STATE_DIR",
         paths_section,
         "state_dir",
         base_dir=settings_dir,
-        default=root / "state",
+        default=runtime_root / "state",
     )
     cache_dir = _resolve_path_setting(
         "MAL_UPDATER_CACHE_DIR",
         paths_section,
         "cache_dir",
         base_dir=settings_dir,
-        default=root / "cache",
+        default=runtime_root / "cache",
     )
     db_path = _resolve_path_setting(
         "MAL_UPDATER_DB_PATH",
@@ -264,6 +292,8 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     )
     app_config = AppConfig(
         project_root=root,
+        workspace_root=workspace_root,
+        runtime_root=runtime_root,
         settings_path=settings_path,
         config_dir=config_dir,
         secrets_dir=secrets_dir,
@@ -370,5 +400,5 @@ def load_mal_secrets(config: AppConfig) -> MalSecrets:
 
 
 def ensure_directories(config: AppConfig) -> None:
-    for path in (config.config_dir, config.secrets_dir, config.data_dir, config.state_dir, config.cache_dir):
+    for path in (config.runtime_root, config.config_dir, config.secrets_dir, config.data_dir, config.state_dir, config.cache_dir):
         path.mkdir(parents=True, exist_ok=True)

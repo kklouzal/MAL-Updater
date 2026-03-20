@@ -87,7 +87,7 @@ class IngestionTests(unittest.TestCase):
     def test_ingest_snapshot_payload_writes_rows_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
 
             summary = ingest_snapshot_payload(sample_snapshot(), config)

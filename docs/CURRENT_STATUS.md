@@ -1,159 +1,26 @@
 # Current Status
 
+## Repository / packaging state
+
+- The repo is now treated as the canonical skill package (`SKILL.md` at repo root).
+- Runtime state is externalized to `.MAL-Updater/` by default instead of living under the repo tree.
+- The bootstrap/onboarding surface now starts with `bootstrap-audit`.
+- Repo-owned systemd units are committed as portable templates and rendered at install time by `scripts/install_user_systemd_units.sh`.
+
 ## Working today
 
 - Python worker/application exists
-- versioned normalized snapshot contract exists
-- SQLite bootstrap + initial schema exist
-- local config/secrets/data directory conventions exist
-- MAL OAuth flow is working end-to-end:
-  - auth URL generation
-  - callback listener
-  - LAN callback reception on the Orin
-  - token exchange
-  - token persistence
-  - `/users/@me` verification
-- Python-side Crunchyroll credential bootstrap exists:
-  - reads local `secrets/crunchyroll_username.txt` and `secrets/crunchyroll_password.txt`
-  - stages `state/crunchyroll/<profile>/refresh_token.txt`
-  - stages matching `device_id.txt`
-  - updates `session.json`
-  - exposes `crunchyroll-auth-login` in the CLI
-- Python-side live Crunchyroll snapshot fetching exists:
-  - refreshes the staged Crunchyroll token through the Python transport
-  - uses browser-TLS impersonation when optional `curl_cffi` is installed
-  - fetches `GET /accounts/v1/me`, `GET /content/v2/{account_id}/watch-history`, and `GET /content/v2/discover/{account_id}/watchlist`
-  - normalizes the live responses into the existing `1.0` snapshot contract
-  - exposes `crunchyroll-fetch-snapshot` in the CLI, with optional direct ingestion
-  - now treats Crunchyroll `401` responses as auth-state failures instead of terminal fetch failures: one fresh credential rebootstrap is attempted from the staged local secrets, then the snapshot fetch is retried once and stops there
-  - now persists an incremental `sync_boundary.json` checkpoint under `state/crunchyroll/<profile>/` after successful fetches and uses it on later runs to stop history/watchlist paging once already-seen overlap is reached; `--full-refresh` bypasses that checkpoint deliberately
-- the Python fetch path has produced real live Crunchyroll data on this host
-- a live snapshot was validated and ingested into SQLite with:
-  - `series_count=245`
-  - `progress_count=4311`
-  - `watchlist_count=197`
-- the Crunchyroll watchlist path was corrected to use the provider's actual pagination shape (`n` + `start`) instead of assuming page/page_size semantics; the prior `watchlist_count=10` was incomplete
+- SQLite bootstrap + migrations exist
+- Crunchyroll auth bootstrap and live snapshot fetch exist
+- MAL OAuth and guarded MAL apply exist
+- mapping review / queue triage workflows exist
+- health-check and unattended wrapper scripts exist
+- recommendation generation and metadata refresh exist
+- tests remain bundled in the repo for third-party auditing
 
-## Not implemented yet
+## Open work
 
-- broad unattended/full-fidelity MAL sync beyond the first narrow exact-approved cadence
-- richer metadata/taste-model recommendation work beyond the first local alert engine
-- fully wired OpenClaw skill integration beyond the first in-repo wrapper scaffold/package
-
-## Newly added downstream progress
-
-- MAL-side search + candidate scoring exists on top of the ingested Crunchyroll SQLite dataset
-- the Python CLI exposes:
-  - `map-series`
-  - `review-mappings`
-  - `list-mappings`
-  - `approve-mapping`
-  - `dry-run-sync`
-  - `list-review-queue`
-  - `apply-sync`
-- `map-series` reports conservative mapping confidence (`exact`, `strong`, `ambiguous`, `weak`, `no_candidates`) instead of silently persisting guesses
-- mapping now leans on deeper Crunchyroll evidence when available: explicit season-title/season-number cues, generic `Season N` / `Part N` / `Nth Cour` / `Final Season` query expansion, installment-hint matching (`Season 2`, `Second Season`, roman numerals, parts, cours, shared split indexes, `Final Season`), and episode-count evidence can break ties between similarly named seasons/sequels
-- exact-title logic is stricter than the similarity scorer on purpose: it still strips dub noise, but it no longer collapses installment-bearing titles like `Part 1` vs `Part 2` into the same "exact" match
-- exact-title base-series TV matches now also recover from two common residue shapes that were still wasting operator time: when the only near runner-up is explainably weaker one-off OVA/auxiliary noise, the TV candidate can still classify as safe `exact`, and when the only close TV runner-ups are non-exact same-franchise suffix variants (`S`, `T`, trailing sequel numbers, etc.) the exact base series can now still auto-approve instead of getting trapped as ambiguous sequel noise; risky OVA/ONA/special-first winners still do not get to slip through that shortcut on raw margin alone
-- provider season metadata is now treated as fallible: when Crunchyroll's `season_number` conflicts with an explicit season number inside `season_title`, the title cue wins for matching and the conflict is surfaced in rationale instead of silently trusting the provider integer
-- movie candidates are still penalized by default, but that penalty is waived when the provider season title itself is an exact movie title; this keeps collection shells like `Dragon Ball Movies` from hiding a clearly named movie match
-- `review-mappings` provides the first durable operator workflow: preserved approved mappings stay fixed, truly exact/unique season-consistent matches are auto-approved into durable `auto_exact` mappings, explicit installment conflicts block auto-approval, strong-but-not-exact suggestions are surfaced for explicit approval, weaker cases remain review-only, unresolved items can be persisted into `review_queue`, and per-series MAL search timeouts now degrade into local review residue instead of aborting the full scan
-- `approve-mapping` persists a user-approved Crunchyroll -> MAL mapping into `mal_series_mapping`
-- `dry-run-sync` prefers approved persisted mappings before falling back to live MAL search, can auto-promote the same safe exact matches into durable `auto_exact` approvals, `--approved-mappings-only` gives the safe gate for execution, and unresolved review/skip results can be persisted into `review_queue`
-- `list-review-queue` exposes the durable backlog from SQLite for operator follow-up, and `--summary` now gives a compact triage view grouped by severity/decision with top repeated reasons plus a few example rows per decision/reason; when the review payload itself lacks a usable title, those summary examples now fall back to the stored provider-series title/season title so the operator can still recognize what needs attention without opening the full row, the summary now also reports repeated title/franchise clusters, repeated decision+reason fix-strategy patterns, and repeated combined franchise+fix-strategy buckets so residue can be batched by likely family and remediation shape together, `--provider-series-id` can now jump straight to one exact Crunchyroll series row when health-check/refresh output already names the series to inspect, `--title-cluster` / `--decision` / `--reason` / `--fix-strategy` / `--cluster-strategy` can now slice the queue directly to one of those batched buckets or remediation slices for follow-up, and the summary payload now includes exact `drilldown_args` plus matching `resolve_args` snippets for those top buckets so both inspection and cleanup commands are copy/pasteable while preserving the active slice filters. The queue surface now also treats the already-emitted family buckets as first-class drilldowns: `--reason-family`, `--fix-strategy-family`, and `--cluster-strategy-family` can slice directly into normalized residue families, and the matching summary entries now expose copy/pasteable drilldown and resolve/reopen commands instead of being informational only
-- `review-queue-next` now turns that triage summary into a one-shot follow-up helper: it auto-picks the highest-signal remaining queue bucket (now preferring broader family-level combined franchise+fix-strategy buckets before the narrower exact variants when both are available), emits the exact `PYTHONPATH=src python3 -m mal_updater.cli ...` drilldown command string to run next, can preserve optional existing queue filters plus non-default `--status` while picking the next narrower bucket, and now also carries a bounded `refresh-mapping-review-queue` command for mapping-review buckets so stale persisted residue can be re-evaluated directly from the selected slice instead of only being resolved/reopened by hand
-- `review-queue-worklist` now emits a ranked short list of the next several drilldowns (default 5) using that same priority order, preserving active filters/status so a batch triage session can start from a copy/pasteable queue of follow-up commands instead of repeatedly asking for just one next bucket at a time; each selected bucket now also carries the matching status-aware queue action command, those auto-ranked helpers now surface family buckets before narrower exact slices when that batches the residue better, resolved worklists no longer suggest impossible `resolve` writes, and mapping-review worklists now also surface bounded targeted refresh commands when newer mapper heuristics may have made a persisted bucket stale
-- `review-queue-refresh-worklist` now closes the matching batch-refresh gap for mapping-review residue: it takes the top ranked stale mapping buckets from that same priority order, preserves the same optional queue scope filters (including the new family-level filters), skips overlap-only buckets that would add no new provider rows, and re-runs only those persisted rows through the latest mapper heuristics in one bounded pass instead of requiring one `refresh-mapping-review-queue --provider-series-id ...` invocation at a time
-- `review-queue-apply-worklist` now turns that ranked worklist into a bounded bulk-maintenance primitive: the top selected buckets can be resolved/reopened in one shot with a configurable `--per-bucket-limit`, family-level buckets now participate in that same ranking, and overlapping buckets dedupe row ids before the DB write so mixed cluster/fix-strategy slices do not double-touch the same residue
-- `resolve-review-queue` now closes the loop on that triage flow for single slices by marking the next matching open backlog rows as resolved from the CLI using the same scoped filters (`--decision`, `--reason`, `--title-cluster`, `--fix-strategy`, `--cluster-strategy`) plus a bounded `--limit`, so residue can be narrowed and actually cleared without dropping to ad-hoc SQL
-- `reopen-review-queue` now provides the matching recovery path when that cleanup was too aggressive or new evidence shows a resolved bucket still needs attention: filtered resolved rows can be moved back to `open` from the CLI with the same scoped filters and bounded `--limit`, and resolved `list-review-queue --summary` / `review-queue-next` output now emits those reopen actions directly instead of stale resolve commands
-- `refresh-mapping-review-queue` now gives the operator a targeted persisted-backlog repair path for stale mapping residue: specific `provider_series_id` rows can be re-run through the latest mapper heuristics and only those queue rows are refreshed/cleared, so new exact-match improvements do not require a full queue rebuild just to retire a few obsolete open entries. That refresh surface now also accepts the same queue-slice filters used by triage (`--decision`, `--reason`, `--reason-family`, `--title-cluster`, `--fix-strategy`, `--fix-strategy-family`, `--cluster-strategy`, `--cluster-strategy-family`), which means a stale bucket can be refreshed directly from its current review slice instead of first expanding the slice back into individual provider ids by hand
-- the first in-repo OpenClaw skill wrapper now exists under `skills/mal-updater/`, is valid/packageable, and documents the repo-local operator flows for status, Crunchyroll fetch/ingest, mapping review triage, guarded apply, recommendations, and test verification without duplicating sync policy outside the Python CLI; that thin wrapper is now also installed into the main OpenClaw workspace at `~/.openclaw/workspace/skills/mal-updater/` so future sessions can trigger it directly while still delegating real business logic to the repo-local CLI
-- `health-check` now gives a first operator-facing maintenance snapshot: local auth material presence, latest completed ingest age, provider row freshness/counts, mapping totals, and open review backlog are emitted as one JSON summary with a configurable stale-snapshot threshold; when backlog exists it now also surfaces the next ranked review bucket plus a configurable triage worklist, a matching `recommended_apply_worklist` batch command, and a matching `recommended_refresh_worklist` batch refresh command so maintenance output is actionable instead of just warning-only, and when auth state is present but the repo still needs a fetch/refresh step it now also emits `maintenance.recommended_commands` with copy/pasteable next-step commands (for example, a fresh `crunchyroll-fetch-snapshot --ingest` after stale or failed ingest state). `maintenance.recommended_command` / `maintenance.recommended_automation_command` now preselect the top overall repair and the first non-interactive safe repair separately so summary output and wrappers do not have to guess, and missing, outdated, installed-but-not-enabled, or miswired repo-owned user systemd automation is now ranked ahead of lower-priority mapping-backlog rebuild suggestions so unattended automation repair stops losing to secondary cleanup work. When several mapping-review slices are open, that maintenance surface now prefers the batch `review-queue-refresh-worklist` command ahead of a single-slice refresh so newer mapper heuristics can retire stale residue faster during unattended maintenance. Open `mapping_review` rows now also carry a `mapper_revision` stamp, and `health-check` warns when persisted mapping backlog was produced by older or unknown heuristics so stale residue gets refreshed before operator time is spent on outdated queue state. `--review-issue-type` can focus queue recommendations on either `mapping_review` or `sync_review`, `--strict` can make automation fail fast with exit code `2` when warnings exist without losing the JSON payload, `--format summary` now emits the same high-signal maintenance view as terse operator-facing lines and now also surfaces repo-owned automation install/update/enable hints directly (`automation_all_units_installed`, `automation_all_units_current`, `automation_all_timers_enabled`, `automation_missing_units`, `automation_outdated_units`, `automation_disabled_timers`, `automation_install_command`) when automation drift exists, maintenance recommendations now also declare whether each command is `automation_safe` or requires interactive auth so wrappers can safely auto-run only the non-interactive subset, and the health output now also detects when the latest incremental ingest only refreshed a subset of cached provider rows, warning that the local cache is only partially fresh and recommending a `--full-refresh` repair command instead of treating that partial overlap-page ingest as globally fresh; it also now warns when approved mapping coverage falls below a configurable `--mapping-coverage-threshold` (default `0.8`) and recommends a bounded `review-mappings --persist-review-queue` maintenance pass so a large unmapped Crunchyroll residue can no longer hide behind an empty queue while still leaving durable follow-up rows behind. That full-refresh repair still takes precedence over the weaker incremental refresh recommendation so auto-remediation wrappers do not burn a cycle on the wrong fetch shape first
-- `scripts/run_health_check_cycle.sh` now wraps that snapshot into a recurring maintenance primitive: it acquires a lock, initializes the local directories/DB, archives the JSON payload under `state/health/`, refreshes `state/health/latest-health-check.json`, writes a companion run log under `state/logs/`, can optionally fail on warnings when `MAL_UPDATER_HEALTH_STRICT=1`, and can now optionally auto-run the first safe recommended maintenance command (`refresh_ingested_snapshot` / `refresh_full_snapshot` by default) before re-running health-check so the saved snapshot reflects the repaired state instead of only warning about it. That auto-remediation path now also understands direct repo-owned shell recommendations like `scripts/install_user_systemd_units.sh` instead of assuming every safe command is a Python CLI subcommand, so allowlisted automation repair can actually execute when health-check prioritizes missing/outdated/disabled user units. When a safe candidate exists but is blocked by the reason-code allowlist, the wrapper now logs that skip explicitly, the wrapper’s final operator-facing summary now surfaces `maintenance_recommended_auto_command` alongside the top overall recommendation, and auto-remediation command logging is shell-quoted so unattended logs remain copy/pasteable even when arguments gain spaces later
-- matching repo-owned user systemd units now exist under `ops/systemd-user/` so the health-check cadence can be installed alongside the exact-approved sync timer instead of living as an ad-hoc manual command, `scripts/install_user_systemd_units.sh` now provides an idempotent repo-owned installer/update path for those user units, that installer path now has direct regression coverage for dry-run output, file copy behavior, preserving an existing local health env file, and reporting which unit files were installed vs updated vs already unchanged so remediation runs are auditable, the health-check service reads an optional `~/.config/mal-updater-health-check.env` EnvironmentFile so strict mode / safe self-remediation policy can be adjusted without forking the unit, and `health-check` now also reports whether those repo-owned user units are actually installed for the current user instead of assuming the documented automation path already exists. It now also checks one more real-world false-green: enabled timers that exist on disk but are not actually active in the live user systemd runtime, surfacing both `automation_timers_inactive` in JSON and `automation_inactive_timers` / `automation_timer_runtime` in summary output so operators can see next/last trigger timing without leaving the CLI, and that runtime probe now parses `systemctl show` key/value output by property name instead of assuming the returned line order matches the requested property order, which prevents false inactive-timer warnings on hosts where systemd reorders the fields
-- MAL client traffic is now rate-shaped locally at roughly `1.0 ± 0.2s` between requests by default, and timeout-prone reads/writes get one bounded retry before the caller turns the failure into normal review/error residue
-- `apply-sync` is the first guarded live-write path:
-  - only consumes durably approved mappings (`user_approved` or safe `auto_exact`)
-  - revalidates live MAL state immediately before acting
-  - only applies proposals that remain forward-safe
-  - never decreases MAL watched-episode counts
-  - never downgrades a `completed` MAL entry
-  - now uses explicit missing-data-only field rules:
-    - `status` is only filled when MAL has no status yet, except that an existing MAL `plan_to_watch` may be upgraded when Crunchyroll proves completed episode progress
-    - progress is only filled when the proposal is backed by completed-episode evidence; `watching + 0 episodes` proposals are suppressed entirely
-    - `score` is treated as meaningful whenever it is non-zero and is never overwritten by Crunchyroll today
-    - `start_date` is preserved because the current Crunchyroll snapshot does not prove the true first-watch date
-    - `finish_date` may be filled only when Crunchyroll safely implies completion and MAL does not already have one
-  - only sends the fields it intends to change, so meaningful existing MAL metadata is left alone
-- candidate scoring now also suppresses several noisy-but-explainable false-near-ties: sequel/spin-off entries with extra installment hints are penalized when the Crunchyroll title has no such hint, obvious auxiliary titles (`PV`, `extras`, `picture drama`, etc.) are penalized unless the provider title explicitly asks for them, single-episode `special`/`OVA` candidates are penalized harder when Crunchyroll clearly looks like a normal multi-episode mainline series, exact-title TV winners can now also auto-promote over non-exact OVA/ONA sidecars when the runner-up is only a franchise extension rather than another exact-title base match, near-identical franchise-extension candidates that only add trailing suffix material (`: Another Story`, `TV Specials`, sequel-style suffixes like trailing `R`) are now also penalized when the provider only names the base series, alpha-digit title spacing like `PERSONA5` vs `Persona 5` now normalizes cleanly so exact base matches stop getting trapped as false near-ties, lone stylized single-letter roman tokens like `X` are no longer treated as installment hints, relation-assisted expansion now also chases suffix/auxiliary residue candidates like `Shuffle! Memories` even when the provider only names the base show, while deliberately skipping plain `Season 1` TV cases so it does not promote side stories just because a base-installment label appeared in the provider title, and explicit provider season context now also penalizes non-TV sidecars/PVs that relation expansion surfaces against season-labeled mainline candidates so generic `Season 1` / `Season 2` Crunchyroll rows stop drifting toward ONA/special residue. Explicitly later-season Crunchyroll titles now also penalize base-installment candidates that do not carry later-season evidence, provider arc/subtitle embellishments like `Title: Egghead Arc` can now boost an otherwise exact base-title candidate into explainable review-ready territory without loosening auto-approval, pipe/em-dash subtitle variants now reuse the same base-title fallback search path instead of missing obvious franchise hits, parenthetical non-installment aliases like `Title (English Alias)` now reuse that same conservative base-title trim instead of staying trapped as weak substring matches, split-specific installment matches can now auto-promote over otherwise tied broader same-season TV candidates when only the top result actually carries the provider’s part/cour-style evidence, and `max_episode_number > MAL num_episodes` is no longer treated as a full contradiction when explicit later-season installment hints match and the Crunchyroll completed-episode count still fits inside the candidate cleanly (`aggregated_episode_numbering_suspected`). When the provider still presents a season-sized TV match whose episode evidence only makes sense as a small multi-entry MAL bundle, the mapper now preserves review mode, adds an explicit `multi_entry_bundle_suspected=` rationale so those residue rows cluster honestly instead of looking like generic raw episode-count contradictions, recognizes both exact-title base rows and explicit later-season installment winners, now recognizes small three-entry split bundles in addition to the earlier two-entry case, also recovers lower-scoring same-franchise later-season companions when they still share the same title family plus installment evidence, ignores higher-scoring OVA/recap sidecar noise when selecting those suspected bundle companions, and carries both the strongest suspected companion candidate plus the full suspected companion set through mapping-review/CLI output so the likely bundle shape is visible without manual runner-up reconstruction
-- live Crunchyroll evidence is now feeding the completion policy directly:
-  - strict ratio completion defaults to `0.95`
-  - episodes with `<= 120s` remaining count as watched to cover the dominant credits-skip pattern seen in the dataset
-  - episodes in the `0.85-0.95` band also count when a later episode in the same series was watched afterwards
-  - progress is deduplicated by `episode_number` when available so alternate dub/sub variants do not inflate MAL watched counts
-- the first local recommendation pass now exists via `recommend`:
-  - surfaces dubbed-episode alerts only when there is a **contiguous tail gap** beyond completed progress, which suppresses many skipped-episode/progress-artifact false positives
-  - now splits stale tail gaps into a separate `resume_backlog` lane so old backlog is no longer mislabeled as a fresh episode alert, and the `fresh_dubbed_episodes` lane is now capped to roughly the last 3 weeks of watch activity instead of keeping month-old backlog-ish gaps in the "fresh" bucket
-  - surfaces dubbed later-season availability when an earlier franchise season appears completed locally
-  - sequel/installment hints stay deliberately conservative: bare `Part N` wording only counts as later-season evidence when the same title text also carries explicit season-style wording such as `Season 2`, `Second Season`, or `Final Season Part 2`
-  - now has a local MAL metadata/relation cache plus `recommend-refresh-metadata`, so continuation detection can progressively lean on real MAL relation edges instead of title grouping alone when cache coverage exists
-  - now also has a first graph-backed `discovery_candidate` lane fed by cached MAL user-recommendation edges with convergence scoring across watched/mapped seed titles
-  - `recommend-refresh-metadata` can now optionally hydrate top discovery-target metadata (including `my_list_status`) so discovery suggestions can suppress titles that are already somewhere on the MAL list
-  - discovery candidates now also get small cached genre-overlap, studio-overlap, **and source-material-overlap** bias/reasons against the watched seed set when MAL metadata is present, so equal graph hits can lean a bit more toward demonstrated taste instead of only raw vote/popularity signals
-  - discovery candidates now suppress direct same-franchise MAL relation targets (`sequel`, `prequel`, `side_story`, etc.) from watched seed titles, and that suppression now applies globally across the watched seed set instead of only when the same seed emitted the recommendation edge; this keeps the discovery lane closer to novel finds instead of recycling franchise-adjacent follow-ons through cross-seed graph paths
-  - discovery candidates also suppress targets whose MAL title/aliases already match something in the current Crunchyroll catalog, preventing rediscovery noise for titles that are already locally present but not mapped yet
-  - when `recommend-refresh-metadata --include-discovery-targets` is limited, discovery-target hydration now prioritizes aggregate multi-seed support first (support count, then summed recommendation votes) instead of just whichever target happened to have the single largest edge
-  - recommendation CLI output is now grouped into category sections (`continue_next`, `fresh_dubbed_episodes`, `discovery_candidates`, `resume_backlog`) by default, with `--flat` retained for legacy single-list JSON consumers
-  - episode alerts now rank with stronger recency and `in_progress` bias instead of mostly alphabetical tie behavior
-  - sync planning now carries a `completion_audit` payload so dry-run/review output can show how completed-episode counts were derived (`ratio_threshold`, `credits_window`, `later_episode_evidence`) plus a few concrete episode examples for debugging borderline cases
-  - stays local/read-only and does not pretend to do a finished taste-model yet
-
-## Current Crunchyroll state
-
-The practical live Crunchyroll path has worked on this machine, but is not fully stable yet.
-
-What was verified locally:
-
-- Crunchyroll username/password secrets are staged locally
-- Python credential login can mint a real refresh token when using browser-like TLS impersonation (`curl_cffi`)
-- the minted refresh token also refreshes successfully through the same Python impersonated transport
-- the Python fetch path can retrieve real live Crunchyroll data on this host and normalize it honestly
-- validated live snapshots ingest cleanly into SQLite
-- the first real guarded exact-approved MAL apply run was executed against the latest successfully ingested live Crunchyroll dataset on 2026-03-15:
-  - 179 exact-approved mappings considered
-  - 126 MAL entries updated successfully
-  - applied status mix: 78 `completed`, 36 `watching`, 12 `plan_to_watch`
-  - 46 entries were skipped by the forward-safe rules
-  - 7 entries remained unapplied due to recoverable live API issues (6 MAL detail timeouts, 1 MAL update redirect/error)
-- latest live mapping audit over the current 245-series Crunchyroll dataset now lands at:
-  - `83` preserved already-approved mappings
-  - `85` fresh safe `auto_exact` mappings
-  - `13` `ready_for_approval` suggestions
-  - `64` unresolved review items
-- that means `168 / 245` series are now durably auto-approvable/preserved without human intervention, versus `156 / 245` before the latest rule pass
-- the remaining review residue is now concentrated in a few honest buckets: same-franchise low-margin ties, aggregated-episode-count conflicts across multi-cour/combined Crunchyroll entries, weak MAL search/alt-title gaps, and movie/collection shells where the title is clear but provider episode evidence still spans more than one MAL entry
-
-Current blocker note: a fresh live Crunchyroll fetch is presently failing reproducibly at `watch-history` with HTTP 401 even after a fresh credential-based re-login. The new incremental boundary should reduce how often later pages are needed on repeated successful runs, but it does **not** eliminate the need for `watch-history` to survive long enough to return at least the overlap page. So the latest successful exact-approved MAL apply still had to run from the most recent already-ingested real live snapshot (`sync_runs.id=5`, 245 series / 4311 progress / 197 watchlist) rather than from a brand-new fetch.
-
-That means the remaining work is now split between: (1) re-stabilizing the fresh Crunchyroll fetch path, and (2) continuing downstream sync-policy hardening, review UX, and recommendation work.
-
-## Next practical milestone
-
-The maintenance lane is now in a good enough state to treat as baseline: the health-check/automation surface, wrapper scripts, repo-owned user systemd units, and their regression coverage are all in place. The current full stdlib regression suite is also green at `221` tests as of 2026-03-20, so the next development passes should rotate back toward the more underdeveloped product work instead of spending more cycles polishing automation glue.
-
-Keep reducing the genuinely ambiguous mapping residue on top of the now-live local Crunchyroll dataset:
-- better review resolution UX for the remaining hard buckets
-- targeted handling for subtitle/arc-title variants and franchise/movie collection naming that still need human review when the provider title is not explicit enough
-- continue tightening same-franchise low-margin ties with explainable canonical-entry cues (today: auxiliary/special penalties are stronger when Crunchyroll clearly looks like the main multi-episode series)
-- continue decomposing combined Crunchyroll entries more honestly for split-cour / multi-season / movie-shell cases (today: aggregate numbering is softened when explicit installment cues align and only the raw numbering looks inflated, exact-title one-shot movie/prologue sidecars no longer get to outrank the real multi-episode TV bundle when the provider evidence clearly describes a season-sized row, and explicit later-season winners can now also surface `multi_entry_bundle_suspected` companions when Crunchyroll appears to have merged the next season-sized slice into the same row)
-- investigate episode-title matching only if a trustworthy episode-metadata source can be used without turning the mapper into an opaque scraper; the current official MAL API surface does not expose episode-title data directly enough to justify pretending this is solved
-- separately, the live Crunchyroll `watch-history` HTTP 401 regression still blocks a truly fresh upstream dataset refresh, so fetch-path restabilization remains the other major high-impact branch when round-robining away from mapper residue
-
-- the first recurring local automation path now exists:
-  - wrapper: `scripts/run_exact_approved_sync_cycle.sh`
-  - scope: fetch + ingest + `apply-sync --limit 0 --exact-approved-only --execute`
-  - overlap guard: `flock` lock file under `state/locks/`
-  - logs: `state/logs/`
-  - user-level systemd units checked in under `ops/systemd-user/` for a persistent jittered ~8-hour average cadence (effective spread: roughly 6-10 hours)
-- the live Crunchyroll fetch path now spaces individual Crunchyroll requests by `request_spacing_seconds ± request_spacing_jitter_seconds` (default `22.5 ± 7.5`, i.e. randomized 15-30 seconds)
+- continue tightening bootstrap/onboarding ergonomics
+- continue reducing genuinely ambiguous mapping residue
+- continue stabilizing fresh Crunchyroll fetches on hostile/auth-fragile hosts
+- continue improving recommendation quality and review UX

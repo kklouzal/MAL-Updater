@@ -25,7 +25,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             target_dir = temp_root / "systemd" / "user"
-            env_target = temp_root / "config" / "mal-updater-health-check.env"
+            env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-health-check.env"
 
             result = self._run_script(
                 "--target-dir",
@@ -48,7 +48,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             target_dir = temp_root / "systemd" / "user"
-            env_target = temp_root / "config" / "mal-updater-health-check.env"
+            env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-health-check.env"
 
             result = self._run_script(
                 "--target-dir",
@@ -70,7 +70,11 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             for unit_path in sorted(self.source_dir.glob("*.service")) + sorted(self.source_dir.glob("*.timer")):
                 copied_path = target_dir / unit_path.name
                 self.assertTrue(copied_path.exists(), msg=f"missing copied unit {unit_path.name}")
-                self.assertEqual(unit_path.read_text(encoding="utf-8"), copied_path.read_text(encoding="utf-8"))
+                rendered = copied_path.read_text(encoding="utf-8")
+                self.assertNotIn("__MAL_UPDATER_REPO_ROOT__", rendered)
+                self.assertNotIn("__MAL_UPDATER_HEALTH_ENV_FILE__", rendered)
+                if unit_path.suffix == ".service":
+                    self.assertIn(str(self.repo_root), rendered)
 
             expected_env = (self.source_dir / "mal-updater-health-check.env.example").read_text(encoding="utf-8")
             self.assertEqual(expected_env, env_target.read_text(encoding="utf-8"))
@@ -79,7 +83,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             target_dir = temp_root / "systemd" / "user"
-            env_target = temp_root / "config" / "mal-updater-health-check.env"
+            env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-health-check.env"
             env_target.parent.mkdir(parents=True, exist_ok=True)
             env_target.write_text("MAL_UPDATER_HEALTH_STRICT=1\n", encoding="utf-8")
 
@@ -101,12 +105,13 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             target_dir = temp_root / "systemd" / "user"
-            env_target = temp_root / "config" / "mal-updater-health-check.env"
+            env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-health-check.env"
             target_dir.mkdir(parents=True, exist_ok=True)
 
             unchanged_unit = self.source_dir / "mal-updater-exact-approved-sync.service"
             updated_unit = self.source_dir / "mal-updater-exact-approved-sync.timer"
-            (target_dir / unchanged_unit.name).write_text(unchanged_unit.read_text(encoding="utf-8"), encoding="utf-8")
+            rendered_unchanged = unchanged_unit.read_text(encoding="utf-8").replace("__MAL_UPDATER_REPO_ROOT__", str(self.repo_root)).replace("__MAL_UPDATER_HEALTH_ENV_FILE__", str(env_target))
+            (target_dir / unchanged_unit.name).write_text(rendered_unchanged, encoding="utf-8")
             (target_dir / updated_unit.name).write_text("[Unit]\nDescription=stale copy\n", encoding="utf-8")
 
             result = self._run_script(

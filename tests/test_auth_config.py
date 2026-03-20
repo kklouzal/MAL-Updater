@@ -22,8 +22,8 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_reads_bind_host_and_redirect_host_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [mal]
@@ -44,8 +44,8 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_reads_request_timeout_seconds_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     request_timeout_seconds = 7.5
@@ -61,8 +61,8 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_reads_mal_request_spacing_and_jitter_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [mal]
@@ -81,9 +81,9 @@ class ConfigTests(unittest.TestCase):
     def test_load_mal_secrets_reads_secret_file_overrides_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "secrets").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [secret_files]
@@ -92,20 +92,20 @@ class ConfigTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / "secrets" / "custom_client_id.txt").write_text("client-123\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "custom_client_id.txt").write_text("client-123\n", encoding="utf-8")
 
             secrets = load_mal_secrets(load_config(root))
 
             self.assertEqual(secrets.client_id, "client-123")
-            self.assertEqual(secrets.client_id_path, (root / "secrets" / "custom_client_id.txt").resolve())
+            self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "custom_client_id.txt").resolve())
 
 
 
     def test_load_config_reads_crunchyroll_request_spacing_and_jitter_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [crunchyroll]
@@ -125,8 +125,8 @@ class AuthHelperTests(unittest.TestCase):
     def test_format_auth_flow_prompt_includes_bind_host_and_redirect_uri(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [mal]
@@ -158,7 +158,7 @@ class AuthHelperTests(unittest.TestCase):
     def test_persist_token_response_writes_access_and_refresh_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             secrets = load_mal_secrets(config)
             token = TokenResponse(
@@ -178,10 +178,10 @@ class AuthHelperTests(unittest.TestCase):
     def test_mal_client_uses_configured_request_timeout_for_get_requests(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text("request_timeout_seconds = 7.5\n", encoding="utf-8")
-            (root / "secrets").mkdir()
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text("request_timeout_seconds = 7.5\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
             config = load_config(root)
             client = MalClient(config, load_mal_secrets(config))
 
@@ -203,8 +203,8 @@ class AuthHelperTests(unittest.TestCase):
     def test_mal_client_paces_requests_using_configured_spacing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "config" / "settings.toml").write_text(
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
                     [mal]
@@ -214,8 +214,8 @@ class AuthHelperTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / "secrets").mkdir()
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
             config = load_config(root)
             client = MalClient(config, load_mal_secrets(config))
 
@@ -242,9 +242,9 @@ class AuthHelperTests(unittest.TestCase):
     def test_mal_client_retries_timeout_once_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "secrets").mkdir()
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
             config = load_config(root)
             client = MalClient(config, load_mal_secrets(config))
 
@@ -270,9 +270,9 @@ class AuthHelperTests(unittest.TestCase):
     def test_mal_client_wraps_timeout_errors_as_mal_api_errors(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
-            (root / "secrets").mkdir()
-            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
             config = load_config(root)
             client = MalClient(config, load_mal_secrets(config))
 
@@ -288,7 +288,7 @@ class AuthHelperTests(unittest.TestCase):
     def test_review_mappings_rejects_partial_queue_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             stderr = io.StringIO()
 
             with redirect_stderr(stderr):
@@ -300,7 +300,7 @@ class AuthHelperTests(unittest.TestCase):
     def test_dry_run_sync_rejects_partial_queue_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             stderr = io.StringIO()
 
             with redirect_stderr(stderr):
@@ -319,7 +319,7 @@ class AuthHelperTests(unittest.TestCase):
     def test_approve_mapping_exact_flag_persists_user_exact_source(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "config").mkdir()
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
             config = load_config(root)
             bootstrap_database(config.db_path)
             ingest_snapshot_payload(sample_snapshot(), config)

@@ -1,6 +1,6 @@
-# Non-secret local configuration.
-# Copy to config/settings.toml and adjust as needed.
-# Paths may be absolute or relative to this file.
+# Non-secret runtime configuration.
+# Copy to .MAL-Updater/config/settings.toml (or point MAL_UPDATER_SETTINGS_PATH at another file).
+# Paths may be absolute or relative to this settings file.
 
 completion_threshold = 0.95
 credits_skip_window_seconds = 120
@@ -19,7 +19,7 @@ base_url = "https://api.myanimelist.net/v2"
 auth_url = "https://myanimelist.net/v1/oauth2/authorize"
 token_url = "https://myanimelist.net/v1/oauth2/token"
 bind_host = "0.0.0.0"
-redirect_host = "192.168.1.117"
+redirect_host = "127.0.0.1"
 redirect_port = 8765
 request_spacing_seconds = 1.0
 request_spacing_jitter_seconds = 0.2

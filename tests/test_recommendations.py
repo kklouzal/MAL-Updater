@@ -27,7 +27,7 @@ class RecommendationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.project_root = Path(self.temp_dir.name)
-        (self.project_root / "config").mkdir(parents=True, exist_ok=True)
+        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True, exist_ok=True)
         self.config = load_config(self.project_root)
         bootstrap_database(self.config.db_path)
 

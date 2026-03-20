@@ -18,7 +18,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
-        (self.project_root / "config").mkdir()
+        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
         bootstrap_database(self.config.db_path)
@@ -54,7 +54,7 @@ class HealthCheckCliTests(unittest.TestCase):
         ):
             (source_dir / unit_name).write_text(f"[Unit]\nDescription={unit_name}\n", encoding="utf-8")
         scripts_dir = self.project_root / "scripts"
-        scripts_dir.mkdir(exist_ok=True)
+        scripts_dir.mkdir(parents=True, exist_ok=True)
         install_script = scripts_dir / "install_user_systemd_units.sh"
         install_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         install_script.chmod(0o755)
@@ -469,11 +469,11 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(maintenance_commands[0]["automation_safe"])
         self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
         self.assertEqual(
-            ["crunchyroll-fetch-snapshot", "--out", "cache/live-crunchyroll-snapshot.json", "--ingest"],
+            ["crunchyroll-fetch-snapshot", "--out", ".MAL-Updater/cache/live-crunchyroll-snapshot.json", "--ingest"],
             maintenance_commands[0]["command_args"],
         )
         self.assertEqual(
-            "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest",
+            "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             maintenance_commands[0]["command"],
         )
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
@@ -834,7 +834,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(maintenance_commands[0]["automation_safe"])
         self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
         self.assertEqual(
-            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", "cache/live-crunchyroll-snapshot.json", "--ingest"],
+            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", ".MAL-Updater/cache/live-crunchyroll-snapshot.json", "--ingest"],
             maintenance_commands[0]["command_args"],
         )
 
@@ -1014,7 +1014,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
         self.assertIn(
-            "maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out cache/live-crunchyroll-snapshot.json --ingest",
+            "maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             stdout,
         )
 

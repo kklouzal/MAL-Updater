@@ -5,5 +5,5 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=<repo-root>
-ExecStart=<repo-root>/scripts/run_exact_approved_sync_cycle.sh
+WorkingDirectory=__MAL_UPDATER_REPO_ROOT__
+ExecStart=__MAL_UPDATER_REPO_ROOT__/scripts/run_exact_approved_sync_cycle.sh

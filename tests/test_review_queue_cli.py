@@ -26,7 +26,7 @@ class ReviewQueueCliTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
-        (self.project_root / "config").mkdir()
+        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
         bootstrap_database(self.config.db_path)
