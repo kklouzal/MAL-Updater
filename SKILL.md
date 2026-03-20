@@ -1,6 +1,8 @@
 ---
 name: mal-updater
-description: Crunchyroll→MyAnimeList sync and maintenance skill for OpenClaw. Use when installing, auditing, bootstrapping, operating, testing, or troubleshooting MAL-Updater from this repository as a skill-first package. Start with bootstrap-audit for new installs, onboarding, dependency checks, runtime layout, credentials, redirect settings, and user-systemd daemon setup; use the CLI for status, service health, review queue triage, guarded sync, recommendations, and maintenance.
+description: Operate the MAL-Updater skill-first repository for Crunchyroll→MyAnimeList sync, bootstrap/onboarding, daemon installation, health checks, guarded sync runs, recommendation retrieval, review-queue triage, and runtime troubleshooting. Use when: (1) installing or auditing the skill on a new OpenClaw instance, (2) checking daemon/service health or bootstrap readiness, (3) retrieving recommendations or sync/review-queue status from the Python back-end data, (4) running or verifying guarded Crunchyroll/MAL auth, snapshot, dry-run, or exact-approved apply flows, or (5) diagnosing unattended runtime/automation problems in MAL-Updater.
+homepage: https://github.com/kklouzal/MAL-Updater
+user-invocable: true
 metadata: {"openclaw":{"requires":{"bins":["python3","flock"]}}}
 ---
 
@@ -29,15 +31,38 @@ Treat `{baseDir}` as the skill root. This repository is the skill package.
    - decide whether the repo-owned user-systemd daemon can be installed on this host
 5. If bootstrap is incomplete, guide the user through the missing steps instead of pretending install is finished.
 
+## How to access backend data / operator surfaces
+
+For the most common operator/data tasks, use the repo-local CLI from `{baseDir}`:
+
+### Read-only inspection
+- `PYTHONPATH=src python3 -m mal_updater.cli status`
+- `PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit`
+- `PYTHONPATH=src python3 -m mal_updater.cli service-status`
+- `PYTHONPATH=src python3 -m mal_updater.cli service-run-once`
+- `PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary`
+
+### Recommendations / recommendation-related data
+- `PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20`
+- `PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat`
+- `PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata`
+
+### Review queue / mapping triage
+- `PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --summary`
+- `PYTHONPATH=src python3 -m mal_updater.cli review-queue-next --issue-type mapping_review`
+- `PYTHONPATH=src python3 -m mal_updater.cli review-queue-worklist --issue-type mapping_review --limit 5`
+- `PYTHONPATH=src python3 -m mal_updater.cli list-mappings`
+
+### Sync planning / guarded execution
+- `PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only`
+- `PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute`
+- `PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest`
+
 ## Operational workflow
 
-Use the repo-local Python CLI from `{baseDir}`:
+Prefer read-only inspection before live writes.
 
-```bash
-PYTHONPATH=src python3 -m mal_updater.cli ...
-```
-
-Prefer read-only inspection before live writes:
+Read-only first:
 - `status`
 - `bootstrap-audit`
 - `health-check`
@@ -62,6 +87,7 @@ Treat these as state-changing:
 
 - Read `{baseDir}/references/bootstrap-onboarding.md` for install/onboarding/bootstrap expectations.
 - Read `{baseDir}/references/cli-recipes.md` for copy/paste command patterns.
+- Read `{baseDir}/references/data-surfaces.md` for a concise map of which backend commands expose recommendations, review-queue state, service/runtime state, and guarded sync surfaces.
 
 ## Guardrails
 

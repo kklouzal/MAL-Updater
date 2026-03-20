@@ -82,13 +82,24 @@ The real local dataset showed that a blind `0.90` ratio threshold was too hand-w
 ### Hard recommendation filter
 - Do not recommend anime or new episodes that lack English dubs.
 
-## 2026-03-14 - Repo posture
+## 2026-03-14 / 2026-03-20 - Repo posture
 
 ### Decision
-Keep `MAL-Updater` private for now.
+Treat `MAL-Updater` as a public repository and keep all tracked artifacts anonymized.
+
+### Rules
+- Do not commit real credentials, tokens, API keys, or account identifiers.
+- Do not commit host-specific absolute paths, private workspace paths, or machine-local identifiers.
+- Use obviously fake placeholders in examples and tests.
+- Runtime-generated state may exist under external runtime directories, but it must not be tracked.
+- If identifying residue is accidentally committed, history rewrite is an acceptable remediation.
 
 ### Why
-Early auth/integration work is exactly where accidental exposure risk is highest. Public release can be considered later after a deliberate sanitization pass.
+Public-repo hygiene needs to be part of the project contract, not an afterthought. Future development should assume anything tracked in git may be published and mirrored.
+
+### Related maintainer channel
+Operational bugs, usability issues, and feature requests discovered by third-party users should be reported through the authoritative upstream issue tracker:
+- <https://github.com/kklouzal/MAL-Updater/issues>
 
 ## 2026-03-14 - Project memory habit
 

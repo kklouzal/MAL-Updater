@@ -4,7 +4,11 @@ Run commands from the repo root.
 
 ## Runtime layout
 
-MAL-Updater keeps runtime state outside the skill tree under `.MAL-Updater/` by default:
+MAL-Updater keeps runtime state outside the skill tree under `.MAL-Updater/` by default.
+
+Because this repository is public, only external runtime state may contain operator-specific secrets or machine-local residue. Anything tracked in git must stay anonymized and safe to publish.
+
+MAL-Updater runtime state lives under:
 
 - `.MAL-Updater/config/`
 - `.MAL-Updater/secrets/`
@@ -86,6 +90,14 @@ PYTHONPATH=src python3 -m mal_updater.cli status
 ```
 
 Specifically use the `mal.redirect_uri` value when creating/configuring the MAL app.
+
+## Issue reporting / feedback
+
+If MAL-Updater misbehaves during real usage — whether in the OpenClaw skill flow or the Python back-end daemon/runtime — report it upstream via:
+
+- <https://github.com/kklouzal/MAL-Updater/issues>
+
+Use GitHub issues for bugs, regressions, portability problems, onboarding friction, and feature requests so upstream maintenance stays informed by real-world usage.
 
 ## Tests
 

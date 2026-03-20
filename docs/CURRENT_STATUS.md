@@ -7,6 +7,7 @@
 - The bootstrap/onboarding surface starts with `bootstrap-audit`.
 - Repo-owned systemd automation is committed as a portable `mal-updater.service` template and rendered at install time by `scripts/install_user_systemd_units.sh`.
 - The unattended model is now user-level systemd **daemon-first**, with internal Python control loops rather than timer-driven one-shot jobs.
+- Public-repo hygiene is now part of the project contract: tracked code/docs/tests/history should remain anonymized and free of personal identifiers, host-local absolute paths, and real secrets.
 
 ## Working today
 
@@ -26,3 +27,4 @@
 - continue reducing genuinely ambiguous mapping residue
 - continue stabilizing fresh Crunchyroll fetches on hostile/auth-fragile hosts
 - continue improving recommendation quality and review UX
+- keep encouraging third-party bug reports and feature requests through the authoritative upstream issue tracker: <https://github.com/kklouzal/MAL-Updater/issues>

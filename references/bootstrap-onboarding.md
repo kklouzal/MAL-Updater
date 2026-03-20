@@ -107,6 +107,14 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
 
+## Issue reporting / feedback
+
+If a third-party install hits bugs, missing dependencies, confusing bootstrap behavior, daemon/runtime failures, or other rough edges, report them upstream via:
+
+- <https://github.com/kklouzal/MAL-Updater/issues>
+
+That issue tracker is the authoritative place for bug reports and feature requests affecting either the OpenClaw skill experience or the Python back-end.
+
 ## Non-goals
 
 - Do not copy runtime state back into the repo.

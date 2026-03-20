@@ -96,6 +96,8 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 - Do not commit real credentials.
 - Keep live secrets in `.MAL-Updater/secrets/`.
 - Keep generated runtime state out of the repo tree.
+- This is a **public GitHub repository**. Any code, docs, examples, tests, commit metadata, or other tracked artifacts that could be uploaded must stay anonymized: no personal identities, personal email addresses, host-specific absolute paths, private workspace paths, real account identifiers, real API keys/tokens, or machine-local secrets.
+- Use obviously fake placeholders in tracked examples/tests, and treat history rewrites as acceptable when needed to remove accidentally committed identifying residue.
 - Prefer `dry-run-sync` before live `apply-sync --execute` unless a live apply is explicitly intended.
 - Treat Crunchyroll auth/fetch instability as real operational residue.
 
@@ -105,6 +107,14 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 cd <repo-root>
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+## Issue reporting / feedback
+
+If you encounter problems while using MAL-Updater — whether in the OpenClaw skill surface or the Python back-end daemon/runtime — report them upstream via a GitHub issue at:
+
+- <https://github.com/kklouzal/MAL-Updater/issues>
+
+Use the upstream issue tracker for bug reports, integration problems, unexpected runtime behavior, and feature requests so the maintainer can continue improving both the skill and the back-end.
 
 ## References
 

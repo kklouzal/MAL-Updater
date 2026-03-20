@@ -79,3 +79,4 @@ A new OpenClaw instance should be able to:
 - avoid host-specific assumptions in committed files
 - preserve full-repo auditability for third parties
 - prefer the daemon-first runtime model over ad-hoc timers or OpenClaw cron
+- because this repo is public, keep all tracked artifacts anonymized: no personal identities, personal emails, host-specific absolute paths, private workspace references, real account identifiers, or real secrets in code/docs/tests/history

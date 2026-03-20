@@ -5,6 +5,7 @@
 - [x] shared JSON contract
 - [x] config / secrets layout
 - [x] SQLite bootstrap
+- [x] public-repo anonymization baseline for tracked code/docs/tests/history
 
 ## Phase 1 - Feasibility spike
 - MAL OAuth works locally
