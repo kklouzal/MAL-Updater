@@ -48,7 +48,7 @@ class ConfigLoadingTests(unittest.TestCase):
 
                     [mal]
                     bind_host = "127.0.0.1"
-                    redirect_host = "192.168.1.50"
+                    redirect_host = "127.0.0.50"
                     redirect_port = 9999
 
                     [secret_files]
@@ -71,7 +71,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.cache_dir, (root / ".MAL-Updater" / "var" / "cache").resolve())
             self.assertEqual(config.db_path, (root / ".MAL-Updater" / "var" / "custom.sqlite3").resolve())
             self.assertEqual(config.mal.bind_host, "127.0.0.1")
-            self.assertEqual(config.mal.redirect_uri, "http://192.168.1.50:9999/callback")
+            self.assertEqual(config.mal.redirect_uri, "http://127.0.0.50:9999/callback")
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "private" / "ids" / "client-id.txt").resolve())
 
 

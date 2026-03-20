@@ -27,7 +27,7 @@ class ConfigTests(unittest.TestCase):
                 textwrap.dedent(
                     """
                     [mal]
-                    bind_host = "192.168.1.50"
+                    bind_host = "127.0.0.50"
                     redirect_host = "animebox.local"
                     redirect_port = 9999
                     """
@@ -37,7 +37,7 @@ class ConfigTests(unittest.TestCase):
 
             config = load_config(root)
 
-            self.assertEqual(config.mal.bind_host, "192.168.1.50")
+            self.assertEqual(config.mal.bind_host, "127.0.0.50")
             self.assertEqual(config.mal.redirect_host, "animebox.local")
             self.assertEqual(config.mal.redirect_uri, "http://animebox.local:9999/callback")
 
@@ -131,7 +131,7 @@ class AuthHelperTests(unittest.TestCase):
                     """
                     [mal]
                     bind_host = "0.0.0.0"
-                    redirect_host = "192.168.1.117"
+                    redirect_host = "127.0.0.117"
                     redirect_port = 8765
                     """
                 ),
@@ -142,7 +142,7 @@ class AuthHelperTests(unittest.TestCase):
             prompt = format_auth_flow_prompt(config, "https://example.test/auth", 300)
 
             self.assertIn("bind_host=0.0.0.0", prompt)
-            self.assertIn("redirect_uri=http://192.168.1.117:8765/callback", prompt)
+            self.assertIn("redirect_uri=http://127.0.0.117:8765/callback", prompt)
             self.assertIn("https://example.test/auth", prompt)
 
     def test_write_secret_file_sets_0600_permissions(self) -> None:
