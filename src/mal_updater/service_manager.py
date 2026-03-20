@@ -45,7 +45,7 @@ WorkingDirectory={repo}
 Environment=PYTHONPATH={repo / 'src'}
 Environment=MAL_UPDATER_WORKSPACE_DIR={config.workspace_root}
 EnvironmentFile=-{env_file}
-ExecStart={python} -m mal_updater.cli service-run --project-root {repo}
+ExecStart={python} -m mal_updater.cli --project-root {repo} service-run
 Restart=always
 RestartSec=15
 

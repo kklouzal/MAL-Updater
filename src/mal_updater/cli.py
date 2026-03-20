@@ -517,8 +517,11 @@ def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
 
 def _render_systemd_unit_template(source_path: Path, project_root: Path, env_path: Path) -> str:
     text = source_path.read_text(encoding="utf-8")
-    return text.replace("__MAL_UPDATER_REPO_ROOT__", str(project_root)).replace(
-        "__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_path)
+    workspace_root = project_root.parent.parent if project_root.parent.name == "skills" else project_root.parent
+    return (
+        text.replace("__MAL_UPDATER_REPO_ROOT__", str(project_root))
+        .replace("__MAL_UPDATER_WORKSPACE_ROOT__", str(workspace_root))
+        .replace("__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_path))
     )
 
 

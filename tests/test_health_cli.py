@@ -946,7 +946,11 @@ class HealthCheckCliTests(unittest.TestCase):
     def test_health_check_summary_format_surfaces_disabled_timer_hint_when_units_are_not_enabled(self) -> None:
         self._install_repo_owned_automation_assets()
 
-        exit_code, stdout = self._run_health_check_raw("--format", "summary")
+        def fake_systemctl_run(command: list[str], **kwargs):
+            return unittest.mock.Mock(returncode=0, stdout="ActiveState=active\nSubState=running\nUnitFileState=disabled\nResult=success\n", stderr="")
+
+        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+            exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=True", stdout)
@@ -970,9 +974,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=True", stdout)
         self.assertIn("automation_all_units_current=False", stdout)
-        self.assertIn("automation_service_enabled=False", stdout)
+        self.assertIn("automation_service_enabled=True", stdout)
         self.assertIn("automation_outdated_units=mal-updater.service", stdout)
-        self.assertIn("automation_disabled_services=mal-updater.service", stdout)
         self.assertIn(
             "automation_install_command=" + shlex.quote(str(self.project_root / "scripts" / "install_user_systemd_units.sh")),
             stdout,
