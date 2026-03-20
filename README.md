@@ -1,6 +1,6 @@
 # MAL-Updater
 
-MAL-Updater is a **skill-first** OpenClaw repository for conservative Crunchyroll → MyAnimeList sync, mapping review, guarded apply runs, recommendations, and unattended maintenance.
+MAL-Updater is a **skill-first** OpenClaw repository for conservative **Crunchyroll → MyAnimeList sync and recommendations**, with mapping review, guarded apply runs, and unattended maintenance.
 
 This repository is the skill package.
 

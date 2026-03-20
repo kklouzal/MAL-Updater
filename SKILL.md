@@ -1,9 +1,6 @@
 ---
 name: mal-updater
-description: Operate the MAL-Updater skill-first repository for Crunchyroll→MyAnimeList sync, bootstrap/onboarding, daemon installation, health checks, guarded sync runs, recommendation retrieval, review-queue triage, and runtime troubleshooting. Use when: (1) installing or auditing the skill on a new OpenClaw instance, (2) checking daemon/service health or bootstrap readiness, (3) retrieving recommendations or sync/review-queue status from the Python back-end data, (4) running or verifying guarded Crunchyroll/MAL auth, snapshot, dry-run, or exact-approved apply flows, or (5) diagnosing unattended runtime/automation problems in MAL-Updater.
-homepage: https://github.com/kklouzal/MAL-Updater
-user-invocable: true
-metadata: {"openclaw":{"requires":{"bins":["python3","flock"]}}}
+description: Crunchyroll → MyAnimeList sync and recommendations skill with guarded auth, review-queue triage, health checks, bootstrap auditing, and user-systemd daemon support. Use when installing, auditing, operating, or troubleshooting MAL-Updater on an OpenClaw host.
 ---
 
 # MAL-Updater
