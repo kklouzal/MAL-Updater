@@ -11,7 +11,7 @@ Current producer shape:
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out path/to/snapshot.json
 ```
 
-- output JSON matches `docs/contracts/crunchyroll_snapshot.schema.json`
+- output JSON matches `references/contracts/crunchyroll_snapshot.schema.json`
 - the snapshot is normalized provider data, not direct MAL mutation intent
 - any future producer must emit the same contract if it wants to plug into the existing ingestion path
 

@@ -51,6 +51,14 @@ PYTHONPATH=src python3 -m mal_updater.cli restart-service
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
 
+`service-status` is now the main structured observability surface for unattended debugging. In addition to user-systemd enabled/active state, it reports:
+
+- recent daemon loop timing (`last_loop_at`)
+- per-lane task summaries from `service-state.json`
+- current API-usage snapshot when available
+- recent `service.log` tail lines
+- parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
+
 ## Legacy wrappers still reused by the daemon
 
 The daemon currently reuses these guarded wrapper scripts for some lanes:

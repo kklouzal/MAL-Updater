@@ -7,7 +7,7 @@
 - The bootstrap/onboarding surface starts with `bootstrap-audit`.
 - Repo-owned systemd automation is committed as a portable `mal-updater.service` template and rendered at install time by `scripts/install_user_systemd_units.sh`.
 - The unattended model is now user-level systemd **daemon-first**, with internal Python control loops rather than timer-driven one-shot jobs.
-- Public-repo hygiene is now part of the project contract: tracked code/docs/tests/history should remain anonymized and free of personal identifiers, host-local absolute paths, and real secrets.
+- Public-repo hygiene is now part of the project contract: tracked code/references/tests/history should remain anonymized and free of personal identifiers, host-local absolute paths, and real secrets.
 
 ## Working today
 
@@ -17,6 +17,7 @@
 - MAL OAuth and guarded MAL apply exist
 - mapping review / queue triage workflows exist
 - long-lived daemon runtime + service manager exist
+- service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging
 - request-event logging / budget awareness scaffolding exists
 - recommendation generation and metadata refresh exist
 - tests remain bundled in the repo for third-party auditing

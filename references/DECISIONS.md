@@ -104,7 +104,7 @@ Operational bugs, usability issues, and feature requests discovered by third-par
 ## 2026-03-14 - Project memory habit
 
 ### Decision
-Use `docs/` as project-specific durable memory.
+Use `references/` as project-specific durable memory.
 
 ### Why
 OpenClaw memory is useful, but project-specific knowledge should live with the project repo.

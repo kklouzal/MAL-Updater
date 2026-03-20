@@ -9,7 +9,7 @@ This repository is the skill package.
 - `SKILL.md` at the repo root is the canonical skill entrypoint.
 - The Python CLI under `src/mal_updater/` contains the real business logic.
 - Runtime state lives **outside** the skill tree under the workspace runtime root `.MAL-Updater/` by default.
-- The repo keeps code, docs, scripts, templates, tests, and references bundled so third parties can audit the whole artifact.
+- The repo keeps code, references, scripts, templates, tests, and supporting artifacts bundled so third parties can audit the whole artifact.
 - Background work now centers on a **long-lived user-level systemd daemon**, not user timers or OpenClaw cron.
 
 ## Default runtime layout
@@ -96,7 +96,7 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 - Do not commit real credentials.
 - Keep live secrets in `.MAL-Updater/secrets/`.
 - Keep generated runtime state out of the repo tree.
-- This is a **public GitHub repository**. Any code, docs, examples, tests, commit metadata, or other tracked artifacts that could be uploaded must stay anonymized: no personal identities, personal email addresses, host-specific absolute paths, private workspace paths, real account identifiers, real API keys/tokens, or machine-local secrets.
+- This is a **public GitHub repository**. Any code, references, examples, tests, commit metadata, or other tracked artifacts that could be uploaded must stay anonymized: no personal identities, personal email addresses, host-specific absolute paths, private workspace paths, real account identifiers, real API keys/tokens, or machine-local secrets.
 - Use obviously fake placeholders in tracked examples/tests, and treat history rewrites as acceptable when needed to remove accidentally committed identifying residue.
 - Prefer `dry-run-sync` before live `apply-sync --execute` unless a live apply is explicitly intended.
 - Treat Crunchyroll auth/fetch instability as real operational residue.
@@ -121,6 +121,6 @@ Use the upstream issue tracker for bug reports, integration problems, unexpected
 - Skill entrypoint: `SKILL.md`
 - Bootstrap flow: `references/bootstrap-onboarding.md`
 - Command cookbook: `references/cli-recipes.md`
-- Operations: `docs/OPERATIONS.md`
-- Automation: `docs/AUTOMATION.md`
-- MAL OAuth details: `docs/MAL_OAUTH.md`
+- Operations: `references/OPERATIONS.md`
+- Automation: `references/AUTOMATION.md`
+- MAL OAuth details: `references/MAL_OAUTH.md`
