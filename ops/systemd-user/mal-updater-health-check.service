@@ -1,0 +1,10 @@
+[Unit]
+Description=MAL-Updater health-check cycle
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/mal-updater-health-check.env
+WorkingDirectory=<repo-root>
+ExecStart=<repo-root>/scripts/run_health_check_cycle.sh

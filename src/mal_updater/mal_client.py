@@ -183,7 +183,7 @@ class MalClient:
     def get_anime_details(self, anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:
         return self._get_json(
             f"/anime/{anime_id}?{urlencode({'fields': fields})}",
-            headers=self._build_auth_headers(require_user=True),
+            headers=self._build_auth_headers(require_user=False),
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
 

@@ -16,6 +16,8 @@ Expected local directories relative to repo root:
 ```bash
 cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli status
+PYTHONPATH=src python3 -m mal_updater.cli health-check
+PYTHONPATH=src python3 -m mal_updater.cli health-check --review-issue-type mapping_review --review-worklist-limit 5
 ```
 
 ### Initialize local DB and directories
@@ -75,6 +77,14 @@ PYTHONPATH=src python3 -m mal_updater.cli map-series --limit 20 --mapping-limit 
 cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review --reason-family same_franchise
+PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --issue-type mapping_review --fix-strategy-family "needs_manual_match | ambiguous_candidates | same_franchise"
+PYTHONPATH=src python3 -m mal_updater.cli review-queue-worklist --issue-type mapping_review --limit 5
+PYTHONPATH=src python3 -m mal_updater.cli review-queue-apply-worklist --issue-type mapping_review --limit 3 --per-bucket-limit 20
+PYTHONPATH=src python3 -m mal_updater.cli review-queue-refresh-worklist --issue-type mapping_review --limit 3 --per-bucket-limit 20
+# These ranked helpers now prefer broader family-level buckets before narrower exact slices when that clears more residue per command.
+# When a selected mapping-review bucket looks stale after mapper changes, either apply the ranked refresh worklist or use the bucket's refresh_command directly
+PYTHONPATH=src python3 -m mal_updater.cli refresh-mapping-review-queue --provider-series-id G63VMKVQY --provider-series-id GYMGDK3GY
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --approved-only
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-123 16498 --confidence 0.995 --notes "manual approval"
 PYTHONPATH=src python3 -m mal_updater.cli approve-mapping series-456 5114 --exact --confidence 1.0 --notes "manual exact approval"
@@ -123,4 +133,32 @@ cd <repo-root>
 ./scripts/run_exact_approved_sync_cycle.sh
 ```
 
-Install the user-level systemd timer from `ops/systemd-user/` as documented in `docs/AUTOMATION.md`.
+Install the user-level systemd timer set with `scripts/install_user_systemd_units.sh` (or use the manual `ops/systemd-user/` copy flow) as documented in `docs/AUTOMATION.md`.
+
+After install, `health-check --format summary` now gives a fast runtime sanity check too: if the timers are enabled on disk but not actually active in the user manager, it emits `automation_inactive_timers=...`; when runtime state is available it also prints `automation_timer_runtime=...` with the timer active state plus next/last trigger timestamps.
+
+## Health-check maintenance cadence
+
+Use the repo wrapper for the standalone maintenance/triage snapshot:
+
+```bash
+cd <repo-root>
+./scripts/run_health_check_cycle.sh
+MAL_UPDATER_HEALTH_STALE_HOURS=48 ./scripts/run_health_check_cycle.sh
+MAL_UPDATER_HEALTH_STRICT=1 ./scripts/run_health_check_cycle.sh
+MAL_UPDATER_HEALTH_AUTO_RUN_RECOMMENDED=1 ./scripts/run_health_check_cycle.sh
+MAL_UPDATER_HEALTH_AUTO_RUN_RECOMMENDED=1 MAL_UPDATER_HEALTH_AUTO_RUN_REASON_CODES=refresh_full_snapshot ./scripts/run_health_check_cycle.sh
+MAL_UPDATER_HEALTH_AUTO_RUN_RECOMMENDED=1 MAL_UPDATER_HEALTH_AUTO_RUN_REASON_CODES=install_user_systemd_units ./scripts/run_health_check_cycle.sh
+```
+
+Artifacts:
+- per-run log: `state/logs/health-check-*.log`
+- per-run JSON snapshot: `state/health/health-check-*.json`
+- latest JSON snapshot: `state/health/latest-health-check.json`
+- queue guidance in the JSON/log now includes `recommended_next`, `recommended_worklist`, `recommended_apply_worklist`, and `recommended_refresh_worklist` when open review residue exists
+- maintenance guidance in the JSON/log now also distinguishes the top overall repair (`recommended_command`) from the first safely automatable repair (`recommended_automation_command`)
+- automation guidance now also distinguishes between missing-vs-outdated-vs-disabled repo-owned automation state, so the summary can tell you whether the next fix is a first install, a repo-sync refresh of stale user units, or simply enabling timers that were copied but never turned on
+
+For the installed user service, optional runtime policy lives in `~/.config/mal-updater-health-check.env` (copy the example from `ops/systemd-user/mal-updater-health-check.env.example`).
+
+Install the matching user-level systemd timer with `scripts/install_user_systemd_units.sh` (or the manual `ops/systemd-user/` copy flow) as documented in `docs/AUTOMATION.md`.

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import deque
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from itertools import combinations
 from typing import Any
 
 _AUTO_APPROVAL_BLOCKERS = (
@@ -11,6 +13,14 @@ _AUTO_APPROVAL_BLOCKERS = (
     "installment_hint_conflict=",
     "episode_evidence_exceeds_candidate_count=",
     "completed_evidence_exceeds_candidate_count=",
+)
+
+_RELATION_EXPANSION_MEDIA_TYPES = {"tv", "ova", "ona", "special", "movie"}
+_RELATION_EXPANSION_MAX_SEEDS = 2
+_RELATION_EXPANSION_MAX_VISITS = 6
+_RELATION_EXPANSION_MAX_DEPTH = 2
+_RELATION_EXPANSION_FIELDS = (
+    "id,title,alternative_titles,media_type,status,num_episodes,start_season,related_anime"
 )
 
 from .mal_client import MalApiError, MalClient
@@ -25,14 +35,15 @@ _TITLE_CLEANUPS = [
     re.compile(r"\bseason\s+\d+\b", re.IGNORECASE),
     re.compile(r"\bpart\s+\d+\b", re.IGNORECASE),
 ]
-_QUERY_CLEANUPS = _TITLE_CLEANUPS[:3]
+_QUERY_CLEANUPS = _TITLE_CLEANUPS[:6]
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_ALPHA_DIGIT_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])")
 _SEARCH_SPACING_REWRITES = (
     (re.compile(r"\bseason\s*(\d+)\b", re.IGNORECASE), r"Season \1"),
     (re.compile(r"\bpart\s*(\d+)\b", re.IGNORECASE), r"Part \1"),
     (re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE), r"Cour \1"),
 )
-_NON_INSTALLMENT_SUBTITLE_SPLIT_RE = re.compile(r"\s*(?::|\||[–—]|\s-\s)\s*")
+_NON_INSTALLMENT_SUBTITLE_SPLIT_RE = re.compile(r"\s*(?::|\||[–—]|\s-\s|\()\s*")
 _AUXILIARY_TITLE_PATTERNS = (
     (re.compile(r"\bpv\b", re.IGNORECASE), "pv"),
     (re.compile(r"\bpromo\b", re.IGNORECASE), "promo"),
@@ -54,6 +65,7 @@ _ORDINAL_COUR_RE = re.compile(
 )
 _COUR_NUMBER_RE = re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE)
 _FINAL_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
+_PLUS_INSTALLMENT_RE = re.compile(r"[+＋](?:!+)?(?:\s*[)\]]\s*)?$")
 _SEASON_RANGE_RE = re.compile(r"\bseasons?\s+\d+\s*[-/]\s*\d+\b", re.IGNORECASE)
 _STANDALONE_SEASON_RE = re.compile(r"^season\s+\d+$", re.IGNORECASE)
 _STANDALONE_PART_RE = re.compile(r"^part\s+\d+$", re.IGNORECASE)
@@ -150,6 +162,8 @@ class MappingResult:
     chosen_candidate: MappingCandidate | None
     candidates: list[MappingCandidate]
     rationale: list[str]
+    bundle_companion_candidate: MappingCandidate | None = None
+    bundle_companion_candidates: list[MappingCandidate] | None = None
 
 
 
@@ -159,6 +173,7 @@ def _normalize_with_cleanup_patterns(value: str | None, cleanup_patterns: list[r
     normalized = unicodedata.normalize("NFKD", value)
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     lowered = normalized.lower().replace("’", "'")
+    lowered = _ALPHA_DIGIT_BOUNDARY_RE.sub(" ", lowered)
     for pattern in cleanup_patterns:
         lowered = pattern.sub(" ", lowered)
     lowered = lowered.replace("&", " and ")
@@ -178,6 +193,8 @@ def _search_query_cleanup(value: str) -> str:
     cleaned = unicodedata.normalize("NFKC", value).replace("’", "'")
     for pattern in _QUERY_CLEANUPS:
         cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\(\s*\)", " ", cleaned)
+    cleaned = re.sub(r"\s*[-:|–—]\s*(?=$|\()", " ", cleaned)
     for pattern, replacement in _SEARCH_SPACING_REWRITES:
         cleaned = pattern.sub(replacement, cleaned)
     return " ".join(cleaned.split()).strip()
@@ -297,7 +314,10 @@ def _extract_roman_installment_number(value: str | None) -> int | None:
     if not value:
         return None
     for match in _ROMAN_TOKEN_RE.finditer(value):
-        number = _ROMAN_TO_NUMBER.get(match.group(1).lower())
+        token = match.group(1).lower()
+        if len(token) == 1:
+            continue
+        number = _ROMAN_TO_NUMBER.get(token)
         if number is not None and number >= 2:
             return number
     return None
@@ -338,25 +358,28 @@ def _extract_title_hints(value: str | None) -> set[str]:
     hints: set[str] = set()
     if not value:
         return hints
-    season_number = _extract_season_number(value)
+    cleaned = _search_query_cleanup(value)
+    season_number = _extract_season_number(cleaned)
     if season_number is not None:
         hints.add(f"season:{season_number}")
-    ordinal_season = _extract_ordinal_season_number(value)
+    ordinal_season = _extract_ordinal_season_number(cleaned)
     if ordinal_season is not None:
         hints.add(f"season:{ordinal_season}")
-    part_number = _extract_part_number(value)
+    part_number = _extract_part_number(cleaned)
     if part_number is not None:
         hints.add(f"part:{part_number}")
         hints.add(f"split:{part_number}")
-    cour_number = _extract_cour_number(value)
+    cour_number = _extract_cour_number(cleaned)
     if cour_number is not None:
         hints.add(f"cour:{cour_number}")
         hints.add(f"split:{cour_number}")
-    roman_number = _extract_roman_installment_number(value)
+    roman_number = _extract_roman_installment_number(cleaned)
     if roman_number is not None:
         hints.add(f"roman:{roman_number}")
-    if _FINAL_SEASON_RE.search(value):
+    if _FINAL_SEASON_RE.search(cleaned):
         hints.add("final")
+    if _PLUS_INSTALLMENT_RE.search(cleaned.strip()):
+        hints.add("plus")
     return hints
 
 
@@ -387,7 +410,7 @@ def _candidate_auxiliary_markers(node: dict[str, Any]) -> set[str]:
 
 def _has_non_base_installment_hint(hints: set[str]) -> bool:
     for hint in hints:
-        if hint == "final":
+        if hint in {"final", "plus"}:
             return True
         if hint.startswith(("season:", "part:", "roman:", "cour:", "split:")):
             try:
@@ -481,6 +504,9 @@ def _provider_episode_evidence_may_have_minor_overflow(
         suffix = season_hint.split(":", 1)[1]
         if any(hint.endswith(f":{suffix}") for hint in candidate_hints if hint.startswith(("part:", "split:", "cour:"))):
             return True
+
+    if not _has_non_base_installment_hint(provider_hints) and not _has_non_base_installment_hint(candidate_hints):
+        return True
     return False
 
 
@@ -536,6 +562,9 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     score = best_ratio
     best_norm = normalize_title(best_title)
     best_strict_norm = normalize_title_strict(best_title)
+    extra_title_suffix = bool(
+        query_strict_norm and best_strict_norm and best_strict_norm.startswith(f"{query_strict_norm} ")
+    )
     if best_strict_norm == query_strict_norm and best_strict_norm:
         score = max(score, 0.995)
         reasons.append("exact_normalized_title")
@@ -606,7 +635,7 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     if provider_splits and candidate_splits:
         if provider_splits & candidate_splits:
             reasons.append(f"split_installment_match={','.join(sorted(provider_splits & candidate_splits))}")
-            score += 0.06
+            score += 0.12
         else:
             conflicting_hints.extend(sorted(provider_splits | candidate_splits))
 
@@ -656,6 +685,10 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score -= 0.08
         reasons.append(f"candidate_auxiliary_content={','.join(extra_auxiliary_markers)}")
 
+    if extra_title_suffix and not provider_has_non_base_installment_hint:
+        score -= 0.04
+        reasons.append("candidate_extra_title_suffix")
+
     candidate_num_episodes = node.get("num_episodes")
     if isinstance(candidate_num_episodes, int) and candidate_num_episodes > 0:
         provider_episode_evidence = series.max_completed_episode_number or series.max_episode_number
@@ -693,10 +726,31 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
                 )
 
     media_type = node.get("media_type")
+    provider_has_explicit_season_context = any(hint.startswith("season:") for hint in provider_hints)
+    candidate_matches_explicit_season_context = bool(
+        provider_season_number is not None and provider_season_number in candidate_season_numbers
+    ) or bool(
+        provider_seasons
+        and any(hint.endswith(f":{season_hint.split(':', 1)[1]}") for hint in candidate_hints for season_hint in provider_seasons)
+    )
+    if (
+        provider_has_explicit_season_context
+        and media_type in {"ova", "ona", "special", "tv_special", "pv", "movie"}
+        and not provider_auxiliary_markers
+        and not candidate_matches_explicit_season_context
+    ):
+        score -= 0.06
+        reasons.append(f"{media_type}_penalty_for_explicit_season_context")
+
+    multi_episode_provider_series = max(
+        series.completed_episode_count or 0,
+        series.max_completed_episode_number or 0,
+        series.max_episode_number or 0,
+    ) > 1
     if (
         media_type == "special"
         and not provider_auxiliary_markers
-        and (series.completed_episode_count or 0) > 1
+        and multi_episode_provider_series
     ):
         score -= 0.10
         reasons.append("special_penalty_for_multi_episode_series")
@@ -704,7 +758,15 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         media_type in {"ova", "ona"}
         and candidate_num_episodes == 1
         and not provider_auxiliary_markers
-        and (series.completed_episode_count or 0) > 1
+        and multi_episode_provider_series
+    ):
+        score -= 0.06
+        reasons.append(f"single_episode_{media_type}_penalty_for_multi_episode_series")
+    elif (
+        media_type in {"movie", "tv_special"}
+        and candidate_num_episodes == 1
+        and not provider_auxiliary_markers
+        and multi_episode_provider_series
     ):
         score -= 0.06
         reasons.append(f"single_episode_{media_type}_penalty_for_multi_episode_series")
@@ -750,7 +812,7 @@ def _candidate_penalty_count(candidate: MappingCandidate) -> int:
         "completed_evidence_exceeds_candidate_count=",
     )
     penalty_reasons = sum(1 for reason in candidate.match_reasons if reason.startswith(penalty_prefixes))
-    if candidate.media_type in {"special", "pv"}:
+    if candidate.media_type in {"special", "tv_special", "pv"}:
         penalty_reasons += 1
     return penalty_reasons
 
@@ -780,17 +842,153 @@ def _candidate_is_explainably_weaker(series: SeriesMappingInput, candidate: Mapp
     )
     if any(reason.startswith(weaker_prefixes) for reason in candidate.match_reasons):
         return True
-    if candidate.media_type in {"special", "pv"}:
+    if candidate.media_type in {"special", "tv_special", "pv"}:
         return True
-    if candidate.media_type in {"ova", "ona"} and candidate.num_episodes == 1 and (series.completed_episode_count or 0) > 1:
+    if candidate.media_type in {"ova", "ona", "movie"} and candidate.num_episodes == 1 and max(
+        series.completed_episode_count or 0,
+        series.max_completed_episode_number or 0,
+        series.max_episode_number or 0,
+    ) > 1:
         return True
     return False
+
+
+
+def _candidate_is_non_exact_franchise_extension(candidate: MappingCandidate) -> bool:
+    if "exact_normalized_title" in candidate.match_reasons:
+        return False
+    if "candidate_extra_title_suffix" not in candidate.match_reasons:
+        return False
+    disqualifying_prefixes = (
+        "season_number_match=",
+        "part_hint_match=",
+        "split_installment_match=",
+        "season_to_split_match=",
+        "roman_installment_match=",
+        "installment_hint_match=",
+    )
+    if any(reason.startswith(disqualifying_prefixes) for reason in candidate.match_reasons):
+        return False
+    return True
+
+
+
+def _candidate_has_installment_progression_reason(candidate: MappingCandidate) -> bool:
+    return any(
+        reason.startswith((
+            "season_number_match=",
+            "season_number_mismatch=",
+            "part_hint_match=",
+            "split_installment_match=",
+            "season_to_split_match=",
+            "roman_installment_match=",
+            "candidate_extra_installment_hint",
+        ))
+        for reason in candidate.match_reasons
+    ) or "final_season_hint_match" in candidate.match_reasons
+
+
+
+def _candidate_shares_bundle_title_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    top_title_norm = normalize_title_strict(top.title)
+    companion_title_norm = normalize_title_strict(companion.title)
+    if not top_title_norm or not companion_title_norm:
+        return False
+    if top_title_norm == companion_title_norm:
+        return True
+    if companion_title_norm.startswith(f"{top_title_norm} ") or top_title_norm.startswith(f"{companion_title_norm} "):
+        return True
+
+    shared_prefix_tokens = 0
+    for top_token, companion_token in zip(top_title_norm.split(), companion_title_norm.split()):
+        if top_token != companion_token:
+            break
+        shared_prefix_tokens += 1
+    return shared_prefix_tokens >= 2
+
+
+
+def _is_low_score_bundle_companion(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    if not _candidate_shares_bundle_title_family(top, companion):
+        return False
+    if not any(
+        reason.startswith(("candidate_extra_title_suffix", "candidate_extra_installment_hint", "season_number_mismatch="))
+        for reason in companion.match_reasons
+    ):
+        return False
+    return companion.score >= 0.35
+
+
+
+def _suspect_multi_entry_bundle(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    candidates: list[MappingCandidate],
+) -> tuple[str, list[MappingCandidate]] | None:
+    top_is_exact_base_match = "exact_normalized_title" in top.match_reasons
+    top_has_installment_alignment = _candidate_has_installment_progression_reason(top)
+    if not top_is_exact_base_match and not top_has_installment_alignment:
+        return None
+
+    provider_episode_evidence = series.max_completed_episode_number or series.max_episode_number
+    if provider_episode_evidence is None or top.num_episodes is None or provider_episode_evidence <= top.num_episodes:
+        return None
+    if not any(reason.startswith("episode_evidence_exceeds_candidate_count=") for reason in top.match_reasons):
+        return None
+
+    plausible_companions: list[MappingCandidate] = []
+    for companion in candidates[1:8]:
+        if companion.num_episodes is None or companion.num_episodes <= 0:
+            continue
+        if companion.media_type != top.media_type or companion.media_type != "tv":
+            continue
+        if not _candidate_shares_bundle_title_family(top, companion):
+            continue
+
+        same_franchise_installment = _is_low_score_bundle_companion(top, companion)
+        if companion.score < max(0.70, top.score - 0.18) and not same_franchise_installment:
+            continue
+
+        if top_is_exact_base_match:
+            if not (
+                "exact_normalized_title" in companion.match_reasons
+                or any(
+                    reason.startswith(("candidate_extra_title_suffix", "candidate_extra_installment_hint", "season_number_mismatch="))
+                    for reason in companion.match_reasons
+                )
+            ):
+                continue
+        elif not _candidate_has_installment_progression_reason(companion):
+            continue
+
+        plausible_companions.append(companion)
+
+    best_match: tuple[str, list[MappingCandidate]] | None = None
+    best_total_episodes: int | None = None
+    for companion_count in (1, 2):
+        for companion_group in combinations(plausible_companions, companion_count):
+            total_episodes = top.num_episodes + sum(companion.num_episodes or 0 for companion in companion_group)
+            if provider_episode_evidence > total_episodes:
+                continue
+            if best_total_episodes is not None and total_episodes >= best_total_episodes:
+                continue
+            episode_parts = [str(top.num_episodes)] + [str(companion.num_episodes) for companion in companion_group if companion.num_episodes is not None]
+            best_total_episodes = total_episodes
+            best_match = (
+                "multi_entry_bundle_suspected="
+                f"{provider_episode_evidence}<={'+'.join(episode_parts)}",
+                list(companion_group),
+            )
+    return best_match
+
 
 
 def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
     if second is None:
         return top.score >= 0.99
     if top.score >= 0.99 and top.score - second.score >= 0.05:
+        if top.media_type in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"} and second.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}:
+            return False
         return True
 
     reasons = list(top.match_reasons)
@@ -806,6 +1004,20 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
         if top.score >= 0.95 and _candidate_is_explainably_weaker(series, second):
             return True
         if top.score >= 0.95 and any(reason.startswith('season_number_mismatch=') for reason in second.match_reasons):
+            return True
+        if (
+            top.score >= 0.95
+            and top.media_type == second.media_type == "tv"
+            and any(reason.startswith('season_number_match=') for reason in second.match_reasons)
+            and not any(
+                reason.startswith((
+                    'season_to_split_match=',
+                    'split_installment_match=',
+                    'part_hint_match=',
+                ))
+                for reason in second.match_reasons
+            )
+        ):
             return True
 
     if (
@@ -823,9 +1035,46 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
     ):
         return True
 
+    if (
+        "exact_normalized_title" in top.match_reasons
+        and any(
+            reason.startswith((
+                'minor_episode_overflow_suspected=',
+                'minor_completed_episode_overflow_suspected=',
+            ))
+            for reason in top.match_reasons
+        )
+        and top.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
+        and top.score >= 0.95
+        and _candidate_is_explainably_weaker(series, second)
+    ):
+        return True
+
     if "exact_normalized_title" not in top.match_reasons:
         return False
-    if not has_specific_installment_context or top.score < 0.99:
+    if top.score < 0.99:
+        return False
+    if (
+        not has_specific_installment_context
+        and _candidate_is_explainably_weaker(series, second)
+        and top.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
+    ):
+        return True
+    if (
+        not has_specific_installment_context
+        and top.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
+        and second.media_type in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
+        and "exact_normalized_title" not in second.match_reasons
+    ):
+        return True
+    if (
+        not has_specific_installment_context
+        and top.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
+        and second.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
+        and _candidate_is_non_exact_franchise_extension(second)
+    ):
+        return True
+    if not has_specific_installment_context:
         return False
     if _candidate_is_explainably_weaker(series, second):
         return True
@@ -866,6 +1115,158 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
     return True
 
 
+def _should_expand_related_candidates(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
+    provider_hints = _provider_title_hints(series)
+    provider_season_number, _ = _provider_season_number(series)
+    has_non_base_installment_context = _has_non_base_installment_hint(provider_hints) or (
+        provider_season_number is not None and provider_season_number >= 2
+    )
+
+    def _is_auxiliary_or_suffix_residue(candidate: MappingCandidate | None) -> bool:
+        if candidate is None:
+            return False
+        return candidate.media_type in {"ova", "ona", "special", "tv_special", "movie", "pv"} or any(
+            reason.startswith("candidate_auxiliary_content=") for reason in candidate.match_reasons
+        ) or "candidate_extra_title_suffix" in candidate.match_reasons
+
+    top_has_extra_suffix = "candidate_extra_title_suffix" in top.match_reasons
+    top_is_auxiliary_residue = top.media_type in {"ova", "ona", "special", "tv_special", "movie", "pv"} or any(
+        reason.startswith("candidate_auxiliary_content=") for reason in top.match_reasons
+    )
+    top_has_episode_overflow = any(
+        reason.startswith(("episode_evidence_exceeds_candidate_count=", "completed_evidence_exceeds_candidate_count="))
+        for reason in top.match_reasons
+    )
+    second_is_close_auxiliary_or_suffix_residue = bool(
+        second
+        and second.score >= top.score - 0.12
+        and _is_auxiliary_or_suffix_residue(second)
+    )
+
+    if second_is_close_auxiliary_or_suffix_residue:
+        return True
+    if not has_non_base_installment_context and not top_has_extra_suffix and not top_is_auxiliary_residue:
+        return False
+    if top_is_auxiliary_residue:
+        return True
+    if top_has_extra_suffix and top.score < 0.90:
+        return True
+    if not has_non_base_installment_context:
+        return False
+    if second and top.score < 0.90:
+        return True
+    if top_has_episode_overflow:
+        return True
+    return False
+
+
+def _relation_expansion_seed_key(candidate: MappingCandidate) -> tuple[int, float, int, str]:
+    return (
+        int(
+            candidate.media_type in {"ova", "ona", "special", "tv_special", "movie", "pv"}
+            or "candidate_extra_title_suffix" in candidate.match_reasons
+            or any(reason.startswith("candidate_auxiliary_content=") for reason in candidate.match_reasons)
+        ),
+        candidate.score,
+        _candidate_positive_signal_count(candidate),
+        candidate.title.lower(),
+    )
+
+
+
+def _best_candidate_from_node(
+    series: SeriesMappingInput,
+    queries: list[str],
+    node: dict[str, Any],
+    *,
+    discovery_reason: str,
+) -> MappingCandidate | None:
+    anime_id = node.get("id")
+    if anime_id is None:
+        return None
+    best_candidate: MappingCandidate | None = None
+    for query in queries:
+        score, reasons = _score_candidate(series, query, node)
+        candidate = MappingCandidate(
+            mal_anime_id=int(anime_id),
+            title=str(node.get("title") or ""),
+            alternative_titles=_extract_titles_from_node(node)[1:],
+            media_type=node.get("media_type"),
+            status=node.get("status"),
+            num_episodes=node.get("num_episodes"),
+            score=score,
+            matched_query=query,
+            match_reasons=[*reasons, discovery_reason],
+            raw=node,
+        )
+        if best_candidate is None or candidate.score > best_candidate.score:
+            best_candidate = candidate
+    return best_candidate
+
+
+def _expand_candidates_via_relations(
+    client: MalClient,
+    series: SeriesMappingInput,
+    queries: list[str],
+    by_id: dict[int, MappingCandidate],
+) -> None:
+    ranked = sorted(by_id.values(), key=_candidate_sort_key, reverse=True)
+    if not ranked:
+        return
+    top = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else None
+    if not _should_expand_related_candidates(series, top, second):
+        return
+
+    seed_candidates = sorted(ranked[:_RELATION_EXPANSION_MAX_SEEDS], key=_relation_expansion_seed_key, reverse=True)
+    seed_ids = [candidate.mal_anime_id for candidate in seed_candidates]
+    queue = deque((anime_id, 0) for anime_id in seed_ids)
+    queued_ids = set(seed_ids)
+    visited_ids: set[int] = set()
+
+    while queue and len(visited_ids) < _RELATION_EXPANSION_MAX_VISITS:
+        anime_id, depth = queue.popleft()
+        if anime_id in visited_ids:
+            continue
+        visited_ids.add(anime_id)
+        try:
+            detail = client.get_anime_details(anime_id, fields=_RELATION_EXPANSION_FIELDS)
+        except MalApiError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        detail_media_type = detail.get("media_type")
+        if detail_media_type in _RELATION_EXPANSION_MEDIA_TYPES:
+            candidate = _best_candidate_from_node(
+                series,
+                queries,
+                detail,
+                discovery_reason="related_anime_expansion",
+            )
+            if candidate is not None:
+                previous = by_id.get(candidate.mal_anime_id)
+                if previous is None or candidate.score > previous.score:
+                    by_id[candidate.mal_anime_id] = candidate
+        if depth >= _RELATION_EXPANSION_MAX_DEPTH:
+            continue
+        next_related: list[int] = []
+        for relation in detail.get("related_anime") or []:
+            related = relation.get("node") or {}
+            related_id = related.get("id")
+            if related_id is None:
+                continue
+            try:
+                normalized_id = int(related_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id in queued_ids or normalized_id in visited_ids:
+                continue
+            next_related.append(normalized_id)
+            queued_ids.add(normalized_id)
+        for normalized_id in reversed(next_related):
+            queue.appendleft((normalized_id, depth + 1))
+
+
 def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) -> MappingResult:
     queries = build_search_queries(series)
     by_id: dict[int, MappingCandidate] = {}
@@ -902,6 +1303,7 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
                 previous = by_id.get(candidate.mal_anime_id)
                 if previous is None or candidate.score > previous.score:
                     by_id[candidate.mal_anime_id] = candidate
+    _expand_candidates_via_relations(client, series, queries, by_id)
     candidates = sorted(by_id.values(), key=_candidate_sort_key, reverse=True)
     top = candidates[0] if candidates else None
     second = candidates[1] if len(candidates) > 1 else None
@@ -912,6 +1314,13 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
     rationale.append(f"top_score={top.score:.3f}")
     rationale.append(f"margin={margin:.3f}")
     rationale.extend(top.match_reasons)
+    bundle_companion_candidate: MappingCandidate | None = None
+    bundle_companion_candidates: list[MappingCandidate] | None = None
+    multi_entry_bundle = _suspect_multi_entry_bundle(series, top, candidates)
+    if multi_entry_bundle:
+        multi_entry_bundle_reason, bundle_companion_candidates = multi_entry_bundle
+        rationale.append(multi_entry_bundle_reason)
+        bundle_companion_candidate = bundle_companion_candidates[0] if bundle_companion_candidates else None
     if _supports_exact_classification(series, top, second):
         status = "exact"
     elif top.score >= 0.90 and margin >= 0.05:
@@ -920,4 +1329,13 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
         status = "ambiguous"
     else:
         status = "weak"
-    return MappingResult(series=series, status=status, confidence=top.score, chosen_candidate=top, candidates=candidates[:limit], rationale=rationale)
+    return MappingResult(
+        series=series,
+        status=status,
+        confidence=top.score,
+        chosen_candidate=top,
+        candidates=candidates[:limit],
+        rationale=rationale,
+        bundle_companion_candidate=bundle_companion_candidate,
+        bundle_companion_candidates=bundle_companion_candidates,
+    )

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
+import subprocess
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 
@@ -23,9 +27,12 @@ from .crunchyroll_snapshot import (
 )
 from .db import (
     bootstrap_database,
+    get_operational_snapshot,
     get_provider_series_title_map,
     list_review_queue_entries,
     list_series_mappings,
+    refresh_review_queue_entries,
+    update_review_queue_entry_statuses,
     upsert_series_mapping,
 )
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
@@ -34,6 +41,7 @@ from .mapping import SeriesMappingInput, map_series, normalize_title
 from .recommendation_metadata import refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations
 from .sync_planner import (
+    MAPPING_REVIEW_HEURISTICS_REVISION,
     build_dry_run_sync_plan,
     build_mapping_review,
     execute_approved_sync,
@@ -101,6 +109,936 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.access_token_path={secrets.access_token_path}")
     print(f"mal.refresh_token_path={secrets.refresh_token_path}")
     return 0
+
+
+
+def _parse_sqlite_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace("T", " ")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1]
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+
+def _age_seconds_from_timestamp(value: object) -> float | None:
+    parsed = _parse_sqlite_timestamp(value)
+    if parsed is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
+
+def _sync_run_summary_counts(sync_run: dict[str, object] | None) -> dict[str, int]:
+    if not isinstance(sync_run, dict):
+        return {}
+    summary = sync_run.get("summary")
+    if not isinstance(summary, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for field in ("series_count", "progress_count", "watchlist_count"):
+        value = summary.get(field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            counts[field] = max(0, int(value))
+    return counts
+
+
+
+def _build_partial_sync_coverage(
+    latest_sync_run: dict[str, object] | None,
+    provider_counts: dict[str, object] | None,
+) -> dict[str, object] | None:
+    latest_counts = _sync_run_summary_counts(latest_sync_run)
+    if not latest_counts or not isinstance(provider_counts, dict):
+        return None
+
+    field_map = {
+        "series_count": "series",
+        "progress_count": "progress",
+        "watchlist_count": "watchlist",
+    }
+    partial_fields: dict[str, dict[str, object]] = {}
+    for summary_field, provider_field in field_map.items():
+        latest_value = latest_counts.get(summary_field)
+        provider_value = provider_counts.get(provider_field)
+        if not isinstance(latest_value, int):
+            continue
+        if not isinstance(provider_value, int) or provider_value <= 0:
+            continue
+        if latest_value >= provider_value:
+            continue
+        partial_fields[provider_field] = {
+            "latest_sync_run_count": latest_value,
+            "provider_total_count": provider_value,
+            "coverage_ratio": round(latest_value / provider_value, 4),
+        }
+
+    if not partial_fields:
+        return None
+
+    return {
+        "sync_run_id": latest_sync_run.get("id") if isinstance(latest_sync_run, dict) else None,
+        "fields": partial_fields,
+    }
+
+
+
+def _build_mapping_coverage_snapshot(
+    provider_counts: dict[str, object] | None,
+    mapping_counts: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(provider_counts, dict) or not isinstance(mapping_counts, dict):
+        return None
+    provider_series_count = provider_counts.get("series")
+    approved_mapping_count = mapping_counts.get("approved")
+    total_mapping_count = mapping_counts.get("total")
+    if not isinstance(provider_series_count, int) or provider_series_count < 0:
+        return None
+    if not isinstance(approved_mapping_count, int) or approved_mapping_count < 0:
+        return None
+    if not isinstance(total_mapping_count, int) or total_mapping_count < 0:
+        total_mapping_count = approved_mapping_count
+
+    coverage_ratio = None
+    if provider_series_count > 0:
+        coverage_ratio = round(min(1.0, approved_mapping_count / provider_series_count), 4)
+
+    return {
+        "provider_series_count": provider_series_count,
+        "approved_mapping_count": approved_mapping_count,
+        "unmapped_series_count": max(0, provider_series_count - approved_mapping_count),
+        "total_mapping_count": total_mapping_count,
+        "approved_coverage_ratio": coverage_ratio,
+    }
+
+
+
+def _build_mapping_review_revision_snapshot(items: list[object]) -> dict[str, object] | None:
+    if not isinstance(items, list):
+        return None
+    total_open = 0
+    stale_items: list[dict[str, object]] = []
+    for item in items:
+        payload = item.payload if hasattr(item, "payload") else None
+        if not isinstance(payload, dict):
+            continue
+        total_open += 1
+        revision = payload.get("mapper_revision")
+        if revision == MAPPING_REVIEW_HEURISTICS_REVISION:
+            continue
+        provider_series_id = item.provider_series_id if hasattr(item, "provider_series_id") else None
+        stale_items.append(
+            {
+                "provider_series_id": provider_series_id,
+                "title": payload.get("title") if isinstance(payload.get("title"), str) else None,
+                "mapper_revision": revision if isinstance(revision, str) and revision else None,
+            }
+        )
+    return {
+        "current_revision": MAPPING_REVIEW_HEURISTICS_REVISION,
+        "open_count": total_open,
+        "stale_open_count": len(stale_items),
+        "stale_examples": stale_items[:10],
+        "all_current": len(stale_items) == 0,
+    }
+
+
+
+def _format_systemd_usec_timestamp(value: str) -> str | None:
+    raw = value.strip()
+    if not raw or raw == "0":
+        return None
+    try:
+        timestamp = int(raw) / 1_000_000
+    except ValueError:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+
+def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
+    properties = [
+        "ActiveState",
+        "SubState",
+        "UnitFileState",
+        "NextElapseUSecRealtime",
+        "LastTriggerUSec",
+        "Result",
+    ]
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit_name,
+                *(f"--property={name}" for name in properties),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "error": str(exc)}
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or f"systemctl exited with code {result.returncode}").strip()
+        return {"available": False, "error": error}
+
+    runtime: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in properties:
+            runtime[key] = value
+    return {
+        "available": True,
+        "active_state": runtime.get("ActiveState") or None,
+        "sub_state": runtime.get("SubState") or None,
+        "unit_file_state": runtime.get("UnitFileState") or None,
+        "next_elapse_at": _format_systemd_usec_timestamp(runtime.get("NextElapseUSecRealtime") or ""),
+        "last_trigger_at": _format_systemd_usec_timestamp(runtime.get("LastTriggerUSec") or ""),
+        "result": runtime.get("Result") or None,
+    }
+
+
+
+def _build_automation_installation_status(project_root: Path) -> dict[str, object] | None:
+    source_dir = project_root / "ops" / "systemd-user"
+    script_path = project_root / "scripts" / "install_user_systemd_units.sh"
+    unit_names = [
+        "mal-updater-exact-approved-sync.service",
+        "mal-updater-exact-approved-sync.timer",
+        "mal-updater-health-check.service",
+        "mal-updater-health-check.timer",
+    ]
+    timer_unit_names = [name for name in unit_names if name.endswith(".timer")]
+    if not source_dir.is_dir() or not script_path.exists() or not all((source_dir / name).exists() for name in unit_names):
+        return None
+
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    target_dir = config_home / "systemd" / "user"
+    wants_dir = target_dir / "timers.target.wants"
+    env_path = config_home / "mal-updater-health-check.env"
+    units: dict[str, dict[str, object]] = {}
+    missing_units: list[str] = []
+    outdated_units: list[str] = []
+    disabled_timers: list[str] = []
+    inactive_timers: list[str] = []
+    runtime_state_available = False
+    runtime_state_error: str | None = None
+    for name in unit_names:
+        source_path = source_dir / name
+        target_path = target_dir / name
+        installed = target_path.exists()
+        content_matches_repo = False
+        timer_enabled = None
+        timer_enablement_points_to_target = None
+        wants_path = None
+        if installed:
+            try:
+                content_matches_repo = source_path.read_text(encoding="utf-8") == target_path.read_text(encoding="utf-8")
+            except OSError:
+                content_matches_repo = False
+        if name.endswith(".timer"):
+            wants_path = wants_dir / name
+            if wants_path.is_symlink():
+                try:
+                    linked_target = wants_path.resolve(strict=False)
+                except OSError:
+                    linked_target = None
+                timer_enablement_points_to_target = linked_target == target_path if linked_target is not None else False
+                timer_enabled = bool(installed and timer_enablement_points_to_target)
+            else:
+                timer_enablement_points_to_target = False if wants_path.exists() else None
+                timer_enabled = False if installed else None
+        runtime_state: dict[str, object] | None = None
+        if name.endswith(".timer") and installed and timer_enabled is True:
+            runtime_state = _read_systemd_user_unit_runtime(name)
+            if runtime_state.get("available") is True:
+                runtime_state_available = True
+                if runtime_state.get("active_state") != "active":
+                    inactive_timers.append(name)
+            elif runtime_state_error is None:
+                error = runtime_state.get("error")
+                runtime_state_error = str(error) if error else "runtime state unavailable"
+
+        if not installed:
+            missing_units.append(name)
+        elif not content_matches_repo:
+            outdated_units.append(name)
+        if name.endswith(".timer") and installed and not bool(timer_enabled):
+            disabled_timers.append(name)
+        units[name] = {
+            "installed": installed,
+            "target_path": str(target_path),
+            "content_matches_repo": content_matches_repo if installed else None,
+            "enabled": timer_enabled,
+            "enablement_points_to_target": timer_enablement_points_to_target,
+            "wants_path": str(wants_path) if wants_path is not None else None,
+            "runtime_state": runtime_state,
+        }
+
+    return {
+        "available": True,
+        "source_dir": str(source_dir),
+        "install_script_path": str(script_path),
+        "target_dir": str(target_dir),
+        "wants_dir": str(wants_dir),
+        "health_env_path": str(env_path),
+        "health_env_present": env_path.exists(),
+        "units": units,
+        "all_units_installed": not missing_units,
+        "all_units_current": not missing_units and not outdated_units,
+        "all_timers_enabled": all(units.get(name, {}).get("installed") and units.get(name, {}).get("enabled") is True for name in timer_unit_names),
+        "runtime_state_available": runtime_state_available,
+        "runtime_state_error": runtime_state_error,
+        "inactive_timers": inactive_timers,
+        "missing_units": missing_units,
+        "outdated_units": outdated_units,
+        "disabled_timers": disabled_timers,
+    }
+
+
+
+def _build_health_maintenance_commands(
+    *,
+    crunchyroll_credentials_present: bool,
+    crunchyroll_state_present: bool,
+    mal_client_id_present: bool,
+    mal_auth_present: bool,
+    latest_sync_run: dict[str, object] | None,
+    latest_completed_sync_run: dict[str, object] | None,
+    latest_completed_age_seconds: float | None,
+    stale_hours: float,
+    partial_sync_coverage: dict[str, object] | None = None,
+    mapping_coverage: dict[str, object] | None = None,
+    mapping_coverage_threshold: float | None = None,
+    maintenance_review_limit: int = 25,
+    automation_installation: dict[str, object] | None = None,
+    review_queue_refresh_command_args: list[str] | None = None,
+    review_queue_refresh_worklist_command_args: list[str] | None = None,
+) -> list[dict[str, object]]:
+    commands: list[dict[str, object]] = []
+    seen_commands: set[str] = set()
+
+    def add_command(
+        reason_code: str,
+        detail: str,
+        args: list[str],
+        *,
+        automation_safe: bool,
+        requires_auth_interaction: bool,
+        command_builder=None,
+    ) -> None:
+        command = command_builder(args) if command_builder is not None else _build_review_queue_command(args)
+        if command in seen_commands:
+            return
+        seen_commands.add(command)
+        commands.append(
+            {
+                "reason_code": reason_code,
+                "detail": detail,
+                "command_args": args,
+                "command": command,
+                "automation_safe": automation_safe,
+                "requires_auth_interaction": requires_auth_interaction,
+            }
+        )
+
+    if crunchyroll_credentials_present and not crunchyroll_state_present:
+        add_command(
+            "missing_crunchyroll_state",
+            "Re-bootstrap Crunchyroll auth state from the staged local credentials",
+            ["crunchyroll-auth-login"],
+            automation_safe=False,
+            requires_auth_interaction=False,
+        )
+
+    if mal_client_id_present and not mal_auth_present:
+        add_command(
+            "missing_mal_auth_material",
+            "Complete MAL OAuth and persist fresh access/refresh tokens",
+            ["mal-auth-login"],
+            automation_safe=False,
+            requires_auth_interaction=True,
+        )
+
+    snapshot_needs_refresh = not isinstance(latest_completed_sync_run, dict)
+    if latest_completed_age_seconds is not None and latest_completed_age_seconds > stale_hours * 3600:
+        snapshot_needs_refresh = True
+    if isinstance(latest_sync_run, dict) and latest_sync_run.get("status") == "failed":
+        snapshot_needs_refresh = True
+
+    if crunchyroll_credentials_present and crunchyroll_state_present and isinstance(partial_sync_coverage, dict):
+        add_command(
+            "refresh_full_snapshot",
+            "Run a full-refresh Crunchyroll ingest so untouched older rows are refreshed instead of only the incremental overlap page",
+            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", "cache/live-crunchyroll-snapshot.json", "--ingest"],
+            automation_safe=True,
+            requires_auth_interaction=False,
+        )
+    elif crunchyroll_credentials_present and crunchyroll_state_present and snapshot_needs_refresh:
+        add_command(
+            "refresh_ingested_snapshot",
+            "Fetch a fresh Crunchyroll snapshot and ingest it so health state is current again",
+            ["crunchyroll-fetch-snapshot", "--out", "cache/live-crunchyroll-snapshot.json", "--ingest"],
+            automation_safe=True,
+            requires_auth_interaction=False,
+        )
+
+    missing_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
+    outdated_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
+    disabled_timers = automation_installation.get("disabled_timers") if isinstance(automation_installation, dict) else None
+    inactive_timers = automation_installation.get("inactive_timers") if isinstance(automation_installation, dict) else None
+    install_script_path = automation_installation.get("install_script_path") if isinstance(automation_installation, dict) else None
+    if (
+        isinstance(install_script_path, str)
+        and install_script_path
+        and (
+            (isinstance(missing_units, list) and missing_units)
+            or (isinstance(outdated_units, list) and outdated_units)
+            or (isinstance(disabled_timers, list) and disabled_timers)
+            or (isinstance(inactive_timers, list) and inactive_timers)
+        )
+    ):
+        detail = "Install the repo-owned user systemd timers so exact-approved sync and health-check automation can run unattended"
+        if isinstance(outdated_units, list) and outdated_units:
+            detail = "Reinstall/update the repo-owned user systemd timers so installed automation matches the current repo versions"
+        elif isinstance(disabled_timers, list) and disabled_timers:
+            detail = "Enable the repo-owned user systemd timers so the installed automation actually runs unattended"
+        elif isinstance(inactive_timers, list) and inactive_timers:
+            detail = "Reinstall/restart the repo-owned user systemd timers so the enabled automation is actually active in the user runtime"
+        add_command(
+            "install_user_systemd_units",
+            detail,
+            [install_script_path],
+            automation_safe=True,
+            requires_auth_interaction=False,
+            command_builder=_build_shell_command,
+        )
+
+    if review_queue_refresh_worklist_command_args and mal_auth_present:
+        add_command(
+            "refresh_mapping_review_worklist",
+            "Re-evaluate the highest-signal open mapping-review slices under the latest mapper heuristics before rebuilding the whole backlog",
+            review_queue_refresh_worklist_command_args,
+            automation_safe=True,
+            requires_auth_interaction=False,
+        )
+    elif review_queue_refresh_command_args and mal_auth_present:
+        add_command(
+            "refresh_mapping_review_queue",
+            "Re-evaluate the highest-signal open mapping-review slice under the latest mapper heuristics before rebuilding the whole backlog",
+            review_queue_refresh_command_args,
+            automation_safe=True,
+            requires_auth_interaction=False,
+        )
+
+    coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
+    unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
+    if (
+        crunchyroll_state_present
+        and not isinstance(partial_sync_coverage, dict)
+        and isinstance(coverage_ratio, float)
+        and isinstance(unmapped_series_count, int)
+        and unmapped_series_count > 0
+        and isinstance(mapping_coverage_threshold, float)
+        and coverage_ratio < mapping_coverage_threshold
+    ):
+        threshold_percent = int(round(mapping_coverage_threshold * 100))
+        recommended_review_limit = max(0, int(maintenance_review_limit))
+        review_command_args = ["review-mappings", "--limit", str(recommended_review_limit), "--mapping-limit", "5", "--persist-review-queue"]
+        detail = (
+            f"Run a bounded mapping review pass and persist the resulting residue because approved mapping coverage is still below {threshold_percent}%"
+        )
+        if recommended_review_limit == 0:
+            detail = f"Rebuild mapping review residue because approved mapping coverage is still below {threshold_percent}%"
+        add_command(
+            "refresh_mapping_review_backlog",
+            detail,
+            review_command_args,
+            automation_safe=True,
+            requires_auth_interaction=False,
+        )
+
+    return commands
+
+
+
+def _select_maintenance_command(
+    recommended_commands: object,
+    *,
+    require_automation_safe: bool = False,
+) -> dict[str, object] | None:
+    if not isinstance(recommended_commands, list):
+        return None
+    for item in recommended_commands:
+        if not isinstance(item, dict):
+            continue
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        if require_automation_safe:
+            if item.get("automation_safe") is not True:
+                continue
+            if item.get("requires_auth_interaction") is True:
+                continue
+        return item
+    return None
+
+
+
+def _emit_health_check_summary(payload: dict[str, object]) -> None:
+    warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
+    warning_codes = [item.get("code") for item in warnings if isinstance(item, dict) and item.get("code")]
+    review_queue = payload.get("review_queue") if isinstance(payload.get("review_queue"), dict) else {}
+    recommended_next = review_queue.get("recommended_next") if isinstance(review_queue.get("recommended_next"), dict) else None
+    recommended_worklist = review_queue.get("recommended_worklist") if isinstance(review_queue.get("recommended_worklist"), list) else []
+    recommended_apply_worklist = review_queue.get("recommended_apply_worklist") if isinstance(review_queue.get("recommended_apply_worklist"), dict) else None
+    recommended_refresh_worklist = review_queue.get("recommended_refresh_worklist") if isinstance(review_queue.get("recommended_refresh_worklist"), dict) else None
+    maintenance = payload.get("maintenance") if isinstance(payload.get("maintenance"), dict) else {}
+    recommended_commands = maintenance.get("recommended_commands") if isinstance(maintenance.get("recommended_commands"), list) else []
+    automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else None
+    mappings = payload.get("mappings") if isinstance(payload.get("mappings"), dict) else {}
+    mapping_coverage = mappings.get("coverage") if isinstance(mappings.get("coverage"), dict) else None
+    mapping_review_revision = review_queue.get("mapping_review_revision") if isinstance(review_queue.get("mapping_review_revision"), dict) else None
+
+    install_units_command = None
+    if isinstance(recommended_commands, list):
+        for item in recommended_commands:
+            if not isinstance(item, dict):
+                continue
+            if item.get("reason_code") != "install_user_systemd_units":
+                continue
+            command = item.get("command")
+            if isinstance(command, str) and command:
+                install_units_command = command
+                break
+
+    print(f"healthy={bool(payload.get('healthy'))}")
+    print(f"warning_count={len(warnings)}")
+    if isinstance(mapping_coverage, dict):
+        approved_count = mapping_coverage.get("approved_mapping_count")
+        provider_series_count = mapping_coverage.get("provider_series_count")
+        coverage_ratio = mapping_coverage.get("approved_coverage_ratio")
+        if isinstance(approved_count, int) and isinstance(provider_series_count, int):
+            if isinstance(coverage_ratio, float):
+                print(
+                    "approved_mapping_coverage="
+                    + f"{approved_count}/{provider_series_count} ({coverage_ratio * 100:.1f}%)"
+                )
+            else:
+                print(f"approved_mapping_coverage={approved_count}/{provider_series_count}")
+    if warning_codes:
+        print("warnings=" + ", ".join(str(code) for code in warning_codes))
+    if isinstance(mapping_review_revision, dict):
+        stale_open_count = mapping_review_revision.get("stale_open_count")
+        open_count = mapping_review_revision.get("open_count")
+        current_revision = mapping_review_revision.get("current_revision")
+        if isinstance(stale_open_count, int) and isinstance(open_count, int) and open_count > 0:
+            line = f"mapping_review_stale_entries={stale_open_count}/{open_count}"
+            if current_revision:
+                line += f" revision={current_revision}"
+            print(line)
+    if isinstance(automation, dict):
+        all_units_installed = automation.get("all_units_installed")
+        if isinstance(all_units_installed, bool):
+            print(f"automation_all_units_installed={all_units_installed}")
+        all_units_current = automation.get("all_units_current")
+        if isinstance(all_units_current, bool):
+            print(f"automation_all_units_current={all_units_current}")
+        all_timers_enabled = automation.get("all_timers_enabled")
+        if isinstance(all_timers_enabled, bool):
+            print(f"automation_all_timers_enabled={all_timers_enabled}")
+        missing_units = automation.get("missing_units")
+        if isinstance(missing_units, list) and missing_units:
+            print("automation_missing_units=" + ", ".join(str(item) for item in missing_units))
+        outdated_units = automation.get("outdated_units")
+        if isinstance(outdated_units, list) and outdated_units:
+            print("automation_outdated_units=" + ", ".join(str(item) for item in outdated_units))
+        disabled_timers = automation.get("disabled_timers")
+        if isinstance(disabled_timers, list) and disabled_timers:
+            print("automation_disabled_timers=" + ", ".join(str(item) for item in disabled_timers))
+        inactive_timers = automation.get("inactive_timers")
+        if isinstance(inactive_timers, list) and inactive_timers:
+            print("automation_inactive_timers=" + ", ".join(str(item) for item in inactive_timers))
+        units = automation.get("units")
+        if isinstance(units, dict):
+            runtime_lines: list[str] = []
+            for name, info in units.items():
+                if not isinstance(info, dict) or not name.endswith(".timer"):
+                    continue
+                runtime_state = info.get("runtime_state")
+                if not isinstance(runtime_state, dict) or runtime_state.get("available") is not True:
+                    continue
+                active_state = runtime_state.get("active_state")
+                next_elapse_at = runtime_state.get("next_elapse_at")
+                last_trigger_at = runtime_state.get("last_trigger_at")
+                parts = [str(name)]
+                if active_state:
+                    parts.append(f"active={active_state}")
+                if next_elapse_at:
+                    parts.append(f"next={next_elapse_at}")
+                if last_trigger_at:
+                    parts.append(f"last={last_trigger_at}")
+                runtime_lines.append(" | ".join(parts))
+            if runtime_lines:
+                print("automation_timer_runtime=" + "; ".join(runtime_lines))
+    if install_units_command:
+        print("automation_install_command=" + install_units_command)
+    top_command = _select_maintenance_command(recommended_commands)
+    if isinstance(top_command, dict) and top_command.get("command"):
+        print("maintenance_recommended_command=" + str(top_command["command"]))
+    top_auto_command = _select_maintenance_command(recommended_commands, require_automation_safe=True)
+    if isinstance(top_auto_command, dict) and top_auto_command.get("command"):
+        print("maintenance_recommended_auto_command=" + str(top_auto_command["command"]))
+    if recommended_next:
+        command = recommended_next.get("drilldown_command")
+        if command:
+            print("recommended_next=" + str(command))
+    if recommended_apply_worklist and recommended_apply_worklist.get("command"):
+        print("recommended_apply_worklist=" + str(recommended_apply_worklist["command"]))
+    if recommended_refresh_worklist and recommended_refresh_worklist.get("command"):
+        print("recommended_refresh_worklist=" + str(recommended_refresh_worklist["command"]))
+    if recommended_worklist:
+        top = recommended_worklist[0]
+        if isinstance(top, dict):
+            action_command = top.get("action_command")
+            if action_command:
+                print("recommended_action=" + str(action_command))
+            resolve_command = top.get("resolve_command")
+            if resolve_command:
+                print("recommended_resolve=" + str(resolve_command))
+
+
+
+def _cmd_health_check(
+    project_root: Path | None,
+    stale_hours: float,
+    strict: bool,
+    review_issue_type: str | None,
+    review_worklist_limit: int,
+    output_format: str,
+    mapping_coverage_threshold: float,
+    maintenance_review_limit: int,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    secrets = load_mal_secrets(config)
+    crunchyroll_credentials = load_crunchyroll_credentials(config)
+    crunchyroll_state = resolve_crunchyroll_state_paths(config)
+    snapshot = get_operational_snapshot(config.db_path)
+
+    latest_sync_run = snapshot.get("latest_sync_run")
+    latest_completed_sync_run = snapshot.get("latest_completed_sync_run")
+    latest_completed_age_seconds = _age_seconds_from_timestamp(
+        latest_completed_sync_run.get("completed_at") if isinstance(latest_completed_sync_run, dict) else None
+    )
+    partial_sync_coverage = _build_partial_sync_coverage(
+        latest_sync_run if isinstance(latest_sync_run, dict) else None,
+        snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
+    )
+    mapping_coverage = _build_mapping_coverage_snapshot(
+        snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
+        snapshot.get("mappings") if isinstance(snapshot.get("mappings"), dict) else None,
+    )
+    automation_installation = _build_automation_installation_status(config.project_root)
+
+    warnings: list[dict[str, object]] = []
+
+    if not crunchyroll_credentials.username or not crunchyroll_credentials.password:
+        warnings.append({"code": "missing_crunchyroll_credentials", "detail": "Crunchyroll username/password secrets are not both present"})
+    if not crunchyroll_state.refresh_token_path.exists() or not crunchyroll_state.device_id_path.exists():
+        warnings.append({"code": "missing_crunchyroll_state", "detail": "Crunchyroll refresh token or device id is missing"})
+    if not secrets.client_id or not secrets.access_token or not secrets.refresh_token:
+        warnings.append({"code": "missing_mal_auth_material", "detail": "MAL client id/access token/refresh token are not all present"})
+    missing_automation_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
+    outdated_automation_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
+    disabled_automation_timers = automation_installation.get("disabled_timers") if isinstance(automation_installation, dict) else None
+    inactive_automation_timers = automation_installation.get("inactive_timers") if isinstance(automation_installation, dict) else None
+    if isinstance(missing_automation_units, list) and missing_automation_units:
+        warnings.append(
+            {
+                "code": "automation_units_missing",
+                "detail": "Repo-owned MAL-Updater user systemd units are not fully installed for this user",
+                "missing_units": missing_automation_units,
+                "target_dir": automation_installation.get("target_dir"),
+            }
+        )
+    if isinstance(outdated_automation_units, list) and outdated_automation_units:
+        warnings.append(
+            {
+                "code": "automation_units_outdated",
+                "detail": "Installed repo-owned MAL-Updater user systemd units do not match the current checked-in repo versions",
+                "outdated_units": outdated_automation_units,
+                "target_dir": automation_installation.get("target_dir"),
+            }
+        )
+    if isinstance(disabled_automation_timers, list) and disabled_automation_timers:
+        warnings.append(
+            {
+                "code": "automation_timers_disabled",
+                "detail": "Repo-owned MAL-Updater user systemd timers are installed but not enabled for this user",
+                "disabled_timers": disabled_automation_timers,
+                "wants_dir": automation_installation.get("wants_dir"),
+            }
+        )
+    if isinstance(inactive_automation_timers, list) and inactive_automation_timers:
+        warnings.append(
+            {
+                "code": "automation_timers_inactive",
+                "detail": "Repo-owned MAL-Updater user systemd timers are enabled on disk but are not currently active in the user systemd runtime",
+                "inactive_timers": inactive_automation_timers,
+            }
+        )
+    if not isinstance(latest_completed_sync_run, dict):
+        warnings.append({"code": "no_completed_ingest_snapshot", "detail": "No completed sync_runs row exists yet"})
+    if isinstance(latest_sync_run, dict) and latest_sync_run.get("status") == "failed":
+        warnings.append({"code": "latest_sync_run_failed", "detail": "Latest sync_runs row is failed", "sync_run_id": latest_sync_run.get("id")})
+    if latest_completed_age_seconds is not None and latest_completed_age_seconds > stale_hours * 3600:
+        warnings.append(
+            {
+                "code": "completed_snapshot_stale",
+                "detail": f"Latest completed ingest snapshot is older than {stale_hours:g} hours",
+                "age_seconds": latest_completed_age_seconds,
+            }
+        )
+    if isinstance(partial_sync_coverage, dict):
+        warnings.append(
+            {
+                "code": "latest_sync_run_partial_coverage",
+                "detail": "Latest completed ingest touched fewer provider rows than currently exist in the local cache; freshness is only partial until a full refresh runs",
+                "sync_run_id": partial_sync_coverage.get("sync_run_id"),
+                "fields": partial_sync_coverage.get("fields"),
+            }
+        )
+    coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
+    unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
+    if (
+        not isinstance(partial_sync_coverage, dict)
+        and isinstance(coverage_ratio, float)
+        and isinstance(unmapped_series_count, int)
+        and unmapped_series_count > 0
+        and coverage_ratio < mapping_coverage_threshold
+    ):
+        warnings.append(
+            {
+                "code": "approved_mapping_coverage_below_threshold",
+                "detail": f"Approved mapping coverage is below the configured {mapping_coverage_threshold * 100:.1f}% threshold",
+                "coverage": mapping_coverage,
+                "threshold_ratio": round(mapping_coverage_threshold, 4),
+            }
+        )
+
+    review_queue = snapshot.get("review_queue") if isinstance(snapshot.get("review_queue"), dict) else {}
+    open_review_counts = review_queue.get("open") if isinstance(review_queue.get("open"), dict) else {}
+    open_review_total = sum(value for value in open_review_counts.values() if isinstance(value, int))
+    review_queue_next: dict[str, object] | None = None
+    review_queue_worklist: list[dict[str, object]] = []
+    review_queue_apply_worklist: dict[str, object] | None = None
+    review_queue_refresh_worklist: dict[str, object] | None = None
+    mapping_review_items = list_review_queue_entries(
+        config.db_path,
+        status="open",
+        issue_type="mapping_review",
+    )
+    mapping_review_revision = _build_mapping_review_revision_snapshot(mapping_review_items)
+    if isinstance(mapping_review_revision, dict) and mapping_review_revision.get("stale_open_count"):
+        warnings.append(
+            {
+                "code": "mapping_review_queue_stale_heuristics",
+                "detail": "Open mapping-review rows were produced by older or unknown mapper heuristics and should be refreshed before manual triage",
+                "current_revision": mapping_review_revision.get("current_revision"),
+                "stale_open_count": mapping_review_revision.get("stale_open_count"),
+                "open_count": mapping_review_revision.get("open_count"),
+                "stale_examples": mapping_review_revision.get("stale_examples"),
+            }
+        )
+    if open_review_total > 0:
+        warnings.append(
+            {
+                "code": "open_review_queue",
+                "detail": "Open review backlog exists",
+                "open_count": open_review_total,
+                "by_issue_type": open_review_counts,
+            }
+        )
+        recommendation_items = list_review_queue_entries(
+            config.db_path,
+            status="open",
+            issue_type=review_issue_type,
+        )
+        provider_series_titles = get_provider_series_title_map(
+            config.db_path,
+            provider="crunchyroll",
+            provider_series_ids=[item.provider_series_id for item in recommendation_items if item.provider_series_id],
+        )
+        review_queue_summary = _summarize_review_queue(
+            recommendation_items,
+            status="open",
+            issue_type=review_issue_type,
+            provider_series_titles=provider_series_titles,
+        )
+        review_queue_next = _select_review_queue_next_bucket(review_queue_summary, bucket="cluster-strategy")
+        if review_queue_next is None:
+            for fallback_bucket in ("fix-strategy", "title-cluster", "reason", "decision"):
+                review_queue_next = _select_review_queue_next_bucket(review_queue_summary, bucket=fallback_bucket)
+                if review_queue_next is not None:
+                    break
+        review_queue_worklist = _build_review_queue_worklist(
+            review_queue_summary,
+            bucket_order=["cluster-strategy", "fix-strategy", "title-cluster", "reason", "decision"],
+            limit=review_worklist_limit,
+        )
+        if review_queue_worklist:
+            apply_args = _review_queue_apply_worklist_args(
+                status="open",
+                issue_type=review_issue_type,
+                limit=review_worklist_limit,
+                per_bucket_limit=20,
+            )
+            review_queue_apply_worklist = {
+                "status_from": "open",
+                "status_to": "resolved",
+                "bucket_limit": review_worklist_limit,
+                "per_bucket_limit": 20,
+                "command_args": apply_args,
+                "command": _build_review_queue_command(apply_args),
+            }
+            if review_issue_type != "sync_review":
+                refresh_issue_type = review_issue_type if review_issue_type == "mapping_review" else None
+                refresh_args = _review_queue_refresh_worklist_args(
+                    status="open",
+                    issue_type=refresh_issue_type,
+                    limit=review_worklist_limit,
+                    per_bucket_limit=20,
+                    mapping_limit=5,
+                )
+                review_queue_refresh_worklist = {
+                    "status": "open",
+                    "issue_type": refresh_issue_type or "mapping_review",
+                    "bucket_limit": review_worklist_limit,
+                    "per_bucket_limit": 20,
+                    "mapping_limit": 5,
+                    "command_args": refresh_args,
+                    "command": _build_review_queue_command(refresh_args),
+                }
+
+    review_queue_refresh_command_args = None
+    if isinstance(review_queue_next, dict):
+        refresh_args = review_queue_next.get("refresh_args")
+        if isinstance(refresh_args, list) and refresh_args:
+            review_queue_refresh_command_args = [str(item) for item in refresh_args if item is not None]
+
+    review_queue_refresh_worklist_command_args = None
+    if isinstance(review_queue_refresh_worklist, dict):
+        refresh_worklist_args = review_queue_refresh_worklist.get("command_args")
+        refresh_worklist_provider_series_ids: set[str] = set()
+        for item in review_queue_worklist:
+            if not isinstance(item, dict):
+                continue
+            provider_series_ids = item.get("refresh_provider_series_ids")
+            if not isinstance(provider_series_ids, list):
+                continue
+            for provider_series_id in provider_series_ids:
+                if isinstance(provider_series_id, str) and provider_series_id.strip():
+                    refresh_worklist_provider_series_ids.add(provider_series_id)
+        if isinstance(refresh_worklist_args, list) and len(refresh_worklist_provider_series_ids) > 1:
+            review_queue_refresh_worklist_command_args = [str(item) for item in refresh_worklist_args if item is not None]
+
+    maintenance_commands = _build_health_maintenance_commands(
+        crunchyroll_credentials_present=bool(crunchyroll_credentials.username and crunchyroll_credentials.password),
+        crunchyroll_state_present=crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists(),
+        mal_client_id_present=bool(secrets.client_id),
+        mal_auth_present=bool(secrets.client_id and secrets.access_token and secrets.refresh_token),
+        latest_sync_run=latest_sync_run if isinstance(latest_sync_run, dict) else None,
+        latest_completed_sync_run=latest_completed_sync_run if isinstance(latest_completed_sync_run, dict) else None,
+        latest_completed_age_seconds=latest_completed_age_seconds,
+        stale_hours=stale_hours,
+        partial_sync_coverage=partial_sync_coverage,
+        mapping_coverage=mapping_coverage,
+        mapping_coverage_threshold=mapping_coverage_threshold,
+        maintenance_review_limit=maintenance_review_limit,
+        automation_installation=automation_installation,
+        review_queue_refresh_command_args=review_queue_refresh_command_args,
+        review_queue_refresh_worklist_command_args=review_queue_refresh_worklist_command_args,
+    )
+
+    payload = {
+        "healthy": not warnings,
+        "stale_hours_threshold": stale_hours,
+        "warnings": warnings,
+        "maintenance": {
+            "recommended_commands": maintenance_commands,
+            "recommended_command": _select_maintenance_command(maintenance_commands),
+            "recommended_automation_command": _select_maintenance_command(
+                maintenance_commands,
+                require_automation_safe=True,
+            ),
+        },
+        "paths": {
+            "project_root": str(config.project_root),
+            "db_path": str(config.db_path),
+            "sync_boundary_path": str(crunchyroll_state.sync_boundary_path),
+        },
+        "automation": automation_installation,
+        "auth": {
+            "crunchyroll": {
+                "username_present": bool(crunchyroll_credentials.username),
+                "password_present": bool(crunchyroll_credentials.password),
+                "refresh_token_present": crunchyroll_state.refresh_token_path.exists(),
+                "device_id_present": crunchyroll_state.device_id_path.exists(),
+                "sync_boundary_present": crunchyroll_state.sync_boundary_path.exists(),
+            },
+            "mal": {
+                "client_id_present": bool(secrets.client_id),
+                "access_token_present": bool(secrets.access_token),
+                "refresh_token_present": bool(secrets.refresh_token),
+            },
+        },
+        "latest_sync_run": latest_sync_run,
+        "latest_completed_sync_run": latest_completed_sync_run,
+        "latest_completed_sync_run_age_seconds": latest_completed_age_seconds,
+        "provider_counts": snapshot.get("provider_counts"),
+        "provider_freshness": snapshot.get("provider_freshness"),
+        "partial_sync_coverage": partial_sync_coverage,
+        "review_queue": {
+            **review_queue,
+            "mapping_review_revision": mapping_review_revision,
+            "recommendation_issue_type_filter": review_issue_type,
+            "recommendation_worklist_limit": review_worklist_limit,
+            "recommended_next": review_queue_next,
+            "recommended_worklist": review_queue_worklist,
+            "recommended_apply_worklist": review_queue_apply_worklist,
+            "recommended_refresh_worklist": review_queue_refresh_worklist,
+        },
+        "mappings": {
+            **(snapshot.get("mappings") if isinstance(snapshot.get("mappings"), dict) else {}),
+            "coverage": mapping_coverage,
+            "coverage_threshold": round(mapping_coverage_threshold, 4),
+        },
+    }
+    if output_format == "summary":
+        _emit_health_check_summary(payload)
+    else:
+        print(json.dumps(payload, indent=2))
+    if strict and warnings:
+        return 2
+    return 0
+
 
 
 def _cmd_mal_auth_url(project_root: Path | None, emit_json: bool) -> int:
@@ -357,6 +1295,29 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
                     "matched_query": mapping.chosen_candidate.matched_query,
                     "match_reasons": mapping.chosen_candidate.match_reasons,
                 },
+                "bundle_companion_candidate": None
+                if not mapping.bundle_companion_candidate
+                else {
+                    "mal_anime_id": mapping.bundle_companion_candidate.mal_anime_id,
+                    "title": mapping.bundle_companion_candidate.title,
+                    "score": mapping.bundle_companion_candidate.score,
+                    "matched_query": mapping.bundle_companion_candidate.matched_query,
+                    "match_reasons": mapping.bundle_companion_candidate.match_reasons,
+                    "media_type": mapping.bundle_companion_candidate.media_type,
+                    "num_episodes": mapping.bundle_companion_candidate.num_episodes,
+                },
+                "bundle_companion_candidates": [
+                    {
+                        "mal_anime_id": candidate.mal_anime_id,
+                        "title": candidate.title,
+                        "score": candidate.score,
+                        "matched_query": candidate.matched_query,
+                        "match_reasons": candidate.match_reasons,
+                        "media_type": candidate.media_type,
+                        "num_episodes": candidate.num_episodes,
+                    }
+                    for candidate in (mapping.bundle_companion_candidates or [])
+                ],
                 "candidates": [
                     {
                         "mal_anime_id": candidate.mal_anime_id,
@@ -393,6 +1354,152 @@ def _cmd_review_mappings(project_root: Path | None, limit: int, mapping_limit: i
     payload: dict[str, object] = {"items": [item.as_dict() for item in items]}
     if persist_queue:
         payload["review_queue"] = persist_mapping_review_queue(config, items)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+
+def _refresh_mapping_review_queue_for_provider_series_ids(
+    config: object,
+    provider_series_ids: list[str],
+    mapping_limit: int,
+) -> dict[str, object]:
+    normalized_provider_series_ids = sorted({value.strip() for value in provider_series_ids if isinstance(value, str) and value.strip()})
+    items = build_mapping_review(
+        config,
+        limit=None,
+        mapping_limit=mapping_limit,
+        provider_series_ids=normalized_provider_series_ids,
+    )
+    queue_entries = []
+    for item in items:
+        if item.decision in {"preserved", "auto_approved", "ready_for_approval"}:
+            continue
+        severity = "error" if item.decision == "needs_manual_match" else "warning"
+        queue_entries.append(
+            {
+                "provider": item.provider,
+                "provider_series_id": item.provider_series_id,
+                "severity": severity,
+                "payload": item.as_dict(),
+            }
+        )
+    review_queue_result = refresh_review_queue_entries(
+        config.db_path,
+        issue_type="mapping_review",
+        provider_series_ids=normalized_provider_series_ids,
+        entries=queue_entries,
+    )
+    return {
+        "provider_series_ids": normalized_provider_series_ids,
+        "items": [item.as_dict() for item in items],
+        "review_queue": review_queue_result,
+    }
+
+
+
+def _resolve_refresh_mapping_review_queue_provider_series_ids(
+    config: object,
+    provider_series_ids: list[str],
+    *,
+    include_all_open: bool,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+) -> list[str]:
+    normalized_provider_series_ids = {
+        value.strip() for value in provider_series_ids if isinstance(value, str) and value.strip()
+    }
+    if include_all_open or any(
+        value is not None
+        for value in (
+            title_cluster,
+            fix_strategy,
+            cluster_strategy,
+            decision,
+            reason,
+            reason_family,
+            fix_strategy_family,
+            cluster_strategy_family,
+        )
+    ):
+        open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+        provider_series_titles = get_provider_series_title_map(
+            config.db_path,
+            provider="crunchyroll",
+            provider_series_ids=[item.provider_series_id for item in open_rows if item.provider_series_id],
+        )
+        filtered_open_rows = _filter_review_queue_items(
+            open_rows,
+            provider_series_titles=provider_series_titles,
+            title_cluster=title_cluster,
+            fix_strategy=fix_strategy,
+            cluster_strategy=cluster_strategy,
+            decision=decision,
+            reason=reason,
+            reason_family=reason_family,
+            fix_strategy_family=fix_strategy_family,
+            cluster_strategy_family=cluster_strategy_family,
+        )
+        normalized_provider_series_ids.update(
+            str(item.provider_series_id).strip()
+            for item in filtered_open_rows
+            if isinstance(item.provider_series_id, str) and item.provider_series_id.strip()
+        )
+    return sorted(normalized_provider_series_ids)
+
+
+
+def _cmd_refresh_mapping_review_queue(
+    project_root: Path | None,
+    provider_series_ids: list[str],
+    mapping_limit: int,
+    include_all_open: bool = False,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    normalized_provider_series_ids = _resolve_refresh_mapping_review_queue_provider_series_ids(
+        config,
+        provider_series_ids,
+        include_all_open=include_all_open,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    if not normalized_provider_series_ids:
+        print(
+            "--provider-series-id is required at least once (or use --all-open or a queue-slice filter)",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        payload = _refresh_mapping_review_queue_for_provider_series_ids(
+            config,
+            normalized_provider_series_ids,
+            mapping_limit,
+        )
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -546,7 +1653,16 @@ def _review_queue_title_cluster_key(title: str | None) -> str | None:
     return normalized or None
 
 
-def _review_queue_fix_strategy_key(payload: dict[str, object]) -> str | None:
+def _review_queue_reason_family(reason: str | None) -> str | None:
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    normalized_reason = reason.strip()
+    if "=" in normalized_reason:
+        return normalized_reason.split("=", 1)[0].strip() or normalized_reason
+    return normalized_reason
+
+
+def _review_queue_fix_strategy_key(payload: dict[str, object], *, canonicalize_reasons: bool = False) -> str | None:
     decision = payload.get("decision")
     if not isinstance(decision, str) or not decision.strip():
         return None
@@ -554,9 +1670,305 @@ def _review_queue_fix_strategy_key(payload: dict[str, object]) -> str | None:
     reasons = payload.get("reasons")
     normalized_reasons: list[str] = []
     if isinstance(reasons, list):
-        normalized_reasons = sorted({reason.strip() for reason in reasons if isinstance(reason, str) and reason.strip()})
+        normalized_reason_values: set[str] = set()
+        for reason in reasons:
+            if not isinstance(reason, str) or not reason.strip():
+                continue
+            normalized_reason = reason.strip()
+            if canonicalize_reasons:
+                normalized_reason = _review_queue_reason_family(normalized_reason) or normalized_reason
+            normalized_reason_values.add(normalized_reason)
+        normalized_reasons = sorted(normalized_reason_values)
     parts.extend(normalized_reasons)
     return " | ".join(parts)
+
+
+def _review_queue_cluster_strategy_key(
+    title: str | None,
+    payload: dict[str, object],
+    *,
+    canonicalize_reasons: bool = False,
+) -> dict[str, str] | None:
+    cluster = _review_queue_title_cluster_key(title)
+    strategy = _review_queue_fix_strategy_key(payload, canonicalize_reasons=canonicalize_reasons)
+    if cluster is None or strategy is None:
+        return None
+    return {
+        "cluster": cluster,
+        "strategy": strategy,
+        "key": f"{cluster} || {strategy}",
+    }
+
+
+def _review_queue_command_args(
+    command: str,
+    *,
+    status: str,
+    issue_type: str | None,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    args: list[str] = [command]
+    status_value = status if command == "list-review-queue" and status != "open" else None
+    option_pairs = [
+        ("--status", status_value),
+        ("--issue-type", issue_type),
+        ("--title-cluster", title_cluster),
+        ("--fix-strategy", fix_strategy),
+        ("--cluster-strategy", cluster_strategy),
+        ("--decision", decision),
+        ("--reason", reason),
+        ("--reason-family", reason_family),
+        ("--fix-strategy-family", fix_strategy_family),
+        ("--cluster-strategy-family", cluster_strategy_family),
+    ]
+    seen_pairs: set[tuple[str, str]] = set()
+    for flag, value in option_pairs:
+        if not isinstance(value, str):
+            continue
+        normalized_value = value.strip()
+        if not normalized_value:
+            continue
+        pair = (flag, normalized_value)
+        if pair in seen_pairs:
+            continue
+        args.extend([flag, normalized_value])
+        seen_pairs.add(pair)
+    if command == "resolve-review-queue" and isinstance(limit, int):
+        args.extend(["--limit", str(limit)])
+    return args
+
+
+def _review_queue_drilldown_args(
+    *,
+    status: str,
+    issue_type: str | None,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+) -> list[str]:
+    return _review_queue_command_args(
+        "list-review-queue",
+        status=status,
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+
+
+def _review_queue_status_action_command(status: str) -> str:
+    return "reopen-review-queue" if status == "resolved" else "resolve-review-queue"
+
+
+
+def _review_queue_status_action_args(
+    *,
+    status: str,
+    issue_type: str | None,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+    limit: int = 20,
+) -> list[str]:
+    command = _review_queue_status_action_command(status)
+    return _review_queue_command_args(
+        command,
+        status="resolved" if command == "reopen-review-queue" else "open",
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+        limit=limit if command == "resolve-review-queue" else None,
+    )
+
+
+
+def _review_queue_resolve_args(
+    *,
+    issue_type: str | None,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+    limit: int = 20,
+) -> list[str]:
+    return _review_queue_status_action_args(
+        status="open",
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+        limit=limit,
+    )
+
+
+
+def _review_queue_status_action_fields(status: str, args: list[str]) -> dict[str, object]:
+    command = _review_queue_status_action_command(status)
+    action = "reopen" if command == "reopen-review-queue" else "resolve"
+    payload: dict[str, object] = {
+        "action": action,
+        "action_args": args,
+        "action_command": _build_review_queue_command(args),
+    }
+    if action == "resolve":
+        payload["resolve_args"] = args
+        payload["resolve_command"] = payload["action_command"]
+    else:
+        payload["reopen_args"] = args
+        payload["reopen_command"] = payload["action_command"]
+    return payload
+
+
+
+def _review_queue_refresh_args(
+    *,
+    issue_type: str | None,
+    provider_series_ids: list[str],
+    mapping_limit: int = 5,
+) -> list[str] | None:
+    if issue_type != "mapping_review":
+        return None
+    normalized_ids = sorted(
+        {
+            value.strip()
+            for value in provider_series_ids
+            if isinstance(value, str) and value.strip()
+        }
+    )
+    if not normalized_ids:
+        return None
+    args = ["refresh-mapping-review-queue"]
+    for provider_series_id in normalized_ids:
+        args.extend(["--provider-series-id", provider_series_id])
+    if mapping_limit != 5:
+        args.extend(["--mapping-limit", str(mapping_limit)])
+    return args
+
+
+
+def _review_queue_refresh_fields(
+    *,
+    issue_type: str | None,
+    provider_series_ids: list[str],
+    mapping_limit: int = 5,
+) -> dict[str, object]:
+    args = _review_queue_refresh_args(
+        issue_type=issue_type,
+        provider_series_ids=provider_series_ids,
+        mapping_limit=mapping_limit,
+    )
+    if args is None:
+        return {}
+    return {
+        "refresh_provider_series_ids": provider_series_ids,
+        "refresh_args": args,
+        "refresh_command": _build_review_queue_command(args),
+    }
+
+
+
+def _review_queue_apply_worklist_args(
+    *,
+    status: str,
+    issue_type: str | None,
+    limit: int,
+    per_bucket_limit: int,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+) -> list[str]:
+    args = _review_queue_command_args(
+        "review-queue-apply-worklist",
+        status=status,
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    args.extend(["--limit", str(limit), "--per-bucket-limit", str(per_bucket_limit)])
+    return args
+
+
+
+def _review_queue_refresh_worklist_args(
+    *,
+    status: str,
+    issue_type: str | None,
+    limit: int,
+    per_bucket_limit: int,
+    mapping_limit: int,
+    title_cluster: str | None = None,
+    fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
+) -> list[str]:
+    args = _review_queue_command_args(
+        "review-queue-refresh-worklist",
+        status=status,
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    args.extend(["--limit", str(limit), "--per-bucket-limit", str(per_bucket_limit), "--mapping-limit", str(mapping_limit)])
+    return args
 
 
 def _filter_review_queue_items(
@@ -565,22 +1977,74 @@ def _filter_review_queue_items(
     provider_series_titles: dict[str, dict[str, str | None]] | None = None,
     title_cluster: str | None = None,
     fix_strategy: str | None = None,
+    cluster_strategy: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    reason_family: str | None = None,
+    fix_strategy_family: str | None = None,
+    cluster_strategy_family: str | None = None,
 ) -> list[object]:
     normalized_title_cluster = _review_queue_title_cluster_key(title_cluster) if title_cluster else None
     normalized_fix_strategy = fix_strategy.strip() if isinstance(fix_strategy, str) and fix_strategy.strip() else None
-    if normalized_title_cluster is None and normalized_fix_strategy is None:
+    normalized_cluster_strategy = cluster_strategy.strip() if isinstance(cluster_strategy, str) and cluster_strategy.strip() else None
+    normalized_decision = decision.strip() if isinstance(decision, str) and decision.strip() else None
+    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    normalized_reason_family = _review_queue_reason_family(reason_family) if isinstance(reason_family, str) and reason_family.strip() else None
+    normalized_fix_strategy_family = fix_strategy_family.strip() if isinstance(fix_strategy_family, str) and fix_strategy_family.strip() else None
+    normalized_cluster_strategy_family = cluster_strategy_family.strip() if isinstance(cluster_strategy_family, str) and cluster_strategy_family.strip() else None
+    if (
+        normalized_title_cluster is None
+        and normalized_fix_strategy is None
+        and normalized_cluster_strategy is None
+        and normalized_decision is None
+        and normalized_reason is None
+        and normalized_reason_family is None
+        and normalized_fix_strategy_family is None
+        and normalized_cluster_strategy_family is None
+    ):
         return items
     filtered: list[object] = []
     for item in items:
         payload = getattr(item, "payload", None)
         if not isinstance(payload, dict):
             continue
+        label = _review_queue_item_label(item, provider_series_titles=provider_series_titles)
         if normalized_title_cluster is not None:
-            label = _review_queue_item_label(item, provider_series_titles=provider_series_titles)
             if _review_queue_title_cluster_key(label.get("title")) != normalized_title_cluster:
                 continue
         if normalized_fix_strategy is not None and _review_queue_fix_strategy_key(payload) != normalized_fix_strategy:
             continue
+        if normalized_cluster_strategy is not None:
+            cluster_strategy_parts = _review_queue_cluster_strategy_key(label.get("title"), payload)
+            if cluster_strategy_parts is None or cluster_strategy_parts["key"] != normalized_cluster_strategy:
+                continue
+        if normalized_decision is not None:
+            payload_decision = payload.get("decision")
+            if not isinstance(payload_decision, str) or payload_decision.strip() != normalized_decision:
+                continue
+        if normalized_reason is not None or normalized_reason_family is not None:
+            reasons = payload.get("reasons")
+            normalized_reasons = {
+                item_reason.strip() for item_reason in reasons if isinstance(item_reason, str) and item_reason.strip()
+            } if isinstance(reasons, list) else set()
+            if normalized_reason is not None and normalized_reason not in normalized_reasons:
+                continue
+            if normalized_reason_family is not None:
+                normalized_reason_families = {_review_queue_reason_family(item_reason) for item_reason in normalized_reasons}
+                normalized_reason_families.discard(None)
+                if normalized_reason_family not in normalized_reason_families:
+                    continue
+        if normalized_fix_strategy_family is not None:
+            if _review_queue_fix_strategy_key(payload, canonicalize_reasons=True) != normalized_fix_strategy_family:
+                continue
+        if normalized_cluster_strategy_family is not None:
+            cluster_strategy_family_parts = _review_queue_cluster_strategy_key(
+                label.get("title"),
+                payload,
+                canonicalize_reasons=True,
+            )
+            if cluster_strategy_family_parts is None or cluster_strategy_family_parts["key"] != normalized_cluster_strategy_family:
+                continue
         filtered.append(item)
     return filtered
 
@@ -593,24 +2057,58 @@ def _summarize_review_queue(
     provider_series_titles: dict[str, dict[str, str | None]] | None = None,
     title_cluster_filter: str | None = None,
     fix_strategy_filter: str | None = None,
+    cluster_strategy_filter: str | None = None,
+    decision_filter: str | None = None,
+    reason_filter: str | None = None,
+    reason_family_filter: str | None = None,
+    fix_strategy_family_filter: str | None = None,
+    cluster_strategy_family_filter: str | None = None,
 ) -> dict[str, object]:
     by_issue_type = Counter(getattr(item, "issue_type", None) for item in items)
     by_severity = Counter(getattr(item, "severity", None) for item in items)
     by_decision: Counter[str] = Counter()
     by_reason: Counter[str] = Counter()
+    by_reason_family: Counter[str] = Counter()
     by_title_cluster: Counter[str] = Counter()
     by_fix_strategy: Counter[str] = Counter()
+    by_fix_strategy_family: Counter[str] = Counter()
+    by_cluster_strategy: Counter[str] = Counter()
+    by_cluster_strategy_family: Counter[str] = Counter()
     decision_examples: dict[str, list[dict[str, object]]] = {}
     reason_examples: dict[str, list[dict[str, object]]] = {}
+    reason_family_examples: dict[str, list[dict[str, object]]] = {}
     title_cluster_examples: dict[str, list[dict[str, object]]] = {}
     title_cluster_labels: dict[str, str] = {}
     fix_strategy_examples: dict[str, list[dict[str, object]]] = {}
+    fix_strategy_family_examples: dict[str, list[dict[str, object]]] = {}
+    cluster_strategy_examples: dict[str, list[dict[str, object]]] = {}
+    cluster_strategy_family_examples: dict[str, list[dict[str, object]]] = {}
+    cluster_strategy_parts: dict[str, dict[str, str]] = {}
+    cluster_strategy_family_parts: dict[str, dict[str, str]] = {}
+    decision_provider_series_ids: dict[str, list[str]] = {}
+    reason_provider_series_ids: dict[str, list[str]] = {}
+    reason_family_provider_series_ids: dict[str, list[str]] = {}
+    title_cluster_provider_series_ids: dict[str, list[str]] = {}
+    fix_strategy_provider_series_ids: dict[str, list[str]] = {}
+    fix_strategy_family_provider_series_ids: dict[str, list[str]] = {}
+    cluster_strategy_provider_series_ids: dict[str, list[str]] = {}
+    cluster_strategy_family_provider_series_ids: dict[str, list[str]] = {}
+
+    def add_provider_series_id(target: dict[str, list[str]], key: str, provider_series_id: str | None) -> None:
+        if not isinstance(provider_series_id, str) or not provider_series_id.strip():
+            return
+        values = target.setdefault(key, [])
+        normalized_id = provider_series_id.strip()
+        if normalized_id in values or len(values) >= 20:
+            return
+        values.append(normalized_id)
 
     for item in items:
         payload = getattr(item, "payload", None)
         if not isinstance(payload, dict):
             continue
         label = _review_queue_item_label(item, provider_series_titles=provider_series_titles)
+        provider_series_id = getattr(item, "provider_series_id", None)
         decision = payload.get("decision")
         if isinstance(decision, str) and decision.strip():
             normalized_decision = decision.strip()
@@ -618,6 +2116,7 @@ def _summarize_review_queue(
             examples = decision_examples.setdefault(normalized_decision, [])
             if len(examples) < 3:
                 examples.append(label)
+            add_provider_series_id(decision_provider_series_ids, normalized_decision, provider_series_id)
         title_cluster_key = _review_queue_title_cluster_key(label.get("title"))
         if title_cluster_key is not None:
             by_title_cluster[title_cluster_key] += 1
@@ -625,12 +2124,43 @@ def _summarize_review_queue(
             examples = title_cluster_examples.setdefault(title_cluster_key, [])
             if len(examples) < 3:
                 examples.append(label)
+            add_provider_series_id(title_cluster_provider_series_ids, title_cluster_key, provider_series_id)
         fix_strategy_key = _review_queue_fix_strategy_key(payload)
         if fix_strategy_key is not None:
             by_fix_strategy[fix_strategy_key] += 1
             examples = fix_strategy_examples.setdefault(fix_strategy_key, [])
             if len(examples) < 3:
                 examples.append(label)
+            add_provider_series_id(fix_strategy_provider_series_ids, fix_strategy_key, provider_series_id)
+        fix_strategy_family_key = _review_queue_fix_strategy_key(payload, canonicalize_reasons=True)
+        if fix_strategy_family_key is not None:
+            by_fix_strategy_family[fix_strategy_family_key] += 1
+            examples = fix_strategy_family_examples.setdefault(fix_strategy_family_key, [])
+            if len(examples) < 3:
+                examples.append(label)
+            add_provider_series_id(fix_strategy_family_provider_series_ids, fix_strategy_family_key, provider_series_id)
+        cluster_strategy = _review_queue_cluster_strategy_key(label.get("title"), payload)
+        if cluster_strategy is not None:
+            cluster_strategy_key = cluster_strategy["key"]
+            by_cluster_strategy[cluster_strategy_key] += 1
+            cluster_strategy_parts.setdefault(cluster_strategy_key, cluster_strategy)
+            examples = cluster_strategy_examples.setdefault(cluster_strategy_key, [])
+            if len(examples) < 3:
+                examples.append(label)
+            add_provider_series_id(cluster_strategy_provider_series_ids, cluster_strategy_key, provider_series_id)
+        cluster_strategy_family = _review_queue_cluster_strategy_key(
+            label.get("title"),
+            payload,
+            canonicalize_reasons=True,
+        )
+        if cluster_strategy_family is not None:
+            cluster_strategy_family_key = cluster_strategy_family["key"]
+            by_cluster_strategy_family[cluster_strategy_family_key] += 1
+            cluster_strategy_family_parts.setdefault(cluster_strategy_family_key, cluster_strategy_family)
+            examples = cluster_strategy_family_examples.setdefault(cluster_strategy_family_key, [])
+            if len(examples) < 3:
+                examples.append(label)
+            add_provider_series_id(cluster_strategy_family_provider_series_ids, cluster_strategy_family_key, provider_series_id)
         reasons = payload.get("reasons")
         if isinstance(reasons, list):
             for reason in reasons:
@@ -641,20 +2171,149 @@ def _summarize_review_queue(
                 examples = reason_examples.setdefault(normalized_reason, [])
                 if len(examples) < 3:
                     examples.append(label)
+                add_provider_series_id(reason_provider_series_ids, normalized_reason, provider_series_id)
+                reason_family = _review_queue_reason_family(normalized_reason)
+                if reason_family is None:
+                    continue
+                by_reason_family[reason_family] += 1
+                family_examples = reason_family_examples.setdefault(reason_family, [])
+                if len(family_examples) < 3:
+                    family_examples.append(label)
+                add_provider_series_id(reason_family_provider_series_ids, reason_family, provider_series_id)
+
+    effective_refresh_issue_type = issue_type
+    visible_issue_types = {key for key, value in by_issue_type.items() if key and value}
+    if effective_refresh_issue_type is None and visible_issue_types == {"mapping_review"}:
+        effective_refresh_issue_type = "mapping_review"
 
     return {
         "status": status,
         "issue_type_filter": issue_type,
         "title_cluster_filter": _review_queue_title_cluster_key(title_cluster_filter) if title_cluster_filter else None,
         "fix_strategy_filter": fix_strategy_filter.strip() if isinstance(fix_strategy_filter, str) and fix_strategy_filter.strip() else None,
+        "cluster_strategy_filter": cluster_strategy_filter.strip() if isinstance(cluster_strategy_filter, str) and cluster_strategy_filter.strip() else None,
+        "decision_filter": decision_filter.strip() if isinstance(decision_filter, str) and decision_filter.strip() else None,
+        "reason_filter": reason_filter.strip() if isinstance(reason_filter, str) and reason_filter.strip() else None,
+        "reason_family_filter": _review_queue_reason_family(reason_family_filter) if isinstance(reason_family_filter, str) and reason_family_filter.strip() else None,
+        "fix_strategy_family_filter": fix_strategy_family_filter.strip() if isinstance(fix_strategy_family_filter, str) and fix_strategy_family_filter.strip() else None,
+        "cluster_strategy_family_filter": cluster_strategy_family_filter.strip() if isinstance(cluster_strategy_family_filter, str) and cluster_strategy_family_filter.strip() else None,
         "count": len(items),
         "by_issue_type": dict(sorted((key, value) for key, value in by_issue_type.items() if key)),
         "by_severity": dict(sorted((key, value) for key, value in by_severity.items() if key)),
         "by_decision": dict(sorted(by_decision.items())),
         "decision_examples": {key: value for key, value in sorted(decision_examples.items())},
+        "decision_drilldowns": {
+            key: _review_queue_drilldown_args(
+                status=status,
+                issue_type=issue_type,
+                title_cluster=title_cluster_filter,
+                fix_strategy=fix_strategy_filter,
+                cluster_strategy=cluster_strategy_filter,
+                decision=key,
+                reason=reason_filter,
+            )
+            for key in sorted(by_decision)
+        },
+        "decision_actions": {
+            key: {
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=key,
+                        reason=reason_filter,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=decision_provider_series_ids.get(key, []),
+                ),
+            }
+            for key in sorted(by_decision)
+        },
+        "decision_resolutions": {
+            key: _review_queue_resolve_args(
+                issue_type=issue_type,
+                title_cluster=title_cluster_filter,
+                fix_strategy=fix_strategy_filter,
+                cluster_strategy=cluster_strategy_filter,
+                decision=key,
+                reason=reason_filter,
+            )
+            for key in sorted(by_decision)
+            if status == "open"
+        },
         "top_reasons": [
-            {"reason": reason, "count": count, "examples": reason_examples.get(reason, [])}
+            {
+                "reason": reason,
+                "count": count,
+                "examples": reason_examples.get(reason, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=title_cluster_filter,
+                    fix_strategy=fix_strategy_filter,
+                    cluster_strategy=cluster_strategy_filter,
+                    decision=decision_filter,
+                    reason=reason,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=decision_filter,
+                        reason=reason,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=reason_provider_series_ids.get(reason, []),
+                ),
+            }
             for reason, count in by_reason.most_common(10)
+        ],
+        "top_reason_families": [
+            {
+                "reason_family": reason_family,
+                "count": count,
+                "examples": reason_family_examples.get(reason_family, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=title_cluster_filter,
+                    fix_strategy=fix_strategy_filter,
+                    cluster_strategy=cluster_strategy_filter,
+                    decision=decision_filter,
+                    reason=reason_filter,
+                    reason_family=reason_family,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=decision_filter,
+                        reason=reason_filter,
+                        reason_family=reason_family,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=reason_family_provider_series_ids.get(reason_family, []),
+                ),
+            }
+            for reason_family, count in by_reason_family.most_common(10)
         ],
         "top_title_clusters": [
             {
@@ -662,23 +2321,365 @@ def _summarize_review_queue(
                 "label": title_cluster_labels.get(cluster, cluster),
                 "count": count,
                 "examples": title_cluster_examples.get(cluster, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=cluster,
+                    fix_strategy=fix_strategy_filter,
+                    cluster_strategy=cluster_strategy_filter,
+                    decision=decision_filter,
+                    reason=reason_filter,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=cluster,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=decision_filter,
+                        reason=reason_filter,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=title_cluster_provider_series_ids.get(cluster, []),
+                ),
             }
             for cluster, count in by_title_cluster.most_common(10)
         ],
         "top_fix_strategies": [
-            {"strategy": strategy, "count": count, "examples": fix_strategy_examples.get(strategy, [])}
+            {
+                "strategy": strategy,
+                "count": count,
+                "examples": fix_strategy_examples.get(strategy, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=title_cluster_filter,
+                    fix_strategy=strategy,
+                    cluster_strategy=cluster_strategy_filter,
+                    decision=decision_filter,
+                    reason=reason_filter,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=strategy,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=decision_filter,
+                        reason=reason_filter,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=fix_strategy_provider_series_ids.get(strategy, []),
+                ),
+            }
             for strategy, count in by_fix_strategy.most_common(10)
+        ],
+        "top_fix_strategy_families": [
+            {
+                "strategy_family": strategy_family,
+                "count": count,
+                "examples": fix_strategy_family_examples.get(strategy_family, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=title_cluster_filter,
+                    fix_strategy=fix_strategy_filter,
+                    cluster_strategy=cluster_strategy_filter,
+                    decision=decision_filter,
+                    reason=reason_filter,
+                    fix_strategy_family=strategy_family,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=decision_filter,
+                        reason=reason_filter,
+                        fix_strategy_family=strategy_family,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=fix_strategy_family_provider_series_ids.get(strategy_family, []),
+                ),
+            }
+            for strategy_family, count in by_fix_strategy_family.most_common(10)
+        ],
+        "top_cluster_strategies": [
+            {
+                "cluster_strategy": cluster_strategy_key,
+                "cluster": cluster_strategy_parts.get(cluster_strategy_key, {}).get("cluster"),
+                "strategy": cluster_strategy_parts.get(cluster_strategy_key, {}).get("strategy"),
+                "label": title_cluster_labels.get(
+                    cluster_strategy_parts.get(cluster_strategy_key, {}).get("cluster", ""),
+                    cluster_strategy_parts.get(cluster_strategy_key, {}).get("cluster"),
+                ),
+                "count": count,
+                "examples": cluster_strategy_examples.get(cluster_strategy_key, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=title_cluster_filter,
+                    fix_strategy=fix_strategy_filter,
+                    cluster_strategy=cluster_strategy_key,
+                    decision=decision_filter,
+                    reason=reason_filter,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_key,
+                        decision=decision_filter,
+                        reason=reason_filter,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=cluster_strategy_provider_series_ids.get(cluster_strategy_key, []),
+                ),
+            }
+            for cluster_strategy_key, count in by_cluster_strategy.most_common(10)
+        ],
+        "top_cluster_strategy_families": [
+            {
+                "cluster_strategy_family": cluster_strategy_family_key,
+                "cluster": cluster_strategy_family_parts.get(cluster_strategy_family_key, {}).get("cluster"),
+                "strategy_family": cluster_strategy_family_parts.get(cluster_strategy_family_key, {}).get("strategy"),
+                "label": title_cluster_labels.get(
+                    cluster_strategy_family_parts.get(cluster_strategy_family_key, {}).get("cluster", ""),
+                    cluster_strategy_family_parts.get(cluster_strategy_family_key, {}).get("cluster"),
+                ),
+                "count": count,
+                "examples": cluster_strategy_family_examples.get(cluster_strategy_family_key, []),
+                "drilldown_args": _review_queue_drilldown_args(
+                    status=status,
+                    issue_type=issue_type,
+                    title_cluster=title_cluster_filter,
+                    fix_strategy=fix_strategy_filter,
+                    cluster_strategy=cluster_strategy_filter,
+                    decision=decision_filter,
+                    reason=reason_filter,
+                    cluster_strategy_family=cluster_strategy_family_key,
+                ),
+                **_review_queue_status_action_fields(
+                    status,
+                    _review_queue_status_action_args(
+                        status=status,
+                        issue_type=issue_type,
+                        title_cluster=title_cluster_filter,
+                        fix_strategy=fix_strategy_filter,
+                        cluster_strategy=cluster_strategy_filter,
+                        decision=decision_filter,
+                        reason=reason_filter,
+                        cluster_strategy_family=cluster_strategy_family_key,
+                    ),
+                ),
+                **_review_queue_refresh_fields(
+                    issue_type=effective_refresh_issue_type,
+                    provider_series_ids=cluster_strategy_family_provider_series_ids.get(cluster_strategy_family_key, []),
+                ),
+            }
+            for cluster_strategy_family_key, count in by_cluster_strategy_family.most_common(10)
         ],
     }
 
 
-def _cmd_list_review_queue(
+_REVIEW_QUEUE_NEXT_BUCKET_ORDER = {
+    "cluster-strategy": "top_cluster_strategies",
+    "cluster-strategy-family": "top_cluster_strategy_families",
+    "fix-strategy": "top_fix_strategies",
+    "fix-strategy-family": "top_fix_strategy_families",
+    "title-cluster": "top_title_clusters",
+    "reason": "top_reasons",
+    "reason-family": "top_reason_families",
+    "decision": "by_decision",
+}
+
+
+_REVIEW_QUEUE_AUTO_BUCKET_ORDER = [
+    "cluster-strategy-family",
+    "cluster-strategy",
+    "fix-strategy-family",
+    "fix-strategy",
+    "title-cluster",
+    "reason-family",
+    "reason",
+    "decision",
+]
+
+
+def _review_queue_bucket_candidates(summary: dict[str, object], *, bucket: str) -> list[dict[str, object]]:
+    if bucket == "decision":
+        decision_counts = summary.get("by_decision")
+        if not isinstance(decision_counts, dict) or not decision_counts:
+            return []
+        drilldowns = summary.get("decision_drilldowns")
+        ordered = sorted(
+            ((str(key), value) for key, value in decision_counts.items() if isinstance(value, int)),
+            key=lambda item: (-item[1], item[0]),
+        )
+        candidates: list[dict[str, object]] = []
+        for decision_name, count in ordered:
+            drilldown_args = drilldowns.get(decision_name) if isinstance(drilldowns, dict) else None
+            if not isinstance(drilldown_args, list):
+                drilldown_args = _review_queue_drilldown_args(
+                    status=summary.get("status") if isinstance(summary.get("status"), str) else "open",
+                    issue_type=summary.get("issue_type_filter") if isinstance(summary.get("issue_type_filter"), str) else None,
+                    title_cluster=summary.get("title_cluster_filter") if isinstance(summary.get("title_cluster_filter"), str) else None,
+                    fix_strategy=summary.get("fix_strategy_filter") if isinstance(summary.get("fix_strategy_filter"), str) else None,
+                    cluster_strategy=summary.get("cluster_strategy_filter") if isinstance(summary.get("cluster_strategy_filter"), str) else None,
+                    decision=decision_name,
+                    reason=summary.get("reason_filter") if isinstance(summary.get("reason_filter"), str) else None,
+                )
+            action_args = _review_queue_status_action_args(
+                status=summary.get("status") if isinstance(summary.get("status"), str) else "open",
+                issue_type=summary.get("issue_type_filter") if isinstance(summary.get("issue_type_filter"), str) else None,
+                title_cluster=summary.get("title_cluster_filter") if isinstance(summary.get("title_cluster_filter"), str) else None,
+                fix_strategy=summary.get("fix_strategy_filter") if isinstance(summary.get("fix_strategy_filter"), str) else None,
+                cluster_strategy=summary.get("cluster_strategy_filter") if isinstance(summary.get("cluster_strategy_filter"), str) else None,
+                decision=decision_name,
+                reason=summary.get("reason_filter") if isinstance(summary.get("reason_filter"), str) else None,
+            )
+            decision_actions = summary.get("decision_actions") if isinstance(summary.get("decision_actions"), dict) else {}
+            action_fields = decision_actions.get(decision_name) if isinstance(decision_actions, dict) else None
+            if not isinstance(action_fields, dict):
+                action_fields = _review_queue_status_action_fields(
+                    summary.get("status") if isinstance(summary.get("status"), str) else "open",
+                    action_args,
+                )
+            candidates.append(
+                {
+                    "bucket_type": "decision",
+                    "bucket_key": decision_name,
+                    "count": count,
+                    "drilldown_args": drilldown_args,
+                    "drilldown_command": _build_review_queue_command(drilldown_args),
+                    **action_fields,
+                }
+            )
+        return candidates
+
+    summary_key = _REVIEW_QUEUE_NEXT_BUCKET_ORDER[bucket]
+    entries = summary.get(summary_key)
+    if not isinstance(entries, list):
+        return []
+    key_field = {
+        "cluster-strategy": "cluster_strategy",
+        "cluster-strategy-family": "cluster_strategy_family",
+        "fix-strategy": "strategy",
+        "fix-strategy-family": "strategy_family",
+        "title-cluster": "cluster",
+        "reason": "reason",
+        "reason-family": "reason_family",
+    }[bucket]
+    candidates: list[dict[str, object]] = []
+    for chosen in entries:
+        if not isinstance(chosen, dict):
+            continue
+        drilldown_args = chosen.get("drilldown_args")
+        if not isinstance(drilldown_args, list):
+            continue
+        action_fields = {
+            key: value
+            for key, value in chosen.items()
+            if key in {
+                "action",
+                "action_args",
+                "action_command",
+                "resolve_args",
+                "resolve_command",
+                "reopen_args",
+                "reopen_command",
+                "refresh_provider_series_ids",
+                "refresh_args",
+                "refresh_command",
+            }
+        }
+        candidates.append(
+            {
+                "bucket_type": bucket,
+                "bucket_key": chosen.get(key_field),
+                "count": chosen.get("count"),
+                "label": chosen.get("label"),
+                "examples": chosen.get("examples"),
+                "drilldown_args": drilldown_args,
+                "drilldown_command": _build_review_queue_command(drilldown_args),
+                **action_fields,
+            }
+        )
+    return candidates
+
+
+def _build_review_queue_worklist(
+    summary: dict[str, object],
+    *,
+    bucket_order: list[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    if limit <= 0:
+        return []
+    selected: list[dict[str, object]] = []
+    seen_commands: set[str] = set()
+    for bucket in bucket_order:
+        for candidate in _review_queue_bucket_candidates(summary, bucket=bucket):
+            command = candidate.get("drilldown_command")
+            if not isinstance(command, str) or not command:
+                continue
+            if command in seen_commands:
+                continue
+            selected.append(candidate)
+            seen_commands.add(command)
+            if len(selected) >= limit:
+                return selected
+    return selected
+
+
+def _build_shell_command(args: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in args)
+
+
+
+def _build_review_queue_command(args: list[str]) -> str:
+    return "PYTHONPATH=src python3 -m mal_updater.cli " + " ".join(
+        json.dumps(part) if any(char.isspace() for char in part) else part
+        for part in args
+    )
+
+
+def _select_review_queue_next_bucket(summary: dict[str, object], *, bucket: str) -> dict[str, object] | None:
+    candidates = _review_queue_bucket_candidates(summary, bucket=bucket)
+    return candidates[0] if candidates else None
+
+
+def _cmd_review_queue_next(
     project_root: Path | None,
     status: str,
     issue_type: str | None,
-    summary: bool,
+    bucket: str,
     title_cluster: str | None,
     fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -689,11 +2690,426 @@ def _cmd_list_review_queue(
         provider="crunchyroll",
         provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
     )
+    filtered_items = _filter_review_queue_items(
+        items,
+        provider_series_titles=provider_series_titles,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    summary = _summarize_review_queue(
+        filtered_items,
+        status=status,
+        issue_type=issue_type,
+        provider_series_titles=provider_series_titles,
+        title_cluster_filter=title_cluster,
+        fix_strategy_filter=fix_strategy,
+        cluster_strategy_filter=cluster_strategy,
+        decision_filter=decision,
+        reason_filter=reason,
+        reason_family_filter=reason_family,
+        fix_strategy_family_filter=fix_strategy_family,
+        cluster_strategy_family_filter=cluster_strategy_family,
+    )
+    bucket_order = [bucket] if bucket != "auto" else list(_REVIEW_QUEUE_AUTO_BUCKET_ORDER)
+    chosen_bucket = None
+    for candidate_bucket in bucket_order:
+        chosen_bucket = _select_review_queue_next_bucket(summary, bucket=candidate_bucket)
+        if chosen_bucket is not None:
+            break
+    payload = {
+        "status": status,
+        "issue_type_filter": issue_type,
+        "title_cluster_filter": _review_queue_title_cluster_key(title_cluster) if title_cluster else None,
+        "fix_strategy_filter": fix_strategy.strip() if isinstance(fix_strategy, str) and fix_strategy.strip() else None,
+        "cluster_strategy_filter": cluster_strategy.strip() if isinstance(cluster_strategy, str) and cluster_strategy.strip() else None,
+        "decision_filter": decision.strip() if isinstance(decision, str) and decision.strip() else None,
+        "reason_filter": reason.strip() if isinstance(reason, str) and reason.strip() else None,
+        "reason_family_filter": _review_queue_reason_family(reason_family) if isinstance(reason_family, str) and reason_family.strip() else None,
+        "fix_strategy_family_filter": fix_strategy_family.strip() if isinstance(fix_strategy_family, str) and fix_strategy_family.strip() else None,
+        "cluster_strategy_family_filter": cluster_strategy_family.strip() if isinstance(cluster_strategy_family, str) and cluster_strategy_family.strip() else None,
+        "count": summary["count"],
+        "bucket_preference": bucket,
+        "selected": chosen_bucket,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _load_filtered_review_queue_context(
+    project_root: Path | None,
+    *,
+    status: str,
+    issue_type: str | None,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> tuple[object, dict[str, dict[str, str | None]], list[object], dict[str, object]]:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    items = list_review_queue_entries(config.db_path, status=status, issue_type=issue_type)
+    provider_series_titles = get_provider_series_title_map(
+        config.db_path,
+        provider="crunchyroll",
+        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+    )
+    filtered_items = _filter_review_queue_items(
+        items,
+        provider_series_titles=provider_series_titles,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    summary = _summarize_review_queue(
+        filtered_items,
+        status=status,
+        issue_type=issue_type,
+        provider_series_titles=provider_series_titles,
+        title_cluster_filter=title_cluster,
+        fix_strategy_filter=fix_strategy,
+        cluster_strategy_filter=cluster_strategy,
+        decision_filter=decision,
+        reason_filter=reason,
+        reason_family_filter=reason_family,
+        fix_strategy_family_filter=fix_strategy_family,
+        cluster_strategy_family_filter=cluster_strategy_family,
+    )
+    return config, provider_series_titles, filtered_items, summary
+
+
+def _cmd_review_queue_worklist(
+    project_root: Path | None,
+    status: str,
+    issue_type: str | None,
+    limit: int,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    _, _, _, summary = _load_filtered_review_queue_context(
+        project_root,
+        status=status,
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    selected = _build_review_queue_worklist(
+        summary,
+        bucket_order=list(_REVIEW_QUEUE_AUTO_BUCKET_ORDER),
+        limit=limit,
+    )
+    payload = {
+        "status": status,
+        "issue_type_filter": issue_type,
+        "title_cluster_filter": _review_queue_title_cluster_key(title_cluster) if title_cluster else None,
+        "fix_strategy_filter": fix_strategy.strip() if isinstance(fix_strategy, str) and fix_strategy.strip() else None,
+        "cluster_strategy_filter": cluster_strategy.strip() if isinstance(cluster_strategy, str) and cluster_strategy.strip() else None,
+        "decision_filter": decision.strip() if isinstance(decision, str) and decision.strip() else None,
+        "reason_filter": reason.strip() if isinstance(reason, str) and reason.strip() else None,
+        "reason_family_filter": _review_queue_reason_family(reason_family) if isinstance(reason_family, str) and reason_family.strip() else None,
+        "fix_strategy_family_filter": fix_strategy_family.strip() if isinstance(fix_strategy_family, str) and fix_strategy_family.strip() else None,
+        "cluster_strategy_family_filter": cluster_strategy_family.strip() if isinstance(cluster_strategy_family, str) and cluster_strategy_family.strip() else None,
+        "count": summary["count"],
+        "limit": limit,
+        "selected": selected,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _review_queue_bucket_filter_kwargs(candidate: dict[str, object]) -> dict[str, str]:
+    bucket_type = candidate.get("bucket_type")
+    bucket_key = candidate.get("bucket_key")
+    if not isinstance(bucket_type, str) or not isinstance(bucket_key, str) or not bucket_key.strip():
+        return {}
+    if bucket_type == "cluster-strategy":
+        return {"cluster_strategy": bucket_key.strip()}
+    if bucket_type == "cluster-strategy-family":
+        return {"cluster_strategy_family": bucket_key.strip()}
+    if bucket_type == "fix-strategy":
+        return {"fix_strategy": bucket_key.strip()}
+    if bucket_type == "fix-strategy-family":
+        return {"fix_strategy_family": bucket_key.strip()}
+    if bucket_type == "title-cluster":
+        return {"title_cluster": bucket_key.strip()}
+    if bucket_type == "reason":
+        return {"reason": bucket_key.strip()}
+    if bucket_type == "reason-family":
+        return {"reason_family": bucket_key.strip()}
+    if bucket_type == "decision":
+        return {"decision": bucket_key.strip()}
+    return {}
+
+
+
+def _cmd_review_queue_apply_worklist(
+    project_root: Path | None,
+    status: str,
+    issue_type: str | None,
+    limit: int,
+    per_bucket_limit: int,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    config, provider_series_titles, filtered_items, summary = _load_filtered_review_queue_context(
+        project_root,
+        status=status,
+        issue_type=issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    selected_buckets = _build_review_queue_worklist(
+        summary,
+        bucket_order=list(_REVIEW_QUEUE_AUTO_BUCKET_ORDER),
+        limit=limit,
+    )
+    selected_ids: list[int] = []
+    seen_ids: set[int] = set()
+    bucket_updates: list[dict[str, object]] = []
+    for candidate in selected_buckets:
+        bucket_filters = _review_queue_bucket_filter_kwargs(candidate)
+        bucket_items = _filter_review_queue_items(
+            filtered_items,
+            provider_series_titles=provider_series_titles,
+            **bucket_filters,
+        )
+        chosen_items = bucket_items if per_bucket_limit == 0 else bucket_items[:per_bucket_limit]
+        new_items = [item for item in chosen_items if item.id not in seen_ids]
+        if not new_items:
+            continue
+        for item in new_items:
+            seen_ids.add(item.id)
+            selected_ids.append(item.id)
+        bucket_updates.append(
+            {
+                **candidate,
+                "matched_rows": len(bucket_items),
+                "selected_rows": len(chosen_items),
+                "new_rows": len(new_items),
+                "selected_entry_ids": [item.id for item in new_items],
+            }
+        )
+    status_to = "open" if status == "resolved" else "resolved"
+    updated_count = update_review_queue_entry_statuses(
+        config.db_path,
+        entry_ids=selected_ids,
+        status=status_to,
+    )
+    payload = {
+        "status_from": status,
+        "status_to": status_to,
+        "issue_type_filter": issue_type,
+        "title_cluster_filter": _review_queue_title_cluster_key(title_cluster) if title_cluster else None,
+        "fix_strategy_filter": fix_strategy.strip() if isinstance(fix_strategy, str) and fix_strategy.strip() else None,
+        "cluster_strategy_filter": cluster_strategy.strip() if isinstance(cluster_strategy, str) and cluster_strategy.strip() else None,
+        "decision_filter": decision.strip() if isinstance(decision, str) and decision.strip() else None,
+        "reason_filter": reason.strip() if isinstance(reason, str) and reason.strip() else None,
+        "reason_family_filter": _review_queue_reason_family(reason_family) if isinstance(reason_family, str) and reason_family.strip() else None,
+        "fix_strategy_family_filter": fix_strategy_family.strip() if isinstance(fix_strategy_family, str) and fix_strategy_family.strip() else None,
+        "cluster_strategy_family_filter": cluster_strategy_family.strip() if isinstance(cluster_strategy_family, str) and cluster_strategy_family.strip() else None,
+        "count": summary["count"],
+        "worklist_limit": limit,
+        "per_bucket_limit": per_bucket_limit,
+        "selected_bucket_count": len(selected_buckets),
+        "updated": updated_count,
+        "selected_entry_ids": selected_ids,
+        "selected_buckets": bucket_updates,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+
+def _cmd_review_queue_refresh_worklist(
+    project_root: Path | None,
+    status: str,
+    issue_type: str | None,
+    limit: int,
+    per_bucket_limit: int,
+    mapping_limit: int,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    effective_issue_type = issue_type or "mapping_review"
+    if effective_issue_type != "mapping_review":
+        print("review-queue-refresh-worklist currently supports only mapping_review", file=sys.stderr)
+        return 2
+    config, provider_series_titles, filtered_items, summary = _load_filtered_review_queue_context(
+        project_root,
+        status=status,
+        issue_type=effective_issue_type,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    selected_buckets = _build_review_queue_worklist(
+        summary,
+        bucket_order=list(_REVIEW_QUEUE_AUTO_BUCKET_ORDER),
+        limit=limit,
+    )
+    selected_provider_series_ids: list[str] = []
+    seen_provider_series_ids: set[str] = set()
+    bucket_updates: list[dict[str, object]] = []
+    for candidate in selected_buckets:
+        bucket_filters = _review_queue_bucket_filter_kwargs(candidate)
+        bucket_items = _filter_review_queue_items(
+            filtered_items,
+            provider_series_titles=provider_series_titles,
+            **bucket_filters,
+        )
+        chosen_items = bucket_items if per_bucket_limit == 0 else bucket_items[:per_bucket_limit]
+        chosen_provider_series_ids = [
+            item.provider_series_id
+            for item in chosen_items
+            if isinstance(item.provider_series_id, str) and item.provider_series_id.strip()
+        ]
+        new_provider_series_ids = [
+            provider_series_id
+            for provider_series_id in chosen_provider_series_ids
+            if provider_series_id not in seen_provider_series_ids
+        ]
+        if not new_provider_series_ids:
+            continue
+        for provider_series_id in new_provider_series_ids:
+            seen_provider_series_ids.add(provider_series_id)
+            selected_provider_series_ids.append(provider_series_id)
+        bucket_updates.append(
+            {
+                **candidate,
+                "matched_rows": len(bucket_items),
+                "selected_rows": len(chosen_items),
+                "new_rows": len(new_provider_series_ids),
+                "selected_provider_series_ids": new_provider_series_ids,
+            }
+        )
+    try:
+        refresh_result = _refresh_mapping_review_queue_for_provider_series_ids(
+            config,
+            selected_provider_series_ids,
+            mapping_limit,
+        ) if selected_provider_series_ids else {
+            "provider_series_ids": [],
+            "items": [],
+            "review_queue": {"resolved": 0, "inserted": 0},
+        }
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    payload = {
+        "status": status,
+        "issue_type_filter": effective_issue_type,
+        "title_cluster_filter": _review_queue_title_cluster_key(title_cluster) if title_cluster else None,
+        "fix_strategy_filter": fix_strategy.strip() if isinstance(fix_strategy, str) and fix_strategy.strip() else None,
+        "cluster_strategy_filter": cluster_strategy.strip() if isinstance(cluster_strategy, str) and cluster_strategy.strip() else None,
+        "decision_filter": decision.strip() if isinstance(decision, str) and decision.strip() else None,
+        "reason_filter": reason.strip() if isinstance(reason, str) and reason.strip() else None,
+        "reason_family_filter": _review_queue_reason_family(reason_family) if isinstance(reason_family, str) and reason_family.strip() else None,
+        "fix_strategy_family_filter": fix_strategy_family.strip() if isinstance(fix_strategy_family, str) and fix_strategy_family.strip() else None,
+        "cluster_strategy_family_filter": cluster_strategy_family.strip() if isinstance(cluster_strategy_family, str) and cluster_strategy_family.strip() else None,
+        "count": summary["count"],
+        "worklist_limit": limit,
+        "per_bucket_limit": per_bucket_limit,
+        "mapping_limit": mapping_limit,
+        "selected_bucket_count": len(selected_buckets),
+        "selected_provider_series_ids": selected_provider_series_ids,
+        "selected_buckets": bucket_updates,
+        "refresh": refresh_result,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_list_review_queue(
+    project_root: Path | None,
+    status: str,
+    issue_type: str | None,
+    summary: bool,
+    limit: int,
+    provider_series_id: str | None,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    items = list_review_queue_entries(
+        config.db_path,
+        status=status,
+        issue_type=issue_type,
+        provider_series_id=provider_series_id,
+    )
+    provider_series_titles = get_provider_series_title_map(
+        config.db_path,
+        provider="crunchyroll",
+        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+    )
     items = _filter_review_queue_items(
         items,
         provider_series_titles=provider_series_titles,
         title_cluster=title_cluster,
         fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
     )
     if summary:
         print(
@@ -705,11 +3121,16 @@ def _cmd_list_review_queue(
                     provider_series_titles=provider_series_titles,
                     title_cluster_filter=title_cluster,
                     fix_strategy_filter=fix_strategy,
+                    cluster_strategy_filter=cluster_strategy,
+                    decision_filter=decision,
+                    reason_filter=reason,
                 ),
                 indent=2,
             )
         )
         return 0
+    if limit > 0:
+        items = items[:limit]
     print(
         json.dumps(
             [
@@ -731,6 +3152,141 @@ def _cmd_list_review_queue(
         )
     )
     return 0
+
+
+def _cmd_update_review_queue_status(
+    project_root: Path | None,
+    *,
+    status_from: str,
+    status_to: str,
+    issue_type: str | None,
+    limit: int,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    items = list_review_queue_entries(config.db_path, status=status_from, issue_type=issue_type)
+    provider_series_titles = get_provider_series_title_map(
+        config.db_path,
+        provider="crunchyroll",
+        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+    )
+    filtered_items = _filter_review_queue_items(
+        items,
+        provider_series_titles=provider_series_titles,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+    selected_items = filtered_items if limit == 0 else filtered_items[:limit]
+    updated_count = update_review_queue_entry_statuses(
+        config.db_path,
+        entry_ids=[item.id for item in selected_items],
+        status=status_to,
+    )
+    payload = {
+        "status_from": status_from,
+        "status_to": status_to,
+        "issue_type_filter": issue_type,
+        "title_cluster_filter": _review_queue_title_cluster_key(title_cluster) if title_cluster else None,
+        "fix_strategy_filter": fix_strategy.strip() if isinstance(fix_strategy, str) and fix_strategy.strip() else None,
+        "cluster_strategy_filter": cluster_strategy.strip() if isinstance(cluster_strategy, str) and cluster_strategy.strip() else None,
+        "decision_filter": decision.strip() if isinstance(decision, str) and decision.strip() else None,
+        "reason_filter": reason.strip() if isinstance(reason, str) and reason.strip() else None,
+        "reason_family_filter": _review_queue_reason_family(reason_family) if isinstance(reason_family, str) and reason_family.strip() else None,
+        "fix_strategy_family_filter": fix_strategy_family.strip() if isinstance(fix_strategy_family, str) and fix_strategy_family.strip() else None,
+        "cluster_strategy_family_filter": cluster_strategy_family.strip() if isinstance(cluster_strategy_family, str) and cluster_strategy_family.strip() else None,
+        "limit": limit,
+        "matched": len(filtered_items),
+        "updated": updated_count,
+        "selected": [
+            {
+                "id": item.id,
+                "provider_series_id": item.provider_series_id,
+                "issue_type": item.issue_type,
+                "severity": item.severity,
+                "decision": item.payload.get("decision") if isinstance(item.payload, dict) else None,
+                "reasons": item.payload.get("reasons") if isinstance(item.payload.get("reasons"), list) else [],
+                "title": _review_queue_item_label(item, provider_series_titles=provider_series_titles).get("title"),
+            }
+            for item in selected_items
+        ],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_resolve_review_queue(
+    project_root: Path | None,
+    issue_type: str | None,
+    limit: int,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    return _cmd_update_review_queue_status(
+        project_root,
+        status_from="open",
+        status_to="resolved",
+        issue_type=issue_type,
+        limit=limit,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
+
+
+def _cmd_reopen_review_queue(
+    project_root: Path | None,
+    issue_type: str | None,
+    limit: int,
+    title_cluster: str | None,
+    fix_strategy: str | None,
+    cluster_strategy: str | None,
+    decision: str | None,
+    reason: str | None,
+    reason_family: str | None,
+    fix_strategy_family: str | None,
+    cluster_strategy_family: str | None,
+) -> int:
+    return _cmd_update_review_queue_status(
+        project_root,
+        status_from="resolved",
+        status_to="open",
+        issue_type=issue_type,
+        limit=limit,
+        title_cluster=title_cluster,
+        fix_strategy=fix_strategy,
+        cluster_strategy=cluster_strategy,
+        decision=decision,
+        reason=reason,
+        reason_family=reason_family,
+        fix_strategy_family=fix_strategy_family,
+        cluster_strategy_family=cluster_strategy_family,
+    )
 
 
 def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool) -> int:
@@ -797,6 +3353,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="Create local dirs and initialize SQLite schema")
     subparsers.add_parser("status", help="Print resolved config, paths, and secret presence")
+    health_check = subparsers.add_parser("health-check", help="Emit a local operational health summary for auth material, snapshot freshness, mappings, and review backlog")
+    health_check.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
+    health_check.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present, while still printing the JSON payload")
+    health_check.add_argument("--review-issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional review_queue issue type to use when building recommended_next/recommended_worklist")
+    health_check.add_argument("--review-worklist-limit", type=int, default=3, help="How many ranked review backlog drilldowns to include in recommended_worklist (use 0 to suppress it)")
+    health_check.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
+    health_check.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved Crunchyroll->MAL mapping coverage falls below this ratio (default: 0.8)")
+    health_check.add_argument("--maintenance-review-limit", type=int, default=25, help="When coverage is low, cap the auto-recommended review-mappings series scan to this many series (use 0 for all)")
     mal_auth = subparsers.add_parser("mal-auth-url", help="Generate a MAL OAuth authorization URL + PKCE verifier")
     mal_auth.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     mal_auth_login = subparsers.add_parser("mal-auth-login", help="Run a local loopback MAL OAuth flow and persist returned tokens")
@@ -837,6 +3401,30 @@ def build_parser() -> argparse.ArgumentParser:
     review_mappings.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect (use 0 for all; required when persisting review_queue)")
     review_mappings.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     review_mappings.add_argument("--persist-review-queue", action="store_true", help="Replace the open mapping_review queue rows with this run's unresolved items")
+    refresh_mapping_review_queue = subparsers.add_parser(
+        "refresh-mapping-review-queue",
+        help="Recompute mapping-review results for specific provider_series_id values and refresh only those persisted queue rows",
+    )
+    refresh_mapping_review_queue.add_argument(
+        "--provider-series-id",
+        action="append",
+        default=[],
+        help="Crunchyroll provider_series_id to refresh in the persisted mapping_review queue (repeatable)",
+    )
+    refresh_mapping_review_queue.add_argument(
+        "--all-open",
+        action="store_true",
+        help="Refresh every currently open persisted mapping_review row (may be combined with explicit --provider-series-id values)",
+    )
+    refresh_mapping_review_queue.add_argument("--title-cluster", default=None, help="Only refresh open mapping_review rows whose normalized title cluster matches this value")
+    refresh_mapping_review_queue.add_argument("--decision", default=None, help="Only refresh open mapping_review rows whose payload decision exactly matches this value")
+    refresh_mapping_review_queue.add_argument("--reason", default=None, help="Only refresh open mapping_review rows whose payload reasons include this exact value")
+    refresh_mapping_review_queue.add_argument("--reason-family", default=None, help="Only refresh open mapping_review rows whose payload reasons include this normalized reason family")
+    refresh_mapping_review_queue.add_argument("--fix-strategy", default=None, help="Only refresh open mapping_review rows whose normalized fix strategy exactly matches this value")
+    refresh_mapping_review_queue.add_argument("--fix-strategy-family", default=None, help="Only refresh open mapping_review rows whose normalized fix strategy family exactly matches this value")
+    refresh_mapping_review_queue.add_argument("--cluster-strategy", default=None, help="Only refresh open mapping_review rows whose combined normalized title-cluster/fix-strategy exactly matches this value")
+    refresh_mapping_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only refresh open mapping_review rows whose combined normalized title-cluster/fix-strategy family exactly matches this value")
+    refresh_mapping_review_queue.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     list_mappings = subparsers.add_parser("list-mappings", help="List persisted Crunchyroll -> MAL mappings from SQLite")
     list_mappings.add_argument("--approved-only", action="store_true", help="Only include mappings explicitly approved by the user")
     approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved Crunchyroll -> MAL series mapping")
@@ -867,8 +3455,112 @@ def build_parser() -> argparse.ArgumentParser:
     list_review_queue.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to show")
     list_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
     list_review_queue.add_argument("--summary", action="store_true", help="Emit a compact summary of queue counts/decisions/reasons instead of every row")
+    list_review_queue.add_argument("--limit", type=int, default=0, help="Maximum number of filtered rows to emit in non-summary mode (use 0 for all)")
+    list_review_queue.add_argument("--provider-series-id", default=None, help="Only show review rows for one exact Crunchyroll provider_series_id")
     list_review_queue.add_argument("--title-cluster", default=None, help="Only show review rows whose normalized title cluster matches this value (for example: 'example show' or 'Example Show Season 2')")
+    list_review_queue.add_argument("--decision", default=None, help="Only show review rows whose payload decision exactly matches this value from --summary")
+    list_review_queue.add_argument("--reason", default=None, help="Only show review rows whose payload reasons include this exact value from --summary")
+    list_review_queue.add_argument("--reason-family", default=None, help="Only show review rows whose payload reasons include this normalized reason family from --summary")
     list_review_queue.add_argument("--fix-strategy", default=None, help="Only show review rows whose decision+reasons strategy exactly matches this value from --summary")
+    list_review_queue.add_argument("--fix-strategy-family", default=None, help="Only show review rows whose normalized decision+reason-family strategy exactly matches this value from --summary")
+    list_review_queue.add_argument("--cluster-strategy", default=None, help="Only show review rows whose combined franchise/fix-strategy bucket exactly matches this value from --summary (format: '<cluster> || <strategy>')")
+    list_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only show review rows whose combined franchise/fix-strategy-family bucket exactly matches this value from --summary (format: '<cluster> || <strategy-family>')")
+    review_queue_next = subparsers.add_parser(
+        "review-queue-next",
+        help="Pick the next highest-signal review backlog bucket and emit the exact drilldown command to run",
+    )
+    review_queue_next.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to inspect")
+    review_queue_next.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
+    review_queue_next.add_argument(
+        "--bucket",
+        default="auto",
+        choices=["auto", "cluster-strategy", "cluster-strategy-family", "fix-strategy", "fix-strategy-family", "title-cluster", "reason", "reason-family", "decision"],
+        help="Which bucket family to prefer when choosing the next drilldown",
+    )
+    review_queue_next.add_argument("--title-cluster", default=None, help="Optional existing title-cluster scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--decision", default=None, help="Optional existing decision scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--reason", default=None, help="Optional existing reason scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--fix-strategy", default=None, help="Optional existing fix-strategy scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--cluster-strategy", default=None, help="Optional existing combined cluster/fix-strategy scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--reason-family", default=None, help="Optional existing reason-family scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--fix-strategy-family", default=None, help="Optional existing fix-strategy-family scope to preserve while choosing the next drilldown")
+    review_queue_next.add_argument("--cluster-strategy-family", default=None, help="Optional existing combined cluster/fix-strategy-family scope to preserve while choosing the next drilldown")
+    review_queue_worklist = subparsers.add_parser(
+        "review-queue-worklist",
+        help="Emit the next several highest-signal review backlog drilldowns as a ranked worklist",
+    )
+    review_queue_worklist.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to inspect")
+    review_queue_worklist.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
+    review_queue_worklist.add_argument("--limit", type=int, default=5, help="Maximum number of ranked drilldowns to emit")
+    review_queue_worklist.add_argument("--title-cluster", default=None, help="Optional existing title-cluster scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--decision", default=None, help="Optional existing decision scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--reason", default=None, help="Optional existing reason scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--fix-strategy", default=None, help="Optional existing fix-strategy scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--cluster-strategy", default=None, help="Optional existing combined cluster/fix-strategy scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--reason-family", default=None, help="Optional existing reason-family scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--fix-strategy-family", default=None, help="Optional existing fix-strategy-family scope to preserve while building the worklist")
+    review_queue_worklist.add_argument("--cluster-strategy-family", default=None, help="Optional existing combined cluster/fix-strategy-family scope to preserve while building the worklist")
+    review_queue_apply_worklist = subparsers.add_parser(
+        "review-queue-apply-worklist",
+        help="Apply the ranked review-queue worklist in one shot by resolving or reopening the selected buckets",
+    )
+    review_queue_apply_worklist.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to mutate (open -> resolve, resolved -> reopen)")
+    review_queue_apply_worklist.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
+    review_queue_apply_worklist.add_argument("--limit", type=int, default=3, help="How many ranked worklist buckets to apply")
+    review_queue_apply_worklist.add_argument("--per-bucket-limit", type=int, default=20, help="Maximum number of matching rows to update per selected bucket (use 0 for all)")
+    review_queue_apply_worklist.add_argument("--title-cluster", default=None, help="Optional existing title-cluster scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--decision", default=None, help="Optional existing decision scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--reason", default=None, help="Optional existing reason scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--fix-strategy", default=None, help="Optional existing fix-strategy scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--cluster-strategy", default=None, help="Optional existing combined cluster/fix-strategy scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--reason-family", default=None, help="Optional existing reason-family scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--fix-strategy-family", default=None, help="Optional existing fix-strategy-family scope to preserve while applying the worklist")
+    review_queue_apply_worklist.add_argument("--cluster-strategy-family", default=None, help="Optional existing combined cluster/fix-strategy-family scope to preserve while applying the worklist")
+    review_queue_refresh_worklist = subparsers.add_parser(
+        "review-queue-refresh-worklist",
+        help="Apply the ranked review-queue worklist in one shot by recomputing mapping_review buckets and refreshing the persisted rows",
+    )
+    review_queue_refresh_worklist.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to inspect while selecting refresh buckets")
+    review_queue_refresh_worklist.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter (currently only mapping_review is supported)")
+    review_queue_refresh_worklist.add_argument("--limit", type=int, default=3, help="How many ranked worklist buckets to refresh")
+    review_queue_refresh_worklist.add_argument("--per-bucket-limit", type=int, default=20, help="Maximum number of matching rows to refresh per selected bucket (use 0 for all)")
+    review_queue_refresh_worklist.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per refreshed series")
+    review_queue_refresh_worklist.add_argument("--title-cluster", default=None, help="Optional existing title-cluster scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--decision", default=None, help="Optional existing decision scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--reason", default=None, help="Optional existing reason scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--fix-strategy", default=None, help="Optional existing fix-strategy scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--cluster-strategy", default=None, help="Optional existing combined cluster/fix-strategy scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--reason-family", default=None, help="Optional existing reason-family scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--fix-strategy-family", default=None, help="Optional existing fix-strategy-family scope to preserve while refreshing the worklist")
+    review_queue_refresh_worklist.add_argument("--cluster-strategy-family", default=None, help="Optional existing combined cluster/fix-strategy-family scope to preserve while refreshing the worklist")
+    resolve_review_queue = subparsers.add_parser(
+        "resolve-review-queue",
+        help="Mark matching open review_queue rows as resolved after triage",
+    )
+    resolve_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
+    resolve_review_queue.add_argument("--limit", type=int, default=20, help="Maximum number of matching open rows to resolve (use 0 for all)")
+    resolve_review_queue.add_argument("--title-cluster", default=None, help="Only resolve rows whose normalized title cluster matches this value")
+    resolve_review_queue.add_argument("--decision", default=None, help="Only resolve rows whose payload decision exactly matches this value")
+    resolve_review_queue.add_argument("--reason", default=None, help="Only resolve rows whose payload reasons include this value")
+    resolve_review_queue.add_argument("--fix-strategy", default=None, help="Only resolve rows whose decision+reasons strategy exactly matches this value")
+    resolve_review_queue.add_argument("--cluster-strategy", default=None, help="Only resolve rows whose combined franchise/fix-strategy bucket exactly matches this value")
+    resolve_review_queue.add_argument("--reason-family", default=None, help="Only resolve rows whose payload reasons include this normalized family")
+    resolve_review_queue.add_argument("--fix-strategy-family", default=None, help="Only resolve rows whose normalized decision+reason-family strategy exactly matches this value")
+    resolve_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only resolve rows whose combined franchise/fix-strategy-family bucket exactly matches this value")
+    reopen_review_queue = subparsers.add_parser(
+        "reopen-review-queue",
+        help="Move matching resolved review_queue rows back to open when residue was cleared too aggressively or needs another pass",
+    )
+    reopen_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
+    reopen_review_queue.add_argument("--limit", type=int, default=20, help="Maximum number of matching resolved rows to reopen (use 0 for all)")
+    reopen_review_queue.add_argument("--title-cluster", default=None, help="Only reopen rows whose normalized title cluster matches this value")
+    reopen_review_queue.add_argument("--decision", default=None, help="Only reopen rows whose payload decision exactly matches this value")
+    reopen_review_queue.add_argument("--reason", default=None, help="Only reopen rows whose payload reasons include this value")
+    reopen_review_queue.add_argument("--fix-strategy", default=None, help="Only reopen rows whose decision+reasons strategy exactly matches this value")
+    reopen_review_queue.add_argument("--cluster-strategy", default=None, help="Only reopen rows whose combined franchise/fix-strategy bucket exactly matches this value")
+    reopen_review_queue.add_argument("--reason-family", default=None, help="Only reopen rows whose payload reasons include this normalized family")
+    reopen_review_queue.add_argument("--fix-strategy-family", default=None, help="Only reopen rows whose normalized decision+reason-family strategy exactly matches this value")
+    reopen_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only reopen rows whose combined franchise/fix-strategy-family bucket exactly matches this value")
     apply_sync = subparsers.add_parser("apply-sync", help="Guarded MAL executor that only operates on approved mappings and forward-safe proposals")
     apply_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     apply_sync.add_argument("--mapping-limit", type=int, default=5, help="Reserved for parity with dry-run planning")
@@ -911,6 +3603,17 @@ def main() -> int:
         return _cmd_init(args.project_root)
     if args.command == "status":
         return _cmd_status(args.project_root)
+    if args.command == "health-check":
+        return _cmd_health_check(
+            args.project_root,
+            args.stale_hours,
+            args.strict,
+            args.review_issue_type,
+            args.review_worklist_limit,
+            args.format,
+            args.mapping_coverage_threshold,
+            args.maintenance_review_limit,
+        )
     if args.command == "mal-auth-url":
         return _cmd_mal_auth_url(args.project_root, args.json)
     if args.command == "mal-auth-login":
@@ -931,6 +3634,21 @@ def main() -> int:
         return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
     if args.command == "review-mappings":
         return _cmd_review_mappings(args.project_root, args.limit, args.mapping_limit, args.persist_review_queue)
+    if args.command == "refresh-mapping-review-queue":
+        return _cmd_refresh_mapping_review_queue(
+            args.project_root,
+            args.provider_series_id,
+            args.mapping_limit,
+            include_all_open=args.all_open,
+            title_cluster=args.title_cluster,
+            fix_strategy=args.fix_strategy,
+            cluster_strategy=args.cluster_strategy,
+            decision=args.decision,
+            reason=args.reason,
+            reason_family=args.reason_family,
+            fix_strategy_family=args.fix_strategy_family,
+            cluster_strategy_family=args.cluster_strategy_family,
+        )
     if args.command == "list-mappings":
         return _cmd_list_mappings(args.project_root, args.approved_only)
     if args.command == "approve-mapping":
@@ -957,8 +3675,107 @@ def main() -> int:
             args.status,
             args.issue_type,
             args.summary,
+            args.limit,
+            args.provider_series_id,
             args.title_cluster,
             args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
+        )
+    if args.command == "review-queue-next":
+        return _cmd_review_queue_next(
+            args.project_root,
+            args.status,
+            args.issue_type,
+            args.bucket,
+            args.title_cluster,
+            args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
+        )
+    if args.command == "review-queue-worklist":
+        return _cmd_review_queue_worklist(
+            args.project_root,
+            args.status,
+            args.issue_type,
+            args.limit,
+            args.title_cluster,
+            args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
+        )
+    if args.command == "review-queue-apply-worklist":
+        return _cmd_review_queue_apply_worklist(
+            args.project_root,
+            args.status,
+            args.issue_type,
+            args.limit,
+            args.per_bucket_limit,
+            args.title_cluster,
+            args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
+        )
+    if args.command == "review-queue-refresh-worklist":
+        return _cmd_review_queue_refresh_worklist(
+            args.project_root,
+            args.status,
+            args.issue_type,
+            args.limit,
+            args.per_bucket_limit,
+            args.mapping_limit,
+            args.title_cluster,
+            args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
+        )
+    if args.command == "resolve-review-queue":
+        return _cmd_resolve_review_queue(
+            args.project_root,
+            args.issue_type,
+            args.limit,
+            args.title_cluster,
+            args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
+        )
+    if args.command == "reopen-review-queue":
+        return _cmd_reopen_review_queue(
+            args.project_root,
+            args.issue_type,
+            args.limit,
+            args.title_cluster,
+            args.fix_strategy,
+            args.cluster_strategy,
+            args.decision,
+            args.reason,
+            args.reason_family,
+            args.fix_strategy_family,
+            args.cluster_strategy_family,
         )
     if args.command == "apply-sync":
         return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)

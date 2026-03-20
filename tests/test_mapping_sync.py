@@ -17,6 +17,7 @@ from mal_updater.mapping import (
     should_auto_approve_mapping,
 )
 from mal_updater.sync_planner import (
+    MAPPING_REVIEW_HEURISTICS_REVISION,
     build_dry_run_sync_plan,
     build_mapping_review,
     execute_approved_sync,
@@ -32,6 +33,500 @@ class MappingTests(unittest.TestCase):
             normalize_title("BOFURI: I Don’t Want to Get Hurt, so I’ll Max Out My Defense. Season 2 (English Dub)"),
             "bofuri i don t want to get hurt so i ll max out my defense",
         )
+
+    def test_normalize_title_splits_letter_digit_boundaries(self) -> None:
+        self.assertEqual(normalize_title("PERSONA5 the Animation"), "persona 5 the animation")
+        self.assertEqual(normalize_title("Ver1.1a"), "ver 1 1 a")
+
+    def test_map_series_does_not_treat_stylized_single_x_as_roman_installment_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 30911,
+                                "title": "Tales of Zestiria the Cross",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 34086,
+                                "title": "Tales of Zestiria the Cross 2nd Season",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Tales of Zestiria the X",
+                        season_title="Tales of Zestiria the X (English Dub)",
+                        season_number=1,
+                        max_episode_number=16,
+                        completed_episode_count=16,
+                    ),
+                )
+
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 30911)
+        self.assertFalse(any(reason.startswith("roman_installment_match=") for reason in result.rationale))
+        self.assertFalse(any(reason.startswith("installment_hint_match=roman:") for reason in result.rationale))
+        self.assertFalse(any(reason.startswith("roman_installment_match=") for reason in result.candidates[0].match_reasons))
+
+    def test_map_series_flags_exact_title_overflow_as_possible_multi_entry_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 849,
+                                "title": "Suzumiya Haruhi no Yuuutsu",
+                                "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 4382,
+                                "title": "Suzumiya Haruhi no Yuuutsu (2009)",
+                                "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="The Melancholy of Haruhi Suzumiya",
+                        season_title="The Melancholy of Haruhi Suzumiya (English Dub)",
+                        season_number=1,
+                        max_episode_number=28,
+                        completed_episode_count=28,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertIn(result.chosen_candidate.mal_anime_id, {849, 4382})
+        self.assertIn("exact_normalized_title", result.rationale)
+        self.assertIn("episode_evidence_exceeds_candidate_count=28>14", result.rationale)
+        self.assertIn("multi_entry_bundle_suspected=28<=14+14", result.rationale)
+        self.assertIsNotNone(result.bundle_companion_candidate)
+        self.assertIn(result.bundle_companion_candidate.mal_anime_id, {849, 4382})
+        self.assertNotEqual(result.bundle_companion_candidate.mal_anime_id, result.chosen_candidate.mal_anime_id)
+        self.assertEqual(1, len(result.bundle_companion_candidates or []))
+        self.assertEqual({result.bundle_companion_candidate.mal_anime_id}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+
+    def test_map_series_flags_exact_title_overflow_as_bundle_even_when_later_season_companion_scores_low(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 20057,
+                                "title": "Space☆Dandy",
+                                "alternative_titles": {"en": "Space Dandy", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 2451,
+                                "title": "Space Cobra",
+                                "alternative_titles": {"en": "Space Cobra", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 31,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 12431,
+                                "title": "Uchuu Kyoudai",
+                                "alternative_titles": {"en": "Space Brothers", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 99,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 2452,
+                                "title": "Space Adventure Cobra",
+                                "alternative_titles": {"en": "Space Adventure Cobra", "synonyms": []},
+                                "media_type": "movie",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 23327,
+                                "title": "Space☆Dandy 2nd Season",
+                                "alternative_titles": {"en": "Space Dandy 2nd Season", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-space-dandy",
+                        title="Space Dandy",
+                        season_title="Space Dandy (English Dub)",
+                        season_number=1,
+                        max_episode_number=21,
+                        completed_episode_count=21,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 20057)
+        self.assertIn("episode_evidence_exceeds_candidate_count=21>13", result.rationale)
+        self.assertIn("multi_entry_bundle_suspected=21<=13+13", result.rationale)
+        self.assertIsNotNone(result.bundle_companion_candidate)
+        self.assertEqual(23327, result.bundle_companion_candidate.mal_anime_id)
+        self.assertEqual({23327}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+
+    def test_map_series_flags_exact_title_overflow_as_possible_three_entry_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 1001,
+                                "title": "Example Split Show",
+                                "alternative_titles": {"en": "Example Split Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 1002,
+                                "title": "Example Split Show Part 2",
+                                "alternative_titles": {"en": "Example Split Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 1003,
+                                "title": "Example Split Show Part 3",
+                                "alternative_titles": {"en": "Example Split Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123b",
+                        title="Example Split Show",
+                        season_title="Example Split Show (English Dub)",
+                        season_number=1,
+                        max_episode_number=36,
+                        completed_episode_count=36,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 1001)
+        self.assertIn("episode_evidence_exceeds_candidate_count=36>12", result.rationale)
+        self.assertIn("multi_entry_bundle_suspected=36<=12+12+12", result.rationale)
+        self.assertIsNotNone(result.bundle_companion_candidate)
+        self.assertIn(result.bundle_companion_candidate.mal_anime_id, {1002, 1003})
+        self.assertEqual({1002, 1003}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+
+    def test_map_series_multi_entry_bundle_prefers_later_seasons_over_higher_scoring_sidecar_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 39468,
+                                "title": "Honzuki no Gekokujou: Shisho ni Naru Tame ni wa Shudan wo Erandeiraremasen",
+                                "alternative_titles": {"en": "Ascendance of a Bookworm", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 40841,
+                                "title": "Honzuki no Gekokujou: Shisho ni Naru Tame ni wa Shudan wo Erandeiraremasen OVA",
+                                "alternative_titles": {"en": "Ascendance of a Bookworm OVA", "synonyms": []},
+                                "media_type": "ova",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 42429,
+                                "title": "Honzuki no Gekokujou: Shisho ni Naru Tame ni wa Shudan wo Erandeiraremasen 3rd Season",
+                                "alternative_titles": {"en": "Ascendance of a Bookworm Season 3", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 10,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 40815,
+                                "title": "Honzuki no Gekokujou: Shisho ni Naru Tame ni wa Shudan wo Erandeiraremasen 2nd Season",
+                                "alternative_titles": {"en": "Ascendance of a Bookworm Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 51616,
+                                "title": "Honzuki no Gekokujou: Shisho ni Naru Tame ni wa Shudan wo Erandeiraremasen Recap",
+                                "alternative_titles": {"en": "Ascendance of a Bookworm Recap", "synonyms": []},
+                                "media_type": "tv_special",
+                                "status": "finished_airing",
+                                "num_episodes": 2,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-bookworm",
+                        title="Ascendance of a Bookworm",
+                        season_title="Ascendance of a Bookworm (English Dub)",
+                        season_number=1,
+                        max_episode_number=32,
+                        completed_episode_count=32,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 39468)
+        self.assertIn("episode_evidence_exceeds_candidate_count=32>14", result.rationale)
+        self.assertIn("multi_entry_bundle_suspected=32<=14+10+12", result.rationale)
+        self.assertEqual({42429, 40815}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertNotIn(40841, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertGreater(
+            next(candidate.score for candidate in result.candidates if candidate.mal_anime_id == 40841),
+            next(candidate.score for candidate in result.candidates if candidate.mal_anime_id == 42429),
+        )
+
+    def test_map_series_flags_explicit_later_season_overflow_as_possible_multi_entry_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 58572,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su 2nd Season",
+                                "alternative_titles": {"en": "Shangri-La Frontier Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 25,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 61338,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su 3rd Season",
+                                "alternative_titles": {"en": "Shangri-La Frontier Season 3", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "not_yet_aired",
+                                "num_episodes": 25,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 52347,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su",
+                                "alternative_titles": {"en": "Shangri-La Frontier", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 25,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-shangri-bundle",
+                        title="Shangri-La Frontier",
+                        season_title="Shangri-La Frontier Season 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=49,
+                        completed_episode_count=49,
+                    ),
+                )
+
+        self.assertEqual(result.status, "strong")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 58572)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertIn("episode_evidence_exceeds_candidate_count=49>25", result.rationale)
+        self.assertIn("multi_entry_bundle_suspected=49<=25+25", result.rationale)
+        self.assertEqual({61338}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
 
     def test_map_series_boosts_base_title_match_when_provider_title_only_adds_arc_subtitle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -211,6 +706,115 @@ class MappingTests(unittest.TestCase):
                 self.assertEqual(result.chosen_candidate.mal_anime_id, 21)
                 self.assertIn("exact_base_title_after_subtitle_trim", result.rationale)
 
+    def test_map_series_penalizes_related_non_tv_sidecar_when_provider_has_explicit_season_context(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                if query == "Million Arthur Season 2 (English Dub)":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 38268,
+                                    "title": "Hangyakusei Million Arthur 2nd Season",
+                                    "alternative_titles": {},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            }
+                        ]
+                    }
+                if query == "Million Arthur":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 37555,
+                                    "title": "Hangyakusei Million Arthur",
+                                    "alternative_titles": {},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 10,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            def fake_details(anime_id: int, fields: str | None = None) -> dict:
+                if anime_id == 38268:
+                    return {
+                        "id": 38268,
+                        "title": "Hangyakusei Million Arthur 2nd Season",
+                        "alternative_titles": {},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 13,
+                        "related_anime": [{"node": {"id": 30954}}],
+                    }
+                if anime_id == 37555:
+                    return {
+                        "id": 37555,
+                        "title": "Hangyakusei Million Arthur",
+                        "alternative_titles": {},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 10,
+                        "related_anime": [],
+                    }
+                if anime_id == 30954:
+                    return {
+                        "id": 30954,
+                        "title": "Jakusansei Million Arthur",
+                        "alternative_titles": {},
+                        "media_type": "ona",
+                        "status": "finished_airing",
+                        "num_episodes": 10,
+                        "related_anime": [],
+                    }
+                return {"id": anime_id, "related_anime": []}
+
+            with (
+                patch.object(MalClient, "search_anime", side_effect=fake_search),
+                patch.object(MalClient, "get_anime_details", side_effect=fake_details),
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-million-arthur",
+                        title="Million Arthur",
+                        season_title="Million Arthur Season 2 (English Dub)",
+                        season_number=2,
+                        completed_episode_count=13,
+                        max_episode_number=13,
+                    ),
+                )
+
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 38268)
+        candidates_by_id = {candidate.mal_anime_id: candidate for candidate in result.candidates}
+        self.assertIn(30954, candidates_by_id)
+        self.assertIn("ona_penalty_for_explicit_season_context", candidates_by_id[30954].match_reasons)
+        self.assertGreater(candidates_by_id[38268].score, candidates_by_id[30954].score)
+
     def test_build_search_queries_combines_generic_season_title_with_base_title(self) -> None:
         queries = build_search_queries(
             SeriesMappingInput(
@@ -250,6 +854,90 @@ class MappingTests(unittest.TestCase):
         self.assertIn("The Saint's Magic Power is Omnipotent 2", queries)
         self.assertIn("The Saint's Magic Power is Omnipotent II", queries)
         self.assertEqual(queries[-1], "The Saint's Magic Power is Omnipotent")
+
+    def test_build_search_queries_strips_broadcast_and_uncensored_suffix_noise(self) -> None:
+        queries = build_search_queries(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-123",
+                title="Harem in the Labyrinth of Another World",
+                season_title="Harem in the Labyrinth of Another World - Broadcast Version (Uncensored)",
+            )
+        )
+
+        self.assertEqual(
+            queries[0:2],
+            [
+                "Harem in the Labyrinth of Another World - Broadcast Version (Uncensored)",
+                "Harem in the Labyrinth of Another World",
+            ],
+        )
+        self.assertEqual(queries[-1], "Harem in the Labyrinth of Another World")
+
+    def test_map_series_boosts_parenthetical_english_alias_to_base_title_match(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 19685,
+                                "title": "Kanojo ga Flag wo Oraretara",
+                                "alternative_titles": {},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 24451,
+                                "title": "Kanojo ga Flag wo Oraretara: Christmas? Sonna Mono ga Boku ni Tsuuyou Suru to Omou no ka?",
+                                "alternative_titles": {},
+                                "media_type": "ova",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-parenthetical-alias",
+                        title="Kanojo ga Flag wo Oraretara (If Her Flag Breaks)",
+                        season_title="Kanojo ga Flag wo Oraretara (If Her Flag Breaks)",
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "strong")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 19685)
+        self.assertIn("exact_base_title_after_subtitle_trim", result.rationale)
+        self.assertFalse(should_auto_approve_mapping(result))
 
     def test_map_series_prefers_exact_specific_installment_over_base_title_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -385,6 +1073,436 @@ class MappingTests(unittest.TestCase):
         self.assertIsNotNone(result.chosen_candidate)
         self.assertEqual(result.chosen_candidate.mal_anime_id, 51180)
         self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_expands_related_anime_to_recover_hidden_tv_sequel(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                if query == "My Wife is the Student Council President+! (Uncensored)":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 31980,
+                                    "title": "Okusama ga Seitokaichou! Seitokaichou to Ofuro Asobi",
+                                    "alternative_titles": {
+                                        "synonyms": ["Okusama ga Seitokaichou! OVA"],
+                                        "en": "My Wife is the Student Council President OVA",
+                                        "ja": "",
+                                    },
+                                    "media_type": "ova",
+                                    "status": "finished_airing",
+                                    "num_episodes": 1,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 5909,
+                                    "title": "Seitokai no Ichizon",
+                                    "alternative_titles": {},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            },
+                        ]
+                    }
+                return {"data": []}
+
+            def fake_details(anime_id: int, *, fields: str = "") -> dict:
+                if anime_id == 31980:
+                    return {
+                        "id": 31980,
+                        "title": "Okusama ga Seitokaichou! Seitokaichou to Ofuro Asobi",
+                        "alternative_titles": {
+                            "synonyms": ["Okusama ga Seitokaichou! OVA"],
+                            "en": "My Wife is the Student Council President OVA",
+                            "ja": "",
+                        },
+                        "media_type": "ova",
+                        "status": "finished_airing",
+                        "num_episodes": 1,
+                        "related_anime": [
+                            {
+                                "node": {"id": 28819, "title": "Okusama ga Seitokaichou!"},
+                                "relation_type": "parent_story",
+                                "relation_type_formatted": "Parent story",
+                            }
+                        ],
+                    }
+                if anime_id == 28819:
+                    return {
+                        "id": 28819,
+                        "title": "Okusama ga Seitokaichou!",
+                        "alternative_titles": {
+                            "synonyms": ["Oku-sama ga Seito Kaichou!"],
+                            "en": "My Wife is the Student Council President!",
+                            "ja": "",
+                        },
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [
+                            {
+                                "node": {"id": 32603, "title": "Okusama ga Seitokaichou!+!"},
+                                "relation_type": "sequel",
+                                "relation_type_formatted": "Sequel",
+                            }
+                        ],
+                    }
+                if anime_id == 32603:
+                    return {
+                        "id": 32603,
+                        "title": "Okusama ga Seitokaichou!+!",
+                        "alternative_titles": {
+                            "synonyms": [
+                                "My Wife is the Student Council President 2nd Season",
+                                "Okusama ga Seitokaichou! Plus",
+                            ],
+                            "en": "My Wife is the Student Council President!+",
+                            "ja": "",
+                        },
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [],
+                    }
+                if anime_id == 5909:
+                    return {
+                        "id": 5909,
+                        "title": "Seitokai no Ichizon",
+                        "alternative_titles": {},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [],
+                    }
+                raise AssertionError(f"unexpected anime details lookup: {anime_id}")
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_details,
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-related-expansion",
+                        title="My Wife is the Student Council President",
+                        season_title="My Wife is the Student Council President+! (Uncensored)",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 32603)
+        self.assertIn("related_anime_expansion", result.chosen_candidate.match_reasons)
+        self.assertIn("installment_hint_match=plus", result.chosen_candidate.match_reasons)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_expands_related_anime_for_suffix_residue_without_installment_context(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                if query == "Shuffle! (English Dub)":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 1836,
+                                    "title": "Shuffle! Memories",
+                                    "alternative_titles": {},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            def fake_details(anime_id: int, *, fields: str = "") -> dict:
+                if anime_id == 1836:
+                    return {
+                        "id": 1836,
+                        "title": "Shuffle! Memories",
+                        "alternative_titles": {},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [
+                            {
+                                "node": {"id": 79, "title": "Shuffle!"},
+                                "relation_type": "prequel",
+                                "relation_type_formatted": "Prequel",
+                            }
+                        ],
+                    }
+                if anime_id == 79:
+                    return {
+                        "id": 79,
+                        "title": "Shuffle!",
+                        "alternative_titles": {"en": "Shuffle!", "synonyms": [], "ja": ""},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 24,
+                        "related_anime": [],
+                    }
+                raise AssertionError(f"unexpected anime details lookup: {anime_id}")
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_details,
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-shuffle",
+                        title="Shuffle!",
+                        season_title="Shuffle! (English Dub)",
+                        season_number=1,
+                        max_episode_number=8,
+                        completed_episode_count=8,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 79)
+        self.assertIn("related_anime_expansion", result.chosen_candidate.match_reasons)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_prioritizes_promising_relation_chains_before_low_value_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                if query == "Seven Mortal Sins (English Dub)":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 35418,
+                                    "title": "Sin: Nanatsu no Taizai Zange-roku Specials",
+                                    "alternative_titles": {"en": "Seven Mortal Sins Specials", "synonyms": [], "ja": ""},
+                                    "media_type": "special",
+                                    "status": "finished_airing",
+                                    "num_episodes": 7,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 23755,
+                                    "title": "Nanatsu no Taizai",
+                                    "alternative_titles": {"en": "The Seven Deadly Sins", "synonyms": [], "ja": ""},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 24,
+                                }
+                            },
+                        ]
+                    }
+                return {"data": []}
+
+            def fake_details(anime_id: int, *, fields: str = "") -> dict:
+                if anime_id == 35418:
+                    return {
+                        "id": 35418,
+                        "title": "Sin: Nanatsu no Taizai Zange-roku Specials",
+                        "alternative_titles": {"en": "Seven Mortal Sins Specials", "synonyms": [], "ja": ""},
+                        "media_type": "special",
+                        "status": "finished_airing",
+                        "num_episodes": 7,
+                        "related_anime": [
+                            {
+                                "node": {"id": 35417, "title": "Sin: Nanatsu no Taizai Zange-roku"},
+                                "relation_type": "prequel",
+                                "relation_type_formatted": "Prequel",
+                            }
+                        ],
+                    }
+                if anime_id == 35417:
+                    return {
+                        "id": 35417,
+                        "title": "Sin: Nanatsu no Taizai Zange-roku",
+                        "alternative_titles": {"en": "", "synonyms": [], "ja": ""},
+                        "media_type": "ona",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [
+                            {
+                                "node": {"id": 33834, "title": "Sin: Nanatsu no Taizai"},
+                                "relation_type": "other",
+                                "relation_type_formatted": "Other",
+                            }
+                        ],
+                    }
+                if anime_id == 33834:
+                    return {
+                        "id": 33834,
+                        "title": "Sin: Nanatsu no Taizai",
+                        "alternative_titles": {"en": "Seven Mortal Sins", "synonyms": [], "ja": ""},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [],
+                    }
+                if anime_id == 23755:
+                    return {
+                        "id": 23755,
+                        "title": "Nanatsu no Taizai",
+                        "alternative_titles": {"en": "The Seven Deadly Sins", "synonyms": [], "ja": ""},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 24,
+                        "related_anime": [
+                            {"node": {"id": 30347, "title": "Nanatsu no Taizai OVA"}},
+                            {"node": {"id": 31722, "title": "Nanatsu no Taizai: Seisen no Shirushi"}},
+                            {"node": {"id": 36923, "title": "Nanatsu no Taizai: Imashime no Fukkatsu Joshou"}},
+                        ],
+                    }
+                if anime_id in {30347, 31722, 36923}:
+                    return {
+                        "id": anime_id,
+                        "title": f"noise-{anime_id}",
+                        "alternative_titles": {},
+                        "media_type": "ova",
+                        "status": "finished_airing",
+                        "num_episodes": 1,
+                        "related_anime": [],
+                    }
+                raise AssertionError(f"unexpected anime details lookup: {anime_id}")
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_details,
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-seven-mortal-sins",
+                        title="Seven Mortal Sins",
+                        season_title="Seven Mortal Sins (English Dub)",
+                        season_number=1,
+                        max_episode_number=7,
+                        completed_episode_count=7,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 33834)
+        self.assertIn("related_anime_expansion", result.chosen_candidate.match_reasons)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_does_not_expand_relations_for_plain_season_one_tv_match(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 37555,
+                                "title": "Hangyakusei Million Arthur",
+                                "alternative_titles": {"en": "Million Arthur", "synonyms": [], "ja": ""},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 10,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(MalClient, "get_anime_details", side_effect=AssertionError("relation expansion should not run")):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-million-arthur",
+                        title="Million Arthur",
+                        season_title="Million Arthur Season 1 (English Dub)",
+                        season_number=1,
+                        max_episode_number=7,
+                        completed_episode_count=7,
+                    ),
+                )
+
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 37555)
+        self.assertNotIn("related_anime_expansion", result.chosen_candidate.match_reasons)
 
     def test_map_series_classifies_exact_match_conservatively(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -688,6 +1806,457 @@ class MappingTests(unittest.TestCase):
         self.assertTrue(should_auto_approve_mapping(result))
         self.assertEqual(result.chosen_candidate.mal_anime_id, 28677)
         self.assertIn("candidate_auxiliary_content=pv", result.candidates[1].match_reasons)
+
+    def test_map_series_promotes_exact_tv_match_over_near_single_episode_ova_review_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 28677,
+                                "title": "Yamada-kun to 7-nin no Majo",
+                                "alternative_titles": {"en": "Yamada-kun and the Seven Witches"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 24627,
+                                "title": "Yamada-kun to 7-nin no Majo: Mou Hitotsu no Suzaku-sai",
+                                "alternative_titles": {"en": "Yamada-kun and the Seven Witches: Another Suzaku Festival"},
+                                "media_type": "ova",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-ova-noise",
+                        title="Yamada-kun and the Seven Witches",
+                        season_title="Yamada-kun and the Seven Witches",
+                        completed_episode_count=12,
+                        max_episode_number=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 28677)
+        self.assertIn("substring_title_match", result.candidates[1].match_reasons)
+        self.assertIn("episode_evidence_exceeds_candidate_count=12>1", result.candidates[1].match_reasons)
+
+    def test_map_series_promotes_exact_tv_match_over_near_extra_suffix_franchise_entry_without_episode_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 28677,
+                                "title": "Yamada-kun to 7-nin no Majo",
+                                "alternative_titles": {"en": "Yamada-kun and the Seven Witches"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": None,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 24627,
+                                "title": "Yamada-kun to 7-nin no Majo: Mou Hitotsu no Suzaku-sai",
+                                "alternative_titles": {"en": "Yamada-kun and the Seven Witches: Another Suzaku Festival"},
+                                "media_type": "ova",
+                                "status": "finished_airing",
+                                "num_episodes": None,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-ova-suffix-noise",
+                        title="Yamada-kun and the Seven Witches",
+                        season_title="Yamada-kun and the Seven Witches",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 28677)
+        self.assertIn("candidate_extra_title_suffix", result.candidates[1].match_reasons)
+
+    def test_map_series_promotes_exact_base_series_over_sequel_suffix_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 38297,
+                                "title": "Maou-sama, Retry!",
+                                "alternative_titles": {"en": "Demon Lord, Retry!"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": None,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 56400,
+                                "title": "Maou-sama, Retry! R",
+                                "alternative_titles": {"en": "Demon Lord, Retry! R"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": None,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-retry-base",
+                        title="Demon Lord, Retry! (English Dub)",
+                        season_title="Demon Lord, Retry! (English Dub)",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 38297)
+        self.assertIn("candidate_extra_title_suffix", result.candidates[1].match_reasons)
+
+    def test_map_series_promotes_exact_base_series_over_non_exact_tv_suffix_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 6213,
+                                "title": "Toaru Kagaku no Railgun",
+                                "alternative_titles": {"en": "A Certain Scientific Railgun"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 24,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 16049,
+                                "title": "Toaru Kagaku no Railgun S",
+                                "alternative_titles": {"en": "A Certain Scientific Railgun S"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 24,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 38481,
+                                "title": "Toaru Kagaku no Railgun T",
+                                "alternative_titles": {"en": "A Certain Scientific Railgun T"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 25,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-railgun-base",
+                        title="A Certain Scientific Railgun (English Dub)",
+                        season_title="A Certain Scientific Railgun (English Dub)",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 6213)
+        self.assertIn("candidate_extra_title_suffix", result.candidates[1].match_reasons)
+        self.assertNotIn("exact_normalized_title", result.candidates[1].match_reasons)
+
+    def test_map_series_promotes_exact_tv_match_over_tv_special_when_title_only_differs_by_digit_spacing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 36023,
+                                "title": "Persona 5 the Animation",
+                                "alternative_titles": {},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": None,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 38431,
+                                "title": "Persona 5 the Animation TV Specials",
+                                "alternative_titles": {},
+                                "media_type": "tv_special",
+                                "status": "finished_airing",
+                                "num_episodes": None,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-persona5",
+                        title="PERSONA5 the Animation",
+                        season_title="PERSONA5 the Animation",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 36023)
+        self.assertIn("exact_normalized_title", result.chosen_candidate.match_reasons)
+        self.assertIn("candidate_extra_title_suffix", result.candidates[1].match_reasons)
+
+    def test_map_series_promotes_exact_tv_match_over_non_exact_ona_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 34257,
+                                "title": "Cinderella Girls Gekijou",
+                                "alternative_titles": {"en": "The iDOLM@STER CINDERELLA GIRLS Theater"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 35346,
+                                "title": "Cinderella Girls Gekijou: Kayou Cinderella Theater",
+                                "alternative_titles": {},
+                                "media_type": "ona",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-cingeki",
+                        title="The iDOLM@STER CINDERELLA GIRLS Theater",
+                        season_title="THE iDOLM@STER CINDERELLA GIRLS Theater 1st and 2nd Seasons (TV)",
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 34257)
+        self.assertEqual(result.candidates[1].media_type, "ona")
+        self.assertNotIn("exact_normalized_title", result.candidates[1].match_reasons)
+
+    def test_map_series_does_not_promote_exact_ova_match_over_base_tv_series(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 666,
+                                "title": "JoJo no Kimyou na Bouken",
+                                "alternative_titles": {"en": "JoJo's Bizarre Adventure"},
+                                "media_type": "ova",
+                                "status": "finished_airing",
+                                "num_episodes": 6,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 14719,
+                                "title": "JoJo no Kimyou na Bouken (TV)",
+                                "alternative_titles": {},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 26,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-jojo-ova",
+                        title="JoJo's Bizarre Adventure",
+                        season_title="JoJo's Bizarre Adventure",
+                        completed_episode_count=26,
+                        max_episode_number=26,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 666)
 
     def test_should_not_auto_approve_when_season_evidence_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1097,6 +2666,85 @@ class MappingTests(unittest.TestCase):
         self.assertNotIn("episode_evidence_exceeds_candidate_count=24>12", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_prefers_split_specific_candidate_over_broader_same_season_tie(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 53200,
+                                "title": "Hataraku Maou-sama!! 2nd Season",
+                                "alternative_titles": {"synonyms": ["The Devil is a Part-Timer! Season 2 Part 2 (English Dub)"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 48413,
+                                "title": "Hataraku Maou-sama!!",
+                                "alternative_titles": {"synonyms": ["The Devil is a Part-Timer! Season 2 (English Dub)"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 15809,
+                                "title": "Hataraku Maou-sama!",
+                                "alternative_titles": {"synonyms": ["The Devil is a Part-Timer! (English Dub)"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-devil-part-timer",
+                        title="The Devil is a Part-Timer!",
+                        season_title="The Devil is a Part-Timer! Season 2 Part 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 53200)
+        self.assertIn("season_to_split_match=part:2,split:2", result.rationale)
+        second = result.candidates[1]
+        self.assertEqual(second.mal_anime_id, 48413)
+        self.assertIn("season_number_match=2", second.match_reasons)
+        self.assertFalse(any(reason.startswith("season_to_split_match=") for reason in second.match_reasons))
+        self.assertTrue(should_auto_approve_mapping(result))
+
     def test_map_series_softens_single_episode_overflow_when_later_season_hint_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1166,6 +2814,74 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 53488)
         self.assertIn("season_number_match=2", result.rationale)
         self.assertTrue(any(reason == "minor_episode_overflow_suspected=13>12" for reason in result.rationale))
+        self.assertNotIn("episode_evidence_exceeds_candidate_count=13>12", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_softens_single_episode_overflow_for_exact_base_title_match(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 6880,
+                                "title": "Deadman Wonderland",
+                                "alternative_titles": {"en": "Deadman Wonderland", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 10372,
+                                "title": "Deadman Wonderland: Akai Knife Tsukai",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "ova",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Deadman Wonderland",
+                        season_title="Deadman Wonderland (English Dub)",
+                        season_number=1,
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                        max_completed_episode_number=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 6880)
+        self.assertIn("exact_normalized_title", result.rationale)
+        self.assertIn("minor_episode_overflow_suspected=13>12", result.rationale)
         self.assertNotIn("episode_evidence_exceeds_candidate_count=13>12", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
@@ -1417,6 +3133,98 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 900)
         self.assertIn("movie_type_allowed_for_exact_title", result.rationale)
 
+    def test_map_series_prefers_tv_bundle_over_exact_movie_and_prologue_sidecars_for_multi_episode_series(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 6922,
+                                "title": "Fate/stay night Movie: Unlimited Blade Works",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "movie",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 22297,
+                                "title": "Fate/stay night: Unlimited Blade Works",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 27821,
+                                "title": "Fate/stay night: Unlimited Blade Works Prologue",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv_special",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 28701,
+                                "title": "Fate/stay night: Unlimited Blade Works 2nd Season",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-fate-ubw",
+                        title="Fate/stay night [Unlimited Blade Works]",
+                        season_title="Fate/stay night [Unlimited Blade Works] (English Dub)",
+                        season_number=1,
+                        max_episode_number=24,
+                        completed_episode_count=24,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(22297, result.chosen_candidate.mal_anime_id)
+        self.assertIn("multi_entry_bundle_suspected=24<=12+13", result.rationale)
+        self.assertEqual({28701}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        movie_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 6922)
+        prologue_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 27821)
+        self.assertIn("single_episode_movie_penalty_for_multi_episode_series", movie_candidate.match_reasons)
+        self.assertIn("movie_penalty", movie_candidate.match_reasons)
+        self.assertIn("single_episode_tv_special_penalty_for_multi_episode_series", prologue_candidate.match_reasons)
+        self.assertLess(movie_candidate.score, result.chosen_candidate.score)
+        self.assertLess(prologue_candidate.score, result.chosen_candidate.score)
+
 
 class PersistedMappingTests(unittest.TestCase):
     def test_upsert_and_list_series_mappings(self) -> None:
@@ -1616,6 +3424,143 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0].mal_anime_id, 222)
         self.assertEqual(persisted[0].mapping_source, "auto_exact")
+
+    def test_build_mapping_review_surfaces_bundle_companion_for_multi_entry_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["title"] = "The Melancholy of Haruhi Suzumiya"
+            payload["series"][0]["season_title"] = "The Melancholy of Haruhi Suzumiya (English Dub)"
+            payload["series"][0]["season_number"] = 1
+            progress_template = dict(payload["progress"][0])
+            payload["progress"] = []
+            for episode_number in range(1, 29):
+                item = dict(progress_template)
+                item["provider_series_id"] = "series-123"
+                item["provider_episode_id"] = f"ep-{episode_number}"
+                item["episode_number"] = episode_number
+                item["completion_ratio"] = 1.0
+                payload["progress"].append(item)
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 849,
+                                "title": "Suzumiya Haruhi no Yuuutsu",
+                                "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 4382,
+                                "title": "Suzumiya Haruhi no Yuuutsu (2009)",
+                                "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                    ]
+                },
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=5)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].decision, "needs_review")
+        self.assertEqual(MAPPING_REVIEW_HEURISTICS_REVISION, items[0].mapper_revision)
+        self.assertEqual(MAPPING_REVIEW_HEURISTICS_REVISION, items[0].as_dict()["mapper_revision"])
+        self.assertIsNotNone(items[0].bundle_companion_candidate)
+        self.assertIn(items[0].bundle_companion_candidate["mal_anime_id"], {849, 4382})
+        self.assertNotEqual(items[0].bundle_companion_candidate["mal_anime_id"], items[0].suggested_mal_anime_id)
+        self.assertEqual(items[0].bundle_companion_candidate["num_episodes"], 14)
+        self.assertEqual(1, len(items[0].bundle_companion_candidates))
+        self.assertEqual(
+            {items[0].bundle_companion_candidate["mal_anime_id"]},
+            {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates},
+        )
+
+    def test_build_mapping_review_surfaces_all_bundle_companions_for_three_entry_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["provider_series_id"] = "series-123b"
+            payload["series"][0]["title"] = "Example Split Show"
+            payload["series"][0]["season_title"] = "Example Split Show (English Dub)"
+            payload["series"][0]["season_number"] = 1
+            payload["watchlist"][0]["provider_series_id"] = "series-123b"
+            progress_template = dict(payload["progress"][0])
+            payload["progress"] = []
+            for episode_number in range(1, 37):
+                item = dict(progress_template)
+                item["provider_series_id"] = "series-123b"
+                item["provider_episode_id"] = f"ep-{episode_number}"
+                item["episode_number"] = episode_number
+                item["completion_ratio"] = 1.0
+                payload["progress"].append(item)
+            ingest_snapshot_payload(payload, config)
+            (root / "secrets").mkdir(exist_ok=True)
+            (root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 1001,
+                                "title": "Example Split Show",
+                                "alternative_titles": {"en": "Example Split Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 1002,
+                                "title": "Example Split Show Part 2",
+                                "alternative_titles": {"en": "Example Split Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 1003,
+                                "title": "Example Split Show Part 3",
+                                "alternative_titles": {"en": "Example Split Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=5)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].decision, "needs_review")
+        self.assertEqual({1002, 1003}, {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates})
+        self.assertIn(items[0].bundle_companion_candidate["mal_anime_id"], {1002, 1003})
 
     def test_build_dry_run_sync_plan_uses_user_approved_mapping_without_search(self) -> None:
         with tempfile.TemporaryDirectory() as td:

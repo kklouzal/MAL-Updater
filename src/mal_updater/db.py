@@ -280,6 +280,55 @@ def replace_review_queue_entries(
     return {"resolved": resolved, "inserted": inserted}
 
 
+
+def refresh_review_queue_entries(
+    db_path: Path,
+    *,
+    issue_type: str,
+    provider_series_ids: Iterable[str],
+    entries: list[dict[str, Any]],
+) -> dict[str, int]:
+    normalized_ids = sorted({value for value in provider_series_ids if isinstance(value, str) and value})
+    if not normalized_ids:
+        return {"resolved": 0, "inserted": 0}
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE review_queue SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP WHERE issue_type = ? AND status = 'open' AND provider_series_id IN ({placeholders})",
+            [issue_type, *normalized_ids],
+        )
+        resolved = int(cursor.rowcount or 0)
+        inserted = 0
+        for entry in entries:
+            provider_series_id = entry.get("provider_series_id")
+            if provider_series_id not in normalized_ids:
+                continue
+            conn.execute(
+                """
+                INSERT INTO review_queue (
+                    provider,
+                    provider_series_id,
+                    provider_episode_id,
+                    issue_type,
+                    severity,
+                    payload_json,
+                    status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'open')
+                """,
+                (
+                    entry["provider"],
+                    provider_series_id,
+                    entry.get("provider_episode_id"),
+                    issue_type,
+                    entry.get("severity", "warning"),
+                    json.dumps(entry["payload"], sort_keys=True),
+                ),
+            )
+            inserted += 1
+        conn.commit()
+    return {"resolved": resolved, "inserted": inserted}
+
+
 def upsert_mal_anime_metadata(
     db_path: Path,
     *,
@@ -550,6 +599,7 @@ def list_review_queue_entries(
     *,
     status: str = "open",
     issue_type: str | None = None,
+    provider_series_id: str | None = None,
 ) -> list[ReviewQueueEntry]:
     query = """
         SELECT
@@ -570,6 +620,14 @@ def list_review_queue_entries(
     if issue_type is not None:
         query += " AND issue_type = ?"
         params.append(issue_type)
+    normalized_provider_series_id = (
+        provider_series_id.strip()
+        if isinstance(provider_series_id, str) and provider_series_id.strip()
+        else None
+    )
+    if normalized_provider_series_id is not None:
+        query += " AND provider_series_id = ?"
+        params.append(normalized_provider_series_id)
     query += " ORDER BY created_at DESC, id DESC"
     with connect(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
@@ -588,3 +646,145 @@ def list_review_queue_entries(
         )
         for row in rows
     ]
+
+
+def update_review_queue_entry_statuses(
+    db_path: Path,
+    *,
+    entry_ids: Iterable[int],
+    status: str,
+) -> int:
+    normalized_ids = sorted({int(value) for value in entry_ids})
+    if not normalized_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    query = f"""
+        UPDATE review_queue
+        SET
+            status = ?,
+            resolved_at = CASE WHEN ? = 'resolved' THEN CURRENT_TIMESTAMP ELSE NULL END
+        WHERE id IN ({placeholders})
+    """
+    with connect(db_path) as conn:
+        cursor = conn.execute(query, [status, status, *normalized_ids])
+        conn.commit()
+        return int(cursor.rowcount or 0)
+
+
+
+def get_operational_snapshot(db_path: Path, *, provider: str = "crunchyroll") -> dict[str, Any]:
+    with connect(db_path) as conn:
+        latest_sync_run_row = conn.execute(
+            """
+            SELECT id, provider, contract_version, mode, started_at, completed_at, status, summary_json
+            FROM sync_runs
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        latest_completed_sync_run_row = conn.execute(
+            """
+            SELECT id, provider, contract_version, mode, started_at, completed_at, status, summary_json
+            FROM sync_runs
+            WHERE status = 'completed'
+            ORDER BY completed_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        provider_counts = {
+            "series": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM provider_series WHERE provider = ?",
+                    (provider,),
+                ).fetchone()[0]
+            ),
+            "progress": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM provider_episode_progress WHERE provider = ?",
+                    (provider,),
+                ).fetchone()[0]
+            ),
+            "watchlist": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM provider_watchlist WHERE provider = ?",
+                    (provider,),
+                ).fetchone()[0]
+            ),
+        }
+        provider_freshness = {
+            "series_last_seen_at": conn.execute(
+                "SELECT MAX(last_seen_at) FROM provider_series WHERE provider = ?",
+                (provider,),
+            ).fetchone()[0],
+            "progress_last_seen_at": conn.execute(
+                "SELECT MAX(last_seen_at) FROM provider_episode_progress WHERE provider = ?",
+                (provider,),
+            ).fetchone()[0],
+            "watchlist_last_seen_at": conn.execute(
+                "SELECT MAX(last_seen_at) FROM provider_watchlist WHERE provider = ?",
+                (provider,),
+            ).fetchone()[0],
+        }
+        review_rows = conn.execute(
+            """
+            SELECT status, issue_type, COUNT(*) AS count
+            FROM review_queue
+            GROUP BY status, issue_type
+            ORDER BY status ASC, issue_type ASC
+            """
+        ).fetchall()
+        mapping_rows = conn.execute(
+            """
+            SELECT approved_by_user, mapping_source, COUNT(*) AS count
+            FROM mal_series_mapping
+            WHERE provider = ?
+            GROUP BY approved_by_user, mapping_source
+            ORDER BY approved_by_user DESC, mapping_source ASC
+            """,
+            (provider,),
+        ).fetchall()
+
+    def _sync_run_row_to_dict(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        summary_json = row["summary_json"]
+        return {
+            "id": int(row["id"]),
+            "provider": row["provider"],
+            "contract_version": row["contract_version"],
+            "mode": row["mode"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+            "status": row["status"],
+            "summary": json.loads(summary_json) if summary_json else None,
+        }
+
+    review_counts: dict[str, dict[str, int]] = {}
+    for row in review_rows:
+        status_key = str(row["status"])
+        issue_type_key = str(row["issue_type"])
+        review_counts.setdefault(status_key, {})[issue_type_key] = int(row["count"])
+
+    mapping_counts = {
+        "total": 0,
+        "approved": 0,
+        "by_source": {},
+    }
+    for row in mapping_rows:
+        count = int(row["count"])
+        mapping_source = str(row["mapping_source"])
+        approved_by_user = bool(row["approved_by_user"])
+        mapping_counts["total"] += count
+        if approved_by_user:
+            mapping_counts["approved"] += count
+        mapping_counts["by_source"][mapping_source] = count
+
+    return {
+        "provider": provider,
+        "latest_sync_run": _sync_run_row_to_dict(latest_sync_run_row),
+        "latest_completed_sync_run": _sync_run_row_to_dict(latest_completed_sync_run_row),
+        "provider_counts": provider_counts,
+        "provider_freshness": provider_freshness,
+        "review_queue": review_counts,
+        "mappings": mapping_counts,
+    }

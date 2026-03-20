@@ -10,6 +10,7 @@ from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
 
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
+MAPPING_REVIEW_HEURISTICS_REVISION = "2026-03-20a"
 
 
 def _is_approved_mapping_eligible(persisted: PersistedSeriesMapping | None, *, exact_approved_only: bool = False) -> bool:
@@ -92,8 +93,11 @@ class MappingReviewItem:
     mapping_status: str
     confidence: float
     decision: str
+    mapper_revision: str = MAPPING_REVIEW_HEURISTICS_REVISION
     reasons: list[str] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    bundle_companion_candidate: dict[str, Any] | None = None
+    bundle_companion_candidates: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,8 +123,11 @@ class MappingReviewItem:
             "mapping_status": self.mapping_status,
             "confidence": self.confidence,
             "decision": self.decision,
+            "mapper_revision": self.mapper_revision,
             "reasons": self.reasons,
             "candidates": self.candidates,
+            "bundle_companion_candidate": self.bundle_companion_candidate,
+            "bundle_companion_candidates": self.bundle_companion_candidates,
         }
 
 
@@ -150,9 +157,15 @@ class ApplyResult:
         }
 
 
-def load_provider_series_states(config: AppConfig, limit: int | None = None, provider: str = "crunchyroll") -> list[ProviderSeriesState]:
+def load_provider_series_states(
+    config: AppConfig,
+    limit: int | None = None,
+    provider: str = "crunchyroll",
+    provider_series_ids: list[str] | None = None,
+) -> list[ProviderSeriesState]:
     if limit is not None and limit <= 0:
         limit = None
+    normalized_provider_series_ids = sorted({value for value in (provider_series_ids or []) if isinstance(value, str) and value.strip()})
     series_query = """
         SELECT
             s.provider,
@@ -166,7 +179,6 @@ def load_provider_series_states(config: AppConfig, limit: int | None = None, pro
         LEFT JOIN provider_watchlist w
             ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
         WHERE s.provider = ?
-        ORDER BY s.title ASC
     """
     progress_query = """
         SELECT
@@ -179,11 +191,20 @@ def load_provider_series_states(config: AppConfig, limit: int | None = None, pro
             last_watched_at
         FROM provider_episode_progress
         WHERE provider = ?
-        ORDER BY provider_series_id ASC, episode_number ASC, last_watched_at ASC, provider_episode_id ASC
     """
+    series_params: list[object] = [provider]
+    progress_params: list[object] = [provider]
+    if normalized_provider_series_ids:
+        placeholders = ", ".join("?" for _ in normalized_provider_series_ids)
+        series_query += f" AND s.provider_series_id IN ({placeholders})"
+        progress_query += f" AND provider_series_id IN ({placeholders})"
+        series_params.extend(normalized_provider_series_ids)
+        progress_params.extend(normalized_provider_series_ids)
+    series_query += " ORDER BY s.title ASC"
+    progress_query += " ORDER BY provider_series_id ASC, episode_number ASC, last_watched_at ASC, provider_episode_id ASC"
     with connect(config.db_path) as conn:
-        series_rows = conn.execute(series_query, [provider]).fetchall()
-        progress_rows = conn.execute(progress_query, [provider]).fetchall()
+        series_rows = conn.execute(series_query, series_params).fetchall()
+        progress_rows = conn.execute(progress_query, progress_params).fetchall()
 
     progress_by_series: dict[str, list[EpisodeProgressState]] = {}
     for row in progress_rows:
@@ -354,8 +375,13 @@ def _build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInpu
     )
 
 
-def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limit: int = 5) -> list[MappingReviewItem]:
-    states = load_provider_series_states(config, limit=limit)
+def build_mapping_review(
+    config: AppConfig,
+    limit: int | None = 20,
+    mapping_limit: int = 5,
+    provider_series_ids: list[str] | None = None,
+) -> list[MappingReviewItem]:
+    states = load_provider_series_states(config, limit=limit, provider_series_ids=provider_series_ids)
     client = MalClient(config, load_mal_secrets(config))
     items: list[MappingReviewItem] = []
     for state in states:
@@ -422,6 +448,29 @@ def build_mapping_review(config: AppConfig, limit: int | None = 20, mapping_limi
                         "media_type": candidate.media_type,
                     }
                     for candidate in mapping.candidates
+                ],
+                bundle_companion_candidate=None
+                if not mapping.bundle_companion_candidate
+                else {
+                    "mal_anime_id": mapping.bundle_companion_candidate.mal_anime_id,
+                    "title": mapping.bundle_companion_candidate.title,
+                    "score": mapping.bundle_companion_candidate.score,
+                    "matched_query": mapping.bundle_companion_candidate.matched_query,
+                    "match_reasons": mapping.bundle_companion_candidate.match_reasons,
+                    "media_type": mapping.bundle_companion_candidate.media_type,
+                    "num_episodes": mapping.bundle_companion_candidate.num_episodes,
+                },
+                bundle_companion_candidates=[
+                    {
+                        "mal_anime_id": candidate.mal_anime_id,
+                        "title": candidate.title,
+                        "score": candidate.score,
+                        "matched_query": candidate.matched_query,
+                        "match_reasons": candidate.match_reasons,
+                        "media_type": candidate.media_type,
+                        "num_episodes": candidate.num_episodes,
+                    }
+                    for candidate in (mapping.bundle_companion_candidates or [])
                 ],
             )
         )
