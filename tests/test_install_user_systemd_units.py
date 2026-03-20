@@ -111,7 +111,6 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             rendered_unchanged = (
                 unit_path.read_text(encoding="utf-8")
                 .replace("__MAL_UPDATER_REPO_ROOT__", str(self.repo_root))
-                .replace("__MAL_UPDATER_WORKSPACE_ROOT__", str(self.repo_root.parent.parent))
                 .replace("__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_target))
             )
             (target_dir / unit_path.name).write_text(rendered_unchanged, encoding="utf-8")

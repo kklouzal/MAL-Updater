@@ -43,7 +43,6 @@ def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[s
     env = {
         **__import__("os").environ,
         "PYTHONPATH": str(config.project_root / "src"),
-        "MAL_UPDATER_WORKSPACE_DIR": str(config.workspace_root),
     }
     result = subprocess.run(args, cwd=config.project_root, text=True, capture_output=True, check=False, env=env)
     payload = {

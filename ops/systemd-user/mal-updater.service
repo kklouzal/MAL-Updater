@@ -6,7 +6,6 @@ After=default.target
 Type=simple
 WorkingDirectory=__MAL_UPDATER_REPO_ROOT__
 Environment=PYTHONPATH=__MAL_UPDATER_REPO_ROOT__/src
-Environment=MAL_UPDATER_WORKSPACE_DIR=__MAL_UPDATER_WORKSPACE_ROOT__
 EnvironmentFile=-__MAL_UPDATER_SERVICE_ENV_FILE__
 ExecStart=python3 -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ service-run
 Restart=always

@@ -71,10 +71,8 @@ source_path = Path(sys.argv[1])
 target_path = Path(sys.argv[2])
 repo_root = Path(sys.argv[3]).resolve()
 service_env_target = sys.argv[4]
-workspace_root = repo_root.parent.parent.resolve()
 text = source_path.read_text(encoding='utf-8')
 text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
-text = text.replace('__MAL_UPDATER_WORKSPACE_ROOT__', str(workspace_root))
 text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
 target_path.parent.mkdir(parents=True, exist_ok=True)
 target_path.write_text(text, encoding='utf-8')
@@ -145,10 +143,8 @@ import sys
 source_path = Path(sys.argv[1])
 repo_root = Path(sys.argv[2]).resolve()
 service_env_target = sys.argv[3]
-workspace_root = repo_root.parent.parent.resolve()
 text = source_path.read_text(encoding='utf-8')
 text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
-text = text.replace('__MAL_UPDATER_WORKSPACE_ROOT__', str(workspace_root))
 text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
 print(text, end='')
 PY

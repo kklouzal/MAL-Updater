@@ -30,7 +30,7 @@ scripts/install_user_systemd_units.sh
 
 Important:
 - the committed `.service` file is a template, not a host-bound final unit
-- the installer renders the current repo root, workspace root, and service env path into the installed copy
+- the installer renders the current repo root and service env path into the installed copy
 - this keeps the repo portable while still producing a valid host-specific user daemon
 
 Useful variants:
