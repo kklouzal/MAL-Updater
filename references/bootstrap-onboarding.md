@@ -80,6 +80,8 @@ This persists MAL access/refresh tokens under the runtime secrets dir.
 
 ### 5. Crunchyroll credentials
 
+Before staging secrets, verify the runtime secrets dir is outside version control and has appropriately restrictive local permissions for the user account.
+
 Stage the user’s Crunchyroll username/password in the runtime secrets dir, then run:
 
 ```bash
@@ -97,6 +99,8 @@ scripts/install_user_systemd_units.sh
 ```
 
 That installer renders a host-specific `mal-updater.service` unit from the repo template, preserving repo portability while still producing a valid installed daemon service.
+
+Before enabling unattended operation, manually review the rendered unit behavior, env-file location, and any host-specific implications so the daemon only runs with the scope you actually want.
 
 ### 7. Verify daemon health
 

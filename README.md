@@ -95,11 +95,20 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 
 - Do not commit real credentials.
 - Keep live secrets in `.MAL-Updater/secrets/`.
+- Restrict secrets-dir permissions appropriately for the local user before staging long-lived credentials or tokens there.
 - Keep generated runtime state out of the repo tree.
 - This is a **public GitHub repository**. Any code, references, examples, tests, commit metadata, or other tracked artifacts that could be uploaded must stay anonymized: no personal identities, personal email addresses, host-specific absolute paths, private workspace paths, real account identifiers, real API keys/tokens, or machine-local secrets.
 - Use obviously fake placeholders in tracked examples/tests, and treat history rewrites as acceptable when needed to remove accidentally committed identifying residue.
 - Prefer `dry-run-sync` before live `apply-sync --execute` unless a live apply is explicitly intended.
 - Treat Crunchyroll auth/fetch instability as real operational residue.
+- Manually review the rendered user-systemd daemon/unit behavior before enabling unattended operation on a host you care about.
+
+## License / attribution
+
+This project is released under the **MIT License**. You can use, modify, and redistribute it freely as long as the license/copyright notice is preserved.
+
+If you reuse or adapt MAL-Updater, attribution to the original project/repo is appreciated:
+- <https://github.com/kklouzal/MAL-Updater>
 
 ## Testing
 

@@ -25,6 +25,7 @@ Treat `{baseDir}` as the skill root. This repository is the skill package.
    - check whether the optional Crunchyroll transport extra is missing
    - confirm the external runtime layout under `.MAL-Updater/`
    - identify which user-provided secrets/app settings are still missing
+   - verify the secrets location is outside version control and suitable for restrictive local permissions
    - decide whether the repo-owned user-systemd daemon can be installed on this host
 5. If bootstrap is incomplete, guide the user through the missing steps instead of pretending install is finished.
 
@@ -91,5 +92,7 @@ Treat these as state-changing:
 - Keep sync behavior conservative; do not invent broader write scope than the CLI already supports.
 - Prefer `dry-run-sync` before `apply-sync --execute` unless the task explicitly asks for a live apply.
 - Treat Crunchyroll auth/fetch instability as real residue; document it plainly.
+- Treat staged provider credentials and long-lived tokens as sensitive local files; keep them out of version control and prefer restrictive local permissions.
 - When a host cannot satisfy the unattended daemon path, say so clearly instead of silently skipping service setup.
+- Recommend manual review before enabling unattended daemon operation on a host that matters.
 - Keep outputs short and actionable: counts, blockers, next command, and whether user input is needed.
