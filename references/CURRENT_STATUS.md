@@ -17,7 +17,7 @@
 - MAL OAuth and guarded MAL apply exist
 - mapping review / queue triage workflows exist
 - long-lived daemon runtime + service manager exist
-- service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging
+- service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging, plus a terse `--format summary` operator view for quick checks
 - request-event logging / budget awareness scaffolding exists
 - recommendation generation and metadata refresh exist
 - tests remain bundled in the repo for third-party auditing

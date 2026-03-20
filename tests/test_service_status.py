@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from mal_updater.cli import main as cli_main
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.service_manager import doctor_service
 
@@ -18,6 +20,22 @@ class ServiceStatusTests(unittest.TestCase):
         (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
+
+    def _run_service_status_raw(self, *args: str) -> tuple[int, str]:
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "service-status",
+            *args,
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            patch.dict("os.environ", {"HOME": str(self.project_root / "fake-home")}, clear=False),
+        ):
+            exit_code = cli_main()
+        return exit_code, stdout.getvalue()
 
     def test_doctor_service_includes_recent_task_state_and_log_tail(self) -> None:
         self.config.service_state_path.write_text(
@@ -125,3 +143,95 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual({}, payload["task_state"])
         self.assertIsNone(payload["last_loop_at"])
         self.assertNotIn("api_usage", payload)
+
+    def test_service_status_summary_format_emits_operator_lines(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "last_loop_at": "2026-03-20T21:55:00Z",
+                    "api_usage": {
+                        "mal": {
+                            "request_count": 4,
+                            "success_count": 3,
+                            "error_count": 1,
+                            "last_event_at": "2026-03-20T21:54:30Z",
+                        },
+                        "crunchyroll": {
+                            "request_count": 2,
+                            "success_count": 2,
+                            "error_count": 0,
+                        },
+                    },
+                    "tasks": {
+                        "sync": {
+                            "last_run_at": "2026-03-20T21:54:00Z",
+                            "last_status": "ok",
+                        },
+                        "health": {
+                            "last_skipped_at": "2026-03-20T21:53:00Z",
+                            "last_skip_reason": "budget_guard",
+                        },
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.config.service_log_path.write_text("line-1\nline-2", encoding="utf-8")
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "warnings": [{"code": "open_review_queue"}],
+                    "maintenance": {
+                        "recommended_command": {"command": "PYTHONPATH=src python3 -m mal_updater.cli review-queue-next"},
+                        "recommended_automation_command": {"command": "PYTHONPATH=src python3 -m mal_updater.cli review-queue-apply-worklist --limit 1"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_run(command: list[str], check: bool = True):
+            if command[-2:] == ["is-enabled", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="enabled\n", stderr="")
+            if command[-2:] == ["is-active", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with patch("mal_updater.service_manager._run", side_effect=fake_run):
+            exit_code, stdout = self._run_service_status_raw("--format", "summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("unit_exists=False", stdout)
+        self.assertIn("enabled=True", stdout)
+        self.assertIn("active=True", stdout)
+        self.assertIn("last_loop_at=2026-03-20T21:55:00Z", stdout)
+        self.assertIn("health_healthy=False", stdout)
+        self.assertIn("health_warning_count=1", stdout)
+        self.assertIn("health_warnings=open_review_queue", stdout)
+        self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli review-queue-next", stdout)
+        self.assertIn("maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli review-queue-apply-worklist --limit 1", stdout)
+        self.assertIn("api_mal_request_count=4", stdout)
+        self.assertIn("api_crunchyroll_success_count=2", stdout)
+        self.assertIn("task_sync_last_status=ok", stdout)
+        self.assertIn("task_health_last_skip_reason=budget_guard", stdout)
+        self.assertIn("service_log_last_line=line-2", stdout)
+
+    def test_service_status_summary_surfaces_parse_errors(self) -> None:
+        self.config.service_state_path.write_text("{not-json", encoding="utf-8")
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text("[]", encoding="utf-8")
+
+        def fake_run(command: list[str], check: bool = True):
+            return Mock(returncode=1, stdout="", stderr="not-found\n")
+
+        with patch("mal_updater.service_manager._run", side_effect=fake_run):
+            exit_code, stdout = self._run_service_status_raw("--format", "summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("enabled=False", stdout)
+        self.assertIn("active=False", stdout)
+        self.assertIn("service_state_parse_error=JSONDecodeError", stdout)
+        self.assertIn(f"health_latest_parse_error=Expected top-level object in {self.config.health_latest_json_path.name}", stdout)

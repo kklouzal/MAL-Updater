@@ -66,6 +66,7 @@ PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
 PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only

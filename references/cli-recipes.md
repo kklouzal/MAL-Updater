@@ -14,6 +14,7 @@ PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 PYTHONPATH=src python3 -m mal_updater.cli install-service
 PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 scripts/install_user_systemd_units.sh
 ```

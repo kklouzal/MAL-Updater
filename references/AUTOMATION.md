@@ -47,6 +47,7 @@ scripts/install_user_systemd_units.sh --start-service
 cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli install-service
 PYTHONPATH=src python3 -m mal_updater.cli service-status
+PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
@@ -58,6 +59,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 - current API-usage snapshot when available
 - recent `service.log` tail lines
 - parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
+- a terse `service-status --format summary` view for quick operator checks and log-friendly output
 
 ## Legacy wrappers still reused by the daemon
 

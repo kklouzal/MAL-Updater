@@ -120,10 +120,14 @@ def _cmd_status(project_root: Path | None) -> int:
     return 0
 
 
-def _cmd_service_status(project_root: Path | None) -> int:
+def _cmd_service_status(project_root: Path | None, output_format: str) -> int:
     config = load_config(project_root)
     ensure_directories(config)
-    print(json.dumps(doctor_service(config), indent=2))
+    payload = doctor_service(config)
+    if output_format == "summary":
+        _emit_service_status_summary(payload)
+    else:
+        print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -311,6 +315,102 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
+
+
+def _emit_service_status_summary(payload: dict[str, object]) -> None:
+    print(f"unit_exists={bool(payload.get('unit_exists'))}")
+    print(f"enabled={bool(payload.get('enabled'))}")
+    print(f"active={bool(payload.get('active'))}")
+    if payload.get("enabled_raw"):
+        print(f"enabled_raw={payload['enabled_raw']}")
+    if payload.get("active_raw"):
+        print(f"active_raw={payload['active_raw']}")
+    print(f"env_exists={bool(payload.get('env_exists'))}")
+    print(f"service_state_exists={bool(payload.get('service_state_exists'))}")
+    print(f"service_log_exists={bool(payload.get('service_log_exists'))}")
+    print(f"health_latest_exists={bool(payload.get('health_latest_exists'))}")
+
+    if isinstance(payload.get("last_loop_at"), str):
+        print(f"last_loop_at={payload['last_loop_at']}")
+        age_seconds = _age_seconds_from_timestamp(payload["last_loop_at"])
+        if age_seconds is not None:
+            print(f"last_loop_age_seconds={age_seconds:.1f}")
+
+    service_state_parse_error = payload.get("service_state_parse_error")
+    if isinstance(service_state_parse_error, str) and service_state_parse_error:
+        print(f"service_state_parse_error={service_state_parse_error}")
+    health_latest_parse_error = payload.get("health_latest_parse_error")
+    if isinstance(health_latest_parse_error, str) and health_latest_parse_error:
+        print(f"health_latest_parse_error={health_latest_parse_error}")
+
+    health_latest = payload.get("health_latest_summary")
+    if isinstance(health_latest, dict):
+        if isinstance(health_latest.get("healthy"), bool):
+            print(f"health_healthy={health_latest['healthy']}")
+        warnings = health_latest.get("warnings") if isinstance(health_latest.get("warnings"), list) else []
+        warning_count = health_latest.get("warning_count")
+        if not isinstance(warning_count, int):
+            warning_count = len(warnings)
+        print(f"health_warning_count={warning_count}")
+        warning_codes = [item.get("code") for item in warnings if isinstance(item, dict) and isinstance(item.get("code"), str)]
+        if warning_codes:
+            print("health_warnings=" + ", ".join(warning_codes))
+
+        maintenance = health_latest.get("maintenance")
+        if isinstance(maintenance, dict):
+            recommended_command = maintenance.get("recommended_command")
+            if isinstance(recommended_command, dict) and isinstance(recommended_command.get("command"), str):
+                print("maintenance_recommended_command=" + recommended_command["command"])
+            recommended_automation_command = maintenance.get("recommended_automation_command")
+            if isinstance(recommended_automation_command, dict) and isinstance(recommended_automation_command.get("command"), str):
+                print("maintenance_recommended_auto_command=" + recommended_automation_command["command"])
+
+    api_usage = payload.get("api_usage")
+    if isinstance(api_usage, dict):
+        for provider_name in ("mal", "crunchyroll"):
+            provider_usage = api_usage.get(provider_name)
+            if not isinstance(provider_usage, dict):
+                continue
+            request_count = provider_usage.get("request_count")
+            if isinstance(request_count, int):
+                print(f"api_{provider_name}_request_count={request_count}")
+            success_count = provider_usage.get("success_count")
+            if isinstance(success_count, int):
+                print(f"api_{provider_name}_success_count={success_count}")
+            error_count = provider_usage.get("error_count")
+            if isinstance(error_count, int):
+                print(f"api_{provider_name}_error_count={error_count}")
+            last_event_at = provider_usage.get("last_event_at")
+            if isinstance(last_event_at, str) and last_event_at:
+                print(f"api_{provider_name}_last_event_at={last_event_at}")
+
+    task_state = payload.get("task_state")
+    if isinstance(task_state, dict):
+        for task_name in sorted(task_state):
+            task_payload = task_state.get(task_name)
+            if not isinstance(task_payload, dict):
+                continue
+            status = task_payload.get("last_status") if isinstance(task_payload.get("last_status"), str) else None
+            if status is not None:
+                print(f"task_{task_name}_last_status={status}")
+            last_run_at = task_payload.get("last_run_at") if isinstance(task_payload.get("last_run_at"), str) else None
+            if last_run_at is not None:
+                print(f"task_{task_name}_last_run_at={last_run_at}")
+            last_skipped_at = task_payload.get("last_skipped_at") if isinstance(task_payload.get("last_skipped_at"), str) else None
+            if last_skipped_at is not None:
+                print(f"task_{task_name}_last_skipped_at={last_skipped_at}")
+            last_skip_reason = task_payload.get("last_skip_reason") if isinstance(task_payload.get("last_skip_reason"), str) else None
+            if last_skip_reason is not None:
+                print(f"task_{task_name}_last_skip_reason={last_skip_reason}")
+            last_error = task_payload.get("last_error") if isinstance(task_payload.get("last_error"), str) else None
+            if last_error is not None:
+                print(f"task_{task_name}_last_error={last_error}")
+
+    service_log_tail = payload.get("service_log_tail")
+    if isinstance(service_log_tail, list) and service_log_tail:
+        last_log_line = service_log_tail[-1]
+        if isinstance(last_log_line, str) and last_log_line:
+            print(f"service_log_last_line={last_log_line}")
 
 
 def _parse_sqlite_timestamp(value: object) -> datetime | None:
@@ -3527,7 +3627,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("start-service", help="Start the MAL-Updater user service")
     subparsers.add_parser("stop-service", help="Stop the MAL-Updater user service")
     subparsers.add_parser("restart-service", help="Restart the MAL-Updater user service")
-    subparsers.add_parser("service-status", help="Print MAL-Updater user service health/runtime status")
+    service_status = subparsers.add_parser("service-status", help="Print MAL-Updater user service health/runtime status")
+    service_status.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
     subparsers.add_parser("service-run", help="Run the MAL-Updater daemon loop in the foreground")
     subparsers.add_parser("service-run-once", help="Run one MAL-Updater daemon loop pass and exit")
     bootstrap_audit = subparsers.add_parser(
@@ -3796,7 +3897,7 @@ def main() -> int:
     if args.command == "restart-service":
         return _cmd_restart_service()
     if args.command == "service-status":
-        return _cmd_service_status(args.project_root)
+        return _cmd_service_status(args.project_root, args.format)
     if args.command == "service-run":
         return _cmd_service_run(args.project_root)
     if args.command == "service-run-once":

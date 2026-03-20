@@ -17,7 +17,7 @@
 - [ ] Improve request-budget accounting / backoff behavior for MAL and Crunchyroll
 - [ ] Decide whether to retire the remaining transitional wrapper scripts after more daemon logic moves in-process
 - [x] Add richer service-state/observability surfaces for debugging unattended failures
-- [ ] Decide whether `service-status` should grow a terse/operator-summary mode in addition to the current rich JSON surface
+- [x] Add `service-status --format summary` as a terse/operator-summary mode alongside the rich JSON surface
 
 ## Product / sync quality
 
