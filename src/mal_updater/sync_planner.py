@@ -50,7 +50,7 @@ class EpisodeProgressState:
 @dataclass(slots=True)
 class SyncProposal:
     provider_series_id: str
-    crunchyroll_title: str
+    provider_title: str
     mapping_status: str
     confidence: float
     mal_anime_id: int | None
@@ -66,7 +66,8 @@ class SyncProposal:
     def as_dict(self) -> dict[str, Any]:
         return {
             "provider_series_id": self.provider_series_id,
-            "crunchyroll_title": self.crunchyroll_title,
+            "provider_title": self.provider_title,
+            "crunchyroll_title": self.provider_title,
             "mapping_status": self.mapping_status,
             "confidence": self.confidence,
             "mal_anime_id": self.mal_anime_id,
@@ -500,8 +501,9 @@ def build_dry_run_sync_plan(
     mapping_limit: int = 5,
     approved_mappings_only: bool = False,
     exact_approved_only: bool = False,
+    provider: str = "crunchyroll",
 ) -> list[SyncProposal]:
-    states = load_provider_series_states(config, limit=limit)
+    states = load_provider_series_states(config, limit=limit, provider=provider)
     client = MalClient(config, load_mal_secrets(config))
     proposals: list[SyncProposal] = []
     for state in states:
@@ -517,7 +519,7 @@ def build_dry_run_sync_plan(
             proposals.append(
                 SyncProposal(
                     provider_series_id=state.provider_series_id,
-                    crunchyroll_title=state.title,
+                    provider_title=state.title,
                     mapping_status="unapproved",
                     confidence=0.0,
                     mal_anime_id=persisted.mal_anime_id if persisted else None,
@@ -544,7 +546,7 @@ def build_dry_run_sync_plan(
             proposals.append(
                 SyncProposal(
                     provider_series_id=state.provider_series_id,
-                    crunchyroll_title=state.title,
+                    provider_title=state.title,
                     mapping_status=mapping_status,
                     confidence=confidence,
                     mal_anime_id=persisted.mal_anime_id if persisted else None,
@@ -568,7 +570,7 @@ def build_dry_run_sync_plan(
             proposals.append(
                 SyncProposal(
                     provider_series_id=state.provider_series_id,
-                    crunchyroll_title=state.title,
+                    provider_title=state.title,
                     mapping_status=mapping_status,
                     confidence=confidence,
                     mal_anime_id=chosen_anime_id,
@@ -795,7 +797,7 @@ def _plan_status_update(
     mal_anime_id = int(detail["id"])
     current_status = detail.get("my_list_status") or None
     num_episodes = detail.get("num_episodes")
-    crunchyroll_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
+    provider_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
     reasons: list[str] = [
         "merge_policy=missing_data_only",
         "completion_policy=ratio>=0.95_or_remaining<=120s_or_later_episode_progress_with_ratio>=0.85",
@@ -817,17 +819,17 @@ def _plan_status_update(
         reasons = list(extra_reasons) + reasons
 
     proposed_status: dict[str, Any] | None = None
-    if crunchyroll_watched_episodes > 0:
+    if provider_watched_episodes > 0:
         proposed_status = {
             "status": "watching",
-            "num_watched_episodes": crunchyroll_watched_episodes,
+            "num_watched_episodes": provider_watched_episodes,
         }
-        reasons.append("crunchyroll_completed_episode_evidence_present")
-        if num_episodes and crunchyroll_watched_episodes >= int(num_episodes):
+        reasons.append("provider_completed_episode_evidence_present")
+        if num_episodes and provider_watched_episodes >= int(num_episodes):
             proposed_status["status"] = "completed"
-            reasons.append("crunchyroll_completion_reached_known_episode_count")
+            reasons.append("provider_completion_reached_known_episode_count")
     elif state.progress_rows > 0:
-        reasons.append("partial_crunchyroll_activity_without_completed_episode")
+        reasons.append("partial_provider_activity_without_completed_episode")
     elif state.watchlist_status:
         proposed_status = {"status": "plan_to_watch", "num_watched_episodes": 0}
         reasons.append("watchlist_only")
@@ -835,7 +837,7 @@ def _plan_status_update(
     if proposed_status is None:
         return SyncProposal(
             provider_series_id=state.provider_series_id,
-            crunchyroll_title=state.title,
+            provider_title=state.title,
             mapping_status=mapping_status,
             confidence=confidence,
             mal_anime_id=mal_anime_id,
@@ -846,7 +848,7 @@ def _plan_status_update(
             mapping_source=mapping_source,
             persisted_mapping_approved=persisted_mapping_approved,
             completion_audit=state.completion_audit,
-            reasons=reasons + ["no_actionable_crunchyroll_state"],
+            reasons=reasons + ["no_actionable_provider_state"],
         )
 
     current_watched = int((current_status or {}).get("num_episodes_watched") or 0)
@@ -854,12 +856,12 @@ def _plan_status_update(
     proposed_watched = int(proposed_status.get("num_watched_episodes") or 0)
 
     if current_list_status == "plan_to_watch" and proposed_watched > 0:
-        reasons.append("override_plan_to_watch_due_to_crunchyroll_watch_evidence")
+        reasons.append("override_plan_to_watch_due_to_provider_watch_evidence")
 
     if current_watched > proposed_watched:
         return SyncProposal(
             provider_series_id=state.provider_series_id,
-            crunchyroll_title=state.title,
+            provider_title=state.title,
             mapping_status=mapping_status,
             confidence=confidence,
             mal_anime_id=mal_anime_id,
@@ -878,7 +880,7 @@ def _plan_status_update(
         if not field_merge:
             return SyncProposal(
                 provider_series_id=state.provider_series_id,
-                crunchyroll_title=state.title,
+                provider_title=state.title,
                 mapping_status=mapping_status,
                 confidence=confidence,
                 mal_anime_id=mal_anime_id,
@@ -905,7 +907,7 @@ def _plan_status_update(
     if current_list_status == "completed" and proposed_status["status"] != "completed":
         return SyncProposal(
             provider_series_id=state.provider_series_id,
-            crunchyroll_title=state.title,
+            provider_title=state.title,
             mapping_status=mapping_status,
             confidence=confidence,
             mal_anime_id=mal_anime_id,
@@ -926,7 +928,7 @@ def _plan_status_update(
 
     return SyncProposal(
         provider_series_id=state.provider_series_id,
-        crunchyroll_title=state.title,
+        provider_title=state.title,
         mapping_status=mapping_status,
         confidence=confidence,
         mal_anime_id=mal_anime_id,
@@ -955,7 +957,7 @@ def _build_missing_field_merge(
     if _is_missing_mal_progress(current):
         merged["num_watched_episodes"] = derived_watched
     if _is_missing_mal_score(current.get("score")):
-        # Crunchyroll snapshot does not provide a trustworthy rating yet.
+        # Provider snapshots do not currently provide a trustworthy rating for sync planning.
         pass
     if derived_status == "completed" and _is_missing_mal_date(current.get("finish_date")) and state.last_watched_at:
         merged["finish_date"] = _iso_datetime_to_date(state.last_watched_at)

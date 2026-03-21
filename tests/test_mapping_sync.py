@@ -4171,7 +4171,7 @@ class DryRunPlannerTests(unittest.TestCase):
 
         self.assertEqual(proposals[0].decision, "propose_update")
         self.assertEqual(proposals[0].proposed_my_list_status, {"status": "watching", "num_watched_episodes": 2})
-        self.assertIn("override_plan_to_watch_due_to_crunchyroll_watch_evidence", proposals[0].reasons)
+        self.assertIn("override_plan_to_watch_due_to_provider_watch_evidence", proposals[0].reasons)
 
     def test_build_dry_run_sync_plan_suppresses_watching_zero_episode_proposals(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -4217,8 +4217,8 @@ class DryRunPlannerTests(unittest.TestCase):
 
         self.assertEqual(proposals[0].decision, "skip")
         self.assertIsNone(proposals[0].proposed_my_list_status)
-        self.assertIn("partial_crunchyroll_activity_without_completed_episode", proposals[0].reasons)
-        self.assertIn("no_actionable_crunchyroll_state", proposals[0].reasons)
+        self.assertIn("partial_provider_activity_without_completed_episode", proposals[0].reasons)
+        self.assertIn("no_actionable_provider_state", proposals[0].reasons)
 
     def test_build_dry_run_sync_plan_counts_follow_on_near_complete_episode_as_watched(self) -> None:
         with tempfile.TemporaryDirectory() as td:

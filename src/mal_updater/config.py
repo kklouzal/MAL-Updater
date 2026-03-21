@@ -73,8 +73,17 @@ class ServiceSettings:
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
+    provider_hourly_limits: dict[str, int] = field(default_factory=dict)
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
     critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
+
+    def hourly_limit_for(self, provider: str) -> int:
+        if provider == "mal":
+            return self.mal_hourly_limit
+        if provider == "crunchyroll":
+            return self.crunchyroll_hourly_limit
+        value = self.provider_hourly_limits.get(provider)
+        return int(value) if isinstance(value, int) else self.crunchyroll_hourly_limit
 
 
 @dataclass(slots=True)
@@ -283,6 +292,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     mal_section = _get_table(settings, "mal")
     crunchyroll_section = _get_table(settings, "crunchyroll")
     service_section = _get_table(settings, "service")
+    service_provider_limits_section = _get_table(service_section, "provider_hourly_limits")
     secret_files_section = _get_table(settings, "secret_files")
     settings_dir = settings_path.parent
 
@@ -397,6 +407,11 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
             crunchyroll_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_CRUNCHYROLL_HOURLY_LIMIT", _get_int(service_section, "crunchyroll_hourly_limit", DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT))),
             mal_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_MAL_HOURLY_LIMIT", _get_int(service_section, "mal_hourly_limit", DEFAULT_SERVICE_MAL_HOURLY_LIMIT))),
+            provider_hourly_limits={
+                str(key): int(value)
+                for key, value in service_provider_limits_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
             warn_ratio=float(os.getenv("MAL_UPDATER_SERVICE_WARN_RATIO", _get_float(service_section, "warn_ratio", DEFAULT_SERVICE_WARN_RATIO))),
             critical_ratio=float(os.getenv("MAL_UPDATER_SERVICE_CRITICAL_RATIO", _get_float(service_section, "critical_ratio", DEFAULT_SERVICE_CRITICAL_RATIO))),
         ),

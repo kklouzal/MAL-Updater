@@ -43,6 +43,9 @@ def sample_snapshot() -> dict:
                 "provider_series_id": "series-123",
                 "added_at": "2026-03-10T12:00:00Z",
                 "status": "watching",
+                "list_id": "favorites",
+                "list_name": "Favorites",
+                "list_kind": "system",
             }
         ],
         "raw": {},
@@ -57,6 +60,8 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(snapshot.series[0].provider_series_id, "series-123")
         self.assertEqual(snapshot.progress[0].completion_ratio, 0.95)
         self.assertEqual(snapshot.watchlist[0].status, "watching")
+        self.assertEqual(snapshot.watchlist[0].list_id, "favorites")
+        self.assertEqual(snapshot.watchlist[0].list_kind, "system")
 
     def test_validate_snapshot_payload_rejects_invalid_ratio(self) -> None:
         payload = sample_snapshot()

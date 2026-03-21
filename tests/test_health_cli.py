@@ -388,6 +388,34 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertIsNone(payload["maintenance"]["recommended_automation_command"])
 
+    def test_health_check_recommends_hidive_snapshot_refresh_when_hidive_is_stale_provider(self) -> None:
+        (self.config.secrets_dir / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "hidive_password.txt").write_text("super-secret\n", encoding="utf-8")
+        hidive_state_root = self.config.state_dir / "hidive" / "default"
+        hidive_state_root.mkdir(parents=True, exist_ok=True)
+        (hidive_state_root / "authorisation_token.txt").write_text("hidive-token\n", encoding="utf-8")
+        (hidive_state_root / "refresh_token.txt").write_text("hidive-refresh\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, datetime('now', '-10 days'), datetime('now', '-10 days'), ?)",
+                ("hidive", "1.0", "ingest_snapshot", "completed", json.dumps({"series_count": 5}, sort_keys=True)),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_health_check("--stale-hours", "24")
+
+        self.assertEqual(0, exit_code)
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual(1, len(maintenance_commands))
+        self.assertEqual("refresh_ingested_snapshot", maintenance_commands[0]["reason_code"])
+        self.assertEqual(
+            ["provider-fetch-snapshot", "--provider", "hidive", "--out", ".MAL-Updater/cache/live-hidive-snapshot.json", "--ingest"],
+            maintenance_commands[0]["command_args"],
+        )
+        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
+        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
+
     def test_health_check_warns_when_approved_mapping_coverage_is_below_threshold(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")

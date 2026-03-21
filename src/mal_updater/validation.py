@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
+from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 
 
 class SnapshotValidationError(ValueError):
@@ -132,30 +132,40 @@ def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
     field = f"watchlist[{index}]"
     _expect_type(item, dict, field)
     required = {"provider_series_id", "added_at", "status"}
+    allowed = required | {"list_id", "list_name", "list_kind"}
     missing = sorted(required - set(item))
     if missing:
         raise SnapshotValidationError(f"{field} is missing keys: {', '.join(missing)}")
-    extras = sorted(set(item) - required)
+    extras = sorted(set(item) - allowed)
     if extras:
         raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
 
     provider_series_id = item["provider_series_id"]
     added_at = item["added_at"]
     status = item["status"]
+    list_id = item.get("list_id")
+    list_name = item.get("list_name")
+    list_kind = item.get("list_kind")
     _expect_type(provider_series_id, str, f"{field}.provider_series_id")
     _expect_optional_type(added_at, str, f"{field}.added_at")
     if added_at is not None and not _is_iso_datetime(added_at):
         raise SnapshotValidationError(f"{field}.added_at must be an ISO-8601 datetime string")
     _expect_optional_type(status, str, f"{field}.status")
+    _expect_optional_type(list_id, str, f"{field}.list_id")
+    _expect_optional_type(list_name, str, f"{field}.list_name")
+    _expect_optional_type(list_kind, str, f"{field}.list_kind")
 
     return WatchlistEntry(
         provider_series_id=provider_series_id,
         added_at=added_at,
         status=status,
+        list_id=list_id,
+        list_name=list_name,
+        list_kind=list_kind,
     )
 
 
-def validate_snapshot_payload(payload: Any) -> CrunchyrollSnapshot:
+def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
     _expect_type(payload, dict, "snapshot")
 
     required = {
@@ -192,8 +202,8 @@ def validate_snapshot_payload(payload: Any) -> CrunchyrollSnapshot:
     if not _is_iso_datetime(generated_at):
         raise SnapshotValidationError("snapshot.generated_at must be an ISO-8601 datetime string")
     _expect_type(provider, str, "snapshot.provider")
-    if provider != "crunchyroll":
-        raise SnapshotValidationError("snapshot.provider must be 'crunchyroll'")
+    if not provider.strip():
+        raise SnapshotValidationError("snapshot.provider must be a non-empty string")
     _expect_optional_type(account_id_hint, str, "snapshot.account_id_hint")
     _expect_type(series, list, "snapshot.series")
     _expect_type(progress, list, "snapshot.progress")
@@ -236,7 +246,7 @@ def validate_snapshot_payload(payload: Any) -> CrunchyrollSnapshot:
                 f"watchlist[{index}].provider_series_id references unknown series id: {item.provider_series_id}"
             )
 
-    return CrunchyrollSnapshot(
+    return ProviderSnapshot(
         contract_version=contract_version,
         generated_at=generated_at,
         provider=provider,
@@ -248,7 +258,7 @@ def validate_snapshot_payload(payload: Any) -> CrunchyrollSnapshot:
     )
 
 
-def validate_snapshot_json_text(text: str) -> CrunchyrollSnapshot:
+def validate_snapshot_json_text(text: str) -> ProviderSnapshot:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -256,5 +266,5 @@ def validate_snapshot_json_text(text: str) -> CrunchyrollSnapshot:
     return validate_snapshot_payload(payload)
 
 
-def validate_snapshot_file(path: Path) -> CrunchyrollSnapshot:
+def validate_snapshot_file(path: Path) -> ProviderSnapshot:
     return validate_snapshot_json_text(path.read_text(encoding="utf-8"))

@@ -22,12 +22,10 @@ from .crunchyroll_auth import (
     load_crunchyroll_credentials,
     resolve_crunchyroll_state_paths,
 )
-from .crunchyroll_snapshot import (
-    CrunchyrollSnapshotError,
-    fetch_snapshot,
-    snapshot_to_dict,
-    write_snapshot_file,
-)
+from .crunchyroll_snapshot import CrunchyrollSnapshotError, snapshot_to_dict
+from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
+from .provider_registry import get_provider, list_provider_slugs
+from . import providers as _providers  # noqa: F401
 from .db import (
     bootstrap_database,
     get_operational_snapshot,
@@ -73,6 +71,8 @@ def _cmd_status(project_root: Path | None) -> int:
     secrets = load_mal_secrets(config)
     crunchyroll_credentials = load_crunchyroll_credentials(config)
     crunchyroll_state = resolve_crunchyroll_state_paths(config)
+    hidive_credentials = load_hidive_credentials(config)
+    hidive_state = resolve_hidive_state_paths(config)
     print(f"project_root={config.project_root}")
     print(f"workspace_root={config.workspace_root}")
     print(f"runtime_root={config.runtime_root}")
@@ -109,6 +109,16 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"crunchyroll.refresh_token_present={crunchyroll_state.refresh_token_path.exists()}")
     print(f"crunchyroll.device_id_present={crunchyroll_state.device_id_path.exists()}")
     print(f"crunchyroll.sync_boundary_present={crunchyroll_state.sync_boundary_path.exists()}")
+    print(f"hidive.username_present={bool(hidive_credentials.username)}")
+    print(f"hidive.password_present={bool(hidive_credentials.password)}")
+    print(f"hidive.username_path={hidive_credentials.username_path}")
+    print(f"hidive.password_path={hidive_credentials.password_path}")
+    print(f"hidive.state_root={hidive_state.root}")
+    print(f"hidive.authorisation_token_path={hidive_state.access_token_path}")
+    print(f"hidive.refresh_token_path={hidive_state.refresh_token_path}")
+    print(f"hidive.session_state_path={hidive_state.session_state_path}")
+    print(f"hidive.authorisation_token_present={hidive_state.access_token_path.exists()}")
+    print(f"hidive.refresh_token_present={hidive_state.refresh_token_path.exists()}")
     print(f"mal.client_id_present={bool(secrets.client_id)}")
     print(f"mal.client_secret_present={bool(secrets.client_secret)}")
     print(f"mal.access_token_present={bool(secrets.access_token)}")
@@ -181,6 +191,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     secrets = load_mal_secrets(config)
     crunchyroll_credentials = load_crunchyroll_credentials(config)
     crunchyroll_state = resolve_crunchyroll_state_paths(config)
+    hidive_credentials = load_hidive_credentials(config)
+    hidive_state = resolve_hidive_state_paths(config)
 
     dependency_checks = {
         "python3": shutil.which("python3") is not None,
@@ -246,6 +258,24 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 "details": "Run `mal-updater crunchyroll-auth-login` to mint and stage the long-lived Crunchyroll refresh token/device id pair.",
             }
         )
+    if not hidive_credentials.username or not hidive_credentials.password:
+        onboarding_steps.append(
+            {
+                "step": "stage-hidive-credentials",
+                "status": "missing",
+                "user_action_required": True,
+                "details": f"Store HIDIVE credentials at {hidive_credentials.username_path} and {hidive_credentials.password_path}.",
+            }
+        )
+    if not hidive_state.access_token_path.exists() or not hidive_state.refresh_token_path.exists():
+        onboarding_steps.append(
+            {
+                "step": "bootstrap-hidive-session",
+                "status": "missing",
+                "user_action_required": False,
+                "details": "Run `mal-updater provider-auth-login --provider hidive` to mint and stage HIDIVE authorisation/refresh tokens.",
+            }
+        )
     if not dependency_checks["systemctl"]:
         onboarding_steps.append(
             {
@@ -285,6 +315,10 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "crunchyroll_password_present": bool(crunchyroll_credentials.password),
             "crunchyroll_refresh_token_present": crunchyroll_state.refresh_token_path.exists(),
             "crunchyroll_device_id_present": crunchyroll_state.device_id_path.exists(),
+            "hidive_username_present": bool(hidive_credentials.username),
+            "hidive_password_present": bool(hidive_credentials.password),
+            "hidive_authorisation_token_present": hidive_state.access_token_path.exists(),
+            "hidive_refresh_token_present": hidive_state.refresh_token_path.exists(),
         },
         "services": {
             "installer_script": str(config.project_root / "scripts" / "install_user_systemd_units.sh"),
@@ -367,7 +401,7 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
 
     api_usage = payload.get("api_usage")
     if isinstance(api_usage, dict):
-        for provider_name in ("mal", "crunchyroll"):
+        for provider_name in sorted(api_usage):
             provider_usage = api_usage.get(provider_name)
             if not isinstance(provider_usage, dict):
                 continue
@@ -689,13 +723,16 @@ def _build_health_maintenance_commands(
     *,
     crunchyroll_credentials_present: bool,
     crunchyroll_state_present: bool,
+    hidive_credentials_present: bool,
+    hidive_state_present: bool,
     mal_client_id_present: bool,
     mal_auth_present: bool,
     latest_sync_run: dict[str, object] | None,
     latest_completed_sync_run: dict[str, object] | None,
     latest_completed_age_seconds: float | None,
     stale_hours: float,
-    snapshot_output_path: Path,
+    crunchyroll_snapshot_output_path: Path,
+    hidive_snapshot_output_path: Path,
     partial_sync_coverage: dict[str, object] | None = None,
     mapping_coverage: dict[str, object] | None = None,
     mapping_coverage_threshold: float | None = None,
@@ -739,6 +776,14 @@ def _build_health_maintenance_commands(
             automation_safe=False,
             requires_auth_interaction=False,
         )
+    if hidive_credentials_present and not hidive_state_present:
+        add_command(
+            "missing_hidive_state",
+            "Re-bootstrap HIDIVE auth state from the staged local credentials",
+            ["provider-auth-login", "--provider", "hidive"],
+            automation_safe=False,
+            requires_auth_interaction=False,
+        )
 
     if mal_client_id_present and not mal_auth_present:
         add_command(
@@ -755,19 +800,42 @@ def _build_health_maintenance_commands(
     if isinstance(latest_sync_run, dict) and latest_sync_run.get("status") == "failed":
         snapshot_needs_refresh = True
 
-    if crunchyroll_credentials_present and crunchyroll_state_present and isinstance(partial_sync_coverage, dict):
+    refresh_provider = "crunchyroll"
+    if isinstance(latest_completed_sync_run, dict) and isinstance(latest_completed_sync_run.get("provider"), str):
+        refresh_provider = str(latest_completed_sync_run.get("provider"))
+    elif hidive_credentials_present and hidive_state_present and not crunchyroll_credentials_present:
+        refresh_provider = "hidive"
+
+    provider_ready = {
+        "crunchyroll": crunchyroll_credentials_present and crunchyroll_state_present,
+        "hidive": hidive_credentials_present and hidive_state_present,
+    }
+    provider_snapshot_output = {
+        "crunchyroll": crunchyroll_snapshot_output_path,
+        "hidive": hidive_snapshot_output_path,
+    }
+    provider_refresh_args = {
+        "crunchyroll": ["crunchyroll-fetch-snapshot"],
+        "hidive": ["provider-fetch-snapshot", "--provider", "hidive"],
+    }
+    provider_label = {
+        "crunchyroll": "Crunchyroll",
+        "hidive": "HIDIVE",
+    }
+
+    if provider_ready.get(refresh_provider) and isinstance(partial_sync_coverage, dict):
         add_command(
             "refresh_full_snapshot",
-            "Run a full-refresh Crunchyroll ingest so untouched older rows are refreshed instead of only the incremental overlap page",
-            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", str(snapshot_output_path), "--ingest"],
+            f"Run a full-refresh {provider_label.get(refresh_provider, refresh_provider)} ingest so untouched older rows are refreshed instead of only the incremental overlap page",
+            [*provider_refresh_args[refresh_provider], "--full-refresh", "--out", str(provider_snapshot_output[refresh_provider]), "--ingest"],
             automation_safe=True,
             requires_auth_interaction=False,
         )
-    elif crunchyroll_credentials_present and crunchyroll_state_present and snapshot_needs_refresh:
+    elif provider_ready.get(refresh_provider) and snapshot_needs_refresh:
         add_command(
             "refresh_ingested_snapshot",
-            "Fetch a fresh Crunchyroll snapshot and ingest it so health state is current again",
-            ["crunchyroll-fetch-snapshot", "--out", str(snapshot_output_path), "--ingest"],
+            f"Fetch a fresh {provider_label.get(refresh_provider, refresh_provider)} snapshot and ingest it so health state is current again",
+            [*provider_refresh_args[refresh_provider], "--out", str(provider_snapshot_output[refresh_provider]), "--ingest"],
             automation_safe=True,
             requires_auth_interaction=False,
         )
@@ -823,7 +891,7 @@ def _build_health_maintenance_commands(
     coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
     unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (
-        crunchyroll_state_present
+        provider_ready.get(refresh_provider)
         and not isinstance(partial_sync_coverage, dict)
         and isinstance(coverage_ratio, float)
         and isinstance(unmapped_series_count, int)
@@ -1010,6 +1078,8 @@ def _cmd_health_check(
     secrets = load_mal_secrets(config)
     crunchyroll_credentials = load_crunchyroll_credentials(config)
     crunchyroll_state = resolve_crunchyroll_state_paths(config)
+    hidive_credentials = load_hidive_credentials(config)
+    hidive_state = resolve_hidive_state_paths(config)
     snapshot = get_operational_snapshot(config.db_path)
 
     latest_sync_run = snapshot.get("latest_sync_run")
@@ -1033,6 +1103,13 @@ def _cmd_health_check(
         warnings.append({"code": "missing_crunchyroll_credentials", "detail": "Crunchyroll username/password secrets are not both present"})
     if not crunchyroll_state.refresh_token_path.exists() or not crunchyroll_state.device_id_path.exists():
         warnings.append({"code": "missing_crunchyroll_state", "detail": "Crunchyroll refresh token or device id is missing"})
+    if hidive_credentials.username or hidive_credentials.password:
+        if not (hidive_credentials.username and hidive_credentials.password):
+            warnings.append({"code": "missing_hidive_credentials", "detail": "HIDIVE username/password secrets are not both present"})
+    if (hidive_credentials.username and hidive_credentials.password) and (
+        not hidive_state.access_token_path.exists() or not hidive_state.refresh_token_path.exists()
+    ):
+        warnings.append({"code": "missing_hidive_state", "detail": "HIDIVE authorisation token or refresh token is missing"})
     if not secrets.client_id or not secrets.access_token or not secrets.refresh_token:
         warnings.append({"code": "missing_mal_auth_material", "detail": "MAL client id/access token/refresh token are not all present"})
     missing_automation_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
@@ -1231,13 +1308,16 @@ def _cmd_health_check(
     maintenance_commands = _build_health_maintenance_commands(
         crunchyroll_credentials_present=bool(crunchyroll_credentials.username and crunchyroll_credentials.password),
         crunchyroll_state_present=crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists(),
+        hidive_credentials_present=bool(hidive_credentials.username and hidive_credentials.password),
+        hidive_state_present=hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists(),
         mal_client_id_present=bool(secrets.client_id),
         mal_auth_present=bool(secrets.client_id and secrets.access_token and secrets.refresh_token),
         latest_sync_run=latest_sync_run if isinstance(latest_sync_run, dict) else None,
         latest_completed_sync_run=latest_completed_sync_run if isinstance(latest_completed_sync_run, dict) else None,
         latest_completed_age_seconds=latest_completed_age_seconds,
         stale_hours=stale_hours,
-        snapshot_output_path=Path(os.path.relpath(config.cache_dir / "live-crunchyroll-snapshot.json", config.project_root)),
+        crunchyroll_snapshot_output_path=Path(os.path.relpath(config.cache_dir / "live-crunchyroll-snapshot.json", config.project_root)),
+        hidive_snapshot_output_path=Path(os.path.relpath(config.cache_dir / "live-hidive-snapshot.json", config.project_root)),
         partial_sync_coverage=partial_sync_coverage,
         mapping_coverage=mapping_coverage,
         mapping_coverage_threshold=mapping_coverage_threshold,
@@ -1263,6 +1343,23 @@ def _cmd_health_check(
             "project_root": str(config.project_root),
             "db_path": str(config.db_path),
             "sync_boundary_path": str(crunchyroll_state.sync_boundary_path),
+            "provider_state_roots": {
+                "crunchyroll": str(crunchyroll_state.root),
+                "hidive": str(hidive_state.root),
+            },
+            "provider_runtime_paths": {
+                "crunchyroll": {
+                    "refresh_token_path": str(crunchyroll_state.refresh_token_path),
+                    "device_id_path": str(crunchyroll_state.device_id_path),
+                    "session_state_path": str(crunchyroll_state.session_state_path),
+                    "sync_boundary_path": str(crunchyroll_state.sync_boundary_path),
+                },
+                "hidive": {
+                    "authorisation_token_path": str(hidive_state.access_token_path),
+                    "refresh_token_path": str(hidive_state.refresh_token_path),
+                    "session_state_path": str(hidive_state.session_state_path),
+                },
+            },
         },
         "automation": automation_installation,
         "auth": {
@@ -1272,6 +1369,12 @@ def _cmd_health_check(
                 "refresh_token_present": crunchyroll_state.refresh_token_path.exists(),
                 "device_id_present": crunchyroll_state.device_id_path.exists(),
                 "sync_boundary_present": crunchyroll_state.sync_boundary_path.exists(),
+            },
+            "hidive": {
+                "username_present": bool(hidive_credentials.username),
+                "password_present": bool(hidive_credentials.password),
+                "authorisation_token_present": hidive_state.access_token_path.exists(),
+                "refresh_token_present": hidive_state.refresh_token_path.exists(),
             },
             "mal": {
                 "client_id_present": bool(secrets.client_id),
@@ -1439,6 +1542,37 @@ def _cmd_mal_whoami(project_root: Path | None) -> int:
     return 0
 
 
+def _cmd_provider_auth_login(project_root: Path | None, provider_slug: str, profile: str, no_verify: bool) -> int:
+    if provider_slug == "crunchyroll":
+        return _cmd_crunchyroll_auth_login(project_root, profile, no_verify)
+    if provider_slug == "hidive":
+        from .hidive_auth import HidiveAuthError, hidive_login_with_credentials
+
+        config = load_config(project_root)
+        ensure_directories(config)
+        try:
+            result = hidive_login_with_credentials(
+                config,
+                profile=profile,
+                verify_account=not no_verify,
+            )
+        except HidiveAuthError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Staged HIDIVE authorisation token to {result.access_token_path}")
+        print(f"Staged HIDIVE refresh token to {result.refresh_token_path}")
+        print(f"Updated session state at {result.session_state_path}")
+        if result.account_id:
+            print(f"HIDIVE account_id={result.account_id}")
+        if result.account_name:
+            print(f"HIDIVE account_name={result.account_name}")
+        print(f"profile={result.profile}")
+        return 0
+    print(f"provider-auth-login is not implemented yet for provider '{provider_slug}'", file=sys.stderr)
+    return 2
+
+
+
 def _cmd_crunchyroll_auth_login(project_root: Path | None, profile: str, no_verify: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -1482,8 +1616,9 @@ def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None
     return 0
 
 
-def _cmd_crunchyroll_fetch_snapshot(
+def _cmd_provider_fetch_snapshot(
     project_root: Path | None,
+    provider_slug: str,
     profile: str,
     out_path: Path | None,
     ingest: bool,
@@ -1491,8 +1626,13 @@ def _cmd_crunchyroll_fetch_snapshot(
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
+    provider = get_provider(provider_slug)
     try:
-        result = fetch_snapshot(config, profile=profile, use_incremental_boundary=not full_refresh)
+        result = provider.fetch_snapshot(
+            config,
+            profile=profile,
+            full_refresh=full_refresh,
+        )
     except (CrunchyrollAuthError, CrunchyrollSnapshotError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1500,8 +1640,8 @@ def _cmd_crunchyroll_fetch_snapshot(
     payload = snapshot_to_dict(result.snapshot)
     target_path = out_path
     if target_path is not None:
-        write_snapshot_file(target_path, result.snapshot)
-        print(f"Wrote Crunchyroll snapshot to {target_path}")
+        provider.write_snapshot_file(target_path, result.snapshot)
+        print(f"Wrote {provider.display_name} snapshot to {target_path}")
 
     if ingest:
         summary = ingest_snapshot_payload(payload, config)
@@ -1510,6 +1650,24 @@ def _cmd_crunchyroll_fetch_snapshot(
 
     print(json.dumps(payload, indent=2))
     return 0
+
+
+
+def _cmd_crunchyroll_fetch_snapshot(
+    project_root: Path | None,
+    profile: str,
+    out_path: Path | None,
+    ingest: bool,
+    full_refresh: bool,
+) -> int:
+    return _cmd_provider_fetch_snapshot(
+        project_root,
+        "crunchyroll",
+        profile,
+        out_path,
+        ingest,
+        full_refresh,
+    )
 
 
 def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
@@ -1843,11 +2001,12 @@ def _cmd_approve_mapping(
 
 def _cmd_dry_run_sync(
     project_root: Path | None,
-    limit: int,
-    mapping_limit: int,
-    approved_mappings_only: bool,
-    exact_approved_only: bool,
-    persist_queue: bool,
+    provider: str = "crunchyroll",
+    limit: int = 20,
+    mapping_limit: int = 5,
+    approved_mappings_only: bool = False,
+    exact_approved_only: bool = False,
+    persist_queue: bool = False,
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -1863,6 +2022,7 @@ def _cmd_dry_run_sync(
             mapping_limit=mapping_limit,
             approved_mappings_only=approved_mappings_only,
             exact_approved_only=exact_approved_only,
+            provider=provider,
         )
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
@@ -1882,7 +2042,7 @@ def _review_queue_item_label(
     payload = getattr(item, "payload", None)
     title = None
     if isinstance(payload, dict):
-        for key in ("title", "crunchyroll_title", "season_title", "mal_title", "suggested_mal_title"):
+        for key in ("title", "provider_title", "crunchyroll_title", "season_title", "mal_title", "suggested_mal_title"):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 title = value.strip()
@@ -3645,7 +3805,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_check.add_argument("--review-issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional review_queue issue type to use when building recommended_next/recommended_worklist")
     health_check.add_argument("--review-worklist-limit", type=int, default=3, help="How many ranked review backlog drilldowns to include in recommended_worklist (use 0 to suppress it)")
     health_check.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
-    health_check.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved Crunchyroll->MAL mapping coverage falls below this ratio (default: 0.8)")
+    health_check.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved provider->MAL mapping coverage falls below this ratio (default: 0.8)")
     health_check.add_argument("--maintenance-review-limit", type=int, default=25, help="When coverage is low, cap the auto-recommended review-mappings series scan to this many series (use 0 for all)")
     mal_auth = subparsers.add_parser("mal-auth-url", help="Generate a MAL OAuth authorization URL + PKCE verifier")
     mal_auth.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
@@ -3655,6 +3815,26 @@ def build_parser() -> argparse.ArgumentParser:
     mal_refresh = subparsers.add_parser("mal-refresh", help="Refresh the persisted MAL access token using the local refresh token")
     mal_refresh.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /users/@me token check")
     subparsers.add_parser("mal-whoami", help="Call MAL GET /users/@me with the currently configured access token")
+    provider_auth_login = subparsers.add_parser(
+        "provider-auth-login",
+        help="Run provider-specific auth bootstrap for a named content provider",
+    )
+    provider_auth_login.add_argument("--provider", required=True, choices=list_provider_slugs(), help="Provider slug")
+    provider_auth_login.add_argument("--profile", default="default", help="Provider state profile name")
+    provider_auth_login.add_argument("--no-verify", action="store_true", help="Skip any provider-specific follow-up account verification step")
+    provider_fetch_snapshot = subparsers.add_parser(
+        "provider-fetch-snapshot",
+        help="Fetch a live normalized snapshot from a named content provider",
+    )
+    provider_fetch_snapshot.add_argument("--provider", required=True, choices=list_provider_slugs(), help="Provider slug")
+    provider_fetch_snapshot.add_argument("--profile", default="default", help="Provider state profile name")
+    provider_fetch_snapshot.add_argument("--out", type=Path, default=None, help="Optional JSON file path to write the fetched snapshot")
+    provider_fetch_snapshot.add_argument("--ingest", action="store_true", help="Immediately validate and ingest the fetched snapshot into SQLite")
+    provider_fetch_snapshot.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="Ignore provider-local incremental boundaries and fetch the full currently reachable history/watchlist surfaces",
+    )
     crunchyroll_auth_login = subparsers.add_parser(
         "crunchyroll-auth-login",
         help="Use local Crunchyroll username/password secrets to stage Crunchyroll refresh-token auth material",
@@ -3673,11 +3853,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore the local incremental sync boundary and fetch the full currently reachable Crunchyroll history/watchlist pages",
     )
-    validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a Crunchyroll snapshot JSON payload")
+    validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a normalized provider snapshot JSON payload")
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
-    ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a Crunchyroll snapshot into SQLite")
+    ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a normalized provider snapshot into SQLite")
     ingest_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
-    map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested Crunchyroll series")
+    map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested provider series")
     map_series_cmd.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     map_series_cmd.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     review_mappings = subparsers.add_parser(
@@ -3695,7 +3875,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider-series-id",
         action="append",
         default=[],
-        help="Crunchyroll provider_series_id to refresh in the persisted mapping_review queue (repeatable)",
+        help="Provider provider_series_id to refresh in the persisted mapping_review queue (repeatable)",
     )
     refresh_mapping_review_queue.add_argument(
         "--all-open",
@@ -3711,10 +3891,10 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_mapping_review_queue.add_argument("--cluster-strategy", default=None, help="Only refresh open mapping_review rows whose combined normalized title-cluster/fix-strategy exactly matches this value")
     refresh_mapping_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only refresh open mapping_review rows whose combined normalized title-cluster/fix-strategy family exactly matches this value")
     refresh_mapping_review_queue.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
-    list_mappings = subparsers.add_parser("list-mappings", help="List persisted Crunchyroll -> MAL mappings from SQLite")
+    list_mappings = subparsers.add_parser("list-mappings", help="List persisted provider -> MAL mappings from SQLite")
     list_mappings.add_argument("--approved-only", action="store_true", help="Only include mappings explicitly approved by the user")
-    approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved Crunchyroll -> MAL series mapping")
-    approve_mapping.add_argument("provider_series_id", help="Crunchyroll provider_series_id to approve")
+    approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved provider -> MAL series mapping")
+    approve_mapping.add_argument("provider_series_id", help="Provider provider_series_id to approve")
     approve_mapping.add_argument("mal_anime_id", type=int, help="Chosen MAL anime id")
     approve_mapping.add_argument("--confidence", type=float, default=None, help="Optional confidence score to store alongside the approval")
     approve_mapping.add_argument("--notes", default=None, help="Optional operator note explaining the approval")
@@ -3723,7 +3903,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Mark this manual approval as exact-safe so the unattended exact-approved executor may use it",
     )
-    dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested Crunchyroll data")
+    dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested provider data")
+    dry_run_sync.add_argument("--provider", default="crunchyroll", choices=list_provider_slugs(), help="Provider slug to plan against")
     dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect (use 0 for all; required when persisting review_queue)")
     dry_run_sync.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     dry_run_sync.add_argument(
@@ -3742,7 +3923,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
     list_review_queue.add_argument("--summary", action="store_true", help="Emit a compact summary of queue counts/decisions/reasons instead of every row")
     list_review_queue.add_argument("--limit", type=int, default=0, help="Maximum number of filtered rows to emit in non-summary mode (use 0 for all)")
-    list_review_queue.add_argument("--provider-series-id", default=None, help="Only show review rows for one exact Crunchyroll provider_series_id")
+    list_review_queue.add_argument("--provider-series-id", default=None, help="Only show review rows for one exact provider_series_id")
     list_review_queue.add_argument("--title-cluster", default=None, help="Only show review rows whose normalized title cluster matches this value (for example: 'example show' or 'Example Show Season 2')")
     list_review_queue.add_argument("--decision", default=None, help="Only show review rows whose payload decision exactly matches this value from --summary")
     list_review_queue.add_argument("--reason", default=None, help="Only show review rows whose payload reasons include this exact value from --summary")
@@ -3858,7 +4039,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_sync.add_argument("--execute", action="store_true", help="Actually write MAL updates; otherwise revalidate and print what would be applied")
     recommend = subparsers.add_parser(
         "recommend",
-        help="Generate local recommendations from the ingested Crunchyroll dataset (grouped by category by default)",
+        help="Generate local recommendations from the ingested provider dataset (grouped by category by default)",
     )
     recommend.add_argument("--limit", type=int, default=20, help="How many recommendations to emit (use 0 for all)")
     recommend.add_argument("--flat", action="store_true", help="Emit the legacy single flat JSON list instead of grouped sections")
@@ -3926,6 +4107,10 @@ def main() -> int:
         return _cmd_mal_refresh(args.project_root, verify_whoami=not args.no_verify)
     if args.command == "mal-whoami":
         return _cmd_mal_whoami(args.project_root)
+    if args.command == "provider-auth-login":
+        return _cmd_provider_auth_login(args.project_root, args.provider, args.profile, args.no_verify)
+    if args.command == "provider-fetch-snapshot":
+        return _cmd_provider_fetch_snapshot(args.project_root, args.provider, args.profile, args.out, args.ingest, args.full_refresh)
     if args.command == "crunchyroll-auth-login":
         return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
     if args.command == "crunchyroll-fetch-snapshot":
@@ -3967,6 +4152,7 @@ def main() -> int:
     if args.command == "dry-run-sync":
         return _cmd_dry_run_sync(
             args.project_root,
+            args.provider,
             args.limit,
             args.mapping_limit,
             args.approved_mappings_only,

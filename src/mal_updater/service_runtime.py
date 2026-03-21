@@ -91,7 +91,7 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
     if provider is None:
         return True, None, None
     usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
-    limit = config.service.mal_hourly_limit if provider == "mal" else config.service.crunchyroll_hourly_limit
+    limit = config.service.hourly_limit_for(provider)
     ratio = 0.0 if limit <= 0 else float(usage.get("request_count", 0)) / float(limit)
     recovery_seconds = estimate_budget_recovery_seconds(
         provider=provider,
@@ -182,9 +182,10 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             _append_log(config, f"task={spec.name} status=error error={type(exc).__name__}: {exc}")
 
     state["last_loop_at"] = _now_iso()
+    tracked_providers = {"mal", "crunchyroll", *config.service.provider_hourly_limits.keys()}
     state["api_usage"] = {
-        "mal": summarize_recent_api_usage(provider="mal", window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict(),
-        "crunchyroll": summarize_recent_api_usage(provider="crunchyroll", window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict(),
+        provider: summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
+        for provider in sorted(tracked_providers)
     }
     _save_state(config, state)
     return {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}

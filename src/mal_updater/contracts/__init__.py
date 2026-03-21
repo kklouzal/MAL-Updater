@@ -1,6 +1,8 @@
-from .crunchyroll import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
+from .provider import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from .crunchyroll import CrunchyrollSnapshot
 
 __all__ = [
+    "ProviderSnapshot",
     "CrunchyrollSnapshot",
     "EpisodeProgress",
     "SeriesRef",
