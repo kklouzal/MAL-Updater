@@ -1,6 +1,6 @@
 ---
 name: mal-updater
-description: Crunchyroll → MyAnimeList sync and recommendations skill with guarded auth, review-queue triage, health checks, bootstrap auditing, and user-systemd daemon support. Use when installing, auditing, operating, or troubleshooting MAL-Updater on an OpenClaw host.
+description: Multi-provider anime → MyAnimeList sync and recommendations skill with guarded auth, review-queue triage, health checks, bootstrap auditing, and user-systemd daemon support. Currently supports Crunchyroll and HIDIVE as source providers. Use when installing, auditing, operating, or troubleshooting MAL-Updater on an OpenClaw host.
 ---
 
 # MAL-Updater
@@ -22,12 +22,13 @@ Treat `{baseDir}` as the skill root. This repository is the skill package.
 3. Read `{baseDir}/references/bootstrap-onboarding.md`
 4. Use the audit output to:
    - verify required binaries
-   - check whether the optional Crunchyroll transport extra is missing
+   - check whether provider-specific optional transport/runtime extras are missing
    - confirm the external runtime layout under `.MAL-Updater/`
-   - identify which user-provided secrets/app settings are still missing
+   - identify which user-provided secrets/app settings are still missing for MAL and any enabled source providers
    - verify the secrets location is outside version control and suitable for restrictive local permissions
    - decide whether the repo-owned user-systemd daemon can be installed on this host
 5. If bootstrap is incomplete, guide the user through the missing steps instead of pretending install is finished.
+6. Prompt for provider credentials only when the workflow reaches that provider's bootstrap step; do not request Crunchyroll or HIDIVE secrets preemptively if the user has not chosen or enabled that provider yet.
 
 ## How to access backend data / operator surfaces
 
@@ -52,9 +53,10 @@ For the most common operator/data tasks, use the repo-local CLI from `{baseDir}`
 - `PYTHONPATH=src python3 -m mal_updater.cli list-mappings`
 
 ### Sync planning / guarded execution
-- `PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only`
+- `PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only`
 - `PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute`
-- `PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest`
+- `PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest`
+- `PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest`
 
 ## Operational workflow
 
@@ -74,8 +76,9 @@ Read-only first:
 Treat these as state-changing:
 - `mal-auth-login`
 - `mal-refresh`
-- `crunchyroll-auth-login`
-- `crunchyroll-fetch-snapshot --ingest`
+- `provider-auth-login --provider crunchyroll`
+- `provider-auth-login --provider hidive`
+- `provider-fetch-snapshot --provider <provider> --ingest`
 - `apply-sync --execute`
 - `scripts/install_user_systemd_units.sh`
 - `install-service`

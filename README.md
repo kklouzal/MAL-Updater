@@ -1,6 +1,6 @@
 # MAL-Updater
 
-MAL-Updater is a **skill-first** OpenClaw repository for conservative **Crunchyroll → MyAnimeList sync and recommendations**, with mapping review, guarded apply runs, and unattended maintenance.
+MAL-Updater is a **skill-first** OpenClaw repository for conservative **multi-provider anime → MyAnimeList sync and recommendations**, with mapping review, guarded apply runs, and unattended maintenance. Current source providers: **Crunchyroll** and **HIDIVE**.
 
 This repository is the skill package.
 
@@ -39,9 +39,10 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
-- dependency checks (`python3`, `flock`, `systemctl`, optional `curl_cffi`)
+- dependency checks (`python3`, `flock`, `systemctl`, optional provider/runtime extras)
 - MAL client id / token presence
 - Crunchyroll credentials / staged auth-state presence
+- HIDIVE credentials / staged auth-state presence
 - current MAL redirect URI
 - whether the repo-owned **user-systemd daemon service** can be installed on this host
 
@@ -52,9 +53,13 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 3. Create the MyAnimeList app and configure the redirect URI reported by `status`
 4. Stage the MAL client id in `.MAL-Updater/secrets/`
 5. Run `mal-auth-login` to persist MAL access/refresh tokens
-6. Stage Crunchyroll username/password in `.MAL-Updater/secrets/`
-7. Run `crunchyroll-auth-login` to mint the staged Crunchyroll refresh token/device id
+6. For each source provider you want enabled, stage that provider's credentials in `.MAL-Updater/secrets/`
+7. Run the provider bootstrap command at the point the audit/onboarding flow says that provider is ready:
+   - Crunchyroll: `provider-auth-login --provider crunchyroll` (or the compatibility wrapper `crunchyroll-auth-login`)
+   - HIDIVE: `provider-auth-login --provider hidive`
 8. Install the unattended daemon with `scripts/install_user_systemd_units.sh` when the host supports user systemd
+
+Normal unattended operation now assumes **all credentialed providers stay enabled** and are swept by separate background fetch lanes before aggregate MAL planning/apply runs.
 
 See `references/bootstrap-onboarding.md` for the detailed agent-facing flow.
 
@@ -69,7 +74,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 ```
@@ -88,7 +93,8 @@ Repo-owned automation/runtime files live under:
 The installed daemon is a **user-level systemd service** that runs `mal_updater.cli service-run` in the foreground and owns its own internal loop cadence for:
 
 - MAL token refresh
-- exact-approved sync passes
+- one fetch lane per credentialed source provider (currently Crunchyroll + HIDIVE)
+- one shared aggregate MAL apply lane
 - recurring health-check/report generation
 - API request logging / budget awareness
 

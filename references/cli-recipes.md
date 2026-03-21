@@ -29,15 +29,26 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 ```
 
-## Crunchyroll auth / fetch
+## Provider auth / fetch
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --full-refresh
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --full-refresh
+```
+
+Compatibility wrappers still exist for Crunchyroll-specific debugging/bootstrap:
 
 ```bash
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --full-refresh
-./scripts/run_exact_approved_sync_cycle.sh
 ```
 
 ## Review queue triage
@@ -56,8 +67,10 @@ PYTHONPATH=src python3 -m mal_updater.cli review-queue-refresh-worklist --issue-
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --mapping-limit 5 --persist-review-queue
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --mapping-limit 5 --persist-review-queue
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider hidive --limit 20
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider crunchyroll --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute

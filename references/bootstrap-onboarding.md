@@ -28,8 +28,10 @@ Use `--summary` for terse line-oriented output.
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
-- whether `python3`, `flock`, `systemctl`, and optional `curl_cffi` are available
-- whether MAL client id, MAL auth tokens, Crunchyroll credentials, and Crunchyroll staged auth state exist
+- whether `python3`, `flock`, `systemctl`, and optional provider/runtime extras are available
+- whether MAL client id / MAL auth tokens exist
+- whether Crunchyroll credentials / staged Crunchyroll auth state exist
+- whether HIDIVE credentials / staged HIDIVE auth state exist
 - whether the user-level systemd daemon can be installed
 - the current MAL redirect URI that the user must configure in their MAL app
 
@@ -78,18 +80,40 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
 
 This persists MAL access/refresh tokens under the runtime secrets dir.
 
-### 5. Crunchyroll credentials
+### 5. Source provider credentials
 
 Before staging secrets, verify the runtime secrets dir is outside version control and has appropriately restrictive local permissions for the user account.
 
+Prompt for source-provider credentials only when that provider is actually being enabled.
+
+#### Crunchyroll
+
 Stage the user’s Crunchyroll username/password in the runtime secrets dir, then run:
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
+```
+
+Compatibility wrapper still exists:
 
 ```bash
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 ```
 
-This creates the long-lived staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.
+This creates the staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.
+
+#### HIDIVE
+
+Stage the user’s HIDIVE username/email + password in the runtime secrets dir, then run:
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive
+```
+
+This creates the staged HIDIVE auth state under `.MAL-Updater/state/hidive/<profile>/`.
 
 ### 6. Install the unattended daemon if supported
 
@@ -110,6 +134,11 @@ PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
+
+On a fully bootstrapped install, normal background operation now means:
+- one provider fetch lane per credentialed source provider
+- one shared aggregate MAL apply lane
+- provider usage gated by credential/runtime state rather than hardcoded enable flags
 
 ## Issue reporting / feedback
 
