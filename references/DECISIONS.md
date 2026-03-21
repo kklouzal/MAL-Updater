@@ -147,3 +147,13 @@ When the daemon hits a provider budget critical threshold, persist a per-task co
 - repeated every-loop budget skips create noisy logs without making progress
 - recovery should be based on the observed request window, not a hand-wavy fixed sleep
 - surfacing `budget_backoff_until` in service state/status makes unattended behavior easier to reason about during debugging
+
+## 2026-03-20 - Supplemental mapping candidate posture
+
+### Decision
+Treat hard-coded supplemental MAL candidate IDs as conservative rescue inputs, not as enough evidence by themselves to auto-resolve exact-title overflow cases.
+
+### Why
+- supplemental IDs help recover titles that MAL search fails to surface at all
+- overflow on top of a supplemental-only hit can still mean a multi-entry bundle or broader franchise residue
+- keeping this path conservative preserves explainability and avoids overconfident auto-approval when the search surface was already weak

@@ -264,13 +264,14 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.status, "exact")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 20057)
         self.assertIn("episode_evidence_exceeds_candidate_count=21>13", result.rationale)
         self.assertIn("multi_entry_bundle_suspected=21<=13+13", result.rationale)
         self.assertIsNotNone(result.bundle_companion_candidate)
         self.assertEqual(23327, result.bundle_companion_candidate.mal_anime_id)
         self.assertEqual({23327}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertTrue(should_auto_approve_mapping(result))
 
     def test_map_series_flags_exact_title_overflow_as_possible_three_entry_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -342,13 +343,14 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.status, "exact")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 1001)
         self.assertIn("episode_evidence_exceeds_candidate_count=36>12", result.rationale)
         self.assertIn("multi_entry_bundle_suspected=36<=12+12+12", result.rationale)
         self.assertIsNotNone(result.bundle_companion_candidate)
         self.assertIn(result.bundle_companion_candidate.mal_anime_id, {1002, 1003})
         self.assertEqual({1002, 1003}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertTrue(should_auto_approve_mapping(result))
 
     def test_map_series_multi_entry_bundle_prefers_later_seasons_over_higher_scoring_sidecar_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -440,12 +442,13 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.status, "exact")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 39468)
         self.assertIn("episode_evidence_exceeds_candidate_count=32>14", result.rationale)
         self.assertIn("multi_entry_bundle_suspected=32<=14+10+12", result.rationale)
         self.assertEqual({42429, 40815}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
         self.assertNotIn(40841, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertTrue(should_auto_approve_mapping(result))
         self.assertGreater(
             next(candidate.score for candidate in result.candidates if candidate.mal_anime_id == 40841),
             next(candidate.score for candidate in result.candidates if candidate.mal_anime_id == 42429),
@@ -3213,10 +3216,11 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.status, "exact")
         self.assertEqual(22297, result.chosen_candidate.mal_anime_id)
         self.assertIn("multi_entry_bundle_suspected=24<=12+13", result.rationale)
         self.assertEqual({28701}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertTrue(should_auto_approve_mapping(result))
         movie_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 6922)
         prologue_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 27821)
         self.assertIn("single_episode_movie_penalty_for_multi_episode_series", movie_candidate.match_reasons)
@@ -3224,6 +3228,245 @@ class MappingTests(unittest.TestCase):
         self.assertIn("single_episode_tv_special_penalty_for_multi_episode_series", prologue_candidate.match_reasons)
         self.assertLess(movie_candidate.score, result.chosen_candidate.score)
         self.assertLess(prologue_candidate.score, result.chosen_candidate.score)
+
+    def test_map_series_uses_supplemental_title_candidate_for_unsearchable_exact_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 40708,
+                    "title": "Monster Musume no Oishasan",
+                    "alternative_titles": {"en": "Monster Girl Doctor", "synonyms": [], "ja": "モンスター娘のお医者さん"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-monster-girl-doctor",
+                        title="Monster Girl Doctor",
+                        season_title="Monster Girl Doctor (English Dub)",
+                        season_number=1,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 40708)
+        self.assertIn("supplemental_title_candidate", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_uses_supplemental_bundle_candidates_for_girls_bravo(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            details = {
+                241: {
+                    "id": 241,
+                    "title": "Girls Bravo: First Season",
+                    "alternative_titles": {"en": "Girls Bravo", "synonyms": [], "ja": "GIRLSブラボー first season"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 11,
+                },
+                487: {
+                    "id": 487,
+                    "title": "Girls Bravo: Second Season",
+                    "alternative_titles": {"en": "Girls Bravo: Second Season", "synonyms": [], "ja": "GIRLSブラボー second season"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 13,
+                },
+            }
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=lambda anime_id, fields=None: details[anime_id],
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-girls-bravo",
+                        title="Girls Bravo",
+                        season_title="Girls Bravo",
+                        season_number=1,
+                        max_episode_number=24,
+                        completed_episode_count=24,
+                    ),
+                )
+
+        self.assertEqual(result.status, "strong")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 241)
+        self.assertEqual([], result.bundle_companion_candidates or [])
+        self.assertFalse(should_auto_approve_mapping(result))
+
+    def test_map_series_auto_approves_exact_later_installment_when_base_title_is_aggregated_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 48761,
+                                "title": "Saihate no Paladin",
+                                "alternative_titles": {"en": "The Faraway Paladin", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 50664,
+                                "title": "Saihate no Paladin: Tetsusabi no Yama no Ou",
+                                "alternative_titles": {"en": "The Faraway Paladin: The Lord of the Rust Mountains", "synonyms": ["Saihate no Paladin 2nd Season"]},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-faraway-paladin-rust-mountains",
+                        title="The Faraway Paladin",
+                        season_title="The Faraway Paladin The Lord Of The Rust Mountains (English Dub)",
+                        season_number=2,
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 50664)
+        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_auto_approves_exact_single_movie_feature(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 48561,
+                                "title": "Jujutsu Kaisen 0 Movie",
+                                "alternative_titles": {"en": "Jujutsu Kaisen 0", "synonyms": ["JJK 0"]},
+                                "media_type": "movie",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 40748,
+                                "title": "Jujutsu Kaisen",
+                                "alternative_titles": {"en": "Jujutsu Kaisen", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 24,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-jjk-zero",
+                        title="JUJUTSU KAISEN 0",
+                        season_title="JUJUTSU KAISEN 0",
+                        season_number=0,
+                        max_episode_number=1,
+                        completed_episode_count=1,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 48561)
+        self.assertTrue(should_auto_approve_mapping(result))
 
 
 class PersistedMappingTests(unittest.TestCase):
@@ -3558,9 +3801,10 @@ class DryRunPlannerTests(unittest.TestCase):
                 items = build_mapping_review(config, limit=5, mapping_limit=5)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].decision, "needs_review")
+        self.assertEqual(items[0].decision, "auto_approved")
         self.assertEqual({1002, 1003}, {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates})
         self.assertIn(items[0].bundle_companion_candidate["mal_anime_id"], {1002, 1003})
+        self.assertIn("auto_approved_exact_unique_match", items[0].reasons)
 
     def test_build_dry_run_sync_plan_uses_user_approved_mapping_without_search(self) -> None:
         with tempfile.TemporaryDirectory() as td:

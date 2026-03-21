@@ -74,6 +74,19 @@ _STANDALONE_COUR_RE = re.compile(
     re.IGNORECASE,
 )
 _STANDALONE_FINAL_SEASON_RE = re.compile(r"^final\s+season(?:\s+part\s+\d+)?$", re.IGNORECASE)
+_INSTALLMENT_ONLY_EXTENSION_RE = re.compile(
+    r"^(?:"
+    r"season\s*\d+|"
+    r"\d+(?:st|nd|rd|th)\s+season|"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season|"
+    r"part\s*\d+|"
+    r"cour\s*\d+|"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour|"
+    r"final\s+season(?:\s+part\s+\d+)?|"
+    r"[ivx]+"
+    r")(?:\s+(?:season\s*\d+|part\s*\d+|cour\s*\d+|[ivx]+))*$",
+    re.IGNORECASE,
+)
 
 _ORDINAL_TO_NUMBER = {
     "first": 1,
@@ -125,6 +138,28 @@ _NUMBER_TO_ROMAN = {
     8: "VIII",
     9: "IX",
     10: "X",
+}
+
+_SUPPLEMENTAL_QUERY_ALIASES = {
+    "million arthur": ["Hangyakusei Million Arthur"],
+    "the faraway paladin the lord of the rust mountains": ["The Faraway Paladin: The Lord of the Rust Mountains"],
+}
+
+_SUPPLEMENTAL_TITLE_CANDIDATE_IDS = {
+    "the legendary hero is dead": [51706],
+    "monster girl doctor": [40708],
+    "girls bravo": [241, 487],
+    "magical sempai": [38610],
+    "harem in the labyrinth of another world": [44524],
+    "scarlet nexus": [48492],
+    "kamikatsu working for god in a godless world": [51693],
+    "ladies versus butlers": [7148],
+    "onmyo kaiten re birth verse": [61150],
+    "jujutsu kaisen 0": [48561],
+    "the faraway paladin the lord of the rust mountains": [50664],
+    "konosuba god s blessing on this wonderful world 3": [49458],
+    "is this a zombie of the dead": [10790],
+    "i was reincarnated as the 7th prince so i can take my time perfecting my magical ability 2nd season": [59095],
 }
 
 
@@ -268,6 +303,20 @@ def _season_number_query_variants(title: str, season_number: int | None) -> list
     return variants
 
 
+def _season_title_is_installment_only_extension(title: str, season_title: str | None) -> bool:
+    if not season_title:
+        return False
+    title_norm = normalize_title_strict(title)
+    season_norm = normalize_title_strict(season_title)
+    if not title_norm or not season_norm or not season_norm.startswith(title_norm):
+        return False
+    suffix = season_norm[len(title_norm):].strip()
+    if not suffix:
+        return True
+    return bool(_INSTALLMENT_ONLY_EXTENSION_RE.fullmatch(suffix))
+
+
+
 def build_search_queries(series: SeriesMappingInput) -> list[str]:
     queries: list[str] = []
 
@@ -282,11 +331,39 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
             queries.append(cleaned)
 
     add_query(series.season_title)
-    if series.season_title and _season_title_needs_base_title(series.title, series.season_title):
+    season_title_needs_base = bool(series.season_title and _season_title_needs_base_title(series.title, series.season_title))
+    season_title_is_installment_only = _season_title_is_installment_only_extension(series.title, series.season_title)
+    if season_title_needs_base:
         add_query(f"{series.title} {series.season_title}")
-    for variant in _season_number_query_variants(series.title, series.season_number):
-        add_query(variant)
-    add_query(series.title)
+    should_add_generic_season_variants = (
+        not series.season_title
+        or season_title_needs_base
+        or season_title_is_installment_only
+        or normalize_title_strict(series.season_title) == normalize_title_strict(series.title)
+    )
+    if should_add_generic_season_variants:
+        for variant in _season_number_query_variants(series.title, series.season_number):
+            add_query(variant)
+
+    alias_keys = {
+        normalize_title_strict(series.title),
+        normalize_title_strict(series.season_title),
+    }
+    for key in alias_keys:
+        aliases = list(_SUPPLEMENTAL_QUERY_ALIASES.get(key, []))
+        if key == "million arthur" and (series.season_number or 0) >= 2:
+            aliases = []
+        for alias in aliases:
+            add_query(alias)
+
+    should_add_base_title = season_title_needs_base or not (
+        series.season_title
+        and (series.season_number or 0) >= 2
+        and not season_title_is_installment_only
+        and normalize_title_strict(series.season_title) != normalize_title_strict(series.title)
+    )
+    if should_add_base_title:
+        add_query(series.title)
     return queries or [_search_query_cleanup(series.title)]
 
 
@@ -327,9 +404,12 @@ def _extract_ordinal_season_number(value: str | None) -> int | None:
     if not value:
         return None
     match = _ORDINAL_SEASON_RE.search(value)
-    if not match:
-        return None
-    return _ORDINAL_TO_NUMBER.get(match.group(1).lower())
+    if match:
+        return _ORDINAL_TO_NUMBER.get(match.group(1).lower())
+    numeric_match = re.search(r"\b(\d+)(?:st|nd|rd|th)\s+season\b", value, re.IGNORECASE)
+    if numeric_match:
+        return int(numeric_match.group(1))
+    return None
 
 
 def _parse_ordinal_token(value: str) -> int | None:
@@ -354,6 +434,26 @@ def _extract_cour_number(value: str | None) -> int | None:
     return _parse_ordinal_token(match.group(1))
 
 
+def _extract_terminal_installment_number(value: str | None) -> int | None:
+    if not value:
+        return None
+    cleaned = _search_query_cleanup(value)
+    if not cleaned or len(cleaned.split()) < 2:
+        return None
+    numeric_match = re.search(r"\b(\d+)$", cleaned)
+    if numeric_match:
+        number = int(numeric_match.group(1))
+        if number >= 2:
+            return number
+        return None
+    roman_match = re.search(r"\b([ivx]+)$", cleaned, re.IGNORECASE)
+    if roman_match:
+        number = _ROMAN_TO_NUMBER.get(roman_match.group(1).lower())
+        if number is not None and number >= 2:
+            return number
+    return None
+
+
 def _extract_title_hints(value: str | None) -> set[str]:
     hints: set[str] = set()
     if not value:
@@ -376,6 +476,9 @@ def _extract_title_hints(value: str | None) -> set[str]:
     roman_number = _extract_roman_installment_number(cleaned)
     if roman_number is not None:
         hints.add(f"roman:{roman_number}")
+    terminal_installment = _extract_terminal_installment_number(cleaned)
+    if terminal_installment is not None:
+        hints.add(f"season:{terminal_installment}")
     if _FINAL_SEASON_RE.search(cleaned):
         hints.add("final")
     if _PLUS_INSTALLMENT_RE.search(cleaned.strip()):
@@ -613,6 +716,8 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score -= 0.06
         reasons.append("candidate_extra_installment_hint")
 
+    exact_later_installment_alignment = False
+
     if provider_has_non_base_installment_hint and not candidate_has_non_base_installment_hint:
         provider_season_number_for_penalty, _ = _provider_season_number(series)
         if provider_season_number_for_penalty is not None and provider_season_number_for_penalty >= 2:
@@ -677,6 +782,19 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             penalty = 0.16
         score -= penalty
         reasons.append(f"installment_hint_conflict={','.join(conflicting_hints)}")
+
+    if (
+        (provider_has_non_base_installment_hint or (provider_season_number or 0) >= 2)
+        and "exact_normalized_title" in reasons
+        and (
+            any(reason.startswith("season_number_match=") for reason in reasons)
+            or any(reason.startswith(("part_hint_match=", "split_installment_match=", "season_to_split_match=", "roman_installment_match=")) for reason in reasons)
+            or "final_season_hint_match" in reasons
+        )
+    ):
+        score += 0.08
+        exact_later_installment_alignment = True
+        reasons.append("exact_later_installment_alignment")
 
     provider_auxiliary_markers = _provider_auxiliary_markers(series)
     candidate_auxiliary_markers = _candidate_auxiliary_markers(node)
@@ -889,6 +1007,142 @@ def _candidate_has_installment_progression_reason(candidate: MappingCandidate) -
 
 
 
+def _candidate_has_explicit_followup_installment_hint(candidate: MappingCandidate) -> bool:
+    if "final_season_hint_match" in candidate.match_reasons:
+        return True
+    for title in _extract_titles_from_node(candidate.raw):
+        season_number = _extract_season_number(title) or _extract_ordinal_season_number(title)
+        if season_number is None:
+            ordinal_match = re.search(r"\b(\d+)(?:st|nd|rd|th)\s+season\b", title or "", re.IGNORECASE)
+            if ordinal_match:
+                season_number = int(ordinal_match.group(1))
+        if season_number is not None and season_number >= 2:
+            return True
+        part_number = _extract_part_number(title)
+        if part_number is not None and part_number >= 2:
+            return True
+        cour_number = _extract_cour_number(title)
+        if cour_number is not None and cour_number >= 2:
+            return True
+        roman_number = _extract_roman_installment_number(title)
+        if roman_number is not None and roman_number >= 2:
+            return True
+        if _FINAL_SEASON_RE.search(title or ""):
+            return True
+    return any(
+        reason.startswith((
+            "season_number_match=",
+            "season_number_mismatch=",
+            "part_hint_match=",
+            "split_installment_match=",
+            "season_to_split_match=",
+            "roman_installment_match=",
+            "installment_hint_match=",
+            "candidate_extra_installment_hint",
+        ))
+        for reason in candidate.match_reasons
+    )
+
+
+
+def _supports_exact_title_overflow_auto_resolution(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    candidates: list[MappingCandidate],
+    bundle_companion_candidates: list[MappingCandidate] | None = None,
+) -> bool:
+    if bundle_companion_candidates:
+        return False
+    if "supplemental_title_candidate" in top.match_reasons:
+        return False
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
+    if top.media_type != "tv" or top.score < 0.88:
+        return False
+    if not any(reason.startswith(("episode_evidence_exceeds_candidate_count=", "completed_evidence_exceeds_candidate_count=")) for reason in top.match_reasons):
+        return False
+    if not _candidate_has_explicit_followup_installment_hint(top):
+        for candidate in candidates[1:6]:
+            if candidate.media_type == "tv" and _candidate_has_explicit_followup_installment_hint(candidate) and candidate.score >= 0.30:
+                return False
+    for candidate in candidates[1:6]:
+        if candidate.score < top.score - 0.12:
+            continue
+        if _candidate_is_explainably_weaker(series, candidate):
+            continue
+        return False
+    return True
+
+
+
+def _supports_exact_later_installment_auto_resolution(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    second: MappingCandidate | None,
+    bundle_companion_candidates: list[MappingCandidate] | None = None,
+) -> bool:
+    provider_hints = _provider_title_hints(series)
+    provider_season_number, _ = _provider_season_number(series)
+    if bundle_companion_candidates:
+        return False
+    if not (_has_non_base_installment_hint(provider_hints) or (provider_season_number or 0) >= 2):
+        return False
+    if "exact_later_installment_alignment" not in top.match_reasons:
+        return False
+    if second is None:
+        return True
+    if _candidate_is_explainably_weaker(series, second) and top.score - second.score >= 0.12:
+        return True
+    if "exact_base_title_after_subtitle_trim" in second.match_reasons and top.score - second.score >= 0.05:
+        return True
+    second_query_norm = normalize_title_strict(second.matched_query)
+    base_query_norm = normalize_title_strict(series.title)
+    if second_query_norm == base_query_norm and "exact_normalized_title" not in second.match_reasons:
+        return True
+    return False
+
+
+
+def _supports_exact_bundle_auto_resolution(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    second: MappingCandidate | None,
+    bundle_companion_candidates: list[MappingCandidate] | None,
+    candidates: list[MappingCandidate],
+) -> bool:
+    if not bundle_companion_candidates:
+        return False
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
+    if top.media_type != "tv" or top.score < 0.88:
+        return False
+    provider_hints = _provider_title_hints(series)
+    provider_season_number, _ = _provider_season_number(series)
+    if _has_non_base_installment_hint(provider_hints) or (provider_season_number or 0) >= 2:
+        return False
+
+    companion_ids = {candidate.mal_anime_id for candidate in bundle_companion_candidates}
+    if not all(
+        candidate.media_type == "tv"
+        and _candidate_has_explicit_followup_installment_hint(candidate)
+        for candidate in bundle_companion_candidates
+    ):
+        return False
+
+    close_candidate_gap = 0.12
+    for candidate in candidates[1:8]:
+        if candidate.mal_anime_id in companion_ids:
+            continue
+        if candidate.score < top.score - close_candidate_gap:
+            continue
+        if _candidate_is_explainably_weaker(series, candidate):
+            continue
+        return False
+
+    return True
+
+
+
 def _candidate_shares_bundle_title_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
     top_title_norm = normalize_title_strict(top.title)
     companion_title_norm = normalize_title_strict(companion.title)
@@ -984,9 +1238,26 @@ def _suspect_multi_entry_bundle(
 
 
 def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
+    provider_episode_evidence = max(
+        series.completed_episode_count or 0,
+        series.max_completed_episode_number or 0,
+        series.max_episode_number or 0,
+    )
+    top_has_blockers = any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in top.match_reasons)
     if second is None:
-        return top.score >= 0.99
+        return top.score >= 0.99 and not top_has_blockers
+    if (
+        top.media_type == "movie"
+        and "exact_normalized_title" in top.match_reasons
+        and top.score >= 0.99
+        and provider_episode_evidence <= 1
+        and second.media_type != "movie"
+        and "exact_normalized_title" not in second.match_reasons
+    ):
+        return True
     if top.score >= 0.99 and top.score - second.score >= 0.05:
+        if top_has_blockers:
+            return False
         if top.media_type in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"} and second.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}:
             return False
         return True
@@ -1102,7 +1373,27 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
             for reason in reasons
         )
     )
-    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match:
+    second_candidate = result.candidates[1] if len(result.candidates) > 1 else None
+    has_safe_bundle_resolution = _supports_exact_bundle_auto_resolution(
+        result.series,
+        result.chosen_candidate,
+        second_candidate,
+        result.bundle_companion_candidates,
+        result.candidates,
+    )
+    has_safe_later_installment_resolution = _supports_exact_later_installment_auto_resolution(
+        result.series,
+        result.chosen_candidate,
+        second_candidate,
+        result.bundle_companion_candidates,
+    )
+    has_safe_exact_title_overflow_resolution = _supports_exact_title_overflow_auto_resolution(
+        result.series,
+        result.chosen_candidate,
+        result.candidates,
+        result.bundle_companion_candidates,
+    )
+    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match and not has_safe_bundle_resolution and not has_safe_later_installment_resolution and not has_safe_exact_title_overflow_resolution:
         return False
 
     provider_season_number, _ = _provider_season_number(result.series)
@@ -1110,7 +1401,7 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
     if provider_season_number is not None and candidate_season_numbers and candidate_season_numbers != {provider_season_number}:
         return False
 
-    if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons):
+    if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons) and not (has_safe_bundle_resolution or has_safe_later_installment_resolution or has_safe_exact_title_overflow_resolution):
         return False
     return True
 
@@ -1202,6 +1493,41 @@ def _best_candidate_from_node(
         if best_candidate is None or candidate.score > best_candidate.score:
             best_candidate = candidate
     return best_candidate
+
+
+def _inject_supplemental_candidates(
+    client: MalClient,
+    series: SeriesMappingInput,
+    queries: list[str],
+    by_id: dict[int, MappingCandidate],
+) -> None:
+    if any(
+        "exact_normalized_title" in candidate.match_reasons or candidate.score >= 0.90
+        for candidate in by_id.values()
+    ):
+        return
+    candidate_ids: set[int] = set()
+    for key in {normalize_title_strict(series.title), normalize_title_strict(series.season_title)}:
+        candidate_ids.update(_SUPPLEMENTAL_TITLE_CANDIDATE_IDS.get(key, []))
+    for anime_id in sorted(candidate_ids):
+        try:
+            detail = client.get_anime_details(anime_id, fields="id,title,alternative_titles,media_type,status,num_episodes,start_season")
+        except MalApiError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        candidate = _best_candidate_from_node(
+            series,
+            queries,
+            detail,
+            discovery_reason="supplemental_title_candidate",
+        )
+        if candidate is None:
+            continue
+        previous = by_id.get(candidate.mal_anime_id)
+        if previous is None or candidate.score > previous.score:
+            by_id[candidate.mal_anime_id] = candidate
+
 
 
 def _expand_candidates_via_relations(
@@ -1303,6 +1629,7 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
                 previous = by_id.get(candidate.mal_anime_id)
                 if previous is None or candidate.score > previous.score:
                     by_id[candidate.mal_anime_id] = candidate
+    _inject_supplemental_candidates(client, series, queries, by_id)
     _expand_candidates_via_relations(client, series, queries, by_id)
     candidates = sorted(by_id.values(), key=_candidate_sort_key, reverse=True)
     top = candidates[0] if candidates else None
@@ -1321,7 +1648,23 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
         multi_entry_bundle_reason, bundle_companion_candidates = multi_entry_bundle
         rationale.append(multi_entry_bundle_reason)
         bundle_companion_candidate = bundle_companion_candidates[0] if bundle_companion_candidates else None
-    if _supports_exact_classification(series, top, second):
+    if _supports_exact_classification(series, top, second) or _supports_exact_bundle_auto_resolution(
+        series,
+        top,
+        second,
+        bundle_companion_candidates,
+        candidates,
+    ) or _supports_exact_later_installment_auto_resolution(
+        series,
+        top,
+        second,
+        bundle_companion_candidates,
+    ) or _supports_exact_title_overflow_auto_resolution(
+        series,
+        top,
+        candidates,
+        bundle_companion_candidates,
+    ):
         status = "exact"
     elif top.score >= 0.90 and margin >= 0.05:
         status = "strong"
