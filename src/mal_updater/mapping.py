@@ -213,6 +213,7 @@ def _normalize_with_cleanup_patterns(value: str | None, cleanup_patterns: list[r
         lowered = pattern.sub(" ", lowered)
     lowered = lowered.replace("&", " and ")
     lowered = _NON_ALNUM_RE.sub(" ", lowered)
+    lowered = re.sub(r"\b(\d+)\s+(st|nd|rd|th)\b", r"\1\2", lowered)
     return " ".join(lowered.split())
 
 
