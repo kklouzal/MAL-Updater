@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.request_tracking import estimate_budget_recovery_seconds
+from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio
 from mal_updater.service_runtime import run_pending_tasks
 
 
@@ -52,6 +52,12 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertGreaterEqual(recovery, 3500)
         self.assertLessEqual(recovery, 3555)
 
+    def test_estimate_budget_recovery_seconds_for_warn_ratio(self) -> None:
+        self._write_request_events("crunchyroll", [50, 100, 200, 300, 400, 500, 600, 700])
+        recovery = estimate_budget_recovery_seconds_for_ratio(provider="crunchyroll", limit=10, target_ratio=0.8, config=self.config)
+        self.assertGreaterEqual(recovery, 2850)
+        self.assertLessEqual(recovery, 2955)
+
     def test_run_pending_tasks_records_budget_backoff_and_skips_rechecks_until_expiry(self) -> None:
         self._write_request_events("crunchyroll", [50, 100, 200])
         self.config.service.crunchyroll_hourly_limit = 3
@@ -92,11 +98,34 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertIn("budget_backoff_active", sync_state_second["last_skip_reason"])
         self.assertGreater(sync_state_second["budget_backoff_remaining_seconds"], 0)
 
+    def test_run_pending_tasks_warn_paces_provider_before_critical_budget(self) -> None:
+        self._write_request_events("crunchyroll", [50, 100, 200, 300, 400, 500, 600, 700])
+        self.config.service.crunchyroll_hourly_limit = 10
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("skipped", sync_result["status"])
+        self.assertIn("crunchyroll_budget_warn", sync_result["reason"])
+        self.assertEqual("warn", sync_result["budget_backoff_level"])
+        self.assertGreater(sync_result["budget_backoff_remaining_seconds"], 0)
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = state["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("warn", sync_state["budget_backoff_level"])
+        self.assertIn("budget_backoff_until", sync_state)
+        self.assertIn("next_due_at", sync_state)
+
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {
             "started_at": "2026-03-20T20:00:00Z",
             "tasks": {
                 "sync_fetch_crunchyroll": {
+                    "budget_backoff_level": "warn",
                     "budget_backoff_until_epoch": 1,
                     "budget_backoff_until": "2026-03-20T21:00:00Z",
                 }
@@ -118,6 +147,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
             run_pending_tasks(self.config)
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        self.assertNotIn("budget_backoff_level", saved["tasks"]["sync_fetch_crunchyroll"])
         self.assertNotIn("budget_backoff_until", saved["tasks"]["sync_fetch_crunchyroll"])
         self.assertNotIn("budget_backoff_until_epoch", saved["tasks"]["sync_fetch_crunchyroll"])
         self.assertEqual("ok", saved["tasks"]["sync_fetch_crunchyroll"]["last_status"])

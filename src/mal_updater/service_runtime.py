@@ -12,7 +12,12 @@ from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
 from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
 from .mal_client import MalApiError, MalClient
-from .request_tracking import estimate_budget_recovery_seconds, prune_api_request_events, summarize_recent_api_usage
+from .request_tracking import (
+    estimate_budget_recovery_seconds,
+    estimate_budget_recovery_seconds_for_ratio,
+    prune_api_request_events,
+    summarize_recent_api_usage,
+)
 
 
 @dataclass(slots=True)
@@ -175,6 +180,13 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
     usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
     limit = config.service.hourly_limit_for(provider)
     ratio = 0.0 if limit <= 0 else float(usage.get("request_count", 0)) / float(limit)
+    warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
+        provider=provider,
+        limit=limit,
+        target_ratio=config.service.warn_ratio,
+        window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        config=config,
+    )
     recovery_seconds = estimate_budget_recovery_seconds(
         provider=provider,
         limit=limit,
@@ -186,9 +198,14 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
     usage["ratio"] = ratio
     usage["warn_ratio"] = config.service.warn_ratio
     usage["critical_ratio"] = config.service.critical_ratio
+    usage["warn_recovery_seconds"] = warn_recovery_seconds
     usage["recovery_seconds"] = recovery_seconds
     if ratio >= config.service.critical_ratio:
+        usage["backoff_level"] = "critical"
         return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={recovery_seconds}s", usage
+    if ratio >= config.service.warn_ratio and warn_recovery_seconds > 0:
+        usage["backoff_level"] = "warn"
+        return False, f"{provider}_budget_warn ratio={ratio:.3f} cooldown={warn_recovery_seconds}s", usage
     return True, None, usage
 
 
@@ -229,18 +246,22 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "reason": f"budget_backoff_active remaining={remaining}s",
                     "budget_backoff_until": task_state.get("budget_backoff_until"),
                     "budget_backoff_remaining_seconds": remaining,
+                    "budget_backoff_level": task_state.get("budget_backoff_level"),
                 }
             )
             continue
         allowed, reason, usage = _budget_gate(config, spec.budget_provider)
         if not allowed:
-            recovery_seconds = int(usage.get("recovery_seconds", 0)) if isinstance(usage, dict) else 0
+            backoff_level = usage.get("backoff_level") if isinstance(usage, dict) else None
+            recovery_key = "warn_recovery_seconds" if backoff_level == "warn" else "recovery_seconds"
+            recovery_seconds = int(usage.get(recovery_key, 0)) if isinstance(usage, dict) else 0
             skipped_at = _now_iso()
             task_state.update(
                 {
                     "last_status": "skipped",
                     "last_skipped_at": skipped_at,
                     "last_skip_reason": reason,
+                    "budget_backoff_level": backoff_level,
                     "budget_backoff_until_epoch": now + recovery_seconds,
                     "budget_backoff_until": _iso_after_seconds(recovery_seconds),
                     "budget_backoff_remaining_seconds": recovery_seconds,
@@ -254,6 +275,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "status": "skipped",
                     "reason": reason,
                     "api_usage": usage,
+                    "budget_backoff_level": backoff_level,
                     "budget_backoff_until": task_state.get("budget_backoff_until"),
                     "budget_backoff_remaining_seconds": recovery_seconds,
                 }
@@ -282,6 +304,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.pop("last_error", None)
             task_state.pop("last_skip_reason", None)
             task_state.pop("last_skipped_at", None)
+            task_state.pop("budget_backoff_level", None)
             task_state.pop("budget_backoff_until_epoch", None)
             task_state.pop("budget_backoff_until", None)
             task_state.pop("budget_backoff_remaining_seconds", None)
@@ -294,6 +317,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             task_state.pop("last_skip_reason", None)
             task_state.pop("last_skipped_at", None)
+            task_state.pop("budget_backoff_level", None)
             task_state.pop("budget_backoff_until_epoch", None)
             task_state.pop("budget_backoff_until", None)
             task_state.pop("budget_backoff_remaining_seconds", None)

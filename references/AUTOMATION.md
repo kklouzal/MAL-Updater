@@ -56,6 +56,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 
 - recent daemon loop timing (`last_loop_at`)
 - per-lane task summaries from `service-state.json` (including last decision time plus last-run start/finish/duration when available)
+- persisted budget backoff details, including whether a lane is cooling down at `warn` or `critical` level
 - current API-usage snapshot when available
 - recent `service.log` tail lines
 - parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)

@@ -110,6 +110,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "last_decision_at",
         "last_started_at",
         "last_finished_at",
+        "budget_backoff_level",
         "budget_backoff_until",
         "next_due_at",
         "budget_provider",

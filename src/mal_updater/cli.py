@@ -545,6 +545,9 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             next_due_in_seconds = task_payload.get("next_due_in_seconds") if isinstance(task_payload.get("next_due_in_seconds"), int) else None
             if next_due_in_seconds is not None:
                 print(f"task_{task_name}_next_due_in_seconds={next_due_in_seconds}")
+            budget_backoff_level = task_payload.get("budget_backoff_level") if isinstance(task_payload.get("budget_backoff_level"), str) else None
+            if budget_backoff_level is not None:
+                print(f"task_{task_name}_budget_backoff_level={budget_backoff_level}")
             budget_backoff_until = task_payload.get("budget_backoff_until") if isinstance(task_payload.get("budget_backoff_until"), str) else None
             if budget_backoff_until is not None:
                 print(f"task_{task_name}_budget_backoff_until={budget_backoff_until}")

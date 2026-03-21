@@ -131,11 +131,11 @@ def summarize_recent_api_usage(*, provider: str, window_seconds: int = 3600, con
     return ApiUsageSummary(provider, window_seconds, request_count, success_count, error_count, dict(by_operation), last_event_at)
 
 
-def estimate_budget_recovery_seconds(
+def estimate_budget_recovery_seconds_for_ratio(
     *,
     provider: str,
     limit: int,
-    critical_ratio: float,
+    target_ratio: float,
     window_seconds: int = 3600,
     config: AppConfig | None = None,
 ) -> int:
@@ -144,13 +144,31 @@ def estimate_budget_recovery_seconds(
     event_times = _recent_provider_event_times(provider=provider, window_seconds=window_seconds, config=config)
     if not event_times:
         return 0
-    allowed_requests = max(0, math.floor(limit * critical_ratio) - 1)
+    normalized_ratio = max(0.0, min(1.0, float(target_ratio)))
+    allowed_requests = max(0, math.floor(limit * normalized_ratio) - 1)
     if len(event_times) <= allowed_requests:
         return 0
     now = datetime.now(timezone.utc)
     drop_count = len(event_times) - allowed_requests
     candidate = event_times[drop_count - 1] + timedelta(seconds=window_seconds)
     return max(0, math.ceil((candidate - now).total_seconds()))
+
+
+def estimate_budget_recovery_seconds(
+    *,
+    provider: str,
+    limit: int,
+    critical_ratio: float,
+    window_seconds: int = 3600,
+    config: AppConfig | None = None,
+) -> int:
+    return estimate_budget_recovery_seconds_for_ratio(
+        provider=provider,
+        limit=limit,
+        target_ratio=critical_ratio,
+        window_seconds=window_seconds,
+        config=config,
+    )
 
 
 def prune_api_request_events(*, retention_days: int = 14, config: AppConfig | None = None) -> int:

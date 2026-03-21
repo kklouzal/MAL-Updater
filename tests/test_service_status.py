@@ -64,6 +64,7 @@ class ServiceStatusTests(unittest.TestCase):
                         "health": {
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "crunchyroll_budget_critical ratio=1.000 cooldown=1800s",
+                            "budget_backoff_level": "critical",
                             "budget_backoff_until": "2026-03-20T22:23:00Z",
                             "budget_backoff_remaining_seconds": 1800,
                             "every_seconds": 43200,
@@ -126,6 +127,7 @@ class ServiceStatusTests(unittest.TestCase):
         health_summary = payload["task_state"]["health"]
         self.assertEqual("2026-03-20T21:53:00Z", health_summary["last_skipped_at"])
         self.assertEqual("crunchyroll_budget_critical ratio=1.000 cooldown=1800s", health_summary["last_skip_reason"])
+        self.assertEqual("critical", health_summary["budget_backoff_level"])
         self.assertEqual("2026-03-20T22:23:00Z", health_summary["budget_backoff_until"])
         self.assertEqual(43200, health_summary["every_seconds"])
         self.assertEqual("2026-03-21T09:53:00Z", health_summary["next_due_at"])
@@ -189,6 +191,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "budget_guard",
                             "last_decision_at": "2026-03-20T21:53:00Z",
+                            "budget_backoff_level": "warn",
                             "budget_backoff_until": "2026-03-20T22:13:00Z",
                             "budget_backoff_remaining_seconds": 1200,
                             "every_seconds": 43200,
@@ -248,6 +251,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_next_due_at=2026-03-21T03:54:00Z", stdout)
         self.assertIn("task_health_last_skip_reason=budget_guard", stdout)
         self.assertIn("task_health_last_decision_at=2026-03-20T21:53:00Z", stdout)
+        self.assertIn("task_health_budget_backoff_level=warn", stdout)
         self.assertIn("task_health_budget_backoff_until=2026-03-20T22:13:00Z", stdout)
         self.assertIn("task_health_budget_backoff_remaining_seconds=", stdout)
         self.assertIn("task_health_next_due_at=2026-03-21T09:53:00Z", stdout)
