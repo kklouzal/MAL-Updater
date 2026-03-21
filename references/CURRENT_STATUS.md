@@ -19,6 +19,7 @@
 - long-lived daemon runtime + service manager exist
 - service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging, plus a terse `--format summary` operator view for quick checks
 - request-event logging / budget awareness scaffolding exists
+- daemon budget skips now compute a recovery window, persist per-task backoff state, and avoid re-check/log spam until the provider budget has room again
 - recommendation generation and metadata refresh exist
 - tests remain bundled in the repo for third-party auditing
 

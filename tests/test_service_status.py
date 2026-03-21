@@ -60,7 +60,8 @@ class ServiceStatusTests(unittest.TestCase):
                         },
                         "health": {
                             "last_skipped_at": "2026-03-20T21:53:00Z",
-                            "last_skip_reason": "crunchyroll_budget_critical ratio=1.000",
+                            "last_skip_reason": "crunchyroll_budget_critical ratio=1.000 cooldown=1800s",
+                            "budget_backoff_until": "2026-03-20T22:23:00Z",
                         },
                     },
                 },
@@ -116,7 +117,8 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual(
             {
                 "last_skipped_at": "2026-03-20T21:53:00Z",
-                "last_skip_reason": "crunchyroll_budget_critical ratio=1.000",
+                "last_skip_reason": "crunchyroll_budget_critical ratio=1.000 cooldown=1800s",
+                "budget_backoff_until": "2026-03-20T22:23:00Z",
             },
             payload["task_state"]["health"],
         )
@@ -170,6 +172,7 @@ class ServiceStatusTests(unittest.TestCase):
                         "health": {
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "budget_guard",
+                            "budget_backoff_until": "2026-03-20T22:13:00Z",
                         },
                     },
                 },
@@ -217,6 +220,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("api_crunchyroll_success_count=2", stdout)
         self.assertIn("task_sync_last_status=ok", stdout)
         self.assertIn("task_health_last_skip_reason=budget_guard", stdout)
+        self.assertIn("task_health_budget_backoff_until=2026-03-20T22:13:00Z", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
 
     def test_service_status_summary_surfaces_parse_errors(self) -> None:

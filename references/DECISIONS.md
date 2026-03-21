@@ -137,3 +137,13 @@ Treat repeated Crunchyroll fetches as incremental by default.
 - the recurring durability problem is still fresh full-cycle Crunchyroll paging, especially `watch-history` returning `401` before the run finishes
 - an overlap checkpoint directly reduces request count on repeated runs without pretending deleted/reordered remote history is solved
 - keeping the boundary file small and local makes the behavior auditable and easy to reset
+
+## 2026-03-20 - Daemon budget backoff posture
+
+### Decision
+When the daemon hits a provider budget critical threshold, persist a per-task cooldown window and stop re-checking that task every loop until enough request history ages out of the hourly window.
+
+### Why
+- repeated every-loop budget skips create noisy logs without making progress
+- recovery should be based on the observed request window, not a hand-wavy fixed sleep
+- surfacing `budget_backoff_until` in service state/status makes unattended behavior easier to reason about during debugging

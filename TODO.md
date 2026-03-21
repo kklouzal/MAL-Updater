@@ -14,7 +14,7 @@
 ## Daemon / operations
 
 - [ ] Tighten daemon control loops and per-lane state tracking
-- [ ] Improve request-budget accounting / backoff behavior for MAL and Crunchyroll
+- [ ] Continue refining request-budget accounting / backoff behavior for MAL and Crunchyroll (recovery-window backoff now exists; next likely steps are smarter warn-threshold pacing and provider-specific cooldown heuristics)
 - [ ] Decide whether to retire the remaining transitional wrapper scripts after more daemon logic moves in-process
 - [x] Add richer service-state/observability surfaces for debugging unattended failures
 - [x] Add `service-status --format summary` as a terse/operator-summary mode alongside the rich JSON surface

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import load_config
+from .config import AppConfig, load_config
 
 
 @dataclass(slots=True)
@@ -32,10 +33,42 @@ class ApiUsageSummary:
         }
 
 
-def _events_path() -> Path:
-    config = load_config()
-    config.api_request_events_path.parent.mkdir(parents=True, exist_ok=True)
-    return config.api_request_events_path
+def _events_path(config: AppConfig | None = None) -> Path:
+    resolved_config = config or load_config()
+    resolved_config.api_request_events_path.parent.mkdir(parents=True, exist_ok=True)
+    return resolved_config.api_request_events_path
+
+
+def _parse_event_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _recent_provider_event_times(*, provider: str, window_seconds: int, config: AppConfig | None = None) -> list[datetime]:
+    path = _events_path(config)
+    if not path.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+    event_times: list[datetime] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("provider") != provider:
+            continue
+        at = _parse_event_timestamp(event.get("at"))
+        if at is None or at < cutoff:
+            continue
+        event_times.append(at)
+    event_times.sort()
+    return event_times
 
 
 def record_api_request_event(
@@ -47,6 +80,7 @@ def record_api_request_event(
     outcome: str,
     status_code: int | None = None,
     error: str | None = None,
+    config: AppConfig | None = None,
 ) -> None:
     event = {
         "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -58,13 +92,13 @@ def record_api_request_event(
         "status_code": status_code,
         "error": error,
     }
-    path = _events_path()
+    path = _events_path(config)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, sort_keys=True) + "\n")
 
 
-def summarize_recent_api_usage(*, provider: str, window_seconds: int = 3600) -> ApiUsageSummary:
-    path = _events_path()
+def summarize_recent_api_usage(*, provider: str, window_seconds: int = 3600, config: AppConfig | None = None) -> ApiUsageSummary:
+    path = _events_path(config)
     if not path.exists():
         return ApiUsageSummary(provider, window_seconds, 0, 0, 0, {}, None)
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
@@ -83,13 +117,8 @@ def summarize_recent_api_usage(*, provider: str, window_seconds: int = 3600) -> 
         if event.get("provider") != provider:
             continue
         at_raw = event.get("at")
-        if not isinstance(at_raw, str):
-            continue
-        try:
-            at = datetime.fromisoformat(at_raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if at < cutoff:
+        at = _parse_event_timestamp(at_raw)
+        if at is None or at < cutoff:
             continue
         request_count += 1
         operation = str(event.get("operation") or "unknown")
@@ -102,8 +131,30 @@ def summarize_recent_api_usage(*, provider: str, window_seconds: int = 3600) -> 
     return ApiUsageSummary(provider, window_seconds, request_count, success_count, error_count, dict(by_operation), last_event_at)
 
 
-def prune_api_request_events(*, retention_days: int = 14) -> int:
-    path = _events_path()
+def estimate_budget_recovery_seconds(
+    *,
+    provider: str,
+    limit: int,
+    critical_ratio: float,
+    window_seconds: int = 3600,
+    config: AppConfig | None = None,
+) -> int:
+    if limit <= 0:
+        return 0
+    event_times = _recent_provider_event_times(provider=provider, window_seconds=window_seconds, config=config)
+    if not event_times:
+        return 0
+    allowed_requests = max(0, math.floor(limit * critical_ratio) - 1)
+    if len(event_times) <= allowed_requests:
+        return 0
+    now = datetime.now(timezone.utc)
+    drop_count = len(event_times) - allowed_requests
+    candidate = event_times[drop_count - 1] + timedelta(seconds=window_seconds)
+    return max(0, math.ceil((candidate - now).total_seconds()))
+
+
+def prune_api_request_events(*, retention_days: int = 14, config: AppConfig | None = None) -> int:
+    path = _events_path(config)
     if not path.exists():
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)

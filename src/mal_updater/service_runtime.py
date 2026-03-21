@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import subprocess
 import time
@@ -10,7 +10,7 @@ from typing import Any
 from .auth import persist_token_response
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
 from .mal_client import MalApiError, MalClient
-from .request_tracking import prune_api_request_events, summarize_recent_api_usage
+from .request_tracking import estimate_budget_recovery_seconds, prune_api_request_events, summarize_recent_api_usage
 
 
 @dataclass(slots=True)
@@ -20,8 +20,15 @@ class TaskSpec:
     budget_provider: str | None = None
 
 
+_BUDGET_GATE_WINDOW_SECONDS = 3600
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_after_seconds(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0, seconds))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _load_state(config: AppConfig) -> dict[str, Any]:
@@ -83,13 +90,23 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
 def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | None, dict[str, Any] | None]:
     if provider is None:
         return True, None, None
-    usage = summarize_recent_api_usage(provider=provider).as_dict()
+    usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
     limit = config.service.mal_hourly_limit if provider == "mal" else config.service.crunchyroll_hourly_limit
     ratio = 0.0 if limit <= 0 else float(usage.get("request_count", 0)) / float(limit)
+    recovery_seconds = estimate_budget_recovery_seconds(
+        provider=provider,
+        limit=limit,
+        critical_ratio=config.service.critical_ratio,
+        window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        config=config,
+    )
     usage["limit"] = limit
     usage["ratio"] = ratio
+    usage["warn_ratio"] = config.service.warn_ratio
+    usage["critical_ratio"] = config.service.critical_ratio
+    usage["recovery_seconds"] = recovery_seconds
     if ratio >= config.service.critical_ratio:
-        return False, f"{provider}_budget_critical ratio={ratio:.3f}", usage
+        return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={recovery_seconds}s", usage
     return True, None, usage
 
 
@@ -100,7 +117,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
     tasks_state = state.setdefault("tasks", {})
     now = time.time()
     results: list[dict[str, Any]] = []
-    pruned = prune_api_request_events(retention_days=14)
+    pruned = prune_api_request_events(retention_days=14, config=config)
     if pruned:
         _append_log(config, f"api_request_events_pruned={pruned}")
 
@@ -109,10 +126,40 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         last_run = float(task_state.get("last_run_epoch", 0))
         if now - last_run < spec.every_seconds:
             continue
+        backoff_until_epoch = float(task_state.get("budget_backoff_until_epoch", 0))
+        if backoff_until_epoch > now:
+            remaining = max(0, int(backoff_until_epoch - now))
+            results.append(
+                {
+                    "task": spec.name,
+                    "status": "skipped",
+                    "reason": f"budget_backoff_active remaining={remaining}s",
+                    "budget_backoff_until": task_state.get("budget_backoff_until"),
+                    "budget_backoff_remaining_seconds": remaining,
+                }
+            )
+            continue
         allowed, reason, usage = _budget_gate(config, spec.budget_provider)
         if not allowed:
-            task_state.update({"last_skipped_at": _now_iso(), "last_skip_reason": reason})
-            results.append({"task": spec.name, "status": "skipped", "reason": reason, "api_usage": usage})
+            recovery_seconds = int(usage.get("recovery_seconds", 0)) if isinstance(usage, dict) else 0
+            task_state.update(
+                {
+                    "last_skipped_at": _now_iso(),
+                    "last_skip_reason": reason,
+                    "budget_backoff_until_epoch": now + recovery_seconds,
+                    "budget_backoff_until": _iso_after_seconds(recovery_seconds),
+                }
+            )
+            results.append(
+                {
+                    "task": spec.name,
+                    "status": "skipped",
+                    "reason": reason,
+                    "api_usage": usage,
+                    "budget_backoff_until": task_state.get("budget_backoff_until"),
+                    "budget_backoff_remaining_seconds": recovery_seconds,
+                }
+            )
             _append_log(config, f"task={spec.name} status=skipped reason={reason}")
             continue
         try:
@@ -126,6 +173,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result = {"status": "skipped", "reason": "unknown_task"}
             task_state.update({"last_run_epoch": now, "last_run_at": _now_iso(), "last_status": result.get("status", "ok"), "last_result": result})
             task_state.pop("last_error", None)
+            task_state.pop("budget_backoff_until_epoch", None)
+            task_state.pop("budget_backoff_until", None)
             results.append({"task": spec.name, **result})
         except (MalApiError, OSError, subprocess.SubprocessError) as exc:
             task_state.update({"last_run_epoch": now, "last_run_at": _now_iso(), "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
@@ -134,8 +183,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
 
     state["last_loop_at"] = _now_iso()
     state["api_usage"] = {
-        "mal": summarize_recent_api_usage(provider="mal").as_dict(),
-        "crunchyroll": summarize_recent_api_usage(provider="crunchyroll").as_dict(),
+        "mal": summarize_recent_api_usage(provider="mal", window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict(),
+        "crunchyroll": summarize_recent_api_usage(provider="crunchyroll", window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict(),
     }
     _save_state(config, state)
     return {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}

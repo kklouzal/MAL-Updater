@@ -88,7 +88,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     summary: dict[str, Any] = {}
-    for field in ("last_run_at", "last_status", "last_skipped_at", "last_skip_reason", "last_error"):
+    for field in ("last_run_at", "last_status", "last_skipped_at", "last_skip_reason", "last_error", "budget_backoff_until"):
         field_value = value.get(field)
         if field_value is not None:
             summary[field] = field_value

@@ -405,6 +405,9 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             last_error = task_payload.get("last_error") if isinstance(task_payload.get("last_error"), str) else None
             if last_error is not None:
                 print(f"task_{task_name}_last_error={last_error}")
+            budget_backoff_until = task_payload.get("budget_backoff_until") if isinstance(task_payload.get("budget_backoff_until"), str) else None
+            if budget_backoff_until is not None:
+                print(f"task_{task_name}_budget_backoff_until={budget_backoff_until}")
 
     service_log_tail = payload.get("service_log_tail")
     if isinstance(service_log_tail, list) and service_log_tail:
