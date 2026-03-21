@@ -202,89 +202,147 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     }
     missing_dependencies = [name for name, present in dependency_checks.items() if not present]
 
+    crunchyroll_credentials_present = bool(crunchyroll_credentials.username) and bool(crunchyroll_credentials.password)
+    crunchyroll_session_present = crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists()
+    hidive_credentials_present = bool(hidive_credentials.username) and bool(hidive_credentials.password)
+    hidive_session_present = hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists()
+    mal_app_present = bool(secrets.client_id)
+    mal_oauth_present = bool(secrets.access_token) and bool(secrets.refresh_token)
+
     onboarding_steps: list[dict[str, object]] = []
-    if not dependency_checks["python3"]:
+
+    def add_onboarding_step(
+        *,
+        step: str,
+        details: str,
+        user_action_required: bool,
+        command: str | None = None,
+        command_args: list[str] | None = None,
+        applies_to: str | None = None,
+    ) -> None:
         onboarding_steps.append(
             {
-                "step": "install-python",
+                "step": step,
                 "status": "missing",
-                "user_action_required": True,
-                "details": "Install Python 3.10+ so the mal-updater console script and CLI can run.",
-            }
-        )
-    if not dependency_checks["curl_cffi"]:
-        onboarding_steps.append(
-            {
-                "step": "install-optional-crunchyroll-transport",
-                "status": "missing",
-                "user_action_required": False,
-                "details": "Install the optional crunchyroll extra (`pip install -e '.[crunchyroll]'`) for browser-TLS impersonation against Crunchyroll.",
+                "user_action_required": user_action_required,
+                "command": command,
+                "command_args": command_args or [],
+                "applies_to": applies_to,
+                "details": details,
             }
         )
 
-    if not secrets.client_id:
-        onboarding_steps.append(
-            {
-                "step": "create-mal-app",
-                "status": "missing",
-                "user_action_required": True,
-                "details": f"Create a MyAnimeList API app and record its client id at {secrets.client_id_path}. Configure redirect URI {config.mal.redirect_uri} in the MAL app settings.",
-            }
+    if not dependency_checks["python3"]:
+        add_onboarding_step(
+            step="install-python",
+            details="Install Python 3.10+ so the mal-updater console script and CLI can run.",
+            user_action_required=True,
+            applies_to="host",
         )
-    if not secrets.access_token or not secrets.refresh_token:
-        onboarding_steps.append(
-            {
-                "step": "complete-mal-oauth",
-                "status": "missing",
-                "user_action_required": True,
-                "details": "Run `mal-updater mal-auth-login` after the MAL app exists so the skill can persist access and refresh tokens.",
-            }
+    if not dependency_checks["curl_cffi"]:
+        add_onboarding_step(
+            step="install-optional-crunchyroll-transport",
+            details="Install the optional crunchyroll extra (`pip install -e '.[crunchyroll]'`) for browser-TLS impersonation against Crunchyroll.",
+            user_action_required=False,
+            command="python3 -m pip install -e '.[crunchyroll]'",
+            command_args=["python3", "-m", "pip", "install", "-e", ".[crunchyroll]"],
+            applies_to="crunchyroll",
         )
-    if not crunchyroll_credentials.username or not crunchyroll_credentials.password:
-        onboarding_steps.append(
-            {
-                "step": "stage-crunchyroll-credentials",
-                "status": "missing",
-                "user_action_required": True,
-                "details": f"Store Crunchyroll credentials at {crunchyroll_credentials.username_path} and {crunchyroll_credentials.password_path}.",
-            }
+
+    if not mal_app_present:
+        add_onboarding_step(
+            step="create-mal-app",
+            details=f"Create a MyAnimeList API app and record its client id at {secrets.client_id_path}. Configure redirect URI {config.mal.redirect_uri} in the MAL app settings.",
+            user_action_required=True,
+            applies_to="mal",
         )
-    if not crunchyroll_state.refresh_token_path.exists():
-        onboarding_steps.append(
-            {
-                "step": "bootstrap-crunchyroll-session",
-                "status": "missing",
-                "user_action_required": False,
-                "details": "Run `mal-updater crunchyroll-auth-login` to mint and stage the long-lived Crunchyroll refresh token/device id pair.",
-            }
+    if not mal_oauth_present:
+        add_onboarding_step(
+            step="complete-mal-oauth",
+            details="Run `mal-updater mal-auth-login` after the MAL app exists so the skill can persist access and refresh tokens.",
+            user_action_required=True,
+            command="PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login",
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "mal-auth-login"],
+            applies_to="mal",
         )
-    if not hidive_credentials.username or not hidive_credentials.password:
-        onboarding_steps.append(
-            {
-                "step": "stage-hidive-credentials",
-                "status": "missing",
-                "user_action_required": True,
-                "details": f"Store HIDIVE credentials at {hidive_credentials.username_path} and {hidive_credentials.password_path}.",
-            }
+    if not crunchyroll_credentials_present:
+        add_onboarding_step(
+            step="stage-crunchyroll-credentials",
+            details=f"Store Crunchyroll credentials at {crunchyroll_credentials.username_path} and {crunchyroll_credentials.password_path}.",
+            user_action_required=True,
+            applies_to="crunchyroll",
         )
-    if not hidive_state.access_token_path.exists() or not hidive_state.refresh_token_path.exists():
-        onboarding_steps.append(
-            {
-                "step": "bootstrap-hidive-session",
-                "status": "missing",
-                "user_action_required": False,
-                "details": "Run `mal-updater provider-auth-login --provider hidive` to mint and stage HIDIVE authorisation/refresh tokens.",
-            }
+    if not crunchyroll_session_present:
+        add_onboarding_step(
+            step="bootstrap-crunchyroll-session",
+            details="Run `mal-updater provider-auth-login --provider crunchyroll` to mint and stage the long-lived Crunchyroll refresh token/device id pair.",
+            user_action_required=False,
+            command="PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "crunchyroll"],
+            applies_to="crunchyroll",
+        )
+    if not hidive_credentials_present:
+        add_onboarding_step(
+            step="stage-hidive-credentials",
+            details=f"Store HIDIVE credentials at {hidive_credentials.username_path} and {hidive_credentials.password_path}.",
+            user_action_required=True,
+            applies_to="hidive",
+        )
+    if not hidive_session_present:
+        add_onboarding_step(
+            step="bootstrap-hidive-session",
+            details="Run `mal-updater provider-auth-login --provider hidive` to mint and stage HIDIVE authorisation/refresh tokens.",
+            user_action_required=False,
+            command="PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "hidive"],
+            applies_to="hidive",
         )
     if not dependency_checks["systemctl"]:
-        onboarding_steps.append(
-            {
-                "step": "install-service-manager",
-                "status": "missing",
-                "user_action_required": True,
-                "details": "systemctl is unavailable; install/enable a compatible service manager or plan to run `mal-updater service-run` manually in the foreground.",
-            }
+        add_onboarding_step(
+            step="install-service-manager",
+            details="systemctl is unavailable; install/enable a compatible service manager or plan to run `mal-updater service-run` manually in the foreground.",
+            user_action_required=True,
+            applies_to="automation",
         )
+
+    blocking_steps = [item for item in onboarding_steps if item["user_action_required"]]
+    nonblocking_steps = [item for item in onboarding_steps if not item["user_action_required"]]
+    actionable_commands = [item for item in onboarding_steps if isinstance(item.get("command"), str)]
+    providers = {
+        "crunchyroll": {
+            "enabled_by_credentials": crunchyroll_credentials_present,
+            "credentials_present": crunchyroll_credentials_present,
+            "session_present": crunchyroll_session_present,
+            "transport_ready": dependency_checks["curl_cffi"],
+            "ready": crunchyroll_credentials_present and crunchyroll_session_present and dependency_checks["curl_cffi"],
+            "missing": [
+                name
+                for name, present in (
+                    ("credentials", crunchyroll_credentials_present),
+                    ("session", crunchyroll_session_present),
+                    ("transport", dependency_checks["curl_cffi"]),
+                )
+                if not present
+            ],
+            "bootstrap_command": "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
+        },
+        "hidive": {
+            "enabled_by_credentials": hidive_credentials_present,
+            "credentials_present": hidive_credentials_present,
+            "session_present": hidive_session_present,
+            "transport_ready": True,
+            "ready": hidive_credentials_present and hidive_session_present,
+            "missing": [
+                name
+                for name, present in (
+                    ("credentials", hidive_credentials_present),
+                    ("session", hidive_session_present),
+                )
+                if not present
+            ],
+            "bootstrap_command": "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+        },
+    }
 
     payload = {
         "project_root": str(config.project_root),
@@ -308,7 +366,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "missing": missing_dependencies,
         },
         "credentials": {
-            "mal_client_id_present": bool(secrets.client_id),
+            "mal_client_id_present": mal_app_present,
             "mal_access_token_present": bool(secrets.access_token),
             "mal_refresh_token_present": bool(secrets.refresh_token),
             "crunchyroll_username_present": bool(crunchyroll_credentials.username),
@@ -327,12 +385,25 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "service_model": "user-systemd daemon",
         },
         "mal": {
+            "client_id_present": mal_app_present,
+            "oauth_ready": mal_oauth_present,
+            "ready": mal_app_present and mal_oauth_present,
             "redirect_uri": config.mal.redirect_uri,
             "bind_host": config.mal.bind_host,
             "redirect_host": config.mal.redirect_host,
             "redirect_port": config.mal.redirect_port,
+            "auth_command": "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login",
+        },
+        "providers": providers,
+        "summary": {
+            "blocking_step_count": len(blocking_steps),
+            "nonblocking_step_count": len(nonblocking_steps),
+            "actionable_command_count": len(actionable_commands),
+            "ready_provider_count": sum(1 for provider in providers.values() if provider["ready"]),
+            "provider_count": len(providers),
         },
         "onboarding_steps": onboarding_steps,
+        "recommended_commands": actionable_commands,
         "ready": not onboarding_steps and not missing_dependencies,
     }
 
@@ -340,10 +411,21 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         print(f"ready={payload['ready']}")
         print(f"runtime_root={config.runtime_root}")
         print(f"settings_path={config.settings_path}")
+        print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
+        print(f"nonblocking_step_count={payload['summary']['nonblocking_step_count']}")
+        print(f"ready_provider_count={payload['summary']['ready_provider_count']}")
         if missing_dependencies:
             print("missing_dependencies=" + ", ".join(missing_dependencies))
+        for provider_name, provider_payload in providers.items():
+            print(f"provider_{provider_name}_ready={provider_payload['ready']}")
+            missing = provider_payload.get("missing") if isinstance(provider_payload.get("missing"), list) else []
+            if missing:
+                print(f"provider_{provider_name}_missing=" + ", ".join(str(item) for item in missing))
         for item in onboarding_steps:
             print(f"next_step={item['step']}: {item['details']}")
+            command = item.get("command")
+            if isinstance(command, str) and command:
+                print(f"next_command={command}")
         return 0
 
     print(json.dumps(payload, indent=2, sort_keys=True))

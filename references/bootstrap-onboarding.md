@@ -26,6 +26,8 @@ Use `--summary` for terse line-oriented output.
 
 ## What bootstrap-audit tells you
 
+The default JSON output is intended to be automation-friendly: it includes per-provider readiness, missing capability buckets, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action.
+
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
 - whether `python3`, `flock`, `systemctl`, and optional provider/runtime extras are available

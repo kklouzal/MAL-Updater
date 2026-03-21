@@ -9,7 +9,7 @@
 - [x] Replace timer-first unattended automation with a user-level daemon-first model
 - [x] Establish public-repo anonymization as an explicit project constraint for tracked code/references/tests/history
 - [ ] Keep tightening the bootstrap/onboarding UX for new OpenClaw installs
-- [ ] Consider whether bootstrap/install metadata should become more machine-readable beyond the current CLI audit surface
+- [x] Make bootstrap/install metadata more machine-readable with provider readiness and explicit recommended commands in `bootstrap-audit`
 
 ## Daemon / operations
 
