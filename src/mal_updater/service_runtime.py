@@ -54,6 +54,24 @@ def _append_log(config: AppConfig, message: str) -> None:
         fh.write(f"[{_now_iso()}] {message}\n")
 
 
+def _mark_task_decision(task_state: dict[str, Any], *, decision_at: str | None = None) -> None:
+    task_state["last_decision_at"] = decision_at or _now_iso()
+
+
+def _record_task_timing(
+    task_state: dict[str, Any],
+    *,
+    started_epoch: float,
+    finished_epoch: float,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> None:
+    task_state["last_started_at"] = started_at or datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    task_state["last_finished_at"] = finished_at or datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    task_state["last_duration_seconds"] = max(0.0, round(float(finished_epoch) - float(started_epoch), 3))
+    _mark_task_decision(task_state, decision_at=task_state["last_finished_at"])
+
+
 def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[str, Any]:
     env = {
         **__import__("os").environ,
@@ -217,16 +235,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         allowed, reason, usage = _budget_gate(config, spec.budget_provider)
         if not allowed:
             recovery_seconds = int(usage.get("recovery_seconds", 0)) if isinstance(usage, dict) else 0
+            skipped_at = _now_iso()
             task_state.update(
                 {
                     "last_status": "skipped",
-                    "last_skipped_at": _now_iso(),
+                    "last_skipped_at": skipped_at,
                     "last_skip_reason": reason,
                     "budget_backoff_until_epoch": now + recovery_seconds,
                     "budget_backoff_until": _iso_after_seconds(recovery_seconds),
                     "budget_backoff_remaining_seconds": recovery_seconds,
                 }
             )
+            _mark_task_decision(task_state, decision_at=skipped_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             results.append(
                 {
@@ -240,6 +260,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             )
             _append_log(config, f"task={spec.name} status=skipped reason={reason}")
             continue
+        started_epoch = time.time()
+        started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         try:
             if spec.name == "mal_refresh":
                 result = _refresh_mal_tokens(config)
@@ -252,7 +274,10 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result = _run_subprocess(config, [str(config.project_root / "scripts" / "run_health_check_cycle.sh")], label="health")
             else:
                 result = {"status": "skipped", "reason": "unknown_task"}
-            task_state.update({"last_run_epoch": now, "last_run_at": _now_iso(), "last_status": result.get("status", "ok"), "last_result": result})
+            finished_epoch = time.time()
+            finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": result.get("status", "ok"), "last_result": result})
+            _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             task_state.pop("last_error", None)
             task_state.pop("last_skip_reason", None)
@@ -262,8 +287,15 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.pop("budget_backoff_remaining_seconds", None)
             results.append({"task": spec.name, **result})
         except (MalApiError, OSError, subprocess.SubprocessError) as exc:
-            task_state.update({"last_run_epoch": now, "last_run_at": _now_iso(), "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
+            finished_epoch = time.time()
+            finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
+            _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            task_state.pop("last_skip_reason", None)
+            task_state.pop("last_skipped_at", None)
+            task_state.pop("budget_backoff_until_epoch", None)
+            task_state.pop("budget_backoff_until", None)
             task_state.pop("budget_backoff_remaining_seconds", None)
             results.append({"task": spec.name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
             _append_log(config, f"task={spec.name} status=error error={type(exc).__name__}: {exc}")
@@ -276,7 +308,6 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
     }
     _save_state(config, state)
     return {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}
-
 
 def run_service_loop(config: AppConfig | None = None) -> int:
     config = config or load_config()

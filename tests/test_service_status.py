@@ -177,6 +177,10 @@ class ServiceStatusTests(unittest.TestCase):
                         "sync": {
                             "last_run_at": "2026-03-20T21:54:00Z",
                             "last_status": "ok",
+                            "last_decision_at": "2026-03-20T21:54:02Z",
+                            "last_started_at": "2026-03-20T21:54:00Z",
+                            "last_finished_at": "2026-03-20T21:54:02Z",
+                            "last_duration_seconds": 2.0,
                             "every_seconds": 21600,
                             "budget_provider": "mal",
                             "next_due_at": "2026-03-21T03:54:00Z",
@@ -184,6 +188,7 @@ class ServiceStatusTests(unittest.TestCase):
                         "health": {
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "budget_guard",
+                            "last_decision_at": "2026-03-20T21:53:00Z",
                             "budget_backoff_until": "2026-03-20T22:13:00Z",
                             "budget_backoff_remaining_seconds": 1200,
                             "every_seconds": 43200,
@@ -236,8 +241,13 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_last_status=ok", stdout)
         self.assertIn("task_sync_every_seconds=21600", stdout)
         self.assertIn("task_sync_budget_provider=mal", stdout)
+        self.assertIn("task_sync_last_decision_at=2026-03-20T21:54:02Z", stdout)
+        self.assertIn("task_sync_last_started_at=2026-03-20T21:54:00Z", stdout)
+        self.assertIn("task_sync_last_finished_at=2026-03-20T21:54:02Z", stdout)
+        self.assertIn("task_sync_last_duration_seconds=2.0", stdout)
         self.assertIn("task_sync_next_due_at=2026-03-21T03:54:00Z", stdout)
         self.assertIn("task_health_last_skip_reason=budget_guard", stdout)
+        self.assertIn("task_health_last_decision_at=2026-03-20T21:53:00Z", stdout)
         self.assertIn("task_health_budget_backoff_until=2026-03-20T22:13:00Z", stdout)
         self.assertIn("task_health_budget_backoff_remaining_seconds=", stdout)
         self.assertIn("task_health_next_due_at=2026-03-21T09:53:00Z", stdout)

@@ -13,7 +13,7 @@
 
 ## Daemon / operations
 
-- [ ] Tighten daemon control loops and per-lane state tracking (cadence / next-due / active-backoff observability now persists in service state)
+- [ ] Tighten daemon control loops and per-lane state tracking (cadence / decision timing / last-run start-finish-duration / next-due / active-backoff observability now persists in service state; next likely step is smarter warn-threshold pacing or provider-specific cooldown heuristics)
 - [ ] Continue refining request-budget accounting / backoff behavior for MAL and Crunchyroll (recovery-window backoff now exists; next likely steps are smarter warn-threshold pacing and provider-specific cooldown heuristics)
 - [ ] Decide whether to retire the remaining transitional wrapper scripts after more daemon logic moves in-process
 - [x] Add richer service-state/observability surfaces for debugging unattended failures

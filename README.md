@@ -92,7 +92,7 @@ Repo-owned automation/runtime files live under:
 
 The installed daemon is a **user-level systemd service** that runs `mal_updater.cli service-run` in the foreground and owns its own internal loop cadence for:
 
-`service-status` / `service-status --format summary` now surface persisted per-task cadence, next-due timing, budget-provider labels, and active backoff countdowns so unattended behavior is inspectable without reading raw state files.
+`service-status` / `service-status --format summary` now surface persisted per-task cadence, decision timing, last-run start/finish/duration, next-due timing, budget-provider labels, and active backoff countdowns so unattended behavior is inspectable without reading raw state files.
 
 - MAL token refresh
 - one fetch lane per credentialed source provider (currently Crunchyroll + HIDIVE)

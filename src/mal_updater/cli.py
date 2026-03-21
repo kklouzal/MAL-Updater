@@ -521,6 +521,18 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             last_error = task_payload.get("last_error") if isinstance(task_payload.get("last_error"), str) else None
             if last_error is not None:
                 print(f"task_{task_name}_last_error={last_error}")
+            last_decision_at = task_payload.get("last_decision_at") if isinstance(task_payload.get("last_decision_at"), str) else None
+            if last_decision_at is not None:
+                print(f"task_{task_name}_last_decision_at={last_decision_at}")
+            last_started_at = task_payload.get("last_started_at") if isinstance(task_payload.get("last_started_at"), str) else None
+            if last_started_at is not None:
+                print(f"task_{task_name}_last_started_at={last_started_at}")
+            last_finished_at = task_payload.get("last_finished_at") if isinstance(task_payload.get("last_finished_at"), str) else None
+            if last_finished_at is not None:
+                print(f"task_{task_name}_last_finished_at={last_finished_at}")
+            last_duration_seconds = task_payload.get("last_duration_seconds") if isinstance(task_payload.get("last_duration_seconds"), (int, float)) else None
+            if last_duration_seconds is not None:
+                print(f"task_{task_name}_last_duration_seconds={last_duration_seconds}")
             every_seconds = task_payload.get("every_seconds") if isinstance(task_payload.get("every_seconds"), int) else None
             if every_seconds is not None:
                 print(f"task_{task_name}_every_seconds={every_seconds}")

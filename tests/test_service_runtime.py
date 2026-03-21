@@ -123,3 +123,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("ok", saved["tasks"]["sync_fetch_crunchyroll"]["last_status"])
         self.assertIn("next_due_at", saved["tasks"]["sync_fetch_crunchyroll"])
         self.assertNotIn("last_skip_reason", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertIn("last_started_at", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertIn("last_finished_at", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertIn("last_decision_at", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertIn("last_duration_seconds", saved["tasks"]["sync_fetch_crunchyroll"])
