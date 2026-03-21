@@ -51,6 +51,9 @@ class ServiceStatusTests(unittest.TestCase):
                             "last_run_epoch": 123.0,
                             "last_run_at": "2026-03-20T21:54:00Z",
                             "last_status": "ok",
+                            "every_seconds": 21600,
+                            "budget_provider": "mal",
+                            "next_due_at": "2026-03-21T03:54:00Z",
                             "last_result": {
                                 "label": "sync",
                                 "returncode": 0,
@@ -62,6 +65,9 @@ class ServiceStatusTests(unittest.TestCase):
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "crunchyroll_budget_critical ratio=1.000 cooldown=1800s",
                             "budget_backoff_until": "2026-03-20T22:23:00Z",
+                            "budget_backoff_remaining_seconds": 1800,
+                            "every_seconds": 43200,
+                            "next_due_at": "2026-03-21T09:53:00Z",
                         },
                     },
                 },
@@ -101,27 +107,30 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual({"healthy": True, "warning_count": 0}, payload["health_latest_summary"])
         self.assertIsNone(payload["service_state_parse_error"])
         self.assertIsNone(payload["health_latest_parse_error"])
+        sync_summary = payload["task_state"]["sync"]
+        self.assertEqual(123.0, sync_summary["last_run_epoch"])
+        self.assertEqual("2026-03-20T21:54:00Z", sync_summary["last_run_at"])
+        self.assertEqual("ok", sync_summary["last_status"])
+        self.assertEqual(21600, sync_summary["every_seconds"])
+        self.assertEqual("mal", sync_summary["budget_provider"])
+        self.assertEqual("2026-03-21T03:54:00Z", sync_summary["next_due_at"])
+        self.assertIn("next_due_in_seconds", sync_summary)
         self.assertEqual(
             {
-                "last_run_epoch": 123.0,
-                "last_run_at": "2026-03-20T21:54:00Z",
-                "last_status": "ok",
-                "last_result": {
-                    "label": "sync",
-                    "returncode": 0,
-                    "stdout_snippet": "sync completed\nwith useful detail",
-                },
+                "label": "sync",
+                "returncode": 0,
+                "stdout_snippet": "sync completed\nwith useful detail",
             },
-            payload["task_state"]["sync"],
+            sync_summary["last_result"],
         )
-        self.assertEqual(
-            {
-                "last_skipped_at": "2026-03-20T21:53:00Z",
-                "last_skip_reason": "crunchyroll_budget_critical ratio=1.000 cooldown=1800s",
-                "budget_backoff_until": "2026-03-20T22:23:00Z",
-            },
-            payload["task_state"]["health"],
-        )
+        health_summary = payload["task_state"]["health"]
+        self.assertEqual("2026-03-20T21:53:00Z", health_summary["last_skipped_at"])
+        self.assertEqual("crunchyroll_budget_critical ratio=1.000 cooldown=1800s", health_summary["last_skip_reason"])
+        self.assertEqual("2026-03-20T22:23:00Z", health_summary["budget_backoff_until"])
+        self.assertEqual(43200, health_summary["every_seconds"])
+        self.assertEqual("2026-03-21T09:53:00Z", health_summary["next_due_at"])
+        self.assertIn("next_due_in_seconds", health_summary)
+        self.assertIn("budget_backoff_remaining_seconds", health_summary)
 
     def test_doctor_service_reports_state_parse_errors_without_crashing(self) -> None:
         self.config.service_state_path.write_text("{not-json", encoding="utf-8")
@@ -168,11 +177,17 @@ class ServiceStatusTests(unittest.TestCase):
                         "sync": {
                             "last_run_at": "2026-03-20T21:54:00Z",
                             "last_status": "ok",
+                            "every_seconds": 21600,
+                            "budget_provider": "mal",
+                            "next_due_at": "2026-03-21T03:54:00Z",
                         },
                         "health": {
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "budget_guard",
                             "budget_backoff_until": "2026-03-20T22:13:00Z",
+                            "budget_backoff_remaining_seconds": 1200,
+                            "every_seconds": 43200,
+                            "next_due_at": "2026-03-21T09:53:00Z",
                         },
                     },
                 },
@@ -219,8 +234,13 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("api_mal_request_count=4", stdout)
         self.assertIn("api_crunchyroll_success_count=2", stdout)
         self.assertIn("task_sync_last_status=ok", stdout)
+        self.assertIn("task_sync_every_seconds=21600", stdout)
+        self.assertIn("task_sync_budget_provider=mal", stdout)
+        self.assertIn("task_sync_next_due_at=2026-03-21T03:54:00Z", stdout)
         self.assertIn("task_health_last_skip_reason=budget_guard", stdout)
         self.assertIn("task_health_budget_backoff_until=2026-03-20T22:13:00Z", stdout)
+        self.assertIn("task_health_budget_backoff_remaining_seconds=", stdout)
+        self.assertIn("task_health_next_due_at=2026-03-21T09:53:00Z", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
 
     def test_service_status_summary_surfaces_parse_errors(self) -> None:

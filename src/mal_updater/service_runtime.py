@@ -43,6 +43,12 @@ def _save_state(config: AppConfig, state: dict[str, Any]) -> None:
     config.service_state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _set_task_next_due(task_state: dict[str, Any], *, base_epoch: float, every_seconds: int) -> None:
+    task_state["every_seconds"] = int(every_seconds)
+    task_state["next_due_epoch"] = float(base_epoch) + int(every_seconds)
+    task_state["next_due_at"] = _iso_after_seconds(int(task_state["next_due_epoch"] - time.time()))
+
+
 def _append_log(config: AppConfig, message: str) -> None:
     with config.service_log_path.open("a", encoding="utf-8") as fh:
         fh.write(f"[{_now_iso()}] {message}\n")
@@ -181,12 +187,23 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
 
     for spec in _task_specs(config):
         task_state = tasks_state.setdefault(spec.name, {})
+        task_state["budget_provider"] = spec.budget_provider
+        task_state["every_seconds"] = int(spec.every_seconds)
         last_run = float(task_state.get("last_run_epoch", 0))
         if now - last_run < spec.every_seconds:
+            _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
         backoff_until_epoch = float(task_state.get("budget_backoff_until_epoch", 0))
         if backoff_until_epoch > now:
             remaining = max(0, int(backoff_until_epoch - now))
+            task_state.update(
+                {
+                    "last_status": "skipped",
+                    "last_skipped_at": _now_iso(),
+                    "last_skip_reason": f"budget_backoff_active remaining={remaining}s",
+                    "budget_backoff_remaining_seconds": remaining,
+                }
+            )
             results.append(
                 {
                     "task": spec.name,
@@ -202,12 +219,15 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             recovery_seconds = int(usage.get("recovery_seconds", 0)) if isinstance(usage, dict) else 0
             task_state.update(
                 {
+                    "last_status": "skipped",
                     "last_skipped_at": _now_iso(),
                     "last_skip_reason": reason,
                     "budget_backoff_until_epoch": now + recovery_seconds,
                     "budget_backoff_until": _iso_after_seconds(recovery_seconds),
+                    "budget_backoff_remaining_seconds": recovery_seconds,
                 }
             )
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             results.append(
                 {
                     "task": spec.name,
@@ -233,12 +253,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             else:
                 result = {"status": "skipped", "reason": "unknown_task"}
             task_state.update({"last_run_epoch": now, "last_run_at": _now_iso(), "last_status": result.get("status", "ok"), "last_result": result})
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             task_state.pop("last_error", None)
+            task_state.pop("last_skip_reason", None)
+            task_state.pop("last_skipped_at", None)
             task_state.pop("budget_backoff_until_epoch", None)
             task_state.pop("budget_backoff_until", None)
+            task_state.pop("budget_backoff_remaining_seconds", None)
             results.append({"task": spec.name, **result})
         except (MalApiError, OSError, subprocess.SubprocessError) as exc:
             task_state.update({"last_run_epoch": now, "last_run_at": _now_iso(), "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            task_state.pop("budget_backoff_remaining_seconds", None)
             results.append({"task": spec.name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
             _append_log(config, f"task={spec.name} status=error error={type(exc).__name__}: {exc}")
 

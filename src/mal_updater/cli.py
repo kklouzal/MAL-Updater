@@ -521,9 +521,24 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             last_error = task_payload.get("last_error") if isinstance(task_payload.get("last_error"), str) else None
             if last_error is not None:
                 print(f"task_{task_name}_last_error={last_error}")
+            every_seconds = task_payload.get("every_seconds") if isinstance(task_payload.get("every_seconds"), int) else None
+            if every_seconds is not None:
+                print(f"task_{task_name}_every_seconds={every_seconds}")
+            budget_provider = task_payload.get("budget_provider") if isinstance(task_payload.get("budget_provider"), str) else None
+            if budget_provider is not None:
+                print(f"task_{task_name}_budget_provider={budget_provider}")
+            next_due_at = task_payload.get("next_due_at") if isinstance(task_payload.get("next_due_at"), str) else None
+            if next_due_at is not None:
+                print(f"task_{task_name}_next_due_at={next_due_at}")
+            next_due_in_seconds = task_payload.get("next_due_in_seconds") if isinstance(task_payload.get("next_due_in_seconds"), int) else None
+            if next_due_in_seconds is not None:
+                print(f"task_{task_name}_next_due_in_seconds={next_due_in_seconds}")
             budget_backoff_until = task_payload.get("budget_backoff_until") if isinstance(task_payload.get("budget_backoff_until"), str) else None
             if budget_backoff_until is not None:
                 print(f"task_{task_name}_budget_backoff_until={budget_backoff_until}")
+            budget_backoff_remaining_seconds = task_payload.get("budget_backoff_remaining_seconds") if isinstance(task_payload.get("budget_backoff_remaining_seconds"), int) else None
+            if budget_backoff_remaining_seconds is not None:
+                print(f"task_{task_name}_budget_backoff_remaining_seconds={budget_backoff_remaining_seconds}")
 
     service_log_tail = payload.get("service_log_tail")
     if isinstance(service_log_tail, list) and service_log_tail:

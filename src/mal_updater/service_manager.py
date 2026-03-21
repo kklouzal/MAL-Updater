@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -67,6 +68,18 @@ def _snippet(value: object, *, limit: int = _RESULT_SNIPPET_LIMIT) -> str | None
     return trimmed[: limit - 3] + "..."
 
 
+def _parse_iso_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _summarize_last_result(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -88,12 +101,33 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     summary: dict[str, Any] = {}
-    for field in ("last_run_at", "last_status", "last_skipped_at", "last_skip_reason", "last_error", "budget_backoff_until"):
+    for field in (
+        "last_run_at",
+        "last_status",
+        "last_skipped_at",
+        "last_skip_reason",
+        "last_error",
+        "budget_backoff_until",
+        "next_due_at",
+        "budget_provider",
+    ):
         field_value = value.get(field)
         if field_value is not None:
             summary[field] = field_value
     if isinstance(value.get("last_run_epoch"), (int, float)):
         summary["last_run_epoch"] = value["last_run_epoch"]
+    if isinstance(value.get("every_seconds"), int):
+        summary["every_seconds"] = value["every_seconds"]
+    if isinstance(value.get("next_due_epoch"), (int, float)):
+        summary["next_due_epoch"] = value["next_due_epoch"]
+    if isinstance(value.get("budget_backoff_remaining_seconds"), (int, float)):
+        summary["budget_backoff_remaining_seconds"] = int(value["budget_backoff_remaining_seconds"])
+    next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
+    if next_due_at is not None:
+        summary["next_due_in_seconds"] = max(0, int((next_due_at - datetime.now(timezone.utc)).total_seconds()))
+    budget_backoff_until = _parse_iso_timestamp(value.get("budget_backoff_until"))
+    if budget_backoff_until is not None:
+        summary["budget_backoff_remaining_seconds"] = max(0, int((budget_backoff_until - datetime.now(timezone.utc)).total_seconds()))
     last_result = _summarize_last_result(value.get("last_result"))
     if last_result is not None:
         summary["last_result"] = last_result

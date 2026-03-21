@@ -71,6 +71,10 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         sync_state = state["tasks"]["sync_fetch_crunchyroll"]
         self.assertIn("budget_backoff_until", sync_state)
         self.assertIn("budget_backoff_until_epoch", sync_state)
+        self.assertEqual("skipped", sync_state["last_status"])
+        self.assertEqual("crunchyroll", sync_state["budget_provider"])
+        self.assertEqual(self.config.service.sync_every_seconds, sync_state["every_seconds"])
+        self.assertIn("next_due_at", sync_state)
 
         with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
             "mal_updater.service_runtime._run_subprocess",
@@ -81,6 +85,12 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         sync_result_second = next(item for item in result_second["results"] if item["task"] == "sync_fetch_crunchyroll")
         self.assertEqual("skipped", sync_result_second["status"])
         self.assertIn("budget_backoff_active", sync_result_second["reason"])
+
+        state_second = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state_second = state_second["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("skipped", sync_state_second["last_status"])
+        self.assertIn("budget_backoff_active", sync_state_second["last_skip_reason"])
+        self.assertGreater(sync_state_second["budget_backoff_remaining_seconds"], 0)
 
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {
@@ -110,3 +120,6 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         self.assertNotIn("budget_backoff_until", saved["tasks"]["sync_fetch_crunchyroll"])
         self.assertNotIn("budget_backoff_until_epoch", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertEqual("ok", saved["tasks"]["sync_fetch_crunchyroll"]["last_status"])
+        self.assertIn("next_due_at", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertNotIn("last_skip_reason", saved["tasks"]["sync_fetch_crunchyroll"])
