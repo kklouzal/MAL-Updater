@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mal-updater"
-version = "0.1.3"
+version = "0.1.4"
 description = "Conservative multi-provider anime -> MyAnimeList sync worker and recommendation engine"
 readme = "README.md"
 requires-python = ">=3.10"

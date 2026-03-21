@@ -1,6 +1,7 @@
 ---
 name: mal-updater
 description: Multi-provider anime → MyAnimeList sync and recommendations skill with guarded auth, review-queue triage, health checks, bootstrap auditing, and user-systemd daemon support. Currently supports Crunchyroll and HIDIVE as source providers. Use when installing, auditing, operating, or troubleshooting MAL-Updater on an OpenClaw host.
+metadata: {"openclaw":{"emoji":"📺","homepage":"https://github.com/kklouzal/mal-updater","os":["linux"],"requires":{"anyBins":["python3","python"]},"primaryEnv":"MAL_UPDATER_MAL_CLIENT_ID"}}
 ---
 
 # MAL-Updater
