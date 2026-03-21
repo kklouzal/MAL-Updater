@@ -18,6 +18,9 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
         (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
+        (self.project_root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+        (self.project_root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.project_root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt").write_text("secret\n", encoding="utf-8")
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
 
@@ -59,13 +62,13 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         ):
             result = run_pending_tasks(self.config)
 
-        sync_result = next(item for item in result["results"] if item["task"] == "sync")
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
         self.assertEqual("skipped", sync_result["status"])
         self.assertIn("crunchyroll_budget_critical", sync_result["reason"])
         self.assertGreater(sync_result["budget_backoff_remaining_seconds"], 0)
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
-        sync_state = state["tasks"]["sync"]
+        sync_state = state["tasks"]["sync_fetch_crunchyroll"]
         self.assertIn("budget_backoff_until", sync_state)
         self.assertIn("budget_backoff_until_epoch", sync_state)
 
@@ -75,7 +78,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         ):
             result_second = run_pending_tasks(self.config)
 
-        sync_result_second = next(item for item in result_second["results"] if item["task"] == "sync")
+        sync_result_second = next(item for item in result_second["results"] if item["task"] == "sync_fetch_crunchyroll")
         self.assertEqual("skipped", sync_result_second["status"])
         self.assertIn("budget_backoff_active", sync_result_second["reason"])
 
@@ -83,7 +86,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         state = {
             "started_at": "2026-03-20T20:00:00Z",
             "tasks": {
-                "sync": {
+                "sync_fetch_crunchyroll": {
                     "budget_backoff_until_epoch": 1,
                     "budget_backoff_until": "2026-03-20T21:00:00Z",
                 }
@@ -91,18 +94,19 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         }
         self.config.service_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
-        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "mal"}), (True, None, {"provider": "crunchyroll"}), (True, None, None)]), patch(
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "mal"}), (True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
             "mal_updater.service_runtime._refresh_mal_tokens",
             return_value={"status": "ok"},
         ), patch(
             "mal_updater.service_runtime._run_subprocess",
             side_effect=[
-                {"status": "ok", "label": "sync", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
                 {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
             ],
         ):
             run_pending_tasks(self.config)
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
-        self.assertNotIn("budget_backoff_until", saved["tasks"]["sync"])
-        self.assertNotIn("budget_backoff_until_epoch", saved["tasks"]["sync"])
+        self.assertNotIn("budget_backoff_until", saved["tasks"]["sync_fetch_crunchyroll"])
+        self.assertNotIn("budget_backoff_until_epoch", saved["tasks"]["sync_fetch_crunchyroll"])

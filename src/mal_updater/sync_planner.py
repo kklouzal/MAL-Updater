@@ -161,7 +161,7 @@ class ApplyResult:
 def load_provider_series_states(
     config: AppConfig,
     limit: int | None = None,
-    provider: str = "crunchyroll",
+    provider: str | None = None,
     provider_series_ids: list[str] | None = None,
 ) -> list[ProviderSeriesState]:
     if limit is not None and limit <= 0:
@@ -179,10 +179,11 @@ def load_provider_series_states(
         FROM provider_series s
         LEFT JOIN provider_watchlist w
             ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
-        WHERE s.provider = ?
+        WHERE 1=1
     """
     progress_query = """
         SELECT
+            provider,
             provider_series_id,
             provider_episode_id,
             episode_number,
@@ -191,10 +192,15 @@ def load_provider_series_states(
             duration_ms,
             last_watched_at
         FROM provider_episode_progress
-        WHERE provider = ?
+        WHERE 1=1
     """
-    series_params: list[object] = [provider]
-    progress_params: list[object] = [provider]
+    series_params: list[object] = []
+    progress_params: list[object] = []
+    if provider:
+        series_query += " AND s.provider = ?"
+        progress_query += " AND provider = ?"
+        series_params.append(provider)
+        progress_params.append(provider)
     if normalized_provider_series_ids:
         placeholders = ", ".join("?" for _ in normalized_provider_series_ids)
         series_query += f" AND s.provider_series_id IN ({placeholders})"
@@ -207,9 +213,9 @@ def load_provider_series_states(
         series_rows = conn.execute(series_query, series_params).fetchall()
         progress_rows = conn.execute(progress_query, progress_params).fetchall()
 
-    progress_by_series: dict[str, list[EpisodeProgressState]] = {}
+    progress_by_series: dict[tuple[str, str], list[EpisodeProgressState]] = {}
     for row in progress_rows:
-        progress_by_series.setdefault(row["provider_series_id"], []).append(
+        progress_by_series.setdefault((row["provider"], row["provider_series_id"]), []).append(
             EpisodeProgressState(
                 provider_episode_id=row["provider_episode_id"],
                 episode_number=row["episode_number"],
@@ -222,7 +228,7 @@ def load_provider_series_states(
 
     states: list[tuple[str | None, str, ProviderSeriesState]] = []
     for row in series_rows:
-        series_progress = progress_by_series.get(row["provider_series_id"], [])
+        series_progress = progress_by_series.get((row["provider"], row["provider_series_id"]), [])
         summary = _summarize_episode_progress(series_progress, config)
         sort_key = summary["last_watched_at"] or row["last_seen_at"]
         states.append(
@@ -501,7 +507,7 @@ def build_dry_run_sync_plan(
     mapping_limit: int = 5,
     approved_mappings_only: bool = False,
     exact_approved_only: bool = False,
-    provider: str = "crunchyroll",
+    provider: str | None = None,
 ) -> list[SyncProposal]:
     states = load_provider_series_states(config, limit=limit, provider=provider)
     client = MalClient(config, load_mal_secrets(config))

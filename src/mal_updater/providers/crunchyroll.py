@@ -37,8 +37,8 @@ class CrunchyrollProvider:
             snapshot=result.snapshot,
             metadata={
                 "provider": self.slug,
-                "phase": result.phase,
                 "used_incremental_boundary": not full_refresh,
+                "account_email": result.account_email,
                 "state_paths": {
                     "root": str(result.state_paths.root),
                     "refresh_token_path": str(result.state_paths.refresh_token_path),

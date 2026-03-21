@@ -2022,7 +2022,7 @@ def _cmd_dry_run_sync(
             mapping_limit=mapping_limit,
             approved_mappings_only=approved_mappings_only,
             exact_approved_only=exact_approved_only,
-            provider=provider,
+            provider=None if provider == "all" else provider,
         )
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
@@ -3904,7 +3904,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mark this manual approval as exact-safe so the unattended exact-approved executor may use it",
     )
     dry_run_sync = subparsers.add_parser("dry-run-sync", help="Generate guarded read-only MAL sync proposals from ingested provider data")
-    dry_run_sync.add_argument("--provider", default="crunchyroll", choices=list_provider_slugs(), help="Provider slug to plan against")
+    dry_run_sync.add_argument("--provider", default="all", choices=["all", *list_provider_slugs()], help="Provider slug to plan against, or 'all' to aggregate across providers")
     dry_run_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect (use 0 for all; required when persisting review_queue)")
     dry_run_sync.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     dry_run_sync.add_argument(

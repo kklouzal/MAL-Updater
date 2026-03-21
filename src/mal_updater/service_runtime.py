@@ -9,6 +9,8 @@ from typing import Any
 
 from .auth import persist_token_response
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
+from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
+from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
 from .mal_client import MalApiError, MalClient
 from .request_tracking import estimate_budget_recovery_seconds, prune_api_request_events, summarize_recent_api_usage
 
@@ -79,12 +81,68 @@ def _refresh_mal_tokens(config: AppConfig) -> dict[str, Any]:
     }
 
 
+def _available_source_providers(config: AppConfig) -> list[str]:
+    providers: list[str] = []
+    crunchyroll_credentials = load_crunchyroll_credentials(config)
+    if crunchyroll_credentials.username and crunchyroll_credentials.password:
+        providers.append("crunchyroll")
+    hidive_credentials = load_hidive_credentials(config)
+    if hidive_credentials.username and hidive_credentials.password:
+        providers.append("hidive")
+    return providers
+
+
+
 def _task_specs(config: AppConfig) -> list[TaskSpec]:
+    specs = [TaskSpec("mal_refresh", config.service.mal_refresh_every_seconds, budget_provider="mal")]
+    for provider in _available_source_providers(config):
+        specs.append(TaskSpec(f"sync_fetch_{provider}", config.service.sync_every_seconds, budget_provider=provider))
+    specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
+    specs.append(TaskSpec("health", config.service.health_every_seconds, budget_provider=None))
+    return specs
+
+
+def _provider_fetch_command(config: AppConfig, provider: str) -> list[str]:
+    if provider == "crunchyroll":
+        snapshot_path = config.cache_dir / "live-crunchyroll-snapshot.json"
+        return [
+            "python3",
+            "-m",
+            "mal_updater.cli",
+            "crunchyroll-fetch-snapshot",
+            "--out",
+            str(snapshot_path),
+            "--ingest",
+        ]
+    if provider == "hidive":
+        snapshot_path = config.cache_dir / "live-hidive-snapshot.json"
+        return [
+            "python3",
+            "-m",
+            "mal_updater.cli",
+            "provider-fetch-snapshot",
+            "--provider",
+            "hidive",
+            "--out",
+            str(snapshot_path),
+            "--ingest",
+        ]
+    raise ValueError(f"unsupported provider fetch task: {provider}")
+
+
+
+def _apply_sync_command() -> list[str]:
     return [
-        TaskSpec("mal_refresh", config.service.mal_refresh_every_seconds, budget_provider="mal"),
-        TaskSpec("sync", config.service.sync_every_seconds, budget_provider="crunchyroll"),
-        TaskSpec("health", config.service.health_every_seconds, budget_provider=None),
+        "python3",
+        "-m",
+        "mal_updater.cli",
+        "apply-sync",
+        "--limit",
+        "0",
+        "--exact-approved-only",
+        "--execute",
     ]
+
 
 
 def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | None, dict[str, Any] | None]:
@@ -165,8 +223,11 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         try:
             if spec.name == "mal_refresh":
                 result = _refresh_mal_tokens(config)
-            elif spec.name == "sync":
-                result = _run_subprocess(config, [str(config.project_root / "scripts" / "run_exact_approved_sync_cycle.sh")], label="sync")
+            elif spec.name.startswith("sync_fetch_"):
+                provider = spec.name.removeprefix("sync_fetch_")
+                result = _run_subprocess(config, _provider_fetch_command(config, provider), label=spec.name)
+            elif spec.name == "sync_apply":
+                result = _run_subprocess(config, _apply_sync_command(), label="sync_apply")
             elif spec.name == "health":
                 result = _run_subprocess(config, [str(config.project_root / "scripts" / "run_health_check_cycle.sh")], label="health")
             else:
@@ -182,7 +243,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             _append_log(config, f"task={spec.name} status=error error={type(exc).__name__}: {exc}")
 
     state["last_loop_at"] = _now_iso()
-    tracked_providers = {"mal", "crunchyroll", *config.service.provider_hourly_limits.keys()}
+    tracked_providers = {"mal", "crunchyroll", *config.service.provider_hourly_limits.keys(), *_available_source_providers(config)}
     state["api_usage"] = {
         provider: summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
         for provider in sorted(tracked_providers)
