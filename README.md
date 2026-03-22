@@ -122,9 +122,12 @@ If you reuse or adapt MAL-Updater, attribution to the original project/repo is a
 
 ## Testing
 
+The repo now bootstraps its own local import paths for test runs, so root-level validation works without extra environment setup.
+
 ```bash
 cd <repo-root>
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+pytest -q
+python3 -m unittest discover -s tests -v
 ```
 
 ## Issue reporting / feedback
