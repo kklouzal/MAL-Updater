@@ -113,6 +113,8 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "budget_backoff_level",
         "budget_backoff_until",
         "budget_backoff_cooldown_source",
+        "failure_backoff_until",
+        "failure_backoff_reason",
         "next_due_at",
         "budget_provider",
     ):
@@ -131,12 +133,19 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         summary["budget_backoff_remaining_seconds"] = int(value["budget_backoff_remaining_seconds"])
     if isinstance(value.get("budget_backoff_floor_seconds"), (int, float)):
         summary["budget_backoff_floor_seconds"] = int(value["budget_backoff_floor_seconds"])
+    if isinstance(value.get("failure_backoff_remaining_seconds"), (int, float)):
+        summary["failure_backoff_remaining_seconds"] = int(value["failure_backoff_remaining_seconds"])
+    if isinstance(value.get("failure_backoff_consecutive_failures"), (int, float)):
+        summary["failure_backoff_consecutive_failures"] = int(value["failure_backoff_consecutive_failures"])
     next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
     if next_due_at is not None:
         summary["next_due_in_seconds"] = max(0, int((next_due_at - datetime.now(timezone.utc)).total_seconds()))
     budget_backoff_until = _parse_iso_timestamp(value.get("budget_backoff_until"))
     if budget_backoff_until is not None:
         summary["budget_backoff_remaining_seconds"] = max(0, int((budget_backoff_until - datetime.now(timezone.utc)).total_seconds()))
+    failure_backoff_until = _parse_iso_timestamp(value.get("failure_backoff_until"))
+    if failure_backoff_until is not None:
+        summary["failure_backoff_remaining_seconds"] = max(0, int((failure_backoff_until - datetime.now(timezone.utc)).total_seconds()))
     last_result = _summarize_last_result(value.get("last_result"))
     if last_result is not None:
         summary["last_result"] = last_result

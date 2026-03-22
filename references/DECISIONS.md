@@ -148,6 +148,16 @@ When the daemon hits a provider budget critical threshold, persist a per-task co
 - recovery should be based on the observed request window, not a hand-wavy fixed sleep
 - surfacing `budget_backoff_until` in service state/status makes unattended behavior easier to reason about during debugging
 
+## 2026-03-22 - Adaptive provider failure backoff posture
+
+### Decision
+When a daemon task tied to a provider fails, persist an adaptive failure-backoff window with the failure reason and consecutive-failure streak so the lane cools down before retrying instead of immediately thrashing.
+
+### Why
+- auth-fragile provider fetches can fail repeatedly for a while after a bad login/session state transition
+- every-loop retries create noisy logs and extra pressure without improving recovery odds
+- surfacing `failure_backoff_until`, `failure_backoff_reason`, and consecutive failures in service state/status makes unattended debugging clearer
+
 ## 2026-03-20 - Supplemental mapping candidate posture
 
 ### Decision

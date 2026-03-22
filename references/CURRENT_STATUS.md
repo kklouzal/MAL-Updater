@@ -18,9 +18,10 @@
 - mapping review / queue triage workflows exist
 - long-lived daemon runtime + service manager exist
 - service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging, plus a terse `--format summary` operator view for quick checks
-- service task state now persists per-task cadence metadata (`every_seconds`), decision timing, last-run start/finish/duration, next-due timing, budget provider labels, backoff level (`warn` vs `critical`), and active backoff countdowns so unattended operators can see when a lane should run next vs when it is intentionally cooling down
+- service task state now persists per-task cadence metadata (`every_seconds`), decision timing, last-run start/finish/duration, next-due timing, budget provider labels, budget backoff level (`warn` vs `critical`), adaptive failure backoff state, and active cooldown countdowns so unattended operators can see when a lane should run next vs when it is intentionally cooling down
 - request-event logging / budget awareness scaffolding exists
-- daemon budget skips now compute both warn-threshold pacing windows and hard critical recovery windows, persist per-task backoff state, and avoid re-check/log spam until the provider budget has room again
+- daemon budget skips now compute both warn-threshold pacing windows and hard critical recovery windows, persist per-task budget backoff state, and avoid re-check/log spam until the provider budget has room again
+- provider-task failures now trigger adaptive failure-aware cooldowns with persisted reason / retry countdown / consecutive-failure state so auth-fragile fetch lanes do not thrash every loop after a bad run
 - recommendation generation and metadata refresh exist
 - tests remain bundled in the repo for third-party auditing
 
