@@ -31,6 +31,7 @@ request_spacing_jitter_seconds = 7.5
 
 [service]
 sync_every_seconds = 21600
+full_refresh_every_seconds = 86400
 health_every_seconds = 43200
 mal_refresh_every_seconds = 21600
 loop_sleep_seconds = 30

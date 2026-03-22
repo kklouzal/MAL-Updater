@@ -32,6 +32,7 @@ DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
 DEFAULT_DB_FILE = "mal_updater.sqlite3"
 DEFAULT_RUNTIME_DIR_NAME = ".MAL-Updater"
 DEFAULT_SERVICE_SYNC_EVERY_SECONDS = 6 * 60 * 60
+DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS = 24 * 60 * 60
 DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 6 * 60 * 60
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
@@ -68,6 +69,7 @@ class CrunchyrollSettings:
 @dataclass(slots=True)
 class ServiceSettings:
     sync_every_seconds: int = DEFAULT_SERVICE_SYNC_EVERY_SECONDS
+    full_refresh_every_seconds: int = DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS
     health_every_seconds: int = DEFAULT_SERVICE_HEALTH_EVERY_SECONDS
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
@@ -422,6 +424,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         ),
         service=ServiceSettings(
             sync_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_SYNC_EVERY_SECONDS", _get_int(service_section, "sync_every_seconds", DEFAULT_SERVICE_SYNC_EVERY_SECONDS))),
+            full_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_FULL_REFRESH_EVERY_SECONDS", _get_int(service_section, "full_refresh_every_seconds", DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS))),
             health_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_EVERY_SECONDS", _get_int(service_section, "health_every_seconds", DEFAULT_SERVICE_HEALTH_EVERY_SECONDS))),
             mal_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_MAL_REFRESH_EVERY_SECONDS", _get_int(service_section, "mal_refresh_every_seconds", DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS))),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),

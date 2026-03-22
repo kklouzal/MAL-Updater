@@ -99,6 +99,7 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 - one shared aggregate MAL apply lane
 - recurring health-check/report generation
 - API request logging / budget awareness
+- periodic provider full-refresh cadence (`service.full_refresh_every_seconds`, default 24h) so unattended runs can remain incremental by default while still forcing occasional conservative resweeps
 
 ## Security / boundaries
 

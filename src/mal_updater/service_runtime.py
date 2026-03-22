@@ -134,10 +134,11 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
     return specs
 
 
-def _provider_fetch_command(config: AppConfig, provider: str) -> list[str]:
+def _provider_fetch_command(config: AppConfig, provider: str, *, full_refresh: bool = False) -> list[str]:
+    command: list[str]
     if provider == "crunchyroll":
         snapshot_path = config.cache_dir / "live-crunchyroll-snapshot.json"
-        return [
+        command = [
             "python3",
             "-m",
             "mal_updater.cli",
@@ -146,9 +147,9 @@ def _provider_fetch_command(config: AppConfig, provider: str) -> list[str]:
             str(snapshot_path),
             "--ingest",
         ]
-    if provider == "hidive":
+    elif provider == "hidive":
         snapshot_path = config.cache_dir / "live-hidive-snapshot.json"
-        return [
+        command = [
             "python3",
             "-m",
             "mal_updater.cli",
@@ -159,7 +160,22 @@ def _provider_fetch_command(config: AppConfig, provider: str) -> list[str]:
             str(snapshot_path),
             "--ingest",
         ]
-    raise ValueError(f"unsupported provider fetch task: {provider}")
+    else:
+        raise ValueError(f"unsupported provider fetch task: {provider}")
+    if full_refresh:
+        command.append("--full-refresh")
+    return command
+
+
+
+def _provider_fetch_requires_full_refresh(config: AppConfig, task_state: dict[str, Any], *, now: float) -> bool:
+    interval = int(config.service.full_refresh_every_seconds)
+    if interval <= 0:
+        return False
+    anchor_epoch = task_state.get("full_refresh_anchor_epoch")
+    if not isinstance(anchor_epoch, (int, float)) or anchor_epoch <= 0:
+        return False
+    return float(now) - float(anchor_epoch) >= interval
 
 
 
@@ -393,11 +409,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         started_epoch = time.time()
         started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         try:
+            full_refresh_requested = False
             if spec.name == "mal_refresh":
                 result = _refresh_mal_tokens(config)
             elif spec.name.startswith("sync_fetch_"):
                 provider = spec.name.removeprefix("sync_fetch_")
-                result = _run_subprocess(config, _provider_fetch_command(config, provider), label=spec.name)
+                full_refresh_requested = _provider_fetch_requires_full_refresh(config, task_state, now=now)
+                result = _run_subprocess(
+                    config,
+                    _provider_fetch_command(config, provider, full_refresh=full_refresh_requested),
+                    label=spec.name,
+                )
+                result["fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
             elif spec.name == "sync_apply":
                 result = _run_subprocess(config, _apply_sync_command(), label="sync_apply")
             elif spec.name == "health":
@@ -410,6 +433,17 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": task_status, "last_result": result})
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            if spec.name.startswith("sync_fetch_"):
+                task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
+                task_state["last_fetch_mode_at"] = finished_at
+                if full_refresh_requested:
+                    task_state["last_successful_full_refresh_epoch"] = finished_epoch
+                    task_state["last_successful_full_refresh_at"] = finished_at
+                    task_state["full_refresh_anchor_epoch"] = finished_epoch
+                    task_state["full_refresh_anchor_at"] = finished_at
+                elif not isinstance(task_state.get("full_refresh_anchor_epoch"), (int, float)):
+                    task_state["full_refresh_anchor_epoch"] = finished_epoch
+                    task_state["full_refresh_anchor_at"] = finished_at
             task_state.pop("last_skip_reason", None)
             task_state.pop("last_skipped_at", None)
             task_state.pop("budget_backoff_level", None)

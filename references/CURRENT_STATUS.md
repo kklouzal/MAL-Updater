@@ -23,6 +23,7 @@
 - request-event logging / budget awareness scaffolding exists
 - daemon budget skips now compute both warn-threshold pacing windows and hard critical recovery windows, persist per-task budget backoff state, and avoid re-check/log spam until the provider budget has room again
 - provider-task failures now trigger adaptive failure-aware cooldowns with persisted reason / retry countdown / consecutive-failure state so auth-fragile fetch lanes do not thrash every loop after a bad run
+- provider fetch lanes now persist fetch-mode state plus a periodic full-refresh anchor so unattended daemon runs can stay incremental by default while still forcing a conservative provider `--full-refresh` sweep on a configurable cadence (`service.full_refresh_every_seconds`, default 24h)
 - recommendation generation and metadata refresh exist
 - tests remain bundled in the repo for third-party auditing
 
