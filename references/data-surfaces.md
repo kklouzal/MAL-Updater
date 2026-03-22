@@ -36,6 +36,7 @@ These expose:
 - one-pass daemon work execution
 - health warnings and recommended remediation commands
 - automation/runtime drift
+- persisted task cadence/backoff details, including provider-floor cooldown provenance when budget pacing was extended on purpose
 
 ## Recommendations
 

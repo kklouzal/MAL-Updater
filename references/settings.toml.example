@@ -39,6 +39,17 @@ mal_hourly_limit = 120
 warn_ratio = 0.8
 critical_ratio = 0.95
 
+[service.provider_hourly_limits]
+hidive = 72
+
+[service.provider_warn_backoff_floor_seconds]
+crunchyroll = 900
+hidive = 300
+
+[service.provider_critical_backoff_floor_seconds]
+crunchyroll = 1800
+hidive = 1200
+
 [secret_files]
 mal_client_id = "mal_client_id.txt"
 mal_client_secret = "mal_client_secret.txt"

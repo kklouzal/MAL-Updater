@@ -554,6 +554,12 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             budget_backoff_remaining_seconds = task_payload.get("budget_backoff_remaining_seconds") if isinstance(task_payload.get("budget_backoff_remaining_seconds"), int) else None
             if budget_backoff_remaining_seconds is not None:
                 print(f"task_{task_name}_budget_backoff_remaining_seconds={budget_backoff_remaining_seconds}")
+            budget_backoff_floor_seconds = task_payload.get("budget_backoff_floor_seconds") if isinstance(task_payload.get("budget_backoff_floor_seconds"), int) else None
+            if budget_backoff_floor_seconds is not None:
+                print(f"task_{task_name}_budget_backoff_floor_seconds={budget_backoff_floor_seconds}")
+            budget_backoff_cooldown_source = task_payload.get("budget_backoff_cooldown_source") if isinstance(task_payload.get("budget_backoff_cooldown_source"), str) else None
+            if budget_backoff_cooldown_source is not None:
+                print(f"task_{task_name}_budget_backoff_cooldown_source={budget_backoff_cooldown_source}")
 
     service_log_tail = payload.get("service_log_tail")
     if isinstance(service_log_tail, list) and service_log_tail:

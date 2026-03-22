@@ -74,6 +74,8 @@ class ServiceSettings:
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
     provider_hourly_limits: dict[str, int] = field(default_factory=dict)
+    provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    provider_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
     critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
 
@@ -84,6 +86,13 @@ class ServiceSettings:
             return self.crunchyroll_hourly_limit
         value = self.provider_hourly_limits.get(provider)
         return int(value) if isinstance(value, int) else self.crunchyroll_hourly_limit
+
+    def backoff_floor_seconds_for(self, provider: str, *, level: str) -> int:
+        floors = self.provider_warn_backoff_floor_seconds if level == "warn" else self.provider_critical_backoff_floor_seconds
+        value = floors.get(provider)
+        if isinstance(value, int):
+            return max(0, int(value))
+        return 0
 
 
 @dataclass(slots=True)
@@ -169,6 +178,15 @@ def _default_runtime_root(workspace_root: Path) -> Path:
 def _get_table(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name)
     return value if isinstance(value, dict) else {}
+
+
+def _get_nested_table(data: dict[str, Any], parent: str, child: str) -> dict[str, Any]:
+    nested_parent = _get_table(data, parent)
+    nested_child = nested_parent.get(child) if isinstance(nested_parent, dict) else None
+    if isinstance(nested_child, dict):
+        return nested_child
+    fallback = data.get(f"{parent}.{child}")
+    return fallback if isinstance(fallback, dict) else {}
 
 
 def _get_str(data: dict[str, Any], key: str, default: str) -> str:
@@ -292,7 +310,9 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     mal_section = _get_table(settings, "mal")
     crunchyroll_section = _get_table(settings, "crunchyroll")
     service_section = _get_table(settings, "service")
-    service_provider_limits_section = _get_table(service_section, "provider_hourly_limits")
+    service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
+    service_warn_backoff_floors_section = _get_nested_table(settings, "service", "provider_warn_backoff_floor_seconds")
+    service_critical_backoff_floors_section = _get_nested_table(settings, "service", "provider_critical_backoff_floor_seconds")
     secret_files_section = _get_table(settings, "secret_files")
     settings_dir = settings_path.parent
 
@@ -410,6 +430,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             provider_hourly_limits={
                 str(key): int(value)
                 for key, value in service_provider_limits_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            provider_warn_backoff_floor_seconds={
+                str(key): int(value)
+                for key, value in service_warn_backoff_floors_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            provider_critical_backoff_floor_seconds={
+                str(key): int(value)
+                for key, value in service_critical_backoff_floors_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
             warn_ratio=float(os.getenv("MAL_UPDATER_SERVICE_WARN_RATIO", _get_float(service_section, "warn_ratio", DEFAULT_SERVICE_WARN_RATIO))),

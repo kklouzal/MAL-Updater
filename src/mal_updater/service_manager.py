@@ -112,6 +112,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "last_finished_at",
         "budget_backoff_level",
         "budget_backoff_until",
+        "budget_backoff_cooldown_source",
         "next_due_at",
         "budget_provider",
     ):
@@ -128,6 +129,8 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         summary["last_duration_seconds"] = float(value["last_duration_seconds"])
     if isinstance(value.get("budget_backoff_remaining_seconds"), (int, float)):
         summary["budget_backoff_remaining_seconds"] = int(value["budget_backoff_remaining_seconds"])
+    if isinstance(value.get("budget_backoff_floor_seconds"), (int, float)):
+        summary["budget_backoff_floor_seconds"] = int(value["budget_backoff_floor_seconds"])
     next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
     if next_due_at is not None:
         summary["next_due_in_seconds"] = max(0, int((next_due_at - datetime.now(timezone.utc)).total_seconds()))

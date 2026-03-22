@@ -74,6 +74,37 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.50:9999/callback")
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "private" / "ids" / "client-id.txt").resolve())
 
+    def test_settings_file_loads_provider_budget_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
+                textwrap.dedent(
+                    """
+                    [service.provider_hourly_limits]
+                    hidive = 72
+
+                    [service.provider_warn_backoff_floor_seconds]
+                    crunchyroll = 900
+                    hidive = 300
+
+                    [service.provider_critical_backoff_floor_seconds]
+                    crunchyroll = 1800
+                    hidive = 1200
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(root)
+
+            self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
+            self.assertEqual(900, config.service.provider_warn_backoff_floor_seconds["crunchyroll"])
+            self.assertEqual(300, config.service.provider_warn_backoff_floor_seconds["hidive"])
+            self.assertEqual(1800, config.service.provider_critical_backoff_floor_seconds["crunchyroll"])
+            self.assertEqual(1200, config.service.provider_critical_backoff_floor_seconds["hidive"])
+
 
 if __name__ == "__main__":
     unittest.main()

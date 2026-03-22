@@ -194,18 +194,32 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
         config=config,
     )
+    warn_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="warn")
+    critical_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="critical")
+    warn_cooldown_seconds = max(warn_recovery_seconds, warn_floor_seconds)
+    critical_cooldown_seconds = max(recovery_seconds, critical_floor_seconds)
     usage["limit"] = limit
     usage["ratio"] = ratio
     usage["warn_ratio"] = config.service.warn_ratio
     usage["critical_ratio"] = config.service.critical_ratio
     usage["warn_recovery_seconds"] = warn_recovery_seconds
     usage["recovery_seconds"] = recovery_seconds
+    usage["warn_backoff_floor_seconds"] = warn_floor_seconds
+    usage["critical_backoff_floor_seconds"] = critical_floor_seconds
+    usage["warn_cooldown_seconds"] = warn_cooldown_seconds
+    usage["critical_cooldown_seconds"] = critical_cooldown_seconds
     if ratio >= config.service.critical_ratio:
         usage["backoff_level"] = "critical"
-        return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={recovery_seconds}s", usage
-    if ratio >= config.service.warn_ratio and warn_recovery_seconds > 0:
+        usage["cooldown_seconds"] = critical_cooldown_seconds
+        if critical_floor_seconds > recovery_seconds:
+            usage["cooldown_source"] = "provider_floor"
+        return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={critical_cooldown_seconds}s", usage
+    if ratio >= config.service.warn_ratio and warn_cooldown_seconds > 0:
         usage["backoff_level"] = "warn"
-        return False, f"{provider}_budget_warn ratio={ratio:.3f} cooldown={warn_recovery_seconds}s", usage
+        usage["cooldown_seconds"] = warn_cooldown_seconds
+        if warn_floor_seconds > warn_recovery_seconds:
+            usage["cooldown_source"] = "provider_floor"
+        return False, f"{provider}_budget_warn ratio={ratio:.3f} cooldown={warn_cooldown_seconds}s", usage
     return True, None, usage
 
 
@@ -253,8 +267,13 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         allowed, reason, usage = _budget_gate(config, spec.budget_provider)
         if not allowed:
             backoff_level = usage.get("backoff_level") if isinstance(usage, dict) else None
-            recovery_key = "warn_recovery_seconds" if backoff_level == "warn" else "recovery_seconds"
-            recovery_seconds = int(usage.get(recovery_key, 0)) if isinstance(usage, dict) else 0
+            recovery_seconds = int(usage.get("cooldown_seconds", 0)) if isinstance(usage, dict) else 0
+            backoff_floor_seconds = 0
+            cooldown_source = None
+            if isinstance(usage, dict):
+                floor_key = "warn_backoff_floor_seconds" if backoff_level == "warn" else "critical_backoff_floor_seconds"
+                backoff_floor_seconds = int(usage.get(floor_key, 0))
+                cooldown_source = usage.get("cooldown_source")
             skipped_at = _now_iso()
             task_state.update(
                 {
@@ -265,8 +284,13 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "budget_backoff_until_epoch": now + recovery_seconds,
                     "budget_backoff_until": _iso_after_seconds(recovery_seconds),
                     "budget_backoff_remaining_seconds": recovery_seconds,
+                    "budget_backoff_floor_seconds": backoff_floor_seconds,
                 }
             )
+            if isinstance(cooldown_source, str) and cooldown_source:
+                task_state["budget_backoff_cooldown_source"] = cooldown_source
+            else:
+                task_state.pop("budget_backoff_cooldown_source", None)
             _mark_task_decision(task_state, decision_at=skipped_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             results.append(
@@ -278,6 +302,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "budget_backoff_level": backoff_level,
                     "budget_backoff_until": task_state.get("budget_backoff_until"),
                     "budget_backoff_remaining_seconds": recovery_seconds,
+                    "budget_backoff_floor_seconds": backoff_floor_seconds,
+                    "budget_backoff_cooldown_source": task_state.get("budget_backoff_cooldown_source"),
                 }
             )
             _append_log(config, f"task={spec.name} status=skipped reason={reason}")
@@ -308,6 +334,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.pop("budget_backoff_until_epoch", None)
             task_state.pop("budget_backoff_until", None)
             task_state.pop("budget_backoff_remaining_seconds", None)
+            task_state.pop("budget_backoff_floor_seconds", None)
+            task_state.pop("budget_backoff_cooldown_source", None)
             results.append({"task": spec.name, **result})
         except (MalApiError, OSError, subprocess.SubprocessError) as exc:
             finished_epoch = time.time()
@@ -321,6 +349,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.pop("budget_backoff_until_epoch", None)
             task_state.pop("budget_backoff_until", None)
             task_state.pop("budget_backoff_remaining_seconds", None)
+            task_state.pop("budget_backoff_floor_seconds", None)
+            task_state.pop("budget_backoff_cooldown_source", None)
             results.append({"task": spec.name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
             _append_log(config, f"task={spec.name} status=error error={type(exc).__name__}: {exc}")
 

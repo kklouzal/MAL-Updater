@@ -120,6 +120,30 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertIn("budget_backoff_until", sync_state)
         self.assertIn("next_due_at", sync_state)
 
+    def test_run_pending_tasks_uses_provider_warn_backoff_floor_when_larger_than_recovery(self) -> None:
+        self._write_request_events("crunchyroll", [2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880])
+        self.config.service.crunchyroll_hourly_limit = 10
+        self.config.service.provider_warn_backoff_floor_seconds["crunchyroll"] = 900
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("skipped", sync_result["status"])
+        self.assertEqual("warn", sync_result["budget_backoff_level"])
+        self.assertEqual(900, sync_result["budget_backoff_remaining_seconds"])
+        self.assertEqual(900, sync_result["budget_backoff_floor_seconds"])
+        self.assertEqual("provider_floor", sync_result["budget_backoff_cooldown_source"])
+        self.assertIn("cooldown=900s", sync_result["reason"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = state["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual(900, sync_state["budget_backoff_floor_seconds"])
+        self.assertEqual("provider_floor", sync_state["budget_backoff_cooldown_source"])
+
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {
             "started_at": "2026-03-20T20:00:00Z",

@@ -43,6 +43,7 @@ The loader reads:
 - request pacing
 - secret file names
 - daemon loop cadence / budget thresholds
+- provider-specific hourly limits and warn/critical cooldown floors for budget pacing
 
 Path values in `settings.toml` may be absolute or relative to the settings file location.
 
