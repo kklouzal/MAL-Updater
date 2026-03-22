@@ -163,16 +163,16 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "ambiguous")
-        self.assertIn(result.chosen_candidate.mal_anime_id, {849, 4382})
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(849, result.chosen_candidate.mal_anime_id)
         self.assertIn("exact_normalized_title", result.rationale)
         self.assertIn("episode_evidence_exceeds_candidate_count=28>14", result.rationale)
         self.assertIn("multi_entry_bundle_suspected=28<=14+14", result.rationale)
         self.assertIsNotNone(result.bundle_companion_candidate)
-        self.assertIn(result.bundle_companion_candidate.mal_anime_id, {849, 4382})
-        self.assertNotEqual(result.bundle_companion_candidate.mal_anime_id, result.chosen_candidate.mal_anime_id)
+        self.assertEqual(4382, result.bundle_companion_candidate.mal_anime_id)
         self.assertEqual(1, len(result.bundle_companion_candidates or []))
-        self.assertEqual({result.bundle_companion_candidate.mal_anime_id}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertEqual({4382}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
 
     def test_map_series_flags_exact_title_overflow_as_bundle_even_when_later_season_companion_scores_low(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3722,18 +3722,16 @@ class DryRunPlannerTests(unittest.TestCase):
                 items = build_mapping_review(config, limit=5, mapping_limit=5)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].decision, "needs_review")
+        self.assertEqual(items[0].decision, "auto_approved")
         self.assertEqual(MAPPING_REVIEW_HEURISTICS_REVISION, items[0].mapper_revision)
         self.assertEqual(MAPPING_REVIEW_HEURISTICS_REVISION, items[0].as_dict()["mapper_revision"])
+        self.assertEqual(849, items[0].suggested_mal_anime_id)
         self.assertIsNotNone(items[0].bundle_companion_candidate)
-        self.assertIn(items[0].bundle_companion_candidate["mal_anime_id"], {849, 4382})
-        self.assertNotEqual(items[0].bundle_companion_candidate["mal_anime_id"], items[0].suggested_mal_anime_id)
+        self.assertEqual(4382, items[0].bundle_companion_candidate["mal_anime_id"])
         self.assertEqual(items[0].bundle_companion_candidate["num_episodes"], 14)
         self.assertEqual(1, len(items[0].bundle_companion_candidates))
-        self.assertEqual(
-            {items[0].bundle_companion_candidate["mal_anime_id"]},
-            {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates},
-        )
+        self.assertEqual({4382}, {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates})
+        self.assertIn("auto_approved_exact_unique_match", items[0].reasons)
 
     def test_build_mapping_review_surfaces_all_bundle_companions_for_three_entry_residue(self) -> None:
         with tempfile.TemporaryDirectory() as td:

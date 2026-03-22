@@ -897,7 +897,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("healthy=False", stdout)
         self.assertIn("warning_count=6", stdout)
         self.assertIn("warnings=missing_crunchyroll_credentials, missing_crunchyroll_state, missing_mal_auth_material, no_completed_ingest_snapshot, mapping_review_queue_stale_heuristics, open_review_queue", stdout)
-        self.assertIn("mapping_review_stale_entries=1/1 revision=2026-03-20a", stdout)
+        self.assertIn("mapping_review_stale_entries=1/1 revision=2026-03-22a", stdout)
         self.assertIn(
             'recommended_next=PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --fix-strategy "needs_manual_match | same_franchise_tie"',
             stdout,

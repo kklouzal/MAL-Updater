@@ -158,6 +158,16 @@ When a daemon task tied to a provider fails, persist an adaptive failure-backoff
 - every-loop retries create noisy logs and extra pressure without improving recovery odds
 - surfacing `failure_backoff_until`, `failure_backoff_reason`, and consecutive failures in service state/status makes unattended debugging clearer
 
+## 2026-03-22 - Same-title split-bundle suffix posture
+
+### Decision
+Allow exact-title split-bundle auto-resolution when the base candidate is an exact TV match and the bundle companion is a same-title TV suffix variant (for example a year-tagged entry like `Title (2009)`), **but only** when provider episode evidence fits the combined bundle length and there is no stronger non-bundle rival nearby.
+
+### Why
+- some real MAL franchises split one provider shell across multiple TV entries without advertising a plain `Season 2` / `Part 2` hint
+- this residue is still explainable when the provider title is exact, the companion stays in the same normalized title family, and the episode count only makes sense as the combined bundle
+- keeping the rule tied to same-title TV suffix companions preserves conservative behavior while removing a class of manual-review busywork
+
 ## 2026-03-20 - Supplemental mapping candidate posture
 
 ### Decision

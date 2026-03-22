@@ -21,7 +21,7 @@
 
 ## Product / sync quality
 
-- [ ] Continue reducing genuinely ambiguous mapping residue
+- [ ] Continue reducing genuinely ambiguous mapping residue (the last live Haruhi-style 14+14 same-title split bundle now auto-resolves under heuristics revision `2026-03-22a`; next residue should be genuinely ambiguous season/alias cases rather than obvious same-title bundle suffixes)
 - [ ] Continue stabilizing fresh Crunchyroll fetches on auth-fragile hosts
 - [ ] Keep improving recommendation quality and review UX
 - [ ] Keep the upstream GitHub issue tracker active as the canonical channel for third-party bug reports and feature requests

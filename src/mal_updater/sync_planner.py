@@ -10,7 +10,7 @@ from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
 
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
-MAPPING_REVIEW_HEURISTICS_REVISION = "2026-03-20a"
+MAPPING_REVIEW_HEURISTICS_REVISION = "2026-03-22a"
 
 
 def _is_approved_mapping_eligible(persisted: PersistedSeriesMapping | None, *, exact_approved_only: bool = False) -> bool:

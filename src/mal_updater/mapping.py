@@ -936,12 +936,14 @@ def _candidate_penalty_count(candidate: MappingCandidate) -> int:
     return penalty_reasons
 
 
-def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, str, int]:
+def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, int, int, str, int]:
     return (
         candidate.score,
         int("exact_normalized_title" in candidate.match_reasons),
         _candidate_positive_signal_count(candidate),
         -_candidate_penalty_count(candidate),
+        int("candidate_extra_title_suffix" not in candidate.match_reasons),
+        int(not re.search(r"\(\d{4}\)\s*$", candidate.title)),
         len(normalize_title_strict(candidate.matched_query)),
         candidate.title.lower(),
         -candidate.mal_anime_id,
@@ -1123,11 +1125,7 @@ def _supports_exact_bundle_auto_resolution(
         return False
 
     companion_ids = {candidate.mal_anime_id for candidate in bundle_companion_candidates}
-    if not all(
-        candidate.media_type == "tv"
-        and _candidate_has_explicit_followup_installment_hint(candidate)
-        for candidate in bundle_companion_candidates
-    ):
+    if not all(_candidate_is_safe_exact_bundle_pair_member(top, candidate) for candidate in bundle_companion_candidates):
         return False
 
     close_candidate_gap = 0.12
@@ -1172,6 +1170,39 @@ def _is_low_score_bundle_companion(top: MappingCandidate, companion: MappingCand
     ):
         return False
     return companion.score >= 0.35
+
+
+
+def _candidate_is_safe_exact_bundle_suffix_companion(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    if companion.media_type != "tv":
+        return False
+    if not _candidate_shares_bundle_title_family(top, companion):
+        return False
+    if "candidate_extra_title_suffix" not in companion.match_reasons:
+        return False
+    disqualifying_prefixes = (
+        "candidate_auxiliary_content=",
+        "installment_hint_conflict=",
+        "base_installment_penalty_for_explicit_later_season",
+    )
+    if any(reason.startswith(disqualifying_prefixes) for reason in companion.match_reasons):
+        return False
+    return companion.score >= max(0.70, top.score - 0.18)
+
+
+
+def _candidate_is_safe_exact_bundle_pair_member(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    if companion.media_type != "tv":
+        return False
+    if not _candidate_shares_bundle_title_family(top, companion):
+        return False
+    if _candidate_has_explicit_followup_installment_hint(companion):
+        return True
+    if _candidate_is_safe_exact_bundle_suffix_companion(top, companion):
+        return True
+    if "exact_normalized_title" in companion.match_reasons and companion.score >= max(0.70, top.score - 0.18):
+        return True
+    return False
 
 
 
