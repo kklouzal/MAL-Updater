@@ -79,6 +79,8 @@ class ServiceStatusTests(unittest.TestCase):
                             "failure_backoff_until": "2026-03-20T22:02:00Z",
                             "failure_backoff_remaining_seconds": 600,
                             "failure_backoff_reason": "HTTP 401 from Crunchyroll",
+                            "failure_backoff_class": "auth",
+                            "failure_backoff_floor_seconds": 7200,
                             "failure_backoff_consecutive_failures": 2,
                             "every_seconds": 21600,
                             "budget_provider": "crunchyroll",
@@ -154,6 +156,8 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual("HTTP 401 from Crunchyroll", fetch_summary["last_error"])
         self.assertEqual("2026-03-20T22:02:00Z", fetch_summary["failure_backoff_until"])
         self.assertEqual("HTTP 401 from Crunchyroll", fetch_summary["failure_backoff_reason"])
+        self.assertEqual("auth", fetch_summary["failure_backoff_class"])
+        self.assertEqual(7200, fetch_summary["failure_backoff_floor_seconds"])
         self.assertEqual(2, fetch_summary["failure_backoff_consecutive_failures"])
         self.assertIn("failure_backoff_remaining_seconds", fetch_summary)
 
@@ -229,6 +233,8 @@ class ServiceStatusTests(unittest.TestCase):
                             "failure_backoff_until": "2026-03-20T22:02:00Z",
                             "failure_backoff_remaining_seconds": 600,
                             "failure_backoff_reason": "HTTP 401 from Crunchyroll",
+                            "failure_backoff_class": "auth",
+                            "failure_backoff_floor_seconds": 7200,
                             "failure_backoff_consecutive_failures": 2,
                             "every_seconds": 21600,
                             "budget_provider": "crunchyroll",
@@ -299,6 +305,8 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_until=2026-03-20T22:02:00Z", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_remaining_seconds=", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_reason=HTTP 401 from Crunchyroll", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_class=auth", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_floor_seconds=7200", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_consecutive_failures=2", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
 

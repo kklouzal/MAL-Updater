@@ -30,6 +30,27 @@ class TaskSpec:
 _BUDGET_GATE_WINDOW_SECONDS = 3600
 _FAILURE_BACKOFF_MIN_SECONDS = 300
 
+_AUTH_STYLE_FAILURE_MARKERS = (
+    "http 401",
+    "http 403",
+    "unauthor",
+    "forbidden",
+    "auth_failed",
+    "invalid_grant",
+    "invalid token",
+    "expired token",
+    "token refresh",
+    "refresh token",
+    "credential_rebootstrap",
+    "login failed",
+    "login did not return",
+    "did not return both access_token and refresh_token",
+    "did not return both authorisationtoken and refreshtoken",
+    "did not return authorisationtoken",
+    "did not return refreshtoken",
+    "bearer",
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -287,16 +308,32 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
     return True, None, usage
 
 
-def _failure_backoff_seconds(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any]) -> int:
+def _looks_auth_style_failure(reason: str) -> bool:
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _AUTH_STYLE_FAILURE_MARKERS)
+
+
+def _failure_backoff_profile(config: AppConfig, spec: TaskSpec, reason: str) -> tuple[str, int]:
     provider = spec.budget_provider
-    configured_floor = 0
+    critical_floor = 0
+    auth_floor = 0
     if provider:
-        configured_floor = config.service.backoff_floor_seconds_for(provider, level="critical")
+        critical_floor = config.service.backoff_floor_seconds_for(provider, level="critical")
+        auth_floor = config.service.auth_failure_backoff_floor_seconds_for(provider)
+    classification = "auth" if provider and _looks_auth_style_failure(reason) else "generic"
+    configured_floor = critical_floor
+    if classification == "auth":
+        configured_floor = max(configured_floor, auth_floor)
+    return classification, configured_floor
+
+
+def _failure_backoff_seconds(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any], *, reason: str) -> tuple[int, str, int]:
+    classification, configured_floor = _failure_backoff_profile(config, spec, reason)
     base_seconds = max(_FAILURE_BACKOFF_MIN_SECONDS, configured_floor)
     consecutive_failures = int(task_state.get("failure_backoff_consecutive_failures", 0)) + 1
     max_seconds = max(base_seconds, int(spec.every_seconds))
     cooldown_seconds = min(max_seconds, base_seconds * (2 ** max(0, consecutive_failures - 1)))
-    return max(0, int(cooldown_seconds))
+    return max(0, int(cooldown_seconds)), classification, configured_floor
 
 
 def _clear_failure_backoff(task_state: dict[str, Any]) -> None:
@@ -305,6 +342,8 @@ def _clear_failure_backoff(task_state: dict[str, Any]) -> None:
     task_state.pop("failure_backoff_remaining_seconds", None)
     task_state.pop("failure_backoff_reason", None)
     task_state.pop("failure_backoff_consecutive_failures", None)
+    task_state.pop("failure_backoff_class", None)
+    task_state.pop("failure_backoff_floor_seconds", None)
 
 
 def _set_failure_backoff(
@@ -315,10 +354,12 @@ def _set_failure_backoff(
     now: float,
     reason: str,
 ) -> dict[str, Any]:
-    cooldown_seconds = _failure_backoff_seconds(config, spec, task_state)
+    cooldown_seconds, failure_class, floor_seconds = _failure_backoff_seconds(config, spec, task_state, reason=reason)
     consecutive_failures = int(task_state.get("failure_backoff_consecutive_failures", 0)) + 1
     task_state["failure_backoff_consecutive_failures"] = consecutive_failures
     task_state["failure_backoff_reason"] = reason
+    task_state["failure_backoff_class"] = failure_class
+    task_state["failure_backoff_floor_seconds"] = floor_seconds
     task_state["failure_backoff_until_epoch"] = now + cooldown_seconds
     task_state["failure_backoff_until"] = _iso_after_seconds(cooldown_seconds)
     task_state["failure_backoff_remaining_seconds"] = cooldown_seconds
@@ -327,6 +368,8 @@ def _set_failure_backoff(
         "failure_backoff_remaining_seconds": cooldown_seconds,
         "failure_backoff_reason": reason,
         "failure_backoff_consecutive_failures": consecutive_failures,
+        "failure_backoff_class": failure_class,
+        "failure_backoff_floor_seconds": floor_seconds,
     }
 
 
@@ -404,6 +447,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "failure_backoff_remaining_seconds": remaining,
                     "failure_backoff_reason": task_state.get("failure_backoff_reason"),
                     "failure_backoff_consecutive_failures": task_state.get("failure_backoff_consecutive_failures"),
+                    "failure_backoff_class": task_state.get("failure_backoff_class"),
+                    "failure_backoff_floor_seconds": task_state.get("failure_backoff_floor_seconds"),
                 }
             )
             continue

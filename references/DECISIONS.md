@@ -171,6 +171,16 @@ Keep provider fetch lanes incremental by default, but let the unattended daemon 
 - wiring health-check maintenance recommendations back into daemon execution closes a real gap between diagnosis and remediation for partial-coverage residue
 - surfacing fetch mode plus last successful full refresh in task state keeps the behavior auditable instead of hiding refresh policy in operator folklore
 
+## 2026-03-23 - Auth-style provider failure cooldown posture
+
+### Decision
+Keep adaptive provider failure backoff for all daemon task errors, but classify auth-style provider failures separately and allow a stronger provider-specific cooldown floor for that class. Persist the failure class and effective floor in service state/status.
+
+### Why
+- repeated auth/login/refresh failures are a different recovery shape than generic subprocess or network residue
+- brittle provider auth should cool down longer before retrying so unattended loops stop re-poking broken sessions
+- surfacing the failure class and floor keeps the daemon's retry posture explainable during debugging instead of hiding it in timing folklore
+
 ## 2026-03-22 - Same-title split-bundle suffix posture
 
 ### Decision

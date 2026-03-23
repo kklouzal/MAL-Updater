@@ -51,6 +51,10 @@ hidive = 300
 crunchyroll = 1800
 hidive = 1200
 
+[service.provider_auth_failure_backoff_floor_seconds]
+crunchyroll = 7200
+hidive = 3600
+
 [secret_files]
 mal_client_id = "mal_client_id.txt"
 mal_client_secret = "mal_client_secret.txt"

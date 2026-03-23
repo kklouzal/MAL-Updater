@@ -575,6 +575,12 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             failure_backoff_reason = task_payload.get("failure_backoff_reason") if isinstance(task_payload.get("failure_backoff_reason"), str) else None
             if failure_backoff_reason is not None:
                 print(f"task_{task_name}_failure_backoff_reason={failure_backoff_reason}")
+            failure_backoff_class = task_payload.get("failure_backoff_class") if isinstance(task_payload.get("failure_backoff_class"), str) else None
+            if failure_backoff_class is not None:
+                print(f"task_{task_name}_failure_backoff_class={failure_backoff_class}")
+            failure_backoff_floor_seconds = task_payload.get("failure_backoff_floor_seconds") if isinstance(task_payload.get("failure_backoff_floor_seconds"), int) else None
+            if failure_backoff_floor_seconds is not None:
+                print(f"task_{task_name}_failure_backoff_floor_seconds={failure_backoff_floor_seconds}")
             failure_backoff_consecutive_failures = task_payload.get("failure_backoff_consecutive_failures") if isinstance(task_payload.get("failure_backoff_consecutive_failures"), int) else None
             if failure_backoff_consecutive_failures is not None:
                 print(f"task_{task_name}_failure_backoff_consecutive_failures={failure_backoff_consecutive_failures}")
@@ -975,6 +981,10 @@ def _provider_service_auth_failure(
         payload["failure_backoff_until"] = task_state["failure_backoff_until"]
     if isinstance(task_state.get("failure_backoff_remaining_seconds"), (int, float)):
         payload["failure_backoff_remaining_seconds"] = int(task_state["failure_backoff_remaining_seconds"])
+    if isinstance(task_state.get("failure_backoff_class"), str):
+        payload["failure_backoff_class"] = task_state["failure_backoff_class"]
+    if isinstance(task_state.get("failure_backoff_floor_seconds"), (int, float)):
+        payload["failure_backoff_floor_seconds"] = int(task_state["failure_backoff_floor_seconds"])
     if isinstance(session_residue, dict):
         payload.update(session_residue)
     return payload

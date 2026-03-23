@@ -115,6 +115,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "budget_backoff_cooldown_source",
         "failure_backoff_until",
         "failure_backoff_reason",
+        "failure_backoff_class",
         "next_due_at",
         "budget_provider",
         "last_fetch_mode",
@@ -139,6 +140,8 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         summary["failure_backoff_remaining_seconds"] = int(value["failure_backoff_remaining_seconds"])
     if isinstance(value.get("failure_backoff_consecutive_failures"), (int, float)):
         summary["failure_backoff_consecutive_failures"] = int(value["failure_backoff_consecutive_failures"])
+    if isinstance(value.get("failure_backoff_floor_seconds"), (int, float)):
+        summary["failure_backoff_floor_seconds"] = int(value["failure_backoff_floor_seconds"])
     next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
     if next_due_at is not None:
         summary["next_due_in_seconds"] = max(0, int((next_due_at - datetime.now(timezone.utc)).total_seconds()))

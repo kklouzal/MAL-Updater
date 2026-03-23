@@ -78,6 +78,7 @@ class ServiceSettings:
     provider_hourly_limits: dict[str, int] = field(default_factory=dict)
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     provider_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    provider_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
     critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
 
@@ -92,6 +93,12 @@ class ServiceSettings:
     def backoff_floor_seconds_for(self, provider: str, *, level: str) -> int:
         floors = self.provider_warn_backoff_floor_seconds if level == "warn" else self.provider_critical_backoff_floor_seconds
         value = floors.get(provider)
+        if isinstance(value, int):
+            return max(0, int(value))
+        return 0
+
+    def auth_failure_backoff_floor_seconds_for(self, provider: str) -> int:
+        value = self.provider_auth_failure_backoff_floor_seconds.get(provider)
         if isinstance(value, int):
             return max(0, int(value))
         return 0
@@ -315,6 +322,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_warn_backoff_floors_section = _get_nested_table(settings, "service", "provider_warn_backoff_floor_seconds")
     service_critical_backoff_floors_section = _get_nested_table(settings, "service", "provider_critical_backoff_floor_seconds")
+    service_auth_failure_backoff_floors_section = _get_nested_table(settings, "service", "provider_auth_failure_backoff_floor_seconds")
     secret_files_section = _get_table(settings, "secret_files")
     settings_dir = settings_path.parent
 
@@ -443,6 +451,11 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             provider_critical_backoff_floor_seconds={
                 str(key): int(value)
                 for key, value in service_critical_backoff_floors_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            provider_auth_failure_backoff_floor_seconds={
+                str(key): int(value)
+                for key, value in service_auth_failure_backoff_floors_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
             warn_ratio=float(os.getenv("MAL_UPDATER_SERVICE_WARN_RATIO", _get_float(service_section, "warn_ratio", DEFAULT_SERVICE_WARN_RATIO))),

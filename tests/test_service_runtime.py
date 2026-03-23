@@ -401,16 +401,46 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("error", sync_result["status"])
         self.assertGreaterEqual(sync_result["failure_backoff_remaining_seconds"], 300)
         self.assertEqual("HTTP 401 from Crunchyroll", sync_result["failure_backoff_reason"])
+        self.assertEqual("auth", sync_result["failure_backoff_class"])
+        self.assertEqual(0, sync_result["failure_backoff_floor_seconds"])
         self.assertEqual(1, sync_result["failure_backoff_consecutive_failures"])
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = state["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual("error", sync_state["last_status"])
         self.assertEqual("HTTP 401 from Crunchyroll", sync_state["last_error"])
+        self.assertEqual("auth", sync_state["failure_backoff_class"])
+        self.assertEqual(0, sync_state["failure_backoff_floor_seconds"])
         self.assertIn("failure_backoff_until", sync_state)
         self.assertIn("failure_backoff_until_epoch", sync_state)
         self.assertGreaterEqual(sync_state["failure_backoff_remaining_seconds"], 300)
         self.assertEqual(1, sync_state["failure_backoff_consecutive_failures"])
+
+    def test_run_pending_tasks_uses_provider_auth_failure_floor_for_auth_style_errors(self) -> None:
+        self.config.service.provider_auth_failure_backoff_floor_seconds["crunchyroll"] = 1800
+
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "mal"}), (True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
+            "mal_updater.service_runtime._refresh_mal_tokens",
+            return_value={"status": "ok"},
+        ), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "error", "label": "sync_fetch_crunchyroll", "returncode": 1, "stdout": "", "stderr": "login failed for Crunchyroll refresh token\n"},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("auth", sync_result["failure_backoff_class"])
+        self.assertEqual(1800, sync_result["failure_backoff_floor_seconds"])
+        self.assertEqual(1800, sync_result["failure_backoff_remaining_seconds"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = state["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("auth", sync_state["failure_backoff_class"])
+        self.assertEqual(1800, sync_state["failure_backoff_floor_seconds"])
 
     def test_run_pending_tasks_skips_provider_retries_while_failure_backoff_is_active(self) -> None:
         state = {
@@ -420,6 +450,8 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
                     "failure_backoff_until_epoch": datetime.now(timezone.utc).timestamp() + 600,
                     "failure_backoff_until": "2026-03-20T21:10:00Z",
                     "failure_backoff_reason": "HTTP 401 from Crunchyroll",
+                    "failure_backoff_class": "auth",
+                    "failure_backoff_floor_seconds": 1800,
                     "failure_backoff_consecutive_failures": 2,
                 }
             },
@@ -442,6 +474,8 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("skipped", sync_result["status"])
         self.assertIn("failure_backoff_active", sync_result["reason"])
         self.assertEqual("HTTP 401 from Crunchyroll", sync_result["failure_backoff_reason"])
+        self.assertEqual("auth", sync_result["failure_backoff_class"])
+        self.assertEqual(1800, sync_result["failure_backoff_floor_seconds"])
         self.assertEqual(2, sync_result["failure_backoff_consecutive_failures"])
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
@@ -482,5 +516,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertNotIn("failure_backoff_until", sync_state)
         self.assertNotIn("failure_backoff_until_epoch", sync_state)
         self.assertNotIn("failure_backoff_reason", sync_state)
+        self.assertNotIn("failure_backoff_class", sync_state)
+        self.assertNotIn("failure_backoff_floor_seconds", sync_state)
         self.assertNotIn("failure_backoff_consecutive_failures", sync_state)
         self.assertEqual("ok", sync_state["last_status"])
