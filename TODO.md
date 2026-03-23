@@ -15,7 +15,7 @@
 ## Daemon / operations
 
 - [ ] Tighten daemon control loops and per-lane state tracking (cadence / decision timing / last-run start-finish-duration / next-due / active-backoff observability now persists in service state, including warn-vs-critical budget backoff plus adaptive failure-aware provider cooldown state; next likely step is smarter lane-specific budgeting and deciding whether some failure classes deserve custom cooldowns)
-- [ ] Continue refining request-budget accounting / backoff behavior for MAL and Crunchyroll (warn-threshold pacing + recovery-window backoff now exist, plus provider-specific cooldown floors and adaptive failure-aware cooldowns after provider task errors; next likely step is smarter lane-specific budgeting and more explicit auth-fragility classification)
+- [ ] Continue refining request-budget accounting / backoff behavior for MAL and Crunchyroll (warn-threshold pacing + recovery-window backoff now exist, plus provider-specific cooldown floors, adaptive failure-aware cooldowns after provider task errors, and health-check auth rebootstrap recommendations after repeated auth-style provider failures; next likely step is smarter lane-specific budgeting and richer auth-fragility classification beyond obvious repeated 401/unauthorized cases)
 - [ ] Decide whether to retire the remaining transitional wrapper scripts after more daemon logic moves in-process
 - [x] Add richer service-state/observability surfaces for debugging unattended failures
 - [x] Add `service-status --format summary` as a terse/operator-summary mode alongside the rich JSON surface
@@ -23,6 +23,6 @@
 ## Product / sync quality
 
 - [ ] Continue reducing genuinely ambiguous mapping residue (the last live Haruhi-style 14+14 same-title split bundle now auto-resolves under heuristics revision `2026-03-22a`; next residue should be genuinely ambiguous season/alias cases rather than obvious same-title bundle suffixes)
-- [ ] Continue stabilizing fresh Crunchyroll fetches on auth-fragile hosts (daemon-side periodic provider full-refresh cadence now exists via `service.full_refresh_every_seconds`, and the daemon now also honors health-check `refresh_full_snapshot` recommendations when partial-coverage warnings persist; next likely step is smarter auth-fragility classification/escalation for repeated provider failures)
+- [ ] Continue stabilizing fresh Crunchyroll fetches on auth-fragile hosts (daemon-side periodic provider full-refresh cadence now exists via `service.full_refresh_every_seconds`, the daemon now honors health-check `refresh_full_snapshot` recommendations when partial-coverage warnings persist, and health-check can now recommend provider auth rebootstrap after repeated auth-style daemon failures; next likely step is smarter auth-fragility classification/escalation for less-obvious failure modes)
 - [ ] Keep improving recommendation quality and review UX
 - [ ] Keep the upstream GitHub issue tracker active as the canonical channel for third-party bug reports and feature requests

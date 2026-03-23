@@ -855,6 +855,67 @@ def _build_automation_installation_status(project_root: Path) -> dict[str, objec
 
 
 
+def _load_service_state_for_health(config: AppConfig) -> dict[str, object] | None:
+    if not config.service_state_path.exists():
+        return None
+    try:
+        payload = json.loads(config.service_state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+_AUTH_STYLE_FAILURE_MARKERS = (
+    "http 401",
+    "unauthor",
+    "forbidden",
+    "auth_failed",
+    "invalid_grant",
+    "invalid token",
+    "expired token",
+    "token refresh",
+    "refresh token",
+    "credential_rebootstrap",
+)
+
+
+def _provider_service_auth_failure(
+    service_state: dict[str, object] | None,
+    *,
+    provider: str,
+    min_consecutive_failures: int = 2,
+) -> dict[str, object] | None:
+    if not isinstance(service_state, dict):
+        return None
+    tasks = service_state.get("tasks")
+    if not isinstance(tasks, dict):
+        return None
+    task_state = tasks.get(f"sync_fetch_{provider}")
+    if not isinstance(task_state, dict):
+        return None
+    reason = task_state.get("failure_backoff_reason") or task_state.get("last_error")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    consecutive_failures = task_state.get("failure_backoff_consecutive_failures", 0)
+    if not isinstance(consecutive_failures, (int, float)) or int(consecutive_failures) < min_consecutive_failures:
+        return None
+    lowered = reason.lower()
+    if not any(marker in lowered for marker in _AUTH_STYLE_FAILURE_MARKERS):
+        return None
+    payload: dict[str, object] = {
+        "provider": provider,
+        "reason": reason.strip(),
+        "consecutive_failures": int(consecutive_failures),
+    }
+    if isinstance(task_state.get("failure_backoff_until"), str):
+        payload["failure_backoff_until"] = task_state["failure_backoff_until"]
+    if isinstance(task_state.get("failure_backoff_remaining_seconds"), (int, float)):
+        payload["failure_backoff_remaining_seconds"] = int(task_state["failure_backoff_remaining_seconds"])
+    return payload
+
+
 def _build_health_maintenance_commands(
     *,
     crunchyroll_credentials_present: bool,
@@ -876,6 +937,7 @@ def _build_health_maintenance_commands(
     automation_installation: dict[str, object] | None = None,
     review_queue_refresh_command_args: list[str] | None = None,
     review_queue_refresh_worklist_command_args: list[str] | None = None,
+    provider_auth_failures: dict[str, dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     commands: list[dict[str, object]] = []
     seen_commands: set[str] = set()
@@ -929,6 +991,38 @@ def _build_health_maintenance_commands(
             automation_safe=False,
             requires_auth_interaction=True,
         )
+
+    if isinstance(provider_auth_failures, dict):
+        crunchyroll_failure = provider_auth_failures.get("crunchyroll")
+        if crunchyroll_credentials_present and crunchyroll_state_present and isinstance(crunchyroll_failure, dict):
+            detail = (
+                "Re-bootstrap Crunchyroll auth state after repeated auth-style unattended fetch failures"
+            )
+            reason = crunchyroll_failure.get("reason")
+            if isinstance(reason, str) and reason:
+                detail += f": {reason}"
+            add_command(
+                "rebootstrap_crunchyroll_auth_after_failures",
+                detail,
+                ["crunchyroll-auth-login"],
+                automation_safe=False,
+                requires_auth_interaction=False,
+            )
+        hidive_failure = provider_auth_failures.get("hidive")
+        if hidive_credentials_present and hidive_state_present and isinstance(hidive_failure, dict):
+            detail = (
+                "Re-bootstrap HIDIVE auth state after repeated auth-style unattended fetch failures"
+            )
+            reason = hidive_failure.get("reason")
+            if isinstance(reason, str) and reason:
+                detail += f": {reason}"
+            add_command(
+                "rebootstrap_hidive_auth_after_failures",
+                detail,
+                ["provider-auth-login", "--provider", "hidive"],
+                automation_safe=False,
+                requires_auth_interaction=False,
+            )
 
     snapshot_needs_refresh = not isinstance(latest_completed_sync_run, dict)
     if latest_completed_age_seconds is not None and latest_completed_age_seconds > stale_hours * 3600:
@@ -1232,6 +1326,12 @@ def _cmd_health_check(
         snapshot.get("mappings") if isinstance(snapshot.get("mappings"), dict) else None,
     )
     automation_installation = _build_automation_installation_status(config.project_root)
+    service_state = _load_service_state_for_health(config)
+    provider_auth_failures = {
+        provider: payload
+        for provider in ("crunchyroll", "hidive")
+        if (payload := _provider_service_auth_failure(service_state, provider=provider)) is not None
+    }
 
     warnings: list[dict[str, object]] = []
 
@@ -1307,6 +1407,13 @@ def _cmd_health_check(
                 "fields": partial_sync_coverage.get("fields"),
             }
         )
+    for provider, failure in provider_auth_failures.items():
+        warning = {
+            "code": f"{provider}_auth_failures_repeated",
+            "detail": f"Repeated unattended {provider} fetch failures look auth-related and likely need auth re-bootstrap",
+            **failure,
+        }
+        warnings.append(warning)
     coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
     unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (
@@ -1461,6 +1568,7 @@ def _cmd_health_check(
         automation_installation=automation_installation,
         review_queue_refresh_command_args=review_queue_refresh_command_args,
         review_queue_refresh_worklist_command_args=review_queue_refresh_worklist_command_args,
+        provider_auth_failures=provider_auth_failures,
     )
 
     payload = {

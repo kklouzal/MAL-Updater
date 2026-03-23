@@ -96,6 +96,77 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual([], payload["review_queue"]["recommended_worklist"])
         self.assertIsNone(payload["review_queue"]["recommended_apply_worklist"])
 
+    def test_health_check_recommends_crunchyroll_reauth_after_repeated_auth_failures(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_status": "error",
+                            "last_error": "HTTP 401 from Crunchyroll",
+                            "failure_backoff_reason": "HTTP 401 from Crunchyroll",
+                            "failure_backoff_consecutive_failures": 3,
+                            "failure_backoff_until": "2026-03-23T09:55:00Z",
+                            "failure_backoff_remaining_seconds": 900,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("crunchyroll_auth_failures_repeated", warning_codes)
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual("rebootstrap_crunchyroll_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual(["crunchyroll-auth-login"], maintenance_commands[0]["command_args"])
+        self.assertFalse(maintenance_commands[0]["automation_safe"])
+        self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
+        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
+        self.assertEqual("refresh_ingested_snapshot", payload["maintenance"]["recommended_automation_command"]["reason_code"])
+
+    def test_health_check_ignores_non_auth_provider_failures(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_status": "error",
+                            "last_error": "HTTP 500 from Crunchyroll",
+                            "failure_backoff_reason": "HTTP 500 from Crunchyroll",
+                            "failure_backoff_consecutive_failures": 3,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertNotIn("crunchyroll_auth_failures_repeated", warning_codes)
+        maintenance_reason_codes = [command["reason_code"] for command in payload["maintenance"]["recommended_commands"]]
+        self.assertNotIn("rebootstrap_crunchyroll_auth_after_failures", maintenance_reason_codes)
+
     def test_health_check_warns_when_repo_owned_automation_units_are_not_installed(self) -> None:
         self._provision_repo_owned_automation_assets()
 
