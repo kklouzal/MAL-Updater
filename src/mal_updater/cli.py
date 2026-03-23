@@ -869,6 +869,7 @@ def _load_service_state_for_health(config: AppConfig) -> dict[str, object] | Non
 
 _AUTH_STYLE_FAILURE_MARKERS = (
     "http 401",
+    "http 403",
     "unauthor",
     "forbidden",
     "auth_failed",
@@ -878,13 +879,74 @@ _AUTH_STYLE_FAILURE_MARKERS = (
     "token refresh",
     "refresh token",
     "credential_rebootstrap",
+    "login failed",
+    "login did not return",
+    "did not return both access_token and refresh_token",
+    "did not return both authorisationtoken and refreshtoken",
+    "did not return authorisationtoken",
+    "did not return refreshtoken",
+    "bearer",
 )
+
+_AUTH_STYLE_SESSION_PHASES = {
+    "auth_failed",
+    "auth_retrying_with_refresh_token",
+    "auth_retrying_with_credentials",
+}
+
+
+def _load_json_dict(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _provider_auth_session_residue(config: AppConfig, provider: str) -> dict[str, object] | None:
+    if provider == "crunchyroll":
+        session_path = resolve_crunchyroll_state_paths(config).session_state_path
+        phase_key = "crunchyroll_phase"
+    elif provider == "hidive":
+        session_path = resolve_hidive_state_paths(config).session_state_path
+        phase_key = "hidive_phase"
+    else:
+        return None
+    payload = _load_json_dict(session_path)
+    if not isinstance(payload, dict):
+        return None
+    phase = payload.get(phase_key)
+    last_error = payload.get("last_error")
+    residue: dict[str, object] = {}
+    if isinstance(phase, str) and phase in _AUTH_STYLE_SESSION_PHASES:
+        residue["session_phase"] = phase
+    if isinstance(last_error, str) and last_error.strip():
+        residue["session_last_error"] = last_error.strip()
+    return residue or None
+
+
+def _looks_auth_style_failure(reason: str, *, session_residue: dict[str, object] | None = None) -> bool:
+    lowered = reason.lower()
+    if any(marker in lowered for marker in _AUTH_STYLE_FAILURE_MARKERS):
+        return True
+    if isinstance(session_residue, dict):
+        if isinstance(session_residue.get("session_phase"), str):
+            return True
+        session_last_error = session_residue.get("session_last_error")
+        if isinstance(session_last_error, str):
+            lowered_session_error = session_last_error.lower()
+            if any(marker in lowered_session_error for marker in _AUTH_STYLE_FAILURE_MARKERS):
+                return True
+    return False
 
 
 def _provider_service_auth_failure(
     service_state: dict[str, object] | None,
     *,
     provider: str,
+    config: AppConfig,
     min_consecutive_failures: int = 2,
 ) -> dict[str, object] | None:
     if not isinstance(service_state, dict):
@@ -901,8 +963,8 @@ def _provider_service_auth_failure(
     consecutive_failures = task_state.get("failure_backoff_consecutive_failures", 0)
     if not isinstance(consecutive_failures, (int, float)) or int(consecutive_failures) < min_consecutive_failures:
         return None
-    lowered = reason.lower()
-    if not any(marker in lowered for marker in _AUTH_STYLE_FAILURE_MARKERS):
+    session_residue = _provider_auth_session_residue(config, provider)
+    if not _looks_auth_style_failure(reason, session_residue=session_residue):
         return None
     payload: dict[str, object] = {
         "provider": provider,
@@ -913,6 +975,8 @@ def _provider_service_auth_failure(
         payload["failure_backoff_until"] = task_state["failure_backoff_until"]
     if isinstance(task_state.get("failure_backoff_remaining_seconds"), (int, float)):
         payload["failure_backoff_remaining_seconds"] = int(task_state["failure_backoff_remaining_seconds"])
+    if isinstance(session_residue, dict):
+        payload.update(session_residue)
     return payload
 
 
@@ -1330,7 +1394,7 @@ def _cmd_health_check(
     provider_auth_failures = {
         provider: payload
         for provider in ("crunchyroll", "hidive")
-        if (payload := _provider_service_auth_failure(service_state, provider=provider)) is not None
+        if (payload := _provider_service_auth_failure(service_state, provider=provider, config=config)) is not None
     }
 
     warnings: list[dict[str, object]] = []

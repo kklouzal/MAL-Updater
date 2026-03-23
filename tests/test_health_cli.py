@@ -135,6 +135,83 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertEqual("refresh_ingested_snapshot", payload["maintenance"]["recommended_automation_command"]["reason_code"])
 
+    def test_health_check_recommends_reauth_for_login_failure_without_http_401_marker(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_status": "error",
+                            "last_error": "Crunchyroll refresh-token login failed: invalid_grant - refresh token revoked",
+                            "failure_backoff_reason": "Crunchyroll refresh-token login failed: invalid_grant - refresh token revoked",
+                            "failure_backoff_consecutive_failures": 3,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        repeated = next(warning for warning in payload["warnings"] if warning["code"] == "crunchyroll_auth_failures_repeated")
+        self.assertEqual("crunchyroll", repeated["provider"])
+        self.assertIn("invalid_grant", repeated["reason"])
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual("rebootstrap_crunchyroll_auth_after_failures", maintenance_commands[0]["reason_code"])
+
+    def test_health_check_uses_provider_session_auth_phase_as_fallback_signal(self) -> None:
+        (self.config.secrets_dir / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "hidive_password.txt").write_text("super-secret\n", encoding="utf-8")
+        hidive_state_root = self.config.state_dir / "hidive" / "default"
+        hidive_state_root.mkdir(parents=True, exist_ok=True)
+        (hidive_state_root / "authorisation_token.txt").write_text("auth-token\n", encoding="utf-8")
+        (hidive_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (hidive_state_root / "session.json").write_text(
+            json.dumps(
+                {
+                    "hidive_phase": "auth_failed",
+                    "last_error": "HIDIVE login did not return authorisationToken",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_hidive": {
+                            "last_status": "error",
+                            "last_error": "provider snapshot failed after token churn",
+                            "failure_backoff_reason": "provider snapshot failed after token churn",
+                            "failure_backoff_consecutive_failures": 2,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        repeated = next(warning for warning in payload["warnings"] if warning["code"] == "hidive_auth_failures_repeated")
+        self.assertEqual("auth_failed", repeated["session_phase"])
+        self.assertIn("authorisationToken", repeated["session_last_error"])
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual("rebootstrap_hidive_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual(["provider-auth-login", "--provider", "hidive"], maintenance_commands[0]["command_args"])
+
     def test_health_check_ignores_non_auth_provider_failures(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
