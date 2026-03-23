@@ -539,6 +539,12 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             budget_provider = task_payload.get("budget_provider") if isinstance(task_payload.get("budget_provider"), str) else None
             if budget_provider is not None:
                 print(f"task_{task_name}_budget_provider={budget_provider}")
+            last_fetch_mode = task_payload.get("last_fetch_mode") if isinstance(task_payload.get("last_fetch_mode"), str) else None
+            if last_fetch_mode is not None:
+                print(f"task_{task_name}_last_fetch_mode={last_fetch_mode}")
+            last_full_refresh_reason = task_payload.get("last_full_refresh_reason") if isinstance(task_payload.get("last_full_refresh_reason"), str) else None
+            if last_full_refresh_reason is not None:
+                print(f"task_{task_name}_last_full_refresh_reason={last_full_refresh_reason}")
             next_due_at = task_payload.get("next_due_at") if isinstance(task_payload.get("next_due_at"), str) else None
             if next_due_at is not None:
                 print(f"task_{task_name}_next_due_at={next_due_at}")

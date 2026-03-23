@@ -179,6 +179,51 @@ def _provider_fetch_requires_full_refresh(config: AppConfig, task_state: dict[st
 
 
 
+def _provider_from_refresh_command_args(command_args: object) -> str | None:
+    if not isinstance(command_args, list) or not command_args:
+        return None
+    if command_args[0] == "crunchyroll-fetch-snapshot":
+        return "crunchyroll"
+    if len(command_args) >= 3 and command_args[0] == "provider-fetch-snapshot" and command_args[1] == "--provider" and isinstance(command_args[2], str):
+        return str(command_args[2])
+    return None
+
+
+
+def _provider_fetch_requested_by_health(config: AppConfig, provider: str, task_state: dict[str, Any]) -> bool:
+    path = config.health_latest_json_path
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    maintenance = payload.get("maintenance")
+    if not isinstance(maintenance, dict):
+        return False
+    commands = maintenance.get("recommended_commands")
+    if not isinstance(commands, list):
+        return False
+    try:
+        health_mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    last_full_refresh_epoch = task_state.get("last_successful_full_refresh_epoch")
+    if isinstance(last_full_refresh_epoch, (int, float)) and float(last_full_refresh_epoch) >= float(health_mtime):
+        return False
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        if command.get("reason_code") != "refresh_full_snapshot":
+            continue
+        if _provider_from_refresh_command_args(command.get("command_args")) == provider:
+            return True
+    return False
+
+
+
 def _apply_sync_command() -> list[str]:
     return [
         "python3",
@@ -414,13 +459,20 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result = _refresh_mal_tokens(config)
             elif spec.name.startswith("sync_fetch_"):
                 provider = spec.name.removeprefix("sync_fetch_")
-                full_refresh_requested = _provider_fetch_requires_full_refresh(config, task_state, now=now)
+                full_refresh_reasons: list[str] = []
+                if _provider_fetch_requires_full_refresh(config, task_state, now=now):
+                    full_refresh_reasons.append("periodic_cadence")
+                if _provider_fetch_requested_by_health(config, provider, task_state):
+                    full_refresh_reasons.append("health_recommended")
+                full_refresh_requested = bool(full_refresh_reasons)
                 result = _run_subprocess(
                     config,
                     _provider_fetch_command(config, provider, full_refresh=full_refresh_requested),
                     label=spec.name,
                 )
                 result["fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
+                if full_refresh_reasons:
+                    result["full_refresh_reason"] = "+".join(full_refresh_reasons)
             elif spec.name == "sync_apply":
                 result = _run_subprocess(config, _apply_sync_command(), label="sync_apply")
             elif spec.name == "health":
@@ -437,13 +489,16 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
                 task_state["last_fetch_mode_at"] = finished_at
                 if full_refresh_requested:
+                    task_state["last_full_refresh_reason"] = result.get("full_refresh_reason")
                     task_state["last_successful_full_refresh_epoch"] = finished_epoch
                     task_state["last_successful_full_refresh_at"] = finished_at
                     task_state["full_refresh_anchor_epoch"] = finished_epoch
                     task_state["full_refresh_anchor_at"] = finished_at
-                elif not isinstance(task_state.get("full_refresh_anchor_epoch"), (int, float)):
-                    task_state["full_refresh_anchor_epoch"] = finished_epoch
-                    task_state["full_refresh_anchor_at"] = finished_at
+                else:
+                    task_state.pop("last_full_refresh_reason", None)
+                    if not isinstance(task_state.get("full_refresh_anchor_epoch"), (int, float)):
+                        task_state["full_refresh_anchor_epoch"] = finished_epoch
+                        task_state["full_refresh_anchor_at"] = finished_at
             task_state.pop("last_skip_reason", None)
             task_state.pop("last_skipped_at", None)
             task_state.pop("budget_backoff_level", None)

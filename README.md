@@ -100,6 +100,7 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 - recurring health-check/report generation
 - API request logging / budget awareness
 - periodic provider full-refresh cadence (`service.full_refresh_every_seconds`, default 24h) so unattended runs can remain incremental by default while still forcing occasional conservative resweeps
+- health-driven full-refresh escalation: if the latest health-check artifact recommends `refresh_full_snapshot` for a provider because cached coverage is only partial, the next unattended fetch lane for that provider automatically upgrades itself to `--full-refresh` instead of waiting for the periodic cadence window
 
 ## Security / boundaries
 

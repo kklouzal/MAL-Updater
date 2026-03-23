@@ -117,6 +117,8 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "failure_backoff_reason",
         "next_due_at",
         "budget_provider",
+        "last_fetch_mode",
+        "last_full_refresh_reason",
     ):
         field_value = value.get(field)
         if field_value is not None:

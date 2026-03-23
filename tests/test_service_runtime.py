@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -93,16 +94,123 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
         self.assertEqual("full_refresh", sync_result["fetch_mode"])
+        self.assertEqual("periodic_cadence", sync_result["full_refresh_reason"])
         sync_args = run_subprocess.call_args_list[0].args[1]
         self.assertIn("--full-refresh", sync_args)
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual("full_refresh", sync_state["last_fetch_mode"])
+        self.assertEqual("periodic_cadence", sync_state["last_full_refresh_reason"])
         self.assertIn("last_successful_full_refresh_epoch", sync_state)
         self.assertGreater(sync_state["full_refresh_anchor_epoch"], stale_anchor)
 
+    def test_run_pending_tasks_requests_health_recommended_full_refresh(self) -> None:
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text(
+            json.dumps(
+                {
+                    "maintenance": {
+                        "recommended_commands": [
+                            {
+                                "reason_code": "refresh_full_snapshot",
+                                "command_args": [
+                                    "crunchyroll-fetch-snapshot",
+                                    "--full-refresh",
+                                    "--out",
+                                    ".MAL-Updater/cache/live-crunchyroll-snapshot.json",
+                                    "--ingest",
+                                ],
+                            }
+                        ]
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("full_refresh", sync_result["fetch_mode"])
+        self.assertEqual("health_recommended", sync_result["full_refresh_reason"])
+        sync_args = run_subprocess.call_args_list[0].args[1]
+        self.assertIn("--full-refresh", sync_args)
+
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("health_recommended", sync_state["last_full_refresh_reason"])
+
+    def test_run_pending_tasks_does_not_repeat_health_recommended_full_refresh_after_newer_success(self) -> None:
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text(
+            json.dumps(
+                {
+                    "maintenance": {
+                        "recommended_commands": [
+                            {
+                                "reason_code": "refresh_full_snapshot",
+                                "command_args": [
+                                    "crunchyroll-fetch-snapshot",
+                                    "--full-refresh",
+                                    "--out",
+                                    ".MAL-Updater/cache/live-crunchyroll-snapshot.json",
+                                    "--ingest",
+                                ],
+                            }
+                        ]
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        stale_health_mtime = time.time() - 600
+        os.utime(self.config.health_latest_json_path, (stale_health_mtime, stale_health_mtime))
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_crunchyroll": {
+                            "last_successful_full_refresh_epoch": time.time(),
+                            "full_refresh_anchor_epoch": time.time(),
+                            "full_refresh_anchor_at": "2026-03-20T20:00:00Z",
+                            "last_run_epoch": 0,
+                        },
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertNotIn("full_refresh_reason", sync_result)
+        sync_args = run_subprocess.call_args_list[0].args[1]
+        self.assertNotIn("--full-refresh", sync_args)
 
 
 class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):

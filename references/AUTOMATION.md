@@ -58,6 +58,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 - per-lane task summaries from `service-state.json` (including last decision time plus last-run start/finish/duration when available)
 - persisted budget backoff details, including whether a lane is cooling down at `warn` or `critical` level
 - persisted failure-backoff details for task errors, including retry countdown, last failure reason, and consecutive-failure streaks for auth-fragile provider lanes
+- health-driven full-refresh escalation: when the latest `latest-health-check.json` artifact recommends `refresh_full_snapshot` for a provider, the next unattended provider fetch lane upgrades itself to `--full-refresh` once so partial-coverage residue is repaired without waiting for the periodic cadence window
 - current API-usage snapshot when available
 - recent `service.log` tail lines
 - parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
