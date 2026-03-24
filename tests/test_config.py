@@ -90,6 +90,9 @@ class ConfigLoadingTests(unittest.TestCase):
                     [service.provider_hourly_limits]
                     hidive = 72
 
+                    [service.task_hourly_limits]
+                    sync_apply = 24
+
                     [service.provider_warn_backoff_floor_seconds]
                     crunchyroll = 900
                     hidive = 300
@@ -98,8 +101,17 @@ class ConfigLoadingTests(unittest.TestCase):
                     crunchyroll = 1800
                     hidive = 1200
 
+                    [service.task_warn_backoff_floor_seconds]
+                    sync_apply = 450
+
+                    [service.task_critical_backoff_floor_seconds]
+                    sync_apply = 1500
+
                     [service.provider_auth_failure_backoff_floor_seconds]
                     hidive = 3600
+
+                    [service.task_auth_failure_backoff_floor_seconds]
+                    sync_apply = 2400
                     """
                 ).strip()
                 + "\n",
@@ -113,16 +125,26 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(600, config.service.source_provider_critical_backoff_floor_seconds)
             self.assertEqual(2400, config.service.source_provider_auth_failure_backoff_floor_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
+            self.assertEqual(24, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(900, config.service.provider_warn_backoff_floor_seconds["crunchyroll"])
             self.assertEqual(300, config.service.provider_warn_backoff_floor_seconds["hidive"])
+            self.assertEqual(450, config.service.task_warn_backoff_floor_seconds["sync_apply"])
             self.assertEqual(1800, config.service.provider_critical_backoff_floor_seconds["crunchyroll"])
             self.assertEqual(1200, config.service.provider_critical_backoff_floor_seconds["hidive"])
+            self.assertEqual(1500, config.service.task_critical_backoff_floor_seconds["sync_apply"])
             self.assertEqual(3600, config.service.provider_auth_failure_backoff_floor_seconds["hidive"])
+            self.assertEqual(2400, config.service.task_auth_failure_backoff_floor_seconds["sync_apply"])
             self.assertEqual(90, config.service.hourly_limit_for("new-provider"))
             self.assertEqual(72, config.service.hourly_limit_for("hidive"))
+            self.assertEqual(24, config.service.hourly_limit_for("mal", task_name="sync_apply"))
             self.assertEqual(180, config.service.backoff_floor_seconds_for("new-provider", level="warn"))
             self.assertEqual(600, config.service.backoff_floor_seconds_for("new-provider", level="critical"))
+            self.assertEqual(450, config.service.backoff_floor_seconds_for("mal", level="warn", task_name="sync_apply"))
+            self.assertEqual(1500, config.service.backoff_floor_seconds_for("mal", level="critical", task_name="sync_apply"))
             self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("new-provider"))
+            self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("mal", task_name="sync_apply"))
+            self.assertEqual("task", config.service.budget_scope_for("mal", task_name="sync_apply"))
+            self.assertEqual("provider", config.service.budget_scope_for("hidive", task_name="sync_fetch_hidive"))
 
 
 if __name__ == "__main__":

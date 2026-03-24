@@ -280,6 +280,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertIn("budget_backoff_until_epoch", sync_state)
         self.assertEqual("skipped", sync_state["last_status"])
         self.assertEqual("crunchyroll", sync_state["budget_provider"])
+        self.assertEqual("provider", sync_state["budget_scope"])
         self.assertEqual(self.config.service.sync_every_seconds, sync_state["every_seconds"])
         self.assertIn("next_due_at", sync_state)
 
@@ -344,6 +345,36 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         sync_state = state["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual(900, sync_state["budget_backoff_floor_seconds"])
         self.assertEqual("provider_floor", sync_state["budget_backoff_cooldown_source"])
+
+    def test_run_pending_tasks_uses_task_specific_budget_limit_and_warn_floor(self) -> None:
+        self._write_request_events("mal", [2810, 2820, 2830, 2840])
+        self.config.service.mal_hourly_limit = 120
+        self.config.service.task_hourly_limits["sync_apply"] = 5
+        self.config.service.task_warn_backoff_floor_seconds["sync_apply"] = 900
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual("skipped", sync_apply_result["status"])
+        self.assertEqual("warn", sync_apply_result["budget_backoff_level"])
+        self.assertEqual("task", sync_apply_result["budget_scope"])
+        self.assertEqual(900, sync_apply_result["budget_backoff_remaining_seconds"])
+        self.assertEqual(900, sync_apply_result["budget_backoff_floor_seconds"])
+        self.assertEqual("task_floor", sync_apply_result["budget_backoff_cooldown_source"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        apply_state = state["tasks"]["sync_apply"]
+        self.assertEqual("mal", apply_state["budget_provider"])
+        self.assertEqual("task", apply_state["budget_scope"])
+        self.assertEqual(900, apply_state["budget_backoff_floor_seconds"])
+        self.assertEqual("task_floor", apply_state["budget_backoff_cooldown_source"])
 
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {

@@ -23,6 +23,7 @@
 - request-event logging / budget awareness scaffolding exists
 - daemon budget skips now compute both warn-threshold pacing windows and hard critical recovery windows, persist per-task budget backoff state, and avoid re-check/log spam until the provider budget has room again
 - service budget defaults are now provider-generic: non-MAL source lanes can inherit shared source-provider hourly/backoff/auth-failure defaults without being silently treated as Crunchyroll unless an explicit per-provider override exists
+- daemon budget policy can now also be overridden per task/lane (`service.task_*` tables), with service state/status surfacing whether a cooldown came from task-level vs provider-level policy so MAL lanes like `sync_apply` no longer have to share one blunt provider-only budget posture
 - provider-task failures now trigger adaptive failure-aware cooldowns with persisted reason / failure class / configured floor / retry countdown / consecutive-failure state so auth-fragile fetch lanes do not thrash every loop after a bad run
 - health-check now inspects persisted daemon failure state and can recommend provider auth re-bootstrap when repeated unattended fetch failures look auth-related (not just repeated 401/unauthorized loops, but also refresh/login failure residue and provider session-state `auth_failed` phases)
 - provider fetch lanes now persist fetch-mode state plus a periodic full-refresh anchor so unattended daemon runs can stay incremental by default while still forcing a conservative provider `--full-refresh` sweep on a configurable cadence (`service.full_refresh_every_seconds`, default 24h)
@@ -32,7 +33,7 @@
 
 ## Open work
 
-- continue tightening daemon orchestration and request-budget behavior
+- continue tightening daemon orchestration and request-budget behavior (task-level budget overrides now exist; next likely step is deeper cost modeling / projected per-run request budgeting rather than only threshold/floor policy)
 - continue reducing genuinely ambiguous mapping residue
 - continue stabilizing fresh Crunchyroll fetches on hostile/auth-fragile hosts
 - continue improving recommendation quality and review UX

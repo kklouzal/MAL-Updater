@@ -56,7 +56,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 
 - recent daemon loop timing (`last_loop_at`)
 - per-lane task summaries from `service-state.json` (including last decision time plus last-run start/finish/duration when available)
-- persisted budget backoff details, including whether a lane is cooling down at `warn` or `critical` level
+- persisted budget backoff details, including whether a lane is cooling down at `warn` or `critical` level and whether the active cooldown policy came from task-level vs provider-level budget settings
 - persisted failure-backoff details for task errors, including retry countdown, last failure reason, and consecutive-failure streaks for auth-fragile provider lanes
 - health-check-driven auth recovery hints: repeated auth-style provider fetch failures recorded in daemon state now surface as explicit re-bootstrap recommendations (`crunchyroll-auth-login` / `provider-auth-login --provider hidive`) instead of only opaque backoff residue
 - health-driven full-refresh escalation: when the latest `latest-health-check.json` artifact recommends `refresh_full_snapshot` for a provider, the next unattended provider fetch lane upgrades itself to `--full-refresh` once so partial-coverage residue is repaired without waiting for the periodic cadence window

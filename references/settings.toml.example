@@ -47,6 +47,9 @@ critical_ratio = 0.95
 [service.provider_hourly_limits]
 hidive = 72
 
+[service.task_hourly_limits]
+sync_apply = 48  # optional per-lane override when a task should budget differently from its provider default
+
 [service.provider_warn_backoff_floor_seconds]
 crunchyroll = 900
 hidive = 300
@@ -55,9 +58,18 @@ hidive = 300
 crunchyroll = 1800
 hidive = 1200
 
+[service.task_warn_backoff_floor_seconds]
+sync_apply = 900
+
+[service.task_critical_backoff_floor_seconds]
+sync_apply = 1800
+
 [service.provider_auth_failure_backoff_floor_seconds]
 crunchyroll = 7200
 hidive = 3600
+
+[service.task_auth_failure_backoff_floor_seconds]
+sync_apply = 2400
 
 [secret_files]
 mal_client_id = "mal_client_id.txt"

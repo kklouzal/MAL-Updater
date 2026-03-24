@@ -210,3 +210,13 @@ Treat hard-coded supplemental MAL candidate IDs as conservative rescue inputs, n
 - supplemental IDs help recover titles that MAL search fails to surface at all
 - overflow on top of a supplemental-only hit can still mean a multi-entry bundle or broader franchise residue
 - keeping this path conservative preserves explainability and avoids overconfident auto-approval when the search surface was already weak
+
+## 2026-03-24 - Task-level daemon budget override posture
+
+### Decision
+Keep provider/shared budget defaults as the baseline, but allow optional per-task daemon budget overrides for hourly limit, warn/critical cooldown floors, and auth-failure cooldown floors. Persist the effective budget scope (`task` vs `provider`) in service state/status.
+
+### Why
+- some daemon lanes share a provider but do not deserve the same throttling posture (for example MAL token refresh vs aggregate apply)
+- per-task overrides let operators tune the risky/expensive lane without inventing fake provider identities
+- surfacing the effective budget scope keeps cooldown decisions explainable during unattended debugging

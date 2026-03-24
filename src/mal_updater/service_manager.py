@@ -118,6 +118,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "failure_backoff_class",
         "next_due_at",
         "budget_provider",
+        "budget_scope",
         "last_fetch_mode",
         "last_full_refresh_reason",
     ):

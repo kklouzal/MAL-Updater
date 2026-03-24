@@ -81,26 +81,51 @@ class ServiceSettings:
     source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
     provider_hourly_limits: dict[str, int] = field(default_factory=dict)
+    task_hourly_limits: dict[str, int] = field(default_factory=dict)
     source_provider_warn_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS
     source_provider_critical_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     provider_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    task_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    task_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     source_provider_auth_failure_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS
     provider_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    task_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
     critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
 
-    def hourly_limit_for(self, provider: str) -> int:
+    def budget_scope_for(self, provider: str | None, *, task_name: str | None = None) -> str:
+        if task_name and (
+            task_name in self.task_hourly_limits
+            or task_name in self.task_warn_backoff_floor_seconds
+            or task_name in self.task_critical_backoff_floor_seconds
+            or task_name in self.task_auth_failure_backoff_floor_seconds
+        ):
+            return "task"
+        if provider:
+            return "provider"
+        return "none"
+
+    def hourly_limit_for(self, provider: str, *, task_name: str | None = None) -> int:
+        if task_name:
+            value = self.task_hourly_limits.get(task_name)
+            if isinstance(value, int):
+                return max(0, int(value))
         if provider == "mal":
             return self.mal_hourly_limit
         value = self.provider_hourly_limits.get(provider)
         if isinstance(value, int):
-            return int(value)
+            return max(0, int(value))
         if provider == "crunchyroll":
-            return self.crunchyroll_hourly_limit
-        return self.source_provider_hourly_limit
+            return max(0, int(self.crunchyroll_hourly_limit))
+        return max(0, int(self.source_provider_hourly_limit))
 
-    def backoff_floor_seconds_for(self, provider: str, *, level: str) -> int:
+    def backoff_floor_seconds_for(self, provider: str, *, level: str, task_name: str | None = None) -> int:
+        if task_name:
+            task_floors = self.task_warn_backoff_floor_seconds if level == "warn" else self.task_critical_backoff_floor_seconds
+            task_value = task_floors.get(task_name)
+            if isinstance(task_value, int):
+                return max(0, int(task_value))
         floors = self.provider_warn_backoff_floor_seconds if level == "warn" else self.provider_critical_backoff_floor_seconds
         value = floors.get(provider)
         if isinstance(value, int):
@@ -111,7 +136,11 @@ class ServiceSettings:
             return max(0, int(self.source_provider_critical_backoff_floor_seconds))
         return 0
 
-    def auth_failure_backoff_floor_seconds_for(self, provider: str) -> int:
+    def auth_failure_backoff_floor_seconds_for(self, provider: str, *, task_name: str | None = None) -> int:
+        if task_name:
+            value = self.task_auth_failure_backoff_floor_seconds.get(task_name)
+            if isinstance(value, int):
+                return max(0, int(value))
         value = self.provider_auth_failure_backoff_floor_seconds.get(provider)
         if isinstance(value, int):
             return max(0, int(value))
@@ -336,9 +365,13 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     crunchyroll_section = _get_table(settings, "crunchyroll")
     service_section = _get_table(settings, "service")
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
+    service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
     service_warn_backoff_floors_section = _get_nested_table(settings, "service", "provider_warn_backoff_floor_seconds")
     service_critical_backoff_floors_section = _get_nested_table(settings, "service", "provider_critical_backoff_floor_seconds")
+    service_task_warn_backoff_floors_section = _get_nested_table(settings, "service", "task_warn_backoff_floor_seconds")
+    service_task_critical_backoff_floors_section = _get_nested_table(settings, "service", "task_critical_backoff_floor_seconds")
     service_auth_failure_backoff_floors_section = _get_nested_table(settings, "service", "provider_auth_failure_backoff_floor_seconds")
+    service_task_auth_failure_backoff_floors_section = _get_nested_table(settings, "service", "task_auth_failure_backoff_floor_seconds")
     secret_files_section = _get_table(settings, "secret_files")
     settings_dir = settings_path.parent
 
@@ -465,6 +498,11 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 for key, value in service_provider_limits_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
+            task_hourly_limits={
+                str(key): int(value)
+                for key, value in service_task_limits_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
             source_provider_warn_backoff_floor_seconds=int(
                 os.getenv(
                     "MAL_UPDATER_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS",
@@ -495,6 +533,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 for key, value in service_critical_backoff_floors_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
+            task_warn_backoff_floor_seconds={
+                str(key): int(value)
+                for key, value in service_task_warn_backoff_floors_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            task_critical_backoff_floor_seconds={
+                str(key): int(value)
+                for key, value in service_task_critical_backoff_floors_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
             source_provider_auth_failure_backoff_floor_seconds=int(
                 os.getenv(
                     "MAL_UPDATER_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS",
@@ -508,6 +556,11 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             provider_auth_failure_backoff_floor_seconds={
                 str(key): int(value)
                 for key, value in service_auth_failure_backoff_floors_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            task_auth_failure_backoff_floor_seconds={
+                str(key): int(value)
+                for key, value in service_task_auth_failure_backoff_floors_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
             warn_ratio=float(os.getenv("MAL_UPDATER_SERVICE_WARN_RATIO", _get_float(service_section, "warn_ratio", DEFAULT_SERVICE_WARN_RATIO))),

@@ -53,6 +53,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "last_status": "ok",
                             "every_seconds": 21600,
                             "budget_provider": "mal",
+                            "budget_scope": "task",
                             "next_due_at": "2026-03-21T03:54:00Z",
                             "last_result": {
                                 "label": "sync",
@@ -84,6 +85,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "failure_backoff_consecutive_failures": 2,
                             "every_seconds": 21600,
                             "budget_provider": "crunchyroll",
+                            "budget_scope": "provider",
                             "next_due_at": "2026-03-21T03:52:00Z"
                         },
                     },
@@ -130,6 +132,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual("ok", sync_summary["last_status"])
         self.assertEqual(21600, sync_summary["every_seconds"])
         self.assertEqual("mal", sync_summary["budget_provider"])
+        self.assertEqual("task", sync_summary["budget_scope"])
         self.assertEqual("2026-03-21T03:54:00Z", sync_summary["next_due_at"])
         self.assertIn("next_due_in_seconds", sync_summary)
         self.assertEqual(
@@ -212,6 +215,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "last_duration_seconds": 2.0,
                             "every_seconds": 21600,
                             "budget_provider": "mal",
+                            "budget_scope": "task",
                             "next_due_at": "2026-03-21T03:54:00Z",
                         },
                         "health": {
@@ -238,6 +242,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "failure_backoff_consecutive_failures": 2,
                             "every_seconds": 21600,
                             "budget_provider": "crunchyroll",
+                            "budget_scope": "provider",
                             "next_due_at": "2026-03-21T03:52:00Z"
                         },
                     },
@@ -287,6 +292,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_last_status=ok", stdout)
         self.assertIn("task_sync_every_seconds=21600", stdout)
         self.assertIn("task_sync_budget_provider=mal", stdout)
+        self.assertIn("task_sync_budget_scope=task", stdout)
         self.assertIn("task_sync_last_decision_at=2026-03-20T21:54:02Z", stdout)
         self.assertIn("task_sync_last_started_at=2026-03-20T21:54:00Z", stdout)
         self.assertIn("task_sync_last_finished_at=2026-03-20T21:54:02Z", stdout)
@@ -308,6 +314,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_class=auth", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_floor_seconds=7200", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_consecutive_failures=2", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_budget_scope=provider", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
 
     def test_service_status_summary_surfaces_parse_errors(self) -> None:

@@ -259,11 +259,12 @@ def _apply_sync_command() -> list[str]:
 
 
 
-def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | None, dict[str, Any] | None]:
+def _budget_gate(config: AppConfig, spec: TaskSpec) -> tuple[bool, str | None, dict[str, Any] | None]:
+    provider = spec.budget_provider
     if provider is None:
         return True, None, None
     usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
-    limit = config.service.hourly_limit_for(provider)
+    limit = config.service.hourly_limit_for(provider, task_name=spec.name)
     ratio = 0.0 if limit <= 0 else float(usage.get("request_count", 0)) / float(limit)
     warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
         provider=provider,
@@ -279,14 +280,16 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
         config=config,
     )
-    warn_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="warn")
-    critical_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="critical")
+    budget_scope = config.service.budget_scope_for(provider, task_name=spec.name)
+    warn_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="warn", task_name=spec.name)
+    critical_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="critical", task_name=spec.name)
     warn_cooldown_seconds = max(warn_recovery_seconds, warn_floor_seconds)
     critical_cooldown_seconds = max(recovery_seconds, critical_floor_seconds)
     usage["limit"] = limit
     usage["ratio"] = ratio
     usage["warn_ratio"] = config.service.warn_ratio
     usage["critical_ratio"] = config.service.critical_ratio
+    usage["budget_scope"] = budget_scope
     usage["warn_recovery_seconds"] = warn_recovery_seconds
     usage["recovery_seconds"] = recovery_seconds
     usage["warn_backoff_floor_seconds"] = warn_floor_seconds
@@ -297,13 +300,13 @@ def _budget_gate(config: AppConfig, provider: str | None) -> tuple[bool, str | N
         usage["backoff_level"] = "critical"
         usage["cooldown_seconds"] = critical_cooldown_seconds
         if critical_floor_seconds > recovery_seconds:
-            usage["cooldown_source"] = "provider_floor"
+            usage["cooldown_source"] = f"{budget_scope}_floor"
         return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={critical_cooldown_seconds}s", usage
     if ratio >= config.service.warn_ratio and warn_cooldown_seconds > 0:
         usage["backoff_level"] = "warn"
         usage["cooldown_seconds"] = warn_cooldown_seconds
         if warn_floor_seconds > warn_recovery_seconds:
-            usage["cooldown_source"] = "provider_floor"
+            usage["cooldown_source"] = f"{budget_scope}_floor"
         return False, f"{provider}_budget_warn ratio={ratio:.3f} cooldown={warn_cooldown_seconds}s", usage
     return True, None, usage
 
@@ -318,8 +321,8 @@ def _failure_backoff_profile(config: AppConfig, spec: TaskSpec, reason: str) -> 
     critical_floor = 0
     auth_floor = 0
     if provider:
-        critical_floor = config.service.backoff_floor_seconds_for(provider, level="critical")
-        auth_floor = config.service.auth_failure_backoff_floor_seconds_for(provider)
+        critical_floor = config.service.backoff_floor_seconds_for(provider, level="critical", task_name=spec.name)
+        auth_floor = config.service.auth_failure_backoff_floor_seconds_for(provider, task_name=spec.name)
     classification = "auth" if provider and _looks_auth_style_failure(reason) else "generic"
     configured_floor = critical_floor
     if classification == "auth":
@@ -400,6 +403,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
     for spec in _task_specs(config):
         task_state = tasks_state.setdefault(spec.name, {})
         task_state["budget_provider"] = spec.budget_provider
+        task_state["budget_scope"] = config.service.budget_scope_for(spec.budget_provider, task_name=spec.name)
         task_state["every_seconds"] = int(spec.every_seconds)
         last_run = float(task_state.get("last_run_epoch", 0))
         if now - last_run < spec.every_seconds:
@@ -424,6 +428,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "budget_backoff_until": task_state.get("budget_backoff_until"),
                     "budget_backoff_remaining_seconds": remaining,
                     "budget_backoff_level": task_state.get("budget_backoff_level"),
+                    "budget_scope": task_state.get("budget_scope"),
                 }
             )
             continue
@@ -452,7 +457,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 }
             )
             continue
-        allowed, reason, usage = _budget_gate(config, spec.budget_provider)
+        allowed, reason, usage = _budget_gate(config, spec)
         if not allowed:
             backoff_level = usage.get("backoff_level") if isinstance(usage, dict) else None
             recovery_seconds = int(usage.get("cooldown_seconds", 0)) if isinstance(usage, dict) else 0
@@ -473,6 +478,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "budget_backoff_until": _iso_after_seconds(recovery_seconds),
                     "budget_backoff_remaining_seconds": recovery_seconds,
                     "budget_backoff_floor_seconds": backoff_floor_seconds,
+                    "budget_scope": task_state.get("budget_scope"),
                 }
             )
             if isinstance(cooldown_source, str) and cooldown_source:
@@ -492,6 +498,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     "budget_backoff_remaining_seconds": recovery_seconds,
                     "budget_backoff_floor_seconds": backoff_floor_seconds,
                     "budget_backoff_cooldown_source": task_state.get("budget_backoff_cooldown_source"),
+                    "budget_scope": task_state.get("budget_scope"),
                 }
             )
             _append_log(config, f"task={spec.name} status=skipped reason={reason}")
