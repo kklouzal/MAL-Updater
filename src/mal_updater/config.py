@@ -37,7 +37,11 @@ DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 6 * 60 * 60
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
+DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
 DEFAULT_SERVICE_MAL_HOURLY_LIMIT = 120
+DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS = 0
+DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS = 0
+DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS = 0
 DEFAULT_SERVICE_WARN_RATIO = 0.8
 DEFAULT_SERVICE_CRITICAL_RATIO = 0.95
 WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
@@ -74,10 +78,14 @@ class ServiceSettings:
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
+    source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
     provider_hourly_limits: dict[str, int] = field(default_factory=dict)
+    source_provider_warn_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS
+    source_provider_critical_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     provider_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    source_provider_auth_failure_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS
     provider_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
     critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
@@ -85,22 +93,30 @@ class ServiceSettings:
     def hourly_limit_for(self, provider: str) -> int:
         if provider == "mal":
             return self.mal_hourly_limit
+        value = self.provider_hourly_limits.get(provider)
+        if isinstance(value, int):
+            return int(value)
         if provider == "crunchyroll":
             return self.crunchyroll_hourly_limit
-        value = self.provider_hourly_limits.get(provider)
-        return int(value) if isinstance(value, int) else self.crunchyroll_hourly_limit
+        return self.source_provider_hourly_limit
 
     def backoff_floor_seconds_for(self, provider: str, *, level: str) -> int:
         floors = self.provider_warn_backoff_floor_seconds if level == "warn" else self.provider_critical_backoff_floor_seconds
         value = floors.get(provider)
         if isinstance(value, int):
             return max(0, int(value))
+        if provider != "mal":
+            if level == "warn":
+                return max(0, int(self.source_provider_warn_backoff_floor_seconds))
+            return max(0, int(self.source_provider_critical_backoff_floor_seconds))
         return 0
 
     def auth_failure_backoff_floor_seconds_for(self, provider: str) -> int:
         value = self.provider_auth_failure_backoff_floor_seconds.get(provider)
         if isinstance(value, int):
             return max(0, int(value))
+        if provider != "mal":
+            return max(0, int(self.source_provider_auth_failure_backoff_floor_seconds))
         return 0
 
 
@@ -437,12 +453,38 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             mal_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_MAL_REFRESH_EVERY_SECONDS", _get_int(service_section, "mal_refresh_every_seconds", DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS))),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
             crunchyroll_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_CRUNCHYROLL_HOURLY_LIMIT", _get_int(service_section, "crunchyroll_hourly_limit", DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT))),
+            source_provider_hourly_limit=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT",
+                    _get_int(service_section, "source_provider_hourly_limit", DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT),
+                )
+            ),
             mal_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_MAL_HOURLY_LIMIT", _get_int(service_section, "mal_hourly_limit", DEFAULT_SERVICE_MAL_HOURLY_LIMIT))),
             provider_hourly_limits={
                 str(key): int(value)
                 for key, value in service_provider_limits_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
+            source_provider_warn_backoff_floor_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS",
+                    _get_int(
+                        service_section,
+                        "source_provider_warn_backoff_floor_seconds",
+                        DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS,
+                    ),
+                )
+            ),
+            source_provider_critical_backoff_floor_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS",
+                    _get_int(
+                        service_section,
+                        "source_provider_critical_backoff_floor_seconds",
+                        DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS,
+                    ),
+                )
+            ),
             provider_warn_backoff_floor_seconds={
                 str(key): int(value)
                 for key, value in service_warn_backoff_floors_section.items()
@@ -453,6 +495,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 for key, value in service_critical_backoff_floors_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
+            source_provider_auth_failure_backoff_floor_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS",
+                    _get_int(
+                        service_section,
+                        "source_provider_auth_failure_backoff_floor_seconds",
+                        DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS,
+                    ),
+                )
+            ),
             provider_auth_failure_backoff_floor_seconds={
                 str(key): int(value)
                 for key, value in service_auth_failure_backoff_floors_section.items()

@@ -131,7 +131,7 @@ It only requires the provider to emit a normalized snapshot contract the core un
 ## Recommended next implementation slice
 
 1. move provider-specific status/bootstrap reporting behind provider-aware helpers
-2. make service runtime/provider budgeting configurable per provider slug rather than MAL vs Crunchyroll hardcoding
+2. build smarter lane-specific daemon budgeting/cost modeling on top of the new generic source-provider defaults
 3. implement HIDIVE auth/session manager and snapshot fetcher under `providers/hidive.py`
 4. add richer watchlist fields (`list_id`, `list_name`, `list_kind`) to normalized ingestion/storage once HIDIVE watchlist enumeration is fully understood
 

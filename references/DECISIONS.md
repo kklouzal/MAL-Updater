@@ -171,6 +171,16 @@ Keep provider fetch lanes incremental by default, but let the unattended daemon 
 - wiring health-check maintenance recommendations back into daemon execution closes a real gap between diagnosis and remediation for partial-coverage residue
 - surfacing fetch mode plus last successful full refresh in task state keeps the behavior auditable instead of hiding refresh policy in operator folklore
 
+## 2026-03-24 - Generic source-provider budget default posture
+
+### Decision
+Keep MAL as its own explicit daemon budget lane, but let non-MAL source providers inherit shared source-provider hourly/backoff/auth-failure defaults unless a per-provider override is configured.
+
+### Why
+- the provider architecture should not silently treat every new source provider as if it were Crunchyroll
+- shared source-provider defaults make new providers safer to onboard before their final tuned per-provider numbers are known
+- explicit per-provider overrides still win, so operators can keep Crunchyroll/HIDIVE-specific tuning where it matters
+
 ## 2026-03-23 - Auth-style provider failure cooldown posture
 
 ### Decision

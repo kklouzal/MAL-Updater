@@ -81,6 +81,12 @@ class ConfigLoadingTests(unittest.TestCase):
             (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
                 textwrap.dedent(
                     """
+                    [service]
+                    source_provider_hourly_limit = 90
+                    source_provider_warn_backoff_floor_seconds = 180
+                    source_provider_critical_backoff_floor_seconds = 600
+                    source_provider_auth_failure_backoff_floor_seconds = 2400
+
                     [service.provider_hourly_limits]
                     hidive = 72
 
@@ -91,6 +97,9 @@ class ConfigLoadingTests(unittest.TestCase):
                     [service.provider_critical_backoff_floor_seconds]
                     crunchyroll = 1800
                     hidive = 1200
+
+                    [service.provider_auth_failure_backoff_floor_seconds]
+                    hidive = 3600
                     """
                 ).strip()
                 + "\n",
@@ -99,11 +108,21 @@ class ConfigLoadingTests(unittest.TestCase):
 
             config = load_config(root)
 
+            self.assertEqual(90, config.service.source_provider_hourly_limit)
+            self.assertEqual(180, config.service.source_provider_warn_backoff_floor_seconds)
+            self.assertEqual(600, config.service.source_provider_critical_backoff_floor_seconds)
+            self.assertEqual(2400, config.service.source_provider_auth_failure_backoff_floor_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(900, config.service.provider_warn_backoff_floor_seconds["crunchyroll"])
             self.assertEqual(300, config.service.provider_warn_backoff_floor_seconds["hidive"])
             self.assertEqual(1800, config.service.provider_critical_backoff_floor_seconds["crunchyroll"])
             self.assertEqual(1200, config.service.provider_critical_backoff_floor_seconds["hidive"])
+            self.assertEqual(3600, config.service.provider_auth_failure_backoff_floor_seconds["hidive"])
+            self.assertEqual(90, config.service.hourly_limit_for("new-provider"))
+            self.assertEqual(72, config.service.hourly_limit_for("hidive"))
+            self.assertEqual(180, config.service.backoff_floor_seconds_for("new-provider", level="warn"))
+            self.assertEqual(600, config.service.backoff_floor_seconds_for("new-provider", level="critical"))
+            self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("new-provider"))
 
 
 if __name__ == "__main__":
