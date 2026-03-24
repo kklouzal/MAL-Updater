@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import subprocess
 import time
 from typing import Any
@@ -29,6 +30,7 @@ class TaskSpec:
 
 _BUDGET_GATE_WINDOW_SECONDS = 3600
 _FAILURE_BACKOFF_MIN_SECONDS = 300
+_PROJECTED_REQUEST_HISTORY_LIMIT = 5
 
 _AUTH_STYLE_FAILURE_MARKERS = (
     "http 401",
@@ -97,6 +99,57 @@ def _record_task_timing(
     task_state["last_finished_at"] = finished_at or datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     task_state["last_duration_seconds"] = max(0.0, round(float(finished_epoch) - float(started_epoch), 3))
     _mark_task_decision(task_state, decision_at=task_state["last_finished_at"])
+
+
+def _normalized_request_delta_history(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    history: list[int] = []
+    for item in value:
+        if isinstance(item, int):
+            history.append(max(0, int(item)))
+    return history
+
+
+def _trimmed_request_delta_history(history: list[int]) -> list[int]:
+    if len(history) <= _PROJECTED_REQUEST_HISTORY_LIMIT:
+        return history
+    return history[-_PROJECTED_REQUEST_HISTORY_LIMIT:]
+
+
+def _smoothed_request_delta(history: list[int]) -> int | None:
+    if len(history) < 2:
+        return None
+    return max(0, int(math.ceil(sum(history) / len(history))))
+
+
+def _record_observed_request_delta(
+    task_state: dict[str, Any],
+    *,
+    observed_request_delta: int,
+    fetch_mode: str | None,
+    finished_at: str,
+) -> None:
+    normalized_delta = max(0, int(observed_request_delta))
+    task_state["last_request_delta"] = normalized_delta
+    task_state["last_request_delta_at"] = finished_at
+    history = _normalized_request_delta_history(task_state.get("last_request_delta_history"))
+    history.append(normalized_delta)
+    task_state["last_request_delta_history"] = _trimmed_request_delta_history(history)
+    if fetch_mode is None:
+        return
+    delta_by_mode = task_state.get("last_request_delta_by_mode")
+    if not isinstance(delta_by_mode, dict):
+        delta_by_mode = {}
+    delta_by_mode[fetch_mode] = normalized_delta
+    task_state["last_request_delta_by_mode"] = delta_by_mode
+    history_by_mode = task_state.get("last_request_delta_history_by_mode")
+    if not isinstance(history_by_mode, dict):
+        history_by_mode = {}
+    mode_history = _normalized_request_delta_history(history_by_mode.get(fetch_mode))
+    mode_history.append(normalized_delta)
+    history_by_mode[fetch_mode] = _trimmed_request_delta_history(mode_history)
+    task_state["last_request_delta_history_by_mode"] = history_by_mode
 
 
 def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[str, Any]:
@@ -282,10 +335,19 @@ def _projected_request_count(
     configured = config.service.task_projected_request_counts.get(spec.name)
     if isinstance(configured, int):
         return max(0, int(configured)), "configured"
-    if fetch_mode and isinstance(task_state.get("last_request_delta_by_mode"), dict):
-        mode_value = task_state["last_request_delta_by_mode"].get(fetch_mode)
-        if isinstance(mode_value, int):
-            return max(0, int(mode_value)), f"observed_{fetch_mode}"
+    if fetch_mode:
+        history_by_mode = task_state.get("last_request_delta_history_by_mode")
+        if isinstance(history_by_mode, dict):
+            smoothed_mode = _smoothed_request_delta(_normalized_request_delta_history(history_by_mode.get(fetch_mode)))
+            if smoothed_mode is not None:
+                return smoothed_mode, f"observed_{fetch_mode}_smoothed"
+        if isinstance(task_state.get("last_request_delta_by_mode"), dict):
+            mode_value = task_state["last_request_delta_by_mode"].get(fetch_mode)
+            if isinstance(mode_value, int):
+                return max(0, int(mode_value)), f"observed_{fetch_mode}"
+    smoothed = _smoothed_request_delta(_normalized_request_delta_history(task_state.get("last_request_delta_history")))
+    if smoothed is not None:
+        return smoothed, "observed_smoothed"
     value = task_state.get("last_request_delta")
     if isinstance(value, int):
         return max(0, int(value)), "observed_last_run"
@@ -624,16 +686,16 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 before_request_count = int(usage.get("request_count", 0))
                 after_usage = summarize_recent_api_usage(provider=spec.budget_provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
                 observed_request_delta = max(0, int(after_usage.get("request_count", 0)) - before_request_count)
-                task_state["last_request_delta"] = observed_request_delta
-                task_state["last_request_delta_at"] = finished_at
+                fetch_mode_for_history = planned_fetch_mode if spec.name.startswith("sync_fetch_") else None
+                _record_observed_request_delta(
+                    task_state,
+                    observed_request_delta=observed_request_delta,
+                    fetch_mode=fetch_mode_for_history,
+                    finished_at=finished_at,
+                )
                 result["request_delta"] = observed_request_delta
-                if spec.name.startswith("sync_fetch_"):
-                    delta_by_mode = task_state.get("last_request_delta_by_mode")
-                    if not isinstance(delta_by_mode, dict):
-                        delta_by_mode = {}
-                    delta_by_mode[planned_fetch_mode or "incremental"] = observed_request_delta
-                    task_state["last_request_delta_by_mode"] = delta_by_mode
-                    result["request_delta_by_mode"] = {planned_fetch_mode or "incremental": observed_request_delta}
+                if fetch_mode_for_history is not None:
+                    result["request_delta_by_mode"] = {fetch_mode_for_history: observed_request_delta}
             task_status = result.get("status", "ok")
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": task_status, "last_result": result})
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)

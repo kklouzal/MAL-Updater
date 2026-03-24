@@ -231,3 +231,14 @@ Teach daemon budget gates to look at projected per-run request cost, not only th
 - last-observed request deltas are a cheap, local, provider-agnostic signal that improves pacing without inventing fake precision or requiring a large planning subsystem
 - explicit per-task overrides still matter for operators who know a lane's expected cost better than one recent observed run
 - persisting projection source/count keeps the gate auditable instead of feeling like invisible daemon magic
+
+## 2026-03-24 - Smoothed observed request projection posture
+
+### Decision
+When a lane does not have an explicit configured projected request count, keep a short rolling observed request-delta history and derive projections from a smoothed average instead of blindly trusting only the most recent run. Prefer fetch-mode-specific history (`incremental` vs `full_refresh`) when available, then fall back to overall lane history, then finally to the legacy last-run delta.
+
+### Why
+- one unusually expensive unattended run should not immediately become the whole budget policy for the next run
+- fetch-mode-specific smoothing preserves the useful distinction between incremental and full-refresh provider cost without needing a larger forecasting subsystem
+- preserving the legacy last-run fallback keeps cold-start behavior simple while letting repeated runs become more stable
+- persisting the projection source still keeps daemon pacing explainable during debugging
