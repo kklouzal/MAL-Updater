@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio
+from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
 from mal_updater.service_runtime import run_pending_tasks
 
 
@@ -375,6 +375,74 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("task", apply_state["budget_scope"])
         self.assertEqual(900, apply_state["budget_backoff_floor_seconds"])
         self.assertEqual("task_floor", apply_state["budget_backoff_cooldown_source"])
+
+    def test_run_pending_tasks_projects_warn_budget_from_configured_request_cost(self) -> None:
+        self._write_request_events("crunchyroll", [50, 100, 200, 300, 400, 500])
+        self.config.service.crunchyroll_hourly_limit = 10
+        self.config.service.task_projected_request_counts["sync_fetch_crunchyroll"] = 2
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("skipped", sync_result["status"])
+        self.assertIn("crunchyroll_budget_projected_warn", sync_result["reason"])
+        self.assertIn("projected_requests=2", sync_result["reason"])
+        self.assertEqual("configured", sync_result["api_usage"]["projected_request_source"])
+        self.assertEqual(2, sync_result["api_usage"]["projected_request_count"])
+        self.assertEqual(8, sync_result["api_usage"]["projected_request_total"])
+        self.assertAlmostEqual(0.8, sync_result["api_usage"]["projected_ratio"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = state["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual(2, sync_state["projected_request_count"])
+        self.assertEqual(8, sync_state["projected_request_total"])
+        self.assertAlmostEqual(0.8, sync_state["projected_ratio"])
+        self.assertEqual("configured", sync_state["projected_request_source"])
+
+    def test_run_pending_tasks_learns_observed_request_delta_for_future_budgeting(self) -> None:
+        self.config.service.sync_every_seconds = 0
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+
+        def fake_run_subprocess(config, args, *, label):
+            if label == "sync_fetch_crunchyroll":
+                record_api_request_event(
+                    "crunchyroll",
+                    "sync-fetch",
+                    url="https://example.invalid/api/1",
+                    method="GET",
+                    outcome="ok",
+                    status_code=200,
+                    config=config,
+                )
+                record_api_request_event(
+                    "crunchyroll",
+                    "sync-fetch",
+                    url="https://example.invalid/api/2",
+                    method="GET",
+                    outcome="ok",
+                    status_code=200,
+                    config=config,
+                )
+            return {"status": "ok", "label": label, "returncode": 0, "stdout": "", "stderr": ""}
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=fake_run_subprocess,
+        ):
+            run_pending_tasks(self.config)
+            run_pending_tasks(self.config)
+
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual(2, sync_state["last_request_delta"])
+        self.assertEqual({"incremental": 2}, sync_state["last_request_delta_by_mode"])
+        self.assertEqual(2, sync_state["projected_request_count"])
+        self.assertEqual("observed_incremental", sync_state["projected_request_source"])
 
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {

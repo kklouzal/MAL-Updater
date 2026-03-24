@@ -542,6 +542,21 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             budget_scope = task_payload.get("budget_scope") if isinstance(task_payload.get("budget_scope"), str) else None
             if budget_scope is not None:
                 print(f"task_{task_name}_budget_scope={budget_scope}")
+            projected_request_source = task_payload.get("projected_request_source") if isinstance(task_payload.get("projected_request_source"), str) else None
+            if projected_request_source is not None:
+                print(f"task_{task_name}_projected_request_source={projected_request_source}")
+            projected_request_count = task_payload.get("projected_request_count") if isinstance(task_payload.get("projected_request_count"), int) else None
+            if projected_request_count is not None:
+                print(f"task_{task_name}_projected_request_count={projected_request_count}")
+            projected_request_total = task_payload.get("projected_request_total") if isinstance(task_payload.get("projected_request_total"), int) else None
+            if projected_request_total is not None:
+                print(f"task_{task_name}_projected_request_total={projected_request_total}")
+            projected_ratio = task_payload.get("projected_ratio") if isinstance(task_payload.get("projected_ratio"), (int, float)) else None
+            if projected_ratio is not None:
+                print(f"task_{task_name}_projected_ratio={projected_ratio}")
+            last_request_delta = task_payload.get("last_request_delta") if isinstance(task_payload.get("last_request_delta"), int) else None
+            if last_request_delta is not None:
+                print(f"task_{task_name}_last_request_delta={last_request_delta}")
             last_fetch_mode = task_payload.get("last_fetch_mode") if isinstance(task_payload.get("last_fetch_mode"), str) else None
             if last_fetch_mode is not None:
                 print(f"task_{task_name}_last_fetch_mode={last_fetch_mode}")

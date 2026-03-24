@@ -54,6 +54,11 @@ class ServiceStatusTests(unittest.TestCase):
                             "every_seconds": 21600,
                             "budget_provider": "mal",
                             "budget_scope": "task",
+                            "projected_request_source": "configured",
+                            "projected_request_count": 4,
+                            "projected_request_total": 8,
+                            "projected_ratio": 0.2,
+                            "last_request_delta": 3,
                             "next_due_at": "2026-03-21T03:54:00Z",
                             "last_result": {
                                 "label": "sync",
@@ -133,6 +138,11 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual(21600, sync_summary["every_seconds"])
         self.assertEqual("mal", sync_summary["budget_provider"])
         self.assertEqual("task", sync_summary["budget_scope"])
+        self.assertEqual("configured", sync_summary["projected_request_source"])
+        self.assertEqual(4, sync_summary["projected_request_count"])
+        self.assertEqual(8, sync_summary["projected_request_total"])
+        self.assertEqual(0.2, sync_summary["projected_ratio"])
+        self.assertEqual(3, sync_summary["last_request_delta"])
         self.assertEqual("2026-03-21T03:54:00Z", sync_summary["next_due_at"])
         self.assertIn("next_due_in_seconds", sync_summary)
         self.assertEqual(
@@ -216,6 +226,11 @@ class ServiceStatusTests(unittest.TestCase):
                             "every_seconds": 21600,
                             "budget_provider": "mal",
                             "budget_scope": "task",
+                            "projected_request_source": "configured",
+                            "projected_request_count": 4,
+                            "projected_request_total": 8,
+                            "projected_ratio": 0.2,
+                            "last_request_delta": 3,
                             "next_due_at": "2026-03-21T03:54:00Z",
                         },
                         "health": {
@@ -293,6 +308,11 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_every_seconds=21600", stdout)
         self.assertIn("task_sync_budget_provider=mal", stdout)
         self.assertIn("task_sync_budget_scope=task", stdout)
+        self.assertIn("task_sync_projected_request_source=configured", stdout)
+        self.assertIn("task_sync_projected_request_count=4", stdout)
+        self.assertIn("task_sync_projected_request_total=8", stdout)
+        self.assertIn("task_sync_projected_ratio=0.2", stdout)
+        self.assertIn("task_sync_last_request_delta=3", stdout)
         self.assertIn("task_sync_last_decision_at=2026-03-20T21:54:02Z", stdout)
         self.assertIn("task_sync_last_started_at=2026-03-20T21:54:00Z", stdout)
         self.assertIn("task_sync_last_finished_at=2026-03-20T21:54:02Z", stdout)

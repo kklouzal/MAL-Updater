@@ -50,6 +50,10 @@ hidive = 72
 [service.task_hourly_limits]
 sync_apply = 48  # optional per-lane override when a task should budget differently from its provider default
 
+[service.task_projected_request_counts]
+sync_apply = 8  # optional pre-run request-cost estimate when a lane's next run is expensive enough to budget proactively
+sync_fetch_crunchyroll = 12
+
 [service.provider_warn_backoff_floor_seconds]
 crunchyroll = 900
 hidive = 300

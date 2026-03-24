@@ -259,17 +259,69 @@ def _apply_sync_command() -> list[str]:
 
 
 
-def _budget_gate(config: AppConfig, spec: TaskSpec) -> tuple[bool, str | None, dict[str, Any] | None]:
+def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any], *, now: float) -> tuple[str | None, list[str]]:
+    if not spec.name.startswith("sync_fetch_"):
+        return None, []
+    provider = spec.name.removeprefix("sync_fetch_")
+    full_refresh_reasons: list[str] = []
+    if _provider_fetch_requires_full_refresh(config, task_state, now=now):
+        full_refresh_reasons.append("periodic_cadence")
+    if _provider_fetch_requested_by_health(config, provider, task_state):
+        full_refresh_reasons.append("health_recommended")
+    return ("full_refresh" if full_refresh_reasons else "incremental"), full_refresh_reasons
+
+
+
+def _projected_request_count(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    fetch_mode: str | None = None,
+) -> tuple[int, str | None]:
+    configured = config.service.task_projected_request_counts.get(spec.name)
+    if isinstance(configured, int):
+        return max(0, int(configured)), "configured"
+    if fetch_mode and isinstance(task_state.get("last_request_delta_by_mode"), dict):
+        mode_value = task_state["last_request_delta_by_mode"].get(fetch_mode)
+        if isinstance(mode_value, int):
+            return max(0, int(mode_value)), f"observed_{fetch_mode}"
+    value = task_state.get("last_request_delta")
+    if isinstance(value, int):
+        return max(0, int(value)), "observed_last_run"
+    return 0, None
+
+
+
+def _budget_gate(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    fetch_mode: str | None = None,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
     provider = spec.budget_provider
     if provider is None:
         return True, None, None
     usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
     limit = config.service.hourly_limit_for(provider, task_name=spec.name)
     ratio = 0.0 if limit <= 0 else float(usage.get("request_count", 0)) / float(limit)
+    projected_request_count, projected_request_source = _projected_request_count(config, spec, task_state, fetch_mode=fetch_mode)
+    projected_request_total = int(usage.get("request_count", 0)) + projected_request_count
+    projected_ratio = 0.0 if limit <= 0 else float(projected_request_total) / float(limit)
     warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
         provider=provider,
         limit=limit,
         target_ratio=config.service.warn_ratio,
+        projected_requests=0,
+        window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        config=config,
+    )
+    projected_warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
+        provider=provider,
+        limit=limit,
+        target_ratio=config.service.warn_ratio,
+        projected_requests=projected_request_count,
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
         config=config,
     )
@@ -277,6 +329,15 @@ def _budget_gate(config: AppConfig, spec: TaskSpec) -> tuple[bool, str | None, d
         provider=provider,
         limit=limit,
         critical_ratio=config.service.critical_ratio,
+        projected_requests=0,
+        window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        config=config,
+    )
+    projected_recovery_seconds = estimate_budget_recovery_seconds(
+        provider=provider,
+        limit=limit,
+        critical_ratio=config.service.critical_ratio,
+        projected_requests=projected_request_count,
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
         config=config,
     )
@@ -285,6 +346,8 @@ def _budget_gate(config: AppConfig, spec: TaskSpec) -> tuple[bool, str | None, d
     critical_floor_seconds = config.service.backoff_floor_seconds_for(provider, level="critical", task_name=spec.name)
     warn_cooldown_seconds = max(warn_recovery_seconds, warn_floor_seconds)
     critical_cooldown_seconds = max(recovery_seconds, critical_floor_seconds)
+    projected_warn_cooldown_seconds = max(projected_warn_recovery_seconds, warn_floor_seconds)
+    projected_critical_cooldown_seconds = max(projected_recovery_seconds, critical_floor_seconds)
     usage["limit"] = limit
     usage["ratio"] = ratio
     usage["warn_ratio"] = config.service.warn_ratio
@@ -296,18 +359,39 @@ def _budget_gate(config: AppConfig, spec: TaskSpec) -> tuple[bool, str | None, d
     usage["critical_backoff_floor_seconds"] = critical_floor_seconds
     usage["warn_cooldown_seconds"] = warn_cooldown_seconds
     usage["critical_cooldown_seconds"] = critical_cooldown_seconds
+    usage["projected_request_count"] = projected_request_count
+    usage["projected_request_total"] = projected_request_total
+    usage["projected_ratio"] = projected_ratio
+    usage["projected_warn_recovery_seconds"] = projected_warn_recovery_seconds
+    usage["projected_recovery_seconds"] = projected_recovery_seconds
+    usage["projected_warn_cooldown_seconds"] = projected_warn_cooldown_seconds
+    usage["projected_critical_cooldown_seconds"] = projected_critical_cooldown_seconds
+    if projected_request_source is not None:
+        usage["projected_request_source"] = projected_request_source
     if ratio >= config.service.critical_ratio:
         usage["backoff_level"] = "critical"
         usage["cooldown_seconds"] = critical_cooldown_seconds
         if critical_floor_seconds > recovery_seconds:
             usage["cooldown_source"] = f"{budget_scope}_floor"
         return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={critical_cooldown_seconds}s", usage
+    if projected_request_count > 0 and projected_ratio >= config.service.critical_ratio:
+        usage["backoff_level"] = "critical"
+        usage["cooldown_seconds"] = projected_critical_cooldown_seconds
+        if critical_floor_seconds > projected_recovery_seconds:
+            usage["cooldown_source"] = f"{budget_scope}_floor"
+        return False, f"{provider}_budget_projected_critical ratio={ratio:.3f} projected_ratio={projected_ratio:.3f} projected_requests={projected_request_count} cooldown={projected_critical_cooldown_seconds}s", usage
     if ratio >= config.service.warn_ratio and warn_cooldown_seconds > 0:
         usage["backoff_level"] = "warn"
         usage["cooldown_seconds"] = warn_cooldown_seconds
         if warn_floor_seconds > warn_recovery_seconds:
             usage["cooldown_source"] = f"{budget_scope}_floor"
         return False, f"{provider}_budget_warn ratio={ratio:.3f} cooldown={warn_cooldown_seconds}s", usage
+    if projected_request_count > 0 and projected_ratio >= config.service.warn_ratio and projected_warn_cooldown_seconds > 0:
+        usage["backoff_level"] = "warn"
+        usage["cooldown_seconds"] = projected_warn_cooldown_seconds
+        if warn_floor_seconds > projected_warn_recovery_seconds:
+            usage["cooldown_source"] = f"{budget_scope}_floor"
+        return False, f"{provider}_budget_projected_warn ratio={ratio:.3f} projected_ratio={projected_ratio:.3f} projected_requests={projected_request_count} cooldown={projected_warn_cooldown_seconds}s", usage
     return True, None, usage
 
 
@@ -457,7 +541,15 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 }
             )
             continue
-        allowed, reason, usage = _budget_gate(config, spec)
+        planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now)
+        allowed, reason, usage = _budget_gate(config, spec, task_state, fetch_mode=planned_fetch_mode)
+        if isinstance(usage, dict):
+            for field in ("projected_request_count", "projected_request_total", "projected_ratio", "projected_request_source"):
+                value = usage.get(field)
+                if value is not None:
+                    task_state[field] = value
+                else:
+                    task_state.pop(field, None)
         if not allowed:
             backoff_level = usage.get("backoff_level") if isinstance(usage, dict) else None
             recovery_seconds = int(usage.get("cooldown_seconds", 0)) if isinstance(usage, dict) else 0
@@ -506,23 +598,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         started_epoch = time.time()
         started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         try:
-            full_refresh_requested = False
+            full_refresh_requested = planned_fetch_mode == "full_refresh"
             if spec.name == "mal_refresh":
                 result = _refresh_mal_tokens(config)
             elif spec.name.startswith("sync_fetch_"):
                 provider = spec.name.removeprefix("sync_fetch_")
-                full_refresh_reasons: list[str] = []
-                if _provider_fetch_requires_full_refresh(config, task_state, now=now):
-                    full_refresh_reasons.append("periodic_cadence")
-                if _provider_fetch_requested_by_health(config, provider, task_state):
-                    full_refresh_reasons.append("health_recommended")
-                full_refresh_requested = bool(full_refresh_reasons)
+                full_refresh_reasons = list(planned_full_refresh_reasons)
                 result = _run_subprocess(
                     config,
                     _provider_fetch_command(config, provider, full_refresh=full_refresh_requested),
                     label=spec.name,
                 )
-                result["fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
+                result["fetch_mode"] = planned_fetch_mode or "incremental"
                 if full_refresh_reasons:
                     result["full_refresh_reason"] = "+".join(full_refresh_reasons)
             elif spec.name == "sync_apply":
@@ -533,6 +620,20 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result = {"status": "skipped", "reason": "unknown_task"}
             finished_epoch = time.time()
             finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if spec.budget_provider is not None and isinstance(usage, dict):
+                before_request_count = int(usage.get("request_count", 0))
+                after_usage = summarize_recent_api_usage(provider=spec.budget_provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
+                observed_request_delta = max(0, int(after_usage.get("request_count", 0)) - before_request_count)
+                task_state["last_request_delta"] = observed_request_delta
+                task_state["last_request_delta_at"] = finished_at
+                result["request_delta"] = observed_request_delta
+                if spec.name.startswith("sync_fetch_"):
+                    delta_by_mode = task_state.get("last_request_delta_by_mode")
+                    if not isinstance(delta_by_mode, dict):
+                        delta_by_mode = {}
+                    delta_by_mode[planned_fetch_mode or "incremental"] = observed_request_delta
+                    task_state["last_request_delta_by_mode"] = delta_by_mode
+                    result["request_delta_by_mode"] = {planned_fetch_mode or "incremental": observed_request_delta}
             task_status = result.get("status", "ok")
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": task_status, "last_result": result})
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)

@@ -82,6 +82,7 @@ class ServiceSettings:
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
     provider_hourly_limits: dict[str, int] = field(default_factory=dict)
     task_hourly_limits: dict[str, int] = field(default_factory=dict)
+    task_projected_request_counts: dict[str, int] = field(default_factory=dict)
     source_provider_warn_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS
     source_provider_critical_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
@@ -366,6 +367,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     service_section = _get_table(settings, "service")
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
+    service_task_projected_request_counts_section = _get_nested_table(settings, "service", "task_projected_request_counts")
     service_warn_backoff_floors_section = _get_nested_table(settings, "service", "provider_warn_backoff_floor_seconds")
     service_critical_backoff_floors_section = _get_nested_table(settings, "service", "provider_critical_backoff_floor_seconds")
     service_task_warn_backoff_floors_section = _get_nested_table(settings, "service", "task_warn_backoff_floor_seconds")
@@ -501,6 +503,11 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             task_hourly_limits={
                 str(key): int(value)
                 for key, value in service_task_limits_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            task_projected_request_counts={
+                str(key): int(value)
+                for key, value in service_task_projected_request_counts_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
             },
             source_provider_warn_backoff_floor_seconds=int(

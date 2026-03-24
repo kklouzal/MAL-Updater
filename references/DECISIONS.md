@@ -220,3 +220,14 @@ Keep provider/shared budget defaults as the baseline, but allow optional per-tas
 - some daemon lanes share a provider but do not deserve the same throttling posture (for example MAL token refresh vs aggregate apply)
 - per-task overrides let operators tune the risky/expensive lane without inventing fake provider identities
 - surfacing the effective budget scope keeps cooldown decisions explainable during unattended debugging
+
+## 2026-03-24 - First-pass projected request budgeting posture
+
+### Decision
+Teach daemon budget gates to look at projected per-run request cost, not only the current hourly count. Use explicit `service.task_projected_request_counts` overrides when present; otherwise reuse the lane's last observed request delta (including fetch-mode-specific deltas for incremental vs full-refresh provider fetches). Persist the projection source/count in service state/status so unattended skips remain explainable.
+
+### Why
+- raw current-hour counts alone react too late for chunky lanes whose next run is what would actually push the provider over warn/critical budget
+- last-observed request deltas are a cheap, local, provider-agnostic signal that improves pacing without inventing fake precision or requiring a large planning subsystem
+- explicit per-task overrides still matter for operators who know a lane's expected cost better than one recent observed run
+- persisting projection source/count keeps the gate auditable instead of feeling like invisible daemon magic

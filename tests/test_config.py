@@ -93,6 +93,10 @@ class ConfigLoadingTests(unittest.TestCase):
                     [service.task_hourly_limits]
                     sync_apply = 24
 
+                    [service.task_projected_request_counts]
+                    sync_apply = 8
+                    sync_fetch_hidive = 14
+
                     [service.provider_warn_backoff_floor_seconds]
                     crunchyroll = 900
                     hidive = 300
@@ -126,6 +130,8 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(2400, config.service.source_provider_auth_failure_backoff_floor_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(24, config.service.task_hourly_limits["sync_apply"])
+            self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
+            self.assertEqual(14, config.service.task_projected_request_counts["sync_fetch_hidive"])
             self.assertEqual(900, config.service.provider_warn_backoff_floor_seconds["crunchyroll"])
             self.assertEqual(300, config.service.provider_warn_backoff_floor_seconds["hidive"])
             self.assertEqual(450, config.service.task_warn_backoff_floor_seconds["sync_apply"])

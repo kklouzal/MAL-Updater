@@ -121,6 +121,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         "budget_scope",
         "last_fetch_mode",
         "last_full_refresh_reason",
+        "projected_request_source",
     ):
         field_value = value.get(field)
         if field_value is not None:
@@ -143,6 +144,14 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
         summary["failure_backoff_consecutive_failures"] = int(value["failure_backoff_consecutive_failures"])
     if isinstance(value.get("failure_backoff_floor_seconds"), (int, float)):
         summary["failure_backoff_floor_seconds"] = int(value["failure_backoff_floor_seconds"])
+    if isinstance(value.get("projected_request_count"), (int, float)):
+        summary["projected_request_count"] = int(value["projected_request_count"])
+    if isinstance(value.get("projected_request_total"), (int, float)):
+        summary["projected_request_total"] = int(value["projected_request_total"])
+    if isinstance(value.get("projected_ratio"), (int, float)):
+        summary["projected_ratio"] = round(float(value["projected_ratio"]), 6)
+    if isinstance(value.get("last_request_delta"), (int, float)):
+        summary["last_request_delta"] = int(value["last_request_delta"])
     next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
     if next_due_at is not None:
         summary["next_due_in_seconds"] = max(0, int((next_due_at - datetime.now(timezone.utc)).total_seconds()))

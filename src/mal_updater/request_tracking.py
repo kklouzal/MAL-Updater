@@ -136,6 +136,7 @@ def estimate_budget_recovery_seconds_for_ratio(
     provider: str,
     limit: int,
     target_ratio: float,
+    projected_requests: int = 0,
     window_seconds: int = 3600,
     config: AppConfig | None = None,
 ) -> int:
@@ -145,7 +146,7 @@ def estimate_budget_recovery_seconds_for_ratio(
     if not event_times:
         return 0
     normalized_ratio = max(0.0, min(1.0, float(target_ratio)))
-    allowed_requests = max(0, math.floor(limit * normalized_ratio) - 1)
+    allowed_requests = max(0, math.floor(limit * normalized_ratio) - max(0, int(projected_requests)) - 1)
     if len(event_times) <= allowed_requests:
         return 0
     now = datetime.now(timezone.utc)
@@ -159,6 +160,7 @@ def estimate_budget_recovery_seconds(
     provider: str,
     limit: int,
     critical_ratio: float,
+    projected_requests: int = 0,
     window_seconds: int = 3600,
     config: AppConfig | None = None,
 ) -> int:
@@ -166,6 +168,7 @@ def estimate_budget_recovery_seconds(
         provider=provider,
         limit=limit,
         target_ratio=critical_ratio,
+        projected_requests=projected_requests,
         window_seconds=window_seconds,
         config=config,
     )
