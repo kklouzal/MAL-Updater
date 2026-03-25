@@ -442,7 +442,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual(2, sync_state["last_request_delta"])
         self.assertEqual({"incremental": 2}, sync_state["last_request_delta_by_mode"])
         self.assertEqual(2, sync_state["projected_request_count"])
-        self.assertEqual("observed_incremental", sync_state["projected_request_source"])
+        self.assertEqual("observed_incremental_smoothed", sync_state["projected_request_source"])
 
     def test_run_pending_tasks_smooths_observed_request_delta_history_for_budgeting(self) -> None:
         self.config.service.sync_every_seconds = 0
@@ -476,7 +476,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual([2, 8, 2], sync_state["last_request_delta_history"])
         self.assertEqual({"incremental": [2, 8, 2]}, sync_state["last_request_delta_history_by_mode"])
-        self.assertEqual(5, sync_state["projected_request_count"])
+        self.assertEqual(4, sync_state["projected_request_count"])
         self.assertEqual("observed_incremental_smoothed", sync_state["projected_request_source"])
 
     def test_run_pending_tasks_uses_task_percentile_projection_and_history_window_for_budgeting(self) -> None:
@@ -522,6 +522,51 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         )
         self.assertEqual(20, projected_count)
         self.assertEqual("observed_incremental_p75", projected_source)
+
+    def test_run_pending_tasks_auto_uses_conservative_percentile_for_bursty_history(self) -> None:
+        self.config.service.sync_every_seconds = 0
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        planned_deltas = iter([2, 12, 2, 20])
+
+        def fake_run_subprocess(config, args, *, label):
+            if label == "sync_fetch_crunchyroll":
+                for index in range(next(planned_deltas)):
+                    record_api_request_event(
+                        "crunchyroll",
+                        "sync-fetch",
+                        url=f"https://example.invalid/api/{index}",
+                        method="GET",
+                        outcome="ok",
+                        status_code=200,
+                        config=config,
+                    )
+            return {"status": "ok", "label": label, "returncode": 0, "stdout": "", "stderr": ""}
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=fake_run_subprocess,
+        ):
+            run_pending_tasks(self.config)
+            run_pending_tasks(self.config)
+            run_pending_tasks(self.config)
+            run_pending_tasks(self.config)
+
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual([2, 12, 2, 20], sync_state["last_request_delta_history"])
+        self.assertEqual({"incremental": [2, 12, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
+        self.assertEqual(20, sync_state["projected_request_count"])
+        self.assertEqual("observed_incremental_auto_p90", sync_state["projected_request_source"])
+
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
+            sync_state,
+            fetch_mode="incremental",
+        )
+        self.assertEqual(20, projected_count)
+        self.assertEqual("observed_incremental_auto_p90", projected_source)
 
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {

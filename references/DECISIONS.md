@@ -211,6 +211,16 @@ Treat hard-coded supplemental MAL candidate IDs as conservative rescue inputs, n
 - overflow on top of a supplemental-only hit can still mean a multi-entry bundle or broader franchise residue
 - keeping this path conservative preserves explainability and avoids overconfident auto-approval when the search surface was already weak
 
+## 2026-03-25 - Bursty learned-request projection posture
+
+### Decision
+When a daemon lane has no explicit projected-request percentile configured, keep the default smoothed-history projection for ordinary lanes but automatically switch to a conservative learned `p90` baseline once the recent observed request history is clearly bursty.
+
+### Why
+- unattended budget gating should react before a spiky lane surprises the provider limit
+- requiring manual percentile tuning for every lane is unnecessary operator busywork
+- auto-switching only after several observed runs keeps the default path simple for stable lanes while making burstier ones safer by default
+
 ## 2026-03-24 - Task-level daemon budget override posture
 
 ### Decision

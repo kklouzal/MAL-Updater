@@ -30,6 +30,9 @@ class TaskSpec:
 
 _BUDGET_GATE_WINDOW_SECONDS = 3600
 _FAILURE_BACKOFF_MIN_SECONDS = 300
+_AUTO_PROJECTED_REQUEST_PERCENTILE = 0.9
+_AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY = 4
+_AUTO_PROJECTED_REQUEST_BURST_RATIO = 2.0
 
 _AUTH_STYLE_FAILURE_MARKERS = (
     "http 401",
@@ -134,15 +137,33 @@ def _smoothed_request_delta(history: list[int]) -> int | None:
     return max(0, int(math.ceil(sum(history) / len(history))))
 
 
+def _auto_projected_request_percentile(history: list[int]) -> float | None:
+    if len(history) < _AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY:
+        return None
+    smoothed = _smoothed_request_delta(history)
+    if smoothed is None or smoothed <= 0:
+        return None
+    highest = max(max(0, int(item)) for item in history)
+    if highest < int(math.ceil(smoothed * _AUTO_PROJECTED_REQUEST_BURST_RATIO)):
+        return None
+    return _AUTO_PROJECTED_REQUEST_PERCENTILE
+
+
 def _projected_request_delta_from_history(
     history: list[int],
     *,
     percentile: float | None,
 ) -> tuple[int | None, str | None]:
-    if percentile is not None:
-        projected = _percentile_request_delta(history, percentile)
+    chosen_percentile = percentile
+    label_prefix = ""
+    if chosen_percentile is None:
+        chosen_percentile = _auto_projected_request_percentile(history)
+        if chosen_percentile is not None:
+            label_prefix = "auto_"
+    if chosen_percentile is not None:
+        projected = _percentile_request_delta(history, chosen_percentile)
         if projected is not None:
-            return projected, f"p{int(round(percentile * 100))}"
+            return projected, f"{label_prefix}p{int(round(chosen_percentile * 100))}"
     projected = _smoothed_request_delta(history)
     if projected is not None:
         return projected, "smoothed"
@@ -387,6 +408,22 @@ def _projected_request_count(
         return max(0, int(value)), "observed_last_run"
     return 0, None
 
+
+
+def _refresh_projected_request_state(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    fetch_mode: str | None = None,
+) -> tuple[int, str | None]:
+    projected_request_count, projected_request_source = _projected_request_count(config, spec, task_state, fetch_mode=fetch_mode)
+    task_state["projected_request_count"] = projected_request_count
+    if projected_request_source is not None:
+        task_state["projected_request_source"] = projected_request_source
+    else:
+        task_state.pop("projected_request_source", None)
+    return projected_request_count, projected_request_source
 
 
 def _budget_gate(
@@ -728,7 +765,16 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     finished_at=finished_at,
                     history_limit=config.service.projected_request_history_window_for(spec.name),
                 )
+                projected_request_count, projected_request_source = _refresh_projected_request_state(
+                    config,
+                    spec,
+                    task_state,
+                    fetch_mode=fetch_mode_for_history,
+                )
                 result["request_delta"] = observed_request_delta
+                result["next_projected_request_count"] = projected_request_count
+                if projected_request_source is not None:
+                    result["next_projected_request_source"] = projected_request_source
                 if fetch_mode_for_history is not None:
                     result["request_delta_by_mode"] = {fetch_mode_for_history: observed_request_delta}
             task_status = result.get("status", "ok")

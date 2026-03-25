@@ -26,7 +26,7 @@
 - daemon budget policy can now also be overridden per task/lane (`service.task_*` tables), with service state/status surfacing whether a cooldown came from task-level vs provider-level policy so MAL lanes like `sync_apply` no longer have to share one blunt provider-only budget posture
 - daemon budget gating is now modestly projection-aware: budgeted lanes persist observed request deltas, can optionally take explicit `service.task_projected_request_counts` overrides, and will pre-emptively warn/skip when the projected post-run hourly ratio would cross warn/critical thresholds instead of only reacting to the current raw count
 - observed request-delta projections now keep a short rolling baseline overall and per fetch mode, smoothing incremental/full-refresh fetch budgeting so one unusually expensive run is less likely to dominate the next unattended budget decision
-- learned request projections are now tunable per task: operators can shrink/expand the observed-history window and optionally switch a lane from mean-style smoothing to a conservative percentile baseline when a fetch path is burstier than average
+- learned request projections are now tunable per task: operators can shrink/expand the observed-history window and optionally switch a lane from mean-style smoothing to a conservative percentile baseline when a fetch path is burstier than average; when no explicit percentile is configured, the daemon now also auto-switches obviously bursty lanes onto a conservative learned p90 baseline instead of blindly trusting the smoothed mean
 - provider-task failures now trigger adaptive failure-aware cooldowns with persisted reason / failure class / configured floor / retry countdown / consecutive-failure state so auth-fragile fetch lanes do not thrash every loop after a bad run
 - health-check now inspects persisted daemon failure state and can recommend provider auth re-bootstrap when repeated unattended fetch failures look auth-related (not just repeated 401/unauthorized loops, but also refresh/login failure residue and provider session-state `auth_failed` phases)
 - provider fetch lanes now persist fetch-mode state plus a periodic full-refresh anchor so unattended daemon runs can stay incremental by default while still forcing a conservative provider `--full-refresh` sweep on a configurable cadence (`service.full_refresh_every_seconds`, default 24h)
@@ -36,7 +36,7 @@
 
 ## Open work
 
-- continue tightening daemon orchestration and request-budget behavior (projected per-run request budgeting now uses explicit lane overrides or tunable learned observed-history windows/percentiles; next likely step is deciding whether some lanes should gain provider-specific defaults or automatic percentile selection based on burstiness)
+- continue tightening daemon orchestration and request-budget behavior (projected per-run request budgeting now uses explicit lane overrides or tunable learned observed-history windows/percentiles, and bursty lanes now auto-fallback to a conservative learned p90 when no explicit percentile is configured; next likely step is deciding whether some lanes should gain provider-specific defaults beyond the generic burstiness heuristic)
 - continue reducing genuinely ambiguous mapping residue
 - continue stabilizing fresh Crunchyroll fetches on hostile/auth-fragile hosts
 - continue improving recommendation quality and review UX
