@@ -242,3 +242,14 @@ When a lane does not have an explicit configured projected request count, keep a
 - fetch-mode-specific smoothing preserves the useful distinction between incremental and full-refresh provider cost without needing a larger forecasting subsystem
 - preserving the legacy last-run fallback keeps cold-start behavior simple while letting repeated runs become more stable
 - persisting the projection source still keeps daemon pacing explainable during debugging
+
+## 2026-03-25 - Tunable learned request projection posture
+
+### Decision
+Keep the learned observed-request projection path configurable per task: allow each lane to override its observed-history window and optionally use a percentile baseline instead of the default smoothed mean. Prefer the same fetch-mode-specific history split (`incremental` vs `full_refresh`) when present.
+
+### Why
+- different daemon lanes have different burst shapes, so one fixed five-sample mean is too blunt as the project grows
+- conservative percentile baselines let fragile/high-cost fetch lanes pace themselves without forcing every quieter lane into worst-case budgeting
+- keeping the tuning task-scoped preserves explainability and avoids inventing hidden provider-wide heuristics too early
+- bounded per-task history windows keep the state small and auditable while still letting operators smooth or tighten learning where it matters

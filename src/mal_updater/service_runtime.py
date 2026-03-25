@@ -30,7 +30,6 @@ class TaskSpec:
 
 _BUDGET_GATE_WINDOW_SECONDS = 3600
 _FAILURE_BACKOFF_MIN_SECONDS = 300
-_PROJECTED_REQUEST_HISTORY_LIMIT = 5
 
 _AUTH_STYLE_FAILURE_MARKERS = (
     "http 401",
@@ -111,10 +110,22 @@ def _normalized_request_delta_history(value: object) -> list[int]:
     return history
 
 
-def _trimmed_request_delta_history(history: list[int]) -> list[int]:
-    if len(history) <= _PROJECTED_REQUEST_HISTORY_LIMIT:
+def _trimmed_request_delta_history(history: list[int], *, limit: int) -> list[int]:
+    normalized_limit = max(1, int(limit))
+    if len(history) <= normalized_limit:
         return history
-    return history[-_PROJECTED_REQUEST_HISTORY_LIMIT:]
+    return history[-normalized_limit:]
+
+
+def _percentile_request_delta(history: list[int], percentile: float) -> int | None:
+    if len(history) < 2:
+        return None
+    normalized = min(1.0, max(0.0, float(percentile)))
+    if normalized <= 0.0:
+        return None
+    sorted_history = sorted(max(0, int(item)) for item in history)
+    index = max(0, min(len(sorted_history) - 1, int(math.ceil(normalized * len(sorted_history))) - 1))
+    return sorted_history[index]
 
 
 def _smoothed_request_delta(history: list[int]) -> int | None:
@@ -123,19 +134,35 @@ def _smoothed_request_delta(history: list[int]) -> int | None:
     return max(0, int(math.ceil(sum(history) / len(history))))
 
 
+def _projected_request_delta_from_history(
+    history: list[int],
+    *,
+    percentile: float | None,
+) -> tuple[int | None, str | None]:
+    if percentile is not None:
+        projected = _percentile_request_delta(history, percentile)
+        if projected is not None:
+            return projected, f"p{int(round(percentile * 100))}"
+    projected = _smoothed_request_delta(history)
+    if projected is not None:
+        return projected, "smoothed"
+    return None, None
+
+
 def _record_observed_request_delta(
     task_state: dict[str, Any],
     *,
     observed_request_delta: int,
     fetch_mode: str | None,
     finished_at: str,
+    history_limit: int,
 ) -> None:
     normalized_delta = max(0, int(observed_request_delta))
     task_state["last_request_delta"] = normalized_delta
     task_state["last_request_delta_at"] = finished_at
     history = _normalized_request_delta_history(task_state.get("last_request_delta_history"))
     history.append(normalized_delta)
-    task_state["last_request_delta_history"] = _trimmed_request_delta_history(history)
+    task_state["last_request_delta_history"] = _trimmed_request_delta_history(history, limit=history_limit)
     if fetch_mode is None:
         return
     delta_by_mode = task_state.get("last_request_delta_by_mode")
@@ -148,7 +175,7 @@ def _record_observed_request_delta(
         history_by_mode = {}
     mode_history = _normalized_request_delta_history(history_by_mode.get(fetch_mode))
     mode_history.append(normalized_delta)
-    history_by_mode[fetch_mode] = _trimmed_request_delta_history(mode_history)
+    history_by_mode[fetch_mode] = _trimmed_request_delta_history(mode_history, limit=history_limit)
     task_state["last_request_delta_history_by_mode"] = history_by_mode
 
 
@@ -335,19 +362,26 @@ def _projected_request_count(
     configured = config.service.task_projected_request_counts.get(spec.name)
     if isinstance(configured, int):
         return max(0, int(configured)), "configured"
+    percentile = config.service.projected_request_percentile_for(spec.name)
     if fetch_mode:
         history_by_mode = task_state.get("last_request_delta_history_by_mode")
         if isinstance(history_by_mode, dict):
-            smoothed_mode = _smoothed_request_delta(_normalized_request_delta_history(history_by_mode.get(fetch_mode)))
-            if smoothed_mode is not None:
-                return smoothed_mode, f"observed_{fetch_mode}_smoothed"
+            projected_mode, projected_mode_label = _projected_request_delta_from_history(
+                _normalized_request_delta_history(history_by_mode.get(fetch_mode)),
+                percentile=percentile,
+            )
+            if projected_mode is not None and projected_mode_label is not None:
+                return projected_mode, f"observed_{fetch_mode}_{projected_mode_label}"
         if isinstance(task_state.get("last_request_delta_by_mode"), dict):
             mode_value = task_state["last_request_delta_by_mode"].get(fetch_mode)
             if isinstance(mode_value, int):
                 return max(0, int(mode_value)), f"observed_{fetch_mode}"
-    smoothed = _smoothed_request_delta(_normalized_request_delta_history(task_state.get("last_request_delta_history")))
-    if smoothed is not None:
-        return smoothed, "observed_smoothed"
+    projected, projected_label = _projected_request_delta_from_history(
+        _normalized_request_delta_history(task_state.get("last_request_delta_history")),
+        percentile=percentile,
+    )
+    if projected is not None and projected_label is not None:
+        return projected, f"observed_{projected_label}"
     value = task_state.get("last_request_delta")
     if isinstance(value, int):
         return max(0, int(value)), "observed_last_run"
@@ -692,6 +726,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     observed_request_delta=observed_request_delta,
                     fetch_mode=fetch_mode_for_history,
                     finished_at=finished_at,
+                    history_limit=config.service.projected_request_history_window_for(spec.name),
                 )
                 result["request_delta"] = observed_request_delta
                 if fetch_mode_for_history is not None:

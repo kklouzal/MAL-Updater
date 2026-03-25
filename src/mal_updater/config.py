@@ -44,6 +44,8 @@ DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS = 0
 DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS = 0
 DEFAULT_SERVICE_WARN_RATIO = 0.8
 DEFAULT_SERVICE_CRITICAL_RATIO = 0.95
+DEFAULT_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW = 5
+MAX_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW = 20
 WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 
 
@@ -83,6 +85,8 @@ class ServiceSettings:
     provider_hourly_limits: dict[str, int] = field(default_factory=dict)
     task_hourly_limits: dict[str, int] = field(default_factory=dict)
     task_projected_request_counts: dict[str, int] = field(default_factory=dict)
+    task_projected_request_history_windows: dict[str, int] = field(default_factory=dict)
+    task_projected_request_percentiles: dict[str, float] = field(default_factory=dict)
     source_provider_warn_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS
     source_provider_critical_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
@@ -106,6 +110,23 @@ class ServiceSettings:
         if provider:
             return "provider"
         return "none"
+
+    def projected_request_history_window_for(self, task_name: str | None = None) -> int:
+        if task_name:
+            value = self.task_projected_request_history_windows.get(task_name)
+            if isinstance(value, int):
+                return max(1, min(MAX_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW, int(value)))
+        return DEFAULT_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW
+
+    def projected_request_percentile_for(self, task_name: str | None = None) -> float | None:
+        if not task_name:
+            return None
+        value = self.task_projected_request_percentiles.get(task_name)
+        if isinstance(value, (int, float)):
+            normalized = float(value)
+            if 0.0 < normalized <= 1.0:
+                return normalized
+        return None
 
     def hourly_limit_for(self, provider: str, *, task_name: str | None = None) -> int:
         if task_name:
@@ -368,6 +389,8 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
     service_task_projected_request_counts_section = _get_nested_table(settings, "service", "task_projected_request_counts")
+    service_task_projected_request_history_windows_section = _get_nested_table(settings, "service", "task_projected_request_history_windows")
+    service_task_projected_request_percentiles_section = _get_nested_table(settings, "service", "task_projected_request_percentiles")
     service_warn_backoff_floors_section = _get_nested_table(settings, "service", "provider_warn_backoff_floor_seconds")
     service_critical_backoff_floors_section = _get_nested_table(settings, "service", "provider_critical_backoff_floor_seconds")
     service_task_warn_backoff_floors_section = _get_nested_table(settings, "service", "task_warn_backoff_floor_seconds")
@@ -509,6 +532,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 str(key): int(value)
                 for key, value in service_task_projected_request_counts_section.items()
                 if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            task_projected_request_history_windows={
+                str(key): max(1, min(MAX_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW, int(value)))
+                for key, value in service_task_projected_request_history_windows_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+            },
+            task_projected_request_percentiles={
+                str(key): float(value)
+                for key, value in service_task_projected_request_percentiles_section.items()
+                if isinstance(key, str) and isinstance(value, (int, float)) and 0.0 < float(value) <= 1.0
             },
             source_provider_warn_backoff_floor_seconds=int(
                 os.getenv(
