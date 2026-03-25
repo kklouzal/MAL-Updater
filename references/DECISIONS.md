@@ -263,3 +263,15 @@ Keep the learned observed-request projection path configurable per task: allow e
 - conservative percentile baselines let fragile/high-cost fetch lanes pace themselves without forcing every quieter lane into worst-case budgeting
 - keeping the tuning task-scoped preserves explainability and avoids inventing hidden provider-wide heuristics too early
 - bounded per-task history windows keep the state small and auditable while still letting operators smooth or tighten learning where it matters
+
+## 2026-03-25 - Shipped provider pacing defaults posture
+
+### Decision
+Ship opinionated daemon pacing defaults for the currently supported source providers instead of leaving those numbers only in example config. Keep shared source-provider defaults as the fallback for unknown/new providers, but seed built-in provider tables for:
+- Crunchyroll: deeper learned request-cost history, conservative percentile projection, and stronger warn/critical/auth-failure cooldown floors
+- HIDIVE: quieter hourly budget plus provider-specific backoff/auth-failure floors
+
+### Why
+- the repo's own likely-next-step had already converged on provider defaults being justified for the current providers
+- supported providers now have enough operational character to deserve safer built-in posture without requiring every operator to rediscover the same settings
+- keeping unknown providers on the generic source-provider fallback preserves extensibility while making today's unattended installs safer out of the box

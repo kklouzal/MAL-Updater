@@ -27,6 +27,14 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.mal.bind_host, "0.0.0.0")
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.1:8765/callback")
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").resolve())
+            self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
+            self.assertEqual(7, config.service.projected_request_history_window_for("unknown_task", provider="crunchyroll"))
+            self.assertEqual(9, config.service.projected_request_history_window_for("unknown_task", provider="hidive"))
+            self.assertEqual(0.9, config.service.projected_request_percentile_for("unknown_task", provider="crunchyroll"))
+            self.assertIsNone(config.service.projected_request_percentile_for("unknown_task", provider="hidive"))
+            self.assertEqual(900, config.service.backoff_floor_seconds_for("crunchyroll", level="warn"))
+            self.assertEqual(1200, config.service.backoff_floor_seconds_for("hidive", level="critical"))
+            self.assertEqual(7200, config.service.auth_failure_backoff_floor_seconds_for("crunchyroll"))
 
     def test_settings_file_overrides_paths_and_secret_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:

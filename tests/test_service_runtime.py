@@ -407,6 +407,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
         self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.provider_projected_request_percentiles.pop("crunchyroll", None)
 
         def fake_run_subprocess(config, args, *, label):
             if label == "sync_fetch_crunchyroll":
@@ -448,6 +449,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
         self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.provider_projected_request_percentiles.pop("crunchyroll", None)
         planned_deltas = iter([2, 8, 2])
 
         def fake_run_subprocess(config, args, *, label):
@@ -572,6 +574,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
         self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.provider_projected_request_percentiles.pop("crunchyroll", None)
         planned_deltas = iter([2, 12, 2, 20])
 
         def fake_run_subprocess(config, args, *, label):
@@ -670,7 +673,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertGreaterEqual(sync_result["failure_backoff_remaining_seconds"], 300)
         self.assertEqual("HTTP 401 from Crunchyroll", sync_result["failure_backoff_reason"])
         self.assertEqual("auth", sync_result["failure_backoff_class"])
-        self.assertEqual(0, sync_result["failure_backoff_floor_seconds"])
+        self.assertEqual(7200, sync_result["failure_backoff_floor_seconds"])
         self.assertEqual(1, sync_result["failure_backoff_consecutive_failures"])
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
@@ -678,7 +681,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("error", sync_state["last_status"])
         self.assertEqual("HTTP 401 from Crunchyroll", sync_state["last_error"])
         self.assertEqual("auth", sync_state["failure_backoff_class"])
-        self.assertEqual(0, sync_state["failure_backoff_floor_seconds"])
+        self.assertEqual(7200, sync_state["failure_backoff_floor_seconds"])
         self.assertIn("failure_backoff_until", sync_state)
         self.assertIn("failure_backoff_until_epoch", sync_state)
         self.assertGreaterEqual(sync_state["failure_backoff_remaining_seconds"], 300)

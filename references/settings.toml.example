@@ -45,7 +45,7 @@ warn_ratio = 0.8
 critical_ratio = 0.95
 
 [service.provider_hourly_limits]
-hidive = 72
+hidive = 72  # built-in default shown explicitly here; override only when this host needs a different HIDIVE budget
 
 [service.task_hourly_limits]
 sync_apply = 48  # optional per-lane override when a task should budget differently from its provider default
@@ -55,26 +55,26 @@ sync_apply = 8  # optional pre-run request-cost estimate when a lane's next run 
 sync_fetch_crunchyroll = 12
 
 [service.provider_projected_request_history_windows]
-crunchyroll = 7  # optional provider-wide learned-history depth for lanes that should default to deeper request-cost memory
-hidive = 9
+crunchyroll = 7  # built-in default shown explicitly here; override only when this host needs a different learned-history depth
+hidive = 9  # built-in default shown explicitly here
 
 [service.task_projected_request_history_windows]
 sync_fetch_crunchyroll = 7  # optional lane-specific override; task settings win over provider defaults when both exist
 sync_apply = 3
 
 [service.provider_projected_request_percentiles]
-crunchyroll = 0.9  # optional provider-wide conservative learned projection for burstier providers when task-specific tuning is absent
+crunchyroll = 0.9  # built-in default shown explicitly here; override only when this host needs a different provider-wide conservative projection
 
 [service.task_projected_request_percentiles]
 sync_fetch_crunchyroll = 0.9  # optional conservative learned projection; when unset the daemon falls back to provider defaults, then smoothed/auto-bursty behavior
 
 [service.provider_warn_backoff_floor_seconds]
-crunchyroll = 900
-hidive = 300
+crunchyroll = 900  # built-in default shown explicitly here
+hidive = 300  # built-in default shown explicitly here
 
 [service.provider_critical_backoff_floor_seconds]
-crunchyroll = 1800
-hidive = 1200
+crunchyroll = 1800  # built-in default shown explicitly here
+hidive = 1200  # built-in default shown explicitly here
 
 [service.task_warn_backoff_floor_seconds]
 sync_apply = 900
@@ -83,8 +83,8 @@ sync_apply = 900
 sync_apply = 1800
 
 [service.provider_auth_failure_backoff_floor_seconds]
-crunchyroll = 7200
-hidive = 3600
+crunchyroll = 7200  # built-in default shown explicitly here
+hidive = 3600  # built-in default shown explicitly here
 
 [service.task_auth_failure_backoff_floor_seconds]
 sync_apply = 2400
