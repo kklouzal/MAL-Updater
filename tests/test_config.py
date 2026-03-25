@@ -97,9 +97,17 @@ class ConfigLoadingTests(unittest.TestCase):
                     sync_apply = 8
                     sync_fetch_hidive = 14
 
+                    [service.provider_projected_request_history_windows]
+                    crunchyroll = 7
+                    hidive = 11
+
                     [service.task_projected_request_history_windows]
                     sync_apply = 3
                     sync_fetch_hidive = 9
+
+                    [service.provider_projected_request_percentiles]
+                    crunchyroll = 0.85
+                    hidive = 0.95
 
                     [service.task_projected_request_percentiles]
                     sync_apply = 0.75
@@ -140,8 +148,12 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(24, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
             self.assertEqual(14, config.service.task_projected_request_counts["sync_fetch_hidive"])
+            self.assertEqual(7, config.service.provider_projected_request_history_windows["crunchyroll"])
+            self.assertEqual(11, config.service.provider_projected_request_history_windows["hidive"])
             self.assertEqual(3, config.service.task_projected_request_history_windows["sync_apply"])
             self.assertEqual(9, config.service.task_projected_request_history_windows["sync_fetch_hidive"])
+            self.assertEqual(0.85, config.service.provider_projected_request_percentiles["crunchyroll"])
+            self.assertEqual(0.95, config.service.provider_projected_request_percentiles["hidive"])
             self.assertEqual(0.75, config.service.task_projected_request_percentiles["sync_apply"])
             self.assertEqual(0.9, config.service.task_projected_request_percentiles["sync_fetch_hidive"])
             self.assertEqual(900, config.service.provider_warn_backoff_floor_seconds["crunchyroll"])
@@ -157,6 +169,8 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(24, config.service.hourly_limit_for("mal", task_name="sync_apply"))
             self.assertEqual(3, config.service.projected_request_history_window_for("sync_apply"))
             self.assertEqual(0.75, config.service.projected_request_percentile_for("sync_apply"))
+            self.assertEqual(11, config.service.projected_request_history_window_for("unknown_task", provider="hidive"))
+            self.assertEqual(0.95, config.service.projected_request_percentile_for("unknown_task", provider="hidive"))
             self.assertEqual(5, config.service.projected_request_history_window_for("unknown_task"))
             self.assertIsNone(config.service.projected_request_percentile_for("unknown_task"))
             self.assertEqual(180, config.service.backoff_floor_seconds_for("new-provider", level="warn"))

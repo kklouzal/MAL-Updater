@@ -54,12 +54,19 @@ sync_apply = 48  # optional per-lane override when a task should budget differen
 sync_apply = 8  # optional pre-run request-cost estimate when a lane's next run is expensive enough to budget proactively
 sync_fetch_crunchyroll = 12
 
+[service.provider_projected_request_history_windows]
+crunchyroll = 7  # optional provider-wide learned-history depth for lanes that should default to deeper request-cost memory
+hidive = 9
+
 [service.task_projected_request_history_windows]
-sync_fetch_crunchyroll = 7  # optional observed-history depth for learned projections when one lane needs more or less smoothing
+sync_fetch_crunchyroll = 7  # optional lane-specific override; task settings win over provider defaults when both exist
 sync_apply = 3
 
+[service.provider_projected_request_percentiles]
+crunchyroll = 0.9  # optional provider-wide conservative learned projection for burstier providers when task-specific tuning is absent
+
 [service.task_projected_request_percentiles]
-sync_fetch_crunchyroll = 0.9  # optional conservative learned projection; when unset the daemon uses a smoothed average instead
+sync_fetch_crunchyroll = 0.9  # optional conservative learned projection; when unset the daemon falls back to provider defaults, then smoothed/auto-bursty behavior
 
 [service.provider_warn_backoff_floor_seconds]
 crunchyroll = 900

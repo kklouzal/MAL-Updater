@@ -383,7 +383,7 @@ def _projected_request_count(
     configured = config.service.task_projected_request_counts.get(spec.name)
     if isinstance(configured, int):
         return max(0, int(configured)), "configured"
-    percentile = config.service.projected_request_percentile_for(spec.name)
+    percentile = config.service.projected_request_percentile_for(spec.name, provider=spec.budget_provider)
     if fetch_mode:
         history_by_mode = task_state.get("last_request_delta_history_by_mode")
         if isinstance(history_by_mode, dict):
@@ -763,7 +763,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     observed_request_delta=observed_request_delta,
                     fetch_mode=fetch_mode_for_history,
                     finished_at=finished_at,
-                    history_limit=config.service.projected_request_history_window_for(spec.name),
+                    history_limit=config.service.projected_request_history_window_for(spec.name, provider=spec.budget_provider),
                 )
                 projected_request_count, projected_request_source = _refresh_projected_request_state(
                     config,
