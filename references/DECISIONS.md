@@ -303,6 +303,17 @@ Keep the existing task-level projected-request override table, but add an option
 - keeping the override task-scoped and fetch-mode-scoped preserves explainability without inventing a larger forecasting subsystem
 - HIDIVE already has enough observed local shape to justify one concrete shipped full-refresh default while leaving other lanes on learned history until they have equally solid evidence
 
+## 2026-03-26 - Crunchyroll full-refresh projection default posture
+
+### Decision
+Extend the built-in fetch-mode task projection defaults to ship a conservative `sync_fetch_crunchyroll` full-refresh projected-request cost of `55`.
+
+### Why
+- Crunchyroll full refreshes are materially heavier than the lane's ordinary incremental fetches, so cold-start budgeting should not have to pretend the first overdue resweep costs zero requests
+- the daemon already has mode-specific budget behavior and downgrade-to-incremental logic, so shipping a concrete Crunchyroll full-refresh default lets those controls act earlier on fresh unattended installs instead of waiting for local history to be learned
+- keeping the default task-scoped and mode-scoped preserves explainability and leaves ordinary incremental Crunchyroll pacing on the existing task/provider learned-history path
+- this mirrors the earlier HIDIVE full-refresh default and closes the most obvious remaining gap in the repo's own shipped provider-fetch posture
+
 ## 2026-03-26 - Budget-blocked full-refresh downgrade posture
 
 ### Decision

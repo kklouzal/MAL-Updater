@@ -52,7 +52,10 @@ sync_apply = 48  # built-in default shown explicitly here; override only when th
 
 [service.task_projected_request_counts]
 sync_apply = 8  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply request-cost estimate
-sync_fetch_crunchyroll = 12
+sync_fetch_crunchyroll = 12  # optional incremental-ish fallback when you want a task-wide Crunchyroll cost estimate outside mode-specific defaults
+
+[service.task_projected_request_counts_by_mode.sync_fetch_crunchyroll]
+full_refresh = 55  # built-in default shown explicitly here; cold-start Crunchyroll full refreshes are materially heavier than incremental fetches
 
 [service.task_projected_request_counts_by_mode.sync_fetch_hidive]
 full_refresh = 71  # built-in default shown explicitly here; use mode-specific task defaults when a lane's full refresh is much more expensive than incremental fetches

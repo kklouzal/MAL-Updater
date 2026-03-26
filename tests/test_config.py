@@ -30,6 +30,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
+            self.assertEqual(55, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["full_refresh"])
             self.assertEqual(71, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["full_refresh"])
             self.assertEqual(7, config.service.projected_request_history_window_for("unknown_task", provider="crunchyroll"))
             self.assertEqual(9, config.service.projected_request_history_window_for("unknown_task", provider="hidive"))

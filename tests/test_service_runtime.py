@@ -679,6 +679,16 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual(20, projected_count)
         self.assertEqual("observed_incremental_p75", projected_source)
 
+    def test_projected_request_count_uses_built_in_crunchyroll_full_refresh_default(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
+            {},
+            fetch_mode="full_refresh",
+        )
+        self.assertEqual(55, projected_count)
+        self.assertEqual("configured_full_refresh", projected_source)
+
     def test_run_pending_tasks_auto_uses_conservative_percentile_for_bursty_history(self) -> None:
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
