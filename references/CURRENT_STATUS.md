@@ -24,6 +24,7 @@
 - daemon budget skips now compute both warn-threshold pacing windows and hard critical recovery windows, persist per-task budget backoff state, and avoid re-check/log spam until the provider budget has room again
 - service budget defaults are now provider-generic: non-MAL source lanes can inherit shared source-provider hourly/backoff/auth-failure defaults without being silently treated as Crunchyroll unless an explicit per-provider override exists
 - daemon budget policy can now also be overridden per task/lane (`service.task_*` tables), with service state/status surfacing whether a cooldown came from task-level vs provider-level policy so MAL lanes like `sync_apply` no longer have to share one blunt provider-only budget posture
+- the repo now ships built-in `sync_apply` task defaults for MAL hourly limit, projected request cost, learned-history depth, and warn/critical/auth-failure cooldown floors so fresh unattended installs inherit a conservative aggregate-apply posture without having to copy those numbers from example config first
 - daemon budget gating is now modestly projection-aware: budgeted lanes persist observed request deltas, can optionally take explicit `service.task_projected_request_counts` overrides, and will pre-emptively warn/skip when the projected post-run hourly ratio would cross warn/critical thresholds instead of only reacting to the current raw count
 - observed request-delta projections now keep a short rolling baseline overall and per fetch mode, smoothing incremental/full-refresh fetch budgeting so one unusually expensive run is less likely to dominate the next unattended budget decision
 - learned request projections are now tunable per task and per provider: operators can shrink/expand the observed-history window and optionally switch a lane/provider from mean-style smoothing to a conservative percentile baseline when a fetch path is burstier than average; task-specific tuning still wins, and when no explicit task/provider percentile is configured the daemon auto-switches obviously bursty lanes onto a conservative learned p90 baseline instead of blindly trusting the smoothed mean
@@ -37,7 +38,7 @@
 
 ## Open work
 
-- continue tightening daemon orchestration and request-budget behavior (projected per-run request budgeting now uses explicit lane overrides or tunable learned observed-history windows/percentiles, and bursty lanes now auto-fallback to a conservative learned p90 when no explicit percentile is configured; next likely step is deciding whether some lanes should gain provider-specific defaults beyond the generic burstiness heuristic)
+- continue tightening daemon orchestration and request-budget behavior (projected per-run request budgeting now uses explicit lane overrides or tunable learned observed-history windows/percentiles, bursty lanes now auto-fallback to a conservative learned p90 when no explicit percentile is configured, and `sync_apply` now has shipped built-in task defaults; next likely step is deciding whether additional lanes deserve built-in task defaults or smarter lane-specific projections)
 - continue reducing genuinely ambiguous mapping residue
 - continue stabilizing fresh Crunchyroll fetches on hostile/auth-fragile hosts
 - continue improving recommendation quality and review UX

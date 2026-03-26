@@ -48,10 +48,10 @@ critical_ratio = 0.95
 hidive = 72  # built-in default shown explicitly here; override only when this host needs a different HIDIVE budget
 
 [service.task_hourly_limits]
-sync_apply = 48  # optional per-lane override when a task should budget differently from its provider default
+sync_apply = 48  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply MAL budget
 
 [service.task_projected_request_counts]
-sync_apply = 8  # optional pre-run request-cost estimate when a lane's next run is expensive enough to budget proactively
+sync_apply = 8  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply request-cost estimate
 sync_fetch_crunchyroll = 12
 
 [service.provider_projected_request_history_windows]
@@ -60,7 +60,7 @@ hidive = 9  # built-in default shown explicitly here
 
 [service.task_projected_request_history_windows]
 sync_fetch_crunchyroll = 7  # optional lane-specific override; task settings win over provider defaults when both exist
-sync_apply = 3
+sync_apply = 3  # built-in default shown explicitly here
 
 [service.provider_projected_request_percentiles]
 crunchyroll = 0.9  # built-in default shown explicitly here; override only when this host needs a different provider-wide conservative projection
@@ -77,17 +77,17 @@ crunchyroll = 1800  # built-in default shown explicitly here
 hidive = 1200  # built-in default shown explicitly here
 
 [service.task_warn_backoff_floor_seconds]
-sync_apply = 900
+sync_apply = 900  # built-in default shown explicitly here
 
 [service.task_critical_backoff_floor_seconds]
-sync_apply = 1800
+sync_apply = 1800  # built-in default shown explicitly here
 
 [service.provider_auth_failure_backoff_floor_seconds]
 crunchyroll = 7200  # built-in default shown explicitly here
 hidive = 3600  # built-in default shown explicitly here
 
 [service.task_auth_failure_backoff_floor_seconds]
-sync_apply = 2400
+sync_apply = 2400  # built-in default shown explicitly here
 
 [secret_files]
 mal_client_id = "mal_client_id.txt"

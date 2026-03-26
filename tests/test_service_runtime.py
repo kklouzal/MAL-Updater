@@ -351,6 +351,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.config.service.mal_hourly_limit = 120
         self.config.service.task_hourly_limits["sync_apply"] = 5
         self.config.service.task_warn_backoff_floor_seconds["sync_apply"] = 900
+        self.config.service.task_projected_request_counts.pop("sync_apply", None)
 
         with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
             "mal_updater.service_runtime._run_subprocess",

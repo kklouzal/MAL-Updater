@@ -49,9 +49,18 @@ MAX_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW = 20
 DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS = {
     "hidive": 72,
 }
+DEFAULT_SERVICE_TASK_HOURLY_LIMITS = {
+    "sync_apply": 48,
+}
+DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
+    "sync_apply": 8,
+}
 DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS = {
     "crunchyroll": 7,
     "hidive": 9,
+}
+DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS = {
+    "sync_apply": 3,
 }
 DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES = {
     "crunchyroll": 0.9,
@@ -60,13 +69,22 @@ DEFAULT_SERVICE_PROVIDER_WARN_BACKOFF_FLOORS = {
     "crunchyroll": 900,
     "hidive": 300,
 }
+DEFAULT_SERVICE_TASK_WARN_BACKOFF_FLOORS = {
+    "sync_apply": 900,
+}
 DEFAULT_SERVICE_PROVIDER_CRITICAL_BACKOFF_FLOORS = {
     "crunchyroll": 1800,
     "hidive": 1200,
 }
+DEFAULT_SERVICE_TASK_CRITICAL_BACKOFF_FLOORS = {
+    "sync_apply": 1800,
+}
 DEFAULT_SERVICE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOORS = {
     "crunchyroll": 7200,
     "hidive": 3600,
+}
+DEFAULT_SERVICE_TASK_AUTH_FAILURE_BACKOFF_FLOORS = {
+    "sync_apply": 2400,
 }
 WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 
@@ -105,21 +123,21 @@ class ServiceSettings:
     source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
     provider_hourly_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS))
-    task_hourly_limits: dict[str, int] = field(default_factory=dict)
-    task_projected_request_counts: dict[str, int] = field(default_factory=dict)
+    task_hourly_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_HOURLY_LIMITS))
+    task_projected_request_counts: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS))
     provider_projected_request_history_windows: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS))
-    task_projected_request_history_windows: dict[str, int] = field(default_factory=dict)
+    task_projected_request_history_windows: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS))
     provider_projected_request_percentiles: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES))
     task_projected_request_percentiles: dict[str, float] = field(default_factory=dict)
     source_provider_warn_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS
     source_provider_critical_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_WARN_BACKOFF_FLOORS))
     provider_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_CRITICAL_BACKOFF_FLOORS))
-    task_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
-    task_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    task_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_WARN_BACKOFF_FLOORS))
+    task_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_CRITICAL_BACKOFF_FLOORS))
     source_provider_auth_failure_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS
     provider_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOORS))
-    task_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=dict)
+    task_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_AUTH_FAILURE_BACKOFF_FLOORS))
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
     critical_ratio: float = DEFAULT_SERVICE_CRITICAL_RATIO
 
@@ -562,14 +580,20 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 },
             },
             task_hourly_limits={
-                str(key): int(value)
-                for key, value in service_task_limits_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float))
+                **DEFAULT_SERVICE_TASK_HOURLY_LIMITS,
+                **{
+                    str(key): int(value)
+                    for key, value in service_task_limits_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
             },
             task_projected_request_counts={
-                str(key): int(value)
-                for key, value in service_task_projected_request_counts_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float))
+                **DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS,
+                **{
+                    str(key): int(value)
+                    for key, value in service_task_projected_request_counts_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
             },
             provider_projected_request_history_windows={
                 **DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS,
@@ -580,9 +604,12 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 },
             },
             task_projected_request_history_windows={
-                str(key): max(1, min(MAX_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW, int(value)))
-                for key, value in service_task_projected_request_history_windows_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float))
+                **DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS,
+                **{
+                    str(key): max(1, min(MAX_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW, int(value)))
+                    for key, value in service_task_projected_request_history_windows_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
             },
             provider_projected_request_percentiles={
                 **DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES,
@@ -634,14 +661,20 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 },
             },
             task_warn_backoff_floor_seconds={
-                str(key): int(value)
-                for key, value in service_task_warn_backoff_floors_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float))
+                **DEFAULT_SERVICE_TASK_WARN_BACKOFF_FLOORS,
+                **{
+                    str(key): int(value)
+                    for key, value in service_task_warn_backoff_floors_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
             },
             task_critical_backoff_floor_seconds={
-                str(key): int(value)
-                for key, value in service_task_critical_backoff_floors_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float))
+                **DEFAULT_SERVICE_TASK_CRITICAL_BACKOFF_FLOORS,
+                **{
+                    str(key): int(value)
+                    for key, value in service_task_critical_backoff_floors_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
             },
             source_provider_auth_failure_backoff_floor_seconds=int(
                 os.getenv(
@@ -662,9 +695,12 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 },
             },
             task_auth_failure_backoff_floor_seconds={
-                str(key): int(value)
-                for key, value in service_task_auth_failure_backoff_floors_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float))
+                **DEFAULT_SERVICE_TASK_AUTH_FAILURE_BACKOFF_FLOORS,
+                **{
+                    str(key): int(value)
+                    for key, value in service_task_auth_failure_backoff_floors_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
             },
             warn_ratio=float(os.getenv("MAL_UPDATER_SERVICE_WARN_RATIO", _get_float(service_section, "warn_ratio", DEFAULT_SERVICE_WARN_RATIO))),
             critical_ratio=float(os.getenv("MAL_UPDATER_SERVICE_CRITICAL_RATIO", _get_float(service_section, "critical_ratio", DEFAULT_SERVICE_CRITICAL_RATIO))),
