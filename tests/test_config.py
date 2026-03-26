@@ -30,6 +30,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
+            self.assertEqual(71, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["full_refresh"])
             self.assertEqual(7, config.service.projected_request_history_window_for("unknown_task", provider="crunchyroll"))
             self.assertEqual(9, config.service.projected_request_history_window_for("unknown_task", provider="hidive"))
             self.assertEqual(3, config.service.projected_request_history_window_for("sync_apply"))
@@ -112,6 +113,10 @@ class ConfigLoadingTests(unittest.TestCase):
                     sync_apply = 8
                     sync_fetch_hidive = 14
 
+                    [service.task_projected_request_counts_by_mode.sync_fetch_hidive]
+                    full_refresh = 60
+                    incremental = 5
+
                     [service.provider_projected_request_history_windows]
                     crunchyroll = 7
                     hidive = 11
@@ -163,6 +168,8 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(24, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
             self.assertEqual(14, config.service.task_projected_request_counts["sync_fetch_hidive"])
+            self.assertEqual(60, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["full_refresh"])
+            self.assertEqual(5, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["incremental"])
             self.assertEqual(7, config.service.provider_projected_request_history_windows["crunchyroll"])
             self.assertEqual(11, config.service.provider_projected_request_history_windows["hidive"])
             self.assertEqual(3, config.service.task_projected_request_history_windows["sync_apply"])

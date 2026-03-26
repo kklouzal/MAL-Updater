@@ -380,9 +380,9 @@ def _projected_request_count(
     *,
     fetch_mode: str | None = None,
 ) -> tuple[int, str | None]:
-    configured = config.service.task_projected_request_counts.get(spec.name)
-    if isinstance(configured, int):
-        return max(0, int(configured)), "configured"
+    configured, configured_source = config.service.projected_request_count_for(spec.name, fetch_mode=fetch_mode)
+    if configured is not None:
+        return configured, configured_source
     percentile = config.service.projected_request_percentile_for(spec.name, provider=spec.budget_provider)
     if fetch_mode:
         history_by_mode = task_state.get("last_request_delta_history_by_mode")

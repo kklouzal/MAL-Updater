@@ -404,6 +404,51 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertAlmostEqual(0.8, sync_state["projected_ratio"])
         self.assertEqual("configured", sync_state["projected_request_source"])
 
+    def test_run_pending_tasks_prefers_mode_specific_configured_projection_for_full_refresh(self) -> None:
+        self._write_request_events("hidive", [50, 100])
+        (self.project_root / ".MAL-Updater" / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.project_root / ".MAL-Updater" / "secrets" / "hidive_password.txt").write_text("secret\n", encoding="utf-8")
+        self.config.service.provider_hourly_limits["hidive"] = 72
+        self.config.service.task_projected_request_counts["sync_fetch_hidive"] = 14
+        self.config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"] = {"full_refresh": 71, "incremental": 5}
+        stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_hidive": {
+                            "full_refresh_anchor_epoch": stale_anchor,
+                            "full_refresh_anchor_at": "2026-03-20T20:00:00Z",
+                            "last_run_epoch": 0,
+                        },
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_hidive")
+        self.assertEqual("skipped", sync_result["status"])
+        self.assertIn("projected_requests=71", sync_result["reason"])
+        self.assertEqual("configured_full_refresh", sync_result["api_usage"]["projected_request_source"])
+        self.assertEqual(71, sync_result["api_usage"]["projected_request_count"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = state["tasks"]["sync_fetch_hidive"]
+        self.assertEqual(71, sync_state["projected_request_count"])
+        self.assertEqual("configured_full_refresh", sync_state["projected_request_source"])
+
+
     def test_run_pending_tasks_learns_observed_request_delta_for_future_budgeting(self) -> None:
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600

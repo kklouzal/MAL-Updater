@@ -55,6 +55,11 @@ DEFAULT_SERVICE_TASK_HOURLY_LIMITS = {
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
     "sync_apply": 8,
 }
+DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE = {
+    "sync_fetch_hidive": {
+        "full_refresh": 71,
+    },
+}
 DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS = {
     "crunchyroll": 7,
     "hidive": 9,
@@ -125,6 +130,9 @@ class ServiceSettings:
     provider_hourly_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS))
     task_hourly_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_HOURLY_LIMITS))
     task_projected_request_counts: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS))
+    task_projected_request_counts_by_mode: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {task_name: dict(mode_map) for task_name, mode_map in DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.items()}
+    )
     provider_projected_request_history_windows: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS))
     task_projected_request_history_windows: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS))
     provider_projected_request_percentiles: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES))
@@ -152,6 +160,18 @@ class ServiceSettings:
         if provider:
             return "provider"
         return "none"
+
+    def projected_request_count_for(self, task_name: str, *, fetch_mode: str | None = None) -> tuple[int | None, str | None]:
+        if fetch_mode:
+            mode_map = self.task_projected_request_counts_by_mode.get(task_name)
+            if isinstance(mode_map, dict):
+                value = mode_map.get(fetch_mode)
+                if isinstance(value, int):
+                    return max(0, int(value)), f"configured_{fetch_mode}"
+        value = self.task_projected_request_counts.get(task_name)
+        if isinstance(value, int):
+            return max(0, int(value)), "configured"
+        return None, None
 
     def projected_request_history_window_for(self, task_name: str | None = None, *, provider: str | None = None) -> int:
         if task_name:
@@ -316,6 +336,19 @@ def _get_nested_table(data: dict[str, Any], parent: str, child: str) -> dict[str
     return fallback if isinstance(fallback, dict) else {}
 
 
+def _get_dotted_nested_tables(data: dict[str, Any], *parts: str) -> dict[str, dict[str, Any]]:
+    prefix = ".".join(parts) + "."
+    tables: dict[str, dict[str, Any]] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not key.startswith(prefix) or not isinstance(value, dict):
+            continue
+        suffix = key[len(prefix):]
+        if not suffix:
+            continue
+        tables[suffix] = dict(value)
+    return tables
+
+
 def _get_str(data: dict[str, Any], key: str, default: str) -> str:
     value = data.get(key, default)
     return str(value)
@@ -440,6 +473,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
     service_task_projected_request_counts_section = _get_nested_table(settings, "service", "task_projected_request_counts")
+    service_task_projected_request_counts_by_mode_section = _get_dotted_nested_tables(settings, "service", "task_projected_request_counts_by_mode")
     service_provider_projected_request_history_windows_section = _get_nested_table(settings, "service", "provider_projected_request_history_windows")
     service_task_projected_request_history_windows_section = _get_nested_table(settings, "service", "task_projected_request_history_windows")
     service_provider_projected_request_percentiles_section = _get_nested_table(settings, "service", "provider_projected_request_percentiles")
@@ -593,6 +627,18 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                     str(key): int(value)
                     for key, value in service_task_projected_request_counts_section.items()
                     if isinstance(key, str) and isinstance(value, (int, float))
+                },
+            },
+            task_projected_request_counts_by_mode={
+                **{task_name: dict(mode_map) for task_name, mode_map in DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.items()},
+                **{
+                    str(task_name): {
+                        str(mode): int(value)
+                        for mode, value in mode_map.items()
+                        if isinstance(mode, str) and isinstance(value, (int, float))
+                    }
+                    for task_name, mode_map in service_task_projected_request_counts_by_mode_section.items()
+                    if isinstance(task_name, str) and isinstance(mode_map, dict)
                 },
             },
             provider_projected_request_history_windows={

@@ -54,6 +54,9 @@ sync_apply = 48  # built-in default shown explicitly here; override only when th
 sync_apply = 8  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply request-cost estimate
 sync_fetch_crunchyroll = 12
 
+[service.task_projected_request_counts_by_mode.sync_fetch_hidive]
+full_refresh = 71  # built-in default shown explicitly here; use mode-specific task defaults when a lane's full refresh is much more expensive than incremental fetches
+
 [service.provider_projected_request_history_windows]
 crunchyroll = 7  # built-in default shown explicitly here; override only when this host needs a different learned-history depth
 hidive = 9  # built-in default shown explicitly here

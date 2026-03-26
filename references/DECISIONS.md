@@ -291,3 +291,14 @@ Ship built-in daemon task defaults for the aggregate MAL `sync_apply` lane inste
 - `sync_apply` is the first MAL lane that clearly behaves like a higher-cost/riskier aggregate task than the provider-level MAL defaults imply
 - fresh unattended installs should inherit a conservative aggregate-apply posture even before an operator copies optional example settings into their runtime config
 - keeping the defaults task-scoped preserves the clean provider/task split while making the most meaningful shipped lane safer out of the box
+
+## 2026-03-26 - Fetch-mode task projection defaults posture
+
+### Decision
+Keep the existing task-level projected-request override table, but add an optional fetch-mode-specific task table for lanes whose incremental and full-refresh cost differ materially. Ship the first built-in default for `sync_fetch_hidive` full refresh at `71` projected requests.
+
+### Why
+- some fetch lanes are cheap incrementally but materially more expensive when forced into `--full-refresh`, so a single task-wide configured projection is too blunt
+- cold-start unattended budgeting should not treat a known heavy full-refresh lane as zero-cost just because local history has not been learned yet
+- keeping the override task-scoped and fetch-mode-scoped preserves explainability without inventing a larger forecasting subsystem
+- HIDIVE already has enough observed local shape to justify one concrete shipped full-refresh default while leaving other lanes on learned history until they have equally solid evidence
