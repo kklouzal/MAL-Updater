@@ -302,3 +302,13 @@ Keep the existing task-level projected-request override table, but add an option
 - cold-start unattended budgeting should not treat a known heavy full-refresh lane as zero-cost just because local history has not been learned yet
 - keeping the override task-scoped and fetch-mode-scoped preserves explainability without inventing a larger forecasting subsystem
 - HIDIVE already has enough observed local shape to justify one concrete shipped full-refresh default while leaving other lanes on learned history until they have equally solid evidence
+
+## 2026-03-26 - Budget-blocked full-refresh downgrade posture
+
+### Decision
+When an unattended provider fetch is due for `full_refresh` because of cadence or health recommendations but that heavier run is budget-blocked, immediately retry the budget check for `incremental` mode and run the cheaper fetch when it fits. Keep the full-refresh anchor/reason overdue so the heavier resweep still happens later once budget allows.
+
+### Why
+- a heavy overdue full refresh should not starve the entire fetch lane when a cheaper incremental pass would still keep fresh progress/watchlist data moving
+- fetch-mode-specific projected-cost defaults are only truly useful if the daemon can act differently on them instead of turning every overdue full refresh into repeated no-op skips
+- preserving the overdue full-refresh anchor/reason keeps the behavior conservative and explainable instead of silently forgetting that a broader resweep is still needed

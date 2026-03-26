@@ -373,6 +373,27 @@ def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str,
 
 
 
+def _maybe_downgrade_fetch_mode_for_budget(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    planned_fetch_mode: str | None,
+    planned_full_refresh_reasons: list[str],
+    allowed: bool,
+    reason: str | None,
+    usage: dict[str, Any] | None,
+) -> tuple[bool, str | None, dict[str, Any] | None, str | None, list[str], str | None, dict[str, Any] | None]:
+    if allowed or not spec.name.startswith("sync_fetch_") or planned_fetch_mode != "full_refresh":
+        return allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, None, None
+    incremental_allowed, incremental_reason, incremental_usage = _budget_gate(config, spec, task_state, fetch_mode="incremental")
+    if not incremental_allowed:
+        return allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, None, incremental_usage
+    deferred_reason = "+".join(planned_full_refresh_reasons) if planned_full_refresh_reasons else "budget_deferred"
+    return True, None, incremental_usage, "incremental", [], deferred_reason, incremental_usage
+
+
+
 def _projected_request_count(
     config: AppConfig,
     spec: TaskSpec,
@@ -676,6 +697,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             continue
         planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now)
         allowed, reason, usage = _budget_gate(config, spec, task_state, fetch_mode=planned_fetch_mode)
+        downgrade_reason = None
+        downgrade_usage = None
+        allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, downgrade_reason, downgrade_usage = _maybe_downgrade_fetch_mode_for_budget(
+            config,
+            spec,
+            task_state,
+            planned_fetch_mode=planned_fetch_mode,
+            planned_full_refresh_reasons=planned_full_refresh_reasons,
+            allowed=allowed,
+            reason=reason,
+            usage=usage,
+        )
         if isinstance(usage, dict):
             for field in ("projected_request_count", "projected_request_total", "projected_ratio", "projected_request_source"):
                 value = usage.get(field)
@@ -745,6 +778,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result["fetch_mode"] = planned_fetch_mode or "incremental"
                 if full_refresh_reasons:
                     result["full_refresh_reason"] = "+".join(full_refresh_reasons)
+                if downgrade_reason:
+                    result["deferred_full_refresh_reason"] = downgrade_reason
             elif spec.name == "sync_apply":
                 result = _run_subprocess(config, _apply_sync_command(), label="sync_apply")
             elif spec.name == "health":

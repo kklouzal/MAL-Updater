@@ -105,6 +105,52 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         self.assertIn("last_successful_full_refresh_epoch", sync_state)
         self.assertGreater(sync_state["full_refresh_anchor_epoch"], stale_anchor)
 
+    def test_run_pending_tasks_downgrades_budget_blocked_full_refresh_to_incremental_fetch(self) -> None:
+        stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
+        state = {
+            "started_at": "2026-03-20T20:00:00Z",
+            "tasks": {
+                "mal_refresh": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
+                "health": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
+                "sync_fetch_crunchyroll": {
+                    "full_refresh_anchor_epoch": stale_anchor,
+                    "full_refresh_anchor_at": "2026-03-20T20:00:00Z",
+                    "last_run_epoch": 0,
+                }
+            },
+        }
+        self.config.service_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        with patch(
+            "mal_updater.service_runtime._budget_gate",
+            side_effect=[
+                (False, "crunchyroll_budget_projected_critical ratio=0.000 projected_ratio=1.000 projected_requests=55 cooldown=1800s", {"provider": "crunchyroll", "projected_request_source": "configured_full_refresh", "projected_request_count": 55}),
+                (True, None, {"provider": "crunchyroll", "projected_request_source": "observed_incremental_smoothed", "projected_request_count": 4}),
+                (True, None, {"provider": "mal"}),
+                (True, None, None),
+            ],
+        ), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("periodic_cadence", sync_result["deferred_full_refresh_reason"])
+        sync_args = run_subprocess.call_args_list[0].args[1]
+        self.assertNotIn("--full-refresh", sync_args)
+
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("incremental", sync_state["last_fetch_mode"])
+        self.assertEqual(stale_anchor, sync_state["full_refresh_anchor_epoch"])
+        self.assertNotIn("last_successful_full_refresh_epoch", sync_state)
+
     def test_run_pending_tasks_requests_health_recommended_full_refresh(self) -> None:
         self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
         self.config.health_latest_json_path.write_text(
@@ -431,22 +477,39 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        def fake_run_subprocess(config, args, *, label):
+            if label == "sync_fetch_hidive":
+                for index in range(5):
+                    record_api_request_event(
+                        "hidive",
+                        "sync-fetch",
+                        url=f"https://example.invalid/api/{index}",
+                        method="GET",
+                        outcome="ok",
+                        status_code=200,
+                        config=config,
+                    )
+            return {"status": "ok", "label": label, "returncode": 0, "stdout": "", "stderr": ""}
+
         with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
             "mal_updater.service_runtime._run_subprocess",
-            return_value={"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            side_effect=fake_run_subprocess,
         ):
             result = run_pending_tasks(self.config)
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_hidive")
-        self.assertEqual("skipped", sync_result["status"])
-        self.assertIn("projected_requests=71", sync_result["reason"])
-        self.assertEqual("configured_full_refresh", sync_result["api_usage"]["projected_request_source"])
-        self.assertEqual(71, sync_result["api_usage"]["projected_request_count"])
+        self.assertEqual("ok", sync_result["status"])
+        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("periodic_cadence", sync_result["deferred_full_refresh_reason"])
+        self.assertEqual(5, sync_result["next_projected_request_count"])
+        self.assertEqual("configured_incremental", sync_result["next_projected_request_source"])
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = state["tasks"]["sync_fetch_hidive"]
-        self.assertEqual(71, sync_state["projected_request_count"])
-        self.assertEqual("configured_full_refresh", sync_state["projected_request_source"])
+        self.assertEqual("incremental", sync_state["last_fetch_mode"])
+        self.assertEqual(stale_anchor, sync_state["full_refresh_anchor_epoch"])
+        self.assertEqual(5, sync_state["projected_request_count"])
+        self.assertEqual("configured_incremental", sync_state["projected_request_source"])
 
 
     def test_run_pending_tasks_learns_observed_request_delta_for_future_budgeting(self) -> None:
