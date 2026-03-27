@@ -314,6 +314,19 @@ Extend the built-in fetch-mode task projection defaults to ship a conservative `
 - keeping the default task-scoped and mode-scoped preserves explainability and leaves ordinary incremental Crunchyroll pacing on the existing task/provider learned-history path
 - this mirrors the earlier HIDIVE full-refresh default and closes the most obvious remaining gap in the repo's own shipped provider-fetch posture
 
+## 2026-03-27 - Incremental fetch projection default posture
+
+### Decision
+Extend the built-in fetch-mode task projection defaults so the ordinary unattended provider fetch path also starts with a conservative non-zero request-cost estimate. Ship built-in incremental projected-request defaults of `4` for both:
+- `sync_fetch_crunchyroll`
+- `sync_fetch_hidive`
+
+### Why
+- the daemon already ships built-in full-refresh fetch costs, but fresh installs were still treating the ordinary incremental fetch path as effectively zero-cost until enough local history accumulated
+- live runtime on this host has now repeatedly settled both Crunchyroll and HIDIVE incremental fetch lanes around `4` requests, which is stable enough to justify a small shipped seed value
+- a low non-zero incremental default makes cold-start budget gating more honest without forcing operators to pre-tune config or waiting for the first few unattended runs to teach the daemon something it already broadly knows
+- keeping the defaults task-scoped and mode-scoped preserves explainability and leaves room for learned history or host-specific overrides to take over once local evidence exists
+
 ## 2026-03-26 - Budget-blocked full-refresh downgrade posture
 
 ### Decision

@@ -349,6 +349,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
     def test_run_pending_tasks_warn_paces_provider_before_critical_budget(self) -> None:
         self._write_request_events("crunchyroll", [50, 100, 200, 300, 400, 500, 600, 700])
         self.config.service.crunchyroll_hourly_limit = 10
+        self.config.service.task_projected_request_counts["sync_fetch_crunchyroll"] = 1
 
         with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
             "mal_updater.service_runtime._run_subprocess",
@@ -372,6 +373,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self._write_request_events("crunchyroll", [2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880])
         self.config.service.crunchyroll_hourly_limit = 10
         self.config.service.provider_warn_backoff_floor_seconds["crunchyroll"] = 900
+        self.config.service.task_projected_request_counts["sync_fetch_crunchyroll"] = 1
 
         with patch("mal_updater.service_runtime._refresh_mal_tokens", return_value={"status": "ok"}), patch(
             "mal_updater.service_runtime._run_subprocess",
@@ -679,6 +681,16 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual(20, projected_count)
         self.assertEqual("observed_incremental_p75", projected_source)
 
+    def test_projected_request_count_uses_built_in_crunchyroll_incremental_default(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
+            {},
+            fetch_mode="incremental",
+        )
+        self.assertEqual(4, projected_count)
+        self.assertEqual("configured_incremental", projected_source)
+
     def test_projected_request_count_uses_built_in_crunchyroll_full_refresh_default(self) -> None:
         projected_count, projected_source = _projected_request_count(
             self.config,
@@ -688,6 +700,16 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         )
         self.assertEqual(55, projected_count)
         self.assertEqual("configured_full_refresh", projected_source)
+
+    def test_projected_request_count_uses_built_in_hidive_incremental_default(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_fetch_hidive", self.config.service.sync_every_seconds, budget_provider="hidive"),
+            {},
+            fetch_mode="incremental",
+        )
+        self.assertEqual(4, projected_count)
+        self.assertEqual("configured_incremental", projected_source)
 
     def test_run_pending_tasks_auto_uses_conservative_percentile_for_bursty_history(self) -> None:
         self.config.service.sync_every_seconds = 0

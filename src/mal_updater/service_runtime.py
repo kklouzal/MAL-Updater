@@ -9,7 +9,13 @@ import time
 from typing import Any
 
 from .auth import persist_token_response
-from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
+from .config import (
+    AppConfig,
+    DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE,
+    ensure_directories,
+    load_config,
+    load_mal_secrets,
+)
 from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
 from .mal_client import MalApiError, MalClient
@@ -402,7 +408,25 @@ def _projected_request_count(
     fetch_mode: str | None = None,
 ) -> tuple[int, str | None]:
     configured, configured_source = config.service.projected_request_count_for(spec.name, fetch_mode=fetch_mode)
-    if configured is not None:
+    built_in_mode_default = None
+    if fetch_mode:
+        built_in_mode_default = DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.get(spec.name, {}).get(fetch_mode)
+    task_wide_configured = config.service.task_projected_request_counts.get(spec.name)
+    if (
+        fetch_mode == "incremental"
+        and configured_source == "configured_incremental"
+        and isinstance(configured, int)
+        and built_in_mode_default == configured
+        and isinstance(task_wide_configured, int)
+    ):
+        return max(0, int(task_wide_configured)), "configured"
+    use_configured_as_cold_start_seed = (
+        fetch_mode == "incremental"
+        and configured_source == "configured_incremental"
+        and isinstance(configured, int)
+        and built_in_mode_default == configured
+    )
+    if configured is not None and not use_configured_as_cold_start_seed:
         return configured, configured_source
     percentile = config.service.projected_request_percentile_for(spec.name, provider=spec.budget_provider)
     if fetch_mode:
@@ -427,6 +451,8 @@ def _projected_request_count(
     value = task_state.get("last_request_delta")
     if isinstance(value, int):
         return max(0, int(value)), "observed_last_run"
+    if configured is not None:
+        return configured, configured_source
     return 0, None
 
 

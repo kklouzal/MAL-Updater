@@ -55,9 +55,11 @@ sync_apply = 8  # built-in default shown explicitly here; override only when thi
 sync_fetch_crunchyroll = 12  # optional incremental-ish fallback when you want a task-wide Crunchyroll cost estimate outside mode-specific defaults
 
 [service.task_projected_request_counts_by_mode.sync_fetch_crunchyroll]
+incremental = 4  # built-in default shown explicitly here; fresh installs now seed the ordinary Crunchyroll fetch path with a conservative non-zero cost
 full_refresh = 55  # built-in default shown explicitly here; cold-start Crunchyroll full refreshes are materially heavier than incremental fetches
 
 [service.task_projected_request_counts_by_mode.sync_fetch_hidive]
+incremental = 4  # built-in default shown explicitly here; fresh installs now seed the ordinary HIDIVE fetch path with a conservative non-zero cost
 full_refresh = 71  # built-in default shown explicitly here; use mode-specific task defaults when a lane's full refresh is much more expensive than incremental fetches
 
 [service.provider_projected_request_history_windows]

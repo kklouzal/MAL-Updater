@@ -57,9 +57,11 @@ DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE = {
     "sync_fetch_crunchyroll": {
+        "incremental": 4,
         "full_refresh": 55,
     },
     "sync_fetch_hidive": {
+        "incremental": 4,
         "full_refresh": 71,
     },
 }
