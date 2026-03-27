@@ -681,6 +681,15 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual(20, projected_count)
         self.assertEqual("observed_incremental_p75", projected_source)
 
+    def test_projected_request_count_uses_built_in_mal_refresh_default(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("mal_refresh", self.config.service.mal_refresh_every_seconds, budget_provider="mal"),
+            {},
+        )
+        self.assertEqual(1, projected_count)
+        self.assertEqual("configured", projected_source)
+
     def test_projected_request_count_uses_built_in_crunchyroll_incremental_default(self) -> None:
         projected_count, projected_source = _projected_request_count(
             self.config,

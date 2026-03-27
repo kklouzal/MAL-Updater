@@ -51,6 +51,7 @@ hidive = 72  # built-in default shown explicitly here; override only when this h
 sync_apply = 48  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply MAL budget
 
 [service.task_projected_request_counts]
+mal_refresh = 1  # built-in default shown explicitly here; fresh installs now seed unattended MAL token refresh with a small non-zero request-cost estimate
 sync_apply = 8  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply request-cost estimate
 sync_fetch_crunchyroll = 12  # optional incremental-ish fallback when you want a task-wide Crunchyroll cost estimate outside mode-specific defaults
 
@@ -67,6 +68,7 @@ crunchyroll = 7  # built-in default shown explicitly here; override only when th
 hidive = 9  # built-in default shown explicitly here
 
 [service.task_projected_request_history_windows]
+mal_refresh = 3  # built-in default shown explicitly here; keep MAL token refresh learning shallow because the lane is normally tiny and steady
 sync_fetch_crunchyroll = 7  # optional lane-specific override; task settings win over provider defaults when both exist
 sync_apply = 3  # built-in default shown explicitly here
 

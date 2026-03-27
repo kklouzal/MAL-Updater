@@ -211,6 +211,16 @@ Treat hard-coded supplemental MAL candidate IDs as conservative rescue inputs, n
 - overflow on top of a supplemental-only hit can still mean a multi-entry bundle or broader franchise residue
 - keeping this path conservative preserves explainability and avoids overconfident auto-approval when the search surface was already weak
 
+## 2026-03-27 - MAL refresh cold-start projection posture
+
+### Decision
+Ship an explicit small built-in projected request cost and shallow learned-history window for the unattended `mal_refresh` daemon lane.
+
+### Why
+- fresh installs should not treat MAL token refresh like a zero-cost mystery lane until the first real run lands
+- `mal_refresh` is a low-variance maintenance lane, so a tiny cold-start seed and short history window are more honest than waiting for broader MAL provider history to accumulate
+- this keeps unattended budget behavior aligned with the repo's current direction: conservative, explainable defaults before host-specific tuning exists
+
 ## 2026-03-25 - Bursty learned-request projection posture
 
 ### Decision

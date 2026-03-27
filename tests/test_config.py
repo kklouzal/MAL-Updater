@@ -29,6 +29,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").resolve())
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
+            self.assertEqual(1, config.service.task_projected_request_counts["mal_refresh"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
             self.assertEqual(4, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["incremental"])
             self.assertEqual(55, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["full_refresh"])
@@ -36,6 +37,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(71, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["full_refresh"])
             self.assertEqual(7, config.service.projected_request_history_window_for("unknown_task", provider="crunchyroll"))
             self.assertEqual(9, config.service.projected_request_history_window_for("unknown_task", provider="hidive"))
+            self.assertEqual(3, config.service.projected_request_history_window_for("mal_refresh"))
             self.assertEqual(3, config.service.projected_request_history_window_for("sync_apply"))
             self.assertEqual(0.9, config.service.projected_request_percentile_for("unknown_task", provider="crunchyroll"))
             self.assertIsNone(config.service.projected_request_percentile_for("unknown_task", provider="hidive"))
@@ -113,6 +115,7 @@ class ConfigLoadingTests(unittest.TestCase):
                     sync_apply = 24
 
                     [service.task_projected_request_counts]
+                    mal_refresh = 2
                     sync_apply = 8
                     sync_fetch_hidive = 14
 
@@ -125,6 +128,7 @@ class ConfigLoadingTests(unittest.TestCase):
                     hidive = 11
 
                     [service.task_projected_request_history_windows]
+                    mal_refresh = 4
                     sync_apply = 3
                     sync_fetch_hidive = 9
 
@@ -169,12 +173,14 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(2400, config.service.source_provider_auth_failure_backoff_floor_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(24, config.service.task_hourly_limits["sync_apply"])
+            self.assertEqual(2, config.service.task_projected_request_counts["mal_refresh"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
             self.assertEqual(14, config.service.task_projected_request_counts["sync_fetch_hidive"])
             self.assertEqual(60, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["full_refresh"])
             self.assertEqual(5, config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"]["incremental"])
             self.assertEqual(7, config.service.provider_projected_request_history_windows["crunchyroll"])
             self.assertEqual(11, config.service.provider_projected_request_history_windows["hidive"])
+            self.assertEqual(4, config.service.task_projected_request_history_windows["mal_refresh"])
             self.assertEqual(3, config.service.task_projected_request_history_windows["sync_apply"])
             self.assertEqual(9, config.service.task_projected_request_history_windows["sync_fetch_hidive"])
             self.assertEqual(0.85, config.service.provider_projected_request_percentiles["crunchyroll"])
@@ -192,6 +198,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(90, config.service.hourly_limit_for("new-provider"))
             self.assertEqual(72, config.service.hourly_limit_for("hidive"))
             self.assertEqual(24, config.service.hourly_limit_for("mal", task_name="sync_apply"))
+            self.assertEqual(4, config.service.projected_request_history_window_for("mal_refresh"))
             self.assertEqual(3, config.service.projected_request_history_window_for("sync_apply"))
             self.assertEqual(0.75, config.service.projected_request_percentile_for("sync_apply"))
             self.assertEqual(11, config.service.projected_request_history_window_for("unknown_task", provider="hidive"))
