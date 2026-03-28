@@ -222,15 +222,22 @@ Treat hard-coded supplemental MAL candidate IDs as conservative rescue inputs, n
 - overflow on top of a supplemental-only hit can still mean a multi-entry bundle or broader franchise residue
 - keeping this path conservative preserves explainability and avoids overconfident auto-approval when the search surface was already weak
 
-## 2026-03-27 - MAL refresh cold-start projection posture
+## 2026-03-27 / 2026-03-28 - Built-in projected-request seed posture
 
 ### Decision
-Ship an explicit small built-in projected request cost and shallow learned-history window for the unattended `mal_refresh` daemon lane.
+Ship explicit built-in projected-request defaults for conservative unattended lanes, but treat those built-ins as **cold-start seeds** rather than permanent hard overrides once the daemon has real observed request history.
+
+This applies to:
+- `mal_refresh`
+- `sync_apply`
+- fetch-mode-specific provider defaults such as Crunchyroll/HIDIVE incremental and full-refresh fetches
+
+If an operator supplies an explicit task-wide override, that override should still beat the shipped seed when no more specific explicit mode override exists.
 
 ### Why
-- fresh installs should not treat MAL token refresh like a zero-cost mystery lane until the first real run lands
-- `mal_refresh` is a low-variance maintenance lane, so a tiny cold-start seed and short history window are more honest than waiting for broader MAL provider history to accumulate
-- this keeps unattended budget behavior aligned with the repo's current direction: conservative, explainable defaults before host-specific tuning exists
+- fresh installs should not treat routine daemon lanes like zero-cost mysteries before the first real run lands
+- once a lane has observed request history, synthetic shipped defaults should stop pinning budget behavior to folklore instead of evidence
+- keeping built-ins seed-like preserves the repo's current direction: conservative, explainable cold starts first, then learned host-specific behavior as soon as real data exists
 
 ## 2026-03-25 - Bursty learned-request projection posture
 

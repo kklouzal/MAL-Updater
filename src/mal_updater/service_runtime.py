@@ -12,6 +12,7 @@ from .auth import persist_token_response
 from .auth_failure_signals import looks_auth_style_failure
 from .config import (
     AppConfig,
+    DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS,
     DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE,
     ensure_directories,
     load_config,
@@ -391,22 +392,24 @@ def _projected_request_count(
     built_in_mode_default = None
     if fetch_mode:
         built_in_mode_default = DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.get(spec.name, {}).get(fetch_mode)
+    built_in_task_default = DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS.get(spec.name)
     task_wide_configured = config.service.task_projected_request_counts.get(spec.name)
-    if (
-        fetch_mode == "incremental"
-        and configured_source == "configured_incremental"
-        and isinstance(configured, int)
-        and built_in_mode_default == configured
-        and isinstance(task_wide_configured, int)
-    ):
-        return max(0, int(task_wide_configured)), "configured"
-    use_configured_as_cold_start_seed = (
-        fetch_mode == "incremental"
-        and configured_source == "configured_incremental"
+
+    use_mode_default_as_cold_start_seed = (
+        fetch_mode is not None
+        and configured_source == f"configured_{fetch_mode}"
         and isinstance(configured, int)
         and built_in_mode_default == configured
     )
-    if configured is not None and not use_configured_as_cold_start_seed:
+    use_task_default_as_cold_start_seed = (
+        configured_source == "configured"
+        and isinstance(configured, int)
+        and built_in_task_default == configured
+    )
+
+    if use_mode_default_as_cold_start_seed and isinstance(task_wide_configured, int):
+        return max(0, int(task_wide_configured)), "configured"
+    if configured is not None and not use_mode_default_as_cold_start_seed and not use_task_default_as_cold_start_seed:
         return configured, configured_source
     percentile = config.service.projected_request_percentile_for(spec.name, provider=spec.budget_provider)
     if fetch_mode:

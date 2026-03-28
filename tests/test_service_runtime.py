@@ -501,7 +501,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         (self.project_root / ".MAL-Updater" / "secrets" / "hidive_password.txt").write_text("secret\n", encoding="utf-8")
         self.config.service.provider_hourly_limits["hidive"] = 72
         self.config.service.task_projected_request_counts["sync_fetch_hidive"] = 14
-        self.config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"] = {"full_refresh": 71, "incremental": 5}
+        self.config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"] = {"full_refresh": 70, "incremental": 5}
         stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
         self.config.service_state_path.write_text(
             json.dumps(
@@ -762,6 +762,39 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         )
         self.assertEqual(4, projected_count)
         self.assertEqual("configured_incremental", projected_source)
+
+    def test_projected_request_count_treats_built_in_mal_refresh_default_as_cold_start_seed(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("mal_refresh", self.config.service.mal_refresh_every_seconds, budget_provider="mal"),
+            {"last_request_delta_history": [2, 3, 2]},
+        )
+        self.assertEqual(3, projected_count)
+        self.assertEqual("observed_smoothed", projected_source)
+
+    def test_projected_request_count_treats_built_in_full_refresh_default_as_cold_start_seed(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
+            {
+                "last_request_delta_history_by_mode": {"full_refresh": [18, 22, 20]},
+                "last_request_delta_by_mode": {"full_refresh": 20},
+            },
+            fetch_mode="full_refresh",
+        )
+        self.assertEqual(22, projected_count)
+        self.assertEqual("observed_full_refresh_p90", projected_source)
+
+    def test_projected_request_count_lets_task_wide_override_beat_built_in_full_refresh_seed(self) -> None:
+        self.config.service.task_projected_request_counts["sync_fetch_crunchyroll"] = 12
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
+            {},
+            fetch_mode="full_refresh",
+        )
+        self.assertEqual(12, projected_count)
+        self.assertEqual("configured", projected_source)
 
     def test_run_pending_tasks_auto_uses_conservative_percentile_for_bursty_history(self) -> None:
         self.config.service.sync_every_seconds = 0
