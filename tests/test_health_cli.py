@@ -168,6 +168,37 @@ class HealthCheckCliTests(unittest.TestCase):
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual("rebootstrap_crunchyroll_auth_after_failures", maintenance_commands[0]["reason_code"])
 
+    def test_health_check_recommends_reauth_for_missing_refresh_token_residue(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_status": "error",
+                            "last_error": "Missing Crunchyroll refresh token at /tmp/cr-token",
+                            "failure_backoff_reason": "Missing Crunchyroll refresh token at /tmp/cr-token",
+                            "failure_backoff_consecutive_failures": 2,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        repeated = next(warning for warning in payload["warnings"] if warning["code"] == "crunchyroll_auth_failures_repeated")
+        self.assertIn("Missing Crunchyroll refresh token", repeated["reason"])
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual(["crunchyroll-auth-login"], maintenance_commands[0]["command_args"])
+
     def test_health_check_uses_provider_session_auth_phase_as_fallback_signal(self) -> None:
         (self.config.secrets_dir / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "hidive_password.txt").write_text("super-secret\n", encoding="utf-8")

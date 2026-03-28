@@ -863,6 +863,32 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("auth", sync_state["failure_backoff_class"])
         self.assertEqual(1800, sync_state["failure_backoff_floor_seconds"])
 
+    def test_run_pending_tasks_treats_missing_refresh_token_as_auth_style_failure(self) -> None:
+        self.config.service.provider_auth_failure_backoff_floor_seconds["crunchyroll"] = 2400
+
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "mal"}), (True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
+            "mal_updater.service_runtime._refresh_mal_tokens",
+            return_value={"status": "ok"},
+        ), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "error", "label": "sync_fetch_crunchyroll", "returncode": 1, "stdout": "", "stderr": "Missing Crunchyroll refresh token at /tmp/cr-token\n"},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("auth", sync_result["failure_backoff_class"])
+        self.assertEqual(2400, sync_result["failure_backoff_floor_seconds"])
+        self.assertEqual("Missing Crunchyroll refresh token at /tmp/cr-token", sync_result["failure_backoff_reason"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = state["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("auth", sync_state["failure_backoff_class"])
+        self.assertEqual(2400, sync_state["failure_backoff_floor_seconds"])
+
     def test_run_pending_tasks_skips_provider_retries_while_failure_backoff_is_active(self) -> None:
         state = {
             "started_at": "2026-03-20T20:00:00Z",

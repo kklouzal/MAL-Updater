@@ -15,6 +15,7 @@ import re
 import shutil
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
+from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, looks_auth_style_failure
 from .config import ensure_directories, load_config, load_mal_secrets
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
@@ -891,34 +892,6 @@ def _load_service_state_for_health(config: AppConfig) -> dict[str, object] | Non
     return payload
 
 
-_AUTH_STYLE_FAILURE_MARKERS = (
-    "http 401",
-    "http 403",
-    "unauthor",
-    "forbidden",
-    "auth_failed",
-    "invalid_grant",
-    "invalid token",
-    "expired token",
-    "token refresh",
-    "refresh token",
-    "credential_rebootstrap",
-    "login failed",
-    "login did not return",
-    "did not return both access_token and refresh_token",
-    "did not return both authorisationtoken and refreshtoken",
-    "did not return authorisationtoken",
-    "did not return refreshtoken",
-    "bearer",
-)
-
-_AUTH_STYLE_SESSION_PHASES = {
-    "auth_failed",
-    "auth_retrying_with_refresh_token",
-    "auth_retrying_with_credentials",
-}
-
-
 def _load_json_dict(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
@@ -944,26 +917,11 @@ def _provider_auth_session_residue(config: AppConfig, provider: str) -> dict[str
     phase = payload.get(phase_key)
     last_error = payload.get("last_error")
     residue: dict[str, object] = {}
-    if isinstance(phase, str) and phase in _AUTH_STYLE_SESSION_PHASES:
+    if isinstance(phase, str) and phase in AUTH_STYLE_SESSION_PHASES:
         residue["session_phase"] = phase
     if isinstance(last_error, str) and last_error.strip():
         residue["session_last_error"] = last_error.strip()
     return residue or None
-
-
-def _looks_auth_style_failure(reason: str, *, session_residue: dict[str, object] | None = None) -> bool:
-    lowered = reason.lower()
-    if any(marker in lowered for marker in _AUTH_STYLE_FAILURE_MARKERS):
-        return True
-    if isinstance(session_residue, dict):
-        if isinstance(session_residue.get("session_phase"), str):
-            return True
-        session_last_error = session_residue.get("session_last_error")
-        if isinstance(session_last_error, str):
-            lowered_session_error = session_last_error.lower()
-            if any(marker in lowered_session_error for marker in _AUTH_STYLE_FAILURE_MARKERS):
-                return True
-    return False
 
 
 def _provider_service_auth_failure(
@@ -988,7 +946,7 @@ def _provider_service_auth_failure(
     if not isinstance(consecutive_failures, (int, float)) or int(consecutive_failures) < min_consecutive_failures:
         return None
     session_residue = _provider_auth_session_residue(config, provider)
-    if not _looks_auth_style_failure(reason, session_residue=session_residue):
+    if not looks_auth_style_failure(reason, session_residue=session_residue):
         return None
     payload: dict[str, object] = {
         "provider": provider,
@@ -1086,7 +1044,7 @@ def _build_health_maintenance_commands(
 
     if isinstance(provider_auth_failures, dict):
         crunchyroll_failure = provider_auth_failures.get("crunchyroll")
-        if crunchyroll_credentials_present and crunchyroll_state_present and isinstance(crunchyroll_failure, dict):
+        if crunchyroll_credentials_present and isinstance(crunchyroll_failure, dict):
             detail = (
                 "Re-bootstrap Crunchyroll auth state after repeated auth-style unattended fetch failures"
             )
@@ -1101,7 +1059,7 @@ def _build_health_maintenance_commands(
                 requires_auth_interaction=False,
             )
         hidive_failure = provider_auth_failures.get("hidive")
-        if hidive_credentials_present and hidive_state_present and isinstance(hidive_failure, dict):
+        if hidive_credentials_present and isinstance(hidive_failure, dict):
             detail = (
                 "Re-bootstrap HIDIVE auth state after repeated auth-style unattended fetch failures"
             )

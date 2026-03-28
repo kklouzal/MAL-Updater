@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from .auth import persist_token_response
+from .auth_failure_signals import looks_auth_style_failure
 from .config import (
     AppConfig,
     DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE,
@@ -39,27 +40,6 @@ _FAILURE_BACKOFF_MIN_SECONDS = 300
 _AUTO_PROJECTED_REQUEST_PERCENTILE = 0.9
 _AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY = 4
 _AUTO_PROJECTED_REQUEST_BURST_RATIO = 2.0
-
-_AUTH_STYLE_FAILURE_MARKERS = (
-    "http 401",
-    "http 403",
-    "unauthor",
-    "forbidden",
-    "auth_failed",
-    "invalid_grant",
-    "invalid token",
-    "expired token",
-    "token refresh",
-    "refresh token",
-    "credential_rebootstrap",
-    "login failed",
-    "login did not return",
-    "did not return both access_token and refresh_token",
-    "did not return both authorisationtoken and refreshtoken",
-    "did not return authorisationtoken",
-    "did not return refreshtoken",
-    "bearer",
-)
 
 
 def _now_iso() -> str:
@@ -575,11 +555,6 @@ def _budget_gate(
     return True, None, usage
 
 
-def _looks_auth_style_failure(reason: str) -> bool:
-    lowered = reason.lower()
-    return any(marker in lowered for marker in _AUTH_STYLE_FAILURE_MARKERS)
-
-
 def _failure_backoff_profile(config: AppConfig, spec: TaskSpec, reason: str) -> tuple[str, int]:
     provider = spec.budget_provider
     critical_floor = 0
@@ -587,7 +562,7 @@ def _failure_backoff_profile(config: AppConfig, spec: TaskSpec, reason: str) -> 
     if provider:
         critical_floor = config.service.backoff_floor_seconds_for(provider, level="critical", task_name=spec.name)
         auth_floor = config.service.auth_failure_backoff_floor_seconds_for(provider, task_name=spec.name)
-    classification = "auth" if provider and _looks_auth_style_failure(reason) else "generic"
+    classification = "auth" if provider and looks_auth_style_failure(reason) else "generic"
     configured_floor = critical_floor
     if classification == "auth":
         configured_floor = max(configured_floor, auth_floor)

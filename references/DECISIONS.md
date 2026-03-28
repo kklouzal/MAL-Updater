@@ -181,14 +181,22 @@ Keep MAL as its own explicit daemon budget lane, but let non-MAL source provider
 - shared source-provider defaults make new providers safer to onboard before their final tuned per-provider numbers are known
 - explicit per-provider overrides still win, so operators can keep Crunchyroll/HIDIVE-specific tuning where it matters
 
-## 2026-03-23 - Auth-style provider failure cooldown posture
+## 2026-03-23 / 2026-03-27 - Auth-style provider failure cooldown posture
 
 ### Decision
 Keep adaptive provider failure backoff for all daemon task errors, but classify auth-style provider failures separately and allow a stronger provider-specific cooldown floor for that class. Persist the failure class and effective floor in service state/status.
 
+Auth-style detection should be shared between the daemon/runtime path and the health-check/operator path, and should conservatively treat these residue classes as auth-related:
+- repeated `401` / `403` / unauthorized-style failures
+- refresh/login failures (`invalid_grant`, token refresh/login failure text)
+- missing refresh-token / missing refresh-material residue
+- malformed token-payload residue (`did not return ...token...`, non-JSON login/token responses)
+- provider session-state auth phases like `auth_failed`
+
 ### Why
 - repeated auth/login/refresh failures are a different recovery shape than generic subprocess or network residue
 - brittle provider auth should cool down longer before retrying so unattended loops stop re-poking broken sessions
+- the same auth residue should drive both unattended cooldown behavior and later health-check rebootstrap guidance instead of letting those heuristics drift apart
 - surfacing the failure class and floor keeps the daemon's retry posture explainable during debugging instead of hiding it in timing folklore
 
 ## 2026-03-22 - Same-title split-bundle suffix posture
