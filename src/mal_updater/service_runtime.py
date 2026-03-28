@@ -817,7 +817,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": task_status, "last_result": result})
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
-            if spec.name.startswith("sync_fetch_"):
+            fetch_succeeded = task_status != "error"
+            if spec.name.startswith("sync_fetch_") and fetch_succeeded:
                 task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
                 task_state["last_fetch_mode_at"] = finished_at
                 if full_refresh_requested:

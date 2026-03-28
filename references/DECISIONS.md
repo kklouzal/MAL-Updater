@@ -158,18 +158,21 @@ When a daemon task tied to a provider fails, persist an adaptive failure-backoff
 - every-loop retries create noisy logs and extra pressure without improving recovery odds
 - surfacing `failure_backoff_until`, `failure_backoff_reason`, and consecutive failures in service state/status makes unattended debugging clearer
 
-## 2026-03-22 / 2026-03-23 - Provider full-refresh escalation posture
+## 2026-03-22 / 2026-03-23 / 2026-03-28 - Provider full-refresh escalation posture
 
 ### Decision
 Keep provider fetch lanes incremental by default, but let the unattended daemon both:
 - persist a provider-specific full-refresh anchor and force a conservative `--full-refresh` sweep whenever `service.full_refresh_every_seconds` elapses (default 24 hours), and
 - honor the latest health-check `refresh_full_snapshot` recommendation for a provider so partial-coverage warnings can trigger the next unattended fetch to self-upgrade into a full refresh immediately.
 
+Only advance `last_fetch_mode`, `last_successful_full_refresh_*`, and the full-refresh anchor after a **successful** provider fetch. A failed attempted full refresh must not be recorded as if the canonical resweep already happened.
+
 ### Why
 - incremental fetches are the right steady-state posture for fragile providers, but unattended sync quality still needs occasional canonical resweeps
 - a persisted cadence anchor gives the daemon an explainable, low-complexity way to recover from stale provider state without requiring operators to remember ad-hoc maintenance commands
 - wiring health-check maintenance recommendations back into daemon execution closes a real gap between diagnosis and remediation for partial-coverage residue
 - surfacing fetch mode plus last successful full refresh in task state keeps the behavior auditable instead of hiding refresh policy in operator folklore
+- treating a failed full refresh as successful would silently suppress the very resweep the daemon was trying to obtain
 
 ## 2026-03-24 - Generic source-provider budget default posture
 

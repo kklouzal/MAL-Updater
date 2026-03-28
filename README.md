@@ -99,7 +99,7 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 - one shared aggregate MAL apply lane
 - recurring health-check/report generation
 - API request logging / budget awareness
-- periodic provider full-refresh cadence (`service.full_refresh_every_seconds`, default 24h) so unattended runs can remain incremental by default while still forcing occasional conservative resweeps
+- periodic provider full-refresh cadence (`service.full_refresh_every_seconds`, default 24h) so unattended runs can remain incremental by default while still forcing occasional conservative resweeps; failed attempted full refreshes do not advance the success markers/anchor, so the overdue canonical resweep stays due until one actually succeeds
 - health-driven full-refresh escalation: if the latest health-check artifact recommends `refresh_full_snapshot` for a provider because cached coverage is only partial, the next unattended fetch lane for that provider automatically upgrades itself to `--full-refresh` instead of waiting for the periodic cadence window
 - broader auth-fragility health escalation: health-check now treats repeated unattended provider failures as auth-related not just for obvious `401`/`unauthorized` residue, but also for refresh/login failure text and provider session-state `auth_failed` residue so re-bootstrap guidance triggers sooner on brittle hosts
 
