@@ -304,19 +304,21 @@ Ship opinionated daemon pacing defaults for the currently supported source provi
 - supported providers now have enough operational character to deserve safer built-in posture without requiring every operator to rediscover the same settings
 - keeping unknown providers on the generic source-provider fallback preserves extensibility while making today's unattended installs safer out of the box
 
-## 2026-03-26 - Shipped `sync_apply` task-default posture
+## 2026-03-26 / 2026-03-29 - Shipped `sync_apply` task-default posture
 
 ### Decision
 Ship built-in daemon task defaults for the aggregate MAL `sync_apply` lane instead of leaving that lane's conservative posture only in example config. Seed built-in task tables for:
 - hourly limit: `48`
 - projected request count: `8`
 - learned request-history window: `3`
+- learned projected-request percentile: `0.9`
 - warn cooldown floor: `900s`
 - critical cooldown floor: `1800s`
 - auth-failure cooldown floor: `2400s`
 
 ### Why
 - `sync_apply` is the first MAL lane that clearly behaves like a higher-cost/riskier aggregate task than the provider-level MAL defaults imply
+- once the lane has real observed request history, a conservative built-in learned percentile keeps MAL write budgeting from drifting back to mean-smoothed optimism on fresh unattended installs
 - fresh unattended installs should inherit a conservative aggregate-apply posture even before an operator copies optional example settings into their runtime config
 - keeping the defaults task-scoped preserves the clean provider/task split while making the most meaningful shipped lane safer out of the box
 

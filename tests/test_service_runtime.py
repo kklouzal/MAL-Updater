@@ -733,6 +733,25 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual(1, projected_count)
         self.assertEqual("configured", projected_source)
 
+    def test_projected_request_count_uses_built_in_sync_apply_percentile(self) -> None:
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_apply", self.config.service.sync_every_seconds, budget_provider="mal"),
+            {"last_request_delta_history": [4, 10, 4]},
+        )
+        self.assertEqual(10, projected_count)
+        self.assertEqual("observed_p90", projected_source)
+
+    def test_projected_request_count_allows_task_percentile_override_for_sync_apply(self) -> None:
+        self.config.service.task_projected_request_percentiles["sync_apply"] = 0.75
+        projected_count, projected_source = _projected_request_count(
+            self.config,
+            TaskSpec("sync_apply", self.config.service.sync_every_seconds, budget_provider="mal"),
+            {"last_request_delta_history": [4, 10, 4]},
+        )
+        self.assertEqual(10, projected_count)
+        self.assertEqual("observed_p75", projected_source)
+
     def test_projected_request_count_uses_built_in_crunchyroll_incremental_default(self) -> None:
         projected_count, projected_source = _projected_request_count(
             self.config,

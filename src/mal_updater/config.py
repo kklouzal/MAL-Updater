@@ -74,6 +74,9 @@ DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS = {
     "mal_refresh": 3,
     "sync_apply": 3,
 }
+DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_PERCENTILES = {
+    "sync_apply": 0.9,
+}
 DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES = {
     "crunchyroll": 0.9,
 }
@@ -143,7 +146,7 @@ class ServiceSettings:
     provider_projected_request_history_windows: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS))
     task_projected_request_history_windows: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS))
     provider_projected_request_percentiles: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES))
-    task_projected_request_percentiles: dict[str, float] = field(default_factory=dict)
+    task_projected_request_percentiles: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_PERCENTILES))
     source_provider_warn_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS
     source_provider_critical_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS
     provider_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_WARN_BACKOFF_FLOORS))
@@ -673,9 +676,12 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 },
             },
             task_projected_request_percentiles={
-                str(key): float(value)
-                for key, value in service_task_projected_request_percentiles_section.items()
-                if isinstance(key, str) and isinstance(value, (int, float)) and 0.0 < float(value) <= 1.0
+                **DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_PERCENTILES,
+                **{
+                    str(key): float(value)
+                    for key, value in service_task_projected_request_percentiles_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float)) and 0.0 < float(value) <= 1.0
+                },
             },
             source_provider_warn_backoff_floor_seconds=int(
                 os.getenv(
