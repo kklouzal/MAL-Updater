@@ -292,16 +292,17 @@ Keep the learned observed-request projection path configurable per task: allow e
 - keeping the tuning task-scoped preserves explainability and avoids inventing hidden provider-wide heuristics too early
 - bounded per-task history windows keep the state small and auditable while still letting operators smooth or tighten learning where it matters
 
-## 2026-03-25 - Shipped provider pacing defaults posture
+## 2026-03-25 / 2026-03-29 - Shipped provider pacing defaults posture
 
 ### Decision
 Ship opinionated daemon pacing defaults for the currently supported source providers instead of leaving those numbers only in example config. Keep shared source-provider defaults as the fallback for unknown/new providers, but seed built-in provider tables for:
 - Crunchyroll: deeper learned request-cost history, conservative percentile projection, and stronger warn/critical/auth-failure cooldown floors
-- HIDIVE: quieter hourly budget plus provider-specific backoff/auth-failure floors
+- HIDIVE: quieter hourly budget, provider-specific backoff/auth-failure floors, and a conservative learned `p90` percentile baseline so observed history can take over from cold-start request-count seeds without falling back to smoothed mean behavior first
 
 ### Why
 - the repo's own likely-next-step had already converged on provider defaults being justified for the current providers
-- supported providers now have enough operational character to deserve safer built-in posture without requiring every operator to rediscover the same settings
+- HIDIVE already had built-in hourly/backoff posture and mode-specific request-count seeds, but not a shipped learned-percentile stance once real history accumulated
+- giving HIDIVE the same conservative percentile family as the rest of the fragile-provider budget lane makes unattended behavior more coherent and less dependent on operators discovering the setting manually
 - keeping unknown providers on the generic source-provider fallback preserves extensibility while making today's unattended installs safer out of the box
 
 ## 2026-03-26 / 2026-03-29 - Shipped `sync_apply` task-default posture

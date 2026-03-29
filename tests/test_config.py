@@ -42,7 +42,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(0.9, config.service.task_projected_request_percentiles["sync_apply"])
             self.assertEqual(0.9, config.service.projected_request_percentile_for("sync_apply"))
             self.assertEqual(0.9, config.service.projected_request_percentile_for("unknown_task", provider="crunchyroll"))
-            self.assertIsNone(config.service.projected_request_percentile_for("unknown_task", provider="hidive"))
+            self.assertEqual(0.9, config.service.projected_request_percentile_for("unknown_task", provider="hidive"))
             self.assertEqual(900, config.service.backoff_floor_seconds_for("crunchyroll", level="warn"))
             self.assertEqual(900, config.service.backoff_floor_seconds_for("mal", level="warn", task_name="sync_apply"))
             self.assertEqual(1200, config.service.backoff_floor_seconds_for("hidive", level="critical"))
