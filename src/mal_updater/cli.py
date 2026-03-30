@@ -13,6 +13,7 @@ import importlib.util
 import platform
 import re
 import shutil
+import stat
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
 from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, looks_auth_style_failure
@@ -187,6 +188,51 @@ def _cmd_service_run(project_root: Path | None) -> int:
     return run_service_loop(config)
 
 
+def _runtime_initialization_status(config) -> dict[str, object]:
+    required_paths = {
+        "config_dir": config.config_dir,
+        "secrets_dir": config.secrets_dir,
+        "data_dir": config.data_dir,
+        "state_dir": config.state_dir,
+        "cache_dir": config.cache_dir,
+        "db_path": config.db_path,
+    }
+    missing = [name for name, path in required_paths.items() if not path.exists()]
+    return {
+        "ready": not missing,
+        "missing": missing,
+        "command": "PYTHONPATH=src python3 -m mal_updater.cli init",
+    }
+
+
+def _secrets_dir_permission_status(config) -> dict[str, object]:
+    secrets_dir = config.secrets_dir
+    if not secrets_dir.exists():
+        return {
+            "exists": False,
+            "mode_octal": None,
+            "restrictive": None,
+            "details": f"Secrets dir {secrets_dir} does not exist yet; run init before staging secrets.",
+            "command": "PYTHONPATH=src python3 -m mal_updater.cli init",
+        }
+
+    mode = stat.S_IMODE(secrets_dir.stat().st_mode)
+    group_or_world_bits = mode & 0o077
+    restrictive = group_or_world_bits == 0
+    details = (
+        f"Secrets dir {secrets_dir} permissions are restrictive."
+        if restrictive
+        else f"Secrets dir {secrets_dir} is broader than recommended; tighten it to owner-only access before staging long-lived credentials/tokens."
+    )
+    return {
+        "exists": True,
+        "mode_octal": f"0o{mode:03o}",
+        "restrictive": restrictive,
+        "details": details,
+        "command": f"chmod 700 {shlex.quote(str(secrets_dir))}",
+    }
+
+
 def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     config = load_config(project_root)
     secrets = load_mal_secrets(config)
@@ -194,6 +240,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     crunchyroll_state = resolve_crunchyroll_state_paths(config)
     hidive_credentials = load_hidive_credentials(config)
     hidive_state = resolve_hidive_state_paths(config)
+    runtime_initialization = _runtime_initialization_status(config)
+    secrets_dir_permissions = _secrets_dir_permission_status(config)
 
     dependency_checks = {
         "python3": shutil.which("python3") is not None,
@@ -233,6 +281,17 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             }
         )
 
+    if not runtime_initialization["ready"]:
+        missing_runtime = runtime_initialization.get("missing") if isinstance(runtime_initialization.get("missing"), list) else []
+        add_onboarding_step(
+            step="initialize-runtime",
+            details="Create the external runtime directories and SQLite database before staging secrets or running sync commands. Missing: "
+            + ", ".join(str(item) for item in missing_runtime),
+            user_action_required=True,
+            command="PYTHONPATH=src python3 -m mal_updater.cli init",
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "init"],
+            applies_to="runtime",
+        )
     if not dependency_checks["python3"]:
         add_onboarding_step(
             step="install-python",
@@ -305,6 +364,15 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             user_action_required=True,
             applies_to="automation",
         )
+    if secrets_dir_permissions["exists"] and not secrets_dir_permissions["restrictive"]:
+        add_onboarding_step(
+            step="tighten-secrets-dir-permissions",
+            details=str(secrets_dir_permissions["details"]),
+            user_action_required=True,
+            command=str(secrets_dir_permissions["command"]),
+            command_args=["chmod", "700", str(config.secrets_dir)],
+            applies_to="security",
+        )
 
     blocking_steps = [item for item in onboarding_steps if item["user_action_required"]]
     nonblocking_steps = [item for item in onboarding_steps if not item["user_action_required"]]
@@ -358,6 +426,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "cache_dir": str(config.cache_dir),
             "db_path": str(config.db_path),
         },
+        "runtime_initialization": runtime_initialization,
+        "secrets_dir_permissions": secrets_dir_permissions,
         "platform": {
             "system": platform.system(),
             "release": platform.release(),
@@ -402,6 +472,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "actionable_command_count": len(actionable_commands),
             "ready_provider_count": sum(1 for provider in providers.values() if provider["ready"]),
             "provider_count": len(providers),
+            "runtime_initialized": runtime_initialization["ready"],
+            "secrets_dir_restrictive": secrets_dir_permissions["restrictive"],
         },
         "onboarding_steps": onboarding_steps,
         "recommended_commands": actionable_commands,
@@ -412,6 +484,13 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         print(f"ready={payload['ready']}")
         print(f"runtime_root={config.runtime_root}")
         print(f"settings_path={config.settings_path}")
+        print(f"runtime_initialized={payload['summary']['runtime_initialized']}")
+        if runtime_initialization.get("missing"):
+            print("runtime_missing=" + ", ".join(str(item) for item in runtime_initialization["missing"]))
+        if secrets_dir_permissions.get("mode_octal") is not None:
+            print(f"secrets_dir_mode={secrets_dir_permissions['mode_octal']}")
+        if secrets_dir_permissions.get("restrictive") is not None:
+            print(f"secrets_dir_restrictive={secrets_dir_permissions['restrictive']}")
         print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
         print(f"nonblocking_step_count={payload['summary']['nonblocking_step_count']}")
         print(f"ready_provider_count={payload['summary']['ready_provider_count']}")

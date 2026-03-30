@@ -8,7 +8,7 @@
 - [x] Replace committed absolute-path systemd units with install-time rendered templates
 - [x] Replace timer-first unattended automation with a user-level daemon-first model
 - [x] Establish public-repo anonymization as an explicit project constraint for tracked code/references/tests/history
-- [ ] Keep tightening the bootstrap/onboarding UX for new OpenClaw installs
+- [ ] Keep tightening the bootstrap/onboarding UX for new OpenClaw installs (`bootstrap-audit` now also reports runtime-init readiness plus secrets-dir permission posture and can recommend `init` / `chmod 700` explicitly; next likely step is surfacing daemon install/drift readiness with the same operator-safe precision)
 - [x] Make repo-root test execution work without manual `PYTHONPATH` fiddling so future development turns can validate faster with plain `pytest -q`
 - [x] Make bootstrap/install metadata more machine-readable with provider readiness and explicit recommended commands in `bootstrap-audit`
 

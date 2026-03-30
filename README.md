@@ -33,7 +33,7 @@ PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli status
 ```
 
-Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
+Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, runtime-initialization readiness, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
 
 ## What bootstrap-audit covers
 

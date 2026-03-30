@@ -26,7 +26,7 @@ Use `--summary` for terse line-oriented output.
 
 ## What bootstrap-audit tells you
 
-The default JSON output is intended to be automation-friendly: it includes per-provider readiness, missing capability buckets, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action.
+The default JSON output is intended to be automation-friendly: it includes per-provider readiness, runtime-initialization readiness, secrets-dir permission posture, missing capability buckets, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action.
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout

@@ -41,13 +41,19 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("providers", payload)
         self.assertIn("summary", payload)
         self.assertIn("recommended_commands", payload)
+        self.assertIn("runtime_initialization", payload)
+        self.assertIn("secrets_dir_permissions", payload)
         self.assertFalse(payload["providers"]["crunchyroll"]["ready"])
         self.assertIn("credentials", payload["providers"]["crunchyroll"]["missing"])
         self.assertIn("session", payload["providers"]["crunchyroll"]["missing"])
         self.assertFalse(payload["providers"]["hidive"]["ready"])
         self.assertEqual(2, payload["summary"]["provider_count"])
+        self.assertFalse(payload["summary"]["runtime_initialized"])
+        self.assertIn("db_path", payload["runtime_initialization"]["missing"])
+        self.assertIsNone(payload["summary"]["secrets_dir_restrictive"])
         self.assertGreaterEqual(payload["summary"]["actionable_command_count"], 1)
         commands = [item["command"] for item in payload["recommended_commands"] if item.get("command")]
+        self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", commands)
         self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", commands)
         self.assertIn(
             "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
@@ -57,6 +63,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
     def test_bootstrap_audit_summary_reports_provider_missing_state_and_next_commands(self) -> None:
         secrets_dir = self.project_root / ".MAL-Updater" / "secrets"
         secrets_dir.mkdir(parents=True, exist_ok=True)
+        secrets_dir.chmod(0o755)
         (secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (secrets_dir / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
         crunchyroll_state_root = self.project_root / ".MAL-Updater" / "state" / "crunchyroll" / "default"
@@ -66,12 +73,18 @@ class BootstrapAuditCliTests(unittest.TestCase):
         exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
 
         self.assertEqual(0, exit_code)
+        self.assertIn("runtime_initialized=False", stdout)
+        self.assertIn("runtime_missing=data_dir, cache_dir, db_path", stdout)
+        self.assertIn("secrets_dir_mode=0o755", stdout)
+        self.assertIn("secrets_dir_restrictive=False", stdout)
         self.assertIn("provider_crunchyroll_ready=False", stdout)
         self.assertIn("provider_crunchyroll_missing=session", stdout)
+        self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
         self.assertIn(
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
             stdout,
         )
+        self.assertIn("next_command=chmod 700", stdout)
         self.assertIn("blocking_step_count=", stdout)
         self.assertIn("nonblocking_step_count=", stdout)
 

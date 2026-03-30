@@ -4,7 +4,7 @@
 
 - The repo is treated as the canonical skill package (`SKILL.md` at repo root).
 - Runtime state is externalized to `.MAL-Updater/` by default instead of living under the repo tree.
-- The bootstrap/onboarding surface starts with `bootstrap-audit`, which now exposes provider readiness, blocking vs non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
+- The bootstrap/onboarding surface starts with `bootstrap-audit`, which now exposes provider readiness, runtime-initialization readiness, secrets-dir permission posture, blocking vs non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
 - Repo-owned systemd automation is committed as a portable `mal-updater.service` template and rendered at install time by `scripts/install_user_systemd_units.sh`.
 - The unattended model is now user-level systemd **daemon-first**, with internal Python control loops rather than timer-driven one-shot jobs.
 - Public-repo hygiene is now part of the project contract: tracked code/references/tests/history should remain anonymized and free of personal identifiers, host-local absolute paths, and real secrets.
