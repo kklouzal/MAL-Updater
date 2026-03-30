@@ -18,6 +18,7 @@ These expose:
 - dependency readiness
 - credential/app-setup readiness
 - daemon install readiness
+- whether manual foreground operation is still acceptable vs the daemon now being the expected unattended path
 - redirect URI / auth-material presence
 
 ## Daemon / unattended runtime state

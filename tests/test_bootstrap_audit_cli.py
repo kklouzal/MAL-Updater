@@ -53,6 +53,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("runtime_initialization", payload)
         self.assertIn("secrets_dir_permissions", payload)
         self.assertIn("automation_installation", payload["services"])
+        self.assertIn("operation_modes", payload)
         self.assertFalse(payload["providers"]["crunchyroll"]["ready"])
         self.assertIn("credentials", payload["providers"]["crunchyroll"]["missing"])
         self.assertIn("session", payload["providers"]["crunchyroll"]["missing"])
@@ -65,6 +66,10 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertFalse(payload["summary"]["automation_current"])
         self.assertIsNone(payload["summary"]["automation_enabled"])
         self.assertIsNone(payload["summary"]["automation_active"])
+        self.assertEqual("bootstrap-manual-acceptable", payload["summary"]["operation_mode"])
+        self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
+        self.assertFalse(payload["summary"]["daemon_expected"])
+        self.assertEqual("bootstrap-manual-acceptable", payload["operation_modes"]["mode"])
         self.assertGreaterEqual(payload["summary"]["actionable_command_count"], 1)
         commands = [item["command"] for item in payload["recommended_commands"] if item.get("command")]
         self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", commands)
@@ -94,6 +99,9 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("secrets_dir_restrictive=False", stdout)
         self.assertIn("automation_installed=False", stdout)
         self.assertIn("automation_current=False", stdout)
+        self.assertIn("operation_mode=bootstrap-manual-acceptable", stdout)
+        self.assertIn("manual_foreground_acceptable=True", stdout)
+        self.assertIn("daemon_expected=False", stdout)
         self.assertIn("provider_crunchyroll_ready=False", stdout)
         self.assertIn("provider_crunchyroll_missing=session", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
@@ -105,6 +113,24 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("next_command=chmod 700", stdout)
         self.assertIn("blocking_step_count=", stdout)
         self.assertIn("nonblocking_step_count=", stdout)
+
+    def test_bootstrap_audit_marks_daemon_expected_once_runtime_and_auth_state_exist(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("daemon-expected-for-unattended", payload["summary"]["operation_mode"])
+        self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
+        self.assertTrue(payload["summary"]["daemon_expected"])
+        self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
 
 
 if __name__ == "__main__":

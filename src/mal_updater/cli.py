@@ -233,6 +233,63 @@ def _secrets_dir_permission_status(config) -> dict[str, object]:
     }
 
 
+def _bootstrap_operation_mode_status(
+    *,
+    runtime_initialized: bool,
+    python_available: bool,
+    systemctl_available: bool,
+    mal_oauth_present: bool,
+    crunchyroll_credentials_present: bool,
+    crunchyroll_session_present: bool,
+    hidive_credentials_present: bool,
+    hidive_session_present: bool,
+) -> dict[str, object]:
+    provider_state_present = any(
+        (
+            mal_oauth_present,
+            crunchyroll_credentials_present,
+            crunchyroll_session_present,
+            hidive_credentials_present,
+            hidive_session_present,
+        )
+    )
+
+    if not python_available:
+        return {
+            "mode": "cli-unavailable",
+            "manual_foreground_acceptable": False,
+            "daemon_preferred": False,
+            "daemon_expected": False,
+            "details": "Python is unavailable, so neither foreground CLI operation nor the repo-owned daemon path is usable yet.",
+        }
+
+    if not systemctl_available:
+        return {
+            "mode": "manual-only-host",
+            "manual_foreground_acceptable": True,
+            "daemon_preferred": False,
+            "daemon_expected": False,
+            "details": "This host does not expose systemctl, so manual foreground CLI operation is the acceptable runtime model here.",
+        }
+
+    if not runtime_initialized or not provider_state_present:
+        return {
+            "mode": "bootstrap-manual-acceptable",
+            "manual_foreground_acceptable": True,
+            "daemon_preferred": True,
+            "daemon_expected": False,
+            "details": "Manual foreground CLI operation is acceptable during bootstrap and spot checks; install the repo-owned user-systemd daemon once you want unattended background sync.",
+        }
+
+    return {
+        "mode": "daemon-expected-for-unattended",
+        "manual_foreground_acceptable": True,
+        "daemon_preferred": True,
+        "daemon_expected": True,
+        "details": "Bootstrap state is present, so manual foreground CLI runs remain valid for validation/recovery, but the repo-owned user-systemd daemon is the expected path for unattended background sync.",
+    }
+
+
 def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     config = load_config(project_root)
     secrets = load_mal_secrets(config)
@@ -258,6 +315,16 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     hidive_session_present = hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists()
     mal_app_present = bool(secrets.client_id)
     mal_oauth_present = bool(secrets.access_token) and bool(secrets.refresh_token)
+    operation_modes = _bootstrap_operation_mode_status(
+        runtime_initialized=bool(runtime_initialization["ready"]),
+        python_available=dependency_checks["python3"],
+        systemctl_available=dependency_checks["systemctl"],
+        mal_oauth_present=mal_oauth_present,
+        crunchyroll_credentials_present=crunchyroll_credentials_present,
+        crunchyroll_session_present=crunchyroll_session_present,
+        hidive_credentials_present=hidive_credentials_present,
+        hidive_session_present=hidive_session_present,
+    )
 
     onboarding_steps: list[dict[str, object]] = []
 
@@ -505,6 +572,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "service_model": "user-systemd daemon",
             "automation_installation": automation_installation,
         },
+        "operation_modes": operation_modes,
         "mal": {
             "client_id_present": mal_app_present,
             "oauth_ready": mal_oauth_present,
@@ -528,6 +596,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "automation_current": automation_installation.get("all_units_current") if isinstance(automation_installation, dict) else None,
             "automation_enabled": automation_installation.get("service_enabled") if isinstance(automation_installation, dict) else None,
             "automation_active": automation_installation.get("service_active") if isinstance(automation_installation, dict) else None,
+            "operation_mode": operation_modes.get("mode"),
+            "manual_foreground_acceptable": operation_modes.get("manual_foreground_acceptable"),
+            "daemon_expected": operation_modes.get("daemon_expected"),
         },
         "onboarding_steps": onboarding_steps,
         "recommended_commands": actionable_commands,
@@ -553,6 +624,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             print(f"automation_enabled={payload['summary']['automation_enabled']}")
         if payload["summary"].get("automation_active") is not None:
             print(f"automation_active={payload['summary']['automation_active']}")
+        print(f"operation_mode={payload['summary']['operation_mode']}")
+        print(f"manual_foreground_acceptable={payload['summary']['manual_foreground_acceptable']}")
+        print(f"daemon_expected={payload['summary']['daemon_expected']}")
         print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
         print(f"nonblocking_step_count={payload['summary']['nonblocking_step_count']}")
         print(f"ready_provider_count={payload['summary']['ready_provider_count']}")

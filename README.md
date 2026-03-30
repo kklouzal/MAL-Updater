@@ -33,7 +33,7 @@ PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli status
 ```
 
-Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, runtime-initialization readiness, daemon install/drift readiness, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
+Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
 
 ## What bootstrap-audit covers
 
@@ -46,6 +46,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 - current MAL redirect URI
 - whether the repo-owned **user-systemd daemon service** can be installed on this host
 - whether the repo-owned user-systemd daemon is missing, outdated, disabled, inactive, or missing its rendered env file for this user
+- whether manual foreground CLI operation is merely acceptable during bootstrap/spot checks or the daemon is now the expected unattended path
 
 ## Bootstrap / onboarding flow
 
