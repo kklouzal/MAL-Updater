@@ -242,6 +242,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     hidive_state = resolve_hidive_state_paths(config)
     runtime_initialization = _runtime_initialization_status(config)
     secrets_dir_permissions = _secrets_dir_permission_status(config)
+    automation_installation = _build_automation_installation_status(config.project_root)
 
     dependency_checks = {
         "python3": shutil.which("python3") is not None,
@@ -364,6 +365,54 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             user_action_required=True,
             applies_to="automation",
         )
+    if isinstance(automation_installation, dict):
+        install_script_path = automation_installation.get("install_script_path")
+        missing_units = automation_installation.get("missing_units") if isinstance(automation_installation.get("missing_units"), list) else []
+        outdated_units = automation_installation.get("outdated_units") if isinstance(automation_installation.get("outdated_units"), list) else []
+        disabled_services = automation_installation.get("disabled_services") if isinstance(automation_installation.get("disabled_services"), list) else []
+        inactive_services = automation_installation.get("inactive_services") if isinstance(automation_installation.get("inactive_services"), list) else []
+        if isinstance(install_script_path, str) and install_script_path:
+            automation_details = None
+            automation_step = None
+            if missing_units:
+                automation_step = "install-user-systemd-daemon"
+                automation_details = (
+                    "Install the repo-owned MAL-Updater user-systemd daemon so unattended sync can run in the background. "
+                    f"Missing units: {', '.join(str(item) for item in missing_units)}"
+                )
+            elif outdated_units:
+                automation_step = "refresh-user-systemd-daemon"
+                automation_details = (
+                    "Reinstall/update the repo-owned MAL-Updater user-systemd daemon so the installed units match the current repo version. "
+                    f"Outdated units: {', '.join(str(item) for item in outdated_units)}"
+                )
+            elif disabled_services:
+                automation_step = "enable-user-systemd-daemon"
+                automation_details = (
+                    "Re-run the repo-owned MAL-Updater user-systemd installer so the unattended daemon is enabled for this user. "
+                    f"Disabled services: {', '.join(str(item) for item in disabled_services)}"
+                )
+            elif inactive_services:
+                automation_step = "restart-user-systemd-daemon"
+                automation_details = (
+                    "Re-run the repo-owned MAL-Updater user-systemd installer so the unattended daemon is active in the current user runtime. "
+                    f"Inactive services: {', '.join(str(item) for item in inactive_services)}"
+                )
+            elif automation_installation.get("env_present") is False:
+                automation_step = "stage-user-systemd-daemon-env"
+                automation_details = (
+                    "The repo-owned MAL-Updater user-systemd unit is installed, but the rendered service environment file is missing. "
+                    "Re-run the installer to recreate the expected environment file before relying on unattended automation."
+                )
+            if automation_step and automation_details:
+                add_onboarding_step(
+                    step=automation_step,
+                    details=automation_details,
+                    user_action_required=False,
+                    command=install_script_path,
+                    command_args=[install_script_path],
+                    applies_to="automation",
+                )
     if secrets_dir_permissions["exists"] and not secrets_dir_permissions["restrictive"]:
         add_onboarding_step(
             step="tighten-secrets-dir-permissions",
@@ -454,6 +503,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "service_manager_available": dependency_checks["systemctl"],
             "service_unit_name": "mal-updater.service",
             "service_model": "user-systemd daemon",
+            "automation_installation": automation_installation,
         },
         "mal": {
             "client_id_present": mal_app_present,
@@ -474,6 +524,10 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "provider_count": len(providers),
             "runtime_initialized": runtime_initialization["ready"],
             "secrets_dir_restrictive": secrets_dir_permissions["restrictive"],
+            "automation_installed": automation_installation.get("all_units_installed") if isinstance(automation_installation, dict) else None,
+            "automation_current": automation_installation.get("all_units_current") if isinstance(automation_installation, dict) else None,
+            "automation_enabled": automation_installation.get("service_enabled") if isinstance(automation_installation, dict) else None,
+            "automation_active": automation_installation.get("service_active") if isinstance(automation_installation, dict) else None,
         },
         "onboarding_steps": onboarding_steps,
         "recommended_commands": actionable_commands,
@@ -491,6 +545,14 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             print(f"secrets_dir_mode={secrets_dir_permissions['mode_octal']}")
         if secrets_dir_permissions.get("restrictive") is not None:
             print(f"secrets_dir_restrictive={secrets_dir_permissions['restrictive']}")
+        if payload["summary"].get("automation_installed") is not None:
+            print(f"automation_installed={payload['summary']['automation_installed']}")
+        if payload["summary"].get("automation_current") is not None:
+            print(f"automation_current={payload['summary']['automation_current']}")
+        if payload["summary"].get("automation_enabled") is not None:
+            print(f"automation_enabled={payload['summary']['automation_enabled']}")
+        if payload["summary"].get("automation_active") is not None:
+            print(f"automation_active={payload['summary']['automation_active']}")
         print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
         print(f"nonblocking_step_count={payload['summary']['nonblocking_step_count']}")
         print(f"ready_provider_count={payload['summary']['ready_provider_count']}")

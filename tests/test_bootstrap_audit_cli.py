@@ -16,6 +16,15 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
         (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
+        scripts_dir = self.project_root / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "install_user_systemd_units.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        ops_dir = self.project_root / "ops" / "systemd-user"
+        ops_dir.mkdir(parents=True)
+        (ops_dir / "mal-updater.service").write_text(
+            "[Unit]\nDescription=MAL-Updater\n[Service]\nEnvironmentFile=__MAL_UPDATER_SERVICE_ENV_FILE__\nWorkingDirectory=__MAL_UPDATER_REPO_ROOT__\n",
+            encoding="utf-8",
+        )
 
     def _run_bootstrap_audit_raw(self, *args: str) -> tuple[int, str]:
         argv = [
@@ -43,6 +52,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("recommended_commands", payload)
         self.assertIn("runtime_initialization", payload)
         self.assertIn("secrets_dir_permissions", payload)
+        self.assertIn("automation_installation", payload["services"])
         self.assertFalse(payload["providers"]["crunchyroll"]["ready"])
         self.assertIn("credentials", payload["providers"]["crunchyroll"]["missing"])
         self.assertIn("session", payload["providers"]["crunchyroll"]["missing"])
@@ -51,6 +61,10 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertFalse(payload["summary"]["runtime_initialized"])
         self.assertIn("db_path", payload["runtime_initialization"]["missing"])
         self.assertIsNone(payload["summary"]["secrets_dir_restrictive"])
+        self.assertFalse(payload["summary"]["automation_installed"])
+        self.assertFalse(payload["summary"]["automation_current"])
+        self.assertIsNone(payload["summary"]["automation_enabled"])
+        self.assertIsNone(payload["summary"]["automation_active"])
         self.assertGreaterEqual(payload["summary"]["actionable_command_count"], 1)
         commands = [item["command"] for item in payload["recommended_commands"] if item.get("command")]
         self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", commands)
@@ -59,6 +73,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
             commands,
         )
+        self.assertIn(str(self.project_root / "scripts" / "install_user_systemd_units.sh"), commands)
 
     def test_bootstrap_audit_summary_reports_provider_missing_state_and_next_commands(self) -> None:
         secrets_dir = self.project_root / ".MAL-Updater" / "secrets"
@@ -77,6 +92,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("runtime_missing=data_dir, cache_dir, db_path", stdout)
         self.assertIn("secrets_dir_mode=0o755", stdout)
         self.assertIn("secrets_dir_restrictive=False", stdout)
+        self.assertIn("automation_installed=False", stdout)
+        self.assertIn("automation_current=False", stdout)
         self.assertIn("provider_crunchyroll_ready=False", stdout)
         self.assertIn("provider_crunchyroll_missing=session", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
@@ -84,6 +101,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
             stdout,
         )
+        self.assertIn(f"next_command={self.project_root / 'scripts' / 'install_user_systemd_units.sh'}", stdout)
         self.assertIn("next_command=chmod 700", stdout)
         self.assertIn("blocking_step_count=", stdout)
         self.assertIn("nonblocking_step_count=", stdout)
