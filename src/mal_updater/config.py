@@ -56,6 +56,9 @@ DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
     "mal_refresh": 1,
     "sync_apply": 8,
 }
+DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
+    "sync_apply": 8,
+}
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE = {
     "sync_fetch_crunchyroll": {
         "incremental": 4,
@@ -141,6 +144,7 @@ class ServiceSettings:
     provider_hourly_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS))
     task_hourly_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_HOURLY_LIMITS))
     task_projected_request_counts: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS))
+    task_execute_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS))
     task_projected_request_counts_by_mode: dict[str, dict[str, int]] = field(
         default_factory=lambda: {task_name: dict(mode_map) for task_name, mode_map in DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.items()}
     )
@@ -183,6 +187,12 @@ class ServiceSettings:
         if isinstance(value, int):
             return max(0, int(value)), "configured"
         return None, None
+
+    def execute_limit_for(self, task_name: str) -> int | None:
+        value = self.task_execute_limits.get(task_name)
+        if isinstance(value, int):
+            return max(0, int(value))
+        return None
 
     def projected_request_history_window_for(self, task_name: str | None = None, *, provider: str | None = None) -> int:
         if task_name:
@@ -484,6 +494,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
     service_task_projected_request_counts_section = _get_nested_table(settings, "service", "task_projected_request_counts")
+    service_task_execute_limits_section = _get_nested_table(settings, "service", "task_execute_limits")
     service_task_projected_request_counts_by_mode_section = _get_dotted_nested_tables(settings, "service", "task_projected_request_counts_by_mode")
     service_provider_projected_request_history_windows_section = _get_nested_table(settings, "service", "provider_projected_request_history_windows")
     service_task_projected_request_history_windows_section = _get_nested_table(settings, "service", "task_projected_request_history_windows")
@@ -637,6 +648,14 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 **{
                     str(key): int(value)
                     for key, value in service_task_projected_request_counts_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
+            },
+            task_execute_limits={
+                **DEFAULT_SERVICE_TASK_EXECUTE_LIMITS,
+                **{
+                    str(key): int(value)
+                    for key, value in service_task_execute_limits_section.items()
                     if isinstance(key, str) and isinstance(value, (int, float))
                 },
             },

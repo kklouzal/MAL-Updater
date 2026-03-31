@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _projected_request_count, run_pending_tasks
+from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, run_pending_tasks
 
 
 class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
@@ -300,6 +300,90 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         self.assertEqual(previous_success, sync_state["last_successful_full_refresh_epoch"])
         self.assertEqual(stale_anchor, sync_state["full_refresh_anchor_epoch"])
         self.assertEqual("auth", sync_state["failure_backoff_class"])
+
+
+class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.project_root = Path(self.temp_dir.name)
+        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
+        (self.project_root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+        (self.project_root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.project_root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt").write_text("secret\n", encoding="utf-8")
+        self.config = load_config(self.project_root)
+        ensure_directories(self.config)
+
+    def test_apply_sync_command_uses_bounded_service_limit(self) -> None:
+        self.config.service.task_execute_limits["sync_apply"] = 6
+        self.assertEqual(
+            [
+                "python3",
+                "-m",
+                "mal_updater.cli",
+                "apply-sync",
+                "--limit",
+                "6",
+                "--exact-approved-only",
+                "--execute",
+            ],
+            _apply_sync_command(self.config),
+        )
+
+    def test_run_pending_tasks_resets_stale_sync_apply_projection_when_execution_signature_changes(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 0
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.task_execute_limits["sync_apply"] = 6
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {
+                            "last_run_epoch": 0,
+                            "execution_signature": "sync_apply:limit=0",
+                            "last_request_delta": 250,
+                            "last_request_delta_history": [250, 250, 250],
+                            "projected_request_count": 250,
+                            "projected_request_source": "observed_p90",
+                            "budget_backoff_until_epoch": now + 7200,
+                            "budget_backoff_until": "2099-01-01T00:00:00Z",
+                            "budget_backoff_remaining_seconds": 7200,
+                            "last_skip_reason": "mal_budget_projected_critical ratio=0.0 projected_ratio=5.2 projected_requests=250 cooldown=1800s",
+                        },
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "mal_updater.service_runtime._budget_gate",
+            side_effect=[(True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)],
+        ), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ):
+            result = run_pending_tasks(self.config)
+
+        sync_apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual("ok", sync_apply_result["status"])
+        self.assertEqual(6, sync_apply_result["apply_limit"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        apply_state = state["tasks"]["sync_apply"]
+        self.assertEqual("sync_apply:limit=6", apply_state["execution_signature"])
+        self.assertNotIn("budget_backoff_until_epoch", apply_state)
+        self.assertNotIn("last_skip_reason", apply_state)
 
 
 class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):

@@ -50,9 +50,12 @@ hidive = 72  # built-in default shown explicitly here; override only when this h
 [service.task_hourly_limits]
 sync_apply = 48  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply MAL budget
 
+[service.task_execute_limits]
+sync_apply = 8  # built-in default shown explicitly here; unattended apply runs should advance MAL in bounded batches instead of trying a full aggregate pass
+
 [service.task_projected_request_counts]
 mal_refresh = 1  # built-in default shown explicitly here; fresh installs now seed unattended MAL token refresh with a small non-zero request-cost estimate, but learned history can replace the seed once real runs exist
-sync_apply = 8  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply request-cost estimate
+sync_apply = 8  # built-in default shown explicitly here; keep this aligned with the unattended apply batch posture unless this host has strong evidence for a different per-run MAL request cost
 sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds
 
 [service.task_projected_request_counts_by_mode.sync_fetch_crunchyroll]

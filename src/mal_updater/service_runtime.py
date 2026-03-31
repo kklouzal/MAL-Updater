@@ -12,6 +12,7 @@ from .auth import persist_token_response
 from .auth_failure_signals import looks_auth_style_failure
 from .config import (
     AppConfig,
+    DEFAULT_SERVICE_TASK_EXECUTE_LIMITS,
     DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS,
     DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE,
     ensure_directories,
@@ -333,17 +334,68 @@ def _provider_fetch_requested_by_health(config: AppConfig, provider: str, task_s
 
 
 
-def _apply_sync_command() -> list[str]:
+def _apply_sync_command(config: AppConfig) -> list[str]:
+    apply_limit = config.service.execute_limit_for("sync_apply")
+    if apply_limit is None:
+        apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
     return [
         "python3",
         "-m",
         "mal_updater.cli",
         "apply-sync",
         "--limit",
-        "0",
+        str(max(0, int(apply_limit))),
         "--exact-approved-only",
         "--execute",
     ]
+
+
+def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: str | None = None) -> str | None:
+    if spec.name == "sync_apply":
+        apply_limit = config.service.execute_limit_for("sync_apply")
+        if apply_limit is None:
+            apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
+        return f"sync_apply:limit={max(0, int(apply_limit))}"
+    if spec.name.startswith("sync_fetch_"):
+        return f"{spec.name}:mode={fetch_mode or 'incremental'}"
+    return None
+
+
+def _maybe_reset_task_projection_state_for_signature(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    fetch_mode: str | None = None,
+) -> None:
+    signature = _task_execution_signature(config, spec, fetch_mode=fetch_mode)
+    if signature is None:
+        return
+    previous = task_state.get("execution_signature")
+    if previous == signature:
+        return
+    task_state["execution_signature"] = signature
+    for key in (
+        "last_request_delta",
+        "last_request_delta_at",
+        "last_request_delta_history",
+        "last_request_delta_by_mode",
+        "last_request_delta_history_by_mode",
+        "projected_request_count",
+        "projected_request_total",
+        "projected_ratio",
+        "projected_request_source",
+        "budget_backoff_level",
+        "budget_backoff_until_epoch",
+        "budget_backoff_until",
+        "budget_backoff_remaining_seconds",
+        "budget_backoff_floor_seconds",
+        "budget_backoff_cooldown_source",
+        "last_skip_reason",
+        "last_skipped_at",
+    ):
+        task_state.pop(key, None)
+    _append_log(config, f"task={spec.name} status=reset reason=execution_signature_changed old={previous!r} new={signature!r}")
 
 
 
@@ -651,6 +703,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         if now - last_run < spec.every_seconds:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
+        planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now)
+        _maybe_reset_task_projection_state_for_signature(config, spec, task_state, fetch_mode=planned_fetch_mode)
         backoff_until_epoch = float(task_state.get("budget_backoff_until_epoch", 0))
         if backoff_until_epoch > now:
             remaining = max(0, int(backoff_until_epoch - now))
@@ -699,7 +753,6 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 }
             )
             continue
-        planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now)
         allowed, reason, usage = _budget_gate(config, spec, task_state, fetch_mode=planned_fetch_mode)
         downgrade_reason = None
         downgrade_usage = None
@@ -785,7 +838,11 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 if downgrade_reason:
                     result["deferred_full_refresh_reason"] = downgrade_reason
             elif spec.name == "sync_apply":
-                result = _run_subprocess(config, _apply_sync_command(), label="sync_apply")
+                result = _run_subprocess(config, _apply_sync_command(config), label="sync_apply")
+                apply_limit = config.service.execute_limit_for("sync_apply")
+                if apply_limit is None:
+                    apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
+                result["apply_limit"] = max(0, int(apply_limit))
             elif spec.name == "health":
                 result = _run_subprocess(config, [str(config.project_root / "scripts" / "run_health_check_cycle.sh")], label="health")
             else:
