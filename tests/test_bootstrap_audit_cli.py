@@ -55,9 +55,11 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("automation_installation", payload["services"])
         self.assertIn("operation_modes", payload)
         self.assertFalse(payload["providers"]["crunchyroll"]["ready"])
+        self.assertEqual("not-configured", payload["providers"]["crunchyroll"]["operation_mode"])
         self.assertIn("credentials", payload["providers"]["crunchyroll"]["missing"])
         self.assertIn("session", payload["providers"]["crunchyroll"]["missing"])
         self.assertFalse(payload["providers"]["hidive"]["ready"])
+        self.assertEqual("not-configured", payload["providers"]["hidive"]["operation_mode"])
         self.assertEqual(2, payload["summary"]["provider_count"])
         self.assertFalse(payload["summary"]["runtime_initialized"])
         self.assertIn("db_path", payload["runtime_initialization"]["missing"])
@@ -105,7 +107,12 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("manual_foreground_acceptable=True", stdout)
         self.assertIn("daemon_expected=False", stdout)
         self.assertIn("provider_crunchyroll_ready=False", stdout)
+        self.assertIn("provider_crunchyroll_operation_mode=credentials-staged-awaiting-bootstrap", stdout)
         self.assertIn("provider_crunchyroll_missing=session", stdout)
+        self.assertIn(
+            "provider_crunchyroll_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
+            stdout,
+        )
         self.assertIn("intended_provider_count=1", stdout)
         self.assertIn("partially_staged_provider_count=1", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
@@ -155,6 +162,11 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual(1, payload["summary"]["intended_provider_count"])
         self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
         self.assertEqual("bootstrap-provider-staged", payload["operation_modes"]["mode"])
+        self.assertEqual("credentials-staged-awaiting-bootstrap", payload["providers"]["crunchyroll"]["operation_mode"])
+        self.assertEqual(
+            "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
+            payload["providers"]["crunchyroll"]["operation_guidance"]["next_command"],
+        )
 
     def test_bootstrap_audit_marks_daemon_expected_once_mal_and_intended_provider_state_exist(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
@@ -181,6 +193,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual(1, payload["summary"]["intended_provider_count"])
         self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
         self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
+        self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
 
 
 if __name__ == "__main__":

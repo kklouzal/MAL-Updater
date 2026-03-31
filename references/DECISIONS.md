@@ -372,6 +372,22 @@ Expose provider-intent and partial-bootstrap counts in the audit payload/summary
 - automation-friendly consumers need a small machine-readable signal to tell “nothing chosen yet” from “finish the staged provider bootstrap before expecting unattended sync”
 - this keeps the daemon-first posture conservative without pretending that every runtime-initialized install is already ready for unattended background operation
 
+## 2026-03-31 - Provider-specific bootstrap guidance for staged installs
+
+### Decision
+Extend `bootstrap-audit` with per-provider operation guidance so each provider reports a small machine-readable operation mode plus an optional next-command hint.
+
+Current provider guidance distinguishes between at least:
+- `not-configured`
+- `credentials-staged-awaiting-bootstrap`
+- `session-staged-missing-credentials`
+- `ready-for-unattended`
+
+### Why
+- once a provider is partially staged, operators and automation need more than a repo-wide `bootstrap-provider-staged` label to know what is actually missing
+- provider-specific next-command hints let the audit stay actionable without guessing at wider live-write behavior
+- this keeps bootstrap/onboarding conservative: the surface can tell the truth about staged state without pretending every provider needs the same remediation path
+
 ## 2026-03-26 - Budget-blocked full-refresh downgrade posture
 
 ### Decision

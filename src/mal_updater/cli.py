@@ -233,6 +233,78 @@ def _secrets_dir_permission_status(config) -> dict[str, object]:
     }
 
 
+def _provider_bootstrap_guidance_status(
+    *,
+    provider_name: str,
+    credentials_present: bool,
+    session_present: bool,
+    transport_ready: bool,
+    bootstrap_command: str,
+) -> dict[str, object]:
+    title = provider_name.capitalize()
+    intended = credentials_present or session_present
+
+    if not intended:
+        return {
+            "mode": "not-configured",
+            "intended": False,
+            "partially_staged": False,
+            "ready": False,
+            "details": f"{title} is not staged yet, so it is optional until you decide to enable that provider.",
+            "next_command": None,
+        }
+
+    if credentials_present and session_present and transport_ready:
+        return {
+            "mode": "ready-for-unattended",
+            "intended": True,
+            "partially_staged": False,
+            "ready": True,
+            "details": f"{title} credentials and session state are staged, so this provider is ready for unattended daemon fetches.",
+            "next_command": None,
+        }
+
+    if credentials_present and not session_present:
+        return {
+            "mode": "credentials-staged-awaiting-bootstrap",
+            "intended": True,
+            "partially_staged": True,
+            "ready": False,
+            "details": f"{title} credentials are staged but provider session state is still missing; finish provider bootstrap before expecting unattended fetches.",
+            "next_command": bootstrap_command,
+        }
+
+    if session_present and not credentials_present:
+        return {
+            "mode": "session-staged-missing-credentials",
+            "intended": True,
+            "partially_staged": True,
+            "ready": False,
+            "details": f"{title} session state exists without matching staged credentials; restore/stage credentials before treating this provider as healthy for unattended fetches.",
+            "next_command": None,
+        }
+
+    if not transport_ready:
+        return {
+            "mode": "blocked-missing-transport",
+            "intended": True,
+            "partially_staged": True,
+            "ready": False,
+            "details": f"{title} bootstrap state is staged but required transport support is missing on this host, so finish transport setup before relying on unattended fetches.",
+            "next_command": None,
+        }
+
+    return {
+        "mode": "provider-staged-not-ready",
+        "intended": True,
+        "partially_staged": True,
+        "ready": False,
+        "details": f"{title} has some staged bootstrap state but is not fully ready yet; finish provider bootstrap before expecting unattended fetches.",
+        "next_command": bootstrap_command if credentials_present else None,
+    }
+
+
+
 def _bootstrap_operation_mode_status(
     *,
     runtime_initialized: bool,
@@ -539,6 +611,22 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     blocking_steps = [item for item in onboarding_steps if item["user_action_required"]]
     nonblocking_steps = [item for item in onboarding_steps if not item["user_action_required"]]
     actionable_commands = [item for item in onboarding_steps if isinstance(item.get("command"), str)]
+    crunchyroll_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll"
+    hidive_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive"
+    crunchyroll_guidance = _provider_bootstrap_guidance_status(
+        provider_name="crunchyroll",
+        credentials_present=crunchyroll_credentials_present,
+        session_present=crunchyroll_session_present,
+        transport_ready=dependency_checks["curl_cffi"],
+        bootstrap_command=crunchyroll_bootstrap_command,
+    )
+    hidive_guidance = _provider_bootstrap_guidance_status(
+        provider_name="hidive",
+        credentials_present=hidive_credentials_present,
+        session_present=hidive_session_present,
+        transport_ready=True,
+        bootstrap_command=hidive_bootstrap_command,
+    )
     providers = {
         "crunchyroll": {
             "enabled_by_credentials": crunchyroll_credentials_present,
@@ -555,7 +643,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 )
                 if not present
             ],
-            "bootstrap_command": "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
+            "bootstrap_command": crunchyroll_bootstrap_command,
+            "operation_mode": crunchyroll_guidance["mode"],
+            "operation_guidance": crunchyroll_guidance,
         },
         "hidive": {
             "enabled_by_credentials": hidive_credentials_present,
@@ -571,7 +661,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 )
                 if not present
             ],
-            "bootstrap_command": "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+            "bootstrap_command": hidive_bootstrap_command,
+            "operation_mode": hidive_guidance["mode"],
+            "operation_guidance": hidive_guidance,
         },
     }
 
@@ -686,9 +778,16 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             print("missing_dependencies=" + ", ".join(missing_dependencies))
         for provider_name, provider_payload in providers.items():
             print(f"provider_{provider_name}_ready={provider_payload['ready']}")
+            operation_mode = provider_payload.get("operation_mode")
+            if isinstance(operation_mode, str) and operation_mode:
+                print(f"provider_{provider_name}_operation_mode={operation_mode}")
             missing = provider_payload.get("missing") if isinstance(provider_payload.get("missing"), list) else []
             if missing:
                 print(f"provider_{provider_name}_missing=" + ", ".join(str(item) for item in missing))
+            operation_guidance = provider_payload.get("operation_guidance") if isinstance(provider_payload.get("operation_guidance"), dict) else {}
+            next_command = operation_guidance.get("next_command") if isinstance(operation_guidance.get("next_command"), str) else None
+            if next_command:
+                print(f"provider_{provider_name}_next_command={next_command}")
         for item in onboarding_steps:
             print(f"next_step={item['step']}: {item['details']}")
             command = item.get("command")
