@@ -244,18 +244,41 @@ def _bootstrap_operation_mode_status(
     hidive_credentials_present: bool,
     hidive_session_present: bool,
 ) -> dict[str, object]:
-    provider_state_present = any(
-        (
-            mal_oauth_present,
-            crunchyroll_credentials_present,
-            crunchyroll_session_present,
-            hidive_credentials_present,
-            hidive_session_present,
-        )
+    provider_states = {
+        "crunchyroll": {
+            "credentials_present": crunchyroll_credentials_present,
+            "session_present": crunchyroll_session_present,
+        },
+        "hidive": {
+            "credentials_present": hidive_credentials_present,
+            "session_present": hidive_session_present,
+        },
+    }
+    intended_provider_count = sum(
+        1
+        for payload in provider_states.values()
+        if payload["credentials_present"] or payload["session_present"]
     )
+    ready_provider_count = sum(
+        1
+        for payload in provider_states.values()
+        if payload["credentials_present"] and payload["session_present"]
+    )
+    partially_staged_provider_count = max(0, intended_provider_count - ready_provider_count)
+    unattended_ready = runtime_initialized and mal_oauth_present and intended_provider_count > 0 and partially_staged_provider_count == 0
+
+    base_payload = {
+        "intended_provider_count": intended_provider_count,
+        "ready_provider_count": ready_provider_count,
+        "partially_staged_provider_count": partially_staged_provider_count,
+        "mal_oauth_present": mal_oauth_present,
+        "runtime_initialized": runtime_initialized,
+        "unattended_ready": unattended_ready,
+    }
 
     if not python_available:
         return {
+            **base_payload,
             "mode": "cli-unavailable",
             "manual_foreground_acceptable": False,
             "daemon_preferred": False,
@@ -265,6 +288,7 @@ def _bootstrap_operation_mode_status(
 
     if not systemctl_available:
         return {
+            **base_payload,
             "mode": "manual-only-host",
             "manual_foreground_acceptable": True,
             "daemon_preferred": False,
@@ -272,21 +296,43 @@ def _bootstrap_operation_mode_status(
             "details": "This host does not expose systemctl, so manual foreground CLI operation is the acceptable runtime model here.",
         }
 
-    if not runtime_initialized or not provider_state_present:
+    if not runtime_initialized:
         return {
+            **base_payload,
             "mode": "bootstrap-manual-acceptable",
             "manual_foreground_acceptable": True,
             "daemon_preferred": True,
             "daemon_expected": False,
-            "details": "Manual foreground CLI operation is acceptable during bootstrap and spot checks; install the repo-owned user-systemd daemon once you want unattended background sync.",
+            "details": "Manual foreground CLI operation is acceptable during bootstrap and spot checks; initialize the runtime and install the repo-owned user-systemd daemon once you want unattended background sync.",
+        }
+
+    if intended_provider_count == 0 and not mal_oauth_present:
+        return {
+            **base_payload,
+            "mode": "bootstrap-manual-acceptable",
+            "manual_foreground_acceptable": True,
+            "daemon_preferred": True,
+            "daemon_expected": False,
+            "details": "Manual foreground CLI operation is acceptable during bootstrap and spot checks; no provider intent is staged yet, so finish MAL/provider bootstrap before treating unattended daemon sync as expected.",
+        }
+
+    if not unattended_ready:
+        return {
+            **base_payload,
+            "mode": "bootstrap-provider-staged",
+            "manual_foreground_acceptable": True,
+            "daemon_preferred": True,
+            "daemon_expected": False,
+            "details": "Some bootstrap state is already staged, but unattended daemon sync is not ready yet; finish MAL OAuth and any partially staged provider bootstrap before treating the repo-owned user-systemd daemon as the expected background path.",
         }
 
     return {
+        **base_payload,
         "mode": "daemon-expected-for-unattended",
         "manual_foreground_acceptable": True,
         "daemon_preferred": True,
         "daemon_expected": True,
-        "details": "Bootstrap state is present, so manual foreground CLI runs remain valid for validation/recovery, but the repo-owned user-systemd daemon is the expected path for unattended background sync.",
+        "details": "MAL auth and all currently intended providers are bootstrapped, so manual foreground CLI runs remain valid for validation/recovery, but the repo-owned user-systemd daemon is the expected path for unattended background sync.",
     }
 
 
@@ -590,6 +636,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "actionable_command_count": len(actionable_commands),
             "ready_provider_count": sum(1 for provider in providers.values() if provider["ready"]),
             "provider_count": len(providers),
+            "intended_provider_count": operation_modes.get("intended_provider_count"),
+            "partially_staged_provider_count": operation_modes.get("partially_staged_provider_count"),
             "runtime_initialized": runtime_initialization["ready"],
             "secrets_dir_restrictive": secrets_dir_permissions["restrictive"],
             "automation_installed": automation_installation.get("all_units_installed") if isinstance(automation_installation, dict) else None,
@@ -630,6 +678,10 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
         print(f"nonblocking_step_count={payload['summary']['nonblocking_step_count']}")
         print(f"ready_provider_count={payload['summary']['ready_provider_count']}")
+        if payload["summary"].get("intended_provider_count") is not None:
+            print(f"intended_provider_count={payload['summary']['intended_provider_count']}")
+        if payload["summary"].get("partially_staged_provider_count") is not None:
+            print(f"partially_staged_provider_count={payload['summary']['partially_staged_provider_count']}")
         if missing_dependencies:
             print("missing_dependencies=" + ", ".join(missing_dependencies))
         for provider_name, provider_payload in providers.items():

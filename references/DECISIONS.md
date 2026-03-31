@@ -358,6 +358,20 @@ Extend the built-in fetch-mode task projection defaults so the ordinary unattend
 - a low non-zero incremental default makes cold-start budget gating more honest without forcing operators to pre-tune config or waiting for the first few unattended runs to teach the daemon something it already broadly knows
 - keeping the defaults task-scoped and mode-scoped preserves explainability and leaves room for learned history or host-specific overrides to take over once local evidence exists
 
+## 2026-03-31 - Bootstrap partial-install operation-mode posture
+
+### Decision
+Teach `bootstrap-audit` to distinguish between:
+- untouched bootstrap state where no provider intent is staged yet, and
+- partial installs where MAL auth and/or one or more providers are already partly staged but unattended daemon sync is not fully ready.
+
+Expose provider-intent and partial-bootstrap counts in the audit payload/summary and use a dedicated `bootstrap-provider-staged` operation mode for the latter case.
+
+### Why
+- partial installs are operationally different from fresh untouched ones: the operator has already started enabling real runtime surfaces, so the audit should say that plainly instead of collapsing everything into one generic bootstrap mode
+- automation-friendly consumers need a small machine-readable signal to tell “nothing chosen yet” from “finish the staged provider bootstrap before expecting unattended sync”
+- this keeps the daemon-first posture conservative without pretending that every runtime-initialized install is already ready for unattended background operation
+
 ## 2026-03-26 - Budget-blocked full-refresh downgrade posture
 
 ### Decision

@@ -70,6 +70,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
         self.assertFalse(payload["summary"]["daemon_expected"])
         self.assertEqual("bootstrap-manual-acceptable", payload["operation_modes"]["mode"])
+        self.assertEqual(0, payload["summary"]["intended_provider_count"])
+        self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
         self.assertGreaterEqual(payload["summary"]["actionable_command_count"], 1)
         commands = [item["command"] for item in payload["recommended_commands"] if item.get("command")]
         self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", commands)
@@ -104,6 +106,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("daemon_expected=False", stdout)
         self.assertIn("provider_crunchyroll_ready=False", stdout)
         self.assertIn("provider_crunchyroll_missing=session", stdout)
+        self.assertIn("intended_provider_count=1", stdout)
+        self.assertIn("partially_staged_provider_count=1", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
         self.assertIn(
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
@@ -127,9 +131,55 @@ class BootstrapAuditCliTests(unittest.TestCase):
         payload = json.loads(stdout)
 
         self.assertEqual(0, exit_code)
+        self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
+        self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
+        self.assertFalse(payload["summary"]["daemon_expected"])
+        self.assertEqual("bootstrap-provider-staged", payload["operation_modes"]["mode"])
+        self.assertEqual(0, payload["summary"]["intended_provider_count"])
+        self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
+
+    def test_bootstrap_audit_marks_partial_provider_bootstrap_as_staged_not_ready(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
+        self.assertFalse(payload["summary"]["daemon_expected"])
+        self.assertEqual(1, payload["summary"]["intended_provider_count"])
+        self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
+        self.assertEqual("bootstrap-provider-staged", payload["operation_modes"]["mode"])
+
+    def test_bootstrap_audit_marks_daemon_expected_once_mal_and_intended_provider_state_exist(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
         self.assertEqual("daemon-expected-for-unattended", payload["summary"]["operation_mode"])
         self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
         self.assertTrue(payload["summary"]["daemon_expected"])
+        self.assertEqual(1, payload["summary"]["intended_provider_count"])
+        self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
         self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
 
 
