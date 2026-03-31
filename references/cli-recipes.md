@@ -73,7 +73,9 @@ PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider hidive --limit
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider crunchyroll --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 20 --execute
-PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute
+
+# Unattended daemon posture: keep exact-approved apply runs bounded unless you are deliberately doing a full manual catch-up pass.
 ```
 
 ## Recommendations

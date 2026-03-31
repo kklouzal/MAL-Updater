@@ -358,6 +358,18 @@ Extend the built-in fetch-mode task projection defaults so the ordinary unattend
 - a low non-zero incremental default makes cold-start budget gating more honest without forcing operators to pre-tune config or waiting for the first few unattended runs to teach the daemon something it already broadly knows
 - keeping the defaults task-scoped and mode-scoped preserves explainability and leaves room for learned history or host-specific overrides to take over once local evidence exists
 
+## 2026-03-31 - Bounded unattended `sync_apply` posture
+
+### Decision
+Keep unattended `sync_apply` runs bounded by an explicit execution-limit surface (`service.task_execute_limits`) instead of assuming a full aggregate apply pass.
+
+Also treat a material execution-posture change (for example historical full-pass apply vs bounded unattended batches) as a reason to clear stale projected-request/backoff state for that lane so old pathological history does not keep poisoning future daemon decisions.
+
+### Why
+- an unattended exact-approved apply lane should make steady forward progress without behaving like an all-or-nothing catch-up pass every cycle
+- a single oversized historical apply run should not be able to trap the daemon in near-permanent projected-budget skips once the intended unattended posture becomes smaller and more conservative
+- keeping the bounded batch size explicit and configurable preserves explainability while still allowing hosts with stronger evidence to tune the lane differently later
+
 ## 2026-03-31 - Bootstrap partial-install operation-mode posture
 
 ### Decision

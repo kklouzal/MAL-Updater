@@ -44,6 +44,7 @@ The loader reads:
 - secret file names
 - daemon loop cadence / budget thresholds
 - provider-specific hourly limits and warn/critical cooldown floors for budget pacing
+- task-specific unattended execution posture such as bounded `sync_apply` batch size via `service.task_execute_limits`
 
 Path values in `settings.toml` may be absolute or relative to the settings file location.
 
@@ -67,5 +68,5 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
-PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute
+PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute
 ```
