@@ -4379,23 +4379,103 @@ def _cmd_reopen_review_queue(
     )
 
 
-def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool) -> int:
-    config = load_config(project_root)
+def _run_apply_sync(config, *, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool):
     ensure_directories(config)
     bootstrap_database(config.db_path)
+    return execute_approved_sync(
+        config,
+        limit=_normalize_limit(limit),
+        mapping_limit=mapping_limit,
+        exact_approved_only=exact_approved_only,
+        dry_run=not execute,
+    )
+
+
+def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool) -> int:
+    config = load_config(project_root)
     try:
-        results = execute_approved_sync(
+        results = _run_apply_sync(
             config,
-            limit=_normalize_limit(limit),
+            limit=limit,
             mapping_limit=mapping_limit,
             exact_approved_only=exact_approved_only,
-            dry_run=not execute,
+            execute=execute,
         )
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps([item.as_dict() for item in results], indent=2))
     return 0
+
+
+def _iter_exact_approved_sync_cycle_providers(config) -> list[tuple[str, Path]]:
+    providers: list[tuple[str, Path]] = []
+    crunchyroll_credentials = load_crunchyroll_credentials(config)
+    if crunchyroll_credentials.username and crunchyroll_credentials.password:
+        providers.append(("crunchyroll", config.cache_dir / "live-crunchyroll-snapshot.json"))
+    hidive_credentials = load_hidive_credentials(config)
+    if hidive_credentials.username and hidive_credentials.password:
+        providers.append(("hidive", config.cache_dir / "live-hidive-snapshot.json"))
+    return providers
+
+
+def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+
+    provider_targets = _iter_exact_approved_sync_cycle_providers(config)
+    fetches: list[dict[str, object]] = []
+    for provider_slug, snapshot_path in provider_targets:
+        exit_code = _cmd_provider_fetch_snapshot(
+            config.project_root,
+            provider_slug,
+            "default",
+            snapshot_path,
+            True,
+            full_refresh,
+        )
+        fetches.append(
+            {
+                "provider": provider_slug,
+                "snapshot_path": str(snapshot_path),
+                "full_refresh": full_refresh,
+                "exit_code": exit_code,
+                "status": "ok" if exit_code == 0 else "warning",
+            }
+        )
+
+    try:
+        apply_results = _run_apply_sync(
+            config,
+            limit=0,
+            mapping_limit=5,
+            exact_approved_only=True,
+            execute=True,
+        )
+    except MalApiError as exc:
+        print(str(exc), file=sys.stderr)
+        apply_exit_code = 1
+        apply_payload = {"exact_approved_only": True, "limit": 0, "execute": True, "status": "error", "error": str(exc)}
+    else:
+        apply_exit_code = 0
+        apply_payload = {
+            "exact_approved_only": True,
+            "limit": 0,
+            "execute": True,
+            "status": "ok",
+            "results": [item.as_dict() for item in apply_results],
+        }
+
+    summary = {
+        "status": "ok" if apply_exit_code == 0 and all(item["exit_code"] == 0 for item in fetches) else "ok_with_warnings" if apply_exit_code == 0 else "error",
+        "providers_considered": [provider for provider, _ in provider_targets],
+        "providers_fetched": [item["provider"] for item in fetches],
+        "fetches": fetches,
+        "apply": apply_payload,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if apply_exit_code == 0 else 1
 
 
 def _cmd_recommend(project_root: Path | None, limit: int, flat: bool) -> int:
@@ -4454,6 +4534,15 @@ def build_parser() -> argparse.ArgumentParser:
     service_status.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
     subparsers.add_parser("service-run", help="Run the MAL-Updater daemon loop in the foreground")
     subparsers.add_parser("service-run-once", help="Run one MAL-Updater daemon loop pass and exit")
+    exact_approved_sync_cycle = subparsers.add_parser(
+        "exact-approved-sync-cycle",
+        help="Initialize runtime, refresh all staged provider snapshots, then execute an exact-approved MAL apply cycle",
+    )
+    exact_approved_sync_cycle.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="Request full-refresh provider fetches before the exact-approved MAL apply pass",
+    )
     bootstrap_audit = subparsers.add_parser(
         "bootstrap-audit",
         help="Audit bootstrap/onboarding readiness: dependencies, runtime dirs, credentials, redirect settings, and service install prerequisites",
@@ -4751,6 +4840,8 @@ def main() -> int:
         return _cmd_service_run(args.project_root)
     if args.command == "service-run-once":
         return _cmd_service_run_once(args.project_root)
+    if args.command == "exact-approved-sync-cycle":
+        return _cmd_exact_approved_sync_cycle(args.project_root, args.full_refresh)
     if args.command == "bootstrap-audit":
         return _cmd_bootstrap_audit(args.project_root, args.summary)
     if args.command == "health-check":

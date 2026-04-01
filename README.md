@@ -76,6 +76,7 @@ PYTHONPATH=src python3 -m mal_updater.cli health-check-cycle
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
+PYTHONPATH=src python3 -m mal_updater.cli exact-approved-sync-cycle
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute

@@ -53,9 +53,11 @@ That foreground daemon owns internal recurring lanes for:
 
 ### Transitional wrappers
 
-The daemon still reuses one transitional helper:
+The exact-approved manual sync cycle now also has a repo-native CLI surface:
 
-- `scripts/run_exact_approved_sync_cycle.sh`
+- `python3 -m mal_updater.cli exact-approved-sync-cycle`
+
+`scripts/run_exact_approved_sync_cycle.sh` remains only as a thin compatibility wrapper around that CLI command.
 
 Health-cycle execution now also exists as a repo-native CLI command:
 

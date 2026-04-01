@@ -66,15 +66,19 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 - parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
 - a terse `service-status --format summary` view for quick operator checks and log-friendly output
 
-## Legacy wrappers still reused by the daemon
+## Repo-native manual cycle commands and compatibility wrappers
 
-The daemon currently reuses these guarded wrapper scripts for some lanes:
+The daemon-first unattended model now keeps both maintenance lanes on repo-native CLI surfaces:
 
-- `scripts/run_exact_approved_sync_cycle.sh`
+- `python3 -m mal_updater.cli exact-approved-sync-cycle` (manual guarded fetch+apply cycle across all staged providers)
 - `python3 -m mal_updater.cli health-check-cycle` (repo-native health lane)
-- `scripts/run_health_check_cycle.sh` (thin compatibility wrapper around the CLI command)
 
-Those still write runtime artifacts under `.MAL-Updater/state/` and `.MAL-Updater/cache/`, but they are now subordinate to the daemon-first orchestration model.
+Compatibility wrappers still exist:
+
+- `scripts/run_exact_approved_sync_cycle.sh` → thin shim to `exact-approved-sync-cycle`
+- `scripts/run_health_check_cycle.sh` → thin shim to `health-check-cycle`
+
+Those commands still write runtime artifacts under `.MAL-Updater/state/` and `.MAL-Updater/cache/`, but they are subordinate to the daemon-first orchestration model.
 
 ## Recommended bootstrap order
 
