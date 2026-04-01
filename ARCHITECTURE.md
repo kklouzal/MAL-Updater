@@ -53,12 +53,15 @@ That foreground daemon owns internal recurring lanes for:
 
 ### Transitional wrappers
 
-The daemon currently still reuses:
+The daemon still reuses one transitional helper:
 
 - `scripts/run_exact_approved_sync_cycle.sh`
-- `scripts/run_health_check_cycle.sh`
 
-Those wrappers are subordinate helpers now, not the primary scheduling model.
+Health-cycle execution now also exists as a repo-native CLI command:
+
+- `python3 -m mal_updater.cli health-check-cycle`
+
+`scripts/run_health_check_cycle.sh` remains only as a thin compatibility wrapper around that CLI surface, not as the daemon's primary execution path.
 
 ## Bootstrap model
 

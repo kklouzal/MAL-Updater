@@ -844,7 +844,11 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
                 result["apply_limit"] = max(0, int(apply_limit))
             elif spec.name == "health":
-                result = _run_subprocess(config, [str(config.project_root / "scripts" / "run_health_check_cycle.sh")], label="health")
+                result = _run_subprocess(
+                    config,
+                    ["python3", "-m", "mal_updater.cli", "--project-root", str(config.project_root), "health-check-cycle"],
+                    label="health",
+                )
             else:
                 result = {"status": "skipped", "reason": "unknown_task"}
             finished_epoch = time.time()

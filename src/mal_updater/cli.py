@@ -4467,6 +4467,11 @@ def build_parser() -> argparse.ArgumentParser:
     health_check.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
     health_check.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved provider->MAL mapping coverage falls below this ratio (default: 0.8)")
     health_check.add_argument("--maintenance-review-limit", type=int, default=25, help="When coverage is low, cap the auto-recommended review-mappings series scan to this many series (use 0 for all)")
+    health_check_cycle = subparsers.add_parser("health-check-cycle", help="Run the repo-native health-check cycle with optional safe auto-remediation and summary output")
+    health_check_cycle.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
+    health_check_cycle.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present in the final summary")
+    health_check_cycle.add_argument("--auto-run-recommended", action="store_true", help="Automatically run one allowlisted automation-safe maintenance command when recommended")
+    health_check_cycle.add_argument("--auto-run-reason-codes", default="refresh_ingested_snapshot,refresh_full_snapshot", help="Comma-separated allowlist of maintenance reason codes eligible for auto-remediation")
     mal_auth = subparsers.add_parser("mal-auth-url", help="Generate a MAL OAuth authorization URL + PKCE verifier")
     mal_auth.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     mal_auth_login = subparsers.add_parser("mal-auth-login", help="Run a local loopback MAL OAuth flow and persist returned tokens")
@@ -4758,6 +4763,21 @@ def main() -> int:
             args.format,
             args.mapping_coverage_threshold,
             args.maintenance_review_limit,
+        )
+    if args.command == "health-check-cycle":
+        from mal_updater.health_cycle import run_health_check_cycle
+
+        allow_reason_codes = {
+            item.strip()
+            for item in args.auto_run_reason_codes.split(",")
+            if item.strip()
+        }
+        return run_health_check_cycle(
+            load_config(args.project_root),
+            stale_hours=args.stale_hours,
+            strict=args.strict,
+            auto_run_recommended=args.auto_run_recommended,
+            auto_run_reason_codes=allow_reason_codes,
         )
     if args.command == "mal-auth-url":
         return _cmd_mal_auth_url(args.project_root, args.json)

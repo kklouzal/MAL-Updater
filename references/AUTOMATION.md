@@ -71,7 +71,8 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 The daemon currently reuses these guarded wrapper scripts for some lanes:
 
 - `scripts/run_exact_approved_sync_cycle.sh`
-- `scripts/run_health_check_cycle.sh`
+- `python3 -m mal_updater.cli health-check-cycle` (repo-native health lane)
+- `scripts/run_health_check_cycle.sh` (thin compatibility wrapper around the CLI command)
 
 Those still write runtime artifacts under `.MAL-Updater/state/` and `.MAL-Updater/cache/`, but they are now subordinate to the daemon-first orchestration model.
 

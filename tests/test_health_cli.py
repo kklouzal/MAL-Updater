@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shlex
 import tempfile
 import unittest
@@ -42,6 +43,22 @@ class HealthCheckCliTests(unittest.TestCase):
     def _run_health_check(self, *args: str) -> tuple[int, dict[str, object]]:
         exit_code, stdout = self._run_health_check_raw(*args)
         return exit_code, json.loads(stdout)
+
+    def _run_health_check_cycle_raw(self, *args: str) -> tuple[int, str]:
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "health-check-cycle",
+            *args,
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.project_root / ".config")}, clear=False),
+        ):
+            exit_code = cli_main()
+        return exit_code, stdout.getvalue()
 
     def _provision_repo_owned_automation_assets(self) -> None:
         source_dir = self.project_root / "ops" / "systemd-user"
@@ -95,6 +112,46 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIsNone(payload["review_queue"]["recommended_next"])
         self.assertEqual([], payload["review_queue"]["recommended_worklist"])
         self.assertIsNone(payload["review_queue"]["recommended_apply_worklist"])
+
+    def test_health_check_cycle_can_run_direct_install_script_commands(self) -> None:
+        self._provision_repo_owned_automation_assets()
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("secret\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        crunchyroll_state = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (crunchyroll_state / "sync_boundary.json").write_text("{}\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "series-1", "Example Show", "Example Show", 1, "{}"),
+            )
+            conn.execute(
+                "INSERT INTO mal_series_mapping(provider, provider_series_id, mal_anime_id, confidence, mapping_source, approved_by_user, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "series-1", 1001, 0.99, "auto_exact", 1, None),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+                ("crunchyroll", "1.0", "ingest_snapshot", "completed", json.dumps({"series_count": 1}, sort_keys=True)),
+            )
+            conn.commit()
+
+        exit_code, stdout = self._run_health_check_cycle_raw(
+            "--auto-run-recommended",
+            "--auto-run-reason-codes",
+            "install_user_systemd_service",
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("auto_remediation_reason_code=install_user_systemd_service", stdout)
+        self.assertIn("auto_remediation_command=", stdout)
+        self.assertNotIn("auto_remediation_action=skipped_not_allowlisted", stdout)
+        self.assertTrue(self.config.health_latest_json_path.exists())
 
     def test_health_check_recommends_crunchyroll_reauth_after_repeated_auth_failures(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")

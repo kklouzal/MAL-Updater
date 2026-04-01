@@ -302,6 +302,40 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         self.assertEqual("auth", sync_state["failure_backoff_class"])
 
 
+class ServiceRuntimeHealthCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.project_root = Path(self.temp_dir.name)
+        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
+        self.config = load_config(self.project_root)
+        ensure_directories(self.config)
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 0
+        self.config.service.mal_refresh_every_seconds = 3600
+
+    def test_run_pending_tasks_uses_repo_native_health_check_cycle_command(self) -> None:
+        with patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual(
+            [
+                "python3",
+                "-m",
+                "mal_updater.cli",
+                "--project-root",
+                str(self.project_root),
+                "health-check-cycle",
+            ],
+            run_subprocess.call_args.args[1],
+        )
+        health_result = next(item for item in result["results"] if item["task"] == "health")
+        self.assertEqual("ok", health_result["status"])
+
+
 class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
