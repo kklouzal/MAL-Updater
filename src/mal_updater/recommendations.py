@@ -58,6 +58,7 @@ class Recommendation:
     provider_series_id: str
     title: str
     season_title: str | None
+    provider: str | None = None
     reasons: list[str] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
 
@@ -65,6 +66,7 @@ class Recommendation:
         return {
             "kind": self.kind,
             "priority": self.priority,
+            "provider": self.provider,
             "provider_series_id": self.provider_series_id,
             "title": self.title,
             "season_title": self.season_title,
@@ -156,10 +158,10 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
 
 def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Recommendation]:
     states = load_provider_series_states(config, limit=None)
-    state_by_id = {state.provider_series_id: state for state in states}
+    state_by_id = {(state.provider, state.provider_series_id): state for state in states}
     mapping_by_series = {
-        mapping.provider_series_id: int(mapping.mal_anime_id)
-        for mapping in list_series_mappings(config.db_path, provider="crunchyroll", approved_only=False)
+        (mapping.provider, mapping.provider_series_id): int(mapping.mal_anime_id)
+        for mapping in list_series_mappings(config.db_path, approved_only=False)
     }
     metadata_by_id = get_mal_anime_metadata_map(config.db_path)
     relations_by_id = get_mal_anime_relations_map(config.db_path)
@@ -223,11 +225,13 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
             Recommendation(
                 kind=kind,
                 priority=priority,
+                provider=state.provider,
                 provider_series_id=state.provider_series_id,
                 title=state.title,
                 season_title=state.season_title,
                 reasons=reasons,
                 context={
+                    "provider": state.provider,
                     "completed_episode_count": state.completed_episode_count,
                     "max_episode_number": state.max_episode_number,
                     "max_completed_episode_number": state.max_completed_episode_number,
@@ -291,9 +295,9 @@ def _freshness_boost(last_watched_at: str | None, kind: str) -> int:
 
 
 def _dedupe_recommendations(items: list[Recommendation]) -> list[Recommendation]:
-    best: dict[tuple[str, str], Recommendation] = {}
+    best: dict[tuple[str, str, str], Recommendation] = {}
     for item in items:
-        key = (item.kind, item.provider_series_id)
+        key = (item.kind, item.provider or "", item.provider_series_id)
         existing = best.get(key)
         if existing is None or item.priority > existing.priority:
             best[key] = item
@@ -388,14 +392,14 @@ _DISCOVERY_FRANCHISE_RELATION_TYPES = frozenset(
 def _build_discovery_recommendations(
     states: list[ProviderSeriesState],
     *,
-    mapping_by_series: dict[str, int],
+    mapping_by_series: dict[tuple[str, str], int],
     metadata_by_id: dict[int, Any],
     relations_by_id: dict[int, list[Any]],
     recommendation_edges_by_id: dict[int, list[Any]],
 ) -> list[Recommendation]:
     seed_weights: dict[int, int] = {}
     for state in states:
-        mal_anime_id = mapping_by_series.get(state.provider_series_id)
+        mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
         if mal_anime_id is None:
             continue
         if state.watchlist_status == "fully_watched":
@@ -517,6 +521,7 @@ def _build_discovery_recommendations(
             Recommendation(
                 kind="discovery_candidate",
                 priority=priority,
+                provider="mal",
                 provider_series_id=f"mal:{target_id}",
                 title=title,
                 season_title=None,
@@ -546,17 +551,21 @@ def _build_discovery_recommendations(
 def _build_relation_backed_new_season_recommendations(
     states: list[ProviderSeriesState],
     *,
-    state_by_id: dict[str, ProviderSeriesState],
-    mapping_by_series: dict[str, int],
+    state_by_id: dict[tuple[str, str], ProviderSeriesState],
+    mapping_by_series: dict[tuple[str, str], int],
     metadata_by_id: dict[int, Any],
     relations_by_id: dict[int, list[Any]],
 ) -> list[Recommendation]:
     items: list[Recommendation] = []
-    series_by_anime_id = {anime_id: state_by_id[sid] for sid, anime_id in mapping_by_series.items() if sid in state_by_id}
+    series_by_anime_id: dict[int, list[ProviderSeriesState]] = defaultdict(list)
+    for series_key, anime_id in mapping_by_series.items():
+        state = state_by_id.get(series_key)
+        if state is not None:
+            series_by_anime_id.setdefault(anime_id, []).append(state)
     sequel_relation_types = {"sequel"}
     predecessor_relation_types = {"prequel", "parent_story"}
     for state in states:
-        current_anime_id = mapping_by_series.get(state.provider_series_id)
+        current_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
         if current_anime_id is None:
             continue
         if not _is_english_dub_series(state):
@@ -566,8 +575,9 @@ def _build_relation_backed_new_season_recommendations(
         for relation in relations:
             if relation.relation_type not in predecessor_relation_types:
                 continue
-            predecessor_state = series_by_anime_id.get(relation.related_mal_anime_id)
-            if predecessor_state is None or not _series_counts_as_completed(predecessor_state):
+            predecessor_candidates = series_by_anime_id.get(relation.related_mal_anime_id, [])
+            predecessor_state = next((item for item in predecessor_candidates if _series_counts_as_completed(item)), None)
+            if predecessor_state is None:
                 continue
             best_predecessor = predecessor_state
             break
@@ -577,6 +587,7 @@ def _build_relation_backed_new_season_recommendations(
                 Recommendation(
                     kind="new_season",
                     priority=110,
+                    provider=state.provider,
                     provider_series_id=state.provider_series_id,
                     title=state.title,
                     season_title=state.season_title,
@@ -585,6 +596,7 @@ def _build_relation_backed_new_season_recommendations(
                         f"MAL relation metadata links this title as a continuation after {best_predecessor.season_title or best_predecessor.title}",
                     ],
                     context={
+                        "provider": state.provider,
                         "relation_backed": True,
                         "mal_anime_id": current_anime_id,
                         "metadata_title": title_hint,
@@ -599,32 +611,36 @@ def _build_relation_backed_new_season_recommendations(
             for relation in relations:
                 if relation.relation_type not in sequel_relation_types:
                     continue
-                sequel_state = series_by_anime_id.get(relation.related_mal_anime_id)
-                if sequel_state is None or not _is_english_dub_series(sequel_state):
-                    continue
-                if sequel_state.completed_episode_count > 0:
-                    continue
-                title_hint = metadata_by_id.get(relation.related_mal_anime_id).title if relation.related_mal_anime_id in metadata_by_id else sequel_state.title
-                items.append(
-                    Recommendation(
-                        kind="new_season",
-                        priority=112,
-                        provider_series_id=sequel_state.provider_series_id,
-                        title=sequel_state.title,
-                        season_title=sequel_state.season_title,
-                        reasons=[
-                            "English dub is available",
-                            f"MAL relation metadata links this as a sequel to {state.season_title or state.title}",
-                        ],
-                        context={
-                            "relation_backed": True,
-                            "mal_anime_id": relation.related_mal_anime_id,
-                            "metadata_title": title_hint,
-                            "predecessor_provider_series_id": state.provider_series_id,
-                            "predecessor_title": state.season_title or state.title,
-                        },
+                sequel_candidates = series_by_anime_id.get(relation.related_mal_anime_id, [])
+                for sequel_state in sequel_candidates:
+                    if not _is_english_dub_series(sequel_state):
+                        continue
+                    if sequel_state.completed_episode_count > 0:
+                        continue
+                    title_hint = metadata_by_id.get(relation.related_mal_anime_id).title if relation.related_mal_anime_id in metadata_by_id else sequel_state.title
+                    items.append(
+                        Recommendation(
+                            kind="new_season",
+                            priority=112,
+                            provider=sequel_state.provider,
+                            provider_series_id=sequel_state.provider_series_id,
+                            title=sequel_state.title,
+                            season_title=sequel_state.season_title,
+                            reasons=[
+                                "English dub is available",
+                                f"MAL relation metadata links this as a sequel to {state.season_title or state.title}",
+                            ],
+                            context={
+                                "provider": sequel_state.provider,
+                                "relation_backed": True,
+                                "mal_anime_id": relation.related_mal_anime_id,
+                                "metadata_title": title_hint,
+                                "predecessor_provider_series_id": state.provider_series_id,
+                                "predecessor_title": state.season_title or state.title,
+                                "predecessor_provider": state.provider,
+                            },
+                        )
                     )
-                )
     return items
 
 
@@ -657,7 +673,7 @@ def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list
                 f"a later season appears available after completing {predecessor.season_title or predecessor.title}",
             ]
             if state.watchlist_status:
-                reasons.append(f"Crunchyroll watchlist status: {state.watchlist_status}")
+                reasons.append(f"{state.provider.title()} watchlist status: {state.watchlist_status}")
             priority = 100 - min(max(installment - 1, 0), 10)
             if state.completed_episode_count <= 0:
                 priority += 5
@@ -665,11 +681,13 @@ def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list
                 Recommendation(
                     kind="new_season",
                     priority=priority,
+                    provider=state.provider,
                     provider_series_id=state.provider_series_id,
                     title=state.title,
                     season_title=state.season_title,
                     reasons=reasons,
                     context={
+                        "provider": state.provider,
                         "installment_index": installment,
                         "predecessor_provider_series_id": predecessor.provider_series_id,
                         "predecessor_title": predecessor.season_title or predecessor.title,

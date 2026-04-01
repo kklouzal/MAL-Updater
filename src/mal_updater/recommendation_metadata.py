@@ -48,7 +48,7 @@ def refresh_recommendation_metadata(
     include_discovery_targets: bool = False,
     discovery_target_limit: int | None = None,
 ) -> MetadataRefreshSummary:
-    mappings = list_series_mappings(config.db_path, provider="crunchyroll", approved_only=False)
+    mappings = list_series_mappings(config.db_path, approved_only=False)
     anime_ids = sorted({int(mapping.mal_anime_id) for mapping in mappings})
     if limit is not None and limit > 0:
         anime_ids = anime_ids[:limit]

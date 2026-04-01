@@ -42,22 +42,23 @@ class RecommendationTests(unittest.TestCase):
         season_title: str | None = None,
         season_number: int | None = None,
         watchlist_status: str | None = None,
+        provider: str = "crunchyroll",
     ) -> None:
         with connect(self.config.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO provider_series (provider, provider_series_id, title, season_title, season_number, raw_json)
-                VALUES ('crunchyroll', ?, ?, ?, ?, '{}')
+                VALUES (?, ?, ?, ?, ?, '{}')
                 """,
-                (provider_series_id, title, season_title, season_number),
+                (provider, provider_series_id, title, season_title, season_number),
             )
             if watchlist_status is not None:
                 conn.execute(
                     """
                     INSERT INTO provider_watchlist (provider, provider_series_id, status, raw_json)
-                    VALUES ('crunchyroll', ?, ?, '{}')
+                    VALUES (?, ?, ?, '{}')
                     """,
-                    (provider_series_id, watchlist_status),
+                    (provider, provider_series_id, watchlist_status),
                 )
             conn.commit()
 
@@ -69,6 +70,7 @@ class RecommendationTests(unittest.TestCase):
         episode_number: int,
         completion_ratio: float,
         last_watched_at: str,
+        provider: str = "crunchyroll",
     ) -> None:
         with connect(self.config.db_path) as conn:
             conn.execute(
@@ -81,16 +83,16 @@ class RecommendationTests(unittest.TestCase):
                     completion_ratio,
                     last_watched_at,
                     raw_json
-                ) VALUES ('crunchyroll', ?, ?, ?, ?, ?, '{}')
+                ) VALUES (?, ?, ?, ?, ?, ?, '{}')
                 """,
-                (provider_episode_id, provider_series_id, episode_number, completion_ratio, last_watched_at),
+                (provider, provider_episode_id, provider_series_id, episode_number, completion_ratio, last_watched_at),
             )
             conn.commit()
 
-    def _map_series(self, provider_series_id: str, mal_anime_id: int) -> None:
+    def _map_series(self, provider_series_id: str, mal_anime_id: int, *, provider: str = "crunchyroll") -> None:
         upsert_series_mapping(
             self.config.db_path,
-            provider="crunchyroll",
+            provider=provider,
             provider_series_id=provider_series_id,
             mal_anime_id=mal_anime_id,
             confidence=1.0,
@@ -185,6 +187,81 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("new_season", item.kind)
         self.assertEqual("season-2", item.provider_series_id)
         self.assertEqual("season-1", item.context["predecessor_provider_series_id"])
+
+    def test_relation_backed_new_season_recommendation_uses_hidive_mapping_context(self) -> None:
+        self._insert_series(
+            "hidive-s1",
+            title="HIDIVE Show",
+            season_title="HIDIVE Show (English Dub)",
+            watchlist_status="fully_watched",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hidive-s1",
+            "hidive-s1-ep-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-01T01:00:00Z",
+            provider="hidive",
+        )
+        self._insert_series(
+            "hidive-s2",
+            title="HIDIVE Show Season 2",
+            season_title="HIDIVE Show Season 2 (English Dub)",
+            watchlist_status="never_watched",
+            provider="hidive",
+        )
+        self._map_series("hidive-s1", 5100, provider="hidive")
+        self._map_series("hidive-s2", 5200, provider="hidive")
+        self._cache_metadata(5100, title="HIDIVE Show")
+        self._cache_metadata(5200, title="HIDIVE Show Season 2")
+        self._cache_relations(
+            5100,
+            [
+                {
+                    "related_mal_anime_id": 5200,
+                    "relation_type": "sequel",
+                    "relation_type_formatted": "Sequel",
+                    "related_title": "HIDIVE Show Season 2",
+                    "raw": {"relation_type": "sequel", "node": {"id": 5200, "title": "HIDIVE Show Season 2"}},
+                }
+            ],
+        )
+
+        results = build_recommendations(self.config, limit=0)
+
+        items = [item for item in results if item.provider == "hidive" and item.provider_series_id == "hidive-s2" and item.kind == "new_season"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("hidive", items[0].context["provider"])
+        self.assertEqual("hidive-s1", items[0].context["predecessor_provider_series_id"])
+
+    def test_discovery_candidate_can_be_seeded_from_hidive_mapping(self) -> None:
+        self._insert_series(
+            "hidive-seed",
+            title="HIDIVE Seed",
+            season_title="HIDIVE Seed (English Dub)",
+            watchlist_status="fully_watched",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hidive-seed",
+            "hidive-seed-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-01T01:00:00Z",
+            provider="hidive",
+        )
+        self._map_series("hidive-seed", 7100, provider="hidive")
+        self._cache_metadata(7100, title="HIDIVE Seed", genres=["Sci-Fi"])
+        self._cache_metadata(7200, title="HIDIVE Discovery", genres=["Sci-Fi"], mean=8.2, popularity=300)
+        self._cache_recommendations(7100, [{"target_mal_anime_id": 7200, "target_title": "HIDIVE Discovery", "num_recommendations": 18, "raw": {}}])
+
+        results = build_recommendations(self.config, limit=0)
+
+        discovery = [item for item in results if item.kind == "discovery_candidate" and item.provider_series_id == "mal:7200"]
+        self.assertEqual(1, len(discovery))
+        self.assertEqual("mal", discovery[0].provider)
+        self.assertEqual([7100], discovery[0].context["supporting_mal_anime_ids"])
 
     def test_relation_backed_new_season_recommendation_detects_title_drift(self) -> None:
         self._insert_series(
@@ -629,6 +706,73 @@ class RecommendationTests(unittest.TestCase):
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
         self.assertEqual([], results)
+
+    def test_discovery_target_metadata_refresh_considers_hidive_mappings(self) -> None:
+        self._insert_series(
+            "hidive-seed",
+            title="HIDIVE Seed",
+            season_title="HIDIVE Seed (English Dub)",
+            watchlist_status="fully_watched",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hidive-seed",
+            "hidive-seed-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-01T01:00:00Z",
+            provider="hidive",
+        )
+        self._map_series("hidive-seed", 9100, provider="hidive")
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "") -> dict:
+            payloads = {
+                9100: {
+                    "id": 9100,
+                    "title": "HIDIVE Seed",
+                    "alternative_titles": {},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "mean": 8.1,
+                    "popularity": 500,
+                    "start_season": {"year": 2020, "season": "winter"},
+                    "related_anime": [],
+                    "recommendations": [
+                        {"node": {"id": 9200, "title": "HIDIVE Discovery"}, "num_recommendations": 20},
+                    ],
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+                },
+                9200: {
+                    "id": 9200,
+                    "title": "HIDIVE Discovery",
+                    "alternative_titles": {"en": "HIDIVE Discovery"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 24,
+                    "mean": 8.7,
+                    "popularity": 120,
+                    "start_season": {"year": 2022, "season": "fall"},
+                    "my_list_status": {"status": "plan_to_watch", "num_episodes_watched": 0},
+                },
+            }
+            return payloads[anime_id]
+
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details) as get_details:
+            summary = refresh_recommendation_metadata(
+                self.config,
+                include_discovery_targets=True,
+                discovery_target_limit=1,
+            )
+
+        self.assertEqual(1, summary.considered)
+        self.assertEqual(1, summary.refreshed)
+        requested_ids = [call.args[0] for call in get_details.call_args_list]
+        self.assertEqual([9100, 9200], requested_ids)
+
+        metadata_by_id = get_mal_anime_metadata_map(self.config.db_path)
+        self.assertIn(9100, metadata_by_id)
+        self.assertIn(9200, metadata_by_id)
 
     def test_discovery_target_metadata_refresh_persists_my_list_status_and_suppresses_candidate(self) -> None:
         self._insert_series(
