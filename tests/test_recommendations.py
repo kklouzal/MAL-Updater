@@ -1171,6 +1171,12 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("cr-s2", item.provider_series_id)
         self.assertTrue(item.context["cross_provider_merged"])
         self.assertEqual(["crunchyroll", "hidive"], item.context["available_via_providers"])
+        self.assertEqual(["crunchyroll", "hidive"], item.available_providers())
+        serialized = item.as_dict()
+        self.assertEqual(["crunchyroll", "hidive"], serialized["providers"])
+        self.assertEqual(2, serialized["provider_count"])
+        self.assertTrue(serialized["multi_provider"])
+        self.assertEqual("Crunchyroll + HIDIVE", serialized["provider_label"])
         self.assertEqual("hidive", item.context["alternate_provider_series"][0]["provider"])
         self.assertEqual("hd-s2", item.context["alternate_provider_series"][0]["provider_series_id"])
 
@@ -1252,7 +1258,63 @@ class RecommendationTests(unittest.TestCase):
         self.assertTrue(grouped[0]["mixed_providers"])
         self.assertEqual(["crunchyroll", "hidive"], grouped[0]["providers"])
         self.assertEqual({"crunchyroll": 1, "hidive": 1}, grouped[0]["provider_counts"])
+        self.assertEqual("Crunchyroll + HIDIVE", grouped[0]["provider_label"])
+        self.assertEqual(0, grouped[0]["multi_provider_item_count"])
         self.assertIn("multiple providers", grouped[0]["mixed_provider_note"])
+
+    def test_group_recommendations_marks_merged_cross_provider_items_as_mixed_sections(self) -> None:
+        grouped = group_recommendations(
+            [
+                Recommendation(
+                    kind="new_season",
+                    priority=100,
+                    provider="crunchyroll",
+                    provider_series_id="cr-next",
+                    title="Next Season Show",
+                    season_title="Next Season Show Season 2 (English Dub)",
+                    context={
+                        "cross_provider_merged": True,
+                        "available_via_providers": ["crunchyroll", "hidive"],
+                    },
+                )
+            ]
+        )
+
+        self.assertEqual(1, len(grouped))
+        self.assertEqual("continue_next", grouped[0]["key"])
+        self.assertTrue(grouped[0]["mixed_providers"])
+        self.assertEqual(["crunchyroll", "hidive"], grouped[0]["providers"])
+        self.assertEqual({"crunchyroll": 1, "hidive": 1}, grouped[0]["provider_counts"])
+        self.assertEqual("Crunchyroll + HIDIVE", grouped[0]["provider_label"])
+        self.assertEqual(1, grouped[0]["multi_provider_item_count"])
+        self.assertEqual(["crunchyroll", "hidive"], grouped[0]["items"][0]["providers"])
+        self.assertTrue(grouped[0]["items"][0]["multi_provider"])
+
+    def test_group_recommendations_prefers_broader_availability_when_priorities_tie(self) -> None:
+        grouped = group_recommendations(
+            [
+                Recommendation(
+                    kind="new_season",
+                    priority=100,
+                    provider="hidive",
+                    provider_series_id="hd-only",
+                    title="Shared Priority",
+                    season_title="Shared Priority Season 2",
+                ),
+                Recommendation(
+                    kind="new_season",
+                    priority=100,
+                    provider="crunchyroll",
+                    provider_series_id="cr-multi",
+                    title="Shared Priority",
+                    season_title="Shared Priority Season 2",
+                    context={"available_via_providers": ["crunchyroll", "hidive"]},
+                ),
+            ]
+        )
+
+        self.assertEqual("cr-multi", grouped[0]["items"][0]["provider_series_id"])
+        self.assertEqual("hd-only", grouped[0]["items"][1]["provider_series_id"])
 
     def test_group_recommendations_keeps_unknown_kinds_under_other(self) -> None:
         grouped = group_recommendations(

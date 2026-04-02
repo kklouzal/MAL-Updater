@@ -83,7 +83,7 @@ PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 ```
 
-Grouped recommendation output now includes per-section provider metadata (`providers`, `provider_counts`, `mixed_providers`) so operators can see when a section mixes Crunchyroll/HIDIVE/MAL-derived items. Equivalent mapped continue/episode recommendations that appear from multiple source providers are also merged conservatively into one primary item with alternate-provider context instead of emitting duplicate operator alerts.
+Grouped recommendation output now includes per-section provider metadata (`providers`, `provider_counts`, `provider_label`, `mixed_providers`, `multi_provider_item_count`) so operators can see when a section mixes Crunchyroll/HIDIVE/MAL-derived items or contains merged cross-provider availability. Individual recommendation items now also expose effective availability fields (`providers`, `provider_count`, `multi_provider`, `provider_label`) rather than only the surviving primary provider. Equivalent mapped continue/episode recommendations that appear from multiple source providers are also merged conservatively into one primary item with alternate-provider context instead of emitting duplicate operator alerts.
 
 The full command cookbook lives in `references/cli-recipes.md`.
 

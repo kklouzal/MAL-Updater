@@ -62,11 +62,26 @@ class Recommendation:
     reasons: list[str] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
 
+    def available_providers(self) -> list[str]:
+        raw = self.context.get("available_via_providers")
+        if isinstance(raw, list):
+            providers = sorted({value for value in raw if isinstance(value, str) and value.strip()})
+            if providers:
+                return providers
+        if isinstance(self.provider, str) and self.provider.strip():
+            return [self.provider]
+        return ["unknown"]
+
     def as_dict(self) -> dict[str, Any]:
+        providers = self.available_providers()
         return {
             "kind": self.kind,
             "priority": self.priority,
             "provider": self.provider,
+            "providers": providers,
+            "provider_count": len(providers),
+            "multi_provider": len(providers) > 1,
+            "provider_label": _format_provider_label(providers),
             "provider_series_id": self.provider_series_id,
             "title": self.title,
             "season_title": self.season_title,
@@ -111,20 +126,39 @@ _RECOMMENDATION_SECTIONS: tuple[RecommendationSectionDefinition, ...] = (
 )
 
 
+_PROVIDER_DISPLAY_NAMES = {
+    "crunchyroll": "Crunchyroll",
+    "hidive": "HIDIVE",
+    "mal": "MyAnimeList",
+    "unknown": "Unknown",
+}
+
+
+def _format_provider_label(providers: list[str]) -> str:
+    names = [_PROVIDER_DISPLAY_NAMES.get(provider, provider.replace("_", " ").title()) for provider in providers]
+    return " + ".join(names)
+
+
 def _section_provider_metadata(items: list[Recommendation]) -> dict[str, Any]:
     provider_counts: dict[str, int] = {}
+    multi_provider_item_count = 0
     for item in items:
-        provider = item.provider or "unknown"
-        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+        providers = item.available_providers()
+        if len(providers) > 1:
+            multi_provider_item_count += 1
+        for provider in providers:
+            provider_counts[provider] = provider_counts.get(provider, 0) + 1
     providers = sorted(provider_counts)
     mixed = len(providers) > 1
     payload: dict[str, Any] = {
         "providers": providers,
         "provider_counts": provider_counts,
+        "provider_label": _format_provider_label(providers),
         "mixed_providers": mixed,
+        "multi_provider_item_count": multi_provider_item_count,
     }
     if mixed:
-        payload["mixed_provider_note"] = "This section contains recommendations from multiple providers."
+        payload["mixed_provider_note"] = "This section contains recommendations available across multiple providers."
     return payload
 
 
@@ -142,7 +176,9 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
             consumed_kinds.add(kind)
         if not section_items:
             continue
-        section_items.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
+        section_items.sort(
+            key=lambda item: (-item.priority, -len(item.available_providers()), item.title.lower(), item.provider_series_id)
+        )
         sections.append(
             {
                 "key": section.key,
@@ -160,7 +196,9 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
         if item.kind not in consumed_kinds:
             remaining_items.append(item)
     if remaining_items:
-        remaining_items.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
+        remaining_items.sort(
+            key=lambda item: (-item.priority, -len(item.available_providers()), item.title.lower(), item.provider_series_id)
+        )
         sections.append(
             {
                 "key": "other",
