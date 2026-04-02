@@ -149,9 +149,10 @@ class RecommendationTests(unittest.TestCase):
             season_number=2,
             watchlist_status="in_progress",
         )
-        self._insert_progress("series-1", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-10T01:00:00Z")
-        self._insert_progress("series-1", "ep-2", episode_number=2, completion_ratio=1.0, last_watched_at="2026-03-10T02:00:00Z")
-        self._insert_progress("series-1", "ep-3", episode_number=3, completion_ratio=0.2, last_watched_at="2026-03-11T02:00:00Z")
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_progress("series-1", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-2", episode_number=2, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-3", episode_number=3, completion_ratio=0.2, last_watched_at=recent)
 
         results = build_recommendations(self.config, limit=0)
 
@@ -1125,12 +1126,61 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual([], results)
 
+    def test_cross_provider_duplicate_new_season_recommendations_merge_by_mapped_mal_target(self) -> None:
+        self._insert_series(
+            "cr-s1",
+            title="Shared Franchise",
+            season_title="Shared Franchise (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "cr-s1",
+            "cr-s1-ep-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-01T01:00:00Z",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "cr-s2",
+            title="Shared Franchise",
+            season_title="Shared Franchise Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="never_watched",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "hd-s2",
+            title="Shared Franchise",
+            season_title="Shared Franchise Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+        self._map_series("cr-s1", 6100, provider="crunchyroll")
+        self._map_series("cr-s2", 6200, provider="crunchyroll")
+        self._map_series("hd-s2", 6200, provider="hidive")
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "new_season"]
+
+        self.assertEqual(1, len(results))
+        item = results[0]
+        self.assertEqual("crunchyroll", item.provider)
+        self.assertEqual("cr-s2", item.provider_series_id)
+        self.assertTrue(item.context["cross_provider_merged"])
+        self.assertEqual(["crunchyroll", "hidive"], item.context["available_via_providers"])
+        self.assertEqual("hidive", item.context["alternate_provider_series"][0]["provider"])
+        self.assertEqual("hd-s2", item.context["alternate_provider_series"][0]["provider_series_id"])
+
     def test_group_recommendations_splits_known_kinds_into_named_sections(self) -> None:
         grouped = group_recommendations(
             [
                 Recommendation(
                     kind="resume_backlog",
                     priority=20,
+                    provider="hidive",
                     provider_series_id="series-backlog",
                     title="Backlog Show",
                     season_title="Backlog Show (English Dub)",
@@ -1138,6 +1188,7 @@ class RecommendationTests(unittest.TestCase):
                 Recommendation(
                     kind="new_dubbed_episode",
                     priority=60,
+                    provider="crunchyroll",
                     provider_series_id="series-fresh",
                     title="Fresh Show",
                     season_title="Fresh Show (English Dub)",
@@ -1145,6 +1196,7 @@ class RecommendationTests(unittest.TestCase):
                 Recommendation(
                     kind="new_season",
                     priority=100,
+                    provider="crunchyroll",
                     provider_series_id="series-next",
                     title="Next Season Show",
                     season_title="Next Season Show Season 2 (English Dub)",
@@ -1152,6 +1204,7 @@ class RecommendationTests(unittest.TestCase):
                 Recommendation(
                     kind="discovery_candidate",
                     priority=50,
+                    provider="mal",
                     provider_series_id="mal:300",
                     title="Discovery Hit",
                     season_title=None,
@@ -1164,9 +1217,42 @@ class RecommendationTests(unittest.TestCase):
             [section["key"] for section in grouped],
         )
         self.assertEqual("series-next", grouped[0]["items"][0]["provider_series_id"])
+        self.assertEqual(["crunchyroll"], grouped[0]["providers"])
+        self.assertFalse(grouped[0]["mixed_providers"])
         self.assertEqual("series-fresh", grouped[1]["items"][0]["provider_series_id"])
         self.assertEqual("mal:300", grouped[2]["items"][0]["provider_series_id"])
+        self.assertEqual(["mal"], grouped[2]["providers"])
         self.assertEqual("series-backlog", grouped[3]["items"][0]["provider_series_id"])
+        self.assertEqual(["hidive"], grouped[3]["providers"])
+
+    def test_group_recommendations_marks_mixed_provider_sections(self) -> None:
+        grouped = group_recommendations(
+            [
+                Recommendation(
+                    kind="new_season",
+                    priority=100,
+                    provider="crunchyroll",
+                    provider_series_id="cr-next",
+                    title="Next Season Show",
+                    season_title="Next Season Show Season 2 (English Dub)",
+                ),
+                Recommendation(
+                    kind="new_season",
+                    priority=95,
+                    provider="hidive",
+                    provider_series_id="hd-next",
+                    title="Another Season Show",
+                    season_title="Another Season Show Season 2 (English Dub)",
+                ),
+            ]
+        )
+
+        self.assertEqual(1, len(grouped))
+        self.assertEqual("continue_next", grouped[0]["key"])
+        self.assertTrue(grouped[0]["mixed_providers"])
+        self.assertEqual(["crunchyroll", "hidive"], grouped[0]["providers"])
+        self.assertEqual({"crunchyroll": 1, "hidive": 1}, grouped[0]["provider_counts"])
+        self.assertIn("multiple providers", grouped[0]["mixed_provider_note"])
 
     def test_group_recommendations_keeps_unknown_kinds_under_other(self) -> None:
         grouped = group_recommendations(

@@ -111,6 +111,23 @@ _RECOMMENDATION_SECTIONS: tuple[RecommendationSectionDefinition, ...] = (
 )
 
 
+def _section_provider_metadata(items: list[Recommendation]) -> dict[str, Any]:
+    provider_counts: dict[str, int] = {}
+    for item in items:
+        provider = item.provider or "unknown"
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+    providers = sorted(provider_counts)
+    mixed = len(providers) > 1
+    payload: dict[str, Any] = {
+        "providers": providers,
+        "provider_counts": provider_counts,
+        "mixed_providers": mixed,
+    }
+    if mixed:
+        payload["mixed_provider_note"] = "This section contains recommendations from multiple providers."
+    return payload
+
+
 def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
     items_by_kind: dict[str, list[Recommendation]] = defaultdict(list)
     for item in items:
@@ -133,6 +150,7 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
                 "description": section.description,
                 "kinds": list(section.kinds),
                 "count": len(section_items),
+                **_section_provider_metadata(section_items),
                 "items": [item.as_dict() for item in section_items],
             }
         )
@@ -150,6 +168,7 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
                 "description": "Recommendation kinds that do not yet have a dedicated named section.",
                 "kinds": sorted({item.kind for item in remaining_items}),
                 "count": len(remaining_items),
+                **_section_provider_metadata(remaining_items),
                 "items": [item.as_dict() for item in remaining_items],
             }
         )
@@ -189,6 +208,7 @@ def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Rec
     )
     recommendations.extend(_build_new_episode_recommendations(states))
     recommendations = _dedupe_recommendations(recommendations)
+    recommendations = _merge_cross_provider_recommendations(recommendations, mapping_by_series=mapping_by_series)
     recommendations.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
     if limit is None or limit <= 0:
         return recommendations
@@ -302,6 +322,66 @@ def _dedupe_recommendations(items: list[Recommendation]) -> list[Recommendation]
         if existing is None or item.priority > existing.priority:
             best[key] = item
     return list(best.values())
+
+
+_CROSS_PROVIDER_MERGE_KINDS = frozenset({"new_season", "new_dubbed_episode", "resume_backlog"})
+
+
+def _merge_cross_provider_recommendations(
+    items: list[Recommendation], *, mapping_by_series: dict[tuple[str, str], int]
+) -> list[Recommendation]:
+    grouped: dict[tuple[str, int], list[Recommendation]] = defaultdict(list)
+    passthrough: list[Recommendation] = []
+    for item in items:
+        provider = item.provider
+        if provider is None or provider == "mal" or item.kind not in _CROSS_PROVIDER_MERGE_KINDS:
+            passthrough.append(item)
+            continue
+        mal_anime_id = mapping_by_series.get((provider, item.provider_series_id))
+        if mal_anime_id is None:
+            passthrough.append(item)
+            continue
+        grouped[(item.kind, mal_anime_id)].append(item)
+
+    merged: list[Recommendation] = list(passthrough)
+    for _, bucket in grouped.items():
+        if len(bucket) == 1:
+            merged.extend(bucket)
+            continue
+        bucket.sort(key=lambda item: (-item.priority, item.provider or "", item.provider_series_id))
+        primary = bucket[0]
+        alternates = bucket[1:]
+        merged_reasons = list(primary.reasons)
+        for alt in alternates:
+            for reason in alt.reasons:
+                if reason not in merged_reasons:
+                    merged_reasons.append(reason)
+        merged_context = dict(primary.context)
+        merged_context["cross_provider_merged"] = True
+        merged_context["available_via_providers"] = sorted({item.provider for item in bucket if item.provider})
+        merged_context["alternate_provider_series"] = [
+            {
+                "provider": item.provider,
+                "provider_series_id": item.provider_series_id,
+                "title": item.title,
+                "season_title": item.season_title,
+                "priority": item.priority,
+            }
+            for item in alternates
+        ]
+        merged.append(
+            Recommendation(
+                kind=primary.kind,
+                priority=primary.priority,
+                provider=primary.provider,
+                provider_series_id=primary.provider_series_id,
+                title=primary.title,
+                season_title=primary.season_title,
+                reasons=merged_reasons,
+                context=merged_context,
+            )
+        )
+    return merged
 
 
 def _metadata_named_list_values(meta: Any, field: str) -> set[str]:
