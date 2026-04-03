@@ -32,6 +32,7 @@ from .db import (
     bootstrap_database,
     get_operational_snapshot,
     get_provider_series_title_map,
+    get_provider_series_title_map_by_keys,
     list_review_queue_entries,
     list_series_mappings,
     refresh_review_queue_entries,
@@ -1886,10 +1887,13 @@ def _cmd_health_check(
             status="open",
             issue_type=review_issue_type,
         )
-        provider_series_titles = get_provider_series_title_map(
+        provider_series_titles = get_provider_series_title_map_by_keys(
             config.db_path,
-            provider="crunchyroll",
-            provider_series_ids=[item.provider_series_id for item in recommendation_items if item.provider_series_id],
+            provider_series_keys=[
+                (item.provider, item.provider_series_id)
+                for item in recommendation_items
+                if item.provider and item.provider_series_id
+            ],
         )
         review_queue_summary = _summarize_review_queue(
             recommendation_items,
@@ -2517,10 +2521,13 @@ def _resolve_refresh_mapping_review_queue_provider_series_ids(
         )
     ):
         open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
-        provider_series_titles = get_provider_series_title_map(
+        provider_series_titles = get_provider_series_title_map_by_keys(
             config.db_path,
-            provider="crunchyroll",
-            provider_series_ids=[item.provider_series_id for item in open_rows if item.provider_series_id],
+            provider_series_keys=[
+                (item.provider, item.provider_series_id)
+                for item in open_rows
+                if item.provider and item.provider_series_id
+            ],
         )
         filtered_open_rows = _filter_review_queue_items(
             open_rows,
@@ -2697,7 +2704,7 @@ def _cmd_dry_run_sync(
 def _review_queue_item_label(
     item: object,
     *,
-    provider_series_titles: dict[str, dict[str, str | None]] | None = None,
+    provider_series_titles: dict[tuple[str, str], dict[str, str | None]] | None = None,
 ) -> dict[str, object]:
     payload = getattr(item, "payload", None)
     title = None
@@ -2707,8 +2714,13 @@ def _review_queue_item_label(
             if isinstance(value, str) and value.strip():
                 title = value.strip()
                 break
+    provider = getattr(item, "provider", None)
     provider_series_id = getattr(item, "provider_series_id", None)
-    series_row = provider_series_titles.get(provider_series_id) if provider_series_titles and isinstance(provider_series_id, str) else None
+    series_row = (
+        provider_series_titles.get((provider, provider_series_id))
+        if provider_series_titles and isinstance(provider, str) and isinstance(provider_series_id, str)
+        else None
+    )
     if title is None and isinstance(series_row, dict):
         for key in ("season_title", "title"):
             value = series_row.get(key)
@@ -3775,10 +3787,13 @@ def _cmd_review_queue_next(
     ensure_directories(config)
     bootstrap_database(config.db_path)
     items = list_review_queue_entries(config.db_path, status=status, issue_type=issue_type)
-    provider_series_titles = get_provider_series_title_map(
+    provider_series_titles = get_provider_series_title_map_by_keys(
         config.db_path,
-        provider="crunchyroll",
-        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+        provider_series_keys=[
+            (item.provider, item.provider_series_id)
+            for item in items
+            if item.provider and item.provider_series_id
+        ],
     )
     filtered_items = _filter_review_queue_items(
         items,
@@ -3844,15 +3859,18 @@ def _load_filtered_review_queue_context(
     reason_family: str | None,
     fix_strategy_family: str | None,
     cluster_strategy_family: str | None,
-) -> tuple[object, dict[str, dict[str, str | None]], list[object], dict[str, object]]:
+) -> tuple[object, dict[tuple[str, str], dict[str, str | None]], list[object], dict[str, object]]:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
     items = list_review_queue_entries(config.db_path, status=status, issue_type=issue_type)
-    provider_series_titles = get_provider_series_title_map(
+    provider_series_titles = get_provider_series_title_map_by_keys(
         config.db_path,
-        provider="crunchyroll",
-        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+        provider_series_keys=[
+            (item.provider, item.provider_series_id)
+            for item in items
+            if item.provider and item.provider_series_id
+        ],
     )
     filtered_items = _filter_review_queue_items(
         items,
@@ -4184,10 +4202,13 @@ def _cmd_list_review_queue(
         issue_type=issue_type,
         provider_series_id=provider_series_id,
     )
-    provider_series_titles = get_provider_series_title_map(
+    provider_series_titles = get_provider_series_title_map_by_keys(
         config.db_path,
-        provider="crunchyroll",
-        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+        provider_series_keys=[
+            (item.provider, item.provider_series_id)
+            for item in items
+            if item.provider and item.provider_series_id
+        ],
     )
     items = _filter_review_queue_items(
         items,
@@ -4264,10 +4285,13 @@ def _cmd_update_review_queue_status(
     ensure_directories(config)
     bootstrap_database(config.db_path)
     items = list_review_queue_entries(config.db_path, status=status_from, issue_type=issue_type)
-    provider_series_titles = get_provider_series_title_map(
+    provider_series_titles = get_provider_series_title_map_by_keys(
         config.db_path,
-        provider="crunchyroll",
-        provider_series_ids=[item.provider_series_id for item in items if item.provider_series_id],
+        provider_series_keys=[
+            (item.provider, item.provider_series_id)
+            for item in items
+            if item.provider and item.provider_series_id
+        ],
     )
     filtered_items = _filter_review_queue_items(
         items,

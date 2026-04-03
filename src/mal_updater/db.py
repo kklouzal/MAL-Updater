@@ -594,6 +594,45 @@ def get_provider_series_title_map(
     }
 
 
+def get_provider_series_title_map_by_keys(
+    db_path: Path,
+    *,
+    provider_series_keys: Iterable[tuple[str, str]],
+) -> dict[tuple[str, str], dict[str, str | None]]:
+    normalized_keys = sorted(
+        {
+            (provider.strip(), provider_series_id.strip())
+            for provider, provider_series_id in provider_series_keys
+            if isinstance(provider, str)
+            and provider.strip()
+            and isinstance(provider_series_id, str)
+            and provider_series_id.strip()
+        }
+    )
+    if not normalized_keys:
+        return {}
+
+    conditions = " OR ".join("(provider = ? AND provider_series_id = ?)" for _ in normalized_keys)
+    query = f"""
+        SELECT provider, provider_series_id, title, season_title
+        FROM provider_series
+        WHERE {conditions}
+    """
+    params: list[str] = []
+    for provider, provider_series_id in normalized_keys:
+        params.extend([provider, provider_series_id])
+
+    with connect(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return {
+        (str(row["provider"]), str(row["provider_series_id"])): {
+            "title": row["title"],
+            "season_title": row["season_title"],
+        }
+        for row in rows
+    }
+
+
 def list_review_queue_entries(
     db_path: Path,
     *,

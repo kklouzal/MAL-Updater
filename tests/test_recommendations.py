@@ -1316,6 +1316,153 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("cr-multi", grouped[0]["items"][0]["provider_series_id"])
         self.assertEqual("hd-only", grouped[0]["items"][1]["provider_series_id"])
 
+    def test_build_recommendations_limit_prefers_broader_availability_when_priorities_tie(self) -> None:
+        self._insert_series(
+            "base-show",
+            title="Shared Priority",
+            season_title="Shared Priority (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "base-show",
+            "base-show-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-12T01:00:00Z",
+            provider="crunchyroll",
+        )
+
+        self._insert_series(
+            "cr-next",
+            title="Shared Priority",
+            season_title="Shared Priority Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="never_watched",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "hd-next",
+            title="Shared Priority",
+            season_title="Shared Priority Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+        self._insert_series(
+            "hd-other",
+            title="Shared Priority Rival",
+            season_title="Shared Priority Rival Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+        self._insert_series(
+            "hd-other-base",
+            title="Shared Priority Rival",
+            season_title="Shared Priority Rival (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hd-other-base",
+            "hd-other-base-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-11T01:00:00Z",
+            provider="hidive",
+        )
+
+        self._map_series("cr-next", 6200, provider="crunchyroll")
+        self._map_series("hd-next", 6200, provider="hidive")
+
+        results = build_recommendations(self.config, limit=1)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("cr-next", results[0].provider_series_id)
+        self.assertEqual(["crunchyroll", "hidive"], results[0].available_providers())
+
+    def test_recommend_cli_limit_prefers_broader_availability_when_priorities_tie(self) -> None:
+        self._insert_series(
+            "base-show",
+            title="CLI Shared Priority",
+            season_title="CLI Shared Priority (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "base-show",
+            "base-show-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-12T01:00:00Z",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "cr-next",
+            title="CLI Shared Priority",
+            season_title="CLI Shared Priority Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="never_watched",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "hd-next",
+            title="CLI Shared Priority",
+            season_title="CLI Shared Priority Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+        self._insert_series(
+            "hd-other",
+            title="CLI Shared Priority Rival",
+            season_title="CLI Shared Priority Rival Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+        self._insert_series(
+            "hd-other-base",
+            title="CLI Shared Priority Rival",
+            season_title="CLI Shared Priority Rival (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hd-other-base",
+            "hd-other-base-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-11T01:00:00Z",
+            provider="hidive",
+        )
+
+        self._map_series("cr-next", 7200, provider="crunchyroll")
+        self._map_series("hd-next", 7200, provider="hidive")
+
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "recommend",
+            "--limit",
+            "1",
+            "--flat",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, len(payload))
+        self.assertEqual("cr-next", payload[0]["provider_series_id"])
+        self.assertEqual(["crunchyroll", "hidive"], payload[0]["providers"])
+
     def test_group_recommendations_keeps_unknown_kinds_under_other(self) -> None:
         grouped = group_recommendations(
             [

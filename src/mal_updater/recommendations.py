@@ -162,6 +162,10 @@ def _section_provider_metadata(items: list[Recommendation]) -> dict[str, Any]:
     return payload
 
 
+def _recommendation_sort_key(item: Recommendation) -> tuple[int, int, str, str]:
+    return (-item.priority, -len(item.available_providers()), item.title.lower(), item.provider_series_id)
+
+
 def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
     items_by_kind: dict[str, list[Recommendation]] = defaultdict(list)
     for item in items:
@@ -176,9 +180,7 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
             consumed_kinds.add(kind)
         if not section_items:
             continue
-        section_items.sort(
-            key=lambda item: (-item.priority, -len(item.available_providers()), item.title.lower(), item.provider_series_id)
-        )
+        section_items.sort(key=_recommendation_sort_key)
         sections.append(
             {
                 "key": section.key,
@@ -196,9 +198,7 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
         if item.kind not in consumed_kinds:
             remaining_items.append(item)
     if remaining_items:
-        remaining_items.sort(
-            key=lambda item: (-item.priority, -len(item.available_providers()), item.title.lower(), item.provider_series_id)
-        )
+        remaining_items.sort(key=_recommendation_sort_key)
         sections.append(
             {
                 "key": "other",
@@ -247,7 +247,7 @@ def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Rec
     recommendations.extend(_build_new_episode_recommendations(states))
     recommendations = _dedupe_recommendations(recommendations)
     recommendations = _merge_cross_provider_recommendations(recommendations, mapping_by_series=mapping_by_series)
-    recommendations.sort(key=lambda item: (-item.priority, item.title.lower(), item.provider_series_id))
+    recommendations.sort(key=_recommendation_sort_key)
     if limit is None or limit <= 0:
         return recommendations
     return recommendations[:limit]
