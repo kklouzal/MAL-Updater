@@ -162,6 +162,13 @@ def _section_provider_metadata(items: list[Recommendation]) -> dict[str, Any]:
     return payload
 
 
+def _availability_priority_bonus(provider_count: int) -> int:
+    if provider_count <= 1:
+        return 0
+    return min((provider_count - 1) * 3, 9)
+
+
+
 def _recommendation_sort_key(item: Recommendation) -> tuple[int, int, str, str]:
     return (-item.priority, -len(item.available_providers()), item.title.lower(), item.provider_series_id)
 
@@ -395,8 +402,11 @@ def _merge_cross_provider_recommendations(
                 if reason not in merged_reasons:
                     merged_reasons.append(reason)
         merged_context = dict(primary.context)
+        available_via_providers = sorted({item.provider for item in bucket if item.provider})
+        availability_priority_bonus = _availability_priority_bonus(len(available_via_providers))
         merged_context["cross_provider_merged"] = True
-        merged_context["available_via_providers"] = sorted({item.provider for item in bucket if item.provider})
+        merged_context["available_via_providers"] = available_via_providers
+        merged_context["availability_priority_bonus"] = availability_priority_bonus
         merged_context["alternate_provider_series"] = [
             {
                 "provider": item.provider,
@@ -407,10 +417,13 @@ def _merge_cross_provider_recommendations(
             }
             for item in alternates
         ]
+        if availability_priority_bonus > 0:
+            provider_label = _format_provider_label(available_via_providers)
+            merged_reasons.append(f"available via multiple providers: {provider_label}")
         merged.append(
             Recommendation(
                 kind=primary.kind,
-                priority=primary.priority,
+                priority=primary.priority + availability_priority_bonus,
                 provider=primary.provider,
                 provider_series_id=primary.provider_series_id,
                 title=primary.title,

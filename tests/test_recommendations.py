@@ -1177,6 +1177,9 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(2, serialized["provider_count"])
         self.assertTrue(serialized["multi_provider"])
         self.assertEqual("Crunchyroll + HIDIVE", serialized["provider_label"])
+        self.assertEqual(3, item.context["availability_priority_bonus"])
+        self.assertEqual(107, item.priority)
+        self.assertIn("available via multiple providers: Crunchyroll + HIDIVE", item.reasons)
         self.assertEqual("hidive", item.context["alternate_provider_series"][0]["provider"])
         self.assertEqual("hd-s2", item.context["alternate_provider_series"][0]["provider_series_id"])
 
@@ -1315,6 +1318,155 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual("cr-multi", grouped[0]["items"][0]["provider_series_id"])
         self.assertEqual("hd-only", grouped[0]["items"][1]["provider_series_id"])
+
+    def test_build_recommendations_multi_provider_new_season_gets_small_raw_priority_bonus(self) -> None:
+        self._insert_series(
+            "base-show",
+            title="Bonus Show",
+            season_title="Bonus Show (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "base-show",
+            "base-show-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-12T01:00:00Z",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "cr-next",
+            title="Bonus Show",
+            season_title="Bonus Show Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="never_watched",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "hd-next",
+            title="Bonus Show",
+            season_title="Bonus Show Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+        self._insert_series(
+            "single-base",
+            title="Single Provider Rival",
+            season_title="Single Provider Rival (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "single-base",
+            "single-base-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-11T01:00:00Z",
+            provider="hidive",
+        )
+        self._insert_series(
+            "single-next",
+            title="Single Provider Rival",
+            season_title="Single Provider Rival Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="never_watched",
+            provider="hidive",
+        )
+
+        self._map_series("cr-next", 8200, provider="crunchyroll")
+        self._map_series("hd-next", 8200, provider="hidive")
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "new_season"]
+
+        self.assertEqual(["cr-next", "single-next"], [item.provider_series_id for item in results[:2]])
+        self.assertEqual(107, results[0].priority)
+        self.assertEqual(104, results[1].priority)
+        self.assertEqual(3, results[0].context["availability_priority_bonus"])
+
+    def test_build_recommendations_multi_provider_new_episode_gets_small_raw_priority_bonus(self) -> None:
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_series(
+            "cr-fresh",
+            title="Episode Bonus",
+            season_title="Episode Bonus (English Dub)",
+            watchlist_status="in_progress",
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "cr-fresh",
+            "cr-fresh-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at=recent,
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "cr-fresh",
+            "cr-fresh-2",
+            episode_number=2,
+            completion_ratio=0.0,
+            last_watched_at=recent,
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "hd-fresh",
+            title="Episode Bonus",
+            season_title="Episode Bonus (English Dub)",
+            watchlist_status="in_progress",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hd-fresh",
+            "hd-fresh-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at=recent,
+            provider="hidive",
+        )
+        self._insert_progress(
+            "hd-fresh",
+            "hd-fresh-2",
+            episode_number=2,
+            completion_ratio=0.0,
+            last_watched_at=recent,
+            provider="hidive",
+        )
+        self._insert_series(
+            "single-fresh",
+            title="Episode Single Rival",
+            season_title="Episode Single Rival (English Dub)",
+            watchlist_status="in_progress",
+            provider="hidive",
+        )
+        self._insert_progress(
+            "single-fresh",
+            "single-fresh-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at=recent,
+            provider="hidive",
+        )
+        self._insert_progress(
+            "single-fresh",
+            "single-fresh-2",
+            episode_number=2,
+            completion_ratio=0.0,
+            last_watched_at=recent,
+            provider="hidive",
+        )
+
+        self._map_series("cr-fresh", 8300, provider="crunchyroll")
+        self._map_series("hd-fresh", 8300, provider="hidive")
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "new_dubbed_episode"]
+
+        self.assertEqual(["cr-fresh", "single-fresh"], [item.provider_series_id for item in results[:2]])
+        self.assertEqual(3, results[0].context["availability_priority_bonus"])
+        self.assertEqual(results[1].priority + 3, results[0].priority)
 
     def test_build_recommendations_limit_prefers_broader_availability_when_priorities_tie(self) -> None:
         self._insert_series(
