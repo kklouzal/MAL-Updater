@@ -195,6 +195,86 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
         self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
 
+    def test_bootstrap_audit_marks_provider_auth_degraded_from_session_residue(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (crunchyroll_state_root / "session.json").write_text(
+            json.dumps({"crunchyroll_phase": "auth_failed", "last_error": "refresh token revoked"}, indent=2),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertFalse(payload["providers"]["crunchyroll"]["ready"])
+        self.assertTrue(payload["providers"]["crunchyroll"]["auth_degraded"])
+        self.assertIn("auth", payload["providers"]["crunchyroll"]["missing"])
+        self.assertEqual("auth-degraded-needs-rebootstrap", payload["providers"]["crunchyroll"]["operation_mode"])
+        self.assertEqual("session_state", payload["providers"]["crunchyroll"]["auth_degradation"]["source"])
+        self.assertIn("refresh token revoked", payload["providers"]["crunchyroll"]["operation_guidance"]["details"])
+        self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
+        self.assertEqual(1, payload["summary"]["intended_provider_count"])
+        self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
+
+    def test_bootstrap_audit_summary_surfaces_rebootstrap_command_for_repeated_auth_failures(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "hidive_password.txt").write_text("top-secret\n", encoding="utf-8")
+        hidive_state_root = runtime_root / "state" / "hidive" / "default"
+        hidive_state_root.mkdir(parents=True, exist_ok=True)
+        (hidive_state_root / "authorisation_token.txt").write_text("access-token\n", encoding="utf-8")
+        (hidive_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "state" / "service-state.json").write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_hidive": {
+                            "last_status": "error",
+                            "last_error": "HIDIVE login failed: refresh token expired",
+                            "failure_backoff_reason": "HIDIVE login failed: refresh token expired",
+                            "failure_backoff_consecutive_failures": 3,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("provider_hidive_ready=False", stdout)
+        self.assertIn("provider_hidive_operation_mode=auth-degraded-needs-rebootstrap", stdout)
+        self.assertIn("provider_hidive_missing=auth", stdout)
+        self.assertIn(
+            "provider_hidive_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+            stdout,
+        )
+        self.assertIn(
+            "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+            stdout,
+        )
+        self.assertIn("partially_staged_provider_count=1", stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

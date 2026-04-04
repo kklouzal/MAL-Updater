@@ -33,7 +33,7 @@ PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli status
 ```
 
-Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, provider-specific operation-mode guidance/next-command hints, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers.
+Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, provider-specific operation-mode guidance/next-command hints, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers. Staged provider auth is now also treated conservatively there: if session residue or repeated unattended failures already suggest auth degradation, the provider is downgraded from `ready-for-unattended` to an explicit re-bootstrap posture instead of being reported as healthy just because token files exist.
 
 ## What bootstrap-audit covers
 
@@ -43,6 +43,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 - MAL client id / token presence
 - Crunchyroll credentials / staged auth-state presence
 - HIDIVE credentials / staged auth-state presence
+- staged provider auth degradation signals from provider session residue or repeated unattended auth-style failures, so bootstrap can recommend re-bootstrap before the daemon is treated as healthy
 - current MAL redirect URI
 - whether the repo-owned **user-systemd daemon service** can be installed on this host
 - whether the repo-owned user-systemd daemon is missing, outdated, disabled, inactive, or missing its rendered env file for this user

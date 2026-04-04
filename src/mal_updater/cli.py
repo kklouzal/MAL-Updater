@@ -241,6 +241,7 @@ def _provider_bootstrap_guidance_status(
     session_present: bool,
     transport_ready: bool,
     bootstrap_command: str,
+    auth_issue: dict[str, object] | None = None,
 ) -> dict[str, object]:
     title = provider_name.capitalize()
     intended = credentials_present or session_present
@@ -252,16 +253,6 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": False,
             "ready": False,
             "details": f"{title} is not staged yet, so it is optional until you decide to enable that provider.",
-            "next_command": None,
-        }
-
-    if credentials_present and session_present and transport_ready:
-        return {
-            "mode": "ready-for-unattended",
-            "intended": True,
-            "partially_staged": False,
-            "ready": True,
-            "details": f"{title} credentials and session state are staged, so this provider is ready for unattended daemon fetches.",
             "next_command": None,
         }
 
@@ -292,6 +283,32 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": True,
             "ready": False,
             "details": f"{title} bootstrap state is staged but required transport support is missing on this host, so finish transport setup before relying on unattended fetches.",
+            "next_command": None,
+        }
+
+    if credentials_present and session_present and isinstance(auth_issue, dict):
+        reason = auth_issue.get("reason")
+        details = (
+            f"{title} credentials and session state are staged, but auth looks degraded; re-bootstrap this provider before treating unattended fetches as healthy."
+        )
+        if isinstance(reason, str) and reason.strip():
+            details += f" Latest signal: {reason.strip()}"
+        return {
+            "mode": "auth-degraded-needs-rebootstrap",
+            "intended": True,
+            "partially_staged": True,
+            "ready": False,
+            "details": details,
+            "next_command": bootstrap_command,
+        }
+
+    if credentials_present and session_present:
+        return {
+            "mode": "ready-for-unattended",
+            "intended": True,
+            "partially_staged": False,
+            "ready": True,
+            "details": f"{title} credentials and session state are staged, so this provider is ready for unattended daemon fetches.",
             "next_command": None,
         }
 
@@ -419,6 +436,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     runtime_initialization = _runtime_initialization_status(config)
     secrets_dir_permissions = _secrets_dir_permission_status(config)
     automation_installation = _build_automation_installation_status(config.project_root)
+    service_state = _load_service_state_for_health(config)
 
     dependency_checks = {
         "python3": shutil.which("python3") is not None,
@@ -434,15 +452,38 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     hidive_session_present = hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists()
     mal_app_present = bool(secrets.client_id)
     mal_oauth_present = bool(secrets.access_token) and bool(secrets.refresh_token)
+    crunchyroll_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll"
+    hidive_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive"
+    provider_auth_issues = {
+        provider: payload
+        for provider in ("crunchyroll", "hidive")
+        if (payload := _provider_bootstrap_auth_issue(provider=provider, config=config, service_state=service_state)) is not None
+    }
+    crunchyroll_guidance = _provider_bootstrap_guidance_status(
+        provider_name="crunchyroll",
+        credentials_present=crunchyroll_credentials_present,
+        session_present=crunchyroll_session_present,
+        transport_ready=dependency_checks["curl_cffi"],
+        bootstrap_command=crunchyroll_bootstrap_command,
+        auth_issue=provider_auth_issues.get("crunchyroll"),
+    )
+    hidive_guidance = _provider_bootstrap_guidance_status(
+        provider_name="hidive",
+        credentials_present=hidive_credentials_present,
+        session_present=hidive_session_present,
+        transport_ready=True,
+        bootstrap_command=hidive_bootstrap_command,
+        auth_issue=provider_auth_issues.get("hidive"),
+    )
     operation_modes = _bootstrap_operation_mode_status(
         runtime_initialized=bool(runtime_initialization["ready"]),
         python_available=dependency_checks["python3"],
         systemctl_available=dependency_checks["systemctl"],
         mal_oauth_present=mal_oauth_present,
         crunchyroll_credentials_present=crunchyroll_credentials_present,
-        crunchyroll_session_present=crunchyroll_session_present,
+        crunchyroll_session_present=crunchyroll_session_present and not isinstance(provider_auth_issues.get("crunchyroll"), dict),
         hidive_credentials_present=hidive_credentials_present,
-        hidive_session_present=hidive_session_present,
+        hidive_session_present=hidive_session_present and not isinstance(provider_auth_issues.get("hidive"), dict),
     )
 
     onboarding_steps: list[dict[str, object]] = []
@@ -524,7 +565,20 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             step="bootstrap-crunchyroll-session",
             details="Run `mal-updater provider-auth-login --provider crunchyroll` to mint and stage the long-lived Crunchyroll refresh token/device id pair.",
             user_action_required=False,
-            command="PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
+            command=crunchyroll_bootstrap_command,
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "crunchyroll"],
+            applies_to="crunchyroll",
+        )
+    elif isinstance(provider_auth_issues.get("crunchyroll"), dict) and dependency_checks["curl_cffi"]:
+        auth_issue_reason = provider_auth_issues["crunchyroll"].get("reason")
+        details = "Re-bootstrap Crunchyroll auth because staged session state looks degraded for unattended fetches."
+        if isinstance(auth_issue_reason, str) and auth_issue_reason.strip():
+            details += f" Latest signal: {auth_issue_reason.strip()}"
+        add_onboarding_step(
+            step="rebootstrap-crunchyroll-session",
+            details=details,
+            user_action_required=False,
+            command=crunchyroll_bootstrap_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "crunchyroll"],
             applies_to="crunchyroll",
         )
@@ -540,7 +594,20 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             step="bootstrap-hidive-session",
             details="Run `mal-updater provider-auth-login --provider hidive` to mint and stage HIDIVE authorisation/refresh tokens.",
             user_action_required=False,
-            command="PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+            command=hidive_bootstrap_command,
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "hidive"],
+            applies_to="hidive",
+        )
+    elif isinstance(provider_auth_issues.get("hidive"), dict):
+        auth_issue_reason = provider_auth_issues["hidive"].get("reason")
+        details = "Re-bootstrap HIDIVE auth because staged session state looks degraded for unattended fetches."
+        if isinstance(auth_issue_reason, str) and auth_issue_reason.strip():
+            details += f" Latest signal: {auth_issue_reason.strip()}"
+        add_onboarding_step(
+            step="rebootstrap-hidive-session",
+            details=details,
+            user_action_required=False,
+            command=hidive_bootstrap_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "hidive"],
             applies_to="hidive",
         )
@@ -612,39 +679,26 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     blocking_steps = [item for item in onboarding_steps if item["user_action_required"]]
     nonblocking_steps = [item for item in onboarding_steps if not item["user_action_required"]]
     actionable_commands = [item for item in onboarding_steps if isinstance(item.get("command"), str)]
-    crunchyroll_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll"
-    hidive_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive"
-    crunchyroll_guidance = _provider_bootstrap_guidance_status(
-        provider_name="crunchyroll",
-        credentials_present=crunchyroll_credentials_present,
-        session_present=crunchyroll_session_present,
-        transport_ready=dependency_checks["curl_cffi"],
-        bootstrap_command=crunchyroll_bootstrap_command,
-    )
-    hidive_guidance = _provider_bootstrap_guidance_status(
-        provider_name="hidive",
-        credentials_present=hidive_credentials_present,
-        session_present=hidive_session_present,
-        transport_ready=True,
-        bootstrap_command=hidive_bootstrap_command,
-    )
     providers = {
         "crunchyroll": {
             "enabled_by_credentials": crunchyroll_credentials_present,
             "credentials_present": crunchyroll_credentials_present,
             "session_present": crunchyroll_session_present,
             "transport_ready": dependency_checks["curl_cffi"],
-            "ready": crunchyroll_credentials_present and crunchyroll_session_present and dependency_checks["curl_cffi"],
+            "ready": crunchyroll_guidance["ready"],
             "missing": [
                 name
                 for name, present in (
                     ("credentials", crunchyroll_credentials_present),
                     ("session", crunchyroll_session_present),
                     ("transport", dependency_checks["curl_cffi"]),
+                    ("auth", not isinstance(provider_auth_issues.get("crunchyroll"), dict)),
                 )
                 if not present
             ],
             "bootstrap_command": crunchyroll_bootstrap_command,
+            "auth_degraded": isinstance(provider_auth_issues.get("crunchyroll"), dict),
+            "auth_degradation": provider_auth_issues.get("crunchyroll"),
             "operation_mode": crunchyroll_guidance["mode"],
             "operation_guidance": crunchyroll_guidance,
         },
@@ -653,16 +707,19 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             "credentials_present": hidive_credentials_present,
             "session_present": hidive_session_present,
             "transport_ready": True,
-            "ready": hidive_credentials_present and hidive_session_present,
+            "ready": hidive_guidance["ready"],
             "missing": [
                 name
                 for name, present in (
                     ("credentials", hidive_credentials_present),
                     ("session", hidive_session_present),
+                    ("auth", not isinstance(provider_auth_issues.get("hidive"), dict)),
                 )
                 if not present
             ],
             "bootstrap_command": hidive_bootstrap_command,
+            "auth_degraded": isinstance(provider_auth_issues.get("hidive"), dict),
+            "auth_degradation": provider_auth_issues.get("hidive"),
             "operation_mode": hidive_guidance["mode"],
             "operation_guidance": hidive_guidance,
         },
@@ -1331,6 +1388,42 @@ def _provider_service_auth_failure(
     if isinstance(session_residue, dict):
         payload.update(session_residue)
     return payload
+
+
+
+def _provider_bootstrap_auth_issue(
+    *,
+    provider: str,
+    config: AppConfig,
+    service_state: dict[str, object] | None,
+) -> dict[str, object] | None:
+    service_failure = _provider_service_auth_failure(service_state, provider=provider, config=config)
+    if isinstance(service_failure, dict):
+        return {
+            **service_failure,
+            "source": "service_state",
+        }
+
+    session_residue = _provider_auth_session_residue(config, provider)
+    if not isinstance(session_residue, dict):
+        return None
+    if not looks_auth_style_failure("", session_residue=session_residue):
+        return None
+
+    reason = session_residue.get("session_last_error")
+    if not isinstance(reason, str) or not reason.strip():
+        session_phase = session_residue.get("session_phase")
+        if isinstance(session_phase, str) and session_phase:
+            reason = f"session phase {session_phase}"
+        else:
+            reason = "provider session state looks auth-degraded"
+
+    return {
+        "provider": provider,
+        "reason": reason,
+        "source": "session_state",
+        **session_residue,
+    }
 
 
 def _build_health_maintenance_commands(

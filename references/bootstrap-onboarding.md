@@ -26,7 +26,7 @@ Use `--summary` for terse line-oriented output.
 
 ## What bootstrap-audit tells you
 
-The default JSON output is intended to be automation-friendly: it includes per-provider readiness, per-provider operation-mode guidance/next-command hints, runtime-initialization readiness, secrets-dir permission posture, missing capability buckets, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts so partial installs are distinguishable from untouched ones, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action.
+The default JSON output is intended to be automation-friendly: it includes per-provider readiness, per-provider operation-mode guidance/next-command hints, runtime-initialization readiness, secrets-dir permission posture, missing capability buckets, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts so partial installs are distinguishable from untouched ones, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action. It now also treats staged provider auth conservatively: if session residue or repeated unattended auth-style failures already indicate degradation, `bootstrap-audit` surfaces that as a re-bootstrap posture instead of claiming the provider is ready merely because token files are present.
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
