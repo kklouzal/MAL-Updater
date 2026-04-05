@@ -192,6 +192,72 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertEqual("refresh_ingested_snapshot", payload["maintenance"]["recommended_automation_command"]["reason_code"])
 
+    def test_health_check_recommends_mal_reauth_after_repeated_mal_refresh_failures(self) -> None:
+        (self.config.secrets_dir / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "mal_refresh": {
+                            "last_status": "error",
+                            "last_error": "MalApiError: invalid_grant from MAL token endpoint",
+                            "failure_backoff_reason": "MalApiError: invalid_grant from MAL token endpoint",
+                            "failure_backoff_consecutive_failures": 3,
+                            "failure_backoff_until": "2026-03-23T09:55:00Z",
+                            "failure_backoff_remaining_seconds": 900,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        repeated = next(warning for warning in payload["warnings"] if warning["code"] == "mal_auth_failures_repeated")
+        self.assertEqual("mal", repeated["provider"])
+        self.assertIn("invalid_grant", repeated["reason"])
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual("rebootstrap_mal_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual(["mal-auth-login"], maintenance_commands[0]["command_args"])
+        self.assertFalse(maintenance_commands[0]["automation_safe"])
+        self.assertTrue(maintenance_commands[0]["requires_auth_interaction"])
+        self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
+        self.assertIsNone(payload["maintenance"]["recommended_automation_command"])
+
+    def test_health_check_ignores_non_auth_mal_refresh_failures(self) -> None:
+        (self.config.secrets_dir / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "mal_refresh": {
+                            "last_status": "error",
+                            "last_error": "OSError: temporary DNS failure",
+                            "failure_backoff_reason": "OSError: temporary DNS failure",
+                            "failure_backoff_consecutive_failures": 3,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertNotIn("mal_auth_failures_repeated", warning_codes)
+        maintenance_reason_codes = [command["reason_code"] for command in payload["maintenance"]["recommended_commands"]]
+        self.assertNotIn("rebootstrap_mal_auth_after_failures", maintenance_reason_codes)
+
     def test_health_check_recommends_reauth_for_login_failure_without_http_401_marker(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")

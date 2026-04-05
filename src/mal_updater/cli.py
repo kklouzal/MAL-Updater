@@ -1348,11 +1348,13 @@ def _provider_auth_session_residue(config: AppConfig, provider: str) -> dict[str
     return residue or None
 
 
-def _provider_service_auth_failure(
+def _task_service_auth_failure(
     service_state: dict[str, object] | None,
     *,
-    provider: str,
-    config: AppConfig,
+    task_name: str,
+    subject_key: str,
+    subject_value: str,
+    session_residue: dict[str, object] | None = None,
     min_consecutive_failures: int = 2,
 ) -> dict[str, object] | None:
     if not isinstance(service_state, dict):
@@ -1360,7 +1362,7 @@ def _provider_service_auth_failure(
     tasks = service_state.get("tasks")
     if not isinstance(tasks, dict):
         return None
-    task_state = tasks.get(f"sync_fetch_{provider}")
+    task_state = tasks.get(task_name)
     if not isinstance(task_state, dict):
         return None
     reason = task_state.get("failure_backoff_reason") or task_state.get("last_error")
@@ -1369,11 +1371,10 @@ def _provider_service_auth_failure(
     consecutive_failures = task_state.get("failure_backoff_consecutive_failures", 0)
     if not isinstance(consecutive_failures, (int, float)) or int(consecutive_failures) < min_consecutive_failures:
         return None
-    session_residue = _provider_auth_session_residue(config, provider)
     if not looks_auth_style_failure(reason, session_residue=session_residue):
         return None
     payload: dict[str, object] = {
-        "provider": provider,
+        subject_key: subject_value,
         "reason": reason.strip(),
         "consecutive_failures": int(consecutive_failures),
     }
@@ -1388,6 +1389,40 @@ def _provider_service_auth_failure(
     if isinstance(session_residue, dict):
         payload.update(session_residue)
     return payload
+
+
+
+def _provider_service_auth_failure(
+    service_state: dict[str, object] | None,
+    *,
+    provider: str,
+    config: AppConfig,
+    min_consecutive_failures: int = 2,
+) -> dict[str, object] | None:
+    session_residue = _provider_auth_session_residue(config, provider)
+    return _task_service_auth_failure(
+        service_state,
+        task_name=f"sync_fetch_{provider}",
+        subject_key="provider",
+        subject_value=provider,
+        session_residue=session_residue,
+        min_consecutive_failures=min_consecutive_failures,
+    )
+
+
+
+def _mal_service_auth_failure(
+    service_state: dict[str, object] | None,
+    *,
+    min_consecutive_failures: int = 2,
+) -> dict[str, object] | None:
+    return _task_service_auth_failure(
+        service_state,
+        task_name="mal_refresh",
+        subject_key="provider",
+        subject_value="mal",
+        min_consecutive_failures=min_consecutive_failures,
+    )
 
 
 
@@ -1434,6 +1469,7 @@ def _build_health_maintenance_commands(
     hidive_state_present: bool,
     mal_client_id_present: bool,
     mal_auth_present: bool,
+    mal_auth_failure: dict[str, object] | None = None,
     latest_sync_run: dict[str, object] | None,
     latest_completed_sync_run: dict[str, object] | None,
     latest_completed_age_seconds: float | None,
@@ -1491,6 +1527,19 @@ def _build_health_maintenance_commands(
             ["provider-auth-login", "--provider", "hidive"],
             automation_safe=False,
             requires_auth_interaction=False,
+        )
+
+    if mal_client_id_present and isinstance(mal_auth_failure, dict):
+        detail = "Complete MAL OAuth again after repeated unattended MAL token refresh failures"
+        reason = mal_auth_failure.get("reason")
+        if isinstance(reason, str) and reason:
+            detail += f": {reason}"
+        add_command(
+            "rebootstrap_mal_auth_after_failures",
+            detail,
+            ["mal-auth-login"],
+            automation_safe=False,
+            requires_auth_interaction=True,
         )
 
     if mal_client_id_present and not mal_auth_present:
@@ -1842,6 +1891,7 @@ def _cmd_health_check(
         for provider in ("crunchyroll", "hidive")
         if (payload := _provider_service_auth_failure(service_state, provider=provider, config=config)) is not None
     }
+    mal_auth_failure = _mal_service_auth_failure(service_state)
 
     warnings: list[dict[str, object]] = []
 
@@ -1924,6 +1974,14 @@ def _cmd_health_check(
             **failure,
         }
         warnings.append(warning)
+    if isinstance(mal_auth_failure, dict):
+        warnings.append(
+            {
+                "code": "mal_auth_failures_repeated",
+                "detail": "Repeated unattended MAL token refresh failures look auth-related and likely need MAL OAuth again",
+                **mal_auth_failure,
+            }
+        )
     coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
     unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (
@@ -2068,6 +2126,7 @@ def _cmd_health_check(
         hidive_state_present=hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists(),
         mal_client_id_present=bool(secrets.client_id),
         mal_auth_present=bool(secrets.client_id and secrets.access_token and secrets.refresh_token),
+        mal_auth_failure=mal_auth_failure,
         latest_sync_run=latest_sync_run if isinstance(latest_sync_run, dict) else None,
         latest_completed_sync_run=latest_completed_sync_run if isinstance(latest_completed_sync_run, dict) else None,
         latest_completed_age_seconds=latest_completed_age_seconds,

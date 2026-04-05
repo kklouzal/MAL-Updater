@@ -184,6 +184,18 @@ Keep MAL as its own explicit daemon budget lane, but let non-MAL source provider
 - shared source-provider defaults make new providers safer to onboard before their final tuned per-provider numbers are known
 - explicit per-provider overrides still win, so operators can keep Crunchyroll/HIDIVE-specific tuning where it matters
 
+## 2026-04-05 - MAL auth-failure remediation posture
+
+### Decision
+Extend the same shared auth-style failure detection used for provider daemon lanes into the `mal_refresh` lane's operator surface, so health-check treats repeated unattended MAL token-refresh auth failures as explicit MAL re-auth work rather than generic daemon residue.
+
+When the daemon records repeated auth-style `mal_refresh` failures (for example `invalid_grant`, expired/revoked refresh material, or other refresh-token/auth residue), `health-check` should emit a dedicated warning plus a `mal-auth-login` maintenance recommendation.
+
+### Why
+- unattended MAL token-refresh failures are operationally similar to provider auth degradation: the daemon should cool down, and the operator should get a clear re-auth instruction
+- without an explicit MAL lane recommendation, the health surface can look noisier and less actionable than the provider-side guidance it already ships
+- reusing the same auth-style detector keeps MAL/provider remediation posture aligned instead of creating a separate folklore path for one auth lane
+
 ## 2026-03-23 / 2026-03-27 - Auth-style provider failure cooldown posture
 
 ### Decision

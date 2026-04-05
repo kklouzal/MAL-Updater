@@ -469,14 +469,18 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual([], [item for item in results if item.provider_series_id == "series-complete"])
 
     def test_more_recent_in_progress_tail_gap_ranks_above_stale_one(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        recent_base = now - timedelta(days=14)
+        stale_base = now - timedelta(days=365 * 3)
+
         self._insert_series(
             "recent-show",
             title="Recent Show",
             season_title="Recent Show (English Dub)",
             watchlist_status="in_progress",
         )
-        self._insert_progress("recent-show", "r1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-14T01:00:00Z")
-        self._insert_progress("recent-show", "r2", episode_number=2, completion_ratio=0.2, last_watched_at="2026-03-14T02:00:00Z")
+        self._insert_progress("recent-show", "r1", episode_number=1, completion_ratio=1.0, last_watched_at=(recent_base - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        self._insert_progress("recent-show", "r2", episode_number=2, completion_ratio=0.2, last_watched_at=recent_base.isoformat().replace("+00:00", "Z"))
 
         self._insert_series(
             "stale-show",
@@ -484,8 +488,8 @@ class RecommendationTests(unittest.TestCase):
             season_title="Stale Show (English Dub)",
             watchlist_status="in_progress",
         )
-        self._insert_progress("stale-show", "s1", episode_number=1, completion_ratio=1.0, last_watched_at="2020-03-10T01:00:00Z")
-        self._insert_progress("stale-show", "s2", episode_number=2, completion_ratio=0.2, last_watched_at="2020-03-10T02:00:00Z")
+        self._insert_progress("stale-show", "s1", episode_number=1, completion_ratio=1.0, last_watched_at=(stale_base - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        self._insert_progress("stale-show", "s2", episode_number=2, completion_ratio=0.2, last_watched_at=stale_base.isoformat().replace("+00:00", "Z"))
 
         results = build_recommendations(self.config, limit=0)
 
