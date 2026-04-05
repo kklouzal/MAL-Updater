@@ -323,6 +323,50 @@ def _provider_bootstrap_guidance_status(
 
 
 
+def _mal_bootstrap_guidance_status(
+    *,
+    client_id_present: bool,
+    oauth_present: bool,
+    auth_command: str,
+    auth_issue: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if not client_id_present:
+        return {
+            "mode": "client-id-missing",
+            "ready": False,
+            "details": "MyAnimeList client id is not staged yet, so MAL OAuth cannot be completed.",
+            "next_command": None,
+        }
+
+    if not oauth_present:
+        return {
+            "mode": "oauth-missing",
+            "ready": False,
+            "details": "MyAnimeList OAuth tokens are not staged yet; complete MAL OAuth before treating unattended sync as ready.",
+            "next_command": auth_command,
+        }
+
+    if isinstance(auth_issue, dict):
+        reason = auth_issue.get("reason")
+        details = "MyAnimeList OAuth tokens are staged, but repeated unattended token refresh failures suggest MAL auth should be completed again before trusting unattended sync."
+        if isinstance(reason, str) and reason.strip():
+            details += f" Latest signal: {reason.strip()}"
+        return {
+            "mode": "auth-degraded-needs-reauth",
+            "ready": False,
+            "details": details,
+            "next_command": auth_command,
+        }
+
+    return {
+        "mode": "ready",
+        "ready": True,
+        "details": "MyAnimeList client id and OAuth tokens are staged, so MAL auth is ready for unattended sync.",
+        "next_command": None,
+    }
+
+
+
 def _bootstrap_operation_mode_status(
     *,
     runtime_initialized: bool,
@@ -452,13 +496,21 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     hidive_session_present = hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists()
     mal_app_present = bool(secrets.client_id)
     mal_oauth_present = bool(secrets.access_token) and bool(secrets.refresh_token)
+    mal_auth_command = "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login"
     crunchyroll_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll"
     hidive_bootstrap_command = "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive"
+    mal_auth_issue = _mal_bootstrap_auth_issue(service_state)
     provider_auth_issues = {
         provider: payload
         for provider in ("crunchyroll", "hidive")
         if (payload := _provider_bootstrap_auth_issue(provider=provider, config=config, service_state=service_state)) is not None
     }
+    mal_guidance = _mal_bootstrap_guidance_status(
+        client_id_present=mal_app_present,
+        oauth_present=mal_oauth_present,
+        auth_command=mal_auth_command,
+        auth_issue=mal_auth_issue,
+    )
     crunchyroll_guidance = _provider_bootstrap_guidance_status(
         provider_name="crunchyroll",
         credentials_present=crunchyroll_credentials_present,
@@ -479,7 +531,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         runtime_initialized=bool(runtime_initialization["ready"]),
         python_available=dependency_checks["python3"],
         systemctl_available=dependency_checks["systemctl"],
-        mal_oauth_present=mal_oauth_present,
+        mal_oauth_present=mal_oauth_present and not isinstance(mal_auth_issue, dict),
         crunchyroll_credentials_present=crunchyroll_credentials_present,
         crunchyroll_session_present=crunchyroll_session_present and not isinstance(provider_auth_issues.get("crunchyroll"), dict),
         hidive_credentials_present=hidive_credentials_present,
@@ -549,7 +601,20 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             step="complete-mal-oauth",
             details="Run `mal-updater mal-auth-login` after the MAL app exists so the skill can persist access and refresh tokens.",
             user_action_required=True,
-            command="PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login",
+            command=mal_auth_command,
+            command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "mal-auth-login"],
+            applies_to="mal",
+        )
+    elif isinstance(mal_auth_issue, dict):
+        auth_issue_reason = mal_auth_issue.get("reason")
+        details = "Complete MAL OAuth again because repeated unattended MAL token refresh failures suggest the staged refresh material is no longer healthy."
+        if isinstance(auth_issue_reason, str) and auth_issue_reason.strip():
+            details += f" Latest signal: {auth_issue_reason.strip()}"
+        add_onboarding_step(
+            step="rebootstrap-mal-oauth",
+            details=details,
+            user_action_required=True,
+            command=mal_auth_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "mal-auth-login"],
             applies_to="mal",
         )
@@ -772,12 +837,16 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         "mal": {
             "client_id_present": mal_app_present,
             "oauth_ready": mal_oauth_present,
-            "ready": mal_app_present and mal_oauth_present,
+            "ready": mal_guidance["ready"],
+            "auth_degraded": isinstance(mal_auth_issue, dict),
+            "auth_degradation": mal_auth_issue,
+            "operation_mode": mal_guidance["mode"],
+            "operation_guidance": mal_guidance,
             "redirect_uri": config.mal.redirect_uri,
             "bind_host": config.mal.bind_host,
             "redirect_host": config.mal.redirect_host,
             "redirect_port": config.mal.redirect_port,
-            "auth_command": "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login",
+            "auth_command": mal_auth_command,
         },
         "providers": providers,
         "summary": {
@@ -823,6 +892,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         if payload["summary"].get("automation_active") is not None:
             print(f"automation_active={payload['summary']['automation_active']}")
         print(f"operation_mode={payload['summary']['operation_mode']}")
+        print(f"mal_ready={payload['mal']['ready']}")
+        print(f"mal_operation_mode={payload['mal']['operation_mode']}")
         print(f"manual_foreground_acceptable={payload['summary']['manual_foreground_acceptable']}")
         print(f"daemon_expected={payload['summary']['daemon_expected']}")
         print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
@@ -834,6 +905,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             print(f"partially_staged_provider_count={payload['summary']['partially_staged_provider_count']}")
         if missing_dependencies:
             print("missing_dependencies=" + ", ".join(missing_dependencies))
+        mal_next_command = payload["mal"]["operation_guidance"].get("next_command") if isinstance(payload["mal"].get("operation_guidance"), dict) else None
+        if isinstance(mal_next_command, str) and mal_next_command:
+            print(f"mal_next_command={mal_next_command}")
         for provider_name, provider_payload in providers.items():
             print(f"provider_{provider_name}_ready={provider_payload['ready']}")
             operation_mode = provider_payload.get("operation_mode")
@@ -1423,6 +1497,21 @@ def _mal_service_auth_failure(
         subject_value="mal",
         min_consecutive_failures=min_consecutive_failures,
     )
+
+
+
+def _mal_bootstrap_auth_issue(
+    service_state: dict[str, object] | None,
+    *,
+    min_consecutive_failures: int = 2,
+) -> dict[str, object] | None:
+    service_failure = _mal_service_auth_failure(service_state, min_consecutive_failures=min_consecutive_failures)
+    if not isinstance(service_failure, dict):
+        return None
+    return {
+        **service_failure,
+        "source": "service_state",
+    }
 
 
 

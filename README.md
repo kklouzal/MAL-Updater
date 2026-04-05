@@ -33,14 +33,14 @@ PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli status
 ```
 
-Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, provider-specific operation-mode guidance/next-command hints, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers. Staged provider auth is now also treated conservatively there: if session residue or repeated unattended failures already suggest auth degradation, the provider is downgraded from `ready-for-unattended` to an explicit re-bootstrap posture instead of being reported as healthy just because token files exist.
+Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, provider-specific operation-mode guidance/next-command hints, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts, secrets-dir permission posture, blocking/non-blocking onboarding counts, and explicit recommended commands for automation-friendly consumers. Staged auth is now treated conservatively there across both MAL and source providers: if repeated unattended `mal_refresh` failures or provider session residue/fetch failures already suggest auth degradation, bootstrap-audit downgrades that lane from healthy/ready posture to explicit re-auth or re-bootstrap guidance instead of trusting token-file presence alone.
 
 ## What bootstrap-audit covers
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
 - dependency checks (`python3`, `flock`, `systemctl`, optional provider/runtime extras)
-- MAL client id / token presence
+- MAL client id / token presence, including repeated unattended MAL token-refresh failures that already imply the staged refresh material needs a fresh `mal-auth-login`
 - Crunchyroll credentials / staged auth-state presence
 - HIDIVE credentials / staged auth-state presence
 - staged provider auth degradation signals from provider session residue or repeated unattended auth-style failures, so bootstrap can recommend re-bootstrap before the daemon is treated as healthy

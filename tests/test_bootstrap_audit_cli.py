@@ -195,6 +195,93 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
         self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
 
+    def test_bootstrap_audit_marks_mal_auth_degraded_from_repeated_refresh_failures(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (runtime_root / "state" / "service-state.json").write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "mal_refresh": {
+                            "last_status": "error",
+                            "last_error": "MalApiError: invalid_grant from MAL token endpoint",
+                            "failure_backoff_reason": "MalApiError: invalid_grant from MAL token endpoint",
+                            "failure_backoff_consecutive_failures": 3,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertFalse(payload["mal"]["ready"])
+        self.assertTrue(payload["mal"]["auth_degraded"])
+        self.assertEqual("auth-degraded-needs-reauth", payload["mal"]["operation_mode"])
+        self.assertEqual("service_state", payload["mal"]["auth_degradation"]["source"])
+        self.assertIn("invalid_grant", payload["mal"]["operation_guidance"]["details"])
+        self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
+        self.assertFalse(payload["summary"]["daemon_expected"])
+        self.assertIn(
+            "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login",
+            [item["command"] for item in payload["recommended_commands"] if item.get("command")],
+        )
+
+    def test_bootstrap_audit_summary_surfaces_mal_reauth_command_for_repeated_refresh_failures(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "hidive_password.txt").write_text("top-secret\n", encoding="utf-8")
+        hidive_state_root = runtime_root / "state" / "hidive" / "default"
+        hidive_state_root.mkdir(parents=True, exist_ok=True)
+        (hidive_state_root / "authorisation_token.txt").write_text("access-token\n", encoding="utf-8")
+        (hidive_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "state" / "service-state.json").write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "mal_refresh": {
+                            "last_status": "error",
+                            "last_error": "MalApiError: invalid_grant from MAL token endpoint",
+                            "failure_backoff_reason": "MalApiError: invalid_grant from MAL token endpoint",
+                            "failure_backoff_consecutive_failures": 2,
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("mal_ready=False", stdout)
+        self.assertIn("mal_operation_mode=auth-degraded-needs-reauth", stdout)
+        self.assertIn("mal_next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
+        self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
+        self.assertIn("operation_mode=bootstrap-provider-staged", stdout)
+
     def test_bootstrap_audit_marks_provider_auth_degraded_from_session_residue(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
         for relative in ("config", "data", "cache", "state", "secrets"):
