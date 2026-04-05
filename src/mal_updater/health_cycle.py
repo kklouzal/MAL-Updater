@@ -73,7 +73,17 @@ def _print_prefixed(message: str) -> None:
     print(f"[{_now_iso()}] {message}")
 
 
-def _health_check_command(config: AppConfig, *, stale_hours: float, strict: bool, output_format: str) -> list[str]:
+def _health_check_command(
+    config: AppConfig,
+    *,
+    stale_hours: float,
+    strict: bool,
+    output_format: str,
+    review_issue_type: str | None,
+    review_worklist_limit: int,
+    mapping_coverage_threshold: float,
+    maintenance_review_limit: int,
+) -> list[str]:
     command = [
         "python3",
         "-m",
@@ -85,7 +95,15 @@ def _health_check_command(config: AppConfig, *, stale_hours: float, strict: bool
         str(stale_hours),
         "--format",
         output_format,
+        "--review-worklist-limit",
+        str(review_worklist_limit),
+        "--mapping-coverage-threshold",
+        str(mapping_coverage_threshold),
+        "--maintenance-review-limit",
+        str(maintenance_review_limit),
     ]
+    if review_issue_type:
+        command.extend(["--review-issue-type", review_issue_type])
     if strict:
         command.append("--strict")
     return command
@@ -96,9 +114,22 @@ def _run_health_check_json(
     *,
     stale_hours: float,
     json_path: Path,
+    review_issue_type: str | None,
+    review_worklist_limit: int,
+    mapping_coverage_threshold: float,
+    maintenance_review_limit: int,
 ) -> tuple[int, dict[str, object]]:
     result = subprocess.run(
-        _health_check_command(config, stale_hours=stale_hours, strict=False, output_format="json"),
+        _health_check_command(
+            config,
+            stale_hours=stale_hours,
+            strict=False,
+            output_format="json",
+            review_issue_type=review_issue_type,
+            review_worklist_limit=review_worklist_limit,
+            mapping_coverage_threshold=mapping_coverage_threshold,
+            maintenance_review_limit=maintenance_review_limit,
+        ),
         check=False,
         capture_output=True,
         text=True,
@@ -173,6 +204,10 @@ def run_health_check_cycle(
     strict: bool = False,
     auto_run_recommended: bool = False,
     auto_run_reason_codes: set[str] | None = None,
+    review_issue_type: str | None = None,
+    review_worklist_limit: int = 3,
+    mapping_coverage_threshold: float = 0.8,
+    maintenance_review_limit: int = 25,
 ) -> int:
     ensure_directories(config)
     lock_file = config.state_dir / "locks" / "health-check.lock"
@@ -192,11 +227,23 @@ def run_health_check_cycle(
                 print(f"stale_hours={stale_hours:g}")
                 print(f"auto_run_recommended={1 if auto_run_recommended else 0}")
                 print("auto_run_reason_codes=" + ",".join(sorted(allowed_reason_codes)))
+                print(f"review_issue_type={review_issue_type or ''}")
+                print(f"review_worklist_limit={review_worklist_limit}")
+                print(f"mapping_coverage_threshold={mapping_coverage_threshold:g}")
+                print(f"maintenance_review_limit={maintenance_review_limit}")
 
                 from .db import bootstrap_database
 
                 bootstrap_database(config.db_path)
-                _, payload = _run_health_check_json(config, stale_hours=stale_hours, json_path=run_json)
+                _, payload = _run_health_check_json(
+                    config,
+                    stale_hours=stale_hours,
+                    json_path=run_json,
+                    review_issue_type=review_issue_type,
+                    review_worklist_limit=review_worklist_limit,
+                    mapping_coverage_threshold=mapping_coverage_threshold,
+                    maintenance_review_limit=maintenance_review_limit,
+                )
 
                 selected = _select_auto_command(payload, allow_reason_codes=allowed_reason_codes) if auto_run_recommended else None
                 if selected is None:
@@ -218,10 +265,27 @@ def run_health_check_cycle(
                 else:
                     _run_auto_command(selected)
                     _print_prefixed("re-running health-check after optional remediation")
-                    _run_health_check_json(config, stale_hours=stale_hours, json_path=run_json)
+                    _run_health_check_json(
+                        config,
+                        stale_hours=stale_hours,
+                        json_path=run_json,
+                        review_issue_type=review_issue_type,
+                        review_worklist_limit=review_worklist_limit,
+                        mapping_coverage_threshold=mapping_coverage_threshold,
+                        maintenance_review_limit=maintenance_review_limit,
+                    )
 
                 summary = subprocess.run(
-                    _health_check_command(config, stale_hours=stale_hours, strict=strict, output_format="summary"),
+                    _health_check_command(
+                        config,
+                        stale_hours=stale_hours,
+                        strict=strict,
+                        output_format="summary",
+                        review_issue_type=review_issue_type,
+                        review_worklist_limit=review_worklist_limit,
+                        mapping_coverage_threshold=mapping_coverage_threshold,
+                        maintenance_review_limit=maintenance_review_limit,
+                    ),
                     check=False,
                     capture_output=True,
                     text=True,

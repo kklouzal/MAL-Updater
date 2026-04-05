@@ -153,6 +153,91 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertNotIn("auto_remediation_action=skipped_not_allowlisted", stdout)
         self.assertTrue(self.config.health_latest_json_path.exists())
 
+    def test_health_check_cycle_passes_mapping_review_tuning_into_saved_health_payload(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            for idx in range(1, 6):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
+                )
+            for idx in range(1, 4):
+                conn.execute(
+                    "INSERT INTO mal_series_mapping(provider, provider_series_id, mal_anime_id, confidence, mapping_source, approved_by_user, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("crunchyroll", f"series-{idx}", 1000 + idx, 0.99, "auto_exact", 1, None),
+                )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+                ("crunchyroll", "1.0", "ingest_snapshot", "completed", json.dumps({"series_count": 5}, sort_keys=True)),
+            )
+            conn.commit()
+
+        exit_code, stdout = self._run_health_check_cycle_raw(
+            "--mapping-coverage-threshold",
+            "0.7",
+            "--maintenance-review-limit",
+            "10",
+            "--review-worklist-limit",
+            "1",
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("mapping_coverage_threshold=0.7", stdout)
+        self.assertIn("maintenance_review_limit=10", stdout)
+        self.assertIn("review_worklist_limit=1", stdout)
+        payload = json.loads(self.config.health_latest_json_path.read_text(encoding="utf-8"))
+        self.assertEqual(0.7, payload["mappings"]["coverage_threshold"])
+        maintenance_commands = payload["maintenance"]["recommended_commands"]
+        self.assertEqual("refresh_mapping_review_backlog", maintenance_commands[0]["reason_code"])
+        self.assertEqual(
+            ["review-mappings", "--limit", "10", "--mapping-limit", "5", "--persist-review-queue"],
+            maintenance_commands[0]["command_args"],
+        )
+        self.assertEqual([], payload["review_queue"]["recommended_worklist"])
+
+    def test_health_check_cycle_passes_review_issue_type_into_saved_health_payload(self) -> None:
+        replace_review_queue_entries(
+            self.config.db_path,
+            issue_type="mapping_review",
+            entries=[
+                {
+                    "provider": "crunchyroll",
+                    "provider_series_id": "series-1",
+                    "severity": "warning",
+                    "payload": {"decision": "needs_manual_match", "reasons": ["same_franchise_tie"]},
+                }
+            ],
+        )
+        replace_review_queue_entries(
+            self.config.db_path,
+            issue_type="sync_review",
+            entries=[
+                {
+                    "provider": "crunchyroll",
+                    "provider_series_id": "series-2",
+                    "severity": "warning",
+                    "payload": {"decision": "blocked", "reasons": ["missing_exact_approval"]},
+                }
+            ],
+        )
+
+        exit_code, stdout = self._run_health_check_cycle_raw("--review-issue-type", "sync_review")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("review_issue_type=sync_review", stdout)
+        payload = json.loads(self.config.health_latest_json_path.read_text(encoding="utf-8"))
+        self.assertEqual("sync_review", payload["review_queue"]["recommendation_issue_type_filter"])
+        self.assertEqual("blocked | missing_exact_approval", payload["review_queue"]["recommended_next"]["bucket_key"])
+
     def test_health_check_recommends_crunchyroll_reauth_after_repeated_auth_failures(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
