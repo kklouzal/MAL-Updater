@@ -39,7 +39,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
-- dependency checks (`python3`, `flock`, `systemctl`, optional provider/runtime extras)
+- dependency checks (`python3`, `systemctl`, optional provider/runtime extras)
 - MAL client id / token presence, including repeated unattended MAL token-refresh failures that already imply the staged refresh material needs a fresh `mal-auth-login`
 - Crunchyroll credentials / staged auth-state presence
 - HIDIVE credentials / staged auth-state presence

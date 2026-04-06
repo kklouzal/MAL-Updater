@@ -30,7 +30,7 @@ The default JSON output is intended to be automation-friendly: it includes per-p
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
-- whether `python3`, `flock`, `systemctl`, and optional provider/runtime extras are available
+- whether `python3`, `systemctl`, and optional provider/runtime extras are available
 - whether MAL client id / MAL auth tokens exist
 - whether Crunchyroll credentials / staged Crunchyroll auth state exist
 - whether HIDIVE credentials / staged HIDIVE auth state exist
@@ -42,9 +42,9 @@ The default JSON output is intended to be automation-friendly: it includes per-p
 ### 1. Dependency check
 
 - Require `python3`
-- Require `flock` for the wrapper scripts the daemon still reuses for some guarded lanes
 - Treat `curl_cffi` as strongly recommended for live Crunchyroll auth/fetch reliability
 - Treat `systemctl` as required only for the unattended user-systemd daemon path
+- Treat compatibility wrapper scripts as optional operator conveniences, not bootstrap blockers for the repo-native daemon/runtime flow
 
 If missing:
 - explain what is missing

@@ -485,7 +485,6 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     dependency_checks = {
         "python3": shutil.which("python3") is not None,
         "systemctl": shutil.which("systemctl") is not None,
-        "flock": shutil.which("flock") is not None,
         "curl_cffi": importlib.util.find_spec("curl_cffi") is not None,
     }
     missing_dependencies = [name for name, present in dependency_checks.items() if not present]

@@ -195,6 +195,17 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
         self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
 
+    def test_bootstrap_audit_does_not_treat_flock_as_a_required_runtime_dependency(self) -> None:
+        with patch("mal_updater.cli.shutil.which") as which:
+            which.side_effect = lambda command: None if command == "flock" else f"/usr/bin/{command}"
+            exit_code, stdout = self._run_bootstrap_audit_raw()
+
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertNotIn("flock", payload["dependencies"]["checks"])
+        self.assertNotIn("flock", payload["dependencies"]["missing"])
+
     def test_bootstrap_audit_marks_mal_auth_degraded_from_repeated_refresh_failures(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
         for relative in ("config", "data", "cache", "state", "secrets"):
