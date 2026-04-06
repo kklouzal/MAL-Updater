@@ -2839,11 +2839,12 @@ def _cmd_refresh_mapping_review_queue(
     return 0
 
 
-def _cmd_list_mappings(project_root: Path | None, approved_only: bool) -> int:
+def _cmd_list_mappings(project_root: Path | None, approved_only: bool, provider: str | None) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
-    items = list_series_mappings(config.db_path, provider="crunchyroll", approved_only=approved_only)
+    normalized_provider = None if provider in {None, "all"} else provider
+    items = list_series_mappings(config.db_path, provider=normalized_provider, approved_only=approved_only)
     print(
         json.dumps(
             [
@@ -4914,6 +4915,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_mapping_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only refresh open mapping_review rows whose combined normalized title-cluster/fix-strategy family exactly matches this value")
     refresh_mapping_review_queue.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
     list_mappings = subparsers.add_parser("list-mappings", help="List persisted provider -> MAL mappings from SQLite")
+    list_mappings.add_argument("--provider", default="all", choices=["all", "crunchyroll", "hidive"], help="Optional provider filter (default: all)")
     list_mappings.add_argument("--approved-only", action="store_true", help="Only include mappings explicitly approved by the user")
     approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved provider -> MAL series mapping")
     approve_mapping.add_argument("provider_series_id", help="Provider provider_series_id to approve")
@@ -5182,7 +5184,7 @@ def main() -> int:
             cluster_strategy_family=args.cluster_strategy_family,
         )
     if args.command == "list-mappings":
-        return _cmd_list_mappings(args.project_root, args.approved_only)
+        return _cmd_list_mappings(args.project_root, args.approved_only, args.provider)
     if args.command == "approve-mapping":
         return _cmd_approve_mapping(
             args.project_root,

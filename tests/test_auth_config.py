@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.auth import format_auth_flow_prompt, persist_token_response, write_secret_file
-from mal_updater.cli import _cmd_approve_mapping, _cmd_dry_run_sync, _cmd_review_mappings
+from mal_updater.cli import _cmd_approve_mapping, _cmd_dry_run_sync, _cmd_list_mappings, _cmd_review_mappings
 from mal_updater.config import load_config, load_mal_secrets
-from mal_updater.db import bootstrap_database, get_series_mapping
+from mal_updater.db import bootstrap_database, connect, get_series_mapping, upsert_series_mapping
 from mal_updater.ingestion import ingest_snapshot_payload
 from tests.test_validation_ingestion import sample_snapshot
 from mal_updater.mal_client import MalApiError, MalClient, TokenResponse
@@ -341,6 +341,85 @@ class AuthHelperTests(unittest.TestCase):
             assert mapping is not None
             self.assertEqual(mapping.mapping_source, "user_exact")
             self.assertTrue(mapping.approved_by_user)
+
+    def test_list_mappings_defaults_to_all_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            with connect(config.db_path) as conn:
+                conn.executemany(
+                    "INSERT INTO provider_series(provider, provider_series_id, title) VALUES (?, ?, ?)",
+                    [("crunchyroll", "series-cr", "Crunchyroll Show"), ("hidive", "series-hd", "HIDIVE Show")],
+                )
+
+            upserts = [
+                ("crunchyroll", "series-cr", 101),
+                ("hidive", "series-hd", 202),
+            ]
+            for provider, provider_series_id, mal_anime_id in upserts:
+                upsert_series_mapping(
+                    config.db_path,
+                    provider=provider,
+                    provider_series_id=provider_series_id,
+                    mal_anime_id=mal_anime_id,
+                    confidence=0.99,
+                    mapping_source="user_approved",
+                    approved_by_user=True,
+                    notes=f"{provider} mapping",
+                )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = _cmd_list_mappings(root, approved_only=False, provider=None)
+
+            self.assertEqual(code, 0)
+            payload = stdout.getvalue()
+            self.assertIn('"provider": "crunchyroll"', payload)
+            self.assertIn('"provider": "hidive"', payload)
+
+    def test_list_mappings_can_filter_to_single_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            with connect(config.db_path) as conn:
+                conn.executemany(
+                    "INSERT INTO provider_series(provider, provider_series_id, title) VALUES (?, ?, ?)",
+                    [("crunchyroll", "series-cr", "Crunchyroll Show"), ("hidive", "series-hd", "HIDIVE Show")],
+                )
+
+            upsert_series_mapping(
+                config.db_path,
+                provider="crunchyroll",
+                provider_series_id="series-cr",
+                mal_anime_id=101,
+                confidence=0.99,
+                mapping_source="user_approved",
+                approved_by_user=True,
+                notes="crunchyroll mapping",
+            )
+            upsert_series_mapping(
+                config.db_path,
+                provider="hidive",
+                provider_series_id="series-hd",
+                mal_anime_id=202,
+                confidence=0.99,
+                mapping_source="user_approved",
+                approved_by_user=True,
+                notes="hidive mapping",
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = _cmd_list_mappings(root, approved_only=False, provider="hidive")
+
+            self.assertEqual(code, 0)
+            payload = stdout.getvalue()
+            self.assertNotIn('"provider": "crunchyroll"', payload)
+            self.assertIn('"provider": "hidive"', payload)
 
 
 if __name__ == "__main__":

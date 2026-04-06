@@ -43,6 +43,7 @@
 - built-in projected-request defaults now consistently act as cold-start seeds rather than permanent hard overrides, so learned request history can take over for `mal_refresh`, `sync_apply`, and provider full-refresh fetches once the daemon has real observed cost data while explicit task-wide overrides still beat the shipped seeds
 - overdue provider full-refresh requests no longer have to starve a fetch lane completely when the heavy sweep is temporarily over budget: the daemon now falls back to an incremental fetch when that cheaper mode fits, while leaving the full-refresh anchor/reason intact so the overdue resweep still happens later
 - recommendation generation and metadata refresh exist
+- `list-mappings` now reflects the repo's multi-provider posture too: it lists all persisted mappings by default and supports explicit provider filtering instead of silently showing Crunchyroll only
 - tests remain bundled in the repo for third-party auditing
 
 ## Open work

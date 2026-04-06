@@ -64,14 +64,14 @@ cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --summary
 PYTHONPATH=src python3 -m mal_updater.cli review-queue-next --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli review-queue-worklist --issue-type mapping_review --limit 5
-PYTHONPATH=src python3 -m mal_updater.cli list-mappings
+PYTHONPATH=src python3 -m mal_updater.cli list-mappings --provider all
 ```
 
 Use this surface when the user wants:
 - mapping backlog state
 - next recommended mapping-review slice
 - grouped review worklists
-- mapping inventory / approved coverage context
+- mapping inventory / approved coverage context across all currently supported providers, with optional per-provider filtering via `--provider`
 
 ## Guarded sync state / execution
 
