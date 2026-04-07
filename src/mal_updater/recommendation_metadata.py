@@ -10,13 +10,16 @@ class _DiscoveredTargetStats:
     supporting_sources: int = 0
     total_recommendation_votes: int = 0
     best_single_source_votes: int = 0
+    cross_seed_support_votes: int = 0
 
     def observe(self, *, title: str | None, num_recommendations: int) -> None:
         self.supporting_sources += 1
         if title and not self.title:
             self.title = title
-        self.total_recommendation_votes += max(num_recommendations, 0)
-        self.best_single_source_votes = max(self.best_single_source_votes, max(num_recommendations, 0))
+        votes = max(num_recommendations, 0)
+        self.total_recommendation_votes += votes
+        self.best_single_source_votes = max(self.best_single_source_votes, votes)
+        self.cross_seed_support_votes = max(self.total_recommendation_votes - self.best_single_source_votes, 0)
 
 from .config import AppConfig, load_mal_secrets
 from .db import (
@@ -143,7 +146,8 @@ def refresh_recommendation_metadata(
             key=lambda item: (
                 -item[1].supporting_sources,
                 -item[1].total_recommendation_votes,
-                -item[1].best_single_source_votes,
+                -item[1].cross_seed_support_votes,
+                item[1].best_single_source_votes,
                 item[0],
             ),
         )

@@ -384,6 +384,23 @@ Also treat a material execution-posture change (for example historical full-pass
 - a single oversized historical apply run should not be able to trap the daemon in near-permanent projected-budget skips once the intended unattended posture becomes smaller and more conservative
 - keeping the bounded batch size explicit and configurable preserves explainability while still allowing hosts with stronger evidence to tune the lane differently later
 
+## 2026-04-07 - Discovery support-balance posture
+
+### Decision
+When discovery-candidate MAL recommendation edges have similar aggregate support, prefer candidates whose support is spread across multiple watched/mapped seed titles over candidates whose votes are concentrated in one bursty seed.
+
+Expose that evidence in recommendation context as:
+- `best_single_source_votes`
+- `cross_seed_support_votes`
+- `support_balance_bonus`
+
+Use the same posture when choosing optional discovery-target metadata refreshes so limited refresh budget follows steadier consensus rather than the loudest single seed.
+
+### Why
+- aggregate vote count alone can overstate one noisy recommendation edge
+- cross-seed consensus is a better conservative signal for discovery suggestions than a single strong burst when totals are otherwise close
+- surfacing the balance metadata keeps the recommendation order explainable instead of hiding this as an opaque tie-break
+
 ## 2026-03-31 - Bootstrap partial-install operation-mode posture
 
 ### Decision

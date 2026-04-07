@@ -580,11 +580,14 @@ def _build_discovery_recommendations(
                     "supporting_sources": set(),
                     "raw_score": 0.0,
                     "votes": 0,
+                    "votes_by_source": {},
                     "title": edge.target_title,
                 },
             )
             votes = edge.num_recommendations or 0
             bucket["supporting_sources"].add(source_id)
+            votes_by_source = bucket["votes_by_source"]
+            votes_by_source[source_id] = votes_by_source.get(source_id, 0) + votes
             bucket["votes"] += votes
             bucket["raw_score"] += weight * min(votes, 40)
 
@@ -611,6 +614,10 @@ def _build_discovery_recommendations(
             continue
         mean = meta.mean if meta is not None else None
         popularity = meta.popularity if meta is not None else None
+        votes_by_source = bucket.get("votes_by_source") or {}
+        best_single_source_votes = max((int(value) for value in votes_by_source.values()), default=0)
+        cross_seed_support_votes = max(bucket["votes"] - best_single_source_votes, 0)
+        support_balance_bonus = min(cross_seed_support_votes // 5, 8)
         popularity_bonus = 0
         if popularity is not None:
             if popularity <= 100:
@@ -631,12 +638,14 @@ def _build_discovery_recommendations(
         source_overlap_score = seed_source_weights.get(candidate_source, 0) if candidate_source is not None else 0
         source_bonus = min(source_overlap_score * 2, 6)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
-        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
         if bucket["votes"]:
             reasons.append(f"aggregated MAL recommendation votes: {bucket['votes']}")
+        if cross_seed_support_votes > 0:
+            reasons.append(f"cross-seed consensus beyond the strongest seed: {cross_seed_support_votes} vote(s)")
         if shared_genres:
             reasons.append("shared seed genres: " + ", ".join(shared_genres[:3]))
         if shared_studios:
@@ -662,6 +671,9 @@ def _build_discovery_recommendations(
                     "supporting_source_count": support_count,
                     "supporting_mal_anime_ids": sorted(bucket["supporting_sources"]),
                     "aggregated_recommendation_votes": bucket["votes"],
+                    "best_single_source_votes": best_single_source_votes,
+                    "cross_seed_support_votes": cross_seed_support_votes,
+                    "support_balance_bonus": support_balance_bonus,
                     "shared_genres": shared_genres,
                     "genre_overlap_score": genre_overlap_score,
                     "shared_studios": shared_studios,

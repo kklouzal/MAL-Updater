@@ -530,6 +530,48 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("mal:300", item.provider_series_id)
         self.assertEqual(2, item.context["supporting_source_count"])
         self.assertEqual(35, item.context["aggregated_recommendation_votes"])
+        self.assertEqual(20, item.context["best_single_source_votes"])
+        self.assertEqual(15, item.context["cross_seed_support_votes"])
+        self.assertEqual(3, item.context["support_balance_bonus"])
+        self.assertIn("cross-seed consensus beyond the strongest seed: 15 vote(s)", item.reasons)
+
+    def test_discovery_candidate_prefers_balanced_cross_seed_support_when_totals_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-b",
+            title="Seed B",
+            season_title="Seed B (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._map_series("seed-b", 200)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(200, title="Seed B")
+        self._cache_metadata(300, title="Balanced Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Bursty Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Balanced Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Bursty Pick", "num_recommendations": 30, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 300, "target_title": "Balanced Pick", "num_recommendations": 10, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Bursty Pick", "num_recommendations": 0, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(10, results[0].context["cross_seed_support_votes"])
+        self.assertEqual(0, results[1].context["cross_seed_support_votes"])
+        self.assertGreater(results[0].context["support_balance_bonus"], results[1].context["support_balance_bonus"])
+        self.assertGreater(results[0].priority, results[1].priority)
 
     def test_discovery_candidate_prefers_cached_genre_overlap(self) -> None:
         self._insert_series(
@@ -966,6 +1008,103 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn(400, metadata_by_id)
         self.assertEqual("plan_to_watch", metadata_by_id[400].raw["my_list_status"]["status"])
         self.assertNotIn(300, metadata_by_id)
+
+    def test_discovery_target_limit_prefers_more_balanced_cross_seed_support_when_totals_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-b",
+            title="Seed B",
+            season_title="Seed B (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._map_series("seed-b", 200)
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "") -> dict:
+            payloads = {
+                100: {
+                    "id": 100,
+                    "title": "Seed A",
+                    "alternative_titles": {},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "mean": 8.1,
+                    "popularity": 500,
+                    "start_season": {"year": 2020, "season": "winter"},
+                    "related_anime": [],
+                    "recommendations": [
+                        {"node": {"id": 300, "title": "Balanced Pick"}, "num_recommendations": 20},
+                        {"node": {"id": 400, "title": "Bursty Pick"}, "num_recommendations": 30},
+                    ],
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+                },
+                200: {
+                    "id": 200,
+                    "title": "Seed B",
+                    "alternative_titles": {},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 13,
+                    "mean": 7.9,
+                    "popularity": 800,
+                    "start_season": {"year": 2021, "season": "spring"},
+                    "related_anime": [],
+                    "recommendations": [
+                        {"node": {"id": 300, "title": "Balanced Pick"}, "num_recommendations": 10},
+                        {"node": {"id": 400, "title": "Bursty Pick"}, "num_recommendations": 0},
+                    ],
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 13},
+                },
+                300: {
+                    "id": 300,
+                    "title": "Balanced Pick",
+                    "alternative_titles": {"en": "Balanced Pick"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 24,
+                    "mean": 8.6,
+                    "popularity": 140,
+                    "start_season": {"year": 2022, "season": "spring"},
+                    "my_list_status": {"status": "watching", "num_episodes_watched": 2},
+                },
+                400: {
+                    "id": 400,
+                    "title": "Bursty Pick",
+                    "alternative_titles": {"en": "Bursty Pick"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "mean": 8.6,
+                    "popularity": 140,
+                    "start_season": {"year": 2022, "season": "spring"},
+                    "my_list_status": {"status": "watching", "num_episodes_watched": 2},
+                },
+            }
+            return payloads[anime_id]
+
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details) as get_details:
+            summary = refresh_recommendation_metadata(
+                self.config,
+                include_discovery_targets=True,
+                discovery_target_limit=1,
+            )
+
+        self.assertEqual(2, summary.considered)
+        self.assertEqual(2, summary.refreshed)
+        requested_ids = [call.args[0] for call in get_details.call_args_list]
+        self.assertEqual([100, 200, 300], requested_ids)
+
+        metadata_by_id = get_mal_anime_metadata_map(self.config.db_path)
+        self.assertIn(300, metadata_by_id)
+        self.assertNotIn(400, metadata_by_id)
 
     def test_discovery_target_limit_prefers_aggregate_multi_seed_support(self) -> None:
         self._insert_series(
