@@ -191,6 +191,8 @@ Extend the same shared auth-style failure detection used for provider daemon lan
 
 When the daemon records repeated auth-style `mal_refresh` failures (for example `invalid_grant`, expired/revoked refresh material, or other refresh-token/auth residue), `health-check` should emit a dedicated warning plus a `mal-auth-login` maintenance recommendation.
 
+That shared command surface should still preserve machine-readable residue specificity (`reason_code`, `auth_remediation_kind`) so automation can distinguish revoked-token, missing-refresh-material, and malformed-token-payload cases even when the conservative next command remains the same.
+
 ### Why
 - unattended MAL token-refresh failures are operationally similar to provider auth degradation: the daemon should cool down, and the operator should get a clear re-auth instruction
 - without an explicit MAL lane recommendation, the health surface can look noisier and less actionable than the provider-side guidance it already ships

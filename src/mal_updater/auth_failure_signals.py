@@ -12,6 +12,37 @@ AUTH_FAILURE_KIND_LABELS = {
     "generic_auth": "generic auth-style failure",
 }
 
+AUTH_FAILURE_REMEDIATION = {
+    "invalid_grant": {
+        "remediation_kind": "refresh-token-invalidated",
+        "detail": "stage fresh auth material because the existing refresh/auth token looks revoked, expired, or otherwise invalid",
+    },
+    "missing_refresh_material": {
+        "remediation_kind": "refresh-material-missing",
+        "detail": "restage the missing refresh material before treating unattended auth as healthy again",
+    },
+    "malformed_token_payload": {
+        "remediation_kind": "token-payload-malformed",
+        "detail": "replace the malformed persisted auth payload with a freshly bootstrapped token set",
+    },
+    "login_failure": {
+        "remediation_kind": "login-bootstrap-failed",
+        "detail": "repeat the auth/bootstrap flow because the previous login/bootstrap attempt did not complete cleanly",
+    },
+    "session_auth_failed": {
+        "remediation_kind": "session-auth-failed",
+        "detail": "re-bootstrap the persisted session/auth state before trusting unattended fetches again",
+    },
+    "http_auth": {
+        "remediation_kind": "http-auth-rejected",
+        "detail": "refresh the staged auth/session material because the provider is actively rejecting the current credentials or tokens",
+    },
+    "generic_auth": {
+        "remediation_kind": "generic-auth-degraded",
+        "detail": "repeat the conservative reauth/rebootstrap flow because persisted auth state still looks degraded",
+    },
+}
+
 AUTH_STYLE_FAILURE_MARKERS = (
     "http 401",
     "http 403",
@@ -111,6 +142,16 @@ def classify_auth_style_failure(
             "label": AUTH_FAILURE_KIND_LABELS["generic_auth"],
         }
     return None
+
+
+
+def auth_failure_remediation(kind_payload: Mapping[str, object] | None) -> dict[str, str]:
+    kind = kind_payload.get("kind") if isinstance(kind_payload, Mapping) else None
+    if isinstance(kind, str):
+        remediation = AUTH_FAILURE_REMEDIATION.get(kind)
+        if isinstance(remediation, dict):
+            return dict(remediation)
+    return dict(AUTH_FAILURE_REMEDIATION["generic_auth"])
 
 
 

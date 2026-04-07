@@ -270,8 +270,10 @@ class HealthCheckCliTests(unittest.TestCase):
         warning_codes = {warning["code"] for warning in payload["warnings"]}
         self.assertIn("crunchyroll_auth_failures_repeated", warning_codes)
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("rebootstrap_crunchyroll_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual("rebootstrap_crunchyroll_auth_after_http_auth", maintenance_commands[0]["reason_code"])
         self.assertEqual(["crunchyroll-auth-login"], maintenance_commands[0]["command_args"])
+        self.assertEqual("http_auth", maintenance_commands[0]["auth_failure_kind"])
+        self.assertEqual("http-auth-rejected", maintenance_commands[0]["auth_remediation_kind"])
         self.assertFalse(maintenance_commands[0]["automation_safe"])
         self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
@@ -309,8 +311,10 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("revoked or invalid refresh/auth token", repeated["detail"])
         self.assertIn("invalid_grant", repeated["reason"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("rebootstrap_mal_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual("rebootstrap_mal_auth_after_invalid_grant", maintenance_commands[0]["reason_code"])
         self.assertEqual(["mal-auth-login"], maintenance_commands[0]["command_args"])
+        self.assertEqual("invalid_grant", maintenance_commands[0]["auth_failure_kind"])
+        self.assertEqual("refresh-token-invalidated", maintenance_commands[0]["auth_remediation_kind"])
         self.assertFalse(maintenance_commands[0]["automation_safe"])
         self.assertTrue(maintenance_commands[0]["requires_auth_interaction"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
@@ -343,7 +347,7 @@ class HealthCheckCliTests(unittest.TestCase):
         warning_codes = {warning["code"] for warning in payload["warnings"]}
         self.assertNotIn("mal_auth_failures_repeated", warning_codes)
         maintenance_reason_codes = [command["reason_code"] for command in payload["maintenance"]["recommended_commands"]]
-        self.assertNotIn("rebootstrap_mal_auth_after_failures", maintenance_reason_codes)
+        self.assertFalse(any(code.startswith("rebootstrap_mal_auth_after_") for code in maintenance_reason_codes))
 
     def test_health_check_recommends_reauth_for_login_failure_without_http_401_marker(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
@@ -376,7 +380,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("crunchyroll", repeated["provider"])
         self.assertIn("invalid_grant", repeated["reason"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("rebootstrap_crunchyroll_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual("rebootstrap_crunchyroll_auth_after_invalid_grant", maintenance_commands[0]["reason_code"])
 
     def test_health_check_recommends_reauth_for_missing_refresh_token_residue(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
@@ -409,7 +413,13 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("missing refresh material", repeated["detail"])
         self.assertIn("Missing Crunchyroll refresh token", repeated["reason"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual(["crunchyroll-auth-login"], maintenance_commands[0]["command_args"])
+        auth_command = next(
+            command for command in maintenance_commands
+            if command["reason_code"] == "rebootstrap_crunchyroll_auth_after_missing_refresh_material"
+        )
+        self.assertEqual(["crunchyroll-auth-login"], auth_command["command_args"])
+        self.assertEqual("missing_refresh_material", auth_command["auth_failure_kind"])
+        self.assertEqual("refresh-material-missing", auth_command["auth_remediation_kind"])
 
     def test_health_check_uses_provider_session_auth_phase_as_fallback_signal(self) -> None:
         (self.config.secrets_dir / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
@@ -454,8 +464,10 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("malformed token payload", repeated["detail"])
         self.assertIn("authorisationToken", repeated["session_last_error"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual("rebootstrap_hidive_auth_after_failures", maintenance_commands[0]["reason_code"])
+        self.assertEqual("rebootstrap_hidive_auth_after_malformed_token_payload", maintenance_commands[0]["reason_code"])
         self.assertEqual(["provider-auth-login", "--provider", "hidive"], maintenance_commands[0]["command_args"])
+        self.assertEqual("malformed_token_payload", maintenance_commands[0]["auth_failure_kind"])
+        self.assertEqual("token-payload-malformed", maintenance_commands[0]["auth_remediation_kind"])
 
     def test_health_check_ignores_non_auth_provider_failures(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
@@ -487,7 +499,7 @@ class HealthCheckCliTests(unittest.TestCase):
         warning_codes = {warning["code"] for warning in payload["warnings"]}
         self.assertNotIn("crunchyroll_auth_failures_repeated", warning_codes)
         maintenance_reason_codes = [command["reason_code"] for command in payload["maintenance"]["recommended_commands"]]
-        self.assertNotIn("rebootstrap_crunchyroll_auth_after_failures", maintenance_reason_codes)
+        self.assertFalse(any(code.startswith("rebootstrap_crunchyroll_auth_after_") for code in maintenance_reason_codes))
 
     def test_health_check_warns_when_repo_owned_automation_units_are_not_installed(self) -> None:
         self._provision_repo_owned_automation_assets()

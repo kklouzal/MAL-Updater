@@ -16,7 +16,7 @@ import shutil
 import stat
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
-from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, classify_auth_style_failure
+from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, auth_failure_remediation, classify_auth_style_failure
 from .config import ensure_directories, load_config, load_mal_secrets
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
@@ -292,9 +292,17 @@ def _provider_bootstrap_guidance_status(
             "kind": str(auth_issue.get("auth_failure_kind")),
             "label": str(auth_issue.get("auth_failure_label")),
         })
+        remediation = _auth_failure_remediation({
+            "kind": str(auth_issue.get("auth_failure_kind")),
+            "label": str(auth_issue.get("auth_failure_label")),
+        })
+        remediation_detail = remediation.get("detail")
         details = (
             f"{title} credentials and session state are staged, but auth looks degraded ({failure_label}); re-bootstrap this provider before treating unattended fetches as healthy."
         )
+        if isinstance(remediation_detail, str) and remediation_detail:
+            details += f" Recommended posture: {remediation_detail}."
+        
         if isinstance(reason, str) and reason.strip():
             details += f" Latest signal: {reason.strip()}"
         return {
@@ -304,6 +312,8 @@ def _provider_bootstrap_guidance_status(
             "ready": False,
             "details": details,
             "next_command": bootstrap_command,
+            "remediation_kind": remediation.get("remediation_kind"),
+            "remediation_detail": remediation_detail,
         }
 
     if credentials_present and session_present:
@@ -356,7 +366,14 @@ def _mal_bootstrap_guidance_status(
             "kind": str(auth_issue.get("auth_failure_kind")),
             "label": str(auth_issue.get("auth_failure_label")),
         })
+        remediation = _auth_failure_remediation({
+            "kind": str(auth_issue.get("auth_failure_kind")),
+            "label": str(auth_issue.get("auth_failure_label")),
+        })
+        remediation_detail = remediation.get("detail")
         details = f"MyAnimeList OAuth tokens are staged, but repeated unattended token refresh failures suggest MAL auth should be completed again before trusting unattended sync ({failure_label})."
+        if isinstance(remediation_detail, str) and remediation_detail:
+            details += f" Recommended posture: {remediation_detail}."
         if isinstance(reason, str) and reason.strip():
             details += f" Latest signal: {reason.strip()}"
         return {
@@ -364,6 +381,8 @@ def _mal_bootstrap_guidance_status(
             "ready": False,
             "details": details,
             "next_command": auth_command,
+            "remediation_kind": remediation.get("remediation_kind"),
+            "remediation_detail": remediation_detail,
         }
 
     return {
@@ -1451,6 +1470,11 @@ def _describe_auth_failure_kind(kind_payload: dict[str, object] | None) -> str:
 
 
 
+def _auth_failure_remediation(kind_payload: dict[str, object] | None) -> dict[str, str]:
+    return auth_failure_remediation(kind_payload)
+
+
+
 def _task_service_auth_failure(
     service_state: dict[str, object] | None,
     *,
@@ -1477,12 +1501,15 @@ def _task_service_auth_failure(
     auth_failure_kind = classify_auth_style_failure(reason, session_residue=session_residue)
     if not isinstance(auth_failure_kind, dict):
         return None
+    remediation = _auth_failure_remediation(auth_failure_kind)
     payload: dict[str, object] = {
         subject_key: subject_value,
         "reason": reason.strip(),
         "consecutive_failures": int(consecutive_failures),
         "auth_failure_kind": auth_failure_kind.get("kind"),
         "auth_failure_label": auth_failure_kind.get("label"),
+        "auth_remediation_kind": remediation.get("remediation_kind"),
+        "auth_remediation_detail": remediation.get("detail"),
     }
     if isinstance(task_state.get("failure_backoff_until"), str):
         payload["failure_backoff_until"] = task_state["failure_backoff_until"]
@@ -1575,12 +1602,15 @@ def _provider_bootstrap_auth_issue(
         else:
             reason = "provider session state looks auth-degraded"
 
+    remediation = _auth_failure_remediation(auth_failure_kind)
     return {
         "provider": provider,
         "reason": reason,
         "source": "session_state",
         "auth_failure_kind": auth_failure_kind.get("kind"),
         "auth_failure_label": auth_failure_kind.get("label"),
+        "auth_remediation_kind": remediation.get("remediation_kind"),
+        "auth_remediation_detail": remediation.get("detail"),
         **session_residue,
     }
 
@@ -1610,7 +1640,7 @@ def _build_health_maintenance_commands(
     provider_auth_failures: dict[str, dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     commands: list[dict[str, object]] = []
-    seen_commands: set[str] = set()
+    seen_commands: dict[str, dict[str, object]] = {}
 
     def add_command(
         reason_code: str,
@@ -1619,22 +1649,37 @@ def _build_health_maintenance_commands(
         *,
         automation_safe: bool,
         requires_auth_interaction: bool,
+        auth_failure_kind: str | None = None,
+        auth_remediation_kind: str | None = None,
         command_builder=None,
     ) -> None:
         command = command_builder(args) if command_builder is not None else _build_review_queue_command(args)
-        if command in seen_commands:
+        existing = seen_commands.get(command)
+        if isinstance(existing, dict):
+            additional_reason_codes = existing.setdefault("additional_reason_codes", [])
+            if isinstance(additional_reason_codes, list) and reason_code not in additional_reason_codes and reason_code != existing.get("reason_code"):
+                additional_reason_codes.append(reason_code)
+            if auth_failure_kind and not existing.get("auth_failure_kind"):
+                existing["reason_code"] = reason_code
+                existing["detail"] = detail
+                existing["auth_failure_kind"] = auth_failure_kind
+                if auth_remediation_kind:
+                    existing["auth_remediation_kind"] = auth_remediation_kind
             return
-        seen_commands.add(command)
-        commands.append(
-            {
-                "reason_code": reason_code,
-                "detail": detail,
-                "command_args": args,
-                "command": command,
-                "automation_safe": automation_safe,
-                "requires_auth_interaction": requires_auth_interaction,
-            }
-        )
+        payload = {
+            "reason_code": reason_code,
+            "detail": detail,
+            "command_args": args,
+            "command": command,
+            "automation_safe": automation_safe,
+            "requires_auth_interaction": requires_auth_interaction,
+        }
+        if isinstance(auth_failure_kind, str) and auth_failure_kind:
+            payload["auth_failure_kind"] = auth_failure_kind
+        if isinstance(auth_remediation_kind, str) and auth_remediation_kind:
+            payload["auth_remediation_kind"] = auth_remediation_kind
+        commands.append(payload)
+        seen_commands[command] = payload
 
     if crunchyroll_credentials_present and not crunchyroll_state_present:
         add_command(
@@ -1654,20 +1699,27 @@ def _build_health_maintenance_commands(
         )
 
     if mal_client_id_present and isinstance(mal_auth_failure, dict):
+        failure_kind = str(mal_auth_failure.get("auth_failure_kind"))
+        remediation_kind = str(mal_auth_failure.get("auth_remediation_kind") or "")
         failure_label = _describe_auth_failure_kind({
-            "kind": str(mal_auth_failure.get("auth_failure_kind")),
+            "kind": failure_kind,
             "label": str(mal_auth_failure.get("auth_failure_label")),
         })
+        remediation_detail = mal_auth_failure.get("auth_remediation_detail")
         detail = f"Complete MAL OAuth again after repeated unattended MAL token refresh failures ({failure_label})"
+        if isinstance(remediation_detail, str) and remediation_detail:
+            detail += f"; {remediation_detail}"
         reason = mal_auth_failure.get("reason")
         if isinstance(reason, str) and reason:
             detail += f": {reason}"
         add_command(
-            "rebootstrap_mal_auth_after_failures",
+            f"rebootstrap_mal_auth_after_{failure_kind or 'auth_failures'}",
             detail,
             ["mal-auth-login"],
             automation_safe=False,
             requires_auth_interaction=True,
+            auth_failure_kind=failure_kind or None,
+            auth_remediation_kind=remediation_kind or None,
         )
 
     if mal_client_id_present and not mal_auth_present:
@@ -1682,41 +1734,55 @@ def _build_health_maintenance_commands(
     if isinstance(provider_auth_failures, dict):
         crunchyroll_failure = provider_auth_failures.get("crunchyroll")
         if crunchyroll_credentials_present and isinstance(crunchyroll_failure, dict):
+            failure_kind = str(crunchyroll_failure.get("auth_failure_kind"))
+            remediation_kind = str(crunchyroll_failure.get("auth_remediation_kind") or "")
             failure_label = _describe_auth_failure_kind({
-                "kind": str(crunchyroll_failure.get("auth_failure_kind")),
+                "kind": failure_kind,
                 "label": str(crunchyroll_failure.get("auth_failure_label")),
             })
+            remediation_detail = crunchyroll_failure.get("auth_remediation_detail")
             detail = (
                 f"Re-bootstrap Crunchyroll auth state after repeated auth-style unattended fetch failures ({failure_label})"
             )
+            if isinstance(remediation_detail, str) and remediation_detail:
+                detail += f"; {remediation_detail}"
             reason = crunchyroll_failure.get("reason")
             if isinstance(reason, str) and reason:
                 detail += f": {reason}"
             add_command(
-                "rebootstrap_crunchyroll_auth_after_failures",
+                f"rebootstrap_crunchyroll_auth_after_{failure_kind or 'auth_failures'}",
                 detail,
                 ["crunchyroll-auth-login"],
                 automation_safe=False,
                 requires_auth_interaction=False,
+                auth_failure_kind=failure_kind or None,
+                auth_remediation_kind=remediation_kind or None,
             )
         hidive_failure = provider_auth_failures.get("hidive")
         if hidive_credentials_present and isinstance(hidive_failure, dict):
+            failure_kind = str(hidive_failure.get("auth_failure_kind"))
+            remediation_kind = str(hidive_failure.get("auth_remediation_kind") or "")
             failure_label = _describe_auth_failure_kind({
-                "kind": str(hidive_failure.get("auth_failure_kind")),
+                "kind": failure_kind,
                 "label": str(hidive_failure.get("auth_failure_label")),
             })
+            remediation_detail = hidive_failure.get("auth_remediation_detail")
             detail = (
                 f"Re-bootstrap HIDIVE auth state after repeated auth-style unattended fetch failures ({failure_label})"
             )
+            if isinstance(remediation_detail, str) and remediation_detail:
+                detail += f"; {remediation_detail}"
             reason = hidive_failure.get("reason")
             if isinstance(reason, str) and reason:
                 detail += f": {reason}"
             add_command(
-                "rebootstrap_hidive_auth_after_failures",
+                f"rebootstrap_hidive_auth_after_{failure_kind or 'auth_failures'}",
                 detail,
                 ["provider-auth-login", "--provider", "hidive"],
                 automation_safe=False,
                 requires_auth_interaction=False,
+                auth_failure_kind=failure_kind or None,
+                auth_remediation_kind=remediation_kind or None,
             )
 
     snapshot_needs_refresh = not isinstance(latest_completed_sync_run, dict)
