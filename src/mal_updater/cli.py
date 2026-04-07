@@ -16,7 +16,7 @@ import shutil
 import stat
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
-from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, looks_auth_style_failure
+from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, classify_auth_style_failure
 from .config import ensure_directories, load_config, load_mal_secrets
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
@@ -288,8 +288,12 @@ def _provider_bootstrap_guidance_status(
 
     if credentials_present and session_present and isinstance(auth_issue, dict):
         reason = auth_issue.get("reason")
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(auth_issue.get("auth_failure_kind")),
+            "label": str(auth_issue.get("auth_failure_label")),
+        })
         details = (
-            f"{title} credentials and session state are staged, but auth looks degraded; re-bootstrap this provider before treating unattended fetches as healthy."
+            f"{title} credentials and session state are staged, but auth looks degraded ({failure_label}); re-bootstrap this provider before treating unattended fetches as healthy."
         )
         if isinstance(reason, str) and reason.strip():
             details += f" Latest signal: {reason.strip()}"
@@ -348,7 +352,11 @@ def _mal_bootstrap_guidance_status(
 
     if isinstance(auth_issue, dict):
         reason = auth_issue.get("reason")
-        details = "MyAnimeList OAuth tokens are staged, but repeated unattended token refresh failures suggest MAL auth should be completed again before trusting unattended sync."
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(auth_issue.get("auth_failure_kind")),
+            "label": str(auth_issue.get("auth_failure_label")),
+        })
+        details = f"MyAnimeList OAuth tokens are staged, but repeated unattended token refresh failures suggest MAL auth should be completed again before trusting unattended sync ({failure_label})."
         if isinstance(reason, str) and reason.strip():
             details += f" Latest signal: {reason.strip()}"
         return {
@@ -606,7 +614,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         )
     elif isinstance(mal_auth_issue, dict):
         auth_issue_reason = mal_auth_issue.get("reason")
-        details = "Complete MAL OAuth again because repeated unattended MAL token refresh failures suggest the staged refresh material is no longer healthy."
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(mal_auth_issue.get("auth_failure_kind")),
+            "label": str(mal_auth_issue.get("auth_failure_label")),
+        })
+        details = f"Complete MAL OAuth again because repeated unattended MAL token refresh failures suggest the staged refresh material is no longer healthy ({failure_label})."
         if isinstance(auth_issue_reason, str) and auth_issue_reason.strip():
             details += f" Latest signal: {auth_issue_reason.strip()}"
         add_onboarding_step(
@@ -635,7 +647,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         )
     elif isinstance(provider_auth_issues.get("crunchyroll"), dict) and dependency_checks["curl_cffi"]:
         auth_issue_reason = provider_auth_issues["crunchyroll"].get("reason")
-        details = "Re-bootstrap Crunchyroll auth because staged session state looks degraded for unattended fetches."
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(provider_auth_issues["crunchyroll"].get("auth_failure_kind")),
+            "label": str(provider_auth_issues["crunchyroll"].get("auth_failure_label")),
+        })
+        details = f"Re-bootstrap Crunchyroll auth because staged session state looks degraded for unattended fetches ({failure_label})."
         if isinstance(auth_issue_reason, str) and auth_issue_reason.strip():
             details += f" Latest signal: {auth_issue_reason.strip()}"
         add_onboarding_step(
@@ -664,7 +680,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         )
     elif isinstance(provider_auth_issues.get("hidive"), dict):
         auth_issue_reason = provider_auth_issues["hidive"].get("reason")
-        details = "Re-bootstrap HIDIVE auth because staged session state looks degraded for unattended fetches."
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(provider_auth_issues["hidive"].get("auth_failure_kind")),
+            "label": str(provider_auth_issues["hidive"].get("auth_failure_label")),
+        })
+        details = f"Re-bootstrap HIDIVE auth because staged session state looks degraded for unattended fetches ({failure_label})."
         if isinstance(auth_issue_reason, str) and auth_issue_reason.strip():
             details += f" Latest signal: {auth_issue_reason.strip()}"
         add_onboarding_step(
@@ -1421,6 +1441,16 @@ def _provider_auth_session_residue(config: AppConfig, provider: str) -> dict[str
     return residue or None
 
 
+def _describe_auth_failure_kind(kind_payload: dict[str, object] | None) -> str:
+    if not isinstance(kind_payload, dict):
+        return "auth looks degraded"
+    label = kind_payload.get("label")
+    if isinstance(label, str) and label.strip() and label.strip().lower() != "none":
+        return label.strip()
+    return "auth looks degraded"
+
+
+
 def _task_service_auth_failure(
     service_state: dict[str, object] | None,
     *,
@@ -1444,12 +1474,15 @@ def _task_service_auth_failure(
     consecutive_failures = task_state.get("failure_backoff_consecutive_failures", 0)
     if not isinstance(consecutive_failures, (int, float)) or int(consecutive_failures) < min_consecutive_failures:
         return None
-    if not looks_auth_style_failure(reason, session_residue=session_residue):
+    auth_failure_kind = classify_auth_style_failure(reason, session_residue=session_residue)
+    if not isinstance(auth_failure_kind, dict):
         return None
     payload: dict[str, object] = {
         subject_key: subject_value,
         "reason": reason.strip(),
         "consecutive_failures": int(consecutive_failures),
+        "auth_failure_kind": auth_failure_kind.get("kind"),
+        "auth_failure_label": auth_failure_kind.get("label"),
     }
     if isinstance(task_state.get("failure_backoff_until"), str):
         payload["failure_backoff_until"] = task_state["failure_backoff_until"]
@@ -1530,7 +1563,8 @@ def _provider_bootstrap_auth_issue(
     session_residue = _provider_auth_session_residue(config, provider)
     if not isinstance(session_residue, dict):
         return None
-    if not looks_auth_style_failure("", session_residue=session_residue):
+    auth_failure_kind = classify_auth_style_failure("", session_residue=session_residue)
+    if not isinstance(auth_failure_kind, dict):
         return None
 
     reason = session_residue.get("session_last_error")
@@ -1545,6 +1579,8 @@ def _provider_bootstrap_auth_issue(
         "provider": provider,
         "reason": reason,
         "source": "session_state",
+        "auth_failure_kind": auth_failure_kind.get("kind"),
+        "auth_failure_label": auth_failure_kind.get("label"),
         **session_residue,
     }
 
@@ -1618,7 +1654,11 @@ def _build_health_maintenance_commands(
         )
 
     if mal_client_id_present and isinstance(mal_auth_failure, dict):
-        detail = "Complete MAL OAuth again after repeated unattended MAL token refresh failures"
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(mal_auth_failure.get("auth_failure_kind")),
+            "label": str(mal_auth_failure.get("auth_failure_label")),
+        })
+        detail = f"Complete MAL OAuth again after repeated unattended MAL token refresh failures ({failure_label})"
         reason = mal_auth_failure.get("reason")
         if isinstance(reason, str) and reason:
             detail += f": {reason}"
@@ -1642,8 +1682,12 @@ def _build_health_maintenance_commands(
     if isinstance(provider_auth_failures, dict):
         crunchyroll_failure = provider_auth_failures.get("crunchyroll")
         if crunchyroll_credentials_present and isinstance(crunchyroll_failure, dict):
+            failure_label = _describe_auth_failure_kind({
+                "kind": str(crunchyroll_failure.get("auth_failure_kind")),
+                "label": str(crunchyroll_failure.get("auth_failure_label")),
+            })
             detail = (
-                "Re-bootstrap Crunchyroll auth state after repeated auth-style unattended fetch failures"
+                f"Re-bootstrap Crunchyroll auth state after repeated auth-style unattended fetch failures ({failure_label})"
             )
             reason = crunchyroll_failure.get("reason")
             if isinstance(reason, str) and reason:
@@ -1657,8 +1701,12 @@ def _build_health_maintenance_commands(
             )
         hidive_failure = provider_auth_failures.get("hidive")
         if hidive_credentials_present and isinstance(hidive_failure, dict):
+            failure_label = _describe_auth_failure_kind({
+                "kind": str(hidive_failure.get("auth_failure_kind")),
+                "label": str(hidive_failure.get("auth_failure_label")),
+            })
             detail = (
-                "Re-bootstrap HIDIVE auth state after repeated auth-style unattended fetch failures"
+                f"Re-bootstrap HIDIVE auth state after repeated auth-style unattended fetch failures ({failure_label})"
             )
             reason = hidive_failure.get("reason")
             if isinstance(reason, str) and reason:
@@ -2056,17 +2104,25 @@ def _cmd_health_check(
             }
         )
     for provider, failure in provider_auth_failures.items():
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(failure.get("auth_failure_kind")),
+            "label": str(failure.get("auth_failure_label")),
+        })
         warning = {
             "code": f"{provider}_auth_failures_repeated",
-            "detail": f"Repeated unattended {provider} fetch failures look auth-related and likely need auth re-bootstrap",
+            "detail": f"Repeated unattended {provider} fetch failures look auth-related ({failure_label}) and likely need auth re-bootstrap",
             **failure,
         }
         warnings.append(warning)
     if isinstance(mal_auth_failure, dict):
+        failure_label = _describe_auth_failure_kind({
+            "kind": str(mal_auth_failure.get("auth_failure_kind")),
+            "label": str(mal_auth_failure.get("auth_failure_label")),
+        })
         warnings.append(
             {
                 "code": "mal_auth_failures_repeated",
-                "detail": "Repeated unattended MAL token refresh failures look auth-related and likely need MAL OAuth again",
+                "detail": f"Repeated unattended MAL token refresh failures look auth-related ({failure_label}) and likely need MAL OAuth again",
                 **mal_auth_failure,
             }
         )

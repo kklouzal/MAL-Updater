@@ -305,6 +305,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         repeated = next(warning for warning in payload["warnings"] if warning["code"] == "mal_auth_failures_repeated")
         self.assertEqual("mal", repeated["provider"])
+        self.assertEqual("invalid_grant", repeated["auth_failure_kind"])
+        self.assertIn("revoked or invalid refresh/auth token", repeated["detail"])
         self.assertIn("invalid_grant", repeated["reason"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual("rebootstrap_mal_auth_after_failures", maintenance_commands[0]["reason_code"])
@@ -403,6 +405,8 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         repeated = next(warning for warning in payload["warnings"] if warning["code"] == "crunchyroll_auth_failures_repeated")
+        self.assertEqual("missing_refresh_material", repeated["auth_failure_kind"])
+        self.assertIn("missing refresh material", repeated["detail"])
         self.assertIn("Missing Crunchyroll refresh token", repeated["reason"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual(["crunchyroll-auth-login"], maintenance_commands[0]["command_args"])
@@ -445,7 +449,9 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         repeated = next(warning for warning in payload["warnings"] if warning["code"] == "hidive_auth_failures_repeated")
+        self.assertEqual("malformed_token_payload", repeated["auth_failure_kind"])
         self.assertEqual("auth_failed", repeated["session_phase"])
+        self.assertIn("malformed token payload", repeated["detail"])
         self.assertIn("authorisationToken", repeated["session_last_error"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual("rebootstrap_hidive_auth_after_failures", maintenance_commands[0]["reason_code"])
