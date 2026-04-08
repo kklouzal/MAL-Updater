@@ -111,6 +111,7 @@ class RecommendationTests(unittest.TestCase):
         genres: list[str] | None = None,
         studios: list[str] | None = None,
         source: str | None = None,
+        start_season: dict | None = None,
     ) -> None:
         raw = {"id": mal_anime_id, "title": title}
         if genres:
@@ -131,7 +132,7 @@ class RecommendationTests(unittest.TestCase):
             num_episodes=12,
             mean=mean,
             popularity=popularity,
-            start_season=None,
+            start_season=start_season,
             raw=raw,
         )
 
@@ -571,6 +572,74 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(10, results[0].context["cross_seed_support_votes"])
         self.assertEqual(0, results[1].context["cross_seed_support_votes"])
         self.assertGreater(results[0].context["support_balance_bonus"], results[1].context["support_balance_bonus"])
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_prefers_more_recent_start_season_when_support_ties(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        now = datetime.now(timezone.utc)
+        current_season = ("winter", "spring", "summer", "fall")[(now.month - 1) // 3]
+        recent_season = {"year": now.year, "season": current_season}
+        older_season = {"year": max(now.year - 12, 2000), "season": current_season}
+        self._cache_metadata(300, title="Recent Pick", mean=8.0, popularity=500, start_season=recent_season)
+        self._cache_metadata(400, title="Older Pick", mean=8.0, popularity=500, start_season=older_season)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Recent Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Older Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertGreater(results[0].context["freshness_bonus"], results[1].context["freshness_bonus"])
+        self.assertEqual("current_or_upcoming", results[0].context["freshness_bucket"])
+        self.assertEqual(current_season.title() + " " + str(now.year), results[0].context["start_season_label"])
+        self.assertIn("recent MAL start season", " ".join(results[0].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_prefers_recently_active_seed_support_when_votes_tie(self) -> None:
+        recent = (datetime.now(timezone.utc) - timedelta(days=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        stale = (datetime.now(timezone.utc) - timedelta(days=220)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_series(
+            "seed-recent",
+            title="Recent Seed",
+            season_title="Recent Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-recent", "seed-recent-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_series(
+            "seed-stale",
+            title="Stale Seed",
+            season_title="Stale Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-stale", "seed-stale-1", episode_number=1, completion_ratio=1.0, last_watched_at=stale)
+        self._map_series("seed-recent", 100)
+        self._map_series("seed-stale", 200)
+        self._cache_metadata(100, title="Recent Seed")
+        self._cache_metadata(200, title="Stale Seed")
+        self._cache_metadata(300, title="Recent-Supported Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Stale-Supported Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Recent-Supported Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Stale-Supported Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertGreater(results[0].context["recent_seed_activity_bonus"], results[1].context["recent_seed_activity_bonus"])
+        self.assertLess(results[0].context["freshest_supporting_seed_days"], results[1].context["freshest_supporting_seed_days"])
+        self.assertIn("recently active seed watch history", " ".join(results[0].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
     def test_discovery_candidate_prefers_cached_genre_overlap(self) -> None:
@@ -1822,19 +1891,20 @@ class RecommendationTests(unittest.TestCase):
             season_title="Fresh Show (English Dub)",
             watchlist_status="available",
         )
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).replace(microsecond=0)
         self._insert_progress(
             "series-fresh",
             "series-fresh-1",
             episode_number=1,
             completion_ratio=1.0,
-            last_watched_at="2026-03-16T01:00:00Z",
+            last_watched_at=recent.isoformat().replace("+00:00", "Z"),
         )
         self._insert_progress(
             "series-fresh",
             "series-fresh-2",
             episode_number=2,
             completion_ratio=0.0,
-            last_watched_at="2026-03-17T01:00:00Z",
+            last_watched_at=(recent + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
         )
 
         argv = [

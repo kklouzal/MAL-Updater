@@ -50,6 +50,13 @@ _ROMAN = {
 
 _FRESH_DUBBED_EPISODE_WINDOW_DAYS = 21
 
+_SEASON_ORDER = {
+    "winter": 0,
+    "spring": 1,
+    "summer": 2,
+    "fall": 3,
+}
+
 
 @dataclass(slots=True)
 class Recommendation:
@@ -465,6 +472,74 @@ def _metadata_source_value(meta: Any) -> str | None:
     return value or None
 
 
+def _metadata_start_season(meta: Any) -> dict[str, Any] | None:
+    start_season = getattr(meta, "start_season", None) if meta is not None else None
+    if not isinstance(start_season, dict):
+        return None
+    year = start_season.get("year")
+    season = start_season.get("season")
+    if not isinstance(year, int):
+        return None
+    if not isinstance(season, str):
+        return None
+    season = season.strip().lower()
+    if season not in _SEASON_ORDER:
+        return None
+    return {"year": year, "season": season}
+
+
+def _start_season_sort_key(start_season: dict[str, Any] | None) -> tuple[int, int] | None:
+    if not isinstance(start_season, dict):
+        return None
+    year = start_season.get("year")
+    season = start_season.get("season")
+    if not isinstance(year, int):
+        return None
+    if not isinstance(season, str):
+        return None
+    season_index = _SEASON_ORDER.get(season.strip().lower())
+    if season_index is None:
+        return None
+    return (year, season_index)
+
+
+def _format_start_season(start_season: dict[str, Any] | None) -> str | None:
+    sort_key = _start_season_sort_key(start_season)
+    if sort_key is None:
+        return None
+    return f"{str(start_season['season']).strip().title()} {start_season['year']}"
+
+
+def _discovery_candidate_freshness_bonus(start_season: dict[str, Any] | None) -> tuple[int, str | None]:
+    sort_key = _start_season_sort_key(start_season)
+    if sort_key is None:
+        return 0, None
+    current = datetime.now(timezone.utc)
+    current_key = (current.year, (current.month - 1) // 3)
+    age_in_seasons = (current_key[0] - sort_key[0]) * 4 + (current_key[1] - sort_key[1])
+    if age_in_seasons <= 0:
+        return 6, "current_or_upcoming"
+    if age_in_seasons <= 8:
+        return 5, "recent_two_years"
+    if age_in_seasons <= 16:
+        return 3, "recent_four_years"
+    if age_in_seasons <= 28:
+        return 1, "modern_catalog"
+    return 0, "older_catalog"
+
+
+def _discovery_seed_recency_bonus(days_since_watch: int | None) -> int:
+    if days_since_watch is None:
+        return 0
+    if days_since_watch <= 30:
+        return 3
+    if days_since_watch <= 90:
+        return 2
+    if days_since_watch <= 180:
+        return 1
+    return 0
+
+
 def _normalized_title_aliases(*values: str | None) -> set[str]:
     aliases: set[str] = set()
     for value in values:
@@ -529,14 +604,24 @@ def _build_discovery_recommendations(
     recommendation_edges_by_id: dict[int, list[Any]],
 ) -> list[Recommendation]:
     seed_weights: dict[int, int] = {}
+    seed_recent_activity_bonus: dict[int, int] = {}
+    seed_recent_activity_days: dict[int, int] = {}
     for state in states:
         mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
         if mal_anime_id is None:
             continue
+        days_since_watch = _days_since(state.last_watched_at)
         if state.watchlist_status == "fully_watched":
-            seed_weights[mal_anime_id] = 3
-        elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or _days_since(state.last_watched_at) in range(0, 91)):
-            seed_weights[mal_anime_id] = 2
+            seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 3)
+        elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or days_since_watch in range(0, 91)):
+            seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 2)
+        recency_bonus = _discovery_seed_recency_bonus(days_since_watch)
+        if recency_bonus > seed_recent_activity_bonus.get(mal_anime_id, 0):
+            seed_recent_activity_bonus[mal_anime_id] = recency_bonus
+        if days_since_watch is not None:
+            current_days = seed_recent_activity_days.get(mal_anime_id)
+            if current_days is None or days_since_watch < current_days:
+                seed_recent_activity_days[mal_anime_id] = days_since_watch
 
     seed_genre_weights: dict[str, int] = {}
     seed_studio_weights: dict[str, int] = {}
@@ -582,10 +667,15 @@ def _build_discovery_recommendations(
                     "votes": 0,
                     "votes_by_source": {},
                     "title": edge.target_title,
+                    "seed_recent_activity_bonus": 0,
+                    "seed_recent_activity_days": {},
                 },
             )
             votes = edge.num_recommendations or 0
             bucket["supporting_sources"].add(source_id)
+            bucket["seed_recent_activity_bonus"] += seed_recent_activity_bonus.get(source_id, 0)
+            if source_id in seed_recent_activity_days:
+                bucket["seed_recent_activity_days"][source_id] = seed_recent_activity_days[source_id]
             votes_by_source = bucket["votes_by_source"]
             votes_by_source[source_id] = votes_by_source.get(source_id, 0) + votes
             bucket["votes"] += votes
@@ -637,8 +727,16 @@ def _build_discovery_recommendations(
         candidate_source = _metadata_source_value(meta)
         source_overlap_score = seed_source_weights.get(candidate_source, 0) if candidate_source is not None else 0
         source_bonus = min(source_overlap_score * 2, 6)
+        start_season = _metadata_start_season(meta)
+        start_season_label = _format_start_season(start_season)
+        freshness_bonus, freshness_bucket = _discovery_candidate_freshness_bonus(start_season)
+        recent_seed_activity_bonus = min(int(bucket.get("seed_recent_activity_bonus", 0)), 6)
+        recent_seed_activity_days = [
+            int(value) for value in (bucket.get("seed_recent_activity_days") or {}).values() if isinstance(value, int)
+        ]
+        freshest_supporting_seed_days = min(recent_seed_activity_days) if recent_seed_activity_days else None
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
-        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
@@ -652,6 +750,10 @@ def _build_discovery_recommendations(
             reasons.append("shared seed studios: " + ", ".join(shared_studios[:2]))
         if source_overlap_score > 0 and candidate_source is not None:
             reasons.append(f"shared seed source material: {candidate_source}")
+        if freshness_bonus > 0 and start_season_label is not None:
+            reasons.append(f"recent MAL start season: {start_season_label}")
+        if recent_seed_activity_bonus > 0 and freshest_supporting_seed_days is not None:
+            reasons.append(f"supported by recently active seed watch history ({freshest_supporting_seed_days} day(s) since last watch)")
         if mean is not None:
             reasons.append(f"MAL mean score: {mean}")
         if meta is None:
@@ -680,6 +782,12 @@ def _build_discovery_recommendations(
                     "studio_overlap_score": studio_overlap_score,
                     "source": candidate_source,
                     "source_overlap_score": source_overlap_score,
+                    "start_season": start_season,
+                    "start_season_label": start_season_label,
+                    "freshness_bucket": freshness_bucket,
+                    "freshness_bonus": freshness_bonus,
+                    "recent_seed_activity_bonus": recent_seed_activity_bonus,
+                    "freshest_supporting_seed_days": freshest_supporting_seed_days,
                     "mean": mean,
                     "popularity": popularity,
                     "media_type": meta.media_type if meta is not None else None,
