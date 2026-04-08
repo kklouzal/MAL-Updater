@@ -112,6 +112,7 @@ class RecommendationTests(unittest.TestCase):
         studios: list[str] | None = None,
         source: str | None = None,
         start_season: dict | None = None,
+        my_list_status: dict | None = None,
     ) -> None:
         raw = {"id": mal_anime_id, "title": title}
         if genres:
@@ -120,6 +121,8 @@ class RecommendationTests(unittest.TestCase):
             raw["studios"] = [{"name": studio} for studio in studios]
         if source:
             raw["source"] = source
+        if my_list_status:
+            raw["my_list_status"] = my_list_status
         upsert_mal_anime_metadata(
             self.config.db_path,
             mal_anime_id=mal_anime_id,
@@ -640,6 +643,85 @@ class RecommendationTests(unittest.TestCase):
         self.assertGreater(results[0].context["recent_seed_activity_bonus"], results[1].context["recent_seed_activity_bonus"])
         self.assertLess(results[0].context["freshest_supporting_seed_days"], results[1].context["freshest_supporting_seed_days"])
         self.assertIn("recently active seed watch history", " ".join(results[0].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_prefers_higher_scored_seed_support_when_votes_tie(self) -> None:
+        self._insert_series(
+            "seed-loved",
+            title="Loved Seed",
+            season_title="Loved Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-loved", "seed-loved-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-neutral",
+            title="Neutral Seed",
+            season_title="Neutral Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-neutral", "seed-neutral-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-loved", 100)
+        self._map_series("seed-neutral", 200)
+        self._cache_metadata(100, title="Loved Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 10})
+        self._cache_metadata(200, title="Neutral Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 6})
+        self._cache_metadata(300, title="Loved-Line Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Neutral-Line Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Loved-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertGreater(results[0].context["seed_quality_bonus"], results[1].context["seed_quality_bonus"])
+        self.assertEqual(10, results[0].context["best_supporting_seed_score"])
+        self.assertIn("higher-confidence seed taste signals", " ".join(results[0].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_prefers_deeper_completion_seed_support_without_scores(self) -> None:
+        self._insert_series(
+            "seed-deep",
+            title="Deep Seed",
+            season_title="Deep Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        for episode_number in range(1, 25):
+            self._insert_progress(
+                "seed-deep",
+                f"seed-deep-{episode_number}",
+                episode_number=episode_number,
+                completion_ratio=1.0,
+                last_watched_at="2026-03-01T01:00:00Z",
+            )
+        self._insert_series(
+            "seed-light",
+            title="Light Seed",
+            season_title="Light Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-light", "seed-light-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-deep", 100)
+        self._map_series("seed-light", 200)
+        self._cache_metadata(100, title="Deep Seed")
+        self._cache_metadata(200, title="Light Seed")
+        self._cache_metadata(300, title="Deep-Line Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Light-Line Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Deep-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Light-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertGreater(results[0].context["seed_quality_bonus"], results[1].context["seed_quality_bonus"])
+        self.assertIsNone(results[0].context["best_supporting_seed_score"])
+        self.assertIn("stronger seed engagement signals", " ".join(results[0].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
     def test_discovery_candidate_prefers_cached_genre_overlap(self) -> None:

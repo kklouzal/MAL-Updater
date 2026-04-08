@@ -540,6 +540,41 @@ def _discovery_seed_recency_bonus(days_since_watch: int | None) -> int:
     return 0
 
 
+def _metadata_my_list_status(meta: Any) -> dict[str, Any] | None:
+    if meta is None or not isinstance(getattr(meta, "raw", None), dict):
+        return None
+    my_list_status = meta.raw.get("my_list_status")
+    return my_list_status if isinstance(my_list_status, dict) else None
+
+
+def _discovery_seed_score_bonus(meta: Any) -> tuple[int, int | None]:
+    my_list_status = _metadata_my_list_status(meta)
+    if not isinstance(my_list_status, dict):
+        return 0, None
+    raw_score = my_list_status.get("score")
+    if not isinstance(raw_score, int) or raw_score <= 0:
+        return 0, None
+    if raw_score >= 9:
+        return 3, raw_score
+    if raw_score >= 8:
+        return 2, raw_score
+    if raw_score >= 7:
+        return 1, raw_score
+    return 0, raw_score
+
+
+def _discovery_seed_completion_bonus(state: ProviderSeriesState) -> int:
+    if state.watchlist_status == "fully_watched":
+        if state.completed_episode_count >= 24:
+            return 2
+        if state.completed_episode_count >= 12:
+            return 1
+        return 0
+    if state.watchlist_status == "in_progress" and state.completed_episode_count >= 12:
+        return 1
+    return 0
+
+
 def _normalized_title_aliases(*values: str | None) -> set[str]:
     aliases: set[str] = set()
     for value in values:
@@ -606,6 +641,8 @@ def _build_discovery_recommendations(
     seed_weights: dict[int, int] = {}
     seed_recent_activity_bonus: dict[int, int] = {}
     seed_recent_activity_days: dict[int, int] = {}
+    seed_quality_bonus: dict[int, int] = {}
+    seed_scores: dict[int, int] = {}
     for state in states:
         mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
         if mal_anime_id is None:
@@ -615,6 +652,14 @@ def _build_discovery_recommendations(
             seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 3)
         elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or days_since_watch in range(0, 91)):
             seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 2)
+        meta = metadata_by_id.get(mal_anime_id)
+        score_bonus, seed_score = _discovery_seed_score_bonus(meta)
+        completion_bonus = _discovery_seed_completion_bonus(state)
+        quality_bonus = score_bonus + completion_bonus
+        if quality_bonus > seed_quality_bonus.get(mal_anime_id, 0):
+            seed_quality_bonus[mal_anime_id] = quality_bonus
+        if seed_score is not None and seed_score > seed_scores.get(mal_anime_id, 0):
+            seed_scores[mal_anime_id] = seed_score
         recency_bonus = _discovery_seed_recency_bonus(days_since_watch)
         if recency_bonus > seed_recent_activity_bonus.get(mal_anime_id, 0):
             seed_recent_activity_bonus[mal_anime_id] = recency_bonus
@@ -669,13 +714,18 @@ def _build_discovery_recommendations(
                     "title": edge.target_title,
                     "seed_recent_activity_bonus": 0,
                     "seed_recent_activity_days": {},
+                    "seed_quality_bonus": 0,
+                    "supporting_seed_scores": {},
                 },
             )
             votes = edge.num_recommendations or 0
             bucket["supporting_sources"].add(source_id)
             bucket["seed_recent_activity_bonus"] += seed_recent_activity_bonus.get(source_id, 0)
+            bucket["seed_quality_bonus"] += seed_quality_bonus.get(source_id, 0)
             if source_id in seed_recent_activity_days:
                 bucket["seed_recent_activity_days"][source_id] = seed_recent_activity_days[source_id]
+            if source_id in seed_scores:
+                bucket["supporting_seed_scores"][source_id] = seed_scores[source_id]
             votes_by_source = bucket["votes_by_source"]
             votes_by_source[source_id] = votes_by_source.get(source_id, 0) + votes
             bucket["votes"] += votes
@@ -731,12 +781,19 @@ def _build_discovery_recommendations(
         start_season_label = _format_start_season(start_season)
         freshness_bonus, freshness_bucket = _discovery_candidate_freshness_bonus(start_season)
         recent_seed_activity_bonus = min(int(bucket.get("seed_recent_activity_bonus", 0)), 6)
+        seed_quality_bonus = min(int(bucket.get("seed_quality_bonus", 0)), 6)
         recent_seed_activity_days = [
             int(value) for value in (bucket.get("seed_recent_activity_days") or {}).values() if isinstance(value, int)
         ]
         freshest_supporting_seed_days = min(recent_seed_activity_days) if recent_seed_activity_days else None
+        supporting_seed_scores = {
+            int(source_id): int(score)
+            for source_id, score in (bucket.get("supporting_seed_scores") or {}).items()
+            if isinstance(source_id, int) and isinstance(score, int) and score > 0
+        }
+        best_supporting_seed_score = max(supporting_seed_scores.values(), default=None)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
-        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
@@ -754,6 +811,11 @@ def _build_discovery_recommendations(
             reasons.append(f"recent MAL start season: {start_season_label}")
         if recent_seed_activity_bonus > 0 and freshest_supporting_seed_days is not None:
             reasons.append(f"supported by recently active seed watch history ({freshest_supporting_seed_days} day(s) since last watch)")
+        if seed_quality_bonus > 0:
+            if best_supporting_seed_score is not None:
+                reasons.append(f"backed by higher-confidence seed taste signals (best supporting seed MAL score: {best_supporting_seed_score})")
+            else:
+                reasons.append("backed by stronger seed engagement signals (completion depth across supporting seeds)")
         if mean is not None:
             reasons.append(f"MAL mean score: {mean}")
         if meta is None:
@@ -787,6 +849,9 @@ def _build_discovery_recommendations(
                     "freshness_bucket": freshness_bucket,
                     "freshness_bonus": freshness_bonus,
                     "recent_seed_activity_bonus": recent_seed_activity_bonus,
+                    "seed_quality_bonus": seed_quality_bonus,
+                    "supporting_seed_scores": supporting_seed_scores,
+                    "best_supporting_seed_score": best_supporting_seed_score,
                     "freshest_supporting_seed_days": freshest_supporting_seed_days,
                     "mean": mean,
                     "popularity": popularity,

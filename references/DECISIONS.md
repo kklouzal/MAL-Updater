@@ -384,6 +384,25 @@ Also treat a material execution-posture change (for example historical full-pass
 - a single oversized historical apply run should not be able to trap the daemon in near-permanent projected-budget skips once the intended unattended posture becomes smaller and more conservative
 - keeping the bounded batch size explicit and configurable preserves explainability while still allowing hosts with stronger evidence to tune the lane differently later
 
+## 2026-04-08 - Discovery seed-quality posture
+
+### Decision
+When discovery-candidate support is otherwise close, let stronger supporting seed titles matter a bit more without replacing the existing aggregate-vote / cross-seed-consensus posture.
+
+Use small explainable bonuses from:
+- cached MAL seed scores when present (`my_list_status.score`)
+- deeper provider-side completion evidence even when MAL scores are absent
+
+Expose the resulting discovery metadata as:
+- `seed_quality_bonus`
+- `supporting_seed_scores`
+- `best_supporting_seed_score`
+
+### Why
+- not every watched/mapped seed is equally representative of the operator's taste
+- a conservative recommendation model should distinguish between a candidate backed by a highly rated or deeply completed seed and one backed only by weak seed evidence when the rest of the ranking is nearly tied
+- keeping the bonus small and explicit preserves explainability and avoids turning one enthusiastic seed into an opaque hard override
+
 ## 2026-04-07 - Discovery support-balance posture
 
 ### Decision
