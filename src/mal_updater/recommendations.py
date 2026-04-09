@@ -547,6 +547,17 @@ def _metadata_my_list_status(meta: Any) -> dict[str, Any] | None:
     return my_list_status if isinstance(my_list_status, dict) else None
 
 
+def _discovery_seed_status_value(meta: Any) -> str | None:
+    my_list_status = _metadata_my_list_status(meta)
+    if not isinstance(my_list_status, dict):
+        return None
+    raw_status = my_list_status.get("status")
+    if not isinstance(raw_status, str):
+        return None
+    status = raw_status.strip().lower()
+    return status or None
+
+
 def _discovery_seed_score_bonus(meta: Any) -> tuple[int, int | None]:
     my_list_status = _metadata_my_list_status(meta)
     if not isinstance(my_list_status, dict):
@@ -661,6 +672,9 @@ def _build_discovery_recommendations(
     seed_quality_penalty: dict[int, int] = {}
     seed_scores: dict[int, int] = {}
     seed_penalty_scores: dict[int, int] = {}
+    dropped_seed_ids: set[int] = set()
+    disliked_seed_ids: set[int] = set()
+    positive_quality_seed_ids: set[int] = set()
     for state in states:
         mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
         if mal_anime_id is None:
@@ -674,9 +688,17 @@ def _build_discovery_recommendations(
         score_bonus, seed_score = _discovery_seed_score_bonus(meta)
         score_penalty, seed_penalty_score = _discovery_seed_score_penalty(meta)
         completion_bonus = _discovery_seed_completion_bonus(state)
+        seed_status = _discovery_seed_status_value(meta)
+         
+        if seed_status == "dropped":
+            dropped_seed_ids.add(mal_anime_id)
+        if seed_penalty_score is not None and seed_penalty_score <= 4:
+            disliked_seed_ids.add(mal_anime_id)
         quality_bonus = score_bonus + completion_bonus
         if quality_bonus > seed_quality_bonus.get(mal_anime_id, 0):
             seed_quality_bonus[mal_anime_id] = quality_bonus
+        if quality_bonus > 0:
+            positive_quality_seed_ids.add(mal_anime_id)
         if score_penalty > seed_quality_penalty.get(mal_anime_id, 0):
             seed_quality_penalty[mal_anime_id] = score_penalty
         if seed_score is not None and seed_score > seed_scores.get(mal_anime_id, 0):
@@ -743,6 +765,9 @@ def _build_discovery_recommendations(
                     "seed_quality_penalty": 0,
                     "supporting_seed_scores": {},
                     "penalized_seed_scores": {},
+                    "dropped_supporting_seed_ids": set(),
+                    "disliked_supporting_seed_ids": set(),
+                    "positive_quality_supporting_seed_ids": set(),
                 },
             )
             votes = edge.num_recommendations or 0
@@ -756,6 +781,12 @@ def _build_discovery_recommendations(
                 bucket["supporting_seed_scores"][source_id] = seed_scores[source_id]
             if source_id in seed_penalty_scores:
                 bucket["penalized_seed_scores"][source_id] = seed_penalty_scores[source_id]
+            if source_id in dropped_seed_ids:
+                bucket["dropped_supporting_seed_ids"].add(source_id)
+            if source_id in disliked_seed_ids:
+                bucket["disliked_supporting_seed_ids"].add(source_id)
+            if source_id in positive_quality_seed_ids:
+                bucket["positive_quality_supporting_seed_ids"].add(source_id)
             votes_by_source = bucket["votes_by_source"]
             votes_by_source[source_id] = votes_by_source.get(source_id, 0) + votes
             bucket["votes"] += votes
@@ -827,8 +858,29 @@ def _build_discovery_recommendations(
             for source_id, score in (bucket.get("penalized_seed_scores") or {}).items()
             if isinstance(source_id, int) and isinstance(score, int) and score > 0
         }
+        dropped_supporting_seed_ids = sorted(
+            int(source_id)
+            for source_id in (bucket.get("dropped_supporting_seed_ids") or set())
+            if isinstance(source_id, int)
+        )
+        disliked_supporting_seed_ids = sorted(
+            int(source_id)
+            for source_id in (bucket.get("disliked_supporting_seed_ids") or set())
+            if isinstance(source_id, int)
+        )
+        positive_quality_supporting_seed_ids = sorted(
+            int(source_id)
+            for source_id in (bucket.get("positive_quality_supporting_seed_ids") or set())
+            if isinstance(source_id, int)
+        )
         best_supporting_seed_score = max(supporting_seed_scores.values(), default=None)
         lowest_supporting_seed_score = min(penalized_seed_scores.values(), default=None)
+        all_support_is_dropped = support_count > 0 and len(dropped_supporting_seed_ids) >= support_count
+        all_support_is_disliked = support_count > 0 and len(disliked_supporting_seed_ids) >= support_count
+        if all_support_is_dropped:
+            continue
+        if all_support_is_disliked and not positive_quality_supporting_seed_ids:
+            continue
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= seed_quality_penalty
@@ -897,6 +949,12 @@ def _build_discovery_recommendations(
                     "penalized_seed_scores": penalized_seed_scores,
                     "best_supporting_seed_score": best_supporting_seed_score,
                     "lowest_supporting_seed_score": lowest_supporting_seed_score,
+                    "dropped_supporting_seed_ids": dropped_supporting_seed_ids,
+                    "dropped_supporting_seed_count": len(dropped_supporting_seed_ids),
+                    "disliked_supporting_seed_ids": disliked_supporting_seed_ids,
+                    "disliked_supporting_seed_count": len(disliked_supporting_seed_ids),
+                    "positive_quality_supporting_seed_ids": positive_quality_supporting_seed_ids,
+                    "positive_quality_supporting_seed_count": len(positive_quality_supporting_seed_ids),
                     "freshest_supporting_seed_days": freshest_supporting_seed_days,
                     "mean": mean,
                     "popularity": popularity,

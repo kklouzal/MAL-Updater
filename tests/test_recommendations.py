@@ -754,12 +754,9 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["mal:300"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["seed_quality_penalty"])
-        self.assertEqual(3, results[1].context["seed_quality_penalty"])
-        self.assertEqual(3, results[1].context["lowest_supporting_seed_score"])
-        self.assertIn("low-confidence/disliked seed support", " ".join(results[1].reasons))
-        self.assertGreater(results[0].priority, results[1].priority)
+        self.assertEqual(0, results[0].context["disliked_supporting_seed_count"])
 
     def test_discovery_candidate_keeps_positive_seed_quality_above_disliked_support_penalty(self) -> None:
         self._insert_series(
@@ -792,12 +789,50 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["mal:300"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["seed_quality_bonus"], 0)
         self.assertEqual(3, results[0].context["seed_quality_penalty"])
         self.assertEqual(10, results[0].context["best_supporting_seed_score"])
         self.assertEqual(3, results[0].context["lowest_supporting_seed_score"])
-        self.assertGreater(results[0].priority, results[1].priority)
+        self.assertEqual(1, results[0].context["disliked_supporting_seed_count"])
+
+    def test_discovery_candidate_suppresses_disliked_only_seed_support(self) -> None:
+        self._insert_series(
+            "seed-disliked",
+            title="Disliked Seed",
+            season_title="Disliked Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-disliked", "seed-disliked-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-disliked", 200)
+        self._cache_metadata(200, title="Disliked Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 3})
+        self._cache_metadata(400, title="Disliked-Only Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Disliked-Only Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], results)
+
+    def test_discovery_candidate_suppresses_dropped_only_seed_support(self) -> None:
+        self._insert_series(
+            "seed-dropped",
+            title="Dropped Seed",
+            season_title="Dropped Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-dropped", "seed-dropped-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-dropped", 200)
+        self._cache_metadata(200, title="Dropped Seed", my_list_status={"status": "dropped", "num_episodes_watched": 4, "score": 6})
+        self._cache_metadata(400, title="Dropped-Only Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Dropped-Only Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], results)
 
     def test_discovery_candidate_prefers_cached_genre_overlap(self) -> None:
         self._insert_series(

@@ -419,6 +419,22 @@ Expose the resulting discovery metadata as:
 - a conservative recommendation model should distinguish between a candidate backed by a highly rated or deeply completed seed and one backed only by weak seed evidence when the rest of the ranking is nearly tied
 - keeping the bonus small and explicit preserves explainability and avoids turning one enthusiastic seed into an opaque hard override
 
+## 2026-04-09 - Discovery negative-signal suppression posture
+
+### Decision
+Keep the existing small discovery penalty for mixed-signal candidates, but fully suppress discovery candidates when *all* supporting seed titles are already explicit negative taste signals.
+
+Treat the following as suppression-worthy when they are the candidate's only support:
+- supporting seeds whose cached MAL status is `dropped`
+- supporting seeds whose cached MAL score falls into the strongly disliked bucket already used by `seed_quality_penalty`
+
+Do **not** suppress mixed-signal candidates when there is still genuinely stronger positive seed-quality evidence from other supporting seeds; keep those explainable via the existing bonus/penalty metadata instead.
+
+### Why
+- a conservative recommendation surface should not keep suggesting discovery titles that are only connected to anime the operator explicitly dropped or strongly disliked
+- mixed-signal taste evidence is still useful, but all-negative support is different from merely weak support and should be filtered rather than cosmetically demoted
+- retaining the smaller penalty for mixed cases preserves explainability without letting one negative seed erase a broader positive consensus
+
 ## 2026-04-07 - Discovery support-balance posture
 
 ### Decision
