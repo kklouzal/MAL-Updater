@@ -184,6 +184,18 @@ Keep MAL as its own explicit daemon budget lane, but let non-MAL source provider
 - shared source-provider defaults make new providers safer to onboard before their final tuned per-provider numbers are known
 - explicit per-provider overrides still win, so operators can keep Crunchyroll/HIDIVE-specific tuning where it matters
 
+## 2026-04-09 - Discovery mixed-signal recommendation posture
+
+### Decision
+Keep discovery recommendations conservative when support is mixed: candidates backed by both positive and explicitly negative seed titles may still be shown, but negative supporting seeds should not contribute full multi-seed confidence.
+
+When a discovery candidate has mixed support, discount dropped/disliked supporting seeds from the support-count boost and apply a small additional `mixed_signal_penalty` based on the negative-support share. Still suppress candidates whose support is entirely dropped or disliked-only.
+
+### Why
+- mixed-signal candidates can still be useful when one strong positive seed is present, so outright suppression would be too blunt
+- counting negative supporting seeds as full consensus overstates confidence and can let noisy candidates outrank cleaner support
+- exposing `negative_support_ratio`, `effective_supporting_seed_count`, and `mixed_signal_penalty` keeps the tradeoff inspectable for operators instead of burying it in opaque ranking folklore
+
 ## 2026-04-05 - MAL auth-failure remediation posture
 
 ### Decision

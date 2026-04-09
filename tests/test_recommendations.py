@@ -795,6 +795,57 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(10, results[0].context["best_supporting_seed_score"])
         self.assertEqual(3, results[0].context["lowest_supporting_seed_score"])
         self.assertEqual(1, results[0].context["disliked_supporting_seed_count"])
+        self.assertEqual(1, results[0].context["negative_supporting_seed_count"])
+        self.assertEqual(0.5, results[0].context["negative_support_ratio"])
+        self.assertEqual(1, results[0].context["effective_supporting_seed_count"])
+        self.assertEqual(3, results[0].context["mixed_signal_penalty"])
+        self.assertIn("mixed-signal support decay applied (1/2 supporting seed title(s) were dropped/disliked)", results[0].reasons)
+
+    def test_discovery_candidate_majority_negative_support_ranks_below_clean_support(self) -> None:
+        for provider_series_id, title in (("seed-loved", "Loved Seed"), ("seed-disliked-a", "Disliked Seed A"), ("seed-disliked-b", "Disliked Seed B")):
+            self._insert_series(
+                provider_series_id,
+                title=title,
+                season_title=f"{title} (English Dub)",
+                watchlist_status="fully_watched",
+            )
+            self._insert_progress(
+                provider_series_id,
+                provider_series_id + "-1",
+                episode_number=1,
+                completion_ratio=1.0,
+                last_watched_at="2026-03-01T01:00:00Z",
+            )
+
+        self._map_series("seed-loved", 100)
+        self._map_series("seed-disliked-a", 200)
+        self._map_series("seed-disliked-b", 250)
+        self._cache_metadata(100, title="Loved Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 10})
+        self._cache_metadata(200, title="Disliked Seed A", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 3})
+        self._cache_metadata(250, title="Disliked Seed B", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 4})
+        self._cache_metadata(300, title="Clean Support Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Majority Negative Pick", mean=8.0, popularity=500)
+
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Clean Support Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Majority Negative Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Majority Negative Pick", "num_recommendations": 4, "raw": {}},
+        ])
+        self._cache_recommendations(250, [
+            {"target_mal_anime_id": 400, "target_title": "Majority Negative Pick", "num_recommendations": 4, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        majority_negative = results[1]
+        self.assertEqual(2, majority_negative.context["negative_supporting_seed_count"])
+        self.assertAlmostEqual(2 / 3, majority_negative.context["negative_support_ratio"])
+        self.assertEqual(1, majority_negative.context["effective_supporting_seed_count"])
+        self.assertEqual(5, majority_negative.context["mixed_signal_penalty"])
+        self.assertLess(majority_negative.priority, results[0].priority)
 
     def test_discovery_candidate_suppresses_disliked_only_seed_support(self) -> None:
         self._insert_series(

@@ -881,9 +881,24 @@ def _build_discovery_recommendations(
             continue
         if all_support_is_disliked and not positive_quality_supporting_seed_ids:
             continue
-        priority = int(min(bucket["raw_score"] / 8.0, 60)) + support_count * 12 + int(mean or 0)
+        negative_supporting_seed_ids = sorted({*dropped_supporting_seed_ids, *disliked_supporting_seed_ids})
+        negative_supporting_seed_count = len(negative_supporting_seed_ids)
+        negative_support_ratio = (
+            negative_supporting_seed_count / support_count if support_count > 0 else 0.0
+        )
+        mixed_signal_penalty = 0
+        if 0 < negative_supporting_seed_count < support_count:
+            if negative_support_ratio >= (2 / 3):
+                mixed_signal_penalty = 5
+            elif negative_support_ratio >= 0.5:
+                mixed_signal_penalty = 3
+            elif negative_support_ratio >= (1 / 3):
+                mixed_signal_penalty = 1
+        effective_supporting_seed_count = max(support_count - negative_supporting_seed_count, 1)
+        priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= seed_quality_penalty
+        priority -= mixed_signal_penalty
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
@@ -910,6 +925,10 @@ def _build_discovery_recommendations(
             reasons.append(
                 f"tempered by low-confidence/disliked seed support (lowest supporting seed MAL score: {lowest_supporting_seed_score})"
             )
+        if mixed_signal_penalty > 0:
+            reasons.append(
+                f"mixed-signal support decay applied ({negative_supporting_seed_count}/{support_count} supporting seed title(s) were dropped/disliked)"
+            )
         if mean is not None:
             reasons.append(f"MAL mean score: {mean}")
         if meta is None:
@@ -927,6 +946,7 @@ def _build_discovery_recommendations(
                 context={
                     "mal_anime_id": target_id,
                     "supporting_source_count": support_count,
+                    "effective_supporting_seed_count": effective_supporting_seed_count,
                     "supporting_mal_anime_ids": sorted(bucket["supporting_sources"]),
                     "aggregated_recommendation_votes": bucket["votes"],
                     "best_single_source_votes": best_single_source_votes,
@@ -953,6 +973,10 @@ def _build_discovery_recommendations(
                     "dropped_supporting_seed_count": len(dropped_supporting_seed_ids),
                     "disliked_supporting_seed_ids": disliked_supporting_seed_ids,
                     "disliked_supporting_seed_count": len(disliked_supporting_seed_ids),
+                    "negative_supporting_seed_ids": negative_supporting_seed_ids,
+                    "negative_supporting_seed_count": negative_supporting_seed_count,
+                    "negative_support_ratio": negative_support_ratio,
+                    "mixed_signal_penalty": mixed_signal_penalty,
                     "positive_quality_supporting_seed_ids": positive_quality_supporting_seed_ids,
                     "positive_quality_supporting_seed_count": len(positive_quality_supporting_seed_ids),
                     "freshest_supporting_seed_days": freshest_supporting_seed_days,
