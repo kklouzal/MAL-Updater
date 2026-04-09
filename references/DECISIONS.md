@@ -253,6 +253,22 @@ If an operator supplies an explicit task-wide override, that override should sti
 - once a lane has observed request history, synthetic shipped defaults should stop pinning budget behavior to folklore instead of evidence
 - keeping built-ins seed-like preserves the repo's current direction: conservative, explainable cold starts first, then learned host-specific behavior as soon as real data exists
 
+## 2026-04-09 - Discovery low-confidence seed penalty posture
+
+### Decision
+Keep discovery-candidate ranking explainable and mostly vote-driven, but add a small **symmetric penalty** when the supporting seed titles themselves carry clear low-confidence taste signals from cached MAL scores.
+
+### Rules
+- Treat cached MAL seed scores of `5` as a mild penalty, `4` as a moderate penalty, and `<=3` as a stronger penalty.
+- Apply the penalty as a modest tie-break / near-tie tempering signal, not as a hard filter and not as something strong enough to outweigh aggregate cross-seed consensus by itself.
+- Record the penalty transparently in recommendation context (`seed_quality_penalty`, `penalized_seed_scores`, `lowest_supporting_seed_score`) and emit an operator-readable reason when it materially affects a candidate.
+- Keep positive high-score / deep-engagement seed bonuses alongside this penalty so mixed-signal discovery candidates can still rank well when the broader support remains convincing.
+
+### Why
+- positive-only taste calibration can overstate recommendations that are backed mainly by titles the user actually rated poorly
+- a small symmetric penalty better reflects the user's demonstrated taste without pretending the recommendation graph is precise enough for aggressive filtering
+- surfacing the penalty explicitly keeps recommendation ordering explainable instead of burying negative taste signals inside opaque score math
+
 ## 2026-03-25 - Bursty learned-request projection posture
 
 ### Decision

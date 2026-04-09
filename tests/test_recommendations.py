@@ -724,6 +724,81 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("stronger seed engagement signals", " ".join(results[0].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_penalizes_low_scored_seed_support_when_votes_tie(self) -> None:
+        self._insert_series(
+            "seed-liked",
+            title="Liked Seed",
+            season_title="Liked Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-liked", "seed-liked-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-disliked",
+            title="Disliked Seed",
+            season_title="Disliked Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-disliked", "seed-disliked-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-liked", 100)
+        self._map_series("seed-disliked", 200)
+        self._cache_metadata(100, title="Liked Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 8})
+        self._cache_metadata(200, title="Disliked Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 3})
+        self._cache_metadata(300, title="Liked-Line Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Disliked-Line Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Liked-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Disliked-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(0, results[0].context["seed_quality_penalty"])
+        self.assertEqual(3, results[1].context["seed_quality_penalty"])
+        self.assertEqual(3, results[1].context["lowest_supporting_seed_score"])
+        self.assertIn("low-confidence/disliked seed support", " ".join(results[1].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_keeps_positive_seed_quality_above_disliked_support_penalty(self) -> None:
+        self._insert_series(
+            "seed-loved",
+            title="Loved Seed",
+            season_title="Loved Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-loved", "seed-loved-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-disliked",
+            title="Disliked Seed",
+            season_title="Disliked Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-disliked", "seed-disliked-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-loved", 100)
+        self._map_series("seed-disliked", 200)
+        self._cache_metadata(100, title="Loved Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 10})
+        self._cache_metadata(200, title="Disliked Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 3})
+        self._cache_metadata(300, title="Mixed-Signal Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Disliked-Only Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Mixed-Signal Pick", "num_recommendations": 12, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 300, "target_title": "Mixed-Signal Pick", "num_recommendations": 8, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Disliked-Only Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertGreater(results[0].context["seed_quality_bonus"], 0)
+        self.assertEqual(3, results[0].context["seed_quality_penalty"])
+        self.assertEqual(10, results[0].context["best_supporting_seed_score"])
+        self.assertEqual(3, results[0].context["lowest_supporting_seed_score"])
+        self.assertGreater(results[0].priority, results[1].priority)
+
     def test_discovery_candidate_prefers_cached_genre_overlap(self) -> None:
         self._insert_series(
             "seed-a",
