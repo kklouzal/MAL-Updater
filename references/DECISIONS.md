@@ -412,6 +412,21 @@ Also treat a material execution-posture change (for example historical full-pass
 - a single oversized historical apply run should not be able to trap the daemon in near-permanent projected-budget skips once the intended unattended posture becomes smaller and more conservative
 - keeping the bounded batch size explicit and configurable preserves explainability while still allowing hosts with stronger evidence to tune the lane differently later
 
+## 2026-04-10 - Discovery neutral-seed weighting posture
+
+### Decision
+When discovery candidates are supported by seed titles with an explicit neutral MAL score (`6`), count that support more conservatively than clearly positive seed support.
+
+Specifically:
+- expose neutral support metadata as `neutral_supporting_seed_ids`, `neutral_support_ratio`, and `neutral_support_penalty`
+- discount neutral supporting seeds from the candidate's effective multi-seed support-count boost
+- apply only a small additional penalty for neutral-heavy support, keeping the posture explainable and conservative rather than aggressively suppressive
+
+### Why
+- an explicit neutral score is meaningfully different from both positive taste evidence and missing score data
+- treating neutral seeds like full positive consensus overstates confidence for otherwise tied discovery candidates
+- surfacing the neutral-support metadata keeps the ranking auditable instead of hiding the decay inside opaque scoring math
+
 ## 2026-04-08 - Discovery seed-quality posture
 
 ### Decision

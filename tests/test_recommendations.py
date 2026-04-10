@@ -724,6 +724,45 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("stronger seed engagement signals", " ".join(results[0].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_penalizes_neutral_seed_support_when_votes_tie(self) -> None:
+        self._insert_series(
+            "seed-liked",
+            title="Liked Seed",
+            season_title="Liked Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-liked", "seed-liked-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-neutral",
+            title="Neutral Seed",
+            season_title="Neutral Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-neutral", "seed-neutral-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-liked", 100)
+        self._map_series("seed-neutral", 200)
+        self._cache_metadata(100, title="Liked Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 8})
+        self._cache_metadata(200, title="Neutral Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 6})
+        self._cache_metadata(300, title="Liked-Line Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Neutral-Line Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Liked-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Line Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(0, results[0].context["neutral_supporting_seed_count"])
+        self.assertEqual(1, results[1].context["neutral_supporting_seed_count"])
+        self.assertEqual({200: 6}, results[1].context["neutral_supporting_seed_scores"])
+        self.assertEqual(1.0, results[1].context["neutral_support_ratio"])
+        self.assertEqual(4, results[1].context["neutral_support_penalty"])
+        self.assertIn("explicit neutral seed support counted conservatively", " ".join(results[1].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
     def test_discovery_candidate_penalizes_low_scored_seed_support_when_votes_tie(self) -> None:
         self._insert_series(
             "seed-liked",
@@ -800,6 +839,52 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(1, results[0].context["effective_supporting_seed_count"])
         self.assertEqual(3, results[0].context["mixed_signal_penalty"])
         self.assertIn("mixed-signal support decay applied (1/2 supporting seed title(s) were dropped/disliked)", results[0].reasons)
+
+    def test_discovery_candidate_neutral_support_does_not_count_like_positive_multi_seed_consensus(self) -> None:
+        for provider_series_id, title in (("seed-liked", "Liked Seed"), ("seed-neutral-a", "Neutral Seed A"), ("seed-neutral-b", "Neutral Seed B")):
+            self._insert_series(
+                provider_series_id,
+                title=title,
+                season_title=f"{title} (English Dub)",
+                watchlist_status="fully_watched",
+            )
+            self._insert_progress(
+                provider_series_id,
+                provider_series_id + "-1",
+                episode_number=1,
+                completion_ratio=1.0,
+                last_watched_at="2026-03-01T01:00:00Z",
+            )
+
+        self._map_series("seed-liked", 100)
+        self._map_series("seed-neutral-a", 200)
+        self._map_series("seed-neutral-b", 250)
+        self._cache_metadata(100, title="Liked Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 8})
+        self._cache_metadata(200, title="Neutral Seed A", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 6})
+        self._cache_metadata(250, title="Neutral Seed B", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 6})
+        self._cache_metadata(300, title="Clean Support Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Neutral-Heavy Pick", mean=8.0, popularity=500)
+
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Clean Support Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 8, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 4, "raw": {}},
+        ])
+        self._cache_recommendations(250, [
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 4, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        neutral_heavy = results[1]
+        self.assertEqual(2, neutral_heavy.context["neutral_supporting_seed_count"])
+        self.assertAlmostEqual(2 / 3, neutral_heavy.context["neutral_support_ratio"])
+        self.assertEqual(1, neutral_heavy.context["effective_supporting_seed_count"])
+        self.assertEqual(4, neutral_heavy.context["neutral_support_penalty"])
+        self.assertLessEqual(neutral_heavy.priority, results[0].priority)
 
     def test_discovery_candidate_majority_negative_support_ranks_below_clean_support(self) -> None:
         for provider_series_id, title in (("seed-loved", "Loved Seed"), ("seed-disliked-a", "Disliked Seed A"), ("seed-disliked-b", "Disliked Seed B")):

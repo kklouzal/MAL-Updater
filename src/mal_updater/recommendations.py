@@ -590,6 +590,16 @@ def _discovery_seed_score_penalty(meta: Any) -> tuple[int, int | None]:
     return 0, raw_score
 
 
+def _discovery_seed_score_is_neutral(meta: Any) -> tuple[bool, int | None]:
+    my_list_status = _metadata_my_list_status(meta)
+    if not isinstance(my_list_status, dict):
+        return False, None
+    raw_score = my_list_status.get("score")
+    if not isinstance(raw_score, int) or raw_score <= 0:
+        return False, None
+    return raw_score == 6, raw_score
+
+
 def _discovery_seed_completion_bonus(state: ProviderSeriesState) -> int:
     if state.watchlist_status == "fully_watched":
         if state.completed_episode_count >= 24:
@@ -675,6 +685,8 @@ def _build_discovery_recommendations(
     dropped_seed_ids: set[int] = set()
     disliked_seed_ids: set[int] = set()
     positive_quality_seed_ids: set[int] = set()
+    neutral_seed_ids: set[int] = set()
+    neutral_seed_scores: dict[int, int] = {}
     for state in states:
         mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
         if mal_anime_id is None:
@@ -687,6 +699,7 @@ def _build_discovery_recommendations(
         meta = metadata_by_id.get(mal_anime_id)
         score_bonus, seed_score = _discovery_seed_score_bonus(meta)
         score_penalty, seed_penalty_score = _discovery_seed_score_penalty(meta)
+        is_neutral_seed, neutral_seed_score = _discovery_seed_score_is_neutral(meta)
         completion_bonus = _discovery_seed_completion_bonus(state)
         seed_status = _discovery_seed_status_value(meta)
          
@@ -701,6 +714,10 @@ def _build_discovery_recommendations(
             positive_quality_seed_ids.add(mal_anime_id)
         if score_penalty > seed_quality_penalty.get(mal_anime_id, 0):
             seed_quality_penalty[mal_anime_id] = score_penalty
+        if is_neutral_seed:
+            neutral_seed_ids.add(mal_anime_id)
+            if neutral_seed_score is not None:
+                neutral_seed_scores[mal_anime_id] = neutral_seed_score
         if seed_score is not None and seed_score > seed_scores.get(mal_anime_id, 0):
             seed_scores[mal_anime_id] = seed_score
         if seed_penalty_score is not None:
@@ -768,6 +785,8 @@ def _build_discovery_recommendations(
                     "dropped_supporting_seed_ids": set(),
                     "disliked_supporting_seed_ids": set(),
                     "positive_quality_supporting_seed_ids": set(),
+                    "neutral_supporting_seed_ids": set(),
+                    "neutral_supporting_seed_scores": {},
                 },
             )
             votes = edge.num_recommendations or 0
@@ -787,6 +806,10 @@ def _build_discovery_recommendations(
                 bucket["disliked_supporting_seed_ids"].add(source_id)
             if source_id in positive_quality_seed_ids:
                 bucket["positive_quality_supporting_seed_ids"].add(source_id)
+            if source_id in neutral_seed_ids:
+                bucket["neutral_supporting_seed_ids"].add(source_id)
+            if source_id in neutral_seed_scores:
+                bucket["neutral_supporting_seed_scores"][source_id] = neutral_seed_scores[source_id]
             votes_by_source = bucket["votes_by_source"]
             votes_by_source[source_id] = votes_by_source.get(source_id, 0) + votes
             bucket["votes"] += votes
@@ -873,6 +896,16 @@ def _build_discovery_recommendations(
             for source_id in (bucket.get("positive_quality_supporting_seed_ids") or set())
             if isinstance(source_id, int)
         )
+        neutral_supporting_seed_ids = sorted(
+            int(source_id)
+            for source_id in (bucket.get("neutral_supporting_seed_ids") or set())
+            if isinstance(source_id, int)
+        )
+        neutral_supporting_seed_scores = {
+            int(source_id): int(score)
+            for source_id, score in (bucket.get("neutral_supporting_seed_scores") or {}).items()
+            if isinstance(source_id, int) and isinstance(score, int) and score > 0
+        }
         best_supporting_seed_score = max(supporting_seed_scores.values(), default=None)
         lowest_supporting_seed_score = min(penalized_seed_scores.values(), default=None)
         all_support_is_dropped = support_count > 0 and len(dropped_supporting_seed_ids) >= support_count
@@ -886,6 +919,10 @@ def _build_discovery_recommendations(
         negative_support_ratio = (
             negative_supporting_seed_count / support_count if support_count > 0 else 0.0
         )
+        neutral_supporting_seed_count = len(neutral_supporting_seed_ids)
+        neutral_support_ratio = (
+            neutral_supporting_seed_count / support_count if support_count > 0 else 0.0
+        )
         mixed_signal_penalty = 0
         if 0 < negative_supporting_seed_count < support_count:
             if negative_support_ratio >= (2 / 3):
@@ -894,11 +931,23 @@ def _build_discovery_recommendations(
                 mixed_signal_penalty = 3
             elif negative_support_ratio >= (1 / 3):
                 mixed_signal_penalty = 1
-        effective_supporting_seed_count = max(support_count - negative_supporting_seed_count, 1)
+        neutral_support_penalty = 0
+        if neutral_supporting_seed_count > 0 and negative_supporting_seed_count < support_count:
+            if neutral_support_ratio >= (2 / 3):
+                neutral_support_penalty = 4
+            elif neutral_support_ratio >= 0.5:
+                neutral_support_penalty = 2
+            elif neutral_support_ratio > 0:
+                neutral_support_penalty = 1
+        effective_supporting_seed_count = max(
+            support_count - negative_supporting_seed_count - neutral_supporting_seed_count,
+            1,
+        )
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= seed_quality_penalty
         priority -= mixed_signal_penalty
+        priority -= neutral_support_penalty
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
@@ -928,6 +977,10 @@ def _build_discovery_recommendations(
         if mixed_signal_penalty > 0:
             reasons.append(
                 f"mixed-signal support decay applied ({negative_supporting_seed_count}/{support_count} supporting seed title(s) were dropped/disliked)"
+            )
+        if neutral_support_penalty > 0:
+            reasons.append(
+                f"explicit neutral seed support counted conservatively ({neutral_supporting_seed_count}/{support_count} supporting seed title(s) carried a neutral MAL score)"
             )
         if mean is not None:
             reasons.append(f"MAL mean score: {mean}")
@@ -979,6 +1032,11 @@ def _build_discovery_recommendations(
                     "mixed_signal_penalty": mixed_signal_penalty,
                     "positive_quality_supporting_seed_ids": positive_quality_supporting_seed_ids,
                     "positive_quality_supporting_seed_count": len(positive_quality_supporting_seed_ids),
+                    "neutral_supporting_seed_ids": neutral_supporting_seed_ids,
+                    "neutral_supporting_seed_count": neutral_supporting_seed_count,
+                    "neutral_supporting_seed_scores": neutral_supporting_seed_scores,
+                    "neutral_support_ratio": neutral_support_ratio,
+                    "neutral_support_penalty": neutral_support_penalty,
                     "freshest_supporting_seed_days": freshest_supporting_seed_days,
                     "mean": mean,
                     "popularity": popularity,
