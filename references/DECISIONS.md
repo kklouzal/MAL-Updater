@@ -184,6 +184,18 @@ Keep MAL as its own explicit daemon budget lane, but let non-MAL source provider
 - shared source-provider defaults make new providers safer to onboard before their final tuned per-provider numbers are known
 - explicit per-provider overrides still win, so operators can keep Crunchyroll/HIDIVE-specific tuning where it matters
 
+## 2026-04-10 - Bootstrap remediation metadata posture
+
+### Decision
+Keep `bootstrap-audit` onboarding output machine-readable enough for operators and automation to distinguish **why** a bootstrap command is being recommended, not just which command to run.
+
+`bootstrap-audit` onboarding steps / `recommended_commands` should preserve a stable `reason_code`, `automation_safe`, and `requires_auth_interaction` posture for actionable commands. When the recommendation is driven by auth degradation, it should also carry the classified `auth_failure_kind` and `auth_remediation_kind`, and `bootstrap-audit --summary` should surface those auth-classification fields too.
+
+### Why
+- bootstrap/onboarding had already become the first operator surface, but its actionable command list still lagged behind `health-check` in machine-readable remediation specificity
+- preserving the auth classification in both JSON and terse summary output makes partial/bootstrap-degraded state easier to debug without forcing operators to jump to a different command
+- stable reason codes keep future automation/reporting aligned with the conservative shared reauth/rebootstrap posture instead of re-parsing freeform detail strings
+
 ## 2026-04-09 - Discovery mixed-signal recommendation posture
 
 ### Decision

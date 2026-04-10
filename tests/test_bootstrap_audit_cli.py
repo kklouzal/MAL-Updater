@@ -75,14 +75,23 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual(0, payload["summary"]["intended_provider_count"])
         self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
         self.assertGreaterEqual(payload["summary"]["actionable_command_count"], 1)
-        commands = [item["command"] for item in payload["recommended_commands"] if item.get("command")]
-        self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", commands)
-        self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", commands)
+        commands = [item for item in payload["recommended_commands"] if item.get("command")]
+        command_strings = [item["command"] for item in commands]
+        self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", command_strings)
+        self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", command_strings)
         self.assertIn(
             "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
-            commands,
+            command_strings,
         )
-        self.assertIn(str(self.project_root / "scripts" / "install_user_systemd_units.sh"), commands)
+        self.assertIn(str(self.project_root / "scripts" / "install_user_systemd_units.sh"), command_strings)
+        init_command = next(item for item in commands if item["command"] == "PYTHONPATH=src python3 -m mal_updater.cli init")
+        self.assertEqual("initialize_runtime", init_command["reason_code"])
+        self.assertTrue(init_command["automation_safe"])
+        self.assertFalse(init_command["requires_auth_interaction"])
+        mal_auth_command = next(item for item in commands if item["command"] == "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login")
+        self.assertEqual("missing_mal_auth_material", mal_auth_command["reason_code"])
+        self.assertFalse(mal_auth_command["automation_safe"])
+        self.assertTrue(mal_auth_command["requires_auth_interaction"])
 
     def test_bootstrap_audit_summary_reports_provider_missing_state_and_next_commands(self) -> None:
         secrets_dir = self.project_root / ".MAL-Updater" / "secrets"
@@ -252,10 +261,14 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("invalid_grant", payload["mal"]["operation_guidance"]["details"])
         self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
         self.assertFalse(payload["summary"]["daemon_expected"])
-        self.assertIn(
-            "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login",
-            [item["command"] for item in payload["recommended_commands"] if item.get("command")],
+        mal_auth_command = next(
+            item for item in payload["recommended_commands"] if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login"
         )
+        self.assertEqual("rebootstrap_mal_auth_after_invalid_grant", mal_auth_command["reason_code"])
+        self.assertEqual("invalid_grant", mal_auth_command["auth_failure_kind"])
+        self.assertEqual("refresh-token-invalidated", mal_auth_command["auth_remediation_kind"])
+        self.assertFalse(mal_auth_command["automation_safe"])
+        self.assertTrue(mal_auth_command["requires_auth_interaction"])
 
     def test_bootstrap_audit_summary_surfaces_mal_reauth_command_for_repeated_refresh_failures(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
@@ -293,6 +306,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("mal_ready=False", stdout)
         self.assertIn("mal_operation_mode=auth-degraded-needs-reauth", stdout)
+        self.assertIn("mal_auth_failure_kind=invalid_grant", stdout)
+        self.assertIn("mal_auth_remediation_kind=refresh-token-invalidated", stdout)
         self.assertIn("mal_next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
         self.assertIn("operation_mode=bootstrap-provider-staged", stdout)
@@ -330,6 +345,16 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("refresh-token-invalidated", payload["providers"]["crunchyroll"]["operation_guidance"]["remediation_kind"])
         self.assertIn("revoked or invalid refresh/auth token", payload["providers"]["crunchyroll"]["operation_guidance"]["details"])
         self.assertIn("refresh token revoked", payload["providers"]["crunchyroll"]["operation_guidance"]["details"])
+        crunchyroll_command = next(
+            item
+            for item in payload["recommended_commands"]
+            if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll"
+        )
+        self.assertEqual("rebootstrap_crunchyroll_auth_after_invalid_grant", crunchyroll_command["reason_code"])
+        self.assertEqual("invalid_grant", crunchyroll_command["auth_failure_kind"])
+        self.assertEqual("refresh-token-invalidated", crunchyroll_command["auth_remediation_kind"])
+        self.assertFalse(crunchyroll_command["automation_safe"])
+        self.assertFalse(crunchyroll_command["requires_auth_interaction"])
         self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
         self.assertEqual(1, payload["summary"]["intended_provider_count"])
         self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
@@ -371,6 +396,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("provider_hidive_ready=False", stdout)
         self.assertIn("provider_hidive_operation_mode=auth-degraded-needs-rebootstrap", stdout)
         self.assertIn("provider_hidive_missing=auth", stdout)
+        self.assertIn("provider_hidive_auth_failure_kind=login_failure", stdout)
+        self.assertIn("provider_hidive_auth_remediation_kind=login-bootstrap-failed", stdout)
         self.assertIn(
             "provider_hidive_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,

@@ -574,18 +574,31 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         command: str | None = None,
         command_args: list[str] | None = None,
         applies_to: str | None = None,
+        reason_code: str | None = None,
+        automation_safe: bool | None = None,
+        requires_auth_interaction: bool | None = None,
+        auth_failure_kind: str | None = None,
+        auth_remediation_kind: str | None = None,
     ) -> None:
-        onboarding_steps.append(
-            {
-                "step": step,
-                "status": "missing",
-                "user_action_required": user_action_required,
-                "command": command,
-                "command_args": command_args or [],
-                "applies_to": applies_to,
-                "details": details,
-            }
-        )
+        payload = {
+            "step": step,
+            "status": "missing",
+            "user_action_required": user_action_required,
+            "command": command,
+            "command_args": command_args or [],
+            "applies_to": applies_to,
+            "details": details,
+            "reason_code": reason_code or step.replace("-", "_"),
+        }
+        if isinstance(automation_safe, bool):
+            payload["automation_safe"] = automation_safe
+        if isinstance(requires_auth_interaction, bool):
+            payload["requires_auth_interaction"] = requires_auth_interaction
+        if isinstance(auth_failure_kind, str) and auth_failure_kind:
+            payload["auth_failure_kind"] = auth_failure_kind
+        if isinstance(auth_remediation_kind, str) and auth_remediation_kind:
+            payload["auth_remediation_kind"] = auth_remediation_kind
+        onboarding_steps.append(payload)
 
     if not runtime_initialization["ready"]:
         missing_runtime = runtime_initialization.get("missing") if isinstance(runtime_initialization.get("missing"), list) else []
@@ -597,6 +610,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command="PYTHONPATH=src python3 -m mal_updater.cli init",
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "init"],
             applies_to="runtime",
+            automation_safe=True,
+            requires_auth_interaction=False,
         )
     if not dependency_checks["python3"]:
         add_onboarding_step(
@@ -613,6 +628,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command="python3 -m pip install -e '.[crunchyroll]'",
             command_args=["python3", "-m", "pip", "install", "-e", ".[crunchyroll]"],
             applies_to="crunchyroll",
+            automation_safe=True,
+            requires_auth_interaction=False,
         )
 
     if not mal_app_present:
@@ -630,6 +647,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=mal_auth_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "mal-auth-login"],
             applies_to="mal",
+            reason_code="missing_mal_auth_material",
+            automation_safe=False,
+            requires_auth_interaction=True,
         )
     elif isinstance(mal_auth_issue, dict):
         auth_issue_reason = mal_auth_issue.get("reason")
@@ -647,6 +667,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=mal_auth_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "mal-auth-login"],
             applies_to="mal",
+            reason_code=f"rebootstrap_mal_auth_after_{str(mal_auth_issue.get('auth_failure_kind') or 'auth_failures')}",
+            automation_safe=False,
+            requires_auth_interaction=True,
+            auth_failure_kind=str(mal_auth_issue.get("auth_failure_kind") or "") or None,
+            auth_remediation_kind=str(mal_auth_issue.get("auth_remediation_kind") or "") or None,
         )
     if not crunchyroll_credentials_present:
         add_onboarding_step(
@@ -663,6 +688,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=crunchyroll_bootstrap_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "crunchyroll"],
             applies_to="crunchyroll",
+            reason_code="missing_crunchyroll_state",
+            automation_safe=False,
+            requires_auth_interaction=False,
         )
     elif isinstance(provider_auth_issues.get("crunchyroll"), dict) and dependency_checks["curl_cffi"]:
         auth_issue_reason = provider_auth_issues["crunchyroll"].get("reason")
@@ -680,6 +708,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=crunchyroll_bootstrap_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "crunchyroll"],
             applies_to="crunchyroll",
+            reason_code=f"rebootstrap_crunchyroll_auth_after_{str(provider_auth_issues['crunchyroll'].get('auth_failure_kind') or 'auth_failures')}",
+            automation_safe=False,
+            requires_auth_interaction=False,
+            auth_failure_kind=str(provider_auth_issues["crunchyroll"].get("auth_failure_kind") or "") or None,
+            auth_remediation_kind=str(provider_auth_issues["crunchyroll"].get("auth_remediation_kind") or "") or None,
         )
     if not hidive_credentials_present:
         add_onboarding_step(
@@ -696,6 +729,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=hidive_bootstrap_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "hidive"],
             applies_to="hidive",
+            reason_code="missing_hidive_state",
+            automation_safe=False,
+            requires_auth_interaction=False,
         )
     elif isinstance(provider_auth_issues.get("hidive"), dict):
         auth_issue_reason = provider_auth_issues["hidive"].get("reason")
@@ -713,6 +749,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=hidive_bootstrap_command,
             command_args=["PYTHONPATH=src", "python3", "-m", "mal_updater.cli", "provider-auth-login", "--provider", "hidive"],
             applies_to="hidive",
+            reason_code=f"rebootstrap_hidive_auth_after_{str(provider_auth_issues['hidive'].get('auth_failure_kind') or 'auth_failures')}",
+            automation_safe=False,
+            requires_auth_interaction=False,
+            auth_failure_kind=str(provider_auth_issues["hidive"].get("auth_failure_kind") or "") or None,
+            auth_remediation_kind=str(provider_auth_issues["hidive"].get("auth_remediation_kind") or "") or None,
         )
     if not dependency_checks["systemctl"]:
         add_onboarding_step(
@@ -768,6 +809,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                     command=install_script_path,
                     command_args=[install_script_path],
                     applies_to="automation",
+                    automation_safe=True,
+                    requires_auth_interaction=False,
                 )
     if secrets_dir_permissions["exists"] and not secrets_dir_permissions["restrictive"]:
         add_onboarding_step(
@@ -777,6 +820,8 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             command=str(secrets_dir_permissions["command"]),
             command_args=["chmod", "700", str(config.secrets_dir)],
             applies_to="security",
+            automation_safe=True,
+            requires_auth_interaction=False,
         )
 
     blocking_steps = [item for item in onboarding_steps if item["user_action_required"]]
@@ -932,6 +977,13 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         print(f"operation_mode={payload['summary']['operation_mode']}")
         print(f"mal_ready={payload['mal']['ready']}")
         print(f"mal_operation_mode={payload['mal']['operation_mode']}")
+        mal_auth_degradation = payload["mal"].get("auth_degradation") if isinstance(payload["mal"].get("auth_degradation"), dict) else {}
+        mal_auth_failure_kind = mal_auth_degradation.get("auth_failure_kind") if isinstance(mal_auth_degradation.get("auth_failure_kind"), str) else None
+        if mal_auth_failure_kind:
+            print(f"mal_auth_failure_kind={mal_auth_failure_kind}")
+        mal_auth_remediation_kind = mal_auth_degradation.get("auth_remediation_kind") if isinstance(mal_auth_degradation.get("auth_remediation_kind"), str) else None
+        if mal_auth_remediation_kind:
+            print(f"mal_auth_remediation_kind={mal_auth_remediation_kind}")
         print(f"manual_foreground_acceptable={payload['summary']['manual_foreground_acceptable']}")
         print(f"daemon_expected={payload['summary']['daemon_expected']}")
         print(f"blocking_step_count={payload['summary']['blocking_step_count']}")
@@ -956,6 +1008,13 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 print(f"provider_{provider_name}_missing=" + ", ".join(str(item) for item in missing))
             operation_guidance = provider_payload.get("operation_guidance") if isinstance(provider_payload.get("operation_guidance"), dict) else {}
             next_command = operation_guidance.get("next_command") if isinstance(operation_guidance.get("next_command"), str) else None
+            provider_auth_degradation = provider_payload.get("auth_degradation") if isinstance(provider_payload.get("auth_degradation"), dict) else {}
+            auth_failure_kind = provider_auth_degradation.get("auth_failure_kind") if isinstance(provider_auth_degradation.get("auth_failure_kind"), str) else None
+            if auth_failure_kind:
+                print(f"provider_{provider_name}_auth_failure_kind={auth_failure_kind}")
+            auth_remediation_kind = provider_auth_degradation.get("auth_remediation_kind") if isinstance(provider_auth_degradation.get("auth_remediation_kind"), str) else None
+            if auth_remediation_kind:
+                print(f"provider_{provider_name}_auth_remediation_kind={auth_remediation_kind}")
             if next_command:
                 print(f"provider_{provider_name}_next_command={next_command}")
         for item in onboarding_steps:
