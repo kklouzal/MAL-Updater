@@ -124,6 +124,12 @@ class BootstrapAuditCliTests(unittest.TestCase):
         )
         self.assertIn("intended_provider_count=1", stdout)
         self.assertIn("partially_staged_provider_count=1", stdout)
+        self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
+        self.assertIn("maintenance_recommended_reason_code=initialize_runtime", stdout)
+        self.assertIn("maintenance_recommended_automation_safe=True", stdout)
+        self.assertIn("maintenance_recommended_requires_auth_interaction=False", stdout)
+        self.assertIn("maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
+        self.assertIn("maintenance_recommended_auto_reason_code=initialize_runtime", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
         self.assertIn(
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
@@ -309,6 +315,10 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("mal_auth_failure_kind=invalid_grant", stdout)
         self.assertIn("mal_auth_remediation_kind=refresh-token-invalidated", stdout)
         self.assertIn("mal_next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
+        self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
+        self.assertIn("maintenance_recommended_reason_code=rebootstrap_mal_auth_after_invalid_grant", stdout)
+        self.assertIn("maintenance_recommended_automation_safe=False", stdout)
+        self.assertIn("maintenance_recommended_requires_auth_interaction=True", stdout)
         self.assertIn("next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
         self.assertIn("operation_mode=bootstrap-provider-staged", stdout)
 
@@ -367,6 +377,12 @@ class BootstrapAuditCliTests(unittest.TestCase):
         (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
         (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
         (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
         (runtime_root / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (runtime_root / "secrets" / "hidive_password.txt").write_text("top-secret\n", encoding="utf-8")
         hidive_state_root = runtime_root / "state" / "hidive" / "default"
@@ -402,6 +418,13 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "provider_hidive_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,
         )
+        self.assertIn(
+            "maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
+            stdout,
+        )
+        self.assertIn("maintenance_recommended_reason_code=rebootstrap_hidive_auth_after_login_failure", stdout)
+        self.assertIn("maintenance_recommended_automation_safe=False", stdout)
+        self.assertIn("maintenance_recommended_requires_auth_interaction=False", stdout)
         self.assertIn(
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,

@@ -189,7 +189,7 @@ Keep MAL as its own explicit daemon budget lane, but let non-MAL source provider
 ### Decision
 Keep `bootstrap-audit` onboarding output machine-readable enough for operators and automation to distinguish **why** a bootstrap command is being recommended, not just which command to run.
 
-`bootstrap-audit` onboarding steps / `recommended_commands` should preserve a stable `reason_code`, `automation_safe`, and `requires_auth_interaction` posture for actionable commands. When the recommendation is driven by auth degradation, it should also carry the classified `auth_failure_kind` and `auth_remediation_kind`, and `bootstrap-audit --summary` should surface those auth-classification fields too.
+`bootstrap-audit` onboarding steps / `recommended_commands` should preserve a stable `reason_code`, `automation_safe`, and `requires_auth_interaction` posture for actionable commands. When the recommendation is driven by auth degradation, it should also carry the classified `auth_failure_kind` and `auth_remediation_kind`, and `bootstrap-audit --summary` should surface those auth-classification fields plus the top recommended command posture too.
 
 ### Why
 - bootstrap/onboarding had already become the first operator surface, but its actionable command list still lagged behind `health-check` in machine-readable remediation specificity

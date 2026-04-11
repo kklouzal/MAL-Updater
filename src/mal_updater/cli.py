@@ -1017,6 +1017,22 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 print(f"provider_{provider_name}_auth_remediation_kind={auth_remediation_kind}")
             if next_command:
                 print(f"provider_{provider_name}_next_command={next_command}")
+        top_command = _select_maintenance_command(actionable_commands)
+        if isinstance(top_command, dict) and top_command.get("command"):
+            print("maintenance_recommended_command=" + str(top_command["command"]))
+            reason_code = top_command.get("reason_code")
+            if isinstance(reason_code, str) and reason_code:
+                print(f"maintenance_recommended_reason_code={reason_code}")
+            if top_command.get("automation_safe") is not None:
+                print(f"maintenance_recommended_automation_safe={top_command['automation_safe']}")
+            if top_command.get("requires_auth_interaction") is not None:
+                print(f"maintenance_recommended_requires_auth_interaction={top_command['requires_auth_interaction']}")
+        top_auto_command = _select_maintenance_command(actionable_commands, require_automation_safe=True)
+        if isinstance(top_auto_command, dict) and top_auto_command.get("command"):
+            print("maintenance_recommended_auto_command=" + str(top_auto_command["command"]))
+            reason_code = top_auto_command.get("reason_code")
+            if isinstance(reason_code, str) and reason_code:
+                print(f"maintenance_recommended_auto_reason_code={reason_code}")
         for item in onboarding_steps:
             print(f"next_step={item['step']}: {item['details']}")
             command = item.get("command")
