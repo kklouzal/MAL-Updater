@@ -50,6 +50,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("providers", payload)
         self.assertIn("summary", payload)
         self.assertIn("recommended_commands", payload)
+        self.assertIn("recommended_command", payload)
+        self.assertIn("recommended_automation_command", payload)
         self.assertIn("runtime_initialization", payload)
         self.assertIn("secrets_dir_permissions", payload)
         self.assertIn("automation_installation", payload["services"])
@@ -88,6 +90,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("initialize_runtime", init_command["reason_code"])
         self.assertTrue(init_command["automation_safe"])
         self.assertFalse(init_command["requires_auth_interaction"])
+        self.assertEqual(init_command, payload["recommended_command"])
+        self.assertEqual(init_command, payload["recommended_automation_command"])
         mal_auth_command = next(item for item in commands if item["command"] == "PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login")
         self.assertEqual("missing_mal_auth_material", mal_auth_command["reason_code"])
         self.assertFalse(mal_auth_command["automation_safe"])
@@ -275,6 +279,9 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("refresh-token-invalidated", mal_auth_command["auth_remediation_kind"])
         self.assertFalse(mal_auth_command["automation_safe"])
         self.assertTrue(mal_auth_command["requires_auth_interaction"])
+        self.assertEqual(mal_auth_command, payload["recommended_command"])
+        self.assertNotEqual(mal_auth_command, payload["recommended_automation_command"])
+        self.assertTrue(payload["recommended_automation_command"]["automation_safe"])
 
     def test_bootstrap_audit_summary_surfaces_mal_reauth_command_for_repeated_refresh_failures(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
@@ -365,6 +372,9 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("refresh-token-invalidated", crunchyroll_command["auth_remediation_kind"])
         self.assertFalse(crunchyroll_command["automation_safe"])
         self.assertFalse(crunchyroll_command["requires_auth_interaction"])
+        self.assertEqual(crunchyroll_command, payload["recommended_command"])
+        self.assertNotEqual(crunchyroll_command, payload["recommended_automation_command"])
+        self.assertTrue(payload["recommended_automation_command"]["automation_safe"])
         self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
         self.assertEqual(1, payload["summary"]["intended_provider_count"])
         self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
