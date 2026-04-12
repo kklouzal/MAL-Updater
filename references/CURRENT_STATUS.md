@@ -17,6 +17,7 @@
 - MAL OAuth and guarded MAL apply exist
 - mapping review / queue triage workflows exist
 - exact-title split-bundle auto-resolution now covers conservative same-title TV suffix companions (for example `Title` + `Title (2009)`) when provider episode evidence cleanly fits the combined entry count and no stronger non-bundle rival remains
+- supplemental-rescued exact-title overflow cases now also surface conservative bundle companions for review when the follow-up installment is only reachable through supplemental candidate IDs (for example `Girls Bravo`), while still preserving the rule that supplemental rescue inputs do not auto-resolve the mapping by themselves
 - long-lived daemon runtime + service manager exist
 - service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging, plus a terse `--format summary` operator view for quick checks
 - service task state now persists per-task cadence metadata (`every_seconds`), decision timing, last-run start/finish/duration, next-due timing, budget provider labels, budget backoff level (`warn` vs `critical`), adaptive failure backoff state, and active cooldown countdowns so unattended operators can see when a lane should run next vs when it is intentionally cooling down

@@ -250,15 +250,18 @@ Allow exact-title split-bundle auto-resolution when the base candidate is an exa
 - this residue is still explainable when the provider title is exact, the companion stays in the same normalized title family, and the episode count only makes sense as the combined bundle
 - keeping the rule tied to same-title TV suffix companions preserves conservative behavior while removing a class of manual-review busywork
 
-## 2026-03-20 - Supplemental mapping candidate posture
+## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision
 Treat hard-coded supplemental MAL candidate IDs as conservative rescue inputs, not as enough evidence by themselves to auto-resolve exact-title overflow cases.
 
+Supplemental candidates may still contribute **bundle-review evidence** when they reveal an exact base title plus a plausible follow-up TV installment whose combined episode counts explain the provider shell, but that evidence should remain review-only unless stronger non-supplemental mapping signals exist.
+
 ### Why
 - supplemental IDs help recover titles that MAL search fails to surface at all
 - overflow on top of a supplemental-only hit can still mean a multi-entry bundle or broader franchise residue
-- keeping this path conservative preserves explainability and avoids overconfident auto-approval when the search surface was already weak
+- surfacing the companion for review reduces manual detective work without pretending the rescue path is as trustworthy as ordinary search evidence
+- keeping auto-resolution disabled on supplemental-only bundle rescue preserves explainability and avoids overconfident approval when the search surface was already weak
 
 ## 2026-03-27 / 2026-03-28 - Built-in projected-request seed posture
 

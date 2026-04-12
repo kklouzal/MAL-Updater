@@ -3336,7 +3336,8 @@ class MappingTests(unittest.TestCase):
 
         self.assertEqual(result.status, "strong")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 241)
-        self.assertEqual([], result.bundle_companion_candidates or [])
+        self.assertEqual({487}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertIn("multi_entry_bundle_suspected=24<=11+13", result.rationale)
         self.assertFalse(should_auto_approve_mapping(result))
 
     def test_map_series_auto_approves_exact_later_installment_when_base_title_is_aggregated_noise(self) -> None:

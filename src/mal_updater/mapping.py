@@ -1115,6 +1115,8 @@ def _supports_exact_bundle_auto_resolution(
 ) -> bool:
     if not bundle_companion_candidates:
         return False
+    if "supplemental_title_candidate" in top.match_reasons:
+        return False
     if "exact_normalized_title" not in top.match_reasons:
         return False
     if top.media_type != "tv" or top.score < 0.88:
@@ -1170,6 +1172,29 @@ def _is_low_score_bundle_companion(top: MappingCandidate, companion: MappingCand
     ):
         return False
     return companion.score >= 0.35
+
+
+def _is_safe_supplemental_bundle_companion(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    if "supplemental_title_candidate" not in top.match_reasons:
+        return False
+    if companion.media_type != "tv":
+        return False
+    if companion.score < 0.30:
+        return False
+    if "supplemental_title_candidate" not in companion.match_reasons:
+        return False
+    if not _candidate_shares_bundle_title_family(top, companion):
+        return False
+    if not _candidate_has_explicit_followup_installment_hint(companion):
+        return False
+    disqualifying_prefixes = (
+        "candidate_auxiliary_content=",
+        "installment_hint_conflict=",
+        "base_installment_penalty_for_explicit_later_season",
+    )
+    if any(reason.startswith(disqualifying_prefixes) for reason in companion.match_reasons):
+        return False
+    return True
 
 
 
@@ -1232,7 +1257,8 @@ def _suspect_multi_entry_bundle(
             continue
 
         same_franchise_installment = _is_low_score_bundle_companion(top, companion)
-        if companion.score < max(0.70, top.score - 0.18) and not same_franchise_installment:
+        safe_supplemental_bundle_companion = _is_safe_supplemental_bundle_companion(top, companion)
+        if companion.score < max(0.70, top.score - 0.18) and not same_franchise_installment and not safe_supplemental_bundle_companion:
             continue
 
         if top_is_exact_base_match:
