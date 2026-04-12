@@ -1144,9 +1144,9 @@ def _supports_exact_bundle_auto_resolution(
 
 
 
-def _candidate_shares_bundle_title_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
-    top_title_norm = normalize_title_strict(top.title)
-    companion_title_norm = normalize_title_strict(companion.title)
+def _titles_share_bundle_family(top_title: str, companion_title: str) -> bool:
+    top_title_norm = normalize_title_strict(top_title)
+    companion_title_norm = normalize_title_strict(companion_title)
     if not top_title_norm or not companion_title_norm:
         return False
     if top_title_norm == companion_title_norm:
@@ -1163,8 +1163,24 @@ def _candidate_shares_bundle_title_family(top: MappingCandidate, companion: Mapp
 
 
 
+def _candidate_shares_bundle_title_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    return _titles_share_bundle_family(top.title, companion.title)
+
+
+
+def _candidate_shares_bundle_alias_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
+    top_titles = [top.title, *top.alternative_titles]
+    companion_titles = [companion.title, *companion.alternative_titles]
+    for top_title in top_titles:
+        for companion_title in companion_titles:
+            if _titles_share_bundle_family(top_title, companion_title):
+                return True
+    return False
+
+
+
 def _is_low_score_bundle_companion(top: MappingCandidate, companion: MappingCandidate) -> bool:
-    if not _candidate_shares_bundle_title_family(top, companion):
+    if not _candidate_shares_bundle_alias_family(top, companion):
         return False
     if not any(
         reason.startswith(("candidate_extra_title_suffix", "candidate_extra_installment_hint", "season_number_mismatch="))
@@ -1253,7 +1269,8 @@ def _suspect_multi_entry_bundle(
             continue
         if companion.media_type != top.media_type or companion.media_type != "tv":
             continue
-        if not _candidate_shares_bundle_title_family(top, companion):
+        shares_bundle_family = _candidate_shares_bundle_title_family(top, companion) or _candidate_shares_bundle_alias_family(top, companion)
+        if not shares_bundle_family:
             continue
 
         same_franchise_installment = _is_low_score_bundle_companion(top, companion)

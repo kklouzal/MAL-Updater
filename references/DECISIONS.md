@@ -250,6 +250,16 @@ Allow exact-title split-bundle auto-resolution when the base candidate is an exa
 - this residue is still explainable when the provider title is exact, the companion stays in the same normalized title family, and the episode count only makes sense as the combined bundle
 - keeping the rule tied to same-title TV suffix companions preserves conservative behavior while removing a class of manual-review busywork
 
+## 2026-04-12 - Alias-backed bundle review posture
+
+### Decision
+Allow exact-title overflow handling to treat MAL **alternative-title family alignment** as enough evidence to surface a later-season bundle companion for review, but keep exact bundle auto-resolution on the stricter primary-title-family rule.
+
+### Why
+- some franchises only line up cleanly through MAL English/synonym aliases even when the primary titles diverge more than conservative auto-resolution should trust
+- surfacing the companion still reduces manual review detective work for bundled provider shells
+- keeping auto-resolution tied to the stricter primary-title-family check preserves the existing conservative write/approval boundary
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision

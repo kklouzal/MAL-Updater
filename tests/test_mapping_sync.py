@@ -273,6 +273,82 @@ class MappingTests(unittest.TestCase):
         self.assertEqual({23327}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_flags_alias_only_bundle_companion_for_review_without_auto_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 71001,
+                                "title": "Kiseki Project",
+                                "alternative_titles": {"en": "Alias Show", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 71002,
+                                "title": "Shin Kiseki Project",
+                                "alternative_titles": {"en": "Alias Show Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 71003,
+                                "title": "Alias Show Mini Drama",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "special",
+                                "status": "finished_airing",
+                                "num_episodes": 1,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-alias-show",
+                        title="Alias Show",
+                        season_title="Alias Show (English Dub)",
+                        season_number=1,
+                        max_episode_number=24,
+                        completed_episode_count=24,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(71001, result.chosen_candidate.mal_anime_id)
+        self.assertIn("multi_entry_bundle_suspected=24<=12+12", result.rationale)
+        self.assertEqual({71002}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertFalse(should_auto_approve_mapping(result))
+
     def test_map_series_flags_exact_title_overflow_as_possible_three_entry_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
