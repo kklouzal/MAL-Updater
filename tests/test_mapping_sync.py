@@ -607,6 +607,91 @@ class MappingTests(unittest.TestCase):
         self.assertIn("multi_entry_bundle_suspected=49<=25+25", result.rationale)
         self.assertEqual({61338}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
 
+    def test_map_series_prefers_contiguous_followup_bundle_companion_over_skip_ahead_installment(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 58572,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su 2nd Season",
+                                "alternative_titles": {"en": "Shangri-La Frontier Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 25,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 70003,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su 4th Season",
+                                "alternative_titles": {"en": "Shangri-La Frontier Season 4", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "not_yet_aired",
+                                "num_episodes": 25,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 61338,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su 3rd Season",
+                                "alternative_titles": {"en": "Shangri-La Frontier Season 3", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "not_yet_aired",
+                                "num_episodes": 25,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 52347,
+                                "title": "Shangri-La Frontier: Kusoge Hunter, Kamige ni Idoman to su",
+                                "alternative_titles": {"en": "Shangri-La Frontier", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 25,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-shangri-contiguous-bundle",
+                        title="Shangri-La Frontier",
+                        season_title="Shangri-La Frontier Season 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=49,
+                        completed_episode_count=49,
+                    ),
+                )
+
+        self.assertEqual(result.status, "strong")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 58572)
+        self.assertIn("multi_entry_bundle_suspected=49<=25+25", result.rationale)
+        self.assertEqual({61338}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+
     def test_map_series_boosts_base_title_match_when_provider_title_only_adds_arc_subtitle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

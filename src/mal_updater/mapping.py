@@ -1247,6 +1247,52 @@ def _candidate_is_safe_exact_bundle_pair_member(top: MappingCandidate, companion
 
 
 
+def _candidate_installment_indexes(candidate: MappingCandidate) -> set[int]:
+    indexes: set[int] = set()
+    for hint in _candidate_title_hints(candidate.raw):
+        if not hint.startswith(("season:", "part:", "split:", "cour:", "roman:")):
+            continue
+        try:
+            value = int(hint.split(":", 1)[1])
+        except ValueError:
+            continue
+        if value >= 2:
+            indexes.add(value)
+    return indexes
+
+
+
+def _bundle_group_followup_rank(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    companions: tuple[MappingCandidate, ...],
+) -> tuple[int, int, int] | None:
+    provider_season_number, _ = _provider_season_number(series)
+    top_indexes = _candidate_installment_indexes(top)
+    if top_indexes:
+        base_index = min(top_indexes)
+    elif "exact_normalized_title" in top.match_reasons:
+        base_index = 1
+    elif provider_season_number is not None and provider_season_number >= 2:
+        base_index = provider_season_number
+    else:
+        return None
+
+    companion_indexes: list[int] = []
+    for companion in companions:
+        indexes = _candidate_installment_indexes(companion)
+        if not indexes:
+            return None
+        companion_indexes.append(min(indexes))
+
+    ordered_indexes = sorted(companion_indexes)
+    expected_indexes = list(range(base_index + 1, base_index + 1 + len(ordered_indexes)))
+    gap_penalty = sum(abs(actual - expected) for actual, expected in zip(ordered_indexes, expected_indexes))
+    skip_penalty = sum(max(0, actual - expected) for actual, expected in zip(ordered_indexes, expected_indexes))
+    return (gap_penalty, skip_penalty, ordered_indexes[0])
+
+
+
 def _suspect_multi_entry_bundle(
     series: SeriesMappingInput,
     top: MappingCandidate,
@@ -1294,15 +1340,25 @@ def _suspect_multi_entry_bundle(
 
     best_match: tuple[str, list[MappingCandidate]] | None = None
     best_total_episodes: int | None = None
+    best_followup_rank: tuple[int, int, int] | None = None
     for companion_count in (1, 2):
         for companion_group in combinations(plausible_companions, companion_count):
             total_episodes = top.num_episodes + sum(companion.num_episodes or 0 for companion in companion_group)
             if provider_episode_evidence > total_episodes:
                 continue
-            if best_total_episodes is not None and total_episodes >= best_total_episodes:
-                continue
+            followup_rank = _bundle_group_followup_rank(series, top, companion_group)
+            if best_total_episodes is not None:
+                if total_episodes > best_total_episodes:
+                    continue
+                if total_episodes == best_total_episodes:
+                    if best_followup_rank is not None and followup_rank is not None:
+                        if followup_rank >= best_followup_rank:
+                            continue
+                    elif best_followup_rank is not None and followup_rank is None:
+                        continue
             episode_parts = [str(top.num_episodes)] + [str(companion.num_episodes) for companion in companion_group if companion.num_episodes is not None]
             best_total_episodes = total_episodes
+            best_followup_rank = followup_rank
             best_match = (
                 "multi_entry_bundle_suspected="
                 f"{provider_episode_evidence}<={'+'.join(episode_parts)}",

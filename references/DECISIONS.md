@@ -260,6 +260,18 @@ Allow exact-title overflow handling to treat MAL **alternative-title family alig
 - surfacing the companion still reduces manual review detective work for bundled provider shells
 - keeping auto-resolution tied to the stricter primary-title-family check preserves the existing conservative write/approval boundary
 
+## 2026-04-13 - Contiguous numbered bundle-companion posture
+
+### Decision
+When exact-overflow bundle review finds multiple plausible numbered follow-up installments with the same episode-fit envelope, prefer the nearest contiguous follow-up sequence (for example season 2 -> season 3) over a skip-ahead later season.
+
+Fall back to the existing smallest-total-episodes heuristic when the candidates do not expose reliable explicit installment numbers.
+
+### Why
+- numbered franchise bundles are easier to review when the surfaced companion sequence matches the expected next installment instead of an arbitrary later season
+- preferring contiguous follow-ups reduces manual detective work without widening auto-approval scope
+- keeping the fallback for unnumbered/suffix-only bundles preserves the conservative same-title bundle behavior already shipped
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision
