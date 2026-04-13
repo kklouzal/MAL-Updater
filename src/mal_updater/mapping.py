@@ -150,6 +150,12 @@ _SUPPLEMENTAL_QUERY_ALIASES = {
     "the faraway paladin the lord of the rust mountains": ["The Faraway Paladin: The Lord of the Rust Mountains"],
 }
 
+_SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES = {
+    ("a certain scientific railgun", 2): ["A Certain Scientific Railgun S"],
+    ("a certain scientific railgun", 3): ["A Certain Scientific Railgun T"],
+    ("demon lord retry", 2): ["Demon Lord, Retry! R"],
+}
+
 _SUPPLEMENTAL_TITLE_CANDIDATE_IDS = {
     "the legendary hero is dead": [51706],
     "monster girl doctor": [40708],
@@ -385,6 +391,13 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
             aliases = []
         for alias in aliases:
             add_query(alias)
+
+    installment_aliases = _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES.get(
+        (normalize_title_strict(series.title), series.season_number or 0),
+        [],
+    )
+    for alias in installment_aliases:
+        add_query(alias)
 
     should_add_base_title = season_title_needs_base or not (
         series.season_title
@@ -654,6 +667,21 @@ def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
     return numbers
 
 
+def _query_matches_supplemental_installment_alias(
+    series: SeriesMappingInput,
+    query: str,
+    provider_season_number: int | None,
+) -> bool:
+    if provider_season_number is None or provider_season_number < 2:
+        return False
+    aliases = _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES.get(
+        (normalize_title_strict(series.title), provider_season_number),
+        [],
+    )
+    normalized_query = normalize_title_strict(query)
+    return any(normalize_title_strict(alias) == normalized_query for alias in aliases)
+
+
 def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str | None]:
     title_season_number = _extract_season_number(series.season_title)
     if title_season_number is None and series.season_title:
@@ -733,19 +761,29 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     if provider_season_conflict_reason:
         reasons.append(provider_season_conflict_reason)
     candidate_season_numbers = _candidate_season_numbers(node)
+
+    provider_hints = _provider_title_hints(series)
+    candidate_hints = _candidate_title_hints(node)
+    alias_installment_match = False
+    if _query_matches_supplemental_installment_alias(series, query, provider_season_number):
+        candidate_hints = set(candidate_hints)
+        candidate_hints.add(f"season:{provider_season_number}")
+        candidate_season_numbers = set(candidate_season_numbers)
+        candidate_season_numbers.add(provider_season_number)
+        alias_installment_match = True
+
     if provider_season_number is not None and candidate_season_numbers:
         if provider_season_number in candidate_season_numbers:
             score += 0.05
             reasons.append(f"season_number_match={provider_season_number}")
+            if alias_installment_match:
+                reasons.append(f"season_alias_query_match={provider_season_number}")
         else:
             score -= 0.08
             reasons.append(
                 "season_number_mismatch="
                 f"provider:{provider_season_number};candidate:{','.join(str(number) for number in sorted(candidate_season_numbers))}"
             )
-
-    provider_hints = _provider_title_hints(series)
-    candidate_hints = _candidate_title_hints(node)
     shared_hints = sorted(provider_hints & candidate_hints)
     conflicting_hints: list[str] = []
 

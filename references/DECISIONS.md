@@ -284,6 +284,18 @@ Prefix those standalone labels with the base series title during MAL search gene
 - dropping the base title in those cases leaves later-season lookup and disambiguation weaker than the repo's existing conservative installment posture warrants
 - prefixing only installment-only labels keeps the behavior explainable and bounded instead of inventing broader alias expansion
 
+## 2026-04-13 - Franchise-specific sequel-alias query posture
+
+### Decision
+Allow explicit later-season search generation to try a **small explicit franchise-specific sequel-alias table** when MAL files the sequel under a non-generic follow-up label instead of `Season N` / roman / part wording.
+
+When one of those alias queries lands an exact title hit for the same provider season context, treat that exact alias hit as explainable season evidence (`season_alias_query_match`) rather than penalizing it like a base-title candidate missing installment metadata.
+
+### Why
+- some MAL franchises expose later TV installments through suffix labels like `Railgun S` rather than generic season numbering, so ordinary conservative season-query expansion can miss them even when the provider season context is explicit
+- keeping the behavior table-driven and season-scoped is narrower and more explainable than teaching the scorer a broad new class of speculative suffix heuristics
+- promoting only exact alias hits preserves the conservative mapping boundary while reducing manual review for a real class of franchise-specific sequel-label residue
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision
