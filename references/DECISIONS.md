@@ -272,6 +272,18 @@ Fall back to the existing smallest-total-episodes heuristic when the candidates 
 - preferring contiguous follow-ups reduces manual detective work without widening auto-approval scope
 - keeping the fallback for unnumbered/suffix-only bundles preserves the conservative same-title bundle behavior already shipped
 
+## 2026-04-13 - Standalone installment-only provider season-label posture
+
+### Decision
+Treat standalone installment-only provider season labels (for example bare `III` or `2`) as real season cues when they appear in the provider `season_title` without a separate reliable `season_number` field.
+
+Prefix those standalone labels with the base series title during MAL search generation, and let the resulting inferred installment number participate in season-match scoring / conservative exact later-installment auto-approval the same way an explicit `Season N` cue already does.
+
+### Why
+- some provider catalogs expose a later season as only a bare installment token instead of a full `Title Season N` string or trustworthy numeric metadata
+- dropping the base title in those cases leaves later-season lookup and disambiguation weaker than the repo's existing conservative installment posture warrants
+- prefixing only installment-only labels keeps the behavior explainable and bounded instead of inventing broader alias expansion
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision

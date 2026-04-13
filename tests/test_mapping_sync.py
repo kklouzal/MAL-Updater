@@ -1238,6 +1238,150 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 51180)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_prefixes_standalone_roman_season_title_without_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            seen_queries: list[str] = []
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                seen_queries.append(query)
+                if query == "Classroom of the Elite III":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 51180,
+                                    "title": "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e 3rd Season",
+                                    "alternative_titles": {"en": "Classroom of the Elite III"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 51096,
+                                    "title": "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e 2nd Season",
+                                    "alternative_titles": {"en": "Classroom of the Elite II"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            },
+                        ]
+                    }
+                if query == "III":
+                    return {"data": []}
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-roman-standalone",
+                        title="Classroom of the Elite",
+                        season_title="III",
+                        max_episode_number=13,
+                        completed_episode_count=13,
+                    ),
+                )
+
+        self.assertIn("Classroom of the Elite III", seen_queries)
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 51180)
+        self.assertIn("season_number_match=3", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_prefixes_standalone_numeric_season_title_without_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            seen_queries: list[str] = []
+
+            def fake_search(query: str, limit: int = 5) -> dict:
+                seen_queries.append(query)
+                if query == "Restaurant to Another World 2":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 48804,
+                                    "title": "Isekai Shokudou 2",
+                                    "alternative_titles": {"en": "Restaurant to Another World 2"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 34012,
+                                    "title": "Isekai Shokudou",
+                                    "alternative_titles": {"en": "Restaurant to Another World"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            },
+                        ]
+                    }
+                if query == "2":
+                    return {"data": []}
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-numeric-standalone",
+                        title="Restaurant to Another World",
+                        season_title="2",
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertIn("Restaurant to Another World 2", seen_queries)
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 48804)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
     def test_map_series_expands_related_anime_to_recover_hidden_tv_sequel(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

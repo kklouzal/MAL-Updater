@@ -74,6 +74,9 @@ _STANDALONE_COUR_RE = re.compile(
     re.IGNORECASE,
 )
 _STANDALONE_FINAL_SEASON_RE = re.compile(r"^final\s+season(?:\s+part\s+\d+)?$", re.IGNORECASE)
+_STANDALONE_ROMAN_INSTALLMENT_RE = re.compile(r"^[ivx]+$", re.IGNORECASE)
+_STANDALONE_NUMERIC_INSTALLMENT_RE = re.compile(r"^\d+$")
+_STANDALONE_ORDINAL_INSTALLMENT_RE = re.compile(r"^(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))$", re.IGNORECASE)
 _INSTALLMENT_ONLY_EXTENSION_RE = re.compile(
     r"^(?:"
     r"season\s*\d+|"
@@ -83,7 +86,9 @@ _INSTALLMENT_ONLY_EXTENSION_RE = re.compile(
     r"cour\s*\d+|"
     r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour|"
     r"final\s+season(?:\s+part\s+\d+)?|"
-    r"[ivx]+"
+    r"[ivx]+|"
+    r"\d+|"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))"
     r")(?:\s+(?:season\s*\d+|part\s*\d+|cour\s*\d+|[ivx]+))*$",
     re.IGNORECASE,
 )
@@ -236,6 +241,29 @@ def _search_query_cleanup(value: str) -> str:
     return " ".join(cleaned.split()).strip()
 
 
+def _extract_standalone_installment_number(value: str | None) -> int | None:
+    if not value:
+        return None
+    cleaned = _search_query_cleanup(value)
+    if not cleaned:
+        return None
+    season_number = _extract_season_number(cleaned) or _extract_ordinal_season_number(cleaned)
+    if season_number is not None and season_number >= 2:
+        return season_number
+    roman_number = _extract_roman_installment_number(cleaned)
+    if roman_number is not None and _STANDALONE_ROMAN_INSTALLMENT_RE.fullmatch(cleaned):
+        return roman_number
+    if _STANDALONE_NUMERIC_INSTALLMENT_RE.fullmatch(cleaned):
+        numeric_value = int(cleaned)
+        if numeric_value >= 2:
+            return numeric_value
+    if _STANDALONE_ORDINAL_INSTALLMENT_RE.fullmatch(cleaned):
+        ordinal_value = _parse_ordinal_token(cleaned)
+        if ordinal_value is not None and ordinal_value >= 2:
+            return ordinal_value
+    return None
+
+
 def _season_title_needs_base_title(title: str, season_title: str) -> bool:
     title_norm = normalize_title(title)
     season_norm = _search_query_cleanup(season_title).lower()
@@ -248,6 +276,7 @@ def _season_title_needs_base_title(title: str, season_title: str) -> bool:
         or _STANDALONE_PART_RE.fullmatch(season_norm)
         or _STANDALONE_COUR_RE.fullmatch(season_norm)
         or _STANDALONE_FINAL_SEASON_RE.fullmatch(season_norm)
+        or _extract_standalone_installment_number(season_norm) is not None
     )
 
 
@@ -466,6 +495,9 @@ def _extract_title_hints(value: str | None) -> set[str]:
     ordinal_season = _extract_ordinal_season_number(cleaned)
     if ordinal_season is not None:
         hints.add(f"season:{ordinal_season}")
+    standalone_installment = _extract_standalone_installment_number(cleaned)
+    if standalone_installment is not None:
+        hints.add(f"season:{standalone_installment}")
     part_number = _extract_part_number(cleaned)
     if part_number is not None:
         hints.add(f"part:{part_number}")
@@ -624,6 +656,15 @@ def _candidate_season_numbers(node: dict[str, Any]) -> set[int]:
 
 def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str | None]:
     title_season_number = _extract_season_number(series.season_title)
+    if title_season_number is None and series.season_title:
+        if _season_title_is_installment_only_extension(series.title, series.season_title) or _season_title_needs_base_title(series.title, series.season_title):
+            title_season_number = _extract_ordinal_season_number(series.season_title)
+            if title_season_number is None:
+                title_season_number = _extract_standalone_installment_number(series.season_title)
+            if title_season_number is None:
+                title_season_number = _extract_terminal_installment_number(series.season_title)
+            if title_season_number is None:
+                title_season_number = _extract_roman_installment_number(series.season_title)
     metadata_season_number = series.season_number
     if title_season_number is not None and metadata_season_number is not None and title_season_number != metadata_season_number:
         return (
