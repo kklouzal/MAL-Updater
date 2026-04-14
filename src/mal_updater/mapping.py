@@ -1658,6 +1658,11 @@ def _should_expand_related_candidates(series: SeriesMappingInput, top: MappingCa
         return True
     if top_has_episode_overflow:
         return True
+    if (
+        "candidate_missing_installment_hint" in top.match_reasons
+        and "base_installment_penalty_for_explicit_later_season" in top.match_reasons
+    ):
+        return True
     return False
 
 

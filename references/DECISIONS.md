@@ -296,6 +296,18 @@ When one of those alias queries lands an exact title hit for the same provider s
 - keeping the behavior table-driven and season-scoped is narrower and more explainable than teaching the scorer a broad new class of speculative suffix heuristics
 - promoting only exact alias hits preserves the conservative mapping boundary while reducing manual review for a real class of franchise-specific sequel-label residue
 
+## 2026-04-14 - Explicit later-season relation-recovery posture
+
+### Decision
+When the provider clearly targets a later installment, allow related-anime expansion to run even if the current top MAL hit still looks like a **base-series false positive**, so long as that top hit carries the conservative signs already exposed by scoring (`candidate_missing_installment_hint` plus `base_installment_penalty_for_explicit_later_season`).
+
+If relation expansion then finds a sequel node whose alternative titles or other installment evidence cleanly match the provider's later-season context, let that related candidate compete normally and auto-approve only under the existing exact later-installment safeguards.
+
+### Why
+- some MAL sequels are not discoverable from ordinary season queries or the explicit alias table, but are easy to reach once the mapper lands on the base franchise entry and follows MAL relations
+- the previous relation-expansion trigger could stay too quiet when the misleading base-series hit looked strong on title similarity alone despite obvious later-season context
+- keeping the trigger tied to both explicit later-season context and the existing missing-installment/base-penalty reasons preserves conservative scope instead of turning every exact base-title hit into broad relation crawling
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision
