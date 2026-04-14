@@ -1034,6 +1034,22 @@ class MappingTests(unittest.TestCase):
         self.assertLess(queries.index("A Certain Scientific Railgun Season 2"), queries.index("A Certain Scientific Railgun S"))
         self.assertLess(queries.index("A Certain Scientific Railgun S"), queries.index("A Certain Scientific Railgun"))
 
+    def test_build_search_queries_infers_sequel_alias_from_season_title_when_metadata_season_missing(self) -> None:
+        queries = build_search_queries(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-railgun-s-no-metadata",
+                title="A Certain Scientific Railgun",
+                season_title="A Certain Scientific Railgun Season 2 (English Dub)",
+                season_number=None,
+            )
+        )
+
+        self.assertIn("A Certain Scientific Railgun Season 2", queries)
+        self.assertIn("A Certain Scientific Railgun 2nd Season", queries)
+        self.assertIn("A Certain Scientific Railgun S", queries)
+        self.assertLess(queries.index("A Certain Scientific Railgun Season 2"), queries.index("A Certain Scientific Railgun S"))
+
     def test_build_search_queries_strips_broadcast_and_uncensored_suffix_noise(self) -> None:
         queries = build_search_queries(
             SeriesMappingInput(
@@ -2754,6 +2770,64 @@ class MappingTests(unittest.TestCase):
         self.assertIn("A Certain Scientific Railgun S", attempted_queries)
         self.assertEqual(result.status, "exact")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 16049)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_uses_franchise_specific_sequel_alias_query_when_season_metadata_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict[str, object]:
+                if query == "A Certain Scientific Railgun S":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 16049,
+                                    "title": "Toaru Kagaku no Railgun S",
+                                    "alternative_titles": {"en": "A Certain Scientific Railgun S"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 24,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search) as search_mock:
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-railgun-s-no-metadata",
+                        title="A Certain Scientific Railgun",
+                        season_title="A Certain Scientific Railgun Season 2 (English Dub)",
+                        season_number=None,
+                        max_episode_number=24,
+                        completed_episode_count=24,
+                    ),
+                )
+
+        attempted_queries = [call.args[0] for call in search_mock.call_args_list]
+        self.assertIn("A Certain Scientific Railgun S", attempted_queries)
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 16049)
+        self.assertIn("season_alias_query_match=2", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
     def test_map_series_expands_relations_for_explicit_later_season_base_title_false_positive(self) -> None:

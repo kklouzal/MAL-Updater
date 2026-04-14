@@ -308,6 +308,20 @@ If relation expansion then finds a sequel node whose alternative titles or other
 - the previous relation-expansion trigger could stay too quiet when the misleading base-series hit looked strong on title similarity alone despite obvious later-season context
 - keeping the trigger tied to both explicit later-season context and the existing missing-installment/base-penalty reasons preserves conservative scope instead of turning every exact base-title hit into broad relation crawling
 
+## 2026-04-14 - Inferred provider-season query generation posture
+
+### Decision
+When search-query generation needs an explicit later-season number, reuse the **effective provider season number** inferred from provider season-title text instead of relying only on raw `season_number` metadata.
+
+This applies to both:
+- generic later-season query variants (`Title Season N`, ordinal, roman, numeric), and
+- the small franchise-specific sequel-alias table used for suffix-labeled MAL sequels such as `Railgun S`.
+
+### Why
+- the mapper already learned how to infer later-season intent from provider season titles even when sparse provider metadata omits `season_number`
+- leaving query generation and sequel-alias lookup on the raw metadata field created an inconsistent gap where scoring could understand the later-season context but search generation could still miss the best sequel lookup path
+- reusing the inferred provider season number keeps the behavior conservative and explainable while reducing later-season false negatives caused only by missing provider metadata
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision

@@ -366,6 +366,8 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
         if cleaned and cleaned not in queries:
             queries.append(cleaned)
 
+    effective_provider_season_number, _ = _provider_season_number(series)
+
     add_query(series.season_title)
     season_title_needs_base = bool(series.season_title and _season_title_needs_base_title(series.title, series.season_title))
     season_title_is_installment_only = _season_title_is_installment_only_extension(series.title, series.season_title)
@@ -378,7 +380,7 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
         or normalize_title_strict(series.season_title) == normalize_title_strict(series.title)
     )
     if should_add_generic_season_variants:
-        for variant in _season_number_query_variants(series.title, series.season_number):
+        for variant in _season_number_query_variants(series.title, effective_provider_season_number):
             add_query(variant)
 
     alias_keys = {
@@ -387,13 +389,13 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
     }
     for key in alias_keys:
         aliases = list(_SUPPLEMENTAL_QUERY_ALIASES.get(key, []))
-        if key == "million arthur" and (series.season_number or 0) >= 2:
+        if key == "million arthur" and (effective_provider_season_number or 0) >= 2:
             aliases = []
         for alias in aliases:
             add_query(alias)
 
     installment_aliases = _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES.get(
-        (normalize_title_strict(series.title), series.season_number or 0),
+        (normalize_title_strict(series.title), effective_provider_season_number or 0),
         [],
     )
     for alias in installment_aliases:
@@ -401,7 +403,7 @@ def build_search_queries(series: SeriesMappingInput) -> list[str]:
 
     should_add_base_title = season_title_needs_base or not (
         series.season_title
-        and (series.season_number or 0) >= 2
+        and (effective_provider_season_number or 0) >= 2
         and not season_title_is_installment_only
         and normalize_title_strict(series.season_title) != normalize_title_strict(series.title)
     )
