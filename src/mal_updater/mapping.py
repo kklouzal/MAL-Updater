@@ -1481,7 +1481,8 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
     top_query_norm = normalize_title_strict(top.matched_query)
     base_query_norm = normalize_title_strict(series.title)
     second_query_norm = normalize_title_strict(second.matched_query)
-    has_specific_installment_context = (series.season_number or 0) >= 2 and top_query_norm != base_query_norm
+    provider_season_number, _ = _provider_season_number(series)
+    has_specific_installment_context = (provider_season_number or 0) >= 2 and top_query_norm != base_query_norm
 
     if "season_to_split_match=" in " ".join(top.match_reasons):
         if top.score >= 0.95 and _candidate_is_explainably_weaker(series, second):

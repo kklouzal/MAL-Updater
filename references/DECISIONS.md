@@ -322,6 +322,18 @@ This applies to both:
 - leaving query generation and sequel-alias lookup on the raw metadata field created an inconsistent gap where scoring could understand the later-season context but search generation could still miss the best sequel lookup path
 - reusing the inferred provider season number keeps the behavior conservative and explainable while reducing later-season false negatives caused only by missing provider metadata
 
+## 2026-04-14 - Inferred provider-season exact-classification posture
+
+### Decision
+When deciding whether an exact mapping is specific enough to classify as a clean later-season resolution, use the same **effective provider season number** inferred from provider season-title text instead of looking only at raw `season_number` metadata.
+
+This keeps exact later-season classification aligned with the mapper's existing inferred-season query generation and scoring posture.
+
+### Why
+- sparse provider metadata can omit `season_number` even when the human-readable provider season title clearly says `Season 2`, `III`, or a similar later-installment cue
+- leaving exact classification on raw metadata alone created an inconsistent gap where the mapper could find and score the right sequel but still hesitate at the final classification step
+- reusing the same inferred provider season number preserves conservative behavior while avoiding review-only residue that existed only because one classification path lagged behind the rest of the later-season logic
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision
