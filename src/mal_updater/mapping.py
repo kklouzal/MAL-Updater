@@ -697,6 +697,13 @@ def _query_matches_supplemental_installment_alias(
     return any(normalize_title_strict(alias) == normalized_query for alias in aliases)
 
 
+def _candidate_exactly_matches_query_alias(node: dict[str, Any], query: str) -> bool:
+    normalized_query = normalize_title_strict(query)
+    if not normalized_query:
+        return False
+    return any(normalize_title_strict(title) == normalized_query for title in _extract_titles_from_node(node))
+
+
 def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str | None]:
     title_season_number = _extract_season_number(series.season_title)
     if title_season_number is None and series.season_title:
@@ -784,7 +791,7 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     provider_hints = _provider_title_hints(series)
     candidate_hints = _candidate_title_hints(node)
     alias_installment_match = False
-    if _query_matches_supplemental_installment_alias(series, query, provider_season_number):
+    if _query_matches_supplemental_installment_alias(series, query, provider_season_number) and _candidate_exactly_matches_query_alias(node, query):
         candidate_hints = set(candidate_hints)
         candidate_hints.add(f"season:{provider_season_number}")
         candidate_season_numbers = set(candidate_season_numbers)

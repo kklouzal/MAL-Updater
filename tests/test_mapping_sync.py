@@ -3005,6 +3005,105 @@ class MappingTests(unittest.TestCase):
         self.assertIn("exact_later_installment_alignment", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_requires_candidate_alias_match_before_alias_query_adds_later_season_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict[str, object]:
+                if query in {
+                    "Demon Lord, Retry! R",
+                    "Demon Lord, Retry! Season 2",
+                    "Demon Lord, Retry! 2nd Season",
+                    "Demon Lord, Retry! 2",
+                    "Demon Lord, Retry! II",
+                    "Demon Lord, Retry!",
+                }:
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 38297,
+                                    "title": "Maou-sama, Retry!",
+                                    "alternative_titles": {"en": "Demon Lord, Retry!"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            def fake_details(anime_id: int, *, fields: str = "") -> dict[str, object]:
+                if anime_id == 38297:
+                    return {
+                        "id": 38297,
+                        "title": "Maou-sama, Retry!",
+                        "alternative_titles": {"en": "Demon Lord, Retry!"},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [
+                            {
+                                "node": {"id": 53009, "title": "Maou-sama, Retry! R"},
+                                "relation_type": "sequel",
+                                "relation_type_formatted": "Sequel",
+                            }
+                        ],
+                    }
+                if anime_id == 53009:
+                    return {
+                        "id": 53009,
+                        "title": "Maou-sama, Retry! R",
+                        "alternative_titles": {"en": "Demon Lord, Retry! R"},
+                        "media_type": "tv",
+                        "status": "currently_airing",
+                        "num_episodes": 12,
+                        "related_anime": [],
+                    }
+                raise AssertionError(f"unexpected anime details lookup: {anime_id}")
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_details,
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-demon-lord-retry-related-sequel",
+                        title="Demon Lord, Retry!",
+                        season_title="Demon Lord, Retry! R (English Dub)",
+                        season_number=None,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 53009)
+        self.assertIn("related_anime_expansion", result.chosen_candidate.match_reasons)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
     def test_map_series_treats_inferred_later_season_context_as_specific_during_exact_classification(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
