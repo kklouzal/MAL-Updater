@@ -20,5 +20,6 @@ state/
 secrets/
 node_modules/
 target/
+*.egg-info/
 1/
 .DS_Store

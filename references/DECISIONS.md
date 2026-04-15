@@ -334,6 +334,18 @@ This keeps exact later-season classification aligned with the mapper's existing 
 - leaving exact classification on raw metadata alone created an inconsistent gap where the mapper could find and score the right sequel but still hesitate at the final classification step
 - reusing the same inferred provider season number preserves conservative behavior while avoiding review-only residue that existed only because one classification path lagged behind the rest of the later-season logic
 
+## 2026-04-15 - Alias-labeled provider-season inference posture
+
+### Decision
+Let the small franchise-specific sequel-alias table contribute **season-number inference and installment hints** even when the provider season title itself is already the alias label (for example `Demon Lord, Retry! R`) rather than a generic `Season N` string.
+
+Use that same alias-derived season context when scoring candidate season matches and exact later-installment classification, not only when generating explicit alias search queries from a numeric provider season.
+
+### Why
+- some providers expose a later season directly through the franchise-specific sequel label instead of a numeric season title, while also omitting reliable `season_number` metadata
+- query-time alias expansion alone left an inconsistency where the mapper could find an exact alias-title hit but still lack the explicit later-season context needed to separate it cleanly from an exact base-series rival
+- reusing the same conservative alias table for provider/candidate season hints keeps the behavior explainable and bounded instead of inventing broader speculative suffix heuristics
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision

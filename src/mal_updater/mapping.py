@@ -5,6 +5,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from itertools import combinations
 from typing import Any
 
@@ -234,6 +235,15 @@ def normalize_title(value: str | None) -> str:
 
 def normalize_title_strict(value: str | None) -> str:
     return _normalize_with_cleanup_patterns(value, _QUERY_CLEANUPS)
+
+
+@lru_cache(maxsize=1)
+def _supplemental_installment_alias_season_hints() -> dict[str, int]:
+    return {
+        normalize_title_strict(alias): season_number
+        for (_, season_number), aliases in _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES.items()
+        for alias in aliases
+    }
 
 
 def _search_query_cleanup(value: str) -> str:
@@ -504,6 +514,9 @@ def _extract_title_hints(value: str | None) -> set[str]:
     if not value:
         return hints
     cleaned = _search_query_cleanup(value)
+    alias_season_number = _supplemental_installment_alias_season_hints().get(normalize_title_strict(cleaned))
+    if alias_season_number is not None and alias_season_number >= 2:
+        hints.add(f"season:{alias_season_number}")
     season_number = _extract_season_number(cleaned)
     if season_number is not None:
         hints.add(f"season:{season_number}")
@@ -695,6 +708,10 @@ def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str
                 title_season_number = _extract_terminal_installment_number(series.season_title)
             if title_season_number is None:
                 title_season_number = _extract_roman_installment_number(series.season_title)
+        if title_season_number is None:
+            title_season_number = _supplemental_installment_alias_season_hints().get(
+                normalize_title_strict(_search_query_cleanup(series.season_title))
+            )
     metadata_season_number = series.season_number
     if title_season_number is not None and metadata_season_number is not None and title_season_number != metadata_season_number:
         return (
