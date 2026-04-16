@@ -510,22 +510,26 @@ def _format_start_season(start_season: dict[str, Any] | None) -> str | None:
     return f"{str(start_season['season']).strip().title()} {start_season['year']}"
 
 
-def _discovery_candidate_freshness_bonus(start_season: dict[str, Any] | None) -> tuple[int, str | None]:
+def _discovery_candidate_freshness_profile(start_season: dict[str, Any] | None) -> tuple[int, str | None, int | None, int]:
     sort_key = _start_season_sort_key(start_season)
     if sort_key is None:
-        return 0, None
+        return 0, None, None, 0
     current = datetime.now(timezone.utc)
     current_key = (current.year, (current.month - 1) // 3)
     age_in_seasons = (current_key[0] - sort_key[0]) * 4 + (current_key[1] - sort_key[1])
     if age_in_seasons <= 0:
-        return 6, "current_or_upcoming"
+        return 6, "current_or_upcoming", age_in_seasons, 0
     if age_in_seasons <= 8:
-        return 5, "recent_two_years"
+        return 5, "recent_two_years", age_in_seasons, 0
     if age_in_seasons <= 16:
-        return 3, "recent_four_years"
+        return 3, "recent_four_years", age_in_seasons, 0
     if age_in_seasons <= 28:
-        return 1, "modern_catalog"
-    return 0, "older_catalog"
+        return 1, "modern_catalog", age_in_seasons, 0
+    if age_in_seasons <= 48:
+        return 0, "aging_catalog", age_in_seasons, 2
+    if age_in_seasons <= 80:
+        return 0, "older_catalog", age_in_seasons, 4
+    return 0, "legacy_catalog", age_in_seasons, 6
 
 
 def _discovery_seed_recency_bonus(days_since_watch: int | None) -> int:
@@ -863,7 +867,7 @@ def _build_discovery_recommendations(
         source_bonus = min(source_overlap_score * 2, 6)
         start_season = _metadata_start_season(meta)
         start_season_label = _format_start_season(start_season)
-        freshness_bonus, freshness_bucket = _discovery_candidate_freshness_bonus(start_season)
+        freshness_bonus, freshness_bucket, catalog_age_in_seasons, freshness_penalty = _discovery_candidate_freshness_profile(start_season)
         recent_seed_activity_bonus = min(int(bucket.get("seed_recent_activity_bonus", 0)), 6)
         seed_quality_bonus = min(int(bucket.get("seed_quality_bonus", 0)), 6)
         seed_quality_penalty = min(int(bucket.get("seed_quality_penalty", 0)), 6)
@@ -945,6 +949,7 @@ def _build_discovery_recommendations(
         )
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
+        priority -= freshness_penalty
         priority -= seed_quality_penalty
         priority -= mixed_signal_penalty
         priority -= neutral_support_penalty
@@ -965,6 +970,8 @@ def _build_discovery_recommendations(
             reasons.append(f"recent MAL start season: {start_season_label}")
         if recent_seed_activity_bonus > 0 and freshest_supporting_seed_days is not None:
             reasons.append(f"supported by recently active seed watch history ({freshest_supporting_seed_days} day(s) since last watch)")
+        if freshness_penalty > 0 and start_season_label is not None:
+            reasons.append(f"older MAL catalog title received modest age decay ({start_season_label})")
         if seed_quality_bonus > 0:
             if best_supporting_seed_score is not None:
                 reasons.append(f"backed by higher-confidence seed taste signals (best supporting seed MAL score: {best_supporting_seed_score})")
@@ -1015,6 +1022,8 @@ def _build_discovery_recommendations(
                     "start_season_label": start_season_label,
                     "freshness_bucket": freshness_bucket,
                     "freshness_bonus": freshness_bonus,
+                    "freshness_penalty": freshness_penalty,
+                    "catalog_age_in_seasons": catalog_age_in_seasons,
                     "recent_seed_activity_bonus": recent_seed_activity_bonus,
                     "seed_quality_bonus": seed_quality_bonus,
                     "seed_quality_penalty": seed_quality_penalty,

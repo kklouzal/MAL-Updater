@@ -550,6 +550,21 @@ Specifically:
 - treating neutral seeds like full positive consensus overstates confidence for otherwise tied discovery candidates
 - surfacing the neutral-support metadata keeps the ranking auditable instead of hiding the decay inside opaque scoring math
 
+## 2026-04-16 - Discovery catalog-age decay posture
+
+### Decision
+Keep discovery ranking mildly freshness-aware in both directions: newer MAL catalog entries may still receive a small freshness bonus, but sufficiently old catalog entries should also take a **modest explainable age decay** instead of merely losing the bonus race.
+
+Specifically:
+- preserve the existing freshness buckets/bonuses for current and still-modern catalog entries
+- add `freshness_penalty` plus `catalog_age_in_seasons` metadata for aging/older/legacy catalog buckets
+- keep the decay small enough to act as a tie-break / near-tie tempering signal rather than a hard filter against older titles
+
+### Why
+- a one-way freshness bonus still let very old catalog entries look stronger than intended whenever votes and metadata otherwise tied
+- recommendation ranking should be able to say *why* an older title lost ground instead of hiding that under raw priority totals
+- exposing both the bucket and the age/penalty keeps discovery ordering inspectable while preserving the conservative, non-aggressive recommendation posture
+
 ## 2026-04-08 - Discovery seed-quality posture
 
 ### Decision

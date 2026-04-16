@@ -607,6 +607,38 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("recent MAL start season", " ".join(results[0].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_applies_modest_age_decay_to_legacy_catalog_titles(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        now = datetime.now(timezone.utc)
+        current_season = ("winter", "spring", "summer", "fall")[(now.month - 1) // 3]
+        aging_season = {"year": max(now.year - 10, 2000), "season": current_season}
+        legacy_season = {"year": max(now.year - 24, 1985), "season": current_season}
+        self._cache_metadata(300, title="Aging Pick", mean=8.0, popularity=500, start_season=aging_season)
+        self._cache_metadata(400, title="Legacy Pick", mean=8.0, popularity=500, start_season=legacy_season)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Aging Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Legacy Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual("aging_catalog", results[0].context["freshness_bucket"])
+        self.assertEqual(2, results[0].context["freshness_penalty"])
+        self.assertEqual("legacy_catalog", results[1].context["freshness_bucket"])
+        self.assertEqual(6, results[1].context["freshness_penalty"])
+        self.assertGreater(results[1].context["catalog_age_in_seasons"], results[0].context["catalog_age_in_seasons"])
+        self.assertIn("older MAL catalog title received modest age decay", " ".join(results[1].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
     def test_discovery_candidate_prefers_recently_active_seed_support_when_votes_tie(self) -> None:
         recent = (datetime.now(timezone.utc) - timedelta(days=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         stale = (datetime.now(timezone.utc) - timedelta(days=220)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
