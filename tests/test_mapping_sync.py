@@ -3185,6 +3185,98 @@ class MappingTests(unittest.TestCase):
         self.assertIn("exact_later_installment_alignment", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_prefers_whole_season_over_split_part_when_provider_only_signals_season(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict[str, object]:
+                if query in {
+                    "Example Show II",
+                    "Example Show Season 2",
+                    "Example Show 2nd Season",
+                    "Example Show 2",
+                }:
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 200,
+                                    "title": "Example Show II",
+                                    "alternative_titles": {"en": "Example Show II"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": 201,
+                                    "title": "Example Show II Part 2",
+                                    "alternative_titles": {"en": "Example Show II Part 2"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            },
+                        ]
+                    }
+                if query == "Example Show":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 100,
+                                    "title": "Example Show",
+                                    "alternative_titles": {"en": "Example Show"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-example-show-ii-whole-season",
+                        title="Example Show",
+                        season_title="Example Show II",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 200)
+        self.assertEqual(result.candidates[0].mal_anime_id, 200)
+        self.assertEqual(result.candidates[1].mal_anime_id, 201)
+        self.assertGreater(result.candidates[0].score, result.candidates[1].score)
+        self.assertIn("candidate_extra_part_hint=part:2", result.candidates[1].match_reasons)
+        self.assertIn("candidate_extra_split_hint=split:2", result.candidates[1].match_reasons)
+        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
     def test_map_series_uses_roman_installment_hint_to_break_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -346,6 +346,18 @@ Use that same alias-derived season context when scoring candidate season matches
 - query-time alias expansion alone left an inconsistency where the mapper could find an exact alias-title hit but still lack the explicit later-season context needed to separate it cleanly from an exact base-series rival
 - reusing the same conservative alias table for provider/candidate season hints keeps the behavior explainable and bounded instead of inventing broader speculative suffix heuristics
 
+## 2026-04-16 - Whole-season vs split-part tie-break posture
+
+### Decision
+When a provider title clearly signals a **whole later season** (`Season 2`, `II`, etc.) but does **not** itself mention `Part`, `Cour`, or another segmented split label, treat MAL split-part/cour candidates for that same season as slightly weaker **when the provider's observed episode evidence already fits an unsegmented season entry**.
+
+Keep split-part/cour candidates viable when the provider episode numbering still looks aggregated for a half-season shell; in that case the existing season-to-split alignment and aggregated-episode evidence should continue to win.
+
+### Why
+- some MAL franchises publish a later season both as a whole-season entry and as a narrower part/cour continuation, and season-number alignment alone can otherwise let the segmented entry tie with the broader season
+- real provider titles like plain `Season 2` / `II` should not auto-resolve onto `Part 2` unless the provider data itself actually looks like a segmented/aggregated shell
+- tying the penalty to episode-fit evidence preserves the earlier conservative split-cour recovery work for genuine aggregated provider shells while reducing false ties on ordinary later-season labels
+
 ## 2026-03-20 / 2026-04-12 - Supplemental mapping candidate posture
 
 ### Decision

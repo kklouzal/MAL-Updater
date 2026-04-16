@@ -840,6 +840,9 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             score += 0.04
         else:
             conflicting_hints.extend(sorted(provider_parts | candidate_parts))
+    elif not provider_parts and candidate_parts and provider_season_number is not None and provider_season_number >= 2:
+        score -= 0.05
+        reasons.append(f"candidate_extra_part_hint={','.join(sorted(candidate_parts))}")
 
     provider_splits = {hint for hint in provider_hints if hint.startswith("split:")}
     candidate_splits = {hint for hint in candidate_hints if hint.startswith("split:")}
@@ -849,6 +852,9 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             score += 0.12
         else:
             conflicting_hints.extend(sorted(provider_splits | candidate_splits))
+    elif not provider_splits and candidate_splits and provider_season_number is not None and provider_season_number >= 2:
+        score -= 0.05
+        reasons.append(f"candidate_extra_split_hint={','.join(sorted(candidate_splits))}")
 
     provider_seasons = {hint for hint in provider_hints if hint.startswith("season:")}
     if provider_seasons:
@@ -948,6 +954,30 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
                 reasons.append(
                     f"completed_evidence_exceeds_candidate_count={series.completed_episode_count}>{candidate_num_episodes}"
                 )
+
+        provider_segment_hints = {hint for hint in provider_hints if hint.startswith(("part:", "split:", "cour:"))}
+        candidate_segment_hints = {hint for hint in candidate_hints if hint.startswith(("part:", "split:", "cour:"))}
+        provider_completed_evidence = series.completed_episode_count
+        provider_episode_fits_candidate = (
+            provider_episode_evidence is not None and provider_episode_evidence <= candidate_num_episodes
+        ) or (
+            provider_episode_evidence is None and provider_completed_evidence is not None and provider_completed_evidence <= candidate_num_episodes
+        )
+        provider_completion_fits_candidate = (
+            provider_completed_evidence is None or provider_completed_evidence <= candidate_num_episodes
+        )
+        if (
+            provider_season_number is not None
+            and provider_season_number >= 2
+            and not provider_segment_hints
+            and candidate_segment_hints
+            and provider_episode_fits_candidate
+            and provider_completion_fits_candidate
+        ):
+            score -= 0.08
+            reasons.append(
+                f"candidate_extra_segment_detail_without_aggregated_episode_evidence={','.join(sorted(candidate_segment_hints))}"
+            )
 
     media_type = node.get("media_type")
     provider_has_explicit_season_context = any(hint.startswith("season:") for hint in provider_hints)
