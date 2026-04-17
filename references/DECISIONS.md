@@ -565,6 +565,21 @@ Specifically:
 - recommendation ranking should be able to say *why* an older title lost ground instead of hiding that under raw priority totals
 - exposing both the bucket and the age/penalty keeps discovery ordering inspectable while preserving the conservative, non-aggressive recommendation posture
 
+## 2026-04-17 - Discovery stale-support decay posture
+
+### Decision
+When discovery candidates are supported mainly by materially old seed-watch activity, count that support a bit more conservatively instead of only withholding the existing recent-activity bonus.
+
+Specifically:
+- add `stale_supporting_seed_ids`, `stale_support_ratio`, and `stale_support_penalty` metadata for discovery candidates whose supporting seeds are older than the recent-activity window
+- modestly downweight stale seeds in the underlying recommendation-vote contribution before final ranking
+- keep the stale-support penalty small and capped so it behaves as explainable near-tie / consensus tempering rather than a hard suppression rule
+
+### Why
+- a previously loved seed title can still matter, but very old watch activity should not look as current as fresh taste evidence when everything else ties
+- the earlier `recent_seed_activity_bonus` only rewarded freshness; it did not actually temper stale support enough when older seeds still had strong votes or scores
+- exposing the stale-support metadata keeps recommendation ordering auditable instead of hiding the decay in opaque raw-score math
+
 ## 2026-04-08 - Discovery seed-quality posture
 
 ### Decision

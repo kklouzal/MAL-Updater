@@ -674,7 +674,52 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["recent_seed_activity_bonus"], results[1].context["recent_seed_activity_bonus"])
         self.assertLess(results[0].context["freshest_supporting_seed_days"], results[1].context["freshest_supporting_seed_days"])
+        self.assertEqual(0, results[0].context["stale_support_penalty"])
+        self.assertGreater(results[1].context["stale_support_penalty"], 0)
         self.assertIn("recently active seed watch history", " ".join(results[0].reasons))
+        self.assertIn("older supporting seed activity counted conservatively", " ".join(results[1].reasons))
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_penalizes_stale_support_even_when_seed_quality_is_high(self) -> None:
+        fresh = (datetime.now(timezone.utc) - timedelta(days=45)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        stale = (datetime.now(timezone.utc) - timedelta(days=900)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_series(
+            "seed-fresh-loved",
+            title="Fresh Loved Seed",
+            season_title="Fresh Loved Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-fresh-loved", "seed-fresh-loved-1", episode_number=1, completion_ratio=1.0, last_watched_at=fresh)
+        self._insert_series(
+            "seed-stale-loved",
+            title="Stale Loved Seed",
+            season_title="Stale Loved Seed (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-stale-loved", "seed-stale-loved-1", episode_number=1, completion_ratio=1.0, last_watched_at=stale)
+        self._map_series("seed-fresh-loved", 100)
+        self._map_series("seed-stale-loved", 200)
+        self._cache_metadata(100, title="Fresh Loved Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 10})
+        self._cache_metadata(200, title="Stale Loved Seed", my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 10})
+        self._cache_metadata(300, title="Fresh Loved Pick", mean=8.0, popularity=500)
+        self._cache_metadata(400, title="Stale Loved Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Fresh Loved Pick", "num_recommendations": 20, "raw": {}},
+        ])
+        self._cache_recommendations(200, [
+            {"target_mal_anime_id": 400, "target_title": "Stale Loved Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(3, results[0].context["seed_quality_bonus"])
+        self.assertEqual(3, results[1].context["seed_quality_bonus"])
+        self.assertEqual(0, results[0].context["stale_supporting_seed_count"])
+        self.assertEqual(1, results[1].context["stale_supporting_seed_count"])
+        self.assertEqual(1.0, results[1].context["stale_support_ratio"])
+        self.assertEqual(3, results[1].context["stale_support_penalty"])
+        self.assertIn("older supporting seed activity counted conservatively", " ".join(results[1].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
     def test_discovery_candidate_prefers_higher_scored_seed_support_when_votes_tie(self) -> None:

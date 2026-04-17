@@ -544,6 +544,18 @@ def _discovery_seed_recency_bonus(days_since_watch: int | None) -> int:
     return 0
 
 
+def _discovery_seed_staleness_profile(days_since_watch: int | None) -> tuple[float, int]:
+    if days_since_watch is None:
+        return 1.0, 0
+    if days_since_watch <= 180:
+        return 1.0, 0
+    if days_since_watch <= 365:
+        return 0.9, 1
+    if days_since_watch <= 730:
+        return 0.75, 2
+    return 0.6, 3
+
+
 def _metadata_my_list_status(meta: Any) -> dict[str, Any] | None:
     if meta is None or not isinstance(getattr(meta, "raw", None), dict):
         return None
@@ -682,10 +694,11 @@ def _build_discovery_recommendations(
     seed_weights: dict[int, int] = {}
     seed_recent_activity_bonus: dict[int, int] = {}
     seed_recent_activity_days: dict[int, int] = {}
-    seed_quality_bonus: dict[int, int] = {}
-    seed_quality_penalty: dict[int, int] = {}
+    seed_staleness_penalty: dict[int, int] = {}
     seed_scores: dict[int, int] = {}
     seed_penalty_scores: dict[int, int] = {}
+    seed_quality_bonus: dict[int, int] = {}
+    seed_quality_penalty: dict[int, int] = {}
     dropped_seed_ids: set[int] = set()
     disliked_seed_ids: set[int] = set()
     positive_quality_seed_ids: set[int] = set()
@@ -731,6 +744,9 @@ def _build_discovery_recommendations(
         recency_bonus = _discovery_seed_recency_bonus(days_since_watch)
         if recency_bonus > seed_recent_activity_bonus.get(mal_anime_id, 0):
             seed_recent_activity_bonus[mal_anime_id] = recency_bonus
+        _, staleness_penalty = _discovery_seed_staleness_profile(days_since_watch)
+        if staleness_penalty > seed_staleness_penalty.get(mal_anime_id, 0):
+            seed_staleness_penalty[mal_anime_id] = staleness_penalty
         if days_since_watch is not None:
             current_days = seed_recent_activity_days.get(mal_anime_id)
             if current_days is None or days_since_watch < current_days:
@@ -782,6 +798,8 @@ def _build_discovery_recommendations(
                     "title": edge.target_title,
                     "seed_recent_activity_bonus": 0,
                     "seed_recent_activity_days": {},
+                    "seed_staleness_penalty": 0,
+                    "stale_supporting_seed_ids": set(),
                     "seed_quality_bonus": 0,
                     "seed_quality_penalty": 0,
                     "supporting_seed_scores": {},
@@ -796,6 +814,7 @@ def _build_discovery_recommendations(
             votes = edge.num_recommendations or 0
             bucket["supporting_sources"].add(source_id)
             bucket["seed_recent_activity_bonus"] += seed_recent_activity_bonus.get(source_id, 0)
+            bucket["seed_staleness_penalty"] += seed_staleness_penalty.get(source_id, 0)
             bucket["seed_quality_bonus"] += seed_quality_bonus.get(source_id, 0)
             bucket["seed_quality_penalty"] += seed_quality_penalty.get(source_id, 0)
             if source_id in seed_recent_activity_days:
@@ -804,6 +823,8 @@ def _build_discovery_recommendations(
                 bucket["supporting_seed_scores"][source_id] = seed_scores[source_id]
             if source_id in seed_penalty_scores:
                 bucket["penalized_seed_scores"][source_id] = seed_penalty_scores[source_id]
+            if seed_staleness_penalty.get(source_id, 0) > 0:
+                bucket["stale_supporting_seed_ids"].add(source_id)
             if source_id in dropped_seed_ids:
                 bucket["dropped_supporting_seed_ids"].add(source_id)
             if source_id in disliked_seed_ids:
@@ -817,7 +838,8 @@ def _build_discovery_recommendations(
             votes_by_source = bucket["votes_by_source"]
             votes_by_source[source_id] = votes_by_source.get(source_id, 0) + votes
             bucket["votes"] += votes
-            bucket["raw_score"] += weight * min(votes, 40)
+            staleness_scale, _ = _discovery_seed_staleness_profile(seed_recent_activity_days.get(source_id))
+            bucket["raw_score"] += weight * min(votes, 40) * staleness_scale
 
     items: list[Recommendation] = []
     for target_id, bucket in candidate_scores.items():
@@ -885,6 +907,11 @@ def _build_discovery_recommendations(
             for source_id, score in (bucket.get("penalized_seed_scores") or {}).items()
             if isinstance(source_id, int) and isinstance(score, int) and score > 0
         }
+        stale_supporting_seed_ids = sorted(
+            int(source_id)
+            for source_id in (bucket.get("stale_supporting_seed_ids") or set())
+            if isinstance(source_id, int)
+        )
         dropped_supporting_seed_ids = sorted(
             int(source_id)
             for source_id in (bucket.get("dropped_supporting_seed_ids") or set())
@@ -918,6 +945,9 @@ def _build_discovery_recommendations(
             continue
         if all_support_is_disliked and not positive_quality_supporting_seed_ids:
             continue
+        stale_supporting_seed_count = len(stale_supporting_seed_ids)
+        stale_support_ratio = stale_supporting_seed_count / support_count if support_count > 0 else 0.0
+        stale_support_penalty = min(int(bucket.get("seed_staleness_penalty", 0)), 6)
         negative_supporting_seed_ids = sorted({*dropped_supporting_seed_ids, *disliked_supporting_seed_ids})
         negative_supporting_seed_count = len(negative_supporting_seed_ids)
         negative_support_ratio = (
@@ -950,6 +980,7 @@ def _build_discovery_recommendations(
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= freshness_penalty
+        priority -= stale_support_penalty
         priority -= seed_quality_penalty
         priority -= mixed_signal_penalty
         priority -= neutral_support_penalty
@@ -972,6 +1003,10 @@ def _build_discovery_recommendations(
             reasons.append(f"supported by recently active seed watch history ({freshest_supporting_seed_days} day(s) since last watch)")
         if freshness_penalty > 0 and start_season_label is not None:
             reasons.append(f"older MAL catalog title received modest age decay ({start_season_label})")
+        if stale_support_penalty > 0:
+            reasons.append(
+                f"older supporting seed activity counted conservatively ({stale_supporting_seed_count}/{support_count} supporting seed title(s) were stale)"
+            )
         if seed_quality_bonus > 0:
             if best_supporting_seed_score is not None:
                 reasons.append(f"backed by higher-confidence seed taste signals (best supporting seed MAL score: {best_supporting_seed_score})")
@@ -1031,6 +1066,10 @@ def _build_discovery_recommendations(
                     "penalized_seed_scores": penalized_seed_scores,
                     "best_supporting_seed_score": best_supporting_seed_score,
                     "lowest_supporting_seed_score": lowest_supporting_seed_score,
+                    "stale_supporting_seed_ids": stale_supporting_seed_ids,
+                    "stale_supporting_seed_count": stale_supporting_seed_count,
+                    "stale_support_ratio": stale_support_ratio,
+                    "stale_support_penalty": stale_support_penalty,
                     "dropped_supporting_seed_ids": dropped_supporting_seed_ids,
                     "dropped_supporting_seed_count": len(dropped_supporting_seed_ids),
                     "disliked_supporting_seed_ids": disliked_supporting_seed_ids,
