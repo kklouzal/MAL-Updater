@@ -867,7 +867,6 @@ def _build_discovery_recommendations(
         votes_by_source = bucket.get("votes_by_source") or {}
         best_single_source_votes = max((int(value) for value in votes_by_source.values()), default=0)
         cross_seed_support_votes = max(bucket["votes"] - best_single_source_votes, 0)
-        support_balance_bonus = min(cross_seed_support_votes // 5, 8)
         popularity_bonus = 0
         if popularity is not None:
             if popularity <= 100:
@@ -985,6 +984,24 @@ def _build_discovery_recommendations(
                 stale_consensus_discount = 1
         stale_consensus_discount = min(stale_consensus_discount, base_effective_supporting_seed_count - 1)
         effective_supporting_seed_count = max(base_effective_supporting_seed_count - stale_consensus_discount, 1)
+        effective_votes_by_source: dict[int, int] = {}
+        for source_id, value in votes_by_source.items():
+            if not isinstance(source_id, int):
+                continue
+            votes = int(value)
+            if source_id in negative_supporting_seed_ids or source_id in neutral_supporting_seed_ids:
+                continue
+            staleness_scale, _ = _discovery_seed_staleness_profile(
+                (bucket.get("seed_recent_activity_days") or {}).get(source_id)
+            )
+            effective_votes_by_source[source_id] = max(int(round(votes * staleness_scale)), 0)
+        effective_total_support_votes = sum(effective_votes_by_source.values())
+        effective_best_single_source_votes = max(effective_votes_by_source.values(), default=0)
+        effective_cross_seed_support_votes = max(
+            effective_total_support_votes - effective_best_single_source_votes,
+            0,
+        )
+        support_balance_bonus = min(effective_cross_seed_support_votes // 5, 8)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= freshness_penalty
@@ -999,6 +1016,10 @@ def _build_discovery_recommendations(
             reasons.append(f"aggregated MAL recommendation votes: {bucket['votes']}")
         if cross_seed_support_votes > 0:
             reasons.append(f"cross-seed consensus beyond the strongest seed: {cross_seed_support_votes} vote(s)")
+        if cross_seed_support_votes > effective_cross_seed_support_votes:
+            reasons.append(
+                f"support spread counted conservatively after neutral/stale seed weighting ({effective_cross_seed_support_votes}/{cross_seed_support_votes} effective cross-seed vote(s))"
+            )
         if shared_genres:
             reasons.append("shared seed genres: " + ", ".join(shared_genres[:3]))
         if shared_studios:
@@ -1060,6 +1081,8 @@ def _build_discovery_recommendations(
                     "aggregated_recommendation_votes": bucket["votes"],
                     "best_single_source_votes": best_single_source_votes,
                     "cross_seed_support_votes": cross_seed_support_votes,
+                    "effective_best_single_source_votes": effective_best_single_source_votes,
+                    "effective_cross_seed_support_votes": effective_cross_seed_support_votes,
                     "support_balance_bonus": support_balance_bonus,
                     "shared_genres": shared_genres,
                     "genre_overlap_score": genre_overlap_score,

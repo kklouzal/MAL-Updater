@@ -595,6 +595,21 @@ Specifically:
 - reducing the count boost is more honest than trying to solve the whole problem with one larger late-stage penalty
 - surfacing both the base count and the discount keeps the ranking inspectable instead of hiding this calibration inside one opaque priority number
 
+## 2026-04-17 - Discovery effective support-spread posture
+
+### Decision
+Keep the discovery support-balance bonus, but compute it from **effective cross-seed spread** rather than raw vote spread alone.
+
+Specifically:
+- preserve raw `best_single_source_votes` / `cross_seed_support_votes` for transparency
+- add `effective_best_single_source_votes` and `effective_cross_seed_support_votes` after removing neutral/disliked-only support from the spread bonus and applying stale-seed weighting
+- derive `support_balance_bonus` from that effective spread, and emit an operator-readable reason when the effective spread is lower than the raw spread
+
+### Why
+- neutral-heavy or stale-heavy candidates could still look too consensus-backed if raw cross-seed vote spread kept granting the same support-balance bonus as cleaner fresh support
+- the recommendation surface already had conservative support-count logic; letting the spread bonus ignore that posture left a real inconsistency
+- exposing both raw and effective spread keeps the ranking auditable instead of replacing one opaque bonus with another
+
 ## 2026-04-08 - Discovery seed-quality posture
 
 ### Decision

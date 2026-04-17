@@ -1005,21 +1005,72 @@ class RecommendationTests(unittest.TestCase):
             {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 8, "raw": {}},
         ])
         self._cache_recommendations(200, [
-            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 4, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 10, "raw": {}},
         ])
         self._cache_recommendations(250, [
-            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 4, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Neutral-Heavy Pick", "num_recommendations": 10, "raw": {}},
         ])
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
-        neutral_heavy = results[1]
+        self.assertEqual({"mal:300", "mal:400"}, {item.provider_series_id for item in results})
+        neutral_heavy = next(item for item in results if item.provider_series_id == "mal:400")
+        clean_support = next(item for item in results if item.provider_series_id == "mal:300")
         self.assertEqual(2, neutral_heavy.context["neutral_supporting_seed_count"])
         self.assertAlmostEqual(2 / 3, neutral_heavy.context["neutral_support_ratio"])
         self.assertEqual(1, neutral_heavy.context["effective_supporting_seed_count"])
+        self.assertEqual(18, neutral_heavy.context["cross_seed_support_votes"])
+        self.assertEqual(0, neutral_heavy.context["effective_cross_seed_support_votes"])
+        self.assertEqual(0, neutral_heavy.context["support_balance_bonus"])
         self.assertEqual(4, neutral_heavy.context["neutral_support_penalty"])
-        self.assertLessEqual(neutral_heavy.priority, results[0].priority)
+        self.assertIn(
+            "support spread counted conservatively after neutral/stale seed weighting (0/18 effective cross-seed vote(s))",
+            neutral_heavy.reasons,
+        )
+        self.assertLessEqual(neutral_heavy.context["support_balance_bonus"], clean_support.context["support_balance_bonus"])
+
+    def test_discovery_candidate_stale_support_spread_gets_less_balance_bonus_than_fresh_spread(self) -> None:
+        for provider_series_id, title, watched_at, mal_anime_id in (
+            ("seed-fresh-a", "Fresh Seed A", "2026-03-01T01:00:00Z", 100),
+            ("seed-fresh-b", "Fresh Seed B", "2026-03-02T01:00:00Z", 200),
+            ("seed-stale-a", "Stale Seed A", "2023-01-01T01:00:00Z", 300),
+            ("seed-stale-b", "Stale Seed B", "2023-01-02T01:00:00Z", 350),
+        ):
+            self._insert_series(
+                provider_series_id,
+                title=title,
+                season_title=f"{title} (English Dub)",
+                watchlist_status="fully_watched",
+            )
+            self._insert_progress(
+                provider_series_id,
+                provider_series_id + "-1",
+                episode_number=1,
+                completion_ratio=1.0,
+                last_watched_at=watched_at,
+            )
+            self._map_series(provider_series_id, mal_anime_id)
+            self._cache_metadata(mal_anime_id, title=title, my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 8})
+
+        self._cache_metadata(400, title="Fresh Spread Pick", mean=8.0, popularity=500)
+        self._cache_metadata(500, title="Stale Spread Pick", mean=8.0, popularity=500)
+        self._cache_recommendations(100, [{"target_mal_anime_id": 400, "target_title": "Fresh Spread Pick", "num_recommendations": 20, "raw": {}}])
+        self._cache_recommendations(200, [{"target_mal_anime_id": 400, "target_title": "Fresh Spread Pick", "num_recommendations": 10, "raw": {}}])
+        self._cache_recommendations(300, [{"target_mal_anime_id": 500, "target_title": "Stale Spread Pick", "num_recommendations": 20, "raw": {}}])
+        self._cache_recommendations(350, [{"target_mal_anime_id": 500, "target_title": "Stale Spread Pick", "num_recommendations": 10, "raw": {}}])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:400", "mal:500"], [item.provider_series_id for item in results])
+        fresh_spread, stale_spread = results
+        self.assertEqual(10, fresh_spread.context["effective_cross_seed_support_votes"])
+        self.assertEqual(6, stale_spread.context["effective_cross_seed_support_votes"])
+        self.assertGreater(fresh_spread.context["support_balance_bonus"], stale_spread.context["support_balance_bonus"])
+        self.assertIn(
+            "support spread counted conservatively after neutral/stale seed weighting (6/10 effective cross-seed vote(s))",
+            stale_spread.reasons,
+        )
+        self.assertGreater(fresh_spread.priority, stale_spread.priority)
 
     def test_discovery_candidate_majority_negative_support_ranks_below_clean_support(self) -> None:
         for provider_series_id, title in (("seed-loved", "Loved Seed"), ("seed-disliked-a", "Disliked Seed A"), ("seed-disliked-b", "Disliked Seed B")):
