@@ -722,6 +722,64 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("older supporting seed activity counted conservatively", " ".join(results[1].reasons))
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_stale_heavy_multi_seed_support_counts_less_like_fresh_consensus(self) -> None:
+        seed_specs = (
+            ("fresh-a", "Fresh Seed A", 100, "2026-03-01T01:00:00Z"),
+            ("fresh-b", "Fresh Seed B", 200, "2026-03-02T01:00:00Z"),
+            ("fresh-c", "Fresh Seed C", 250, "2026-03-03T01:00:00Z"),
+            ("stale-a", "Stale Seed A", 300, "2024-01-01T01:00:00Z"),
+            ("stale-b", "Stale Seed B", 350, "2024-01-02T01:00:00Z"),
+            ("fresh-d", "Fresh Seed D", 360, "2026-03-04T01:00:00Z"),
+        )
+        for provider_series_id, title, mal_anime_id, watched_at in seed_specs:
+            self._insert_series(
+                provider_series_id,
+                title=title,
+                season_title=f"{title} (English Dub)",
+                watchlist_status="fully_watched",
+            )
+            self._insert_progress(
+                provider_series_id,
+                provider_series_id + "-1",
+                episode_number=1,
+                completion_ratio=1.0,
+                last_watched_at=watched_at,
+            )
+            self._map_series(provider_series_id, mal_anime_id)
+            self._cache_metadata(
+                mal_anime_id,
+                title=title,
+                my_list_status={"status": "completed", "num_episodes_watched": 12, "score": 8},
+            )
+
+        self._cache_metadata(400, title="Fresh Consensus Pick", mean=8.0, popularity=500)
+        self._cache_metadata(500, title="Stale-Heavy Consensus Pick", mean=8.0, popularity=500)
+
+        for source_id in (100, 200, 250):
+            self._cache_recommendations(source_id, [
+                {"target_mal_anime_id": 400, "target_title": "Fresh Consensus Pick", "num_recommendations": 6, "raw": {}},
+            ])
+        for source_id in (300, 350, 360):
+            self._cache_recommendations(source_id, [
+                {"target_mal_anime_id": 500, "target_title": "Stale-Heavy Consensus Pick", "num_recommendations": 6, "raw": {}},
+            ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:400", "mal:500"], [item.provider_series_id for item in results])
+        stale_heavy = results[1]
+        self.assertEqual(3, stale_heavy.context["supporting_source_count"])
+        self.assertEqual(3, stale_heavy.context["base_effective_supporting_seed_count"])
+        self.assertEqual(2, stale_heavy.context["stale_supporting_seed_count"])
+        self.assertAlmostEqual(2 / 3, stale_heavy.context["stale_support_ratio"])
+        self.assertEqual(1, stale_heavy.context["stale_consensus_discount"])
+        self.assertEqual(2, stale_heavy.context["effective_supporting_seed_count"])
+        self.assertIn(
+            "stale-heavy multi-seed consensus counted less strongly (2/3 supporting seed title(s) were stale)",
+            stale_heavy.reasons,
+        )
+        self.assertLessEqual(stale_heavy.priority, results[0].priority)
+
     def test_discovery_candidate_prefers_higher_scored_seed_support_when_votes_tie(self) -> None:
         self._insert_series(
             "seed-loved",

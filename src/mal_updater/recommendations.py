@@ -973,10 +973,18 @@ def _build_discovery_recommendations(
                 neutral_support_penalty = 2
             elif neutral_support_ratio > 0:
                 neutral_support_penalty = 1
-        effective_supporting_seed_count = max(
+        base_effective_supporting_seed_count = max(
             support_count - negative_supporting_seed_count - neutral_supporting_seed_count,
             1,
         )
+        stale_consensus_discount = 0
+        if base_effective_supporting_seed_count > 1 and stale_supporting_seed_count > 0:
+            if stale_support_ratio >= 1.0:
+                stale_consensus_discount = 2
+            elif stale_support_ratio >= (2 / 3):
+                stale_consensus_discount = 1
+        stale_consensus_discount = min(stale_consensus_discount, base_effective_supporting_seed_count - 1)
+        effective_supporting_seed_count = max(base_effective_supporting_seed_count - stale_consensus_discount, 1)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
         priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= freshness_penalty
@@ -1006,6 +1014,10 @@ def _build_discovery_recommendations(
         if stale_support_penalty > 0:
             reasons.append(
                 f"older supporting seed activity counted conservatively ({stale_supporting_seed_count}/{support_count} supporting seed title(s) were stale)"
+            )
+        if stale_consensus_discount > 0:
+            reasons.append(
+                f"stale-heavy multi-seed consensus counted less strongly ({stale_supporting_seed_count}/{support_count} supporting seed title(s) were stale)"
             )
         if seed_quality_bonus > 0:
             if best_supporting_seed_score is not None:
@@ -1041,6 +1053,8 @@ def _build_discovery_recommendations(
                 context={
                     "mal_anime_id": target_id,
                     "supporting_source_count": support_count,
+                    "base_effective_supporting_seed_count": base_effective_supporting_seed_count,
+                    "stale_consensus_discount": stale_consensus_discount,
                     "effective_supporting_seed_count": effective_supporting_seed_count,
                     "supporting_mal_anime_ids": sorted(bucket["supporting_sources"]),
                     "aggregated_recommendation_votes": bucket["votes"],

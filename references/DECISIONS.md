@@ -580,6 +580,21 @@ Specifically:
 - the earlier `recent_seed_activity_bonus` only rewarded freshness; it did not actually temper stale support enough when older seeds still had strong votes or scores
 - exposing the stale-support metadata keeps recommendation ordering auditable instead of hiding the decay in opaque raw-score math
 
+## 2026-04-17 - Discovery stale-heavy consensus-count posture
+
+### Decision
+When stale support dominates a discovery candidate's backing seeds, reduce the **multi-seed consensus-count boost itself**, not only the late stale-support penalty.
+
+Specifically:
+- preserve the existing `stale_support_penalty` and staleness-aware raw-score decay
+- add `base_effective_supporting_seed_count` plus a bounded `stale_consensus_discount` so stale-heavy support can lower `effective_supporting_seed_count`
+- keep the discount conservative and capped so stale-heavy support still counts, just not as strongly as equally broad fresh consensus
+
+### Why
+- stale-heavy candidates were still receiving the same multi-seed confidence boost as fresh multi-seed support, which overstated how current that consensus really was
+- reducing the count boost is more honest than trying to solve the whole problem with one larger late-stage penalty
+- surfacing both the base count and the discount keeps the ranking inspectable instead of hiding this calibration inside one opaque priority number
+
 ## 2026-04-08 - Discovery seed-quality posture
 
 ### Decision
