@@ -195,6 +195,7 @@ Keep `bootstrap-audit` onboarding output machine-readable enough for operators a
 - bootstrap/onboarding had already become the first operator surface, but its actionable command list still lagged behind `health-check` in machine-readable remediation specificity
 - preserving the auth classification in both JSON and terse summary output makes partial/bootstrap-degraded state easier to debug without forcing operators to jump to a different command
 - stable reason codes keep future automation/reporting aligned with the conservative shared reauth/rebootstrap posture instead of re-parsing freeform detail strings
+- the same metadata should also follow MAL/provider `operation_guidance` next-command hints so lane-specific bootstrap consumers do not have to rediscover command posture from a separate top-level list
 
 ## 2026-04-09 - Discovery mixed-signal recommendation posture
 

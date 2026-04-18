@@ -234,6 +234,32 @@ def _secrets_dir_permission_status(config) -> dict[str, object]:
     }
 
 
+def _guidance_command_fields(
+    *,
+    command: str | None,
+    reason_code: str | None = None,
+    automation_safe: bool | None = None,
+    requires_auth_interaction: bool | None = None,
+    auth_failure_kind: str | None = None,
+    auth_remediation_kind: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"next_command": command}
+    if not isinstance(command, str) or not command:
+        return payload
+    if isinstance(reason_code, str) and reason_code:
+        payload["next_command_reason_code"] = reason_code
+    if isinstance(automation_safe, bool):
+        payload["next_command_automation_safe"] = automation_safe
+    if isinstance(requires_auth_interaction, bool):
+        payload["next_command_requires_auth_interaction"] = requires_auth_interaction
+    if isinstance(auth_failure_kind, str) and auth_failure_kind:
+        payload["next_command_auth_failure_kind"] = auth_failure_kind
+    if isinstance(auth_remediation_kind, str) and auth_remediation_kind:
+        payload["next_command_auth_remediation_kind"] = auth_remediation_kind
+    return payload
+
+
+
 def _provider_bootstrap_guidance_status(
     *,
     provider_name: str,
@@ -253,7 +279,7 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": False,
             "ready": False,
             "details": f"{title} is not staged yet, so it is optional until you decide to enable that provider.",
-            "next_command": None,
+            **_guidance_command_fields(command=None),
         }
 
     if credentials_present and not session_present:
@@ -263,7 +289,12 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": True,
             "ready": False,
             "details": f"{title} credentials are staged but provider session state is still missing; finish provider bootstrap before expecting unattended fetches.",
-            "next_command": bootstrap_command,
+            **_guidance_command_fields(
+                command=bootstrap_command,
+                reason_code=f"missing_{provider_name}_state",
+                automation_safe=False,
+                requires_auth_interaction=False,
+            ),
         }
 
     if session_present and not credentials_present:
@@ -273,7 +304,7 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": True,
             "ready": False,
             "details": f"{title} session state exists without matching staged credentials; restore/stage credentials before treating this provider as healthy for unattended fetches.",
-            "next_command": None,
+            **_guidance_command_fields(command=None),
         }
 
     if not transport_ready:
@@ -283,11 +314,12 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": True,
             "ready": False,
             "details": f"{title} bootstrap state is staged but required transport support is missing on this host, so finish transport setup before relying on unattended fetches.",
-            "next_command": None,
+            **_guidance_command_fields(command=None),
         }
 
     if credentials_present and session_present and isinstance(auth_issue, dict):
         reason = auth_issue.get("reason")
+        auth_failure_kind = str(auth_issue.get("auth_failure_kind") or "") or None
         failure_label = _describe_auth_failure_kind({
             "kind": str(auth_issue.get("auth_failure_kind")),
             "label": str(auth_issue.get("auth_failure_label")),
@@ -297,12 +329,13 @@ def _provider_bootstrap_guidance_status(
             "label": str(auth_issue.get("auth_failure_label")),
         })
         remediation_detail = remediation.get("detail")
+        remediation_kind = str(remediation.get("remediation_kind") or "") or None
         details = (
             f"{title} credentials and session state are staged, but auth looks degraded ({failure_label}); re-bootstrap this provider before treating unattended fetches as healthy."
         )
         if isinstance(remediation_detail, str) and remediation_detail:
             details += f" Recommended posture: {remediation_detail}."
-        
+
         if isinstance(reason, str) and reason.strip():
             details += f" Latest signal: {reason.strip()}"
         return {
@@ -311,8 +344,15 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": True,
             "ready": False,
             "details": details,
-            "next_command": bootstrap_command,
-            "remediation_kind": remediation.get("remediation_kind"),
+            **_guidance_command_fields(
+                command=bootstrap_command,
+                reason_code=f"rebootstrap_{provider_name}_auth_after_{auth_failure_kind or 'auth_failures'}",
+                automation_safe=False,
+                requires_auth_interaction=False,
+                auth_failure_kind=auth_failure_kind,
+                auth_remediation_kind=remediation_kind,
+            ),
+            "remediation_kind": remediation_kind,
             "remediation_detail": remediation_detail,
         }
 
@@ -323,7 +363,7 @@ def _provider_bootstrap_guidance_status(
             "partially_staged": False,
             "ready": True,
             "details": f"{title} credentials and session state are staged, so this provider is ready for unattended daemon fetches.",
-            "next_command": None,
+            **_guidance_command_fields(command=None),
         }
 
     return {
@@ -332,7 +372,12 @@ def _provider_bootstrap_guidance_status(
         "partially_staged": True,
         "ready": False,
         "details": f"{title} has some staged bootstrap state but is not fully ready yet; finish provider bootstrap before expecting unattended fetches.",
-        "next_command": bootstrap_command if credentials_present else None,
+        **_guidance_command_fields(
+            command=bootstrap_command if credentials_present else None,
+            reason_code=f"missing_{provider_name}_state" if credentials_present else None,
+            automation_safe=False if credentials_present else None,
+            requires_auth_interaction=False if credentials_present else None,
+        ),
     }
 
 
@@ -349,7 +394,7 @@ def _mal_bootstrap_guidance_status(
             "mode": "client-id-missing",
             "ready": False,
             "details": "MyAnimeList client id is not staged yet, so MAL OAuth cannot be completed.",
-            "next_command": None,
+            **_guidance_command_fields(command=None),
         }
 
     if not oauth_present:
@@ -357,11 +402,17 @@ def _mal_bootstrap_guidance_status(
             "mode": "oauth-missing",
             "ready": False,
             "details": "MyAnimeList OAuth tokens are not staged yet; complete MAL OAuth before treating unattended sync as ready.",
-            "next_command": auth_command,
+            **_guidance_command_fields(
+                command=auth_command,
+                reason_code="missing_mal_auth_material",
+                automation_safe=False,
+                requires_auth_interaction=True,
+            ),
         }
 
     if isinstance(auth_issue, dict):
         reason = auth_issue.get("reason")
+        auth_failure_kind = str(auth_issue.get("auth_failure_kind") or "") or None
         failure_label = _describe_auth_failure_kind({
             "kind": str(auth_issue.get("auth_failure_kind")),
             "label": str(auth_issue.get("auth_failure_label")),
@@ -371,6 +422,7 @@ def _mal_bootstrap_guidance_status(
             "label": str(auth_issue.get("auth_failure_label")),
         })
         remediation_detail = remediation.get("detail")
+        remediation_kind = str(remediation.get("remediation_kind") or "") or None
         details = f"MyAnimeList OAuth tokens are staged, but repeated unattended token refresh failures suggest MAL auth should be completed again before trusting unattended sync ({failure_label})."
         if isinstance(remediation_detail, str) and remediation_detail:
             details += f" Recommended posture: {remediation_detail}."
@@ -380,8 +432,15 @@ def _mal_bootstrap_guidance_status(
             "mode": "auth-degraded-needs-reauth",
             "ready": False,
             "details": details,
-            "next_command": auth_command,
-            "remediation_kind": remediation.get("remediation_kind"),
+            **_guidance_command_fields(
+                command=auth_command,
+                reason_code=f"rebootstrap_mal_auth_after_{auth_failure_kind or 'auth_failures'}",
+                automation_safe=False,
+                requires_auth_interaction=True,
+                auth_failure_kind=auth_failure_kind,
+                auth_remediation_kind=remediation_kind,
+            ),
+            "remediation_kind": remediation_kind,
             "remediation_detail": remediation_detail,
         }
 
@@ -389,7 +448,7 @@ def _mal_bootstrap_guidance_status(
         "mode": "ready",
         "ready": True,
         "details": "MyAnimeList client id and OAuth tokens are staged, so MAL auth is ready for unattended sync.",
-        "next_command": None,
+        **_guidance_command_fields(command=None),
     }
 
 
@@ -1000,9 +1059,23 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             print(f"partially_staged_provider_count={payload['summary']['partially_staged_provider_count']}")
         if missing_dependencies:
             print("missing_dependencies=" + ", ".join(missing_dependencies))
-        mal_next_command = payload["mal"]["operation_guidance"].get("next_command") if isinstance(payload["mal"].get("operation_guidance"), dict) else None
+        mal_operation_guidance = payload["mal"].get("operation_guidance") if isinstance(payload["mal"].get("operation_guidance"), dict) else {}
+        mal_next_command = mal_operation_guidance.get("next_command") if isinstance(mal_operation_guidance.get("next_command"), str) else None
         if isinstance(mal_next_command, str) and mal_next_command:
             print(f"mal_next_command={mal_next_command}")
+            mal_next_reason_code = mal_operation_guidance.get("next_command_reason_code")
+            if isinstance(mal_next_reason_code, str) and mal_next_reason_code:
+                print(f"mal_next_command_reason_code={mal_next_reason_code}")
+            if mal_operation_guidance.get("next_command_automation_safe") is not None:
+                print(f"mal_next_command_automation_safe={mal_operation_guidance['next_command_automation_safe']}")
+            if mal_operation_guidance.get("next_command_requires_auth_interaction") is not None:
+                print(f"mal_next_command_requires_auth_interaction={mal_operation_guidance['next_command_requires_auth_interaction']}")
+            mal_next_auth_failure_kind = mal_operation_guidance.get("next_command_auth_failure_kind")
+            if isinstance(mal_next_auth_failure_kind, str) and mal_next_auth_failure_kind:
+                print(f"mal_next_command_auth_failure_kind={mal_next_auth_failure_kind}")
+            mal_next_auth_remediation_kind = mal_operation_guidance.get("next_command_auth_remediation_kind")
+            if isinstance(mal_next_auth_remediation_kind, str) and mal_next_auth_remediation_kind:
+                print(f"mal_next_command_auth_remediation_kind={mal_next_auth_remediation_kind}")
         for provider_name, provider_payload in providers.items():
             print(f"provider_{provider_name}_ready={provider_payload['ready']}")
             operation_mode = provider_payload.get("operation_mode")
@@ -1022,6 +1095,19 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 print(f"provider_{provider_name}_auth_remediation_kind={auth_remediation_kind}")
             if next_command:
                 print(f"provider_{provider_name}_next_command={next_command}")
+                next_reason_code = operation_guidance.get("next_command_reason_code")
+                if isinstance(next_reason_code, str) and next_reason_code:
+                    print(f"provider_{provider_name}_next_command_reason_code={next_reason_code}")
+                if operation_guidance.get("next_command_automation_safe") is not None:
+                    print(f"provider_{provider_name}_next_command_automation_safe={operation_guidance['next_command_automation_safe']}")
+                if operation_guidance.get("next_command_requires_auth_interaction") is not None:
+                    print(f"provider_{provider_name}_next_command_requires_auth_interaction={operation_guidance['next_command_requires_auth_interaction']}")
+                next_auth_failure_kind = operation_guidance.get("next_command_auth_failure_kind")
+                if isinstance(next_auth_failure_kind, str) and next_auth_failure_kind:
+                    print(f"provider_{provider_name}_next_command_auth_failure_kind={next_auth_failure_kind}")
+                next_auth_remediation_kind = operation_guidance.get("next_command_auth_remediation_kind")
+                if isinstance(next_auth_remediation_kind, str) and next_auth_remediation_kind:
+                    print(f"provider_{provider_name}_next_command_auth_remediation_kind={next_auth_remediation_kind}")
         top_command = payload.get("recommended_command") if isinstance(payload.get("recommended_command"), dict) else None
         if isinstance(top_command, dict) and top_command.get("command"):
             print("maintenance_recommended_command=" + str(top_command["command"]))

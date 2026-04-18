@@ -96,6 +96,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("missing_mal_auth_material", mal_auth_command["reason_code"])
         self.assertFalse(mal_auth_command["automation_safe"])
         self.assertTrue(mal_auth_command["requires_auth_interaction"])
+        self.assertIsNone(payload["mal"]["operation_guidance"]["next_command"])
+        self.assertNotIn("next_command_reason_code", payload["mal"]["operation_guidance"])
 
     def test_bootstrap_audit_summary_reports_provider_missing_state_and_next_commands(self) -> None:
         secrets_dir = self.project_root / ".MAL-Updater" / "secrets"
@@ -126,6 +128,9 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "provider_crunchyroll_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
             stdout,
         )
+        self.assertIn("provider_crunchyroll_next_command_reason_code=missing_crunchyroll_state", stdout)
+        self.assertIn("provider_crunchyroll_next_command_automation_safe=False", stdout)
+        self.assertIn("provider_crunchyroll_next_command_requires_auth_interaction=False", stdout)
         self.assertIn("intended_provider_count=1", stdout)
         self.assertIn("partially_staged_provider_count=1", stdout)
         self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli init", stdout)
@@ -186,6 +191,12 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
             payload["providers"]["crunchyroll"]["operation_guidance"]["next_command"],
         )
+        self.assertEqual(
+            "missing_crunchyroll_state",
+            payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_reason_code"],
+        )
+        self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_automation_safe"])
+        self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_requires_auth_interaction"])
 
     def test_bootstrap_audit_marks_daemon_expected_once_mal_and_intended_provider_state_exist(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
@@ -322,6 +333,11 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("mal_auth_failure_kind=invalid_grant", stdout)
         self.assertIn("mal_auth_remediation_kind=refresh-token-invalidated", stdout)
         self.assertIn("mal_next_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
+        self.assertIn("mal_next_command_reason_code=rebootstrap_mal_auth_after_invalid_grant", stdout)
+        self.assertIn("mal_next_command_automation_safe=False", stdout)
+        self.assertIn("mal_next_command_requires_auth_interaction=True", stdout)
+        self.assertIn("mal_next_command_auth_failure_kind=invalid_grant", stdout)
+        self.assertIn("mal_next_command_auth_remediation_kind=refresh-token-invalidated", stdout)
         self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
         self.assertIn("maintenance_recommended_reason_code=rebootstrap_mal_auth_after_invalid_grant", stdout)
         self.assertIn("maintenance_recommended_automation_safe=False", stdout)
@@ -360,6 +376,20 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("invalid_grant", payload["providers"]["crunchyroll"]["auth_degradation"]["auth_failure_kind"])
         self.assertEqual("refresh-token-invalidated", payload["providers"]["crunchyroll"]["auth_degradation"]["auth_remediation_kind"])
         self.assertEqual("refresh-token-invalidated", payload["providers"]["crunchyroll"]["operation_guidance"]["remediation_kind"])
+        self.assertEqual(
+            "rebootstrap_crunchyroll_auth_after_invalid_grant",
+            payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_reason_code"],
+        )
+        self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_automation_safe"])
+        self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_requires_auth_interaction"])
+        self.assertEqual(
+            "invalid_grant",
+            payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_auth_failure_kind"],
+        )
+        self.assertEqual(
+            "refresh-token-invalidated",
+            payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_auth_remediation_kind"],
+        )
         self.assertIn("revoked or invalid refresh/auth token", payload["providers"]["crunchyroll"]["operation_guidance"]["details"])
         self.assertIn("refresh token revoked", payload["providers"]["crunchyroll"]["operation_guidance"]["details"])
         crunchyroll_command = next(
@@ -428,6 +458,11 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "provider_hidive_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,
         )
+        self.assertIn("provider_hidive_next_command_reason_code=rebootstrap_hidive_auth_after_login_failure", stdout)
+        self.assertIn("provider_hidive_next_command_automation_safe=False", stdout)
+        self.assertIn("provider_hidive_next_command_requires_auth_interaction=False", stdout)
+        self.assertIn("provider_hidive_next_command_auth_failure_kind=login_failure", stdout)
+        self.assertIn("provider_hidive_next_command_auth_remediation_kind=login-bootstrap-failed", stdout)
         self.assertIn(
             "maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,
