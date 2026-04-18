@@ -611,6 +611,21 @@ Specifically:
 - the recommendation surface already had conservative support-count logic; letting the spread bonus ignore that posture left a real inconsistency
 - exposing both raw and effective spread keeps the ranking auditable instead of replacing one opaque bonus with another
 
+## 2026-04-18 - Discovery metadata-affinity tie-break posture
+
+### Decision
+When discovery candidates are already close on recommendation-vote and seed-support posture, allow **metadata-rich multi-surface alignment** to matter a little more than a single overlap surface.
+
+Specifically:
+- add `metadata_match_dimensions` to count how many cached metadata families align with the watched seed set (`genres`, `studios`, `source`)
+- add a small `metadata_affinity_bonus` only when at least two of those metadata families align
+- keep the bonus capped and modest, with only a mild extra bump for broadly popular candidates inside that already metadata-rich bucket
+
+### Why
+- the recommendation surface already exposed genre/studio/source overlap, but near-ties could still overvalue one isolated overlap against a candidate whose cached metadata matched the user's seeds across multiple dimensions at once
+- rewarding metadata richness only after the core graph/support signals are already close preserves the project's conservative recommendation posture instead of turning metadata into the main driver
+- exposing both matched-dimension count and the explicit bonus keeps the tie-break inspectable rather than burying it in opaque score math
+
 ## 2026-04-08 - Discovery seed-quality posture
 
 ### Decision

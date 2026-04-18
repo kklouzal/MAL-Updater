@@ -1237,6 +1237,58 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(0, results[1].context["source_overlap_score"])
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_prefers_metadata_rich_alignment_when_votes_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Metadata Rich", mean=8.0, popularity=500, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(400, title="Genre Only", mean=8.0, popularity=500, genres=["Sci-Fi"], studios=["Madhouse"], source="manga")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Metadata Rich", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Genre Only", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(3, results[0].context["metadata_match_dimensions"])
+        self.assertGreater(results[0].context["metadata_affinity_bonus"], 0)
+        self.assertEqual(1, results[1].context["metadata_match_dimensions"])
+        self.assertEqual(0, results[1].context["metadata_affinity_bonus"])
+        self.assertIn("metadata-rich seed alignment across 3 dimensions counted as an extra tie-break", results[0].reasons)
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_prefers_popular_metadata_rich_alignment_when_votes_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Popular Metadata Rich", mean=8.0, popularity=200, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(400, title="Obscure Metadata Rich", mean=8.0, popularity=5000, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Popular Metadata Rich", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Obscure Metadata Rich", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(3, results[0].context["metadata_match_dimensions"])
+        self.assertEqual(3, results[1].context["metadata_match_dimensions"])
+        self.assertGreater(results[0].context["metadata_affinity_bonus"], results[1].context["metadata_affinity_bonus"])
+        self.assertGreater(results[0].priority, results[1].priority)
+
     def test_discovery_candidate_skips_direct_franchise_relations_from_seed_titles(self) -> None:
         self._insert_series(
             "seed-a",
