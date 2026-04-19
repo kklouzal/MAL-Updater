@@ -260,7 +260,16 @@ class ServiceStatusTests(unittest.TestCase):
                             "every_seconds": 21600,
                             "budget_provider": "crunchyroll",
                             "budget_scope": "provider",
-                            "full_refresh_anchor_epoch": 0,
+                            "full_refresh_anchor_epoch": 1,
+                            "full_refresh_anchor_at": "1970-01-01T00:00:01Z",
+                            "last_fetch_mode": "incremental",
+                            "last_result": {
+                                "status": "ok",
+                                "label": "sync_fetch_crunchyroll",
+                                "returncode": 0,
+                                "fetch_mode": "incremental",
+                                "deferred_full_refresh_reason": "periodic_cadence"
+                            },
                             "next_due_at": "2026-03-21T03:52:00Z"
                         },
                     },
@@ -338,7 +347,10 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_floor_seconds=7200", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_consecutive_failures=2", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_budget_scope=provider", stdout)
-        self.assertIn("task_sync_fetch_crunchyroll_planned_fetch_mode=incremental", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_planned_fetch_mode=full_refresh", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_reason=periodic_cadence", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_budget_deferred=True", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_deferred_reason=periodic_cadence", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
 
     def test_doctor_service_surfaces_planned_full_refresh_reason_for_overdue_fetch_lane(self) -> None:
@@ -381,6 +393,59 @@ class ServiceStatusTests(unittest.TestCase):
         fetch_summary = payload["task_state"]["sync_fetch_crunchyroll"]
         self.assertEqual("full_refresh", fetch_summary["planned_fetch_mode"])
         self.assertEqual("periodic_cadence", fetch_summary["planned_full_refresh_reason"])
+        self.assertNotIn("planned_full_refresh_budget_deferred", fetch_summary)
+
+    def test_doctor_service_surfaces_budget_deferred_full_refresh_pressure(self) -> None:
+        stale_anchor = 1
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_run_at": "2026-03-20T21:52:00Z",
+                            "last_status": "ok",
+                            "last_fetch_mode": "incremental",
+                            "every_seconds": 21600,
+                            "budget_provider": "crunchyroll",
+                            "budget_scope": "provider",
+                            "full_refresh_anchor_epoch": stale_anchor,
+                            "full_refresh_anchor_at": "1970-01-01T00:00:01Z",
+                            "last_result": {
+                                "status": "ok",
+                                "label": "sync_fetch_crunchyroll",
+                                "returncode": 0,
+                                "fetch_mode": "incremental",
+                                "deferred_full_refresh_reason": "periodic_cadence"
+                            },
+                            "next_due_at": "2026-03-21T03:52:00Z"
+                        }
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_run(command: list[str], check: bool = True):
+            if command[-2:] == ["is-enabled", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="enabled\n", stderr="")
+            if command[-2:] == ["is-active", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        fake_home = self.project_root / "fake-home"
+        with (
+            patch("mal_updater.service_manager._run", side_effect=fake_run),
+            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+        ):
+            payload = doctor_service(self.config)
+
+        fetch_summary = payload["task_state"]["sync_fetch_crunchyroll"]
+        self.assertEqual("full_refresh", fetch_summary["planned_fetch_mode"])
+        self.assertEqual("periodic_cadence", fetch_summary["planned_full_refresh_reason"])
+        self.assertTrue(fetch_summary["planned_full_refresh_budget_deferred"])
+        self.assertEqual("periodic_cadence", fetch_summary["planned_full_refresh_deferred_reason"])
+        self.assertEqual("periodic_cadence", fetch_summary["last_result"]["deferred_full_refresh_reason"])
 
     def test_service_status_summary_surfaces_parse_errors(self) -> None:
         self.config.service_state_path.write_text("{not-json", encoding="utf-8")

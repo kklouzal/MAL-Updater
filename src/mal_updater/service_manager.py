@@ -85,7 +85,17 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     summary: dict[str, Any] = {}
-    for field in ("status", "label", "returncode", "reason", "access_token_path", "refresh_token_path"):
+    for field in (
+        "status",
+        "label",
+        "returncode",
+        "reason",
+        "fetch_mode",
+        "full_refresh_reason",
+        "deferred_full_refresh_reason",
+        "access_token_path",
+        "refresh_token_path",
+    ):
         field_value = value.get(field)
         if field_value is not None:
             summary[field] = field_value
@@ -109,6 +119,15 @@ def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state
     summary: dict[str, Any] = {"planned_fetch_mode": planned_fetch_mode}
     if planned_full_refresh_reasons:
         summary["planned_full_refresh_reason"] = "+".join(planned_full_refresh_reasons)
+        last_result = task_state.get("last_result")
+        deferred_reason = None
+        if isinstance(last_result, dict):
+            raw_deferred_reason = last_result.get("deferred_full_refresh_reason")
+            if isinstance(raw_deferred_reason, str) and raw_deferred_reason:
+                deferred_reason = raw_deferred_reason
+        if deferred_reason is not None and task_state.get("last_fetch_mode") == "incremental":
+            summary["planned_full_refresh_budget_deferred"] = True
+            summary["planned_full_refresh_deferred_reason"] = deferred_reason
     return summary
 
 
@@ -136,6 +155,7 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         "budget_scope",
         "last_fetch_mode",
         "last_full_refresh_reason",
+        "planned_full_refresh_deferred_reason",
         "projected_request_source",
     ):
         field_value = value.get(field)
@@ -163,6 +183,8 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         summary["projected_request_count"] = int(value["projected_request_count"])
     if isinstance(value.get("projected_request_total"), (int, float)):
         summary["projected_request_total"] = int(value["projected_request_total"])
+    if isinstance(value.get("planned_full_refresh_budget_deferred"), bool):
+        summary["planned_full_refresh_budget_deferred"] = value["planned_full_refresh_budget_deferred"]
     if isinstance(value.get("projected_ratio"), (int, float)):
         summary["projected_ratio"] = round(float(value["projected_ratio"]), 6)
     if isinstance(value.get("last_request_delta"), (int, float)):
