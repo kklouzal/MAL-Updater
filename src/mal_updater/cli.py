@@ -1272,6 +1272,12 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             planned_full_refresh_reason = task_payload.get("planned_full_refresh_reason") if isinstance(task_payload.get("planned_full_refresh_reason"), str) else None
             if planned_full_refresh_reason is not None:
                 print(f"task_{task_name}_planned_full_refresh_reason={planned_full_refresh_reason}")
+            planned_full_refresh_due_at = task_payload.get("planned_full_refresh_due_at") if isinstance(task_payload.get("planned_full_refresh_due_at"), str) else None
+            if planned_full_refresh_due_at is not None:
+                print(f"task_{task_name}_planned_full_refresh_due_at={planned_full_refresh_due_at}")
+            planned_full_refresh_overdue_seconds = task_payload.get("planned_full_refresh_overdue_seconds") if isinstance(task_payload.get("planned_full_refresh_overdue_seconds"), int) else None
+            if planned_full_refresh_overdue_seconds is not None:
+                print(f"task_{task_name}_planned_full_refresh_overdue_seconds={planned_full_refresh_overdue_seconds}")
             planned_full_refresh_budget_deferred = task_payload.get("planned_full_refresh_budget_deferred") if isinstance(task_payload.get("planned_full_refresh_budget_deferred"), bool) else None
             if planned_full_refresh_budget_deferred is not None:
                 print(f"task_{task_name}_planned_full_refresh_budget_deferred={planned_full_refresh_budget_deferred}")

@@ -113,12 +113,20 @@ def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state
         return {}
     provider = task_name.removeprefix("sync_fetch_")
     spec = TaskSpec(name=task_name, every_seconds=int(task_state.get("every_seconds", 0) or 0), budget_provider=provider)
-    planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=datetime.now(timezone.utc).timestamp())
+    now_dt = datetime.now(timezone.utc)
+    planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now_dt.timestamp())
     if planned_fetch_mode is None:
         return {}
     summary: dict[str, Any] = {"planned_fetch_mode": planned_fetch_mode}
     if planned_full_refresh_reasons:
         summary["planned_full_refresh_reason"] = "+".join(planned_full_refresh_reasons)
+        if "periodic_cadence" in planned_full_refresh_reasons:
+            anchor_epoch = task_state.get("full_refresh_anchor_epoch")
+            interval_seconds = int(config.service.full_refresh_every_seconds)
+            if isinstance(anchor_epoch, (int, float)) and anchor_epoch > 0 and interval_seconds > 0:
+                due_at = datetime.fromtimestamp(float(anchor_epoch) + float(interval_seconds), tz=timezone.utc)
+                summary["planned_full_refresh_due_at"] = due_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+                summary["planned_full_refresh_overdue_seconds"] = max(0, int((now_dt - due_at).total_seconds()))
         last_result = task_state.get("last_result")
         deferred_reason = None
         if isinstance(last_result, dict):

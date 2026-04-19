@@ -349,6 +349,8 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_fetch_crunchyroll_budget_scope=provider", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_fetch_mode=full_refresh", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_reason=periodic_cadence", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_due_at=1970-01-02T00:00:01Z", stdout)
+        self.assertRegex(stdout, r"task_sync_fetch_crunchyroll_planned_full_refresh_overdue_seconds=\d+")
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_budget_deferred=True", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_deferred_reason=periodic_cadence", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
@@ -393,6 +395,8 @@ class ServiceStatusTests(unittest.TestCase):
         fetch_summary = payload["task_state"]["sync_fetch_crunchyroll"]
         self.assertEqual("full_refresh", fetch_summary["planned_fetch_mode"])
         self.assertEqual("periodic_cadence", fetch_summary["planned_full_refresh_reason"])
+        self.assertEqual("1970-01-02T00:00:01Z", fetch_summary["planned_full_refresh_due_at"])
+        self.assertGreater(fetch_summary["planned_full_refresh_overdue_seconds"], 0)
         self.assertNotIn("planned_full_refresh_budget_deferred", fetch_summary)
 
     def test_doctor_service_surfaces_budget_deferred_full_refresh_pressure(self) -> None:
@@ -443,6 +447,8 @@ class ServiceStatusTests(unittest.TestCase):
         fetch_summary = payload["task_state"]["sync_fetch_crunchyroll"]
         self.assertEqual("full_refresh", fetch_summary["planned_fetch_mode"])
         self.assertEqual("periodic_cadence", fetch_summary["planned_full_refresh_reason"])
+        self.assertEqual("1970-01-02T00:00:01Z", fetch_summary["planned_full_refresh_due_at"])
+        self.assertGreater(fetch_summary["planned_full_refresh_overdue_seconds"], 0)
         self.assertTrue(fetch_summary["planned_full_refresh_budget_deferred"])
         self.assertEqual("periodic_cadence", fetch_summary["planned_full_refresh_deferred_reason"])
         self.assertEqual("periodic_cadence", fetch_summary["last_result"]["deferred_full_refresh_reason"])
