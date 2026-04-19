@@ -8,6 +8,7 @@ import subprocess
 from typing import Any
 
 from .config import AppConfig, ensure_directories, load_config
+from .service_runtime import TaskSpec, _planned_fetch_mode
 
 SERVICE_NAME = "mal-updater.service"
 _RECENT_LOG_LINES = 20
@@ -97,7 +98,21 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
     return summary or None
 
 
-def _summarize_task_state(value: object) -> dict[str, Any] | None:
+def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state: dict[str, Any]) -> dict[str, Any]:
+    if not task_name.startswith("sync_fetch_"):
+        return {}
+    provider = task_name.removeprefix("sync_fetch_")
+    spec = TaskSpec(name=task_name, every_seconds=int(task_state.get("every_seconds", 0) or 0), budget_provider=provider)
+    planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=datetime.now(timezone.utc).timestamp())
+    if planned_fetch_mode is None:
+        return {}
+    summary: dict[str, Any] = {"planned_fetch_mode": planned_fetch_mode}
+    if planned_full_refresh_reasons:
+        summary["planned_full_refresh_reason"] = "+".join(planned_full_refresh_reasons)
+    return summary
+
+
+def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     summary: dict[str, Any] = {}
@@ -161,6 +176,7 @@ def _summarize_task_state(value: object) -> dict[str, Any] | None:
     failure_backoff_until = _parse_iso_timestamp(value.get("failure_backoff_until"))
     if failure_backoff_until is not None:
         summary["failure_backoff_remaining_seconds"] = max(0, int((failure_backoff_until - datetime.now(timezone.utc)).total_seconds()))
+    summary.update(_current_planned_fetch_summary(config, task_name, value))
     last_result = _summarize_last_result(value.get("last_result"))
     if last_result is not None:
         summary["last_result"] = last_result
@@ -267,9 +283,10 @@ def doctor_service(config: AppConfig | None = None) -> dict[str, Any]:
         raw_tasks = service_state.get("tasks")
         if isinstance(raw_tasks, dict):
             for task_name, raw_task_state in raw_tasks.items():
-                summary = _summarize_task_state(raw_task_state)
+                normalized_task_name = str(task_name)
+                summary = _summarize_task_state(config, normalized_task_name, raw_task_state)
                 if summary is not None:
-                    task_state[str(task_name)] = summary
+                    task_state[normalized_task_name] = summary
 
     payload = {
         **status,
