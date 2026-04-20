@@ -1289,6 +1289,68 @@ class RecommendationTests(unittest.TestCase):
         self.assertGreater(results[0].context["metadata_affinity_bonus"], results[1].context["metadata_affinity_bonus"])
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_prefers_higher_mean_inside_metadata_rich_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Higher Mean Metadata Rich", mean=8.6, popularity=500, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(400, title="Lower Mean Metadata Rich", mean=8.1, popularity=500, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Higher Mean Metadata Rich", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Lower Mean Metadata Rich", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(3, results[0].context["metadata_match_dimensions"])
+        self.assertEqual(2, results[0].context["metadata_quality_bonus"])
+        self.assertEqual("elite", results[0].context["metadata_mean_band"])
+        self.assertIsNone(results[0].context["metadata_popularity_band"])
+        self.assertEqual(0, results[1].context["metadata_quality_bonus"])
+        self.assertIn(
+            "metadata-rich tie-break also favored stronger MAL quality/adoption signals (elite MAL mean)",
+            results[0].reasons,
+        )
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_prefers_broader_adoption_inside_metadata_rich_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Broadly Adopted Metadata Rich", mean=8.0, popularity=300, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(400, title="Less Adopted Metadata Rich", mean=8.0, popularity=450, genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Broadly Adopted Metadata Rich", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Less Adopted Metadata Rich", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(3, results[0].context["metadata_match_dimensions"])
+        self.assertEqual(1, results[0].context["metadata_quality_bonus"])
+        self.assertIsNone(results[0].context["metadata_mean_band"])
+        self.assertEqual("broad", results[0].context["metadata_popularity_band"])
+        self.assertEqual(0, results[1].context["metadata_quality_bonus"])
+        self.assertIn(
+            "metadata-rich tie-break also favored stronger MAL quality/adoption signals (broad catalog adoption)",
+            results[0].reasons,
+        )
+        self.assertGreater(results[0].priority, results[1].priority)
+
     def test_discovery_candidate_skips_direct_franchise_relations_from_seed_titles(self) -> None:
         self._insert_series(
             "seed-a",
