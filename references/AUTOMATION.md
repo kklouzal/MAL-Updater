@@ -65,7 +65,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 - current API-usage snapshot when available
 - recent `service.log` tail lines
 - parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
-- a terse `service-status --format summary` view for quick operator checks and log-friendly output
+- a terse `service-status --format summary` view for quick operator checks and log-friendly output; that summary now also preserves the parsed health artifact's top maintenance command metadata (`reason_code`, automation-safe posture, auth-interaction posture, and auth failure/remediation classification when present) instead of only echoing the bare command string
 
 ## Repo-native manual cycle commands and compatibility wrappers
 
@@ -90,5 +90,7 @@ Those commands still write runtime artifacts under `.MAL-Updater/state/` and `.M
 5. `service-status`
 6. `service-run-once`
 7. `health-check --format summary`
+
+`health-check --format summary` now mirrors the top maintenance command metadata from the richer JSON payload too, so shell/log consumers can see not just the recommended command but also why it was chosen and whether it is automation-safe or auth-interactive.
 
 Do not claim unattended automation is installed or healthy until the installer, service-status, and health-check all agree.

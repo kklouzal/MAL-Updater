@@ -1109,21 +1109,9 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 if isinstance(next_auth_remediation_kind, str) and next_auth_remediation_kind:
                     print(f"provider_{provider_name}_next_command_auth_remediation_kind={next_auth_remediation_kind}")
         top_command = payload.get("recommended_command") if isinstance(payload.get("recommended_command"), dict) else None
-        if isinstance(top_command, dict) and top_command.get("command"):
-            print("maintenance_recommended_command=" + str(top_command["command"]))
-            reason_code = top_command.get("reason_code")
-            if isinstance(reason_code, str) and reason_code:
-                print(f"maintenance_recommended_reason_code={reason_code}")
-            if top_command.get("automation_safe") is not None:
-                print(f"maintenance_recommended_automation_safe={top_command['automation_safe']}")
-            if top_command.get("requires_auth_interaction") is not None:
-                print(f"maintenance_recommended_requires_auth_interaction={top_command['requires_auth_interaction']}")
+        _emit_recommended_command_summary("maintenance_recommended", top_command)
         top_auto_command = payload.get("recommended_automation_command") if isinstance(payload.get("recommended_automation_command"), dict) else None
-        if isinstance(top_auto_command, dict) and top_auto_command.get("command"):
-            print("maintenance_recommended_auto_command=" + str(top_auto_command["command"]))
-            reason_code = top_auto_command.get("reason_code")
-            if isinstance(reason_code, str) and reason_code:
-                print(f"maintenance_recommended_auto_reason_code={reason_code}")
+        _emit_recommended_command_summary("maintenance_recommended_auto", top_auto_command)
         for item in onboarding_steps:
             print(f"next_step={item['step']}: {item['details']}")
             command = item.get("command")
@@ -1133,6 +1121,31 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
 
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+
+def _emit_recommended_command_summary(prefix: str, command_payload: object) -> None:
+    if not isinstance(command_payload, dict):
+        return
+    command = command_payload.get("command")
+    if not isinstance(command, str) or not command:
+        return
+    print(f"{prefix}_command={command}")
+    reason_code = command_payload.get("reason_code")
+    if isinstance(reason_code, str) and reason_code:
+        print(f"{prefix}_reason_code={reason_code}")
+    automation_safe = command_payload.get("automation_safe")
+    if automation_safe is not None:
+        print(f"{prefix}_automation_safe={automation_safe}")
+    requires_auth_interaction = command_payload.get("requires_auth_interaction")
+    if requires_auth_interaction is not None:
+        print(f"{prefix}_requires_auth_interaction={requires_auth_interaction}")
+    auth_failure_kind = command_payload.get("auth_failure_kind")
+    if isinstance(auth_failure_kind, str) and auth_failure_kind:
+        print(f"{prefix}_auth_failure_kind={auth_failure_kind}")
+    auth_remediation_kind = command_payload.get("auth_remediation_kind")
+    if isinstance(auth_remediation_kind, str) and auth_remediation_kind:
+        print(f"{prefix}_auth_remediation_kind={auth_remediation_kind}")
 
 
 
@@ -1177,12 +1190,8 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
 
         maintenance = health_latest.get("maintenance")
         if isinstance(maintenance, dict):
-            recommended_command = maintenance.get("recommended_command")
-            if isinstance(recommended_command, dict) and isinstance(recommended_command.get("command"), str):
-                print("maintenance_recommended_command=" + recommended_command["command"])
-            recommended_automation_command = maintenance.get("recommended_automation_command")
-            if isinstance(recommended_automation_command, dict) and isinstance(recommended_automation_command.get("command"), str):
-                print("maintenance_recommended_auto_command=" + recommended_automation_command["command"])
+            _emit_recommended_command_summary("maintenance_recommended", maintenance.get("recommended_command"))
+            _emit_recommended_command_summary("maintenance_recommended_auto", maintenance.get("recommended_automation_command"))
 
     api_usage = payload.get("api_usage")
     if isinstance(api_usage, dict):
@@ -2212,11 +2221,9 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
     if install_units_command:
         print("automation_install_command=" + install_units_command)
     top_command = _select_maintenance_command(recommended_commands)
-    if isinstance(top_command, dict) and top_command.get("command"):
-        print("maintenance_recommended_command=" + str(top_command["command"]))
+    _emit_recommended_command_summary("maintenance_recommended", top_command)
     top_auto_command = _select_maintenance_command(recommended_commands, require_automation_safe=True)
-    if isinstance(top_auto_command, dict) and top_auto_command.get("command"):
-        print("maintenance_recommended_auto_command=" + str(top_auto_command["command"]))
+    _emit_recommended_command_summary("maintenance_recommended_auto", top_auto_command)
     if recommended_next:
         command = recommended_next.get("drilldown_command")
         if command:

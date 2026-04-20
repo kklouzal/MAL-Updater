@@ -1340,10 +1340,16 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", stdout)
+        self.assertIn("maintenance_recommended_reason_code=missing_mal_auth_material", stdout)
+        self.assertIn("maintenance_recommended_automation_safe=False", stdout)
+        self.assertIn("maintenance_recommended_requires_auth_interaction=True", stdout)
         self.assertIn(
             "maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             stdout,
         )
+        self.assertIn("maintenance_recommended_auto_reason_code=refresh_ingested_snapshot", stdout)
+        self.assertIn("maintenance_recommended_auto_automation_safe=True", stdout)
+        self.assertIn("maintenance_recommended_auto_requires_auth_interaction=False", stdout)
 
     def test_health_check_summary_format_surfaces_automation_drift_hint_when_units_are_outdated(self) -> None:
         target_dir = self._install_repo_owned_automation_assets()

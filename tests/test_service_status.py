@@ -286,8 +286,18 @@ class ServiceStatusTests(unittest.TestCase):
                     "healthy": False,
                     "warnings": [{"code": "open_review_queue"}],
                     "maintenance": {
-                        "recommended_command": {"command": "PYTHONPATH=src python3 -m mal_updater.cli review-queue-next"},
-                        "recommended_automation_command": {"command": "PYTHONPATH=src python3 -m mal_updater.cli review-queue-apply-worklist --limit 1"},
+                        "recommended_command": {
+                            "command": "PYTHONPATH=src python3 -m mal_updater.cli review-queue-next",
+                            "reason_code": "review_queue_backlog",
+                            "automation_safe": True,
+                            "requires_auth_interaction": False,
+                        },
+                        "recommended_automation_command": {
+                            "command": "PYTHONPATH=src python3 -m mal_updater.cli review-queue-apply-worklist --limit 1",
+                            "reason_code": "apply_review_queue_worklist",
+                            "automation_safe": True,
+                            "requires_auth_interaction": False,
+                        },
                     },
                 }
             ),
@@ -313,7 +323,13 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("health_warning_count=1", stdout)
         self.assertIn("health_warnings=open_review_queue", stdout)
         self.assertIn("maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli review-queue-next", stdout)
+        self.assertIn("maintenance_recommended_reason_code=review_queue_backlog", stdout)
+        self.assertIn("maintenance_recommended_automation_safe=True", stdout)
+        self.assertIn("maintenance_recommended_requires_auth_interaction=False", stdout)
         self.assertIn("maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli review-queue-apply-worklist --limit 1", stdout)
+        self.assertIn("maintenance_recommended_auto_reason_code=apply_review_queue_worklist", stdout)
+        self.assertIn("maintenance_recommended_auto_automation_safe=True", stdout)
+        self.assertIn("maintenance_recommended_auto_requires_auth_interaction=False", stdout)
         self.assertIn("api_mal_request_count=4", stdout)
         self.assertIn("api_crunchyroll_success_count=2", stdout)
         self.assertIn("task_sync_last_status=ok", stdout)
