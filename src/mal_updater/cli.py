@@ -1332,6 +1332,35 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             failure_backoff_consecutive_failures = task_payload.get("failure_backoff_consecutive_failures") if isinstance(task_payload.get("failure_backoff_consecutive_failures"), int) else None
             if failure_backoff_consecutive_failures is not None:
                 print(f"task_{task_name}_failure_backoff_consecutive_failures={failure_backoff_consecutive_failures}")
+            last_result = task_payload.get("last_result") if isinstance(task_payload.get("last_result"), dict) else None
+            if last_result is not None:
+                last_result_status = last_result.get("status") if isinstance(last_result.get("status"), str) else None
+                if last_result_status is not None:
+                    print(f"task_{task_name}_last_result_status={last_result_status}")
+                last_result_label = last_result.get("label") if isinstance(last_result.get("label"), str) else None
+                if last_result_label is not None:
+                    print(f"task_{task_name}_last_result_label={last_result_label}")
+                last_result_returncode = last_result.get("returncode") if isinstance(last_result.get("returncode"), int) else None
+                if last_result_returncode is not None:
+                    print(f"task_{task_name}_last_result_returncode={last_result_returncode}")
+                last_result_reason = last_result.get("reason") if isinstance(last_result.get("reason"), str) else None
+                if last_result_reason is not None:
+                    print(f"task_{task_name}_last_result_reason={last_result_reason}")
+                last_result_fetch_mode = last_result.get("fetch_mode") if isinstance(last_result.get("fetch_mode"), str) else None
+                if last_result_fetch_mode is not None:
+                    print(f"task_{task_name}_last_result_fetch_mode={last_result_fetch_mode}")
+                last_result_full_refresh_reason = last_result.get("full_refresh_reason") if isinstance(last_result.get("full_refresh_reason"), str) else None
+                if last_result_full_refresh_reason is not None:
+                    print(f"task_{task_name}_last_result_full_refresh_reason={last_result_full_refresh_reason}")
+                last_result_deferred_full_refresh_reason = last_result.get("deferred_full_refresh_reason") if isinstance(last_result.get("deferred_full_refresh_reason"), str) else None
+                if last_result_deferred_full_refresh_reason is not None:
+                    print(f"task_{task_name}_last_result_deferred_full_refresh_reason={last_result_deferred_full_refresh_reason}")
+                last_result_stdout_snippet = last_result.get("stdout_snippet") if isinstance(last_result.get("stdout_snippet"), str) else None
+                if last_result_stdout_snippet is not None:
+                    print(f"task_{task_name}_last_result_stdout_snippet={last_result_stdout_snippet}")
+                last_result_stderr_snippet = last_result.get("stderr_snippet") if isinstance(last_result.get("stderr_snippet"), str) else None
+                if last_result_stderr_snippet is not None:
+                    print(f"task_{task_name}_last_result_stderr_snippet={last_result_stderr_snippet}")
 
     service_log_tail = payload.get("service_log_tail")
     if isinstance(service_log_tail, list) and service_log_tail:

@@ -267,8 +267,10 @@ class ServiceStatusTests(unittest.TestCase):
                                 "status": "ok",
                                 "label": "sync_fetch_crunchyroll",
                                 "returncode": 0,
+                                "reason": "completed",
                                 "fetch_mode": "incremental",
-                                "deferred_full_refresh_reason": "periodic_cadence"
+                                "deferred_full_refresh_reason": "periodic_cadence",
+                                "stdout": "incremental fetch completed\nwith operator detail"
                             },
                             "next_due_at": "2026-03-21T03:52:00Z"
                         },
@@ -363,6 +365,13 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_floor_seconds=7200", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_consecutive_failures=2", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_budget_scope=provider", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_status=ok", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_label=sync_fetch_crunchyroll", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_returncode=0", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_reason=completed", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_fetch_mode=incremental", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_deferred_full_refresh_reason=periodic_cadence", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_last_result_stdout_snippet=incremental fetch completed", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_fetch_mode=full_refresh", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_reason=periodic_cadence", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_due_at=1970-01-02T00:00:01Z", stdout)
