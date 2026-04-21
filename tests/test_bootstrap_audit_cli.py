@@ -225,6 +225,126 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
         self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
 
+    def test_bootstrap_audit_surfaces_health_recommended_provider_full_refresh(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets", "state/health"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (runtime_root / "state" / "health" / "latest-health-check.json").write_text(
+            json.dumps(
+                {
+                    "maintenance": {
+                        "recommended_commands": [
+                            {
+                                "reason_code": "refresh_full_snapshot",
+                                "detail": "Run a full-refresh Crunchyroll ingest so untouched older rows are refreshed instead of only the incremental overlap page",
+                                "command_args": [
+                                    "crunchyroll-fetch-snapshot",
+                                    "--full-refresh",
+                                    "--out",
+                                    ".MAL-Updater/cache/live-crunchyroll-snapshot.json",
+                                    "--ingest",
+                                ],
+                            }
+                        ]
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(payload["providers"]["crunchyroll"]["ready"])
+        self.assertEqual("ready-health-recommends-full-refresh", payload["providers"]["crunchyroll"]["operation_mode"])
+        self.assertEqual(
+            "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --full-refresh --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
+            payload["providers"]["crunchyroll"]["operation_guidance"]["next_command"],
+        )
+        self.assertEqual("refresh_full_snapshot", payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_reason_code"])
+        self.assertTrue(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_automation_safe"])
+        self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_requires_auth_interaction"])
+        refresh_command = next(
+            item
+            for item in payload["recommended_commands"]
+            if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --full-refresh --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest"
+        )
+        self.assertEqual("refresh_full_snapshot", refresh_command["reason_code"])
+        self.assertTrue(refresh_command["automation_safe"])
+        self.assertFalse(refresh_command["requires_auth_interaction"])
+
+    def test_bootstrap_audit_summary_surfaces_health_recommended_provider_full_refresh(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets", "state/health"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "hidive_password.txt").write_text("top-secret\n", encoding="utf-8")
+        hidive_state_root = runtime_root / "state" / "hidive" / "default"
+        hidive_state_root.mkdir(parents=True, exist_ok=True)
+        (hidive_state_root / "authorisation_token.txt").write_text("access-token\n", encoding="utf-8")
+        (hidive_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "state" / "health" / "latest-health-check.json").write_text(
+            json.dumps(
+                {
+                    "maintenance": {
+                        "recommended_commands": [
+                            {
+                                "reason_code": "refresh_full_snapshot",
+                                "detail": "Run a full-refresh HIDIVE ingest so untouched older rows are refreshed instead of only the incremental overlap page",
+                                "command_args": [
+                                    "provider-fetch-snapshot",
+                                    "--provider",
+                                    "hidive",
+                                    "--full-refresh",
+                                    "--out",
+                                    ".MAL-Updater/cache/live-hidive-snapshot.json",
+                                    "--ingest",
+                                ],
+                            }
+                        ]
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("provider_hidive_ready=True", stdout)
+        self.assertIn("provider_hidive_operation_mode=ready-health-recommends-full-refresh", stdout)
+        self.assertIn(
+            "provider_hidive_next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --full-refresh --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest",
+            stdout,
+        )
+        self.assertIn("provider_hidive_next_command_reason_code=refresh_full_snapshot", stdout)
+        self.assertIn("provider_hidive_next_command_automation_safe=True", stdout)
+        self.assertIn("provider_hidive_next_command_requires_auth_interaction=False", stdout)
+        self.assertIn(
+            "maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --full-refresh --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest",
+            stdout,
+        )
+        self.assertIn("maintenance_recommended_auto_reason_code=refresh_full_snapshot", stdout)
+        self.assertIn("maintenance_recommended_auto_automation_safe=True", stdout)
+        self.assertIn("maintenance_recommended_auto_requires_auth_interaction=False", stdout)
+
     def test_bootstrap_audit_does_not_treat_flock_as_a_required_runtime_dependency(self) -> None:
         with patch("mal_updater.cli.shutil.which") as which:
             which.side_effect = lambda command: None if command == "flock" else f"/usr/bin/{command}"

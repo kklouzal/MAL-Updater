@@ -260,6 +260,71 @@ def _guidance_command_fields(
 
 
 
+def _provider_from_refresh_command_args(command_args: object) -> str | None:
+    if not isinstance(command_args, list) or not command_args:
+        return None
+    if command_args[0] == "crunchyroll-fetch-snapshot":
+        return "crunchyroll"
+    if len(command_args) >= 3 and command_args[0] == "provider-fetch-snapshot" and command_args[1] == "--provider" and isinstance(command_args[2], str):
+        return str(command_args[2])
+    return None
+
+
+
+def _provider_bootstrap_health_refresh_recommendation(
+    config: AppConfig,
+    *,
+    provider: str,
+    service_state: dict[str, object] | None,
+) -> dict[str, object] | None:
+    path = config.health_latest_json_path
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    maintenance = payload.get("maintenance")
+    if not isinstance(maintenance, dict):
+        return None
+    commands = maintenance.get("recommended_commands")
+    if not isinstance(commands, list):
+        return None
+    try:
+        health_mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if isinstance(service_state, dict):
+        tasks = service_state.get("tasks")
+        if isinstance(tasks, dict):
+            task_state = tasks.get(f"sync_fetch_{provider}")
+            if isinstance(task_state, dict):
+                last_full_refresh_epoch = task_state.get("last_successful_full_refresh_epoch")
+                if isinstance(last_full_refresh_epoch, (int, float)) and float(last_full_refresh_epoch) >= float(health_mtime):
+                    return None
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        if command.get("reason_code") != "refresh_full_snapshot":
+            continue
+        if _provider_from_refresh_command_args(command.get("command_args")) != provider:
+            continue
+        command_args = command.get("command_args")
+        if not isinstance(command_args, list) or not all(isinstance(part, str) for part in command_args):
+            continue
+        detail = command.get("detail") if isinstance(command.get("detail"), str) else None
+        return {
+            "reason_code": "refresh_full_snapshot",
+            "command_args": list(command_args),
+            "command": _build_review_queue_command(list(command_args)),
+            "detail": detail,
+        }
+    return None
+
+
+
 def _provider_bootstrap_guidance_status(
     *,
     provider_name: str,
@@ -268,6 +333,7 @@ def _provider_bootstrap_guidance_status(
     transport_ready: bool,
     bootstrap_command: str,
     auth_issue: dict[str, object] | None = None,
+    health_refresh_recommendation: dict[str, object] | None = None,
 ) -> dict[str, object]:
     title = provider_name.capitalize()
     intended = credentials_present or session_present
@@ -354,6 +420,28 @@ def _provider_bootstrap_guidance_status(
             ),
             "remediation_kind": remediation_kind,
             "remediation_detail": remediation_detail,
+        }
+
+    if credentials_present and session_present and isinstance(health_refresh_recommendation, dict):
+        refresh_command = health_refresh_recommendation.get("command") if isinstance(health_refresh_recommendation.get("command"), str) else None
+        refresh_detail = health_refresh_recommendation.get("detail") if isinstance(health_refresh_recommendation.get("detail"), str) else None
+        details = (
+            f"{title} credentials and session state are staged, so unattended fetches are bootstrapped, but the latest health artifact still recommends a conservative full refresh before treating cached provider coverage as current."
+        )
+        if refresh_detail:
+            details += f" Latest maintenance signal: {refresh_detail}"
+        return {
+            "mode": "ready-health-recommends-full-refresh",
+            "intended": True,
+            "partially_staged": False,
+            "ready": True,
+            "details": details,
+            **_guidance_command_fields(
+                command=refresh_command,
+                reason_code="refresh_full_snapshot",
+                automation_safe=True,
+                requires_auth_interaction=False,
+            ),
         }
 
     if credentials_present and session_present:
@@ -590,6 +678,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         for provider in ("crunchyroll", "hidive")
         if (payload := _provider_bootstrap_auth_issue(provider=provider, config=config, service_state=service_state)) is not None
     }
+    provider_health_refresh_recommendations = {
+        provider: payload
+        for provider in ("crunchyroll", "hidive")
+        if (payload := _provider_bootstrap_health_refresh_recommendation(config, provider=provider, service_state=service_state)) is not None
+    }
     mal_guidance = _mal_bootstrap_guidance_status(
         client_id_present=mal_app_present,
         oauth_present=mal_oauth_present,
@@ -603,6 +696,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         transport_ready=dependency_checks["curl_cffi"],
         bootstrap_command=crunchyroll_bootstrap_command,
         auth_issue=provider_auth_issues.get("crunchyroll"),
+        health_refresh_recommendation=provider_health_refresh_recommendations.get("crunchyroll"),
     )
     hidive_guidance = _provider_bootstrap_guidance_status(
         provider_name="hidive",
@@ -611,6 +705,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         transport_ready=True,
         bootstrap_command=hidive_bootstrap_command,
         auth_issue=provider_auth_issues.get("hidive"),
+        health_refresh_recommendation=provider_health_refresh_recommendations.get("hidive"),
     )
     operation_modes = _bootstrap_operation_mode_status(
         runtime_initialized=bool(runtime_initialization["ready"]),
@@ -813,6 +908,26 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             requires_auth_interaction=False,
             auth_failure_kind=str(provider_auth_issues["hidive"].get("auth_failure_kind") or "") or None,
             auth_remediation_kind=str(provider_auth_issues["hidive"].get("auth_remediation_kind") or "") or None,
+        )
+
+    for provider_name, refresh_payload in provider_health_refresh_recommendations.items():
+        refresh_command = refresh_payload.get("command") if isinstance(refresh_payload.get("command"), str) else None
+        refresh_command_args = refresh_payload.get("command_args") if isinstance(refresh_payload.get("command_args"), list) else []
+        refresh_details = refresh_payload.get("detail") if isinstance(refresh_payload.get("detail"), str) else None
+        provider_title = "Crunchyroll" if provider_name == "crunchyroll" else "HIDIVE" if provider_name == "hidive" else provider_name
+        details = f"Run a conservative full-refresh {provider_title} ingest because the latest health artifact still reports partial provider coverage."
+        if refresh_details:
+            details += f" Latest maintenance signal: {refresh_details}"
+        add_onboarding_step(
+            step=f"refresh-{provider_name}-full-snapshot",
+            details=details,
+            user_action_required=False,
+            command=refresh_command,
+            command_args=refresh_command_args,
+            applies_to=provider_name,
+            reason_code="refresh_full_snapshot",
+            automation_safe=True,
+            requires_auth_interaction=False,
         )
     if not dependency_checks["systemctl"]:
         add_onboarding_step(
