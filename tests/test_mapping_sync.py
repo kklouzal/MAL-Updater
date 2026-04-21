@@ -1050,6 +1050,22 @@ class MappingTests(unittest.TestCase):
         self.assertIn("A Certain Scientific Railgun S", queries)
         self.assertLess(queries.index("A Certain Scientific Railgun Season 2"), queries.index("A Certain Scientific Railgun S"))
 
+    def test_build_search_queries_adds_generic_stage_variants_for_later_season(self) -> None:
+        queries = build_search_queries(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-stage-query",
+                title="Example Show",
+                season_title="Example Show Season 2 (English Dub)",
+                season_number=2,
+            )
+        )
+
+        self.assertIn("Example Show Second Stage", queries)
+        self.assertIn("Example Show 2nd Stage", queries)
+        self.assertLess(queries.index("Example Show 2nd Season"), queries.index("Example Show Second Stage"))
+        self.assertLess(queries.index("Example Show Second Stage"), queries.index("Example Show"))
+
     def test_build_search_queries_strips_broadcast_and_uncensored_suffix_noise(self) -> None:
         queries = build_search_queries(
             SeriesMappingInput(
@@ -3181,6 +3197,81 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.status, "exact")
         self.assertIsNotNone(result.chosen_candidate)
         self.assertEqual(result.chosen_candidate.mal_anime_id, 200)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_uses_generic_stage_query_for_later_season_without_alias_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict[str, object]:
+                if query == "Example Show Second Stage":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 220,
+                                    "title": "Example Show Second Stage",
+                                    "alternative_titles": {"en": "Example Show Second Stage"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            }
+                        ]
+                    }
+                if query == "Example Show":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 100,
+                                    "title": "Example Show",
+                                    "alternative_titles": {"en": "Example Show"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-generic-stage-query",
+                        title="Example Show",
+                        season_title="Example Show Season 2 (English Dub)",
+                        season_number=2,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 220)
+        self.assertEqual(result.chosen_candidate.matched_query, "Example Show Second Stage")
+        self.assertIn("exact_normalized_title", result.rationale)
         self.assertIn("season_number_match=2", result.rationale)
         self.assertIn("exact_later_installment_alignment", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))

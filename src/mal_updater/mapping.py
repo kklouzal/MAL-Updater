@@ -64,6 +64,10 @@ _ORDINAL_COUR_RE = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour\b",
     re.IGNORECASE,
 )
+_ORDINAL_STAGE_RE = re.compile(
+    r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+stage\b",
+    re.IGNORECASE,
+)
 _COUR_NUMBER_RE = re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE)
 _FINAL_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
 _PLUS_INSTALLMENT_RE = re.compile(r"[+＋](?:!+)?(?:\s*[)\]]\s*)?$")
@@ -72,6 +76,10 @@ _STANDALONE_SEASON_RE = re.compile(r"^season\s+\d+$", re.IGNORECASE)
 _STANDALONE_PART_RE = re.compile(r"^part\s+\d+$", re.IGNORECASE)
 _STANDALONE_COUR_RE = re.compile(
     r"^(?:cour\s+\d+|(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour)$",
+    re.IGNORECASE,
+)
+_STANDALONE_STAGE_RE = re.compile(
+    r"^(?:(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+stage)$",
     re.IGNORECASE,
 )
 _STANDALONE_FINAL_SEASON_RE = re.compile(r"^final\s+season(?:\s+part\s+\d+)?$", re.IGNORECASE)
@@ -86,6 +94,7 @@ _INSTALLMENT_ONLY_EXTENSION_RE = re.compile(
     r"part\s*\d+|"
     r"cour\s*\d+|"
     r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour|"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+stage|"
     r"final\s+season(?:\s+part\s+\d+)?|"
     r"[ivx]+|"
     r"\d+|"
@@ -132,6 +141,8 @@ _NUMBER_TO_ORDINAL = {
     9: "9th",
     10: "10th",
 }
+
+_NUMBER_TO_WORD_ORDINAL = {value: key for key, value in _ORDINAL_TO_NUMBER.items()}
 
 _NUMBER_TO_ROMAN = {
     1: "I",
@@ -277,6 +288,9 @@ def _extract_standalone_installment_number(value: str | None) -> int | None:
         ordinal_value = _parse_ordinal_token(cleaned)
         if ordinal_value is not None and ordinal_value >= 2:
             return ordinal_value
+    stage_number = _extract_stage_number(cleaned)
+    if stage_number is not None and _STANDALONE_STAGE_RE.fullmatch(cleaned):
+        return stage_number
     return None
 
 
@@ -291,6 +305,7 @@ def _season_title_needs_base_title(title: str, season_title: str) -> bool:
         _STANDALONE_SEASON_RE.fullmatch(season_norm)
         or _STANDALONE_PART_RE.fullmatch(season_norm)
         or _STANDALONE_COUR_RE.fullmatch(season_norm)
+        or _STANDALONE_STAGE_RE.fullmatch(season_norm)
         or _STANDALONE_FINAL_SEASON_RE.fullmatch(season_norm)
         or _extract_standalone_installment_number(season_norm) is not None
     )
@@ -338,9 +353,12 @@ def _trim_non_installment_subtitle(value: str | None) -> str:
 def _season_number_query_variants(title: str, season_number: int | None) -> list[str]:
     if not title or season_number is None or season_number < 2:
         return []
+    ordinal_word = _NUMBER_TO_WORD_ORDINAL.get(season_number, f"{season_number}th")
     variants = [
         f"{title} Season {season_number}",
         f"{title} {_NUMBER_TO_ORDINAL.get(season_number, f'{season_number}th')} Season",
+        f"{title} {ordinal_word.title()} Stage",
+        f"{title} {_NUMBER_TO_ORDINAL.get(season_number, f'{season_number}th')} Stage",
         f"{title} {season_number}",
     ]
     roman = _NUMBER_TO_ROMAN.get(season_number)
@@ -489,6 +507,15 @@ def _extract_cour_number(value: str | None) -> int | None:
     return _parse_ordinal_token(match.group(1))
 
 
+def _extract_stage_number(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = _ORDINAL_STAGE_RE.search(value)
+    if not match:
+        return None
+    return _parse_ordinal_token(match.group(1))
+
+
 def _extract_terminal_installment_number(value: str | None) -> int | None:
     if not value:
         return None
@@ -534,6 +561,9 @@ def _extract_title_hints(value: str | None) -> set[str]:
     if cour_number is not None:
         hints.add(f"cour:{cour_number}")
         hints.add(f"split:{cour_number}")
+    stage_number = _extract_stage_number(cleaned)
+    if stage_number is not None:
+        hints.add(f"season:{stage_number}")
     roman_number = _extract_roman_installment_number(cleaned)
     if roman_number is not None:
         hints.add(f"roman:{roman_number}")
@@ -713,6 +743,8 @@ def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str
                 title_season_number = _extract_standalone_installment_number(series.season_title)
             if title_season_number is None:
                 title_season_number = _extract_terminal_installment_number(series.season_title)
+            if title_season_number is None:
+                title_season_number = _extract_stage_number(series.season_title)
             if title_season_number is None:
                 title_season_number = _extract_roman_installment_number(series.season_title)
         if title_season_number is None:
