@@ -141,21 +141,23 @@ def _projected_request_delta_from_history(
     history: list[int],
     *,
     percentile: float | None,
-) -> tuple[int | None, str | None]:
+) -> tuple[int | None, str | None, float | None, str | None]:
     chosen_percentile = percentile
+    percentile_source = "configured" if chosen_percentile is not None else None
     label_prefix = ""
     if chosen_percentile is None:
         chosen_percentile = _auto_projected_request_percentile(history)
         if chosen_percentile is not None:
+            percentile_source = "auto"
             label_prefix = "auto_"
     if chosen_percentile is not None:
         projected = _percentile_request_delta(history, chosen_percentile)
         if projected is not None:
-            return projected, f"{label_prefix}p{int(round(chosen_percentile * 100))}"
+            return projected, f"{label_prefix}p{int(round(chosen_percentile * 100))}", chosen_percentile, percentile_source
     projected = _smoothed_request_delta(history)
     if projected is not None:
-        return projected, "smoothed"
-    return None, None
+        return projected, "smoothed", None, None
+    return None, None, None, None
 
 
 def _record_observed_request_delta(
@@ -433,6 +435,39 @@ def _maybe_downgrade_fetch_mode_for_budget(
 
 
 
+def _projected_request_policy_details(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    fetch_mode: str | None = None,
+) -> dict[str, Any]:
+    history_window = config.service.projected_request_history_window_for(spec.name, provider=spec.budget_provider)
+    details: dict[str, Any] = {
+        "projected_request_history_window": history_window,
+    }
+    history = _normalized_request_delta_history(task_state.get("last_request_delta_history"))
+    if fetch_mode:
+        details["projected_request_history_mode"] = fetch_mode
+        history_by_mode = task_state.get("last_request_delta_history_by_mode")
+        if isinstance(history_by_mode, dict):
+            history = _normalized_request_delta_history(history_by_mode.get(fetch_mode))
+        else:
+            history = []
+    details["projected_request_history_sample_count"] = len(history)
+    percentile = config.service.projected_request_percentile_for(spec.name, provider=spec.budget_provider)
+    if percentile is not None:
+        details["projected_request_percentile"] = round(float(percentile), 6)
+        details["projected_request_percentile_source"] = "configured"
+        return details
+    auto_percentile = _auto_projected_request_percentile(history)
+    if auto_percentile is not None:
+        details["projected_request_percentile"] = round(float(auto_percentile), 6)
+        details["projected_request_percentile_source"] = "auto"
+    return details
+
+
+
 def _projected_request_count(
     config: AppConfig,
     spec: TaskSpec,
@@ -467,7 +502,7 @@ def _projected_request_count(
     if fetch_mode:
         history_by_mode = task_state.get("last_request_delta_history_by_mode")
         if isinstance(history_by_mode, dict):
-            projected_mode, projected_mode_label = _projected_request_delta_from_history(
+            projected_mode, projected_mode_label, _projected_mode_percentile, _projected_mode_percentile_source = _projected_request_delta_from_history(
                 _normalized_request_delta_history(history_by_mode.get(fetch_mode)),
                 percentile=percentile,
             )
@@ -477,7 +512,7 @@ def _projected_request_count(
             mode_value = task_state["last_request_delta_by_mode"].get(fetch_mode)
             if isinstance(mode_value, int):
                 return max(0, int(mode_value)), f"observed_{fetch_mode}"
-    projected, projected_label = _projected_request_delta_from_history(
+    projected, projected_label, _projected_percentile, _projected_percentile_source = _projected_request_delta_from_history(
         _normalized_request_delta_history(task_state.get("last_request_delta_history")),
         percentile=percentile,
     )
@@ -505,6 +540,8 @@ def _refresh_projected_request_state(
         task_state["projected_request_source"] = projected_request_source
     else:
         task_state.pop("projected_request_source", None)
+    for field, value in _projected_request_policy_details(config, spec, task_state, fetch_mode=fetch_mode).items():
+        task_state[field] = value
     return projected_request_count, projected_request_source
 
 
@@ -583,6 +620,7 @@ def _budget_gate(
     usage["projected_critical_cooldown_seconds"] = projected_critical_cooldown_seconds
     if projected_request_source is not None:
         usage["projected_request_source"] = projected_request_source
+    usage.update(_projected_request_policy_details(config, spec, task_state, fetch_mode=fetch_mode))
     if ratio >= config.service.critical_ratio:
         usage["backoff_level"] = "critical"
         usage["cooldown_seconds"] = critical_cooldown_seconds
@@ -767,7 +805,17 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             usage=usage,
         )
         if isinstance(usage, dict):
-            for field in ("projected_request_count", "projected_request_total", "projected_ratio", "projected_request_source"):
+            for field in (
+                "projected_request_count",
+                "projected_request_total",
+                "projected_ratio",
+                "projected_request_source",
+                "projected_request_history_window",
+                "projected_request_history_mode",
+                "projected_request_history_sample_count",
+                "projected_request_percentile",
+                "projected_request_percentile_source",
+            ):
                 value = usage.get(field)
                 if value is not None:
                     task_state[field] = value

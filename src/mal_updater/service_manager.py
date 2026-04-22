@@ -165,6 +165,8 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         "last_full_refresh_reason",
         "planned_full_refresh_deferred_reason",
         "projected_request_source",
+        "projected_request_history_mode",
+        "projected_request_percentile_source",
     ):
         field_value = value.get(field)
         if field_value is not None:
@@ -191,10 +193,16 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         summary["projected_request_count"] = int(value["projected_request_count"])
     if isinstance(value.get("projected_request_total"), (int, float)):
         summary["projected_request_total"] = int(value["projected_request_total"])
+    if isinstance(value.get("projected_request_history_window"), (int, float)):
+        summary["projected_request_history_window"] = int(value["projected_request_history_window"])
+    if isinstance(value.get("projected_request_history_sample_count"), (int, float)):
+        summary["projected_request_history_sample_count"] = int(value["projected_request_history_sample_count"])
     if isinstance(value.get("planned_full_refresh_budget_deferred"), bool):
         summary["planned_full_refresh_budget_deferred"] = value["planned_full_refresh_budget_deferred"]
     if isinstance(value.get("projected_ratio"), (int, float)):
         summary["projected_ratio"] = round(float(value["projected_ratio"]), 6)
+    if isinstance(value.get("projected_request_percentile"), (int, float)):
+        summary["projected_request_percentile"] = round(float(value["projected_request_percentile"]), 6)
     if isinstance(value.get("last_request_delta"), (int, float)):
         summary["last_request_delta"] = int(value["last_request_delta"])
     next_due_at = _parse_iso_timestamp(value.get("next_due_at"))

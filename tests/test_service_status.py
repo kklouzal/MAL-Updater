@@ -57,6 +57,10 @@ class ServiceStatusTests(unittest.TestCase):
                             "projected_request_source": "configured",
                             "projected_request_count": 4,
                             "projected_request_total": 8,
+                            "projected_request_history_window": 3,
+                            "projected_request_history_sample_count": 2,
+                            "projected_request_percentile": 0.75,
+                            "projected_request_percentile_source": "configured",
                             "projected_ratio": 0.2,
                             "last_request_delta": 3,
                             "next_due_at": "2026-03-21T03:54:00Z",
@@ -142,6 +146,10 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual("configured", sync_summary["projected_request_source"])
         self.assertEqual(4, sync_summary["projected_request_count"])
         self.assertEqual(8, sync_summary["projected_request_total"])
+        self.assertEqual(3, sync_summary["projected_request_history_window"])
+        self.assertEqual(2, sync_summary["projected_request_history_sample_count"])
+        self.assertEqual(0.75, sync_summary["projected_request_percentile"])
+        self.assertEqual("configured", sync_summary["projected_request_percentile_source"])
         self.assertEqual(0.2, sync_summary["projected_ratio"])
         self.assertEqual(3, sync_summary["last_request_delta"])
         self.assertEqual("2026-03-21T03:54:00Z", sync_summary["next_due_at"])
@@ -231,6 +239,10 @@ class ServiceStatusTests(unittest.TestCase):
                             "projected_request_source": "configured",
                             "projected_request_count": 4,
                             "projected_request_total": 8,
+                            "projected_request_history_window": 3,
+                            "projected_request_history_sample_count": 2,
+                            "projected_request_percentile": 0.75,
+                            "projected_request_percentile_source": "configured",
                             "projected_ratio": 0.2,
                             "last_request_delta": 3,
                             "next_due_at": "2026-03-21T03:54:00Z",
@@ -260,6 +272,13 @@ class ServiceStatusTests(unittest.TestCase):
                             "every_seconds": 21600,
                             "budget_provider": "crunchyroll",
                             "budget_scope": "provider",
+                            "projected_request_source": "observed_incremental_auto_p90",
+                            "projected_request_count": 20,
+                            "projected_request_history_window": 7,
+                            "projected_request_history_mode": "incremental",
+                            "projected_request_history_sample_count": 4,
+                            "projected_request_percentile": 0.9,
+                            "projected_request_percentile_source": "auto",
                             "full_refresh_anchor_epoch": 1,
                             "full_refresh_anchor_at": "1970-01-01T00:00:01Z",
                             "last_fetch_mode": "incremental",
@@ -341,6 +360,10 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_projected_request_source=configured", stdout)
         self.assertIn("task_sync_projected_request_count=4", stdout)
         self.assertIn("task_sync_projected_request_total=8", stdout)
+        self.assertIn("task_sync_projected_request_history_window=3", stdout)
+        self.assertIn("task_sync_projected_request_history_sample_count=2", stdout)
+        self.assertIn("task_sync_projected_request_percentile=0.75", stdout)
+        self.assertIn("task_sync_projected_request_percentile_source=configured", stdout)
         self.assertIn("task_sync_projected_ratio=0.2", stdout)
         self.assertIn("task_sync_last_request_delta=3", stdout)
         self.assertIn("task_sync_last_decision_at=2026-03-20T21:54:02Z", stdout)
@@ -365,6 +388,13 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_floor_seconds=7200", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_consecutive_failures=2", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_budget_scope=provider", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_source=observed_incremental_auto_p90", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_count=20", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_history_window=7", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_history_mode=incremental", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_history_sample_count=4", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_percentile=0.9", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_projected_request_percentile_source=auto", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_last_result_status=ok", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_last_result_label=sync_fetch_crunchyroll", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_last_result_returncode=0", stdout)

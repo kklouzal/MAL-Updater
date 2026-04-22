@@ -1378,9 +1378,24 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             projected_request_total = task_payload.get("projected_request_total") if isinstance(task_payload.get("projected_request_total"), int) else None
             if projected_request_total is not None:
                 print(f"task_{task_name}_projected_request_total={projected_request_total}")
+            projected_request_history_window = task_payload.get("projected_request_history_window") if isinstance(task_payload.get("projected_request_history_window"), int) else None
+            if projected_request_history_window is not None:
+                print(f"task_{task_name}_projected_request_history_window={projected_request_history_window}")
+            projected_request_history_mode = task_payload.get("projected_request_history_mode") if isinstance(task_payload.get("projected_request_history_mode"), str) else None
+            if projected_request_history_mode is not None:
+                print(f"task_{task_name}_projected_request_history_mode={projected_request_history_mode}")
+            projected_request_history_sample_count = task_payload.get("projected_request_history_sample_count") if isinstance(task_payload.get("projected_request_history_sample_count"), int) else None
+            if projected_request_history_sample_count is not None:
+                print(f"task_{task_name}_projected_request_history_sample_count={projected_request_history_sample_count}")
             projected_ratio = task_payload.get("projected_ratio") if isinstance(task_payload.get("projected_ratio"), (int, float)) else None
             if projected_ratio is not None:
                 print(f"task_{task_name}_projected_ratio={projected_ratio}")
+            projected_request_percentile = task_payload.get("projected_request_percentile") if isinstance(task_payload.get("projected_request_percentile"), (int, float)) else None
+            if projected_request_percentile is not None:
+                print(f"task_{task_name}_projected_request_percentile={projected_request_percentile}")
+            projected_request_percentile_source = task_payload.get("projected_request_percentile_source") if isinstance(task_payload.get("projected_request_percentile_source"), str) else None
+            if projected_request_percentile_source is not None:
+                print(f"task_{task_name}_projected_request_percentile_source={projected_request_percentile_source}")
             last_request_delta = task_payload.get("last_request_delta") if isinstance(task_payload.get("last_request_delta"), int) else None
             if last_request_delta is not None:
                 print(f"task_{task_name}_last_request_delta={last_request_delta}")

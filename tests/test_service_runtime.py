@@ -982,6 +982,11 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual({"incremental": [2, 12, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
         self.assertEqual(20, sync_state["projected_request_count"])
         self.assertEqual("observed_incremental_auto_p90", sync_state["projected_request_source"])
+        self.assertEqual(7, sync_state["projected_request_history_window"])
+        self.assertEqual("incremental", sync_state["projected_request_history_mode"])
+        self.assertEqual(4, sync_state["projected_request_history_sample_count"])
+        self.assertEqual(0.9, sync_state["projected_request_percentile"])
+        self.assertEqual("auto", sync_state["projected_request_percentile_source"])
 
         projected_count, projected_source = _projected_request_count(
             self.config,
