@@ -1050,6 +1050,21 @@ class MappingTests(unittest.TestCase):
         self.assertIn("A Certain Scientific Railgun S", queries)
         self.assertLess(queries.index("A Certain Scientific Railgun Season 2"), queries.index("A Certain Scientific Railgun S"))
 
+    def test_build_search_queries_adds_punctuation_significant_franchise_specific_sequel_alias(self) -> None:
+        queries = build_search_queries(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-devil-part-timer-s2",
+                title="The Devil is a Part-Timer!",
+                season_title="The Devil is a Part-Timer! Season 2 (English Dub)",
+                season_number=2,
+            )
+        )
+
+        self.assertIn("The Devil is a Part-Timer!!", queries)
+        self.assertLess(queries.index("The Devil is a Part-Timer! Season 2"), queries.index("The Devil is a Part-Timer!!"))
+        self.assertLess(queries.index("The Devil is a Part-Timer!!"), queries.index("The Devil is a Part-Timer!"))
+
     def test_build_search_queries_adds_generic_stage_variants_for_later_season(self) -> None:
         queries = build_search_queries(
             SeriesMappingInput(
@@ -2936,6 +2951,80 @@ class MappingTests(unittest.TestCase):
         self.assertIn("exact_later_installment_alignment", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_infers_later_season_context_from_punctuation_significant_alias_labeled_season_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict[str, object]:
+                if query == "The Devil is a Part-Timer!!":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 53200,
+                                    "title": "Hataraku Maou-sama!!",
+                                    "alternative_titles": {"en": "The Devil is a Part-Timer!!"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 12,
+                                }
+                            }
+                        ]
+                    }
+                if query == "The Devil is a Part-Timer!":
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 15809,
+                                    "title": "Hataraku Maou-sama!",
+                                    "alternative_titles": {"en": "The Devil is a Part-Timer!"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-devil-part-timer-bangbang-no-metadata",
+                        title="The Devil is a Part-Timer!",
+                        season_title="The Devil is a Part-Timer!! (English Dub)",
+                        season_number=None,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 53200)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertIn("season_alias_query_match=2", result.rationale)
+        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
     def test_map_series_expands_relations_for_explicit_later_season_base_title_false_positive(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -3133,6 +3222,106 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 53009)
         self.assertIn("related_anime_expansion", result.chosen_candidate.match_reasons)
         self.assertIn("season_number_match=2", result.rationale)
+        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_requires_punctuation_significant_alias_match_before_alias_query_adds_later_season_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            def fake_search(query: str, limit: int = 5) -> dict[str, object]:
+                if query in {
+                    "The Devil is a Part-Timer!!",
+                    "The Devil is a Part-Timer! Season 2",
+                    "The Devil is a Part-Timer! 2nd Season",
+                    "The Devil is a Part-Timer! 2",
+                    "The Devil is a Part-Timer! II",
+                    "The Devil is a Part-Timer!",
+                }:
+                    return {
+                        "data": [
+                            {
+                                "node": {
+                                    "id": 15809,
+                                    "title": "Hataraku Maou-sama!",
+                                    "alternative_titles": {"en": "The Devil is a Part-Timer!"},
+                                    "media_type": "tv",
+                                    "status": "finished_airing",
+                                    "num_episodes": 13,
+                                }
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            def fake_details(anime_id: int, *, fields: str = "") -> dict[str, object]:
+                if anime_id == 15809:
+                    return {
+                        "id": 15809,
+                        "title": "Hataraku Maou-sama!",
+                        "alternative_titles": {"en": "The Devil is a Part-Timer!"},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 13,
+                        "related_anime": [
+                            {
+                                "node": {"id": 53200, "title": "Hataraku Maou-sama!!"},
+                                "relation_type": "sequel",
+                                "relation_type_formatted": "Sequel",
+                            }
+                        ],
+                    }
+                if anime_id == 53200:
+                    return {
+                        "id": 53200,
+                        "title": "Hataraku Maou-sama!!",
+                        "alternative_titles": {"en": "The Devil is a Part-Timer!!"},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "related_anime": [],
+                    }
+                raise AssertionError(f"unexpected anime details lookup: {anime_id}")
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_details,
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-devil-part-timer-related-sequel",
+                        title="The Devil is a Part-Timer!",
+                        season_title="The Devil is a Part-Timer!! (English Dub)",
+                        season_number=None,
+                        max_episode_number=12,
+                        completed_episode_count=12,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertIsNotNone(result.chosen_candidate)
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 53200)
+        self.assertIn("related_anime_expansion", result.chosen_candidate.match_reasons)
+        self.assertIn("season_number_match=2", result.rationale)
+        self.assertIn("season_alias_query_match=2", result.rationale)
         self.assertIn("exact_later_installment_alignment", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 

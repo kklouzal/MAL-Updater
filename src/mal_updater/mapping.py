@@ -175,6 +175,7 @@ _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES = {
     ("a certain scientific railgun", 2): ["A Certain Scientific Railgun S"],
     ("a certain scientific railgun", 3): ["A Certain Scientific Railgun T"],
     ("demon lord retry", 2): ["Demon Lord, Retry! R"],
+    ("the devil is a part timer", 2): ["The Devil is a Part-Timer!!"],
 }
 
 _SUPPLEMENTAL_TITLE_CANDIDATE_IDS = {
@@ -257,13 +258,47 @@ def normalize_title_strict(value: str | None) -> str:
     return _normalize_with_cleanup_patterns(value, _QUERY_CLEANUPS)
 
 
+def _supplemental_alias_exact_key(value: str | None) -> str:
+    if not value:
+        return ""
+    cleaned = _search_query_cleanup(value)
+    if not cleaned:
+        return ""
+    return unicodedata.normalize("NFKC", cleaned).replace("’", "'").lower()
+
+
 @lru_cache(maxsize=1)
-def _supplemental_installment_alias_season_hints() -> dict[str, int]:
+def _supplemental_installment_alias_season_hints_exact() -> dict[str, int]:
     return {
-        normalize_title_strict(alias): season_number
+        _supplemental_alias_exact_key(alias): season_number
         for (_, season_number), aliases in _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES.items()
         for alias in aliases
+        if _supplemental_alias_exact_key(alias)
     }
+
+
+@lru_cache(maxsize=1)
+def _supplemental_installment_alias_season_hints_strict() -> dict[str, int]:
+    hints: dict[str, int] = {}
+    for (base_title, season_number), aliases in _SUPPLEMENTAL_INSTALLMENT_QUERY_ALIASES.items():
+        base_key = normalize_title_strict(base_title)
+        for alias in aliases:
+            alias_key = normalize_title_strict(alias)
+            if alias_key and alias_key != base_key:
+                hints[alias_key] = season_number
+    return hints
+
+
+def _supplemental_installment_alias_season_hint(value: str | None) -> int | None:
+    exact_key = _supplemental_alias_exact_key(value)
+    if exact_key:
+        season_number = _supplemental_installment_alias_season_hints_exact().get(exact_key)
+        if season_number is not None:
+            return season_number
+    strict_key = normalize_title_strict(value)
+    if strict_key:
+        return _supplemental_installment_alias_season_hints_strict().get(strict_key)
+    return None
 
 
 def _search_query_cleanup(value: str) -> str:
@@ -565,7 +600,7 @@ def _extract_title_hints(value: str | None) -> set[str]:
     if not value:
         return hints
     cleaned = _search_query_cleanup(value)
-    alias_season_number = _supplemental_installment_alias_season_hints().get(normalize_title_strict(cleaned))
+    alias_season_number = _supplemental_installment_alias_season_hint(cleaned)
     if alias_season_number is not None and alias_season_number >= 2:
         hints.add(f"season:{alias_season_number}")
     season_number = _extract_season_number(cleaned)
@@ -750,15 +785,15 @@ def _query_matches_supplemental_installment_alias(
         (normalize_title_strict(series.title), provider_season_number),
         [],
     )
-    normalized_query = normalize_title_strict(query)
-    return any(normalize_title_strict(alias) == normalized_query for alias in aliases)
+    exact_query = _supplemental_alias_exact_key(query)
+    return any(_supplemental_alias_exact_key(alias) == exact_query for alias in aliases)
 
 
 def _candidate_exactly_matches_query_alias(node: dict[str, Any], query: str) -> bool:
-    normalized_query = normalize_title_strict(query)
-    if not normalized_query:
+    exact_query = _supplemental_alias_exact_key(query)
+    if not exact_query:
         return False
-    return any(normalize_title_strict(title) == normalized_query for title in _extract_titles_from_node(node))
+    return any(_supplemental_alias_exact_key(title) == exact_query for title in _extract_titles_from_node(node))
 
 
 def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str | None]:
@@ -775,9 +810,7 @@ def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str
             if title_season_number is None:
                 title_season_number = _extract_roman_installment_number(series.season_title)
         if title_season_number is None:
-            title_season_number = _supplemental_installment_alias_season_hints().get(
-                normalize_title_strict(_search_query_cleanup(series.season_title))
-            )
+            title_season_number = _supplemental_installment_alias_season_hint(series.season_title)
     metadata_season_number = series.season_number
     if title_season_number is not None and metadata_season_number is not None and title_season_number != metadata_season_number:
         return (

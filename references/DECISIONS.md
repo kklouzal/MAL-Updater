@@ -347,6 +347,18 @@ Use that same alias-derived season context when scoring candidate season matches
 - query-time alias expansion alone left an inconsistency where the mapper could find an exact alias-title hit but still lack the explicit later-season context needed to separate it cleanly from an exact base-series rival
 - reusing the same conservative alias table for provider/candidate season hints keeps the behavior explainable and bounded instead of inventing broader speculative suffix heuristics
 
+## 2026-04-22 - Punctuation-significant franchise sequel alias posture
+
+### Decision
+Let the small franchise-specific sequel-alias lane preserve **punctuation-significant alias identity** for exact alias lookups and alias-labeled season inference, instead of relying only on strict normalized title matching.
+
+Use that punctuation-aware exact comparison only for the explicit sequel-alias path, so aliases such as `The Devil is a Part-Timer!!` can contribute later-season evidence without letting the base title `The Devil is a Part-Timer!` inherit sequel credit.
+
+### Why
+- some franchise sequel labels differ from the base title mostly through punctuation, so the repo's normal strict title normalization can collapse the sequel alias back into the base title
+- that collapse is especially dangerous on the alias-query path because it can make a base-series false positive look like an exact alias hit
+- keeping the punctuation-aware behavior scoped to the small explicit alias table preserves conservative explainability while unlocking a real class of weaker franchise-specific sequel residue
+
 ## 2026-04-22 - Generic beat-style sequel posture
 
 ### Decision
