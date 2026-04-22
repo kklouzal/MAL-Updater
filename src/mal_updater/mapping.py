@@ -68,6 +68,10 @@ _ORDINAL_STAGE_RE = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+stage\b",
     re.IGNORECASE,
 )
+_ORDINAL_BEAT_RE = re.compile(
+    r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+beat\b",
+    re.IGNORECASE,
+)
 _COUR_NUMBER_RE = re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE)
 _FINAL_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
 _PLUS_INSTALLMENT_RE = re.compile(r"[+＋](?:!+)?(?:\s*[)\]]\s*)?$")
@@ -80,6 +84,10 @@ _STANDALONE_COUR_RE = re.compile(
 )
 _STANDALONE_STAGE_RE = re.compile(
     r"^(?:(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+stage)$",
+    re.IGNORECASE,
+)
+_STANDALONE_BEAT_RE = re.compile(
+    r"^(?:(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+beat)$",
     re.IGNORECASE,
 )
 _STANDALONE_FINAL_SEASON_RE = re.compile(r"^final\s+season(?:\s+part\s+\d+)?$", re.IGNORECASE)
@@ -95,6 +103,7 @@ _INSTALLMENT_ONLY_EXTENSION_RE = re.compile(
     r"cour\s*\d+|"
     r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+cour|"
     r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+stage|"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+beat|"
     r"final\s+season(?:\s+part\s+\d+)?|"
     r"[ivx]+|"
     r"\d+|"
@@ -291,6 +300,9 @@ def _extract_standalone_installment_number(value: str | None) -> int | None:
     stage_number = _extract_stage_number(cleaned)
     if stage_number is not None and _STANDALONE_STAGE_RE.fullmatch(cleaned):
         return stage_number
+    beat_number = _extract_beat_number(cleaned)
+    if beat_number is not None and _STANDALONE_BEAT_RE.fullmatch(cleaned):
+        return beat_number
     return None
 
 
@@ -306,6 +318,7 @@ def _season_title_needs_base_title(title: str, season_title: str) -> bool:
         or _STANDALONE_PART_RE.fullmatch(season_norm)
         or _STANDALONE_COUR_RE.fullmatch(season_norm)
         or _STANDALONE_STAGE_RE.fullmatch(season_norm)
+        or _STANDALONE_BEAT_RE.fullmatch(season_norm)
         or _STANDALONE_FINAL_SEASON_RE.fullmatch(season_norm)
         or _extract_standalone_installment_number(season_norm) is not None
     )
@@ -359,6 +372,8 @@ def _season_number_query_variants(title: str, season_number: int | None) -> list
         f"{title} {_NUMBER_TO_ORDINAL.get(season_number, f'{season_number}th')} Season",
         f"{title} {ordinal_word.title()} Stage",
         f"{title} {_NUMBER_TO_ORDINAL.get(season_number, f'{season_number}th')} Stage",
+        f"{title} {ordinal_word.title()} Beat",
+        f"{title} {_NUMBER_TO_ORDINAL.get(season_number, f'{season_number}th')} Beat",
         f"{title} {season_number}",
     ]
     roman = _NUMBER_TO_ROMAN.get(season_number)
@@ -516,6 +531,15 @@ def _extract_stage_number(value: str | None) -> int | None:
     return _parse_ordinal_token(match.group(1))
 
 
+def _extract_beat_number(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = _ORDINAL_BEAT_RE.search(value)
+    if not match:
+        return None
+    return _parse_ordinal_token(match.group(1))
+
+
 def _extract_terminal_installment_number(value: str | None) -> int | None:
     if not value:
         return None
@@ -564,6 +588,9 @@ def _extract_title_hints(value: str | None) -> set[str]:
     stage_number = _extract_stage_number(cleaned)
     if stage_number is not None:
         hints.add(f"season:{stage_number}")
+    beat_number = _extract_beat_number(cleaned)
+    if beat_number is not None:
+        hints.add(f"season:{beat_number}")
     roman_number = _extract_roman_installment_number(cleaned)
     if roman_number is not None:
         hints.add(f"roman:{roman_number}")

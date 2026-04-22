@@ -347,6 +347,16 @@ Use that same alias-derived season context when scoring candidate season matches
 - query-time alias expansion alone left an inconsistency where the mapper could find an exact alias-title hit but still lack the explicit later-season context needed to separate it cleanly from an exact base-series rival
 - reusing the same conservative alias table for provider/candidate season hints keeps the behavior explainable and bounded instead of inventing broader speculative suffix heuristics
 
+## 2026-04-22 - Generic beat-style sequel posture
+
+### Decision
+Treat generic later-season `... Beat` sequel labels (for example `Second Beat` / `2nd Beat`) the same way the mapper already treats generic `... Stage` labels: emit them as later-season search variants, accept them as season-number hints, and keep the behavior bounded to explicit ordinal/numbered beat wording.
+
+### Why
+- some MAL sequel titles use `Beat` rather than `Season N` or `Stage`, so otherwise clean later-season mappings can still miss the best search query despite already having explicit provider season context
+- this is the same conservative shape as the existing generic `Stage` support: explicit ordinal wording only, no speculative suffix guessing
+- reusing the existing later-season inference/query path keeps the mapping behavior explainable while shrinking one more class of franchise-agnostic sequel-label residue
+
 ## 2026-04-16 - Whole-season vs split-part tie-break posture
 
 ### Decision
