@@ -1429,6 +1429,18 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             next_due_in_seconds = task_payload.get("next_due_in_seconds") if isinstance(task_payload.get("next_due_in_seconds"), int) else None
             if next_due_in_seconds is not None:
                 print(f"task_{task_name}_next_due_in_seconds={next_due_in_seconds}")
+            execution_state = task_payload.get("execution_state") if isinstance(task_payload.get("execution_state"), str) else None
+            if execution_state is not None:
+                print(f"task_{task_name}_execution_state={execution_state}")
+            execution_state_reason = task_payload.get("execution_state_reason") if isinstance(task_payload.get("execution_state_reason"), str) else None
+            if execution_state_reason is not None:
+                print(f"task_{task_name}_execution_state_reason={execution_state_reason}")
+            execution_state_detail = task_payload.get("execution_state_detail") if isinstance(task_payload.get("execution_state_detail"), str) else None
+            if execution_state_detail is not None:
+                print(f"task_{task_name}_execution_state_detail={execution_state_detail}")
+            execution_state_remaining_seconds = task_payload.get("execution_state_remaining_seconds") if isinstance(task_payload.get("execution_state_remaining_seconds"), int) else None
+            if execution_state_remaining_seconds is not None:
+                print(f"task_{task_name}_execution_state_remaining_seconds={execution_state_remaining_seconds}")
             budget_backoff_level = task_payload.get("budget_backoff_level") if isinstance(task_payload.get("budget_backoff_level"), str) else None
             if budget_backoff_level is not None:
                 print(f"task_{task_name}_budget_backoff_level={budget_backoff_level}")

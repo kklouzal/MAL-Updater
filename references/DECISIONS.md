@@ -209,6 +209,25 @@ When a discovery candidate has mixed support, discount dropped/disliked supporti
 - counting negative supporting seeds as full consensus overstates confidence and can let noisy candidates outrank cleaner support
 - exposing `negative_support_ratio`, `effective_supporting_seed_count`, and `mixed_signal_penalty` keeps the tradeoff inspectable for operators instead of burying it in opaque ranking folklore
 
+## 2026-04-23 - Service-status execution-state posture
+
+### Decision
+Keep `service-status` / `service-status --format summary` operator-friendly by deriving a compact per-task execution-state surface from persisted cadence/backoff timestamps instead of forcing operators to mentally reconstruct lane posture from raw fields.
+
+Each summarized task should now expose one of:
+- `waiting_until_due`
+- `due_now`
+- `cooling_down_for_budget`
+- `cooling_down_after_failure`
+- `awaiting_schedule`
+
+and preserve matching reason/detail/countdown metadata when that context exists.
+
+### Why
+- raw `next_due_at`, `budget_backoff_until`, and `failure_backoff_until` timestamps were already present, but quick operator checks still required manual interpretation
+- terse summary output is supposed to help with unattended daemon triage, so the high-level lane posture should be immediately visible in shell/log-friendly form too
+- keeping the state derived from persisted timestamps preserves inspectability without introducing a second hidden scheduling model
+
 ## 2026-04-23 - Discovery catalog quality calibration posture
 
 ### Decision

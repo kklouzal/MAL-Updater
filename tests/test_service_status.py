@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -38,6 +39,12 @@ class ServiceStatusTests(unittest.TestCase):
         return exit_code, stdout.getvalue()
 
     def test_doctor_service_includes_recent_task_state_and_log_tail(self) -> None:
+        now = datetime.now(timezone.utc)
+        sync_next_due = (now + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        health_budget_backoff_until = (now + timedelta(minutes=30)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        health_next_due = (now + timedelta(hours=12)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        fetch_failure_backoff_until = (now + timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        fetch_next_due = (now + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         self.config.service_state_path.write_text(
             json.dumps(
                 {
@@ -63,7 +70,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "projected_request_percentile_source": "configured",
                             "projected_ratio": 0.2,
                             "last_request_delta": 3,
-                            "next_due_at": "2026-03-21T03:54:00Z",
+                            "next_due_at": sync_next_due,
                             "last_result": {
                                 "label": "sync",
                                 "returncode": 0,
@@ -75,18 +82,18 @@ class ServiceStatusTests(unittest.TestCase):
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "crunchyroll_budget_critical ratio=1.000 cooldown=1800s",
                             "budget_backoff_level": "critical",
-                            "budget_backoff_until": "2026-03-20T22:23:00Z",
+                            "budget_backoff_until": health_budget_backoff_until,
                             "budget_backoff_remaining_seconds": 1800,
                             "budget_backoff_floor_seconds": 1800,
                             "budget_backoff_cooldown_source": "provider_floor",
                             "every_seconds": 43200,
-                            "next_due_at": "2026-03-21T09:53:00Z",
+                            "next_due_at": health_next_due,
                         },
                         "sync_fetch_crunchyroll": {
                             "last_run_at": "2026-03-20T21:52:00Z",
                             "last_status": "error",
                             "last_error": "HTTP 401 from Crunchyroll",
-                            "failure_backoff_until": "2026-03-20T22:02:00Z",
+                            "failure_backoff_until": fetch_failure_backoff_until,
                             "failure_backoff_remaining_seconds": 600,
                             "failure_backoff_reason": "HTTP 401 from Crunchyroll",
                             "failure_backoff_class": "auth",
@@ -96,7 +103,7 @@ class ServiceStatusTests(unittest.TestCase):
                             "budget_provider": "crunchyroll",
                             "budget_scope": "provider",
                             "full_refresh_anchor_epoch": 0,
-                            "next_due_at": "2026-03-21T03:52:00Z"
+                            "next_due_at": fetch_next_due
                         },
                     },
                 },
@@ -152,8 +159,10 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual("configured", sync_summary["projected_request_percentile_source"])
         self.assertEqual(0.2, sync_summary["projected_ratio"])
         self.assertEqual(3, sync_summary["last_request_delta"])
-        self.assertEqual("2026-03-21T03:54:00Z", sync_summary["next_due_at"])
+        self.assertEqual(sync_next_due, sync_summary["next_due_at"])
         self.assertIn("next_due_in_seconds", sync_summary)
+        self.assertEqual("waiting_until_due", sync_summary["execution_state"])
+        self.assertEqual("next_due_pending", sync_summary["execution_state_reason"])
         self.assertEqual(
             {
                 "label": "sync",
@@ -166,21 +175,28 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual("2026-03-20T21:53:00Z", health_summary["last_skipped_at"])
         self.assertEqual("crunchyroll_budget_critical ratio=1.000 cooldown=1800s", health_summary["last_skip_reason"])
         self.assertEqual("critical", health_summary["budget_backoff_level"])
-        self.assertEqual("2026-03-20T22:23:00Z", health_summary["budget_backoff_until"])
+        self.assertEqual(health_budget_backoff_until, health_summary["budget_backoff_until"])
+        self.assertEqual("cooling_down_for_budget", health_summary["execution_state"])
+        self.assertEqual("budget_backoff_active", health_summary["execution_state_reason"])
+        self.assertEqual("critical", health_summary["execution_state_detail"])
         self.assertEqual(1800, health_summary["budget_backoff_floor_seconds"])
         self.assertEqual("provider_floor", health_summary["budget_backoff_cooldown_source"])
         self.assertEqual(43200, health_summary["every_seconds"])
-        self.assertEqual("2026-03-21T09:53:00Z", health_summary["next_due_at"])
+        self.assertEqual(health_next_due, health_summary["next_due_at"])
         self.assertIn("next_due_in_seconds", health_summary)
         self.assertIn("budget_backoff_remaining_seconds", health_summary)
         fetch_summary = payload["task_state"]["sync_fetch_crunchyroll"]
         self.assertEqual("error", fetch_summary["last_status"])
         self.assertEqual("HTTP 401 from Crunchyroll", fetch_summary["last_error"])
-        self.assertEqual("2026-03-20T22:02:00Z", fetch_summary["failure_backoff_until"])
+        self.assertEqual(fetch_failure_backoff_until, fetch_summary["failure_backoff_until"])
         self.assertEqual("HTTP 401 from Crunchyroll", fetch_summary["failure_backoff_reason"])
         self.assertEqual("auth", fetch_summary["failure_backoff_class"])
         self.assertEqual(7200, fetch_summary["failure_backoff_floor_seconds"])
         self.assertEqual(2, fetch_summary["failure_backoff_consecutive_failures"])
+        self.assertEqual("cooling_down_after_failure", fetch_summary["execution_state"])
+        self.assertEqual("failure_backoff_active", fetch_summary["execution_state_reason"])
+        self.assertEqual("auth", fetch_summary["execution_state_detail"])
+        self.assertIn("execution_state_remaining_seconds", fetch_summary)
         self.assertEqual("incremental", fetch_summary["planned_fetch_mode"])
         self.assertIn("failure_backoff_remaining_seconds", fetch_summary)
 
@@ -208,6 +224,12 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertNotIn("api_usage", payload)
 
     def test_service_status_summary_format_emits_operator_lines(self) -> None:
+        now = datetime.now(timezone.utc)
+        sync_next_due = (now + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        health_budget_backoff_until = (now + timedelta(minutes=20)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        health_next_due = (now + timedelta(hours=12)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        fetch_failure_backoff_until = (now + timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        fetch_next_due = (now + timedelta(hours=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         self.config.service_state_path.write_text(
             json.dumps(
                 {
@@ -245,25 +267,25 @@ class ServiceStatusTests(unittest.TestCase):
                             "projected_request_percentile_source": "configured",
                             "projected_ratio": 0.2,
                             "last_request_delta": 3,
-                            "next_due_at": "2026-03-21T03:54:00Z",
+                            "next_due_at": sync_next_due,
                         },
                         "health": {
                             "last_skipped_at": "2026-03-20T21:53:00Z",
                             "last_skip_reason": "budget_guard",
                             "last_decision_at": "2026-03-20T21:53:00Z",
                             "budget_backoff_level": "warn",
-                            "budget_backoff_until": "2026-03-20T22:13:00Z",
+                            "budget_backoff_until": health_budget_backoff_until,
                             "budget_backoff_remaining_seconds": 1200,
                             "budget_backoff_floor_seconds": 900,
                             "budget_backoff_cooldown_source": "provider_floor",
                             "every_seconds": 43200,
-                            "next_due_at": "2026-03-21T09:53:00Z",
+                            "next_due_at": health_next_due,
                         },
                         "sync_fetch_crunchyroll": {
                             "last_run_at": "2026-03-20T21:52:00Z",
                             "last_status": "error",
                             "last_error": "HTTP 401 from Crunchyroll",
-                            "failure_backoff_until": "2026-03-20T22:02:00Z",
+                            "failure_backoff_until": fetch_failure_backoff_until,
                             "failure_backoff_remaining_seconds": 600,
                             "failure_backoff_reason": "HTTP 401 from Crunchyroll",
                             "failure_backoff_class": "auth",
@@ -291,7 +313,7 @@ class ServiceStatusTests(unittest.TestCase):
                                 "deferred_full_refresh_reason": "periodic_cadence",
                                 "stdout": "incremental fetch completed\nwith operator detail"
                             },
-                            "next_due_at": "2026-03-21T03:52:00Z"
+                            "next_due_at": fetch_next_due
                         },
                     },
                 },
@@ -370,19 +392,30 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("task_sync_last_started_at=2026-03-20T21:54:00Z", stdout)
         self.assertIn("task_sync_last_finished_at=2026-03-20T21:54:02Z", stdout)
         self.assertIn("task_sync_last_duration_seconds=2.0", stdout)
-        self.assertIn("task_sync_next_due_at=2026-03-21T03:54:00Z", stdout)
+        self.assertIn(f"task_sync_next_due_at={sync_next_due}", stdout)
+        self.assertIn("task_sync_execution_state=waiting_until_due", stdout)
+        self.assertIn("task_sync_execution_state_reason=next_due_pending", stdout)
+        self.assertIn("task_sync_execution_state_remaining_seconds=", stdout)
         self.assertIn("task_health_last_skip_reason=budget_guard", stdout)
         self.assertIn("task_health_last_decision_at=2026-03-20T21:53:00Z", stdout)
         self.assertIn("task_health_budget_backoff_level=warn", stdout)
-        self.assertIn("task_health_budget_backoff_until=2026-03-20T22:13:00Z", stdout)
+        self.assertIn(f"task_health_budget_backoff_until={health_budget_backoff_until}", stdout)
         self.assertIn("task_health_budget_backoff_remaining_seconds=", stdout)
+        self.assertIn("task_health_execution_state=cooling_down_for_budget", stdout)
+        self.assertIn("task_health_execution_state_reason=budget_backoff_active", stdout)
+        self.assertIn("task_health_execution_state_detail=warn", stdout)
+        self.assertIn("task_health_execution_state_remaining_seconds=", stdout)
         self.assertIn("task_health_budget_backoff_floor_seconds=900", stdout)
         self.assertIn("task_health_budget_backoff_cooldown_source=provider_floor", stdout)
-        self.assertIn("task_health_next_due_at=2026-03-21T09:53:00Z", stdout)
+        self.assertIn(f"task_health_next_due_at={health_next_due}", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_last_status=error", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_last_error=HTTP 401 from Crunchyroll", stdout)
-        self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_until=2026-03-20T22:02:00Z", stdout)
+        self.assertIn(f"task_sync_fetch_crunchyroll_failure_backoff_until={fetch_failure_backoff_until}", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_remaining_seconds=", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_execution_state=cooling_down_after_failure", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_execution_state_reason=failure_backoff_active", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_execution_state_detail=auth", stdout)
+        self.assertIn("task_sync_fetch_crunchyroll_execution_state_remaining_seconds=", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_reason=HTTP 401 from Crunchyroll", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_class=auth", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_failure_backoff_floor_seconds=7200", stdout)

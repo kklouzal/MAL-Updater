@@ -139,6 +139,59 @@ def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state
     return summary
 
 
+def _derive_task_execution_state(task_state: dict[str, Any], *, now: datetime) -> dict[str, Any] | None:
+    failure_backoff_until = _parse_iso_timestamp(task_state.get("failure_backoff_until"))
+    if failure_backoff_until is not None and failure_backoff_until > now:
+        remaining = max(0, int((failure_backoff_until - now).total_seconds()))
+        payload: dict[str, Any] = {
+            "execution_state": "cooling_down_after_failure",
+            "execution_state_reason": "failure_backoff_active",
+            "execution_state_remaining_seconds": remaining,
+        }
+        failure_class = task_state.get("failure_backoff_class")
+        if isinstance(failure_class, str) and failure_class:
+            payload["execution_state_detail"] = failure_class
+        return payload
+
+    budget_backoff_until = _parse_iso_timestamp(task_state.get("budget_backoff_until"))
+    if budget_backoff_until is not None and budget_backoff_until > now:
+        remaining = max(0, int((budget_backoff_until - now).total_seconds()))
+        payload = {
+            "execution_state": "cooling_down_for_budget",
+            "execution_state_reason": "budget_backoff_active",
+            "execution_state_remaining_seconds": remaining,
+        }
+        budget_level = task_state.get("budget_backoff_level")
+        if isinstance(budget_level, str) and budget_level:
+            payload["execution_state_detail"] = budget_level
+        return payload
+
+    next_due_at = _parse_iso_timestamp(task_state.get("next_due_at"))
+    if next_due_at is not None:
+        remaining = int((next_due_at - now).total_seconds())
+        if remaining <= 0:
+            return {
+                "execution_state": "due_now",
+                "execution_state_reason": "next_due_elapsed",
+                "execution_state_remaining_seconds": 0,
+            }
+        return {
+            "execution_state": "waiting_until_due",
+            "execution_state_reason": "next_due_pending",
+            "execution_state_remaining_seconds": remaining,
+        }
+
+    last_status = task_state.get("last_status")
+    if isinstance(last_status, str) and last_status:
+        return {
+            "execution_state": "awaiting_schedule",
+            "execution_state_reason": f"last_status_{last_status}",
+            "execution_state_remaining_seconds": 0,
+        }
+
+    return None
+
+
 def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -205,15 +258,19 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         summary["projected_request_percentile"] = round(float(value["projected_request_percentile"]), 6)
     if isinstance(value.get("last_request_delta"), (int, float)):
         summary["last_request_delta"] = int(value["last_request_delta"])
+    now_dt = datetime.now(timezone.utc)
     next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
     if next_due_at is not None:
-        summary["next_due_in_seconds"] = max(0, int((next_due_at - datetime.now(timezone.utc)).total_seconds()))
+        summary["next_due_in_seconds"] = max(0, int((next_due_at - now_dt).total_seconds()))
     budget_backoff_until = _parse_iso_timestamp(value.get("budget_backoff_until"))
     if budget_backoff_until is not None:
-        summary["budget_backoff_remaining_seconds"] = max(0, int((budget_backoff_until - datetime.now(timezone.utc)).total_seconds()))
+        summary["budget_backoff_remaining_seconds"] = max(0, int((budget_backoff_until - now_dt).total_seconds()))
     failure_backoff_until = _parse_iso_timestamp(value.get("failure_backoff_until"))
     if failure_backoff_until is not None:
-        summary["failure_backoff_remaining_seconds"] = max(0, int((failure_backoff_until - datetime.now(timezone.utc)).total_seconds()))
+        summary["failure_backoff_remaining_seconds"] = max(0, int((failure_backoff_until - now_dt).total_seconds()))
+    execution_state = _derive_task_execution_state(value, now=now_dt)
+    if execution_state is not None:
+        summary.update(execution_state)
     summary.update(_current_planned_fetch_summary(config, task_name, value))
     last_result = _summarize_last_result(value.get("last_result"))
     if last_result is not None:
