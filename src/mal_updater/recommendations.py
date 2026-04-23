@@ -523,6 +523,27 @@ def _discovery_metadata_quality_bonus(
     return min(bonus, 3), mean_band, popularity_band
 
 
+def _discovery_catalog_quality_bonus(*, mean: float | None, popularity: int | None) -> tuple[int, str | None, str | None]:
+    bonus = 0
+    mean_band: str | None = None
+    popularity_band: str | None = None
+    if mean is not None:
+        if mean >= 8.6:
+            bonus += 2
+            mean_band = "elite"
+        elif mean >= 8.3:
+            bonus += 1
+            mean_band = "strong"
+    if popularity is not None:
+        if popularity <= 150:
+            bonus += 2
+            popularity_band = "very_broad"
+        elif popularity <= 400:
+            bonus += 1
+            popularity_band = "broad"
+    return min(bonus, 3), mean_band, popularity_band
+
+
 def _metadata_start_season(meta: Any) -> dict[str, Any] | None:
     start_season = getattr(meta, "start_season", None) if meta is not None else None
     if not isinstance(start_season, dict):
@@ -948,6 +969,10 @@ def _build_discovery_recommendations(
             mean=mean,
             popularity=popularity,
         )
+        catalog_quality_bonus, catalog_mean_band, catalog_popularity_band = _discovery_catalog_quality_bonus(
+            mean=mean,
+            popularity=popularity,
+        )
         start_season = _metadata_start_season(meta)
         start_season_label = _format_start_season(start_season)
         freshness_bonus, freshness_bucket, catalog_age_in_seasons, freshness_penalty = _discovery_candidate_freshness_profile(start_season)
@@ -1065,7 +1090,7 @@ def _build_discovery_recommendations(
         )
         support_balance_bonus = min(effective_cross_seed_support_votes // 5, 8)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
-        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + metadata_affinity_bonus + metadata_quality_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + metadata_affinity_bonus + metadata_quality_bonus + catalog_quality_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
         priority -= freshness_penalty
         priority -= stale_support_penalty
         priority -= seed_quality_penalty
@@ -1102,6 +1127,20 @@ def _build_discovery_recommendations(
                 reasons.append(
                     "metadata-rich tie-break also favored stronger MAL quality/adoption signals ("
                     + ", ".join(quality_fragments)
+                    + ")"
+                )
+        if catalog_quality_bonus > 0:
+            catalog_quality_fragments: list[str] = []
+            if catalog_mean_band is not None:
+                catalog_quality_fragments.append(f"{catalog_mean_band} MAL mean")
+            if catalog_popularity_band is not None:
+                catalog_quality_fragments.append(
+                    "very broad catalog adoption" if catalog_popularity_band == "very_broad" else "broad catalog adoption"
+                )
+            if catalog_quality_fragments:
+                reasons.append(
+                    "global catalog quality/adoption calibration slightly favored this candidate ("
+                    + ", ".join(catalog_quality_fragments)
                     + ")"
                 )
         if freshness_bonus > 0 and start_season_label is not None:
@@ -1173,6 +1212,9 @@ def _build_discovery_recommendations(
                     "metadata_quality_bonus": metadata_quality_bonus,
                     "metadata_mean_band": metadata_mean_band,
                     "metadata_popularity_band": metadata_popularity_band,
+                    "catalog_quality_bonus": catalog_quality_bonus,
+                    "catalog_mean_band": catalog_mean_band,
+                    "catalog_popularity_band": catalog_popularity_band,
                     "start_season": start_season,
                     "start_season_label": start_season_label,
                     "freshness_bucket": freshness_bucket,

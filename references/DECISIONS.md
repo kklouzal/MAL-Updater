@@ -209,6 +209,18 @@ When a discovery candidate has mixed support, discount dropped/disliked supporti
 - counting negative supporting seeds as full consensus overstates confidence and can let noisy candidates outrank cleaner support
 - exposing `negative_support_ratio`, `effective_supporting_seed_count`, and `mixed_signal_penalty` keeps the tradeoff inspectable for operators instead of burying it in opaque ranking folklore
 
+## 2026-04-23 - Discovery catalog quality calibration posture
+
+### Decision
+Keep discovery ranking primarily driven by support and overlap evidence, but allow a **small global catalog quality/adoption calibration** even when a candidate is not inside a metadata-rich tie.
+
+When discovery candidates are otherwise fairly flat, higher MAL mean and broader catalog adoption may contribute a bounded `catalog_quality_bonus` plus explainable `catalog_mean_band` / `catalog_popularity_band` metadata. This calibration should stay modest and should not replace support-count, vote-spread, freshness, or metadata-affinity posture as the main ranking driver.
+
+### Why
+- recommendation ordering already used coarse mean/popularity signals, but some flatter races still needed a more explicit and inspectable tie-break outside the metadata-rich path
+- exposing the calibration in recommendation context/reasons keeps the behavior auditable instead of burying another scoring nudge inside opaque arithmetic
+- keeping the bonus small preserves the repo's conservative posture: catalog prestige can help break a close race, but it should not overpower seed consensus
+
 ## 2026-04-05 - MAL auth-failure remediation posture
 
 ### Decision
