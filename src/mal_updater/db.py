@@ -711,7 +711,7 @@ def update_review_queue_entry_statuses(
 
 
 
-def get_operational_snapshot(db_path: Path, *, provider: str = "crunchyroll") -> dict[str, Any]:
+def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
     with connect(db_path) as conn:
         latest_sync_run_row = conn.execute(
             """
@@ -730,40 +730,33 @@ def get_operational_snapshot(db_path: Path, *, provider: str = "crunchyroll") ->
             LIMIT 1
             """
         ).fetchone()
-        provider_counts = {
-            "series": int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM provider_series WHERE provider = ?",
-                    (provider,),
-                ).fetchone()[0]
-            ),
-            "progress": int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM provider_episode_progress WHERE provider = ?",
-                    (provider,),
-                ).fetchone()[0]
-            ),
-            "watchlist": int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM provider_watchlist WHERE provider = ?",
-                    (provider,),
-                ).fetchone()[0]
-            ),
+        provider_series_counts = {
+            str(row["provider"]): int(row["count"])
+            for row in conn.execute(
+                "SELECT provider, COUNT(*) AS count FROM provider_series GROUP BY provider"
+            ).fetchall()
         }
-        provider_freshness = {
-            "series_last_seen_at": conn.execute(
-                "SELECT MAX(last_seen_at) FROM provider_series WHERE provider = ?",
-                (provider,),
-            ).fetchone()[0],
-            "progress_last_seen_at": conn.execute(
-                "SELECT MAX(last_seen_at) FROM provider_episode_progress WHERE provider = ?",
-                (provider,),
-            ).fetchone()[0],
-            "watchlist_last_seen_at": conn.execute(
-                "SELECT MAX(last_seen_at) FROM provider_watchlist WHERE provider = ?",
-                (provider,),
-            ).fetchone()[0],
+        provider_progress_counts = {
+            str(row["provider"]): int(row["count"])
+            for row in conn.execute(
+                "SELECT provider, COUNT(*) AS count FROM provider_episode_progress GROUP BY provider"
+            ).fetchall()
         }
+        provider_watchlist_counts = {
+            str(row["provider"]): int(row["count"])
+            for row in conn.execute(
+                "SELECT provider, COUNT(*) AS count FROM provider_watchlist GROUP BY provider"
+            ).fetchall()
+        }
+        series_freshness_rows = conn.execute(
+            "SELECT provider, MAX(last_seen_at) AS last_seen_at FROM provider_series GROUP BY provider"
+        ).fetchall()
+        progress_freshness_rows = conn.execute(
+            "SELECT provider, MAX(last_seen_at) AS last_seen_at FROM provider_episode_progress GROUP BY provider"
+        ).fetchall()
+        watchlist_freshness_rows = conn.execute(
+            "SELECT provider, MAX(last_seen_at) AS last_seen_at FROM provider_watchlist GROUP BY provider"
+        ).fetchall()
         review_rows = conn.execute(
             """
             SELECT status, issue_type, COUNT(*) AS count
@@ -774,13 +767,11 @@ def get_operational_snapshot(db_path: Path, *, provider: str = "crunchyroll") ->
         ).fetchall()
         mapping_rows = conn.execute(
             """
-            SELECT approved_by_user, mapping_source, COUNT(*) AS count
+            SELECT provider, approved_by_user, mapping_source, COUNT(*) AS count
             FROM mal_series_mapping
-            WHERE provider = ?
-            GROUP BY approved_by_user, mapping_source
-            ORDER BY approved_by_user DESC, mapping_source ASC
-            """,
-            (provider,),
+            GROUP BY provider, approved_by_user, mapping_source
+            ORDER BY provider ASC, approved_by_user DESC, mapping_source ASC
+            """
         ).fetchall()
 
     def _sync_run_row_to_dict(row: Any) -> dict[str, Any] | None:
@@ -798,6 +789,52 @@ def get_operational_snapshot(db_path: Path, *, provider: str = "crunchyroll") ->
             "summary": json.loads(summary_json) if summary_json else None,
         }
 
+    provider_names = sorted(
+        set(provider_series_counts)
+        | set(provider_progress_counts)
+        | set(provider_watchlist_counts)
+        | {str(row["provider"]) for row in series_freshness_rows}
+        | {str(row["provider"]) for row in progress_freshness_rows}
+        | {str(row["provider"]) for row in watchlist_freshness_rows}
+        | {str(row["provider"]) for row in mapping_rows}
+    )
+
+    provider_counts_by_provider: dict[str, dict[str, int]] = {}
+    for provider in provider_names:
+        provider_counts_by_provider[provider] = {
+            "series": int(provider_series_counts.get(provider, 0)),
+            "progress": int(provider_progress_counts.get(provider, 0)),
+            "watchlist": int(provider_watchlist_counts.get(provider, 0)),
+        }
+
+    provider_freshness_by_provider: dict[str, dict[str, Any]] = {provider: {} for provider in provider_names}
+    for row in series_freshness_rows:
+        provider_freshness_by_provider.setdefault(str(row["provider"]), {})["series_last_seen_at"] = row["last_seen_at"]
+    for row in progress_freshness_rows:
+        provider_freshness_by_provider.setdefault(str(row["provider"]), {})["progress_last_seen_at"] = row["last_seen_at"]
+    for row in watchlist_freshness_rows:
+        provider_freshness_by_provider.setdefault(str(row["provider"]), {})["watchlist_last_seen_at"] = row["last_seen_at"]
+
+    provider_counts = {
+        "series": sum(item["series"] for item in provider_counts_by_provider.values()),
+        "progress": sum(item["progress"] for item in provider_counts_by_provider.values()),
+        "watchlist": sum(item["watchlist"] for item in provider_counts_by_provider.values()),
+    }
+    provider_freshness = {
+        "series_last_seen_at": max(
+            (item.get("series_last_seen_at") for item in provider_freshness_by_provider.values() if item.get("series_last_seen_at")),
+            default=None,
+        ),
+        "progress_last_seen_at": max(
+            (item.get("progress_last_seen_at") for item in provider_freshness_by_provider.values() if item.get("progress_last_seen_at")),
+            default=None,
+        ),
+        "watchlist_last_seen_at": max(
+            (item.get("watchlist_last_seen_at") for item in provider_freshness_by_provider.values() if item.get("watchlist_last_seen_at")),
+            default=None,
+        ),
+    }
+
     review_counts: dict[str, dict[str, int]] = {}
     for row in review_rows:
         status_key = str(row["status"])
@@ -808,22 +845,33 @@ def get_operational_snapshot(db_path: Path, *, provider: str = "crunchyroll") ->
         "total": 0,
         "approved": 0,
         "by_source": {},
+        "by_provider": {},
     }
     for row in mapping_rows:
+        provider = str(row["provider"])
         count = int(row["count"])
         mapping_source = str(row["mapping_source"])
         approved_by_user = bool(row["approved_by_user"])
         mapping_counts["total"] += count
         if approved_by_user:
             mapping_counts["approved"] += count
-        mapping_counts["by_source"][mapping_source] = count
+        mapping_counts["by_source"][mapping_source] = mapping_counts["by_source"].get(mapping_source, 0) + count
+        provider_bucket = mapping_counts["by_provider"].setdefault(
+            provider,
+            {"total": 0, "approved": 0, "by_source": {}},
+        )
+        provider_bucket["total"] += count
+        if approved_by_user:
+            provider_bucket["approved"] += count
+        provider_bucket["by_source"][mapping_source] = provider_bucket["by_source"].get(mapping_source, 0) + count
 
     return {
-        "provider": provider,
         "latest_sync_run": _sync_run_row_to_dict(latest_sync_run_row),
         "latest_completed_sync_run": _sync_run_row_to_dict(latest_completed_sync_run_row),
         "provider_counts": provider_counts,
+        "provider_counts_by_provider": provider_counts_by_provider,
         "provider_freshness": provider_freshness,
+        "provider_freshness_by_provider": provider_freshness_by_provider,
         "review_queue": review_counts,
         "mappings": mapping_counts,
     }

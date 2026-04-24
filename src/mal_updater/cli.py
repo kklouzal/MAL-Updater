@@ -1554,10 +1554,17 @@ def _sync_run_summary_counts(sync_run: dict[str, object] | None) -> dict[str, in
 
 def _build_partial_sync_coverage(
     latest_sync_run: dict[str, object] | None,
-    provider_counts: dict[str, object] | None,
+    provider_counts_by_provider: dict[str, object] | None,
 ) -> dict[str, object] | None:
     latest_counts = _sync_run_summary_counts(latest_sync_run)
-    if not latest_counts or not isinstance(provider_counts, dict):
+    if not latest_counts or not isinstance(provider_counts_by_provider, dict):
+        return None
+
+    provider_name = latest_sync_run.get("provider") if isinstance(latest_sync_run, dict) else None
+    if not isinstance(provider_name, str) or not provider_name:
+        return None
+    provider_counts = provider_counts_by_provider.get(provider_name)
+    if not isinstance(provider_counts, dict):
         return None
 
     field_map = {
@@ -1585,6 +1592,7 @@ def _build_partial_sync_coverage(
         return None
 
     return {
+        "provider": provider_name,
         "sync_run_id": latest_sync_run.get("id") if isinstance(latest_sync_run, dict) else None,
         "fields": partial_fields,
     }
@@ -2442,7 +2450,7 @@ def _cmd_health_check(
     )
     partial_sync_coverage = _build_partial_sync_coverage(
         latest_sync_run if isinstance(latest_sync_run, dict) else None,
-        snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
+        snapshot.get("provider_counts_by_provider") if isinstance(snapshot.get("provider_counts_by_provider"), dict) else None,
     )
     mapping_coverage = _build_mapping_coverage_snapshot(
         snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
@@ -2774,7 +2782,9 @@ def _cmd_health_check(
         "latest_completed_sync_run": latest_completed_sync_run,
         "latest_completed_sync_run_age_seconds": latest_completed_age_seconds,
         "provider_counts": snapshot.get("provider_counts"),
+        "provider_counts_by_provider": snapshot.get("provider_counts_by_provider"),
         "provider_freshness": snapshot.get("provider_freshness"),
+        "provider_freshness_by_provider": snapshot.get("provider_freshness_by_provider"),
         "partial_sync_coverage": partial_sync_coverage,
         "review_queue": {
             **review_queue,

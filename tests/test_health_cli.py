@@ -867,6 +867,58 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
 
+    def test_health_check_aggregates_mapping_coverage_across_multiple_providers(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "hidive_password.txt").write_text("super-secret\n", encoding="utf-8")
+        hidive_state_root = self.config.state_dir / "hidive" / "default"
+        hidive_state_root.mkdir(parents=True, exist_ok=True)
+        (hidive_state_root / "authorisation_token.txt").write_text("hidive-token\n", encoding="utf-8")
+        (hidive_state_root / "refresh_token.txt").write_text("hidive-refresh\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "cr-series-1", "Crunchy Example", "Crunchy Example", 1, "{}"),
+            )
+            conn.execute(
+                "INSERT INTO mal_series_mapping(provider, provider_series_id, mal_anime_id, confidence, mapping_source, approved_by_user, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "cr-series-1", 1001, 0.99, "auto_exact", 1, None),
+            )
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                ("hidive", "hidive-series-1", "HIDIVE Example", "HIDIVE Example", 1, "{}"),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+                ("hidive", "1.0", "ingest_snapshot", "completed", json.dumps({"series_count": 1}, sort_keys=True)),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_health_check("--stale-hours", "72")
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, payload["provider_counts"]["series"])
+        self.assertEqual(
+            {
+                "crunchyroll": {"series": 1, "progress": 0, "watchlist": 0},
+                "hidive": {"series": 1, "progress": 0, "watchlist": 0},
+            },
+            payload["provider_counts_by_provider"],
+        )
+        self.assertEqual(2, payload["mappings"]["coverage"]["provider_series_count"])
+        self.assertEqual(1, payload["mappings"]["coverage"]["approved_mapping_count"])
+        self.assertEqual(1, payload["mappings"]["coverage"]["unmapped_series_count"])
+        self.assertEqual(0.5, payload["mappings"]["coverage"]["approved_coverage_ratio"])
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("approved_mapping_coverage_below_threshold", warning_codes)
+        self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
+
     def test_health_check_prefers_targeted_mapping_queue_refresh_before_full_backlog_rebuild(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")

@@ -209,6 +209,18 @@ When a discovery candidate has mixed support, discount dropped/disliked supporti
 - counting negative supporting seeds as full consensus overstates confidence and can let noisy candidates outrank cleaner support
 - exposing `negative_support_ratio`, `effective_supporting_seed_count`, and `mixed_signal_penalty` keeps the tradeoff inspectable for operators instead of burying it in opaque ranking folklore
 
+## 2026-04-24 - Multi-provider health coverage posture
+
+### Decision
+Keep `health-check` coverage/reporting aligned with the repo's multi-provider runtime posture instead of silently measuring provider counts and approved mapping coverage from a single default provider snapshot.
+
+Aggregate provider counts and approved mapping coverage should span **all persisted source providers**, while latest-run partial-coverage warnings should still compare the latest ingest summary against that specific provider's cached totals.
+
+### Why
+- Crunchyroll-only accounting can falsely read a mixed Crunchyroll + HIDIVE install as healthy when HIDIVE-side mapping residue is the real gap
+- coverage and backlog guidance should reflect the whole configured system, not whichever provider happened to be hard-coded earliest
+- partial-refresh warnings remain provider-specific by nature, so that comparison should stay tied to the provider that actually ran instead of being diluted by cross-provider totals
+
 ## 2026-04-23 - Service-status execution-state posture
 
 ### Decision
