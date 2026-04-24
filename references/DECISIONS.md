@@ -209,6 +209,22 @@ When a discovery candidate has mixed support, discount dropped/disliked supporti
 - counting negative supporting seeds as full consensus overstates confidence and can let noisy candidates outrank cleaner support
 - exposing `negative_support_ratio`, `effective_supporting_seed_count`, and `mixed_signal_penalty` keeps the tradeoff inspectable for operators instead of burying it in opaque ranking folklore
 
+## 2026-04-24 - Bootstrap health-refresh carry-through posture
+
+### Decision
+Keep `bootstrap-audit` aligned with `health-check` for provider-side non-auth refresh work, not just the heavier partial-coverage/full-refresh case.
+
+When the latest saved health artifact recommends a bootstrap-ready provider either:
+- `refresh_ingested_snapshot`, or
+- `refresh_full_snapshot`
+
+`bootstrap-audit` should keep the provider marked ready but surface the matching safe next command / reason-code through both provider `operation_guidance` and the top-level onboarding `recommended_commands` list.
+
+### Why
+- operators often start from `bootstrap-audit`, so safe provider refresh pressure should not disappear merely because it is not the heavier full-refresh variant
+- `health-check-cycle` already treats both reason codes as safe auto-remediation candidates, so bootstrap/onboarding should not lag behind the repo's broader maintenance posture
+- preserving the exact reason-code keeps machine-readable guidance aligned without forcing consumers to infer whether the next fetch should be ordinary or full-refresh
+
 ## 2026-04-24 - Multi-provider health coverage posture
 
 ### Decision

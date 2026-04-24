@@ -271,6 +271,29 @@ def _provider_from_refresh_command_args(command_args: object) -> str | None:
 
 
 
+def _provider_task_clears_health_refresh_recommendation(
+    task_state: dict[str, object],
+    *,
+    reason_code: str,
+    health_mtime: float,
+) -> bool:
+    last_full_refresh_epoch = task_state.get("last_successful_full_refresh_epoch")
+    if isinstance(last_full_refresh_epoch, (int, float)) and float(last_full_refresh_epoch) >= float(health_mtime):
+        return True
+    if reason_code != "refresh_ingested_snapshot":
+        return False
+    if task_state.get("last_status") != "ok":
+        return False
+    last_finished_at = _parse_sqlite_timestamp(task_state.get("last_finished_at"))
+    if last_finished_at is not None and last_finished_at.timestamp() >= float(health_mtime):
+        return True
+    last_run_epoch = task_state.get("last_run_epoch")
+    if isinstance(last_run_epoch, (int, float)) and float(last_run_epoch) >= float(health_mtime):
+        return True
+    return False
+
+
+
 def _provider_bootstrap_health_refresh_recommendation(
     config: AppConfig,
     *,
@@ -296,27 +319,33 @@ def _provider_bootstrap_health_refresh_recommendation(
         health_mtime = path.stat().st_mtime
     except OSError:
         return None
+    task_state = None
     if isinstance(service_state, dict):
         tasks = service_state.get("tasks")
         if isinstance(tasks, dict):
-            task_state = tasks.get(f"sync_fetch_{provider}")
-            if isinstance(task_state, dict):
-                last_full_refresh_epoch = task_state.get("last_successful_full_refresh_epoch")
-                if isinstance(last_full_refresh_epoch, (int, float)) and float(last_full_refresh_epoch) >= float(health_mtime):
-                    return None
+            candidate_state = tasks.get(f"sync_fetch_{provider}")
+            if isinstance(candidate_state, dict):
+                task_state = candidate_state
     for command in commands:
         if not isinstance(command, dict):
             continue
-        if command.get("reason_code") != "refresh_full_snapshot":
+        reason_code = command.get("reason_code")
+        if reason_code not in {"refresh_ingested_snapshot", "refresh_full_snapshot"}:
             continue
         if _provider_from_refresh_command_args(command.get("command_args")) != provider:
             continue
         command_args = command.get("command_args")
         if not isinstance(command_args, list) or not all(isinstance(part, str) for part in command_args):
             continue
+        if isinstance(task_state, dict) and _provider_task_clears_health_refresh_recommendation(
+            task_state,
+            reason_code=str(reason_code),
+            health_mtime=health_mtime,
+        ):
+            continue
         detail = command.get("detail") if isinstance(command.get("detail"), str) else None
         return {
-            "reason_code": "refresh_full_snapshot",
+            "reason_code": str(reason_code),
             "command_args": list(command_args),
             "command": _build_review_queue_command(list(command_args)),
             "detail": detail,
@@ -425,20 +454,29 @@ def _provider_bootstrap_guidance_status(
     if credentials_present and session_present and isinstance(health_refresh_recommendation, dict):
         refresh_command = health_refresh_recommendation.get("command") if isinstance(health_refresh_recommendation.get("command"), str) else None
         refresh_detail = health_refresh_recommendation.get("detail") if isinstance(health_refresh_recommendation.get("detail"), str) else None
-        details = (
-            f"{title} credentials and session state are staged, so unattended fetches are bootstrapped, but the latest health artifact still recommends a conservative full refresh before treating cached provider coverage as current."
-        )
+        refresh_reason_code = str(health_refresh_recommendation.get("reason_code") or "") or "refresh_full_snapshot"
+        if refresh_reason_code == "refresh_ingested_snapshot":
+            details = (
+                f"{title} credentials and session state are staged, so unattended fetches are bootstrapped, but the latest health artifact still recommends refreshing the ingested provider snapshot before treating cached provider state as current."
+            )
+            operation_mode = "ready-health-recommends-snapshot-refresh"
+        else:
+            details = (
+                f"{title} credentials and session state are staged, so unattended fetches are bootstrapped, but the latest health artifact still recommends a conservative full refresh before treating cached provider coverage as current."
+            )
+            operation_mode = "ready-health-recommends-full-refresh"
+            refresh_reason_code = "refresh_full_snapshot"
         if refresh_detail:
             details += f" Latest maintenance signal: {refresh_detail}"
         return {
-            "mode": "ready-health-recommends-full-refresh",
+            "mode": operation_mode,
             "intended": True,
             "partially_staged": False,
             "ready": True,
             "details": details,
             **_guidance_command_fields(
                 command=refresh_command,
-                reason_code="refresh_full_snapshot",
+                reason_code=refresh_reason_code,
                 automation_safe=True,
                 requires_auth_interaction=False,
             ),
@@ -914,18 +952,25 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         refresh_command = refresh_payload.get("command") if isinstance(refresh_payload.get("command"), str) else None
         refresh_command_args = refresh_payload.get("command_args") if isinstance(refresh_payload.get("command_args"), list) else []
         refresh_details = refresh_payload.get("detail") if isinstance(refresh_payload.get("detail"), str) else None
+        refresh_reason_code = str(refresh_payload.get("reason_code") or "") or "refresh_full_snapshot"
         provider_title = "Crunchyroll" if provider_name == "crunchyroll" else "HIDIVE" if provider_name == "hidive" else provider_name
-        details = f"Run a conservative full-refresh {provider_title} ingest because the latest health artifact still reports partial provider coverage."
+        if refresh_reason_code == "refresh_ingested_snapshot":
+            step = f"refresh-{provider_name}-snapshot"
+            details = f"Run a conservative {provider_title} ingest refresh because the latest health artifact says the cached provider snapshot should be refreshed before it is treated as current."
+        else:
+            step = f"refresh-{provider_name}-full-snapshot"
+            details = f"Run a conservative full-refresh {provider_title} ingest because the latest health artifact still reports partial provider coverage."
+            refresh_reason_code = "refresh_full_snapshot"
         if refresh_details:
             details += f" Latest maintenance signal: {refresh_details}"
         add_onboarding_step(
-            step=f"refresh-{provider_name}-full-snapshot",
+            step=step,
             details=details,
             user_action_required=False,
             command=refresh_command,
             command_args=refresh_command_args,
             applies_to=provider_name,
-            reason_code="refresh_full_snapshot",
+            reason_code=refresh_reason_code,
             automation_safe=True,
             requires_auth_interaction=False,
         )
