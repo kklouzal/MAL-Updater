@@ -354,6 +354,58 @@ def _provider_bootstrap_health_refresh_recommendation(
 
 
 
+def _bootstrap_health_review_recommendations(config: AppConfig) -> list[dict[str, object]]:
+    path = config.health_latest_json_path
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    maintenance = payload.get("maintenance")
+    if not isinstance(maintenance, dict):
+        return []
+    commands = maintenance.get("recommended_commands")
+    if not isinstance(commands, list):
+        return []
+
+    review_reason_codes = {
+        "refresh_mapping_review_worklist",
+        "refresh_mapping_review_queue",
+        "refresh_mapping_review_backlog",
+    }
+    recommendations: list[dict[str, object]] = []
+    seen_commands: set[str] = set()
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        reason_code = command.get("reason_code")
+        if reason_code not in review_reason_codes:
+            continue
+        command_args = command.get("command_args")
+        if not isinstance(command_args, list) or not all(isinstance(part, str) for part in command_args):
+            continue
+        command_string = _build_review_queue_command(list(command_args))
+        if command_string in seen_commands:
+            continue
+        seen_commands.add(command_string)
+        detail = command.get("detail") if isinstance(command.get("detail"), str) else None
+        recommendations.append(
+            {
+                "reason_code": str(reason_code),
+                "command_args": list(command_args),
+                "command": command_string,
+                "detail": detail,
+                "automation_safe": command.get("automation_safe") if isinstance(command.get("automation_safe"), bool) else True,
+                "requires_auth_interaction": command.get("requires_auth_interaction") if isinstance(command.get("requires_auth_interaction"), bool) else False,
+            }
+        )
+    return recommendations
+
+
+
 def _provider_bootstrap_guidance_status(
     *,
     provider_name: str,
@@ -721,6 +773,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         for provider in ("crunchyroll", "hidive")
         if (payload := _provider_bootstrap_health_refresh_recommendation(config, provider=provider, service_state=service_state)) is not None
     }
+    health_review_recommendations = _bootstrap_health_review_recommendations(config)
     mal_guidance = _mal_bootstrap_guidance_status(
         client_id_present=mal_app_present,
         oauth_present=mal_oauth_present,
@@ -974,6 +1027,26 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             automation_safe=True,
             requires_auth_interaction=False,
         )
+    if mal_oauth_present and not isinstance(mal_auth_issue, dict):
+        for review_recommendation in health_review_recommendations:
+            review_command = review_recommendation.get("command") if isinstance(review_recommendation.get("command"), str) else None
+            review_command_args = review_recommendation.get("command_args") if isinstance(review_recommendation.get("command_args"), list) else []
+            review_detail = review_recommendation.get("detail") if isinstance(review_recommendation.get("detail"), str) else None
+            review_reason_code = str(review_recommendation.get("reason_code") or "") or "refresh_mapping_review_backlog"
+            step = review_reason_code.replace("_", "-")
+            details = review_detail or "Run the mapping-review maintenance command recommended by the latest health artifact."
+            details += " This is carried from the latest health artifact into bootstrap-audit so bootstrap-ready installs still surface review/backlog pressure without requiring a separate health-check read."
+            add_onboarding_step(
+                step=step,
+                details=details,
+                user_action_required=False,
+                command=review_command,
+                command_args=review_command_args,
+                applies_to="review_queue",
+                reason_code=review_reason_code,
+                automation_safe=review_recommendation.get("automation_safe") is True,
+                requires_auth_interaction=review_recommendation.get("requires_auth_interaction") is True,
+            )
     if not dependency_checks["systemctl"]:
         add_onboarding_step(
             step="install-service-manager",

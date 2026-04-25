@@ -714,6 +714,64 @@ class BootstrapAuditCliTests(unittest.TestCase):
         )
         self.assertIn("partially_staged_provider_count=1", stdout)
 
+    def test_bootstrap_audit_carries_health_mapping_review_recommendation(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets", "state/health"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+        (runtime_root / "state" / "health" / "latest-health-check.json").write_text(
+            json.dumps(
+                {
+                    "maintenance": {
+                        "recommended_commands": [
+                            {
+                                "reason_code": "refresh_mapping_review_worklist",
+                                "detail": "Re-evaluate the highest-signal open mapping-review slices under the latest mapper heuristics before rebuilding the whole backlog",
+                                "command_args": [
+                                    "refresh-mapping-review-queue",
+                                    "--issue-type",
+                                    "mapping_review",
+                                    "--limit",
+                                    "3",
+                                ],
+                                "automation_safe": True,
+                                "requires_auth_interaction": False,
+                            }
+                        ]
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        review_command = next(
+            item
+            for item in payload["recommended_commands"]
+            if item.get("reason_code") == "refresh_mapping_review_worklist"
+        )
+        self.assertEqual(
+            "PYTHONPATH=src python3 -m mal_updater.cli refresh-mapping-review-queue --issue-type mapping_review --limit 3",
+            review_command["command"],
+        )
+        self.assertEqual("review_queue", review_command["applies_to"])
+        self.assertTrue(review_command["automation_safe"])
+        self.assertFalse(review_command["requires_auth_interaction"])
+        self.assertIn("health artifact", review_command["details"])
+
 
 if __name__ == "__main__":
     unittest.main()
