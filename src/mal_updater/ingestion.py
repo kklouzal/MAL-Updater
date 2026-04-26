@@ -30,7 +30,7 @@ class IngestionSummary:
         }
 
 
-def ingest_snapshot_payload(payload: Any, config: AppConfig) -> IngestionSummary:
+def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ingest_snapshot") -> IngestionSummary:
     snapshot = validate_snapshot_payload(payload)
     bootstrap_database(config.db_path)
 
@@ -38,7 +38,7 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig) -> IngestionSummary
     contract_version = snapshot.contract_version
 
     with connect(config.db_path) as conn:
-        sync_run_id = _insert_sync_run(conn, provider, contract_version)
+        sync_run_id = _insert_sync_run(conn, provider, contract_version, mode)
         try:
             _upsert_series(conn, provider, snapshot.series)
             _upsert_progress(conn, provider, snapshot.progress)
@@ -60,18 +60,18 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig) -> IngestionSummary
             raise
 
 
-def ingest_snapshot_file(path: Path, config: AppConfig) -> IngestionSummary:
+def ingest_snapshot_file(path: Path, config: AppConfig, *, mode: str = "ingest_snapshot") -> IngestionSummary:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return ingest_snapshot_payload(payload, config)
+    return ingest_snapshot_payload(payload, config, mode=mode)
 
 
-def _insert_sync_run(conn, provider: str, contract_version: str) -> int:
+def _insert_sync_run(conn, provider: str, contract_version: str, mode: str) -> int:
     cursor = conn.execute(
         """
         INSERT INTO sync_runs(provider, contract_version, mode, status)
         VALUES (?, ?, ?, ?)
         """,
-        (provider, contract_version, "ingest_snapshot", "running"),
+        (provider, contract_version, mode, "running"),
     )
     return int(cursor.lastrowid)
 

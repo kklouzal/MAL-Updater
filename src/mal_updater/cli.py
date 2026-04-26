@@ -3189,7 +3189,8 @@ def _cmd_provider_fetch_snapshot(
         print(f"Wrote {provider.display_name} snapshot to {target_path}")
 
     if ingest:
-        summary = ingest_snapshot_payload(payload, config)
+        ingest_mode = "full_refresh" if full_refresh else "ingest_snapshot"
+        summary = ingest_snapshot_payload(payload, config, mode=ingest_mode)
         print(json.dumps(summary.as_dict(), indent=2))
         return 0
 
