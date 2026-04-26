@@ -246,10 +246,13 @@ If the gap between the full-refresh summary counts and the cached provider total
 
 Keep ordinary incremental coverage gaps on the existing `latest_sync_run_partial_coverage` path with `refresh_full_snapshot` remediation, even when older cached rows are present.
 
+Include bounded read-only stale-row samples in the partial-coverage payload when older cached rows exist. This is diagnostic evidence only; it must not prune, archive, or otherwise mutate provider rows automatically.
+
 ### Why
 - a completed full refresh that omits a few previously cached rows is stronger evidence that those rows are stale/deleted upstream than that another identical full refresh will help
 - repeated full-refresh recommendations after an already-successful full refresh create noisy automation pressure without improving provider freshness
 - incremental refreshes still only prove overlap-page freshness, so they must not use stale-row classification to suppress the conservative full-refresh escape hatch
+- sample rows make the next retention/archive/prune decision inspectable without turning health-check into a destructive cleanup workflow
 
 ## 2026-04-23 - Service-status execution-state posture
 

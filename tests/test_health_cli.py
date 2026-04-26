@@ -1263,6 +1263,11 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(partial["fully_explained_by_stale_rows"])
         self.assertEqual("stale_or_deleted_provider_rows", partial["fields"]["series"]["classification"])
         self.assertEqual(3, partial["fields"]["series"]["older_last_seen_row_count"])
+        samples = partial["fields"]["series"]["older_last_seen_samples"]
+        self.assertEqual(3, len(samples))
+        self.assertEqual("series-3", samples[0]["provider_series_id"])
+        self.assertEqual("Example Show 3", samples[0]["title"])
+        self.assertEqual("2026-04-24 18:00:00", samples[0]["last_seen_at"])
         self.assertNotIn(
             "refresh_full_snapshot",
             {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},

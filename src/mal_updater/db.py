@@ -904,3 +904,104 @@ def get_provider_stale_row_counts(db_path: Path, *, provider: str, cutoff: str) 
         "progress": int(progress_count or 0),
         "watchlist": int(watchlist_count or 0),
     }
+
+
+def list_provider_stale_row_samples(
+    db_path: Path,
+    *,
+    provider: str,
+    cutoff: str,
+    limit: int = 5,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return small operator-facing samples of cached provider rows older than a cutoff.
+
+    The samples intentionally remain read-only diagnostics. They give health-check
+    output enough context to decide whether stale/deleted upstream rows should be
+    left as classified residue, refreshed again, or handled by a future archive/prune
+    workflow without making that destructive policy choice automatically.
+    """
+    if not provider or not cutoff:
+        return {"series": [], "progress": [], "watchlist": []}
+    safe_limit = max(1, min(25, int(limit)))
+    with connect(db_path) as conn:
+        series_rows = conn.execute(
+            """
+            SELECT provider_series_id, title, season_title, season_number, last_seen_at
+            FROM provider_series
+            WHERE provider = ? AND last_seen_at < ?
+            ORDER BY last_seen_at ASC, title COLLATE NOCASE ASC, provider_series_id ASC
+            LIMIT ?
+            """,
+            (provider, cutoff, safe_limit),
+        ).fetchall()
+        progress_rows = conn.execute(
+            """
+            SELECT
+                p.provider_episode_id,
+                p.provider_series_id,
+                s.title AS series_title,
+                p.episode_number,
+                p.episode_title,
+                p.last_watched_at,
+                p.last_seen_at
+            FROM provider_episode_progress p
+            LEFT JOIN provider_series s
+                ON s.provider = p.provider AND s.provider_series_id = p.provider_series_id
+            WHERE p.provider = ? AND p.last_seen_at < ?
+            ORDER BY p.last_seen_at ASC, p.provider_series_id ASC, p.episode_number ASC, p.provider_episode_id ASC
+            LIMIT ?
+            """,
+            (provider, cutoff, safe_limit),
+        ).fetchall()
+        watchlist_rows = conn.execute(
+            """
+            SELECT
+                w.provider_series_id,
+                s.title,
+                w.status,
+                w.added_at,
+                w.last_seen_at
+            FROM provider_watchlist w
+            LEFT JOIN provider_series s
+                ON s.provider = w.provider AND s.provider_series_id = w.provider_series_id
+            WHERE w.provider = ? AND w.last_seen_at < ?
+            ORDER BY w.last_seen_at ASC, COALESCE(s.title, w.provider_series_id) COLLATE NOCASE ASC
+            LIMIT ?
+            """,
+            (provider, cutoff, safe_limit),
+        ).fetchall()
+
+    return {
+        "series": [
+            {
+                "provider_series_id": str(row["provider_series_id"]),
+                "title": row["title"],
+                "season_title": row["season_title"],
+                "season_number": row["season_number"],
+                "last_seen_at": row["last_seen_at"],
+            }
+            for row in series_rows
+        ],
+        "progress": [
+            {
+                "provider_episode_id": str(row["provider_episode_id"]),
+                "provider_series_id": str(row["provider_series_id"]),
+                "series_title": row["series_title"],
+                "episode_number": row["episode_number"],
+                "episode_title": row["episode_title"],
+                "last_watched_at": row["last_watched_at"],
+                "last_seen_at": row["last_seen_at"],
+            }
+            for row in progress_rows
+        ],
+        "watchlist": [
+            {
+                "provider_series_id": str(row["provider_series_id"]),
+                "title": row["title"],
+                "status": row["status"],
+                "added_at": row["added_at"],
+                "last_seen_at": row["last_seen_at"],
+            }
+            for row in watchlist_rows
+        ],
+    }

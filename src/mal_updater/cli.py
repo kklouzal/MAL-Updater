@@ -32,6 +32,7 @@ from .db import (
     bootstrap_database,
     get_operational_snapshot,
     get_provider_stale_row_counts,
+    list_provider_stale_row_samples,
     get_provider_series_title_map,
     get_provider_series_title_map_by_keys,
     list_review_queue_entries,
@@ -1675,6 +1676,7 @@ def _build_partial_sync_coverage(
     latest_sync_run: dict[str, object] | None,
     provider_counts_by_provider: dict[str, object] | None,
     stale_row_counts: dict[str, int] | None = None,
+    stale_row_samples: dict[str, list[dict[str, object]]] | None = None,
 ) -> dict[str, object] | None:
     latest_counts = _sync_run_summary_counts(latest_sync_run)
     if not latest_counts or not isinstance(provider_counts_by_provider, dict):
@@ -1714,6 +1716,9 @@ def _build_partial_sync_coverage(
         stale_count = stale_row_counts.get(provider_field) if isinstance(stale_row_counts, dict) else None
         if isinstance(stale_count, int) and stale_count > 0:
             field_payload["older_last_seen_row_count"] = stale_count
+            stale_samples = stale_row_samples.get(provider_field) if isinstance(stale_row_samples, dict) else None
+            if isinstance(stale_samples, list) and stale_samples:
+                field_payload["older_last_seen_samples"] = stale_samples
             if mode == "full_refresh" and stale_count == missing_count:
                 field_payload["classification"] = "stale_or_deleted_provider_rows"
                 stale_explained_fields[provider_field] = field_payload
@@ -2584,6 +2589,7 @@ def _cmd_health_check(
         latest_completed_sync_run.get("completed_at") if isinstance(latest_completed_sync_run, dict) else None
     )
     latest_provider_stale_row_counts: dict[str, int] | None = None
+    latest_provider_stale_row_samples: dict[str, list[dict[str, object]]] | None = None
     if isinstance(latest_sync_run, dict):
         latest_provider = latest_sync_run.get("provider")
         latest_started_at = latest_sync_run.get("started_at")
@@ -2593,10 +2599,17 @@ def _cmd_health_check(
                 provider=latest_provider,
                 cutoff=latest_started_at,
             )
+            latest_provider_stale_row_samples = list_provider_stale_row_samples(
+                config.db_path,
+                provider=latest_provider,
+                cutoff=latest_started_at,
+                limit=5,
+            )
     partial_sync_coverage = _build_partial_sync_coverage(
         latest_sync_run if isinstance(latest_sync_run, dict) else None,
         snapshot.get("provider_counts_by_provider") if isinstance(snapshot.get("provider_counts_by_provider"), dict) else None,
         latest_provider_stale_row_counts,
+        latest_provider_stale_row_samples,
     )
     mapping_coverage = _build_mapping_coverage_snapshot(
         snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
