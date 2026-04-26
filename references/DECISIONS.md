@@ -237,6 +237,20 @@ Aggregate provider counts and approved mapping coverage should span **all persis
 - coverage and backlog guidance should reflect the whole configured system, not whichever provider happened to be hard-coded earliest
 - partial-refresh warnings remain provider-specific by nature, so that comparison should stay tied to the provider that actually ran instead of being diluted by cross-provider totals
 
+## 2026-04-25 - Full-refresh stale-row classification posture
+
+### Decision
+When the latest successful provider ingest was a `full_refresh`, let `health-check` distinguish stale/deleted upstream residue from genuinely partial refresh coverage.
+
+If the gap between the full-refresh summary counts and the cached provider totals is exactly explained by rows whose `last_seen_at` predates the sync run start, report `latest_sync_run_stale_provider_rows` and preserve the per-field `older_last_seen_row_count` / `stale_or_deleted_provider_rows` classification. Do **not** recommend another immediate `refresh_full_snapshot` for that shape.
+
+Keep ordinary incremental coverage gaps on the existing `latest_sync_run_partial_coverage` path with `refresh_full_snapshot` remediation, even when older cached rows are present.
+
+### Why
+- a completed full refresh that omits a few previously cached rows is stronger evidence that those rows are stale/deleted upstream than that another identical full refresh will help
+- repeated full-refresh recommendations after an already-successful full refresh create noisy automation pressure without improving provider freshness
+- incremental refreshes still only prove overlap-page freshness, so they must not use stale-row classification to suppress the conservative full-refresh escape hatch
+
 ## 2026-04-23 - Service-status execution-state posture
 
 ### Decision

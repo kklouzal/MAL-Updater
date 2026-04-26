@@ -31,6 +31,7 @@ from . import providers as _providers  # noqa: F401
 from .db import (
     bootstrap_database,
     get_operational_snapshot,
+    get_provider_stale_row_counts,
     get_provider_series_title_map,
     get_provider_series_title_map_by_keys,
     list_review_queue_entries,
@@ -1673,6 +1674,7 @@ def _sync_run_summary_counts(sync_run: dict[str, object] | None) -> dict[str, in
 def _build_partial_sync_coverage(
     latest_sync_run: dict[str, object] | None,
     provider_counts_by_provider: dict[str, object] | None,
+    stale_row_counts: dict[str, int] | None = None,
 ) -> dict[str, object] | None:
     latest_counts = _sync_run_summary_counts(latest_sync_run)
     if not latest_counts or not isinstance(provider_counts_by_provider, dict):
@@ -1691,6 +1693,8 @@ def _build_partial_sync_coverage(
         "watchlist_count": "watchlist",
     }
     partial_fields: dict[str, dict[str, object]] = {}
+    stale_explained_fields: dict[str, dict[str, object]] = {}
+    mode = latest_sync_run.get("mode") if isinstance(latest_sync_run, dict) else None
     for summary_field, provider_field in field_map.items():
         latest_value = latest_counts.get(summary_field)
         provider_value = provider_counts.get(provider_field)
@@ -1700,18 +1704,30 @@ def _build_partial_sync_coverage(
             continue
         if latest_value >= provider_value:
             continue
-        partial_fields[provider_field] = {
+        missing_count = provider_value - latest_value
+        field_payload = {
             "latest_sync_run_count": latest_value,
             "provider_total_count": provider_value,
             "coverage_ratio": round(latest_value / provider_value, 4),
+            "missing_count": missing_count,
         }
+        stale_count = stale_row_counts.get(provider_field) if isinstance(stale_row_counts, dict) else None
+        if isinstance(stale_count, int) and stale_count > 0:
+            field_payload["older_last_seen_row_count"] = stale_count
+            if mode == "full_refresh" and stale_count == missing_count:
+                field_payload["classification"] = "stale_or_deleted_provider_rows"
+                stale_explained_fields[provider_field] = field_payload
+        partial_fields[provider_field] = field_payload
 
     if not partial_fields:
         return None
 
+    fully_explained_by_stale_rows = bool(partial_fields) and set(stale_explained_fields) == set(partial_fields)
     return {
         "provider": provider_name,
         "sync_run_id": latest_sync_run.get("id") if isinstance(latest_sync_run, dict) else None,
+        "mode": mode,
+        "fully_explained_by_stale_rows": fully_explained_by_stale_rows,
         "fields": partial_fields,
     }
 
@@ -2304,7 +2320,8 @@ def _build_health_maintenance_commands(
         "hidive": "HIDIVE",
     }
 
-    if provider_ready.get(refresh_provider) and isinstance(partial_sync_coverage, dict):
+    partial_coverage_needs_refresh = isinstance(partial_sync_coverage, dict) and partial_sync_coverage.get("fully_explained_by_stale_rows") is not True
+    if provider_ready.get(refresh_provider) and partial_coverage_needs_refresh:
         add_command(
             "refresh_full_snapshot",
             f"Run a full-refresh {provider_label.get(refresh_provider, refresh_provider)} ingest so untouched older rows are refreshed instead of only the incremental overlap page",
@@ -2566,9 +2583,20 @@ def _cmd_health_check(
     latest_completed_age_seconds = _age_seconds_from_timestamp(
         latest_completed_sync_run.get("completed_at") if isinstance(latest_completed_sync_run, dict) else None
     )
+    latest_provider_stale_row_counts: dict[str, int] | None = None
+    if isinstance(latest_sync_run, dict):
+        latest_provider = latest_sync_run.get("provider")
+        latest_started_at = latest_sync_run.get("started_at")
+        if isinstance(latest_provider, str) and latest_provider and isinstance(latest_started_at, str) and latest_started_at:
+            latest_provider_stale_row_counts = get_provider_stale_row_counts(
+                config.db_path,
+                provider=latest_provider,
+                cutoff=latest_started_at,
+            )
     partial_sync_coverage = _build_partial_sync_coverage(
         latest_sync_run if isinstance(latest_sync_run, dict) else None,
         snapshot.get("provider_counts_by_provider") if isinstance(snapshot.get("provider_counts_by_provider"), dict) else None,
+        latest_provider_stale_row_counts,
     )
     mapping_coverage = _build_mapping_coverage_snapshot(
         snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
@@ -2649,10 +2677,11 @@ def _cmd_health_check(
             }
         )
     if isinstance(partial_sync_coverage, dict):
+        fully_explained_by_stale_rows = partial_sync_coverage.get("fully_explained_by_stale_rows") is True
         warnings.append(
             {
-                "code": "latest_sync_run_partial_coverage",
-                "detail": "Latest completed ingest touched fewer provider rows than currently exist in the local cache; freshness is only partial until a full refresh runs",
+                "code": "latest_sync_run_stale_provider_rows" if fully_explained_by_stale_rows else "latest_sync_run_partial_coverage",
+                "detail": "Latest ingest touched fewer rows than the local cache, and the gap is fully explained by older last_seen rows that may be stale/deleted upstream" if fully_explained_by_stale_rows else "Latest completed ingest touched fewer provider rows than currently exist in the local cache; freshness is only partial until a full refresh runs",
                 "sync_run_id": partial_sync_coverage.get("sync_run_id"),
                 "fields": partial_sync_coverage.get("fields"),
             }

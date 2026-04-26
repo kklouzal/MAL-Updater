@@ -1217,6 +1217,108 @@ class HealthCheckCliTests(unittest.TestCase):
             maintenance_commands[0]["command_args"],
         )
 
+    def test_health_check_classifies_full_refresh_gaps_as_stale_provider_rows(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            for idx in range(1, 6):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "crunchyroll",
+                        f"series-{idx}",
+                        f"Example Show {idx}",
+                        f"Example Show {idx}",
+                        1,
+                        "{}",
+                        "2026-04-25 18:00:00" if idx <= 2 else "2026-04-24 18:00:00",
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 2}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_health_check("--stale-hours", "72")
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("latest_sync_run_stale_provider_rows", warning_codes)
+        self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
+        partial = payload["partial_sync_coverage"]
+        self.assertTrue(partial["fully_explained_by_stale_rows"])
+        self.assertEqual("stale_or_deleted_provider_rows", partial["fields"]["series"]["classification"])
+        self.assertEqual(3, partial["fields"]["series"]["older_last_seen_row_count"])
+        self.assertNotIn(
+            "refresh_full_snapshot",
+            {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
+        )
+
+    def test_health_check_keeps_incremental_stale_gaps_on_full_refresh_remediation(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            for idx in range(1, 6):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "crunchyroll",
+                        f"series-{idx}",
+                        f"Example Show {idx}",
+                        f"Example Show {idx}",
+                        1,
+                        "{}",
+                        "2026-04-25 18:00:00" if idx <= 2 else "2026-04-24 18:00:00",
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "ingest_snapshot",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 2}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_health_check("--stale-hours", "72")
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("latest_sync_run_partial_coverage", warning_codes)
+        self.assertNotIn("latest_sync_run_stale_provider_rows", warning_codes)
+        partial = payload["partial_sync_coverage"]
+        self.assertFalse(partial["fully_explained_by_stale_rows"])
+        self.assertEqual(3, partial["fields"]["series"]["older_last_seen_row_count"])
+        self.assertNotIn("classification", partial["fields"]["series"])
+        self.assertIn(
+            "refresh_full_snapshot",
+            {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
+        )
+
     def test_health_check_prefers_full_refresh_over_incremental_refresh_when_partial_coverage_exists(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")

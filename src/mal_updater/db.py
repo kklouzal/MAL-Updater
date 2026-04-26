@@ -875,3 +875,32 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
         "review_queue": review_counts,
         "mappings": mapping_counts,
     }
+
+
+def get_provider_stale_row_counts(db_path: Path, *, provider: str, cutoff: str) -> dict[str, int]:
+    """Count cached provider rows not touched since a sync-run cutoff.
+
+    Health checks use this to distinguish a genuinely partial incremental ingest from
+    the common full-refresh residue shape where a provider no longer returns a few
+    catalog/watchlist/progress rows but the local cache still retains them.
+    """
+    if not provider or not cutoff:
+        return {}
+    with connect(db_path) as conn:
+        series_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM provider_series WHERE provider = ? AND last_seen_at < ?",
+            (provider, cutoff),
+        ).fetchone()["count"]
+        progress_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM provider_episode_progress WHERE provider = ? AND last_seen_at < ?",
+            (provider, cutoff),
+        ).fetchone()["count"]
+        watchlist_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM provider_watchlist WHERE provider = ? AND last_seen_at < ?",
+            (provider, cutoff),
+        ).fetchone()["count"]
+    return {
+        "series": int(series_count or 0),
+        "progress": int(progress_count or 0),
+        "watchlist": int(watchlist_count or 0),
+    }
