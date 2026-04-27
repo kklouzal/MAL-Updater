@@ -877,6 +877,44 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
     }
 
 
+def get_latest_completed_sync_run(
+    db_path: Path,
+    *,
+    provider: str,
+    mode: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the latest completed sync run for a provider, optionally by mode."""
+    if not provider:
+        return None
+    conditions = ["provider = ?", "status = 'completed'"]
+    params: list[object] = [provider]
+    if mode is not None:
+        conditions.append("mode = ?")
+        params.append(mode)
+    query = """
+        SELECT id, provider, contract_version, mode, started_at, completed_at, status, summary_json
+        FROM sync_runs
+        WHERE {conditions}
+        ORDER BY datetime(completed_at) DESC, id DESC
+        LIMIT 1
+    """.format(conditions=" AND ".join(conditions))
+    with connect(db_path) as conn:
+        row = conn.execute(query, params).fetchone()
+    if row is None:
+        return None
+    summary_json = row["summary_json"]
+    return {
+        "id": int(row["id"]),
+        "provider": row["provider"],
+        "contract_version": row["contract_version"],
+        "mode": row["mode"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "status": row["status"],
+        "summary": json.loads(summary_json) if summary_json else None,
+    }
+
+
 def get_provider_stale_row_counts(db_path: Path, *, provider: str, cutoff: str) -> dict[str, int]:
     """Count cached provider rows not touched since a sync-run cutoff.
 

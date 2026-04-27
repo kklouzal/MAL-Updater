@@ -30,6 +30,7 @@ from .provider_registry import get_provider, list_provider_slugs
 from . import providers as _providers  # noqa: F401
 from .db import (
     bootstrap_database,
+    get_latest_completed_sync_run,
     get_operational_snapshot,
     get_provider_stale_row_counts,
     list_provider_stale_row_samples,
@@ -3241,6 +3242,61 @@ def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) 
     return 0
 
 
+def _cmd_provider_stale_rows(
+    project_root: Path | None,
+    provider: str,
+    cutoff: str | None,
+    limit: int,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+
+    cutoff_source = "explicit"
+    sync_run: dict[str, object] | None = None
+    effective_cutoff = cutoff.strip() if isinstance(cutoff, str) and cutoff.strip() else None
+    if effective_cutoff is None:
+        sync_run = get_latest_completed_sync_run(config.db_path, provider=provider, mode="full_refresh")
+        if isinstance(sync_run, dict):
+            started_at = sync_run.get("started_at")
+            if isinstance(started_at, str) and started_at.strip():
+                effective_cutoff = started_at.strip()
+                cutoff_source = "latest_completed_full_refresh_started_at"
+
+    if effective_cutoff is None:
+        payload = {
+            "provider": provider,
+            "cutoff": None,
+            "cutoff_source": None,
+            "latest_completed_full_refresh": None,
+            "counts": {"series": 0, "progress": 0, "watchlist": 0},
+            "samples": {"series": [], "progress": [], "watchlist": []},
+            "ready": False,
+            "detail": "No cutoff was provided and no completed full-refresh sync run exists for this provider.",
+        }
+        print(json.dumps(payload, indent=2))
+        return 1
+
+    safe_limit = max(1, min(25, int(limit)))
+    counts = get_provider_stale_row_counts(config.db_path, provider=provider, cutoff=effective_cutoff)
+    samples = list_provider_stale_row_samples(config.db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit)
+    payload = {
+        "provider": provider,
+        "cutoff": effective_cutoff,
+        "cutoff_source": cutoff_source,
+        "latest_completed_full_refresh": sync_run,
+        "counts": counts,
+        "total_count": sum(value for value in counts.values() if isinstance(value, int)),
+        "sample_limit": safe_limit,
+        "samples": samples,
+        "ready": True,
+        "read_only": True,
+        "policy": "diagnostic_only_no_archive_or_prune",
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -> int:
     config = load_config(project_root)
     states = load_provider_series_states(config, limit=limit)
@@ -5535,6 +5591,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a normalized provider snapshot into SQLite")
     ingest_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
+    provider_stale_rows = subparsers.add_parser(
+        "provider-stale-rows",
+        help="Inspect read-only provider cache rows older than a cutoff, defaulting to the provider's latest completed full refresh",
+    )
+    provider_stale_rows.add_argument("--provider", required=True, choices=list_provider_slugs(), help="Provider slug to inspect")
+    provider_stale_rows.add_argument("--cutoff", default=None, help="SQLite timestamp cutoff; rows with last_seen_at older than this are reported")
+    provider_stale_rows.add_argument("--limit", type=int, default=5, help="Maximum samples per row family (1-25)")
     map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested provider series")
     map_series_cmd.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     map_series_cmd.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
@@ -5819,6 +5882,8 @@ def main() -> int:
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":
         return _cmd_ingest_snapshot(args.project_root, args.snapshot)
+    if args.command == "provider-stale-rows":
+        return _cmd_provider_stale_rows(args.project_root, args.provider, args.cutoff, args.limit)
     if args.command == "map-series":
         return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
     if args.command == "review-mappings":

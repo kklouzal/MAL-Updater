@@ -44,6 +44,22 @@ class HealthCheckCliTests(unittest.TestCase):
         exit_code, stdout = self._run_health_check_raw(*args)
         return exit_code, json.loads(stdout)
 
+    def _run_provider_stale_rows(self, *args: str) -> tuple[int, dict[str, object]]:
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "provider-stale-rows",
+            *args,
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.project_root / ".config")}, clear=False),
+        ):
+            exit_code = cli_main()
+        return exit_code, json.loads(stdout.getvalue())
+
     def _run_health_check_cycle_raw(self, *args: str) -> tuple[int, str]:
         argv = [
             "mal-updater",
@@ -1272,6 +1288,63 @@ class HealthCheckCliTests(unittest.TestCase):
             "refresh_full_snapshot",
             {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
         )
+
+    def test_provider_stale_rows_defaults_to_latest_provider_full_refresh_cutoff(self) -> None:
+        with connect(self.config.db_path) as conn:
+            for idx in range(1, 5):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "crunchyroll",
+                        f"series-{idx}",
+                        f"Example Show {idx}",
+                        f"Example Show {idx}",
+                        1,
+                        "{}",
+                        "2026-04-25 18:00:00" if idx <= 2 else "2026-04-24 18:00:00",
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO provider_episode_progress(provider, provider_episode_id, provider_series_id, episode_number, episode_title, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "episode-3", "series-3", 1, "Episode 1", "{}", "2026-04-24 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO provider_watchlist(provider, provider_series_id, status, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+                ("crunchyroll", "series-4", "watching", "{}", "2026-04-24 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 2}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_provider_stale_rows("--provider", "crunchyroll", "--limit", "1")
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["read_only"])
+        self.assertEqual("latest_completed_full_refresh_started_at", payload["cutoff_source"])
+        self.assertEqual("2026-04-25 17:59:00", payload["cutoff"])
+        self.assertEqual({"series": 2, "progress": 1, "watchlist": 1}, payload["counts"])
+        self.assertEqual(4, payload["total_count"])
+        self.assertEqual(1, len(payload["samples"]["series"]))
+        self.assertEqual("series-3", payload["samples"]["series"][0]["provider_series_id"])
+        self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
+
+    def test_provider_stale_rows_requires_cutoff_or_full_refresh(self) -> None:
+        exit_code, payload = self._run_provider_stale_rows("--provider", "crunchyroll")
+
+        self.assertEqual(1, exit_code)
+        self.assertFalse(payload["ready"])
+        self.assertIn("No cutoff", payload["detail"])
 
     def test_health_check_keeps_incremental_stale_gaps_on_full_refresh_remediation(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
