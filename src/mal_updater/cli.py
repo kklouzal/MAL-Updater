@@ -3247,6 +3247,7 @@ def _cmd_provider_stale_rows(
     provider: str,
     cutoff: str | None,
     limit: int,
+    output_format: str = "json",
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -3274,7 +3275,10 @@ def _cmd_provider_stale_rows(
             "ready": False,
             "detail": "No cutoff was provided and no completed full-refresh sync run exists for this provider.",
         }
-        print(json.dumps(payload, indent=2))
+        if output_format == "summary":
+            _print_provider_stale_rows_summary(payload)
+        else:
+            print(json.dumps(payload, indent=2))
         return 1
 
     safe_limit = max(1, min(25, int(limit)))
@@ -3293,8 +3297,42 @@ def _cmd_provider_stale_rows(
         "read_only": True,
         "policy": "diagnostic_only_no_archive_or_prune",
     }
-    print(json.dumps(payload, indent=2))
+    if output_format == "summary":
+        _print_provider_stale_rows_summary(payload)
+    else:
+        print(json.dumps(payload, indent=2))
     return 0
+
+
+def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
+    """Emit a stable terse operator summary for stale provider-row diagnostics."""
+    provider = payload.get("provider") if isinstance(payload.get("provider"), str) else "unknown"
+    ready = bool(payload.get("ready"))
+    print(f"provider={provider}")
+    print(f"ready={ready}")
+    cutoff = payload.get("cutoff") if isinstance(payload.get("cutoff"), str) else None
+    if cutoff is not None:
+        print(f"cutoff={cutoff}")
+    cutoff_source = payload.get("cutoff_source") if isinstance(payload.get("cutoff_source"), str) else None
+    if cutoff_source is not None:
+        print(f"cutoff_source={cutoff_source}")
+    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+    for family in ("series", "progress", "watchlist"):
+        value = counts.get(family) if isinstance(counts, dict) else None
+        count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+        print(f"{family}_stale_count={count}")
+    total_count = payload.get("total_count")
+    if isinstance(total_count, int) and not isinstance(total_count, bool):
+        print(f"total_stale_count={total_count}")
+    policy = payload.get("policy") if isinstance(payload.get("policy"), str) else None
+    if policy is not None:
+        print(f"policy={policy}")
+    read_only = payload.get("read_only")
+    if isinstance(read_only, bool):
+        print(f"read_only={read_only}")
+    detail = payload.get("detail") if isinstance(payload.get("detail"), str) else None
+    if detail is not None:
+        print(f"detail={detail}")
 
 
 def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -> int:
@@ -5598,6 +5636,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_stale_rows.add_argument("--provider", required=True, choices=list_provider_slugs(), help="Provider slug to inspect")
     provider_stale_rows.add_argument("--cutoff", default=None, help="SQLite timestamp cutoff; rows with last_seen_at older than this are reported")
     provider_stale_rows.add_argument("--limit", type=int, default=5, help="Maximum samples per row family (1-25)")
+    provider_stale_rows.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested provider series")
     map_series_cmd.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
     map_series_cmd.add_argument("--mapping-limit", type=int, default=5, help="How many MAL candidates to keep per series")
@@ -5883,7 +5922,7 @@ def main() -> int:
     if args.command == "ingest-snapshot":
         return _cmd_ingest_snapshot(args.project_root, args.snapshot)
     if args.command == "provider-stale-rows":
-        return _cmd_provider_stale_rows(args.project_root, args.provider, args.cutoff, args.limit)
+        return _cmd_provider_stale_rows(args.project_root, args.provider, args.cutoff, args.limit, args.format)
     if args.command == "map-series":
         return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
     if args.command == "review-mappings":

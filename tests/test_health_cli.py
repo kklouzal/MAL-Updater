@@ -44,7 +44,7 @@ class HealthCheckCliTests(unittest.TestCase):
         exit_code, stdout = self._run_health_check_raw(*args)
         return exit_code, json.loads(stdout)
 
-    def _run_provider_stale_rows(self, *args: str) -> tuple[int, dict[str, object]]:
+    def _run_provider_stale_rows_raw(self, *args: str) -> tuple[int, str]:
         argv = [
             "mal-updater",
             "--project-root",
@@ -58,7 +58,11 @@ class HealthCheckCliTests(unittest.TestCase):
             patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.project_root / ".config")}, clear=False),
         ):
             exit_code = cli_main()
-        return exit_code, json.loads(stdout.getvalue())
+        return exit_code, stdout.getvalue()
+
+    def _run_provider_stale_rows(self, *args: str) -> tuple[int, dict[str, object]]:
+        exit_code, stdout = self._run_provider_stale_rows_raw(*args)
+        return exit_code, json.loads(stdout)
 
     def _run_health_check_cycle_raw(self, *args: str) -> tuple[int, str]:
         argv = [
@@ -1338,6 +1342,50 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(1, len(payload["samples"]["series"]))
         self.assertEqual("series-3", payload["samples"]["series"][0]["provider_series_id"])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
+
+    def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "series-1", "Example Show", "Example Show", 1, "{}", "2026-04-24 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 0}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
+
+        self.assertEqual(0, exit_code)
+        lines = stdout.strip().splitlines()
+        self.assertIn("provider=crunchyroll", lines)
+        self.assertIn("ready=True", lines)
+        self.assertIn("cutoff_source=latest_completed_full_refresh_started_at", lines)
+        self.assertIn("series_stale_count=1", lines)
+        self.assertIn("progress_stale_count=0", lines)
+        self.assertIn("watchlist_stale_count=0", lines)
+        self.assertIn("total_stale_count=1", lines)
+        self.assertIn("policy=diagnostic_only_no_archive_or_prune", lines)
+        self.assertIn("read_only=True", lines)
+
+    def test_provider_stale_rows_summary_reports_missing_cutoff(self) -> None:
+        exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
+
+        self.assertEqual(1, exit_code)
+        lines = stdout.strip().splitlines()
+        self.assertIn("provider=crunchyroll", lines)
+        self.assertIn("ready=False", lines)
+        self.assertIn("series_stale_count=0", lines)
+        self.assertTrue(any(line.startswith("detail=No cutoff") for line in lines))
 
     def test_provider_stale_rows_requires_cutoff_or_full_refresh(self) -> None:
         exit_code, payload = self._run_provider_stale_rows("--provider", "crunchyroll")
