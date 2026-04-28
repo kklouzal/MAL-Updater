@@ -33,6 +33,7 @@ from .db import (
     get_latest_completed_sync_run,
     get_operational_snapshot,
     get_provider_stale_row_counts,
+    get_provider_stale_row_last_seen_ranges,
     list_provider_stale_row_samples,
     get_provider_series_title_map,
     get_provider_series_title_map_by_keys,
@@ -3316,6 +3317,7 @@ def _build_provider_stale_rows_payload(
         }
 
     counts = get_provider_stale_row_counts(db_path, provider=provider, cutoff=effective_cutoff)
+    last_seen_ranges = get_provider_stale_row_last_seen_ranges(db_path, provider=provider, cutoff=effective_cutoff)
     samples = list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit)
     return {
         "provider": provider,
@@ -3324,12 +3326,42 @@ def _build_provider_stale_rows_payload(
         "latest_completed_full_refresh": sync_run,
         "counts": counts,
         "total_count": sum(value for value in counts.values() if isinstance(value, int)),
+        "last_seen_ranges": last_seen_ranges,
         "sample_limit": safe_limit,
         "samples": samples,
         "ready": True,
         "read_only": True,
         "policy": "diagnostic_only_no_archive_or_prune",
     }
+
+
+
+def _aggregate_provider_stale_row_last_seen_ranges(provider_payloads: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    aggregated: dict[str, dict[str, object]] = {}
+    for family in ("series", "progress", "watchlist"):
+        count = 0
+        oldest_values: list[str] = []
+        newest_values: list[str] = []
+        for payload in provider_payloads.values():
+            ranges = payload.get("last_seen_ranges") if isinstance(payload, dict) else None
+            family_range = ranges.get(family) if isinstance(ranges, dict) else None
+            if not isinstance(family_range, dict):
+                continue
+            family_count = family_range.get("count")
+            if isinstance(family_count, int) and not isinstance(family_count, bool):
+                count += family_count
+            oldest = family_range.get("oldest_last_seen_at")
+            if isinstance(oldest, str) and oldest:
+                oldest_values.append(oldest)
+            newest = family_range.get("newest_last_seen_at")
+            if isinstance(newest, str) and newest:
+                newest_values.append(newest)
+        aggregated[family] = {
+            "count": count,
+            "oldest_last_seen_at": min(oldest_values) if oldest_values else None,
+            "newest_last_seen_at": max(newest_values) if newest_values else None,
+        }
+    return aggregated
 
 
 def _cmd_provider_stale_rows(
@@ -3372,6 +3404,7 @@ def _cmd_provider_stale_rows(
             "all_ready": ready_count == len(provider_payloads),
             "counts": counts,
             "total_count": sum(counts.values()),
+            "last_seen_ranges": _aggregate_provider_stale_row_last_seen_ranges(provider_payloads),
             "sample_limit": safe_limit,
             "read_only": True,
             "policy": "diagnostic_only_no_archive_or_prune",
@@ -3421,6 +3454,17 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
         value = counts.get(family) if isinstance(counts, dict) else None
         count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
         print(f"{family}_stale_count={count}")
+    last_seen_ranges = payload.get("last_seen_ranges") if isinstance(payload.get("last_seen_ranges"), dict) else {}
+    for family in ("series", "progress", "watchlist"):
+        family_range = last_seen_ranges.get(family) if isinstance(last_seen_ranges, dict) else None
+        if not isinstance(family_range, dict):
+            continue
+        oldest = family_range.get("oldest_last_seen_at")
+        newest = family_range.get("newest_last_seen_at")
+        if isinstance(oldest, str) and oldest:
+            print(f"{family}_oldest_last_seen_at={oldest}")
+        if isinstance(newest, str) and newest:
+            print(f"{family}_newest_last_seen_at={newest}")
     total_count = payload.get("total_count")
     if isinstance(total_count, int) and not isinstance(total_count, bool):
         print(f"total_stale_count={total_count}")
@@ -3448,6 +3492,17 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
             value = provider_counts.get(family) if isinstance(provider_counts, dict) else None
             count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
             print(f"{prefix}.{family}_stale_count={count}")
+        provider_ranges = provider_payload.get("last_seen_ranges") if isinstance(provider_payload.get("last_seen_ranges"), dict) else {}
+        for family in ("series", "progress", "watchlist"):
+            family_range = provider_ranges.get(family) if isinstance(provider_ranges, dict) else None
+            if not isinstance(family_range, dict):
+                continue
+            oldest = family_range.get("oldest_last_seen_at")
+            newest = family_range.get("newest_last_seen_at")
+            if isinstance(oldest, str) and oldest:
+                print(f"{prefix}.{family}_oldest_last_seen_at={oldest}")
+            if isinstance(newest, str) and newest:
+                print(f"{prefix}.{family}_newest_last_seen_at={newest}")
         provider_total = provider_payload.get("total_count")
         if isinstance(provider_total, int) and not isinstance(provider_total, bool):
             print(f"{prefix}.total_stale_count={provider_total}")

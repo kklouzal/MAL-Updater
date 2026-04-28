@@ -944,6 +944,39 @@ def get_provider_stale_row_counts(db_path: Path, *, provider: str, cutoff: str) 
     }
 
 
+def get_provider_stale_row_last_seen_ranges(db_path: Path, *, provider: str, cutoff: str) -> dict[str, dict[str, Any]]:
+    """Return min/max last_seen_at ranges for stale provider cache rows.
+
+    The ranges give operators age evidence for stale/deleted upstream residue without
+    implying any archive/prune policy. Empty row families are represented with a
+    zero count and null bounds so JSON and summary consumers can rely on stable keys.
+    """
+    empty = {
+        "series": {"count": 0, "oldest_last_seen_at": None, "newest_last_seen_at": None},
+        "progress": {"count": 0, "oldest_last_seen_at": None, "newest_last_seen_at": None},
+        "watchlist": {"count": 0, "oldest_last_seen_at": None, "newest_last_seen_at": None},
+    }
+    if not provider or not cutoff:
+        return empty
+
+    queries = {
+        "series": "SELECT COUNT(*) AS count, MIN(last_seen_at) AS oldest_last_seen_at, MAX(last_seen_at) AS newest_last_seen_at FROM provider_series WHERE provider = ? AND last_seen_at < ?",
+        "progress": "SELECT COUNT(*) AS count, MIN(last_seen_at) AS oldest_last_seen_at, MAX(last_seen_at) AS newest_last_seen_at FROM provider_episode_progress WHERE provider = ? AND last_seen_at < ?",
+        "watchlist": "SELECT COUNT(*) AS count, MIN(last_seen_at) AS oldest_last_seen_at, MAX(last_seen_at) AS newest_last_seen_at FROM provider_watchlist WHERE provider = ? AND last_seen_at < ?",
+    }
+    ranges: dict[str, dict[str, Any]] = {}
+    with connect(db_path) as conn:
+        for family, query in queries.items():
+            row = conn.execute(query, (provider, cutoff)).fetchone()
+            count = int(row["count"] or 0) if row is not None else 0
+            ranges[family] = {
+                "count": count,
+                "oldest_last_seen_at": row["oldest_last_seen_at"] if count and row is not None else None,
+                "newest_last_seen_at": row["newest_last_seen_at"] if count and row is not None else None,
+            }
+    return ranges
+
+
 def list_provider_stale_row_samples(
     db_path: Path,
     *,
