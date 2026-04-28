@@ -3285,22 +3285,18 @@ def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) 
     return 0
 
 
-def _cmd_provider_stale_rows(
-    project_root: Path | None,
+def _build_provider_stale_rows_payload(
+    *,
+    db_path: Path,
     provider: str,
     cutoff: str | None,
-    limit: int,
-    output_format: str = "json",
-) -> int:
-    config = load_config(project_root)
-    ensure_directories(config)
-    bootstrap_database(config.db_path)
-
+    safe_limit: int,
+) -> dict[str, object]:
     cutoff_source = "explicit"
     sync_run: dict[str, object] | None = None
     effective_cutoff = cutoff.strip() if isinstance(cutoff, str) and cutoff.strip() else None
     if effective_cutoff is None:
-        sync_run = get_latest_completed_sync_run(config.db_path, provider=provider, mode="full_refresh")
+        sync_run = get_latest_completed_sync_run(db_path, provider=provider, mode="full_refresh")
         if isinstance(sync_run, dict):
             started_at = sync_run.get("started_at")
             if isinstance(started_at, str) and started_at.strip():
@@ -3308,7 +3304,7 @@ def _cmd_provider_stale_rows(
                 cutoff_source = "latest_completed_full_refresh_started_at"
 
     if effective_cutoff is None:
-        payload = {
+        return {
             "provider": provider,
             "cutoff": None,
             "cutoff_source": None,
@@ -3318,16 +3314,10 @@ def _cmd_provider_stale_rows(
             "ready": False,
             "detail": "No cutoff was provided and no completed full-refresh sync run exists for this provider.",
         }
-        if output_format == "summary":
-            _print_provider_stale_rows_summary(payload)
-        else:
-            print(json.dumps(payload, indent=2))
-        return 1
 
-    safe_limit = max(1, min(25, int(limit)))
-    counts = get_provider_stale_row_counts(config.db_path, provider=provider, cutoff=effective_cutoff)
-    samples = list_provider_stale_row_samples(config.db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit)
-    payload = {
+    counts = get_provider_stale_row_counts(db_path, provider=provider, cutoff=effective_cutoff)
+    samples = list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit)
+    return {
         "provider": provider,
         "cutoff": effective_cutoff,
         "cutoff_source": cutoff_source,
@@ -3340,11 +3330,69 @@ def _cmd_provider_stale_rows(
         "read_only": True,
         "policy": "diagnostic_only_no_archive_or_prune",
     }
+
+
+def _cmd_provider_stale_rows(
+    project_root: Path | None,
+    provider: str,
+    cutoff: str | None,
+    limit: int,
+    output_format: str = "json",
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    safe_limit = max(1, min(25, int(limit)))
+
+    if provider == "all":
+        provider_payloads = {
+            slug: _build_provider_stale_rows_payload(
+                db_path=config.db_path,
+                provider=slug,
+                cutoff=cutoff,
+                safe_limit=safe_limit,
+            )
+            for slug in list_provider_slugs()
+        }
+        counts = {
+            family: sum(
+                int(payload.get("counts", {}).get(family, 0))
+                for payload in provider_payloads.values()
+                if isinstance(payload.get("counts"), dict)
+            )
+            for family in ("series", "progress", "watchlist")
+        }
+        ready_count = sum(1 for payload in provider_payloads.values() if payload.get("ready") is True)
+        payload = {
+            "provider": "all",
+            "providers": provider_payloads,
+            "provider_count": len(provider_payloads),
+            "providers_ready_count": ready_count,
+            "ready": ready_count > 0,
+            "all_ready": ready_count == len(provider_payloads),
+            "counts": counts,
+            "total_count": sum(counts.values()),
+            "sample_limit": safe_limit,
+            "read_only": True,
+            "policy": "diagnostic_only_no_archive_or_prune",
+        }
+        if output_format == "summary":
+            _print_provider_stale_rows_summary(payload)
+        else:
+            print(json.dumps(payload, indent=2))
+        return 0 if ready_count > 0 else 1
+
+    payload = _build_provider_stale_rows_payload(
+        db_path=config.db_path,
+        provider=provider,
+        cutoff=cutoff,
+        safe_limit=safe_limit,
+    )
     if output_format == "summary":
         _print_provider_stale_rows_summary(payload)
     else:
         print(json.dumps(payload, indent=2))
-    return 0
+    return 0 if payload.get("ready") is True else 1
 
 
 def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
@@ -3353,6 +3401,15 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
     ready = bool(payload.get("ready"))
     print(f"provider={provider}")
     print(f"ready={ready}")
+    all_ready = payload.get("all_ready")
+    if isinstance(all_ready, bool):
+        print(f"all_ready={all_ready}")
+    provider_count = payload.get("provider_count")
+    if isinstance(provider_count, int) and not isinstance(provider_count, bool):
+        print(f"provider_count={provider_count}")
+    providers_ready_count = payload.get("providers_ready_count")
+    if isinstance(providers_ready_count, int) and not isinstance(providers_ready_count, bool):
+        print(f"providers_ready_count={providers_ready_count}")
     cutoff = payload.get("cutoff") if isinstance(payload.get("cutoff"), str) else None
     if cutoff is not None:
         print(f"cutoff={cutoff}")
@@ -3376,6 +3433,27 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
     detail = payload.get("detail") if isinstance(payload.get("detail"), str) else None
     if detail is not None:
         print(f"detail={detail}")
+    providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+    for slug in sorted(providers):
+        provider_payload = providers.get(slug)
+        if not isinstance(provider_payload, dict):
+            continue
+        prefix = f"provider.{slug}"
+        print(f"{prefix}.ready={provider_payload.get('ready') is True}")
+        provider_cutoff = provider_payload.get("cutoff") if isinstance(provider_payload.get("cutoff"), str) else None
+        if provider_cutoff is not None:
+            print(f"{prefix}.cutoff={provider_cutoff}")
+        provider_counts = provider_payload.get("counts") if isinstance(provider_payload.get("counts"), dict) else {}
+        for family in ("series", "progress", "watchlist"):
+            value = provider_counts.get(family) if isinstance(provider_counts, dict) else None
+            count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+            print(f"{prefix}.{family}_stale_count={count}")
+        provider_total = provider_payload.get("total_count")
+        if isinstance(provider_total, int) and not isinstance(provider_total, bool):
+            print(f"{prefix}.total_stale_count={provider_total}")
+        provider_detail = provider_payload.get("detail") if isinstance(provider_payload.get("detail"), str) else None
+        if provider_detail is not None:
+            print(f"{prefix}.detail={provider_detail}")
 
 
 def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -> int:
@@ -5676,7 +5754,7 @@ def build_parser() -> argparse.ArgumentParser:
         "provider-stale-rows",
         help="Inspect read-only provider cache rows older than a cutoff, defaulting to the provider's latest completed full refresh",
     )
-    provider_stale_rows.add_argument("--provider", required=True, choices=list_provider_slugs(), help="Provider slug to inspect")
+    provider_stale_rows.add_argument("--provider", required=True, choices=["all", *list_provider_slugs()], help="Provider slug to inspect, or 'all' for every known provider")
     provider_stale_rows.add_argument("--cutoff", default=None, help="SQLite timestamp cutoff; rows with last_seen_at older than this are reported")
     provider_stale_rows.add_argument("--limit", type=int, default=5, help="Maximum samples per row family (1-25)")
     provider_stale_rows.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")

@@ -41,6 +41,7 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider cru
 PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json
 PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest
 PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --full-refresh
+PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider all --format summary
 PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchyroll
 PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchyroll --format summary
 PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider hidive --cutoff "2026-04-25 17:59:00"

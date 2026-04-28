@@ -1427,6 +1427,81 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("series_stale_count=0", lines)
         self.assertTrue(any(line.startswith("detail=No cutoff") for line in lines))
 
+    def test_provider_stale_rows_all_aggregates_known_providers(self) -> None:
+        with connect(self.config.db_path) as conn:
+            for provider in ("crunchyroll", "hidive"):
+                conn.execute(
+                    "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        provider,
+                        "1.0",
+                        "full_refresh",
+                        "completed",
+                        "2026-04-25 17:59:00",
+                        "2026-04-25 18:01:00",
+                        json.dumps({"series_count": 0}, sort_keys=True),
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "cr-stale", "CR Stale", "CR Stale", 1, "{}", "2026-04-24 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("hidive", "hi-stale", "HIDIVE Stale", "HIDIVE Stale", 1, "{}", "2026-04-24 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO provider_watchlist(provider, provider_series_id, status, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+                ("hidive", "hi-stale", "watching", "{}", "2026-04-24 18:00:00"),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_provider_stale_rows("--provider", "all", "--limit", "1")
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["all_ready"])
+        self.assertEqual(2, payload["providers_ready_count"])
+        self.assertEqual({"series": 2, "progress": 0, "watchlist": 1}, payload["counts"])
+        self.assertEqual(3, payload["total_count"])
+        self.assertEqual(1, payload["providers"]["crunchyroll"]["counts"]["series"])
+        self.assertEqual(1, payload["providers"]["hidive"]["counts"]["watchlist"])
+        self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
+
+    def test_provider_stale_rows_all_summary_shows_per_provider_counts(self) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 0}, sort_keys=True),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "cr-stale", "CR Stale", "CR Stale", 1, "{}", "2026-04-24 18:00:00"),
+            )
+            conn.commit()
+
+        exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "all", "--format", "summary")
+
+        self.assertEqual(0, exit_code)
+        lines = stdout.strip().splitlines()
+        self.assertIn("provider=all", lines)
+        self.assertIn("ready=True", lines)
+        self.assertIn("all_ready=False", lines)
+        self.assertIn("providers_ready_count=1", lines)
+        self.assertIn("series_stale_count=1", lines)
+        self.assertIn("provider.crunchyroll.ready=True", lines)
+        self.assertIn("provider.crunchyroll.series_stale_count=1", lines)
+        self.assertIn("provider.hidive.ready=False", lines)
+        self.assertTrue(any(line.startswith("provider.hidive.detail=No cutoff") for line in lines))
+
     def test_provider_stale_rows_requires_cutoff_or_full_refresh(self) -> None:
         exit_code, payload = self._run_provider_stale_rows("--provider", "crunchyroll")
 
