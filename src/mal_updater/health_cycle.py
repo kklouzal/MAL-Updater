@@ -214,7 +214,7 @@ def run_health_check_cycle(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_log = config.state_dir / "logs" / f"health-check-{stamp}.log"
     run_json = config.health_latest_json_path.parent / f"health-check-{stamp}.json"
-    allowed_reason_codes = auto_run_reason_codes or {"refresh_ingested_snapshot", "refresh_full_snapshot"}
+    allowed_reason_codes = auto_run_reason_codes or {"refresh_ingested_snapshot"}
 
     try:
         with _exclusive_lock(lock_file):

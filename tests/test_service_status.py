@@ -19,6 +19,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
         (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
+        (self.project_root / ".MAL-Updater" / "config" / "settings.toml").write_text("[service]\nfull_refresh_every_seconds = 86400\n", encoding="utf-8")
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
 

@@ -238,6 +238,9 @@ class AuthHelperTests(unittest.TestCase):
 
             sleep_mock.assert_called_once()
             self.assertAlmostEqual(sleep_mock.call_args.args[0], 0.6, places=6)
+            event_log = config.api_request_events_path.read_text(encoding="utf-8")
+            self.assertIn("Example", event_log)
+            self.assertIn("Example+Again", event_log)
 
     def test_mal_client_retries_timeout_once_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as td:

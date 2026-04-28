@@ -16,6 +16,7 @@ _AUTO_APPROVAL_BLOCKERS = (
     "completed_evidence_exceeds_candidate_count=",
 )
 
+_MAX_PLAUSIBLE_INSTALLMENT_NUMBER = 30
 _RELATION_EXPANSION_MEDIA_TYPES = {"tv", "ova", "ona", "special", "movie"}
 _RELATION_EXPANSION_MAX_SEEDS = 2
 _RELATION_EXPANSION_MAX_VISITS = 6
@@ -193,6 +194,9 @@ _SUPPLEMENTAL_TITLE_CANDIDATE_IDS = {
     "konosuba god s blessing on this wonderful world 3": [49458],
     "is this a zombie of the dead": [10790],
     "i was reincarnated as the 7th prince so i can take my time perfecting my magical ability 2nd season": [59095],
+    "beheneko the elf girl s cat is secretly an s ranked monster": [58473],
+    "dusk beyond the end of the world": [61917],
+    "heaven s lost property": [5958],
 }
 
 
@@ -326,7 +330,7 @@ def _extract_standalone_installment_number(value: str | None) -> int | None:
         return roman_number
     if _STANDALONE_NUMERIC_INSTALLMENT_RE.fullmatch(cleaned):
         numeric_value = int(cleaned)
-        if numeric_value >= 2:
+        if 2 <= numeric_value <= _MAX_PLAUSIBLE_INSTALLMENT_NUMBER:
             return numeric_value
     if _STANDALONE_ORDINAL_INSTALLMENT_RE.fullmatch(cleaned):
         ordinal_value = _parse_ordinal_token(cleaned)
@@ -584,7 +588,7 @@ def _extract_terminal_installment_number(value: str | None) -> int | None:
     numeric_match = re.search(r"\b(\d+)$", cleaned)
     if numeric_match:
         number = int(numeric_match.group(1))
-        if number >= 2:
+        if 2 <= number <= _MAX_PLAUSIBLE_INSTALLMENT_NUMBER:
             return number
         return None
     roman_match = re.search(r"\b([ivx]+)$", cleaned, re.IGNORECASE)
@@ -1595,13 +1599,65 @@ def _suspect_multi_entry_bundle(
 
 
 
-def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
-    provider_episode_evidence = max(
+def _provider_episode_evidence(series: SeriesMappingInput) -> int:
+    return max(
         series.completed_episode_count or 0,
         series.max_completed_episode_number or 0,
         series.max_episode_number or 0,
     )
-    top_has_blockers = any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in top.match_reasons)
+
+
+def _candidate_episode_evidence_fits(series: SeriesMappingInput, candidate: MappingCandidate) -> bool:
+    provider_episode_evidence = _provider_episode_evidence(series)
+    if provider_episode_evidence <= 0:
+        return True
+    if candidate.num_episodes is None or candidate.num_episodes <= 0:
+        return False
+    return provider_episode_evidence <= candidate.num_episodes
+
+
+def _candidate_has_auto_approval_blockers(candidate: MappingCandidate) -> bool:
+    return any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in candidate.match_reasons)
+
+
+def _supports_high_confidence_lexical_auto_resolution(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    second: MappingCandidate | None,
+) -> bool:
+    if _candidate_has_auto_approval_blockers(top):
+        return False
+    if top.media_type in {"special", "tv_special", "pv", "music", "cm"}:
+        return False
+    if not _candidate_episode_evidence_fits(series, top):
+        return False
+    margin = top.score - (second.score if second else 0.0)
+    if top.score >= 0.995 and margin >= 0.12 and "substring_title_match" in top.match_reasons:
+        return True
+    if top.score >= 0.96 and margin >= 0.25 and "substring_title_match" in top.match_reasons:
+        return True
+    def has_parenthetical_alias_without_arc_delimiter(value: str | None) -> bool:
+        if not value or "(" not in value:
+            return False
+        cleaned = _search_query_cleanup(value)
+        before_parenthetical = cleaned.split("(", 1)[0]
+        return not re.search(r"[:|\u2013\u2014-]", before_parenthetical)
+
+    if (
+        top.score >= 0.91
+        and margin >= 0.12
+        and "exact_base_title_after_subtitle_trim" in top.match_reasons
+        and any(has_parenthetical_alias_without_arc_delimiter(value) for value in (series.title, series.season_title))
+    ):
+        return True
+    if top.score >= 0.98 and margin >= 0.25 and not top.match_reasons:
+        return True
+    return False
+
+
+def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
+    provider_episode_evidence = _provider_episode_evidence(series)
+    top_has_blockers = _candidate_has_auto_approval_blockers(top)
     if second is None:
         return top.score >= 0.99 and not top_has_blockers
     if (
@@ -1752,7 +1808,12 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
         result.candidates,
         result.bundle_companion_candidates,
     )
-    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match and not has_safe_bundle_resolution and not has_safe_later_installment_resolution and not has_safe_exact_title_overflow_resolution:
+    has_safe_high_confidence_lexical_resolution = _supports_high_confidence_lexical_auto_resolution(
+        result.series,
+        result.chosen_candidate,
+        second_candidate,
+    )
+    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match and not has_safe_bundle_resolution and not has_safe_later_installment_resolution and not has_safe_exact_title_overflow_resolution and not has_safe_high_confidence_lexical_resolution:
         return False
 
     provider_season_number, _ = _provider_season_number(result.series)
@@ -2028,6 +2089,10 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
         top,
         candidates,
         bundle_companion_candidates,
+    ) or _supports_high_confidence_lexical_auto_resolution(
+        series,
+        top,
+        second,
     ):
         status = "exact"
     elif top.score >= 0.90 and margin >= 0.05:

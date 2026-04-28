@@ -38,6 +38,260 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(normalize_title("PERSONA5 the Animation"), "persona 5 the animation")
         self.assertEqual(normalize_title("Ver1.1a"), "ver 1 1 a")
 
+    def test_map_series_does_not_treat_large_terminal_unit_number_as_installment(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 56009,
+                                "title": "Yuusha-kei ni Shosu: Choubatsu Yuusha 9004-tai Keimu Kiroku",
+                                "alternative_titles": {
+                                    "en": "Sentenced to Be a Hero",
+                                    "synonyms": ["Sentenced to Be a Hero: The Prison Records of Penal Hero Unit 9004"],
+                                },
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 63820,
+                                "title": "Yuusha-kei ni Shosu: Choubatsu Yuusha 9004-tai Keimu Kiroku 2nd Season",
+                                "alternative_titles": {"en": "Sentenced to Be a Hero Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "not_yet_aired",
+                                "num_episodes": 0,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="Sentenced to Be a Hero",
+                        season_title="Season 1",
+                        season_number=1,
+                        max_episode_number=10,
+                        completed_episode_count=9,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 56009)
+        self.assertNotIn("season_number_mismatch=provider:1;candidate:9004", result.rationale)
+
+    def test_high_confidence_english_alias_match_can_auto_approve_when_episode_evidence_fits(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 39523,
+                                "title": "Choujin Koukousei-tachi wa Isekai demo Yoyuu de Ikinuku you desu!",
+                                "alternative_titles": {
+                                    "en": "CHOYOYU!: High School Prodigies Have It Easy Even in Another World!",
+                                    "synonyms": ["Super Human High Schoolers Are in Another World, But Seem to be Living in Comfort!"],
+                                },
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 34012,
+                                "title": "Isekai Shokudou",
+                                "alternative_titles": {"en": "Restaurant to Another World", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="High School Prodigies Have It Easy Even In Another World",
+                        season_title="High School Prodigies Have It Easy Even In Another World (English Dub)",
+                        season_number=1,
+                        max_episode_number=12,
+                        completed_episode_count=11,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 39523)
+
+    def test_high_confidence_english_alias_match_stays_unapproved_when_episode_evidence_overflows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 39523,
+                                "title": "Choujin Koukousei-tachi wa Isekai demo Yoyuu de Ikinuku you desu!",
+                                "alternative_titles": {"en": "CHOYOYU!: High School Prodigies Have It Easy Even in Another World!", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        }
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-123",
+                        title="High School Prodigies Have It Easy Even In Another World",
+                        season_title="High School Prodigies Have It Easy Even In Another World (English Dub)",
+                        season_number=1,
+                        max_episode_number=24,
+                        completed_episode_count=24,
+                    ),
+                )
+
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertIn("episode_evidence_exceeds_candidate_count=24>12", result.rationale)
+
+    def test_supplemental_title_candidate_recovers_mal_search_alias_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 1251,
+                                "title": "Fushigi no Umi no Nadia",
+                                "alternative_titles": {"en": "Nadia: The Secret of Blue Water", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 39,
+                            }
+                        }
+                    ]
+                },
+            ), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value={
+                    "id": 58473,
+                    "title": "S-Rank Monster no \"Behemoth\" dakedo, Neko to Machigawarete Elf Musume no Pet toshite Kurashitemasu",
+                    "alternative_titles": {"en": "Beheneko: The Elf-Girl's Cat is Secretly an S-Ranked Monster!", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="hidive",
+                        provider_series_id="series-123",
+                        title="Beheneko: The Elf-Girl's Cat is Secretly an S-Ranked Monster!",
+                        season_title="Season 1",
+                        season_number=1,
+                        max_episode_number=8,
+                        completed_episode_count=0,
+                    ),
+                )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 58473)
+        self.assertIn("supplemental_title_candidate", result.rationale)
+
     def test_map_series_does_not_treat_stylized_single_x_as_roman_installment_hint(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1175,11 +1429,11 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "strong")
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
         self.assertIsNotNone(result.chosen_candidate)
         self.assertEqual(result.chosen_candidate.mal_anime_id, 19685)
         self.assertIn("exact_base_title_after_subtitle_trim", result.rationale)
-        self.assertFalse(should_auto_approve_mapping(result))
 
     def test_map_series_prefers_exact_specific_installment_over_base_title_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:

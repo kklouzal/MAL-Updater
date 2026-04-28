@@ -31,7 +31,7 @@ request_spacing_jitter_seconds = 7.5
 
 [service]
 sync_every_seconds = 21600
-full_refresh_every_seconds = 86400
+full_refresh_every_seconds = 0  # disabled by default; reserve full refresh for initial bootstrap or explicit recovery
 health_every_seconds = 43200
 mal_refresh_every_seconds = 21600
 loop_sleep_seconds = 30

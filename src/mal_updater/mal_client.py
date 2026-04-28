@@ -224,16 +224,16 @@ class MalClient:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
                     body = response.read().decode("utf-8")
-                    record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="ok", status_code=getattr(response, "status", None))
+                    record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
                     return json.loads(body) if body else {"status": status, "num_episodes_watched": num_watched_episodes}
 
             return self._request_with_timeout_retry(error_context, _send)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="http_error", status_code=exc.code, error=detail)
+            record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="url_error", error=str(exc.reason))
+            record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="url_error", error=str(exc.reason), config=self.config)
             raise MalApiError(f"{error_context}: {exc.reason}") from exc
 
     def _get_json(self, path_or_url: str, *, headers: dict[str, str], error_context: str) -> dict[str, Any]:
@@ -243,16 +243,16 @@ class MalClient:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                    record_api_request_event("mal", "get_json", url=url, method="GET", outcome="ok", status_code=getattr(response, "status", None))
+                    record_api_request_event("mal", "get_json", url=url, method="GET", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
                     return payload
 
             return self._request_with_timeout_retry(error_context, _send)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            record_api_request_event("mal", "get_json", url=url, method="GET", outcome="http_error", status_code=exc.code, error=detail)
+            record_api_request_event("mal", "get_json", url=url, method="GET", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            record_api_request_event("mal", "get_json", url=url, method="GET", outcome="url_error", error=str(exc.reason))
+            record_api_request_event("mal", "get_json", url=url, method="GET", outcome="url_error", error=str(exc.reason), config=self.config)
             raise MalApiError(f"{error_context}: {exc.reason}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
@@ -271,16 +271,16 @@ class MalClient:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                    record_api_request_event("mal", "token_request", url=url, method="POST", outcome="ok", status_code=getattr(response, "status", None))
+                    record_api_request_event("mal", "token_request", url=url, method="POST", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
                     return payload
 
             raw = self._request_with_timeout_retry("MAL token request failed", _send)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            record_api_request_event("mal", "token_request", url=url, method="POST", outcome="http_error", status_code=exc.code, error=detail)
+            record_api_request_event("mal", "token_request", url=url, method="POST", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"MAL token request failed: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            record_api_request_event("mal", "token_request", url=url, method="POST", outcome="url_error", error=str(exc.reason))
+            record_api_request_event("mal", "token_request", url=url, method="POST", outcome="url_error", error=str(exc.reason), config=self.config)
             raise MalApiError(f"MAL token request failed: {exc.reason}") from exc
         return TokenResponse(
             access_token=raw["access_token"],

@@ -162,8 +162,8 @@ When a daemon task tied to a provider fails, persist an adaptive failure-backoff
 
 ### Decision
 Keep provider fetch lanes incremental by default, but let the unattended daemon both:
-- persist a provider-specific full-refresh anchor and force a conservative `--full-refresh` sweep whenever `service.full_refresh_every_seconds` elapses (default 24 hours), and
-- honor the latest health-check `refresh_full_snapshot` recommendation for a provider so partial-coverage warnings can trigger the next unattended fetch to self-upgrade into a full refresh immediately.
+- persist a provider-specific full-refresh anchor only when full-refresh cadence is explicitly enabled (`service.full_refresh_every_seconds > 0`; default is disabled), and
+- honor the latest health-check `refresh_full_snapshot` recommendation for a provider only when the operator has explicitly enabled unattended full-refresh cadence (`service.full_refresh_every_seconds > 0`), so diagnostics do not silently turn into routine full resweeps.
 
 Only advance `last_fetch_mode`, `last_successful_full_refresh_*`, and the full-refresh anchor after a **successful** provider fetch. A failed attempted full refresh must not be recorded as if the canonical resweep already happened.
 

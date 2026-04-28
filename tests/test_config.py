@@ -27,6 +27,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.mal.bind_host, "0.0.0.0")
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.1:8765/callback")
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").resolve())
+            self.assertEqual(0, config.service.full_refresh_every_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(1, config.service.task_projected_request_counts["mal_refresh"])

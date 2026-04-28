@@ -618,6 +618,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         (self.project_root / ".MAL-Updater" / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.project_root / ".MAL-Updater" / "secrets" / "hidive_password.txt").write_text("secret\n", encoding="utf-8")
         self.config.service.provider_hourly_limits["hidive"] = 72
+        self.config.service.full_refresh_every_seconds = 86400
         self.config.service.task_projected_request_counts["sync_fetch_hidive"] = 14
         self.config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"] = {"full_refresh": 70, "incremental": 5}
         stale_anchor = datetime.now(timezone.utc).timestamp() - 90000

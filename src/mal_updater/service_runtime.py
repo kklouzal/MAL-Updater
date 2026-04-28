@@ -303,6 +303,8 @@ def _provider_from_refresh_command_args(command_args: object) -> str | None:
 
 
 def _provider_fetch_requested_by_health(config: AppConfig, provider: str, task_state: dict[str, Any]) -> bool:
+    if int(config.service.full_refresh_every_seconds) <= 0:
+        return False
     path = config.health_latest_json_path
     if not path.exists():
         return False

@@ -2606,12 +2606,55 @@ def _cmd_health_check(
                 cutoff=latest_started_at,
                 limit=5,
             )
+    provider_counts_by_provider = snapshot.get("provider_counts_by_provider") if isinstance(snapshot.get("provider_counts_by_provider"), dict) else None
     partial_sync_coverage = _build_partial_sync_coverage(
         latest_sync_run if isinstance(latest_sync_run, dict) else None,
-        snapshot.get("provider_counts_by_provider") if isinstance(snapshot.get("provider_counts_by_provider"), dict) else None,
+        provider_counts_by_provider,
         latest_provider_stale_row_counts,
         latest_provider_stale_row_samples,
     )
+    if (
+        isinstance(partial_sync_coverage, dict)
+        and partial_sync_coverage.get("fully_explained_by_stale_rows") is not True
+        and isinstance(latest_sync_run, dict)
+        and latest_sync_run.get("mode") != "full_refresh"
+    ):
+        latest_provider = latest_sync_run.get("provider")
+        latest_full_refresh = (
+            get_latest_completed_sync_run(config.db_path, provider=latest_provider, mode="full_refresh")
+            if isinstance(latest_provider, str) and latest_provider
+            else None
+        )
+        latest_full_refresh_age_seconds = _age_seconds_from_timestamp(
+            latest_full_refresh.get("completed_at") if isinstance(latest_full_refresh, dict) else None
+        )
+        latest_full_refresh_started_at = latest_full_refresh.get("started_at") if isinstance(latest_full_refresh, dict) else None
+        if (
+            isinstance(latest_full_refresh, dict)
+            and (latest_full_refresh_age_seconds is None or latest_full_refresh_age_seconds <= stale_hours * 3600)
+            and isinstance(latest_full_refresh_started_at, str)
+            and latest_full_refresh_started_at
+        ):
+            full_refresh_stale_row_counts = get_provider_stale_row_counts(
+                config.db_path,
+                provider=latest_provider,
+                cutoff=latest_full_refresh_started_at,
+            )
+            full_refresh_stale_row_samples = list_provider_stale_row_samples(
+                config.db_path,
+                provider=latest_provider,
+                cutoff=latest_full_refresh_started_at,
+                limit=5,
+            )
+            full_refresh_coverage = _build_partial_sync_coverage(
+                latest_full_refresh,
+                provider_counts_by_provider,
+                full_refresh_stale_row_counts,
+                full_refresh_stale_row_samples,
+            )
+            if isinstance(full_refresh_coverage, dict) and full_refresh_coverage.get("fully_explained_by_stale_rows") is True:
+                full_refresh_coverage["latest_incremental_sync_run_id"] = latest_sync_run.get("id")
+                partial_sync_coverage = full_refresh_coverage
     mapping_coverage = _build_mapping_coverage_snapshot(
         snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
         snapshot.get("mappings") if isinstance(snapshot.get("mappings"), dict) else None,
@@ -5574,7 +5617,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_check_cycle.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
     health_check_cycle.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present in the final summary")
     health_check_cycle.add_argument("--auto-run-recommended", action="store_true", help="Automatically run one allowlisted automation-safe maintenance command when recommended")
-    health_check_cycle.add_argument("--auto-run-reason-codes", default="refresh_ingested_snapshot,refresh_full_snapshot", help="Comma-separated allowlist of maintenance reason codes eligible for auto-remediation")
+    health_check_cycle.add_argument("--auto-run-reason-codes", default="refresh_ingested_snapshot", help="Comma-separated allowlist of maintenance reason codes eligible for auto-remediation; include refresh_full_snapshot only for explicit recovery")
     health_check_cycle.add_argument("--review-issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional review_queue issue type to use when building recommended_next/recommended_worklist")
     health_check_cycle.add_argument("--review-worklist-limit", type=int, default=3, help="How many ranked review backlog drilldowns to include in recommended_worklist (use 0 to suppress it)")
     health_check_cycle.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved provider->MAL mapping coverage falls below this ratio (default: 0.8)")

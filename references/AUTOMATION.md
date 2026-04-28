@@ -61,7 +61,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 - bounded unattended execution posture for `sync_apply` via `service.task_execute_limits`, plus automatic reset of stale projected-request/backoff state when that execution posture changes so old full-pass history does not keep poisoning the lane
 - persisted failure-backoff details for task errors, including retry countdown, last failure reason, and consecutive-failure streaks for auth-fragile provider lanes
 - health-check-driven auth recovery hints: repeated auth-style provider fetch failures recorded in daemon state now surface as explicit re-bootstrap recommendations (`crunchyroll-auth-login` / `provider-auth-login --provider hidive`) instead of only opaque backoff residue
-- health-driven full-refresh escalation: when the latest `latest-health-check.json` artifact recommends `refresh_full_snapshot` for a provider, the next unattended provider fetch lane upgrades itself to `--full-refresh` once so partial-coverage residue is repaired without waiting for the periodic cadence window
+- health-driven full-refresh escalation is disabled by default with `service.full_refresh_every_seconds = 0`; if an operator explicitly enables full-refresh cadence, health recommendations can still upgrade the next unattended provider fetch to `--full-refresh`
 - current API-usage snapshot when available
 - recent `service.log` tail lines
 - parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
