@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import random
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -39,6 +40,23 @@ class MalApiError(RuntimeError):
 
 _T = TypeVar("_T")
 _TIMEOUT_RETRY_ATTEMPTS = 2
+_ANIME_SEARCH_NOISE_PATTERNS = (
+    # Provider catalogs commonly append language/audio availability markers that
+    # MAL rejects as noisy/invalid search text. Keep this suffix-oriented and
+    # bracket-scoped so title words are not stripped in the middle of a query.
+    re.compile(r"[\[(]\s*[^\])()]{0,80}\b(?:dub|sub)\s*[\])]", re.IGNORECASE),
+    re.compile(r"\b(?:english|french|spanish|german|portuguese|castilian|latin\s+american\s+spanish)\s+(?:dub|sub)\b", re.IGNORECASE),
+)
+
+
+def _sanitize_anime_search_query(query: str) -> str:
+    """Strip provider catalog noise that MAL rejects as invalid search text."""
+    cleaned = " ".join(str(query).split()).strip()
+    for pattern in _ANIME_SEARCH_NOISE_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\(\s*\)", " ", cleaned)
+    cleaned = re.sub(r"\s*[-:|–—]\s*(?=$|\))", " ", cleaned)
+    return " ".join(cleaned.split()).strip()
 
 
 class MalClient:
@@ -174,11 +192,12 @@ class MalClient:
         )
 
     def search_anime(self, query: str, *, limit: int = 5, fields: str = "id,title,alternative_titles,media_type,status,num_episodes") -> dict[str, Any]:
-        encoded_query = urlencode({"q": query, "limit": limit, "fields": fields})
+        sanitized_query = _sanitize_anime_search_query(query) or " ".join(str(query).split()).strip()
+        encoded_query = urlencode({"q": sanitized_query, "limit": limit, "fields": fields})
         return self._get_json(
             f"/anime?{encoded_query}",
             headers=self._build_auth_headers(require_user=False),
-            error_context=f"MAL API anime search failed for query={query!r}",
+            error_context=f"MAL API anime search failed for query={sanitized_query!r}",
         )
 
     def get_anime_details(self, anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:

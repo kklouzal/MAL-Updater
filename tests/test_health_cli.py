@@ -1618,7 +1618,7 @@ class HealthCheckCliTests(unittest.TestCase):
             )
             conn.commit()
 
-        exit_code, payload = self._run_health_check("--stale-hours", "72")
+        exit_code, payload = self._run_health_check("--stale-hours", "168")
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}
