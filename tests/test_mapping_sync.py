@@ -4192,6 +4192,82 @@ class MappingTests(unittest.TestCase):
         self.assertNotIn("episode_evidence_exceeds_candidate_count=24>12", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
+    def test_map_series_surfaces_split_part_companion_for_aggregate_season_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 48417,
+                                "title": "Maou Gakuin no Futekigousha II: Shijou Saikyou no Maou no Shiso, Tensei shite Shison-tachi no Gakkou e Kayou",
+                                "alternative_titles": {"en": "The Misfit of Demon King Academy II"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 48418,
+                                "title": "Maou Gakuin no Futekigousha II: Shijou Saikyou no Maou no Shiso, Tensei shite Shison-tachi no Gakkou e Kayou Part 2",
+                                "alternative_titles": {"en": "The Misfit of Demon King Academy II Part 2"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 40496,
+                                "title": "Maou Gakuin no Futekigousha: Shijou Saikyou no Maou no Shiso, Tensei shite Shison-tachi no Gakkou e Kayou",
+                                "alternative_titles": {"en": "The Misfit of Demon King Academy"},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 13,
+                            }
+                        },
+                    ]
+                },
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="series-misfit-s2",
+                        title="The Misfit of Demon King Academy",
+                        season_title="The Misfit of Demon King Academy II(English Dub)",
+                        season_number=2,
+                        max_episode_number=24,
+                        completed_episode_count=24,
+                    ),
+                )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 48417)
+        self.assertIn("multi_entry_bundle_suspected=24<=12+12", result.rationale)
+        self.assertEqual({48418}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertFalse(should_auto_approve_mapping(result))
+
     def test_map_series_prefers_split_specific_candidate_over_broader_same_season_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

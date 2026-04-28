@@ -1414,7 +1414,13 @@ def _is_low_score_bundle_companion(top: MappingCandidate, companion: MappingCand
     if not _candidate_shares_bundle_alias_family(top, companion):
         return False
     if not any(
-        reason.startswith(("candidate_extra_title_suffix", "candidate_extra_installment_hint", "season_number_mismatch="))
+        reason.startswith((
+            "candidate_extra_title_suffix",
+            "candidate_extra_installment_hint",
+            "candidate_extra_part_hint",
+            "candidate_extra_split_hint",
+            "season_number_mismatch=",
+        ))
         for reason in companion.match_reasons
     ):
         return False
@@ -1559,7 +1565,13 @@ def _suspect_multi_entry_bundle(
             if not (
                 "exact_normalized_title" in companion.match_reasons
                 or any(
-                    reason.startswith(("candidate_extra_title_suffix", "candidate_extra_installment_hint", "season_number_mismatch="))
+                    reason.startswith((
+                        "candidate_extra_title_suffix",
+                        "candidate_extra_installment_hint",
+                        "candidate_extra_part_hint",
+                        "candidate_extra_split_hint",
+                        "season_number_mismatch=",
+                    ))
                     for reason in companion.match_reasons
                 )
             ):
