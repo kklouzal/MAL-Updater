@@ -7,7 +7,7 @@ import shlex
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import importlib.util
 import platform
@@ -3286,28 +3286,51 @@ def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) 
     return 0
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_sqlite_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _build_provider_stale_rows_payload(
     *,
     db_path: Path,
     provider: str,
     cutoff: str | None,
     safe_limit: int,
+    older_than_days: float | None = None,
 ) -> dict[str, object]:
     cutoff_source = "explicit"
     sync_run: dict[str, object] | None = None
-    effective_cutoff = cutoff.strip() if isinstance(cutoff, str) and cutoff.strip() else None
+    base_cutoff = cutoff.strip() if isinstance(cutoff, str) and cutoff.strip() else None
+    effective_cutoff = base_cutoff
+    age_cutoff: str | None = None
+    safe_older_than_days = older_than_days
+    if older_than_days is not None:
+        safe_older_than_days = max(0.0, float(older_than_days))
+        age_cutoff = _format_sqlite_timestamp(_utcnow() - timedelta(days=safe_older_than_days))
     if effective_cutoff is None:
         sync_run = get_latest_completed_sync_run(db_path, provider=provider, mode="full_refresh")
         if isinstance(sync_run, dict):
             started_at = sync_run.get("started_at")
             if isinstance(started_at, str) and started_at.strip():
-                effective_cutoff = started_at.strip()
+                base_cutoff = started_at.strip()
+                effective_cutoff = base_cutoff
                 cutoff_source = "latest_completed_full_refresh_started_at"
+
+    if effective_cutoff is not None and age_cutoff is not None:
+        effective_cutoff = min(effective_cutoff, age_cutoff)
+        cutoff_source = f"{cutoff_source}_and_older_than_days"
 
     if effective_cutoff is None:
         return {
             "provider": provider,
             "cutoff": None,
+            "base_cutoff": None,
+            "age_cutoff": age_cutoff,
+            "older_than_days": safe_older_than_days,
             "cutoff_source": None,
             "latest_completed_full_refresh": None,
             "counts": {"series": 0, "progress": 0, "watchlist": 0},
@@ -3322,6 +3345,9 @@ def _build_provider_stale_rows_payload(
     return {
         "provider": provider,
         "cutoff": effective_cutoff,
+        "base_cutoff": base_cutoff,
+        "age_cutoff": age_cutoff,
+        "older_than_days": safe_older_than_days,
         "cutoff_source": cutoff_source,
         "latest_completed_full_refresh": sync_run,
         "counts": counts,
@@ -3370,6 +3396,7 @@ def _cmd_provider_stale_rows(
     cutoff: str | None,
     limit: int,
     output_format: str = "json",
+    older_than_days: float | None = None,
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -3383,6 +3410,7 @@ def _cmd_provider_stale_rows(
                 provider=slug,
                 cutoff=cutoff,
                 safe_limit=safe_limit,
+                older_than_days=older_than_days,
             )
             for slug in list_provider_slugs()
         }
@@ -3395,6 +3423,11 @@ def _cmd_provider_stale_rows(
             for family in ("series", "progress", "watchlist")
         }
         ready_count = sum(1 for payload in provider_payloads.values() if payload.get("ready") is True)
+        age_cutoffs = [
+            payload.get("age_cutoff")
+            for payload in provider_payloads.values()
+            if isinstance(payload.get("age_cutoff"), str)
+        ]
         payload = {
             "provider": "all",
             "providers": provider_payloads,
@@ -3406,6 +3439,8 @@ def _cmd_provider_stale_rows(
             "total_count": sum(counts.values()),
             "last_seen_ranges": _aggregate_provider_stale_row_last_seen_ranges(provider_payloads),
             "sample_limit": safe_limit,
+            "age_cutoff": min(age_cutoffs) if age_cutoffs else None,
+            "older_than_days": older_than_days,
             "read_only": True,
             "policy": "diagnostic_only_no_archive_or_prune",
         }
@@ -3420,6 +3455,7 @@ def _cmd_provider_stale_rows(
         provider=provider,
         cutoff=cutoff,
         safe_limit=safe_limit,
+        older_than_days=older_than_days,
     )
     if output_format == "summary":
         _print_provider_stale_rows_summary(payload)
@@ -3446,6 +3482,15 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
     cutoff = payload.get("cutoff") if isinstance(payload.get("cutoff"), str) else None
     if cutoff is not None:
         print(f"cutoff={cutoff}")
+    base_cutoff = payload.get("base_cutoff") if isinstance(payload.get("base_cutoff"), str) else None
+    if base_cutoff is not None and base_cutoff != cutoff:
+        print(f"base_cutoff={base_cutoff}")
+    age_cutoff = payload.get("age_cutoff") if isinstance(payload.get("age_cutoff"), str) else None
+    if age_cutoff is not None:
+        print(f"age_cutoff={age_cutoff}")
+    older_than_days = payload.get("older_than_days")
+    if isinstance(older_than_days, (int, float)) and not isinstance(older_than_days, bool):
+        print(f"older_than_days={older_than_days:g}")
     cutoff_source = payload.get("cutoff_source") if isinstance(payload.get("cutoff_source"), str) else None
     if cutoff_source is not None:
         print(f"cutoff_source={cutoff_source}")
@@ -3487,6 +3532,12 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
         provider_cutoff = provider_payload.get("cutoff") if isinstance(provider_payload.get("cutoff"), str) else None
         if provider_cutoff is not None:
             print(f"{prefix}.cutoff={provider_cutoff}")
+        provider_age_cutoff = provider_payload.get("age_cutoff") if isinstance(provider_payload.get("age_cutoff"), str) else None
+        if provider_age_cutoff is not None:
+            print(f"{prefix}.age_cutoff={provider_age_cutoff}")
+        provider_older_than_days = provider_payload.get("older_than_days")
+        if isinstance(provider_older_than_days, (int, float)) and not isinstance(provider_older_than_days, bool):
+            print(f"{prefix}.older_than_days={provider_older_than_days:g}")
         provider_counts = provider_payload.get("counts") if isinstance(provider_payload.get("counts"), dict) else {}
         for family in ("series", "progress", "watchlist"):
             value = provider_counts.get(family) if isinstance(provider_counts, dict) else None
@@ -5811,6 +5862,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provider_stale_rows.add_argument("--provider", required=True, choices=["all", *list_provider_slugs()], help="Provider slug to inspect, or 'all' for every known provider")
     provider_stale_rows.add_argument("--cutoff", default=None, help="SQLite timestamp cutoff; rows with last_seen_at older than this are reported")
+    provider_stale_rows.add_argument("--older-than-days", type=float, default=None, help="Further restrict stale diagnostics to rows last seen at least this many days ago (read-only)")
     provider_stale_rows.add_argument("--limit", type=int, default=5, help="Maximum samples per row family (1-25)")
     provider_stale_rows.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     map_series_cmd = subparsers.add_parser("map-series", help="Search MAL for conservative mapping candidates for ingested provider series")
@@ -6098,7 +6150,7 @@ def main() -> int:
     if args.command == "ingest-snapshot":
         return _cmd_ingest_snapshot(args.project_root, args.snapshot)
     if args.command == "provider-stale-rows":
-        return _cmd_provider_stale_rows(args.project_root, args.provider, args.cutoff, args.limit, args.format)
+        return _cmd_provider_stale_rows(args.project_root, args.provider, args.cutoff, args.limit, args.format, args.older_than_days)
     if args.command == "map-series":
         return _cmd_map_series(args.project_root, args.limit, args.mapping_limit)
     if args.command == "review-mappings":

@@ -6,6 +6,7 @@ import os
 import shlex
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1386,6 +1387,55 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("series-3", payload["samples"]["series"][0]["provider_series_id"])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
 
+    def test_provider_stale_rows_can_filter_to_rows_older_than_age_threshold(self) -> None:
+        with connect(self.config.db_path) as conn:
+            for provider_series_id, last_seen_at in (
+                ("old-series", "2026-04-20 18:00:00"),
+                ("recent-series", "2026-04-24 18:00:00"),
+            ):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "crunchyroll",
+                        provider_series_id,
+                        provider_series_id,
+                        provider_series_id,
+                        1,
+                        "{}",
+                        last_seen_at,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 0}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        with patch("mal_updater.cli._utcnow", return_value=datetime(2026, 4, 29, 8, 0, 0, tzinfo=timezone.utc)):
+            exit_code, payload = self._run_provider_stale_rows(
+                "--provider",
+                "crunchyroll",
+                "--older-than-days",
+                "7",
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("latest_completed_full_refresh_started_at_and_older_than_days", payload["cutoff_source"])
+        self.assertEqual("2026-04-22 08:00:00", payload["cutoff"])
+        self.assertEqual("2026-04-25 17:59:00", payload["base_cutoff"])
+        self.assertEqual("2026-04-22 08:00:00", payload["age_cutoff"])
+        self.assertEqual(7.0, payload["older_than_days"])
+        self.assertEqual({"series": 1, "progress": 0, "watchlist": 0}, payload["counts"])
+        self.assertEqual("old-series", payload["samples"]["series"][0]["provider_series_id"])
+
     def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
         with connect(self.config.db_path) as conn:
             conn.execute(
@@ -1475,6 +1525,44 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(1, payload["providers"]["crunchyroll"]["counts"]["series"])
         self.assertEqual(1, payload["providers"]["hidive"]["counts"]["watchlist"])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
+
+    def test_provider_stale_rows_all_reports_age_filter_fields(self) -> None:
+        with connect(self.config.db_path) as conn:
+            for provider in ("crunchyroll", "hidive"):
+                conn.execute(
+                    "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        provider,
+                        "1.0",
+                        "full_refresh",
+                        "completed",
+                        "2026-04-25 17:59:00",
+                        "2026-04-25 18:01:00",
+                        json.dumps({"series_count": 0}, sort_keys=True),
+                    ),
+                )
+            for provider, provider_series_id, last_seen_at in (
+                ("crunchyroll", "cr-old", "2026-04-20 18:00:00"),
+                ("hidive", "hi-recent", "2026-04-24 18:00:00"),
+            ):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (provider, provider_series_id, provider_series_id, provider_series_id, 1, "{}", last_seen_at),
+                )
+            conn.commit()
+
+        with patch("mal_updater.cli._utcnow", return_value=datetime(2026, 4, 29, 8, 0, 0, tzinfo=timezone.utc)):
+            exit_code, payload = self._run_provider_stale_rows("--provider", "all", "--older-than-days", "7")
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(payload["all_ready"])
+        self.assertEqual("2026-04-22 08:00:00", payload["age_cutoff"])
+        self.assertEqual(7.0, payload["older_than_days"])
+        self.assertEqual({"series": 1, "progress": 0, "watchlist": 0}, payload["counts"])
+        self.assertEqual("2026-04-22 08:00:00", payload["providers"]["crunchyroll"]["age_cutoff"])
+        self.assertEqual(7.0, payload["providers"]["crunchyroll"]["older_than_days"])
+        self.assertEqual({"series": 1, "progress": 0, "watchlist": 0}, payload["providers"]["crunchyroll"]["counts"])
+        self.assertEqual({"series": 0, "progress": 0, "watchlist": 0}, payload["providers"]["hidive"]["counts"])
 
     def test_provider_stale_rows_all_summary_shows_per_provider_counts(self) -> None:
         with connect(self.config.db_path) as conn:
