@@ -977,6 +977,64 @@ def get_provider_stale_row_last_seen_ranges(db_path: Path, *, provider: str, cut
     return ranges
 
 
+def get_provider_stale_row_age_buckets(
+    db_path: Path,
+    *,
+    provider: str,
+    cutoff: str,
+    seven_day_cutoff: str,
+    thirty_day_cutoff: str,
+) -> dict[str, dict[str, int]]:
+    """Count stale provider cache rows by coarse last_seen_at age buckets.
+
+    This keeps stale/deleted row handling diagnostic-only while giving operators a
+    policy-neutral distribution of how long residue has been retained.
+    """
+    empty = {
+        "series": {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0},
+        "progress": {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0},
+        "watchlist": {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0},
+    }
+    if not provider or not cutoff or not seven_day_cutoff or not thirty_day_cutoff:
+        return empty
+
+    tables = {
+        "series": "provider_series",
+        "progress": "provider_episode_progress",
+        "watchlist": "provider_watchlist",
+    }
+    buckets: dict[str, dict[str, int]] = {}
+    with connect(db_path) as conn:
+        for family, table in tables.items():
+            row = conn.execute(
+                f"""
+                SELECT
+                    SUM(CASE WHEN last_seen_at < ? AND last_seen_at >= ? THEN 1 ELSE 0 END) AS recent_0_7_days,
+                    SUM(CASE WHEN last_seen_at < ? AND last_seen_at < ? AND last_seen_at >= ? THEN 1 ELSE 0 END) AS older_8_30_days,
+                    SUM(CASE WHEN last_seen_at < ? AND last_seen_at < ? THEN 1 ELSE 0 END) AS older_31_plus_days
+                FROM {table}
+                WHERE provider = ? AND last_seen_at < ?
+                """,
+                (
+                    cutoff,
+                    seven_day_cutoff,
+                    cutoff,
+                    seven_day_cutoff,
+                    thirty_day_cutoff,
+                    cutoff,
+                    thirty_day_cutoff,
+                    provider,
+                    cutoff,
+                ),
+            ).fetchone()
+            buckets[family] = {
+                "recent_0_7_days": int(row["recent_0_7_days"] or 0) if row is not None else 0,
+                "older_8_30_days": int(row["older_8_30_days"] or 0) if row is not None else 0,
+                "older_31_plus_days": int(row["older_31_plus_days"] or 0) if row is not None else 0,
+            }
+    return buckets
+
+
 def list_provider_stale_row_samples(
     db_path: Path,
     *,

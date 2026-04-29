@@ -32,6 +32,7 @@ from .db import (
     bootstrap_database,
     get_latest_completed_sync_run,
     get_operational_snapshot,
+    get_provider_stale_row_age_buckets,
     get_provider_stale_row_counts,
     get_provider_stale_row_last_seen_ranges,
     list_provider_stale_row_samples,
@@ -3341,6 +3342,18 @@ def _build_provider_stale_rows_payload(
 
     counts = get_provider_stale_row_counts(db_path, provider=provider, cutoff=effective_cutoff)
     last_seen_ranges = get_provider_stale_row_last_seen_ranges(db_path, provider=provider, cutoff=effective_cutoff)
+    reference_now = _utcnow()
+    age_bucket_cutoffs = {
+        "seven_day_cutoff": _format_sqlite_timestamp(reference_now - timedelta(days=7)),
+        "thirty_day_cutoff": _format_sqlite_timestamp(reference_now - timedelta(days=30)),
+    }
+    age_buckets = get_provider_stale_row_age_buckets(
+        db_path,
+        provider=provider,
+        cutoff=effective_cutoff,
+        seven_day_cutoff=age_bucket_cutoffs["seven_day_cutoff"],
+        thirty_day_cutoff=age_bucket_cutoffs["thirty_day_cutoff"],
+    )
     samples = list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit)
     return {
         "provider": provider,
@@ -3353,6 +3366,8 @@ def _build_provider_stale_rows_payload(
         "counts": counts,
         "total_count": sum(value for value in counts.values() if isinstance(value, int)),
         "last_seen_ranges": last_seen_ranges,
+        "age_bucket_cutoffs": age_bucket_cutoffs,
+        "age_buckets": age_buckets,
         "sample_limit": safe_limit,
         "samples": samples,
         "ready": True,
@@ -3387,6 +3402,23 @@ def _aggregate_provider_stale_row_last_seen_ranges(provider_payloads: dict[str, 
             "oldest_last_seen_at": min(oldest_values) if oldest_values else None,
             "newest_last_seen_at": max(newest_values) if newest_values else None,
         }
+    return aggregated
+
+
+def _aggregate_provider_stale_row_age_buckets(provider_payloads: dict[str, dict[str, object]]) -> dict[str, dict[str, int]]:
+    aggregated: dict[str, dict[str, int]] = {}
+    for family in ("series", "progress", "watchlist"):
+        family_totals = {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0}
+        for payload in provider_payloads.values():
+            age_buckets = payload.get("age_buckets") if isinstance(payload, dict) else None
+            family_buckets = age_buckets.get(family) if isinstance(age_buckets, dict) else None
+            if not isinstance(family_buckets, dict):
+                continue
+            for bucket in family_totals:
+                value = family_buckets.get(bucket)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    family_totals[bucket] += value
+        aggregated[family] = family_totals
     return aggregated
 
 
@@ -3438,6 +3470,11 @@ def _cmd_provider_stale_rows(
             "counts": counts,
             "total_count": sum(counts.values()),
             "last_seen_ranges": _aggregate_provider_stale_row_last_seen_ranges(provider_payloads),
+            "age_bucket_cutoffs": next(
+                (payload.get("age_bucket_cutoffs") for payload in provider_payloads.values() if isinstance(payload.get("age_bucket_cutoffs"), dict)),
+                None,
+            ),
+            "age_buckets": _aggregate_provider_stale_row_age_buckets(provider_payloads),
             "sample_limit": safe_limit,
             "age_cutoff": min(age_cutoffs) if age_cutoffs else None,
             "older_than_days": older_than_days,
@@ -3510,6 +3547,15 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
             print(f"{family}_oldest_last_seen_at={oldest}")
         if isinstance(newest, str) and newest:
             print(f"{family}_newest_last_seen_at={newest}")
+    age_buckets = payload.get("age_buckets") if isinstance(payload.get("age_buckets"), dict) else {}
+    for family in ("series", "progress", "watchlist"):
+        family_buckets = age_buckets.get(family) if isinstance(age_buckets, dict) else None
+        if not isinstance(family_buckets, dict):
+            continue
+        for bucket in ("recent_0_7_days", "older_8_30_days", "older_31_plus_days"):
+            value = family_buckets.get(bucket)
+            count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+            print(f"{family}_{bucket}_count={count}")
     total_count = payload.get("total_count")
     if isinstance(total_count, int) and not isinstance(total_count, bool):
         print(f"total_stale_count={total_count}")
@@ -3554,6 +3600,15 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
                 print(f"{prefix}.{family}_oldest_last_seen_at={oldest}")
             if isinstance(newest, str) and newest:
                 print(f"{prefix}.{family}_newest_last_seen_at={newest}")
+        provider_age_buckets = provider_payload.get("age_buckets") if isinstance(provider_payload.get("age_buckets"), dict) else {}
+        for family in ("series", "progress", "watchlist"):
+            family_buckets = provider_age_buckets.get(family) if isinstance(provider_age_buckets, dict) else None
+            if not isinstance(family_buckets, dict):
+                continue
+            for bucket in ("recent_0_7_days", "older_8_30_days", "older_31_plus_days"):
+                value = family_buckets.get(bucket)
+                count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+                print(f"{prefix}.{family}_{bucket}_count={count}")
         provider_total = provider_payload.get("total_count")
         if isinstance(provider_total, int) and not isinstance(provider_total, bool):
             print(f"{prefix}.total_stale_count={provider_total}")

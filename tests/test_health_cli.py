@@ -1434,7 +1434,63 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("2026-04-22 08:00:00", payload["age_cutoff"])
         self.assertEqual(7.0, payload["older_than_days"])
         self.assertEqual({"series": 1, "progress": 0, "watchlist": 0}, payload["counts"])
+        self.assertEqual(1, payload["age_buckets"]["series"]["older_8_30_days"])
+        self.assertEqual(0, payload["age_buckets"]["series"]["recent_0_7_days"])
         self.assertEqual("old-series", payload["samples"]["series"][0]["provider_series_id"])
+
+    def test_provider_stale_rows_reports_age_bucket_distribution(self) -> None:
+        with connect(self.config.db_path) as conn:
+            for provider_series_id, last_seen_at in (
+                ("recent-stale", "2026-04-24 18:00:00"),
+                ("middle-stale", "2026-04-15 18:00:00"),
+                ("old-stale", "2026-03-20 18:00:00"),
+            ):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "crunchyroll",
+                        provider_series_id,
+                        provider_series_id,
+                        provider_series_id,
+                        1,
+                        "{}",
+                        last_seen_at,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO provider_episode_progress(provider, provider_episode_id, provider_series_id, episode_number, episode_title, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("crunchyroll", "episode-old", "old-stale", 1, "Episode 1", "{}", "2026-03-20 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO provider_watchlist(provider, provider_series_id, status, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+                ("crunchyroll", "middle-stale", "watching", "{}", "2026-04-15 18:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 0}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        with patch("mal_updater.cli._utcnow", return_value=datetime(2026, 4, 29, 8, 0, 0, tzinfo=timezone.utc)):
+            exit_code, payload = self._run_provider_stale_rows("--provider", "crunchyroll")
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("2026-04-22 08:00:00", payload["age_bucket_cutoffs"]["seven_day_cutoff"])
+        self.assertEqual("2026-03-30 08:00:00", payload["age_bucket_cutoffs"]["thirty_day_cutoff"])
+        self.assertEqual(
+            {"recent_0_7_days": 1, "older_8_30_days": 1, "older_31_plus_days": 1},
+            payload["age_buckets"]["series"],
+        )
+        self.assertEqual(1, payload["age_buckets"]["progress"]["older_31_plus_days"])
+        self.assertEqual(1, payload["age_buckets"]["watchlist"]["older_8_30_days"])
 
     def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
         with connect(self.config.db_path) as conn:
@@ -1468,6 +1524,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("watchlist_stale_count=0", lines)
         self.assertIn("series_oldest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertIn("series_newest_last_seen_at=2026-04-24 18:00:00", lines)
+        self.assertTrue(any(line.startswith("series_") and line.endswith("_count=1") for line in lines))
         self.assertIn("total_stale_count=1", lines)
         self.assertIn("policy=diagnostic_only_no_archive_or_prune", lines)
         self.assertIn("read_only=True", lines)
@@ -1559,6 +1616,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("2026-04-22 08:00:00", payload["age_cutoff"])
         self.assertEqual(7.0, payload["older_than_days"])
         self.assertEqual({"series": 1, "progress": 0, "watchlist": 0}, payload["counts"])
+        self.assertEqual(1, payload["age_buckets"]["series"]["older_8_30_days"])
         self.assertEqual("2026-04-22 08:00:00", payload["providers"]["crunchyroll"]["age_cutoff"])
         self.assertEqual(7.0, payload["providers"]["crunchyroll"]["older_than_days"])
         self.assertEqual({"series": 1, "progress": 0, "watchlist": 0}, payload["providers"]["crunchyroll"]["counts"])
@@ -1597,6 +1655,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("provider.crunchyroll.series_stale_count=1", lines)
         self.assertIn("provider.crunchyroll.series_oldest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertIn("provider.crunchyroll.series_newest_last_seen_at=2026-04-24 18:00:00", lines)
+        self.assertTrue(any(line.startswith("provider.crunchyroll.series_") and line.endswith("_count=1") for line in lines))
         self.assertIn("provider.hidive.ready=False", lines)
         self.assertTrue(any(line.startswith("provider.hidive.detail=No cutoff") for line in lines))
 

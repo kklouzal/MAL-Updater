@@ -48,7 +48,7 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchy
 PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider hidive --cutoff "2026-04-25 17:59:00"
 ```
 
-`provider-stale-rows` is read-only. JSON and summary output include per-family stale counts plus oldest/newest `last_seen_at` bounds so operators can judge residue age before deciding whether to leave, archive, or prune rows later. Add `--older-than-days N` when you only want rows that are stale since the cutoff and have also been absent for at least `N` days.
+`provider-stale-rows` is read-only. JSON and summary output include per-family stale counts, oldest/newest `last_seen_at` bounds, and coarse age-bucket counts (`recent_0_7_days`, `older_8_30_days`, `older_31_plus_days`) so operators can judge residue age before deciding whether to leave, archive, or prune rows later. Add `--older-than-days N` when you only want rows that are stale since the cutoff and have also been absent for at least `N` days.
 
 Compatibility wrappers still exist for Crunchyroll-specific debugging/bootstrap:
 
