@@ -1500,6 +1500,75 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(39.583, payload["samples"]["progress"][0]["age_days"])
         self.assertEqual(13.583, payload["samples"]["watchlist"][0]["age_days"])
 
+    def test_provider_stale_rows_reports_child_row_series_linkage(self) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            for provider_series_id, last_seen_at in (
+                ("stale-series", "2026-04-20 18:00:00"),
+                ("current-series", "2026-04-26 18:00:00"),
+            ):
+                conn.execute(
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "crunchyroll",
+                        provider_series_id,
+                        provider_series_id,
+                        provider_series_id,
+                        1,
+                        "{}",
+                        last_seen_at,
+                    ),
+                )
+            for episode_id, series_id in (
+                ("episode-stale", "stale-series"),
+                ("episode-current", "current-series"),
+                ("episode-missing", "missing-series"),
+            ):
+                conn.execute(
+                    "INSERT INTO provider_episode_progress(provider, provider_episode_id, provider_series_id, episode_number, episode_title, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("crunchyroll", episode_id, series_id, 1, "Episode 1", "{}", "2026-04-20 18:00:00"),
+                )
+            for series_id in ("stale-series", "current-series", "missing-series"):
+                conn.execute(
+                    "INSERT INTO provider_watchlist(provider, provider_series_id, status, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+                    ("crunchyroll", series_id, "watching", "{}", "2026-04-20 18:00:00"),
+                )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "crunchyroll",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    "2026-04-25 17:59:00",
+                    "2026-04-25 18:01:00",
+                    json.dumps({"series_count": 1}, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_provider_stale_rows("--provider", "crunchyroll")
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(
+            {"with_stale_series": 1, "with_current_series": 1, "with_missing_series": 1},
+            payload["linkage"]["progress"],
+        )
+        self.assertEqual(
+            {"with_stale_series": 1, "with_current_series": 1, "with_missing_series": 1},
+            payload["linkage"]["watchlist"],
+        )
+
+        exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
+        self.assertEqual(0, exit_code)
+        lines = stdout.strip().splitlines()
+        self.assertIn("progress_with_stale_series_count=1", lines)
+        self.assertIn("progress_with_current_series_count=1", lines)
+        self.assertIn("progress_with_missing_series_count=1", lines)
+        self.assertIn("watchlist_with_stale_series_count=1", lines)
+        self.assertIn("watchlist_with_current_series_count=1", lines)
+        self.assertIn("watchlist_with_missing_series_count=1", lines)
+
     def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
         with connect(self.config.db_path) as conn:
             conn.execute(

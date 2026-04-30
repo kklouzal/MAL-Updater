@@ -1035,6 +1035,62 @@ def get_provider_stale_row_age_buckets(
     return buckets
 
 
+def get_provider_stale_row_linkage(
+    db_path: Path,
+    *,
+    provider: str,
+    cutoff: str,
+    series_cutoff: str | None = None,
+) -> dict[str, dict[str, int]]:
+    """Classify stale child rows by their linked provider-series row posture.
+
+    This is read-only retention evidence. Before choosing an archive/prune/retain
+    policy, operators need to know whether stale progress/watchlist rows are part
+    of the same stale-series residue, still point at a currently observed series,
+    or are already orphaned from the series cache.
+    """
+    empty = {
+        "progress": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
+        "watchlist": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
+    }
+    if not provider or not cutoff:
+        return empty
+    effective_series_cutoff = series_cutoff or cutoff
+
+    queries = {
+        "progress": """
+            SELECT
+                SUM(CASE WHEN s.provider_series_id IS NOT NULL AND s.last_seen_at < ? THEN 1 ELSE 0 END) AS with_stale_series,
+                SUM(CASE WHEN s.provider_series_id IS NOT NULL AND s.last_seen_at >= ? THEN 1 ELSE 0 END) AS with_current_series,
+                SUM(CASE WHEN s.provider_series_id IS NULL THEN 1 ELSE 0 END) AS with_missing_series
+            FROM provider_episode_progress p
+            LEFT JOIN provider_series s
+                ON s.provider = p.provider AND s.provider_series_id = p.provider_series_id
+            WHERE p.provider = ? AND p.last_seen_at < ?
+        """,
+        "watchlist": """
+            SELECT
+                SUM(CASE WHEN s.provider_series_id IS NOT NULL AND s.last_seen_at < ? THEN 1 ELSE 0 END) AS with_stale_series,
+                SUM(CASE WHEN s.provider_series_id IS NOT NULL AND s.last_seen_at >= ? THEN 1 ELSE 0 END) AS with_current_series,
+                SUM(CASE WHEN s.provider_series_id IS NULL THEN 1 ELSE 0 END) AS with_missing_series
+            FROM provider_watchlist w
+            LEFT JOIN provider_series s
+                ON s.provider = w.provider AND s.provider_series_id = w.provider_series_id
+            WHERE w.provider = ? AND w.last_seen_at < ?
+        """,
+    }
+    linkage: dict[str, dict[str, int]] = {}
+    with connect(db_path) as conn:
+        for family, query in queries.items():
+            row = conn.execute(query, (effective_series_cutoff, effective_series_cutoff, provider, cutoff)).fetchone()
+            linkage[family] = {
+                "with_stale_series": int(row["with_stale_series"] or 0) if row is not None else 0,
+                "with_current_series": int(row["with_current_series"] or 0) if row is not None else 0,
+                "with_missing_series": int(row["with_missing_series"] or 0) if row is not None else 0,
+            }
+    return linkage
+
+
 def list_provider_stale_row_samples(
     db_path: Path,
     *,

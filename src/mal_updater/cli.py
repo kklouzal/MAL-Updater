@@ -35,6 +35,7 @@ from .db import (
     get_provider_stale_row_age_buckets,
     get_provider_stale_row_counts,
     get_provider_stale_row_last_seen_ranges,
+    get_provider_stale_row_linkage,
     list_provider_stale_row_samples,
     get_provider_series_title_map,
     get_provider_series_title_map_by_keys,
@@ -3413,6 +3414,10 @@ def _build_provider_stale_rows_payload(
             "latest_completed_full_refresh": None,
             "counts": {"series": 0, "progress": 0, "watchlist": 0},
             "samples": {"series": [], "progress": [], "watchlist": []},
+            "linkage": {
+                "progress": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
+                "watchlist": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
+            },
             "ready": False,
             "detail": "No cutoff was provided and no completed full-refresh sync run exists for this provider.",
         }
@@ -3434,6 +3439,9 @@ def _build_provider_stale_rows_payload(
         list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit),
         reference_now=reference_now,
     )
+    linkage = get_provider_stale_row_linkage(
+        db_path, provider=provider, cutoff=effective_cutoff, series_cutoff=base_cutoff
+    )
     return {
         "provider": provider,
         "cutoff": effective_cutoff,
@@ -3450,6 +3458,7 @@ def _build_provider_stale_rows_payload(
         "age_buckets": age_buckets,
         "sample_limit": safe_limit,
         "samples": samples,
+        "linkage": linkage,
         "ready": True,
         "read_only": True,
         "policy": "diagnostic_only_no_archive_or_prune",
@@ -3494,6 +3503,23 @@ def _aggregate_provider_stale_row_age_ranges(
         _aggregate_provider_stale_row_last_seen_ranges(provider_payloads),
         reference_now=reference_now,
     )
+
+
+def _aggregate_provider_stale_row_linkage(provider_payloads: dict[str, dict[str, object]]) -> dict[str, dict[str, int]]:
+    aggregated: dict[str, dict[str, int]] = {}
+    for family in ("progress", "watchlist"):
+        family_totals = {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0}
+        for payload in provider_payloads.values():
+            linkage = payload.get("linkage") if isinstance(payload, dict) else None
+            family_linkage = linkage.get(family) if isinstance(linkage, dict) else None
+            if not isinstance(family_linkage, dict):
+                continue
+            for key in family_totals:
+                value = family_linkage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    family_totals[key] += value
+        aggregated[family] = family_totals
+    return aggregated
 
 
 def _aggregate_provider_stale_row_age_buckets(provider_payloads: dict[str, dict[str, object]]) -> dict[str, dict[str, int]]:
@@ -3569,6 +3595,7 @@ def _cmd_provider_stale_rows(
                 None,
             ),
             "age_buckets": _aggregate_provider_stale_row_age_buckets(provider_payloads),
+            "linkage": _aggregate_provider_stale_row_linkage(provider_payloads),
             "sample_limit": safe_limit,
             "age_cutoff": min(age_cutoffs) if age_cutoffs else None,
             "older_than_days": next(
@@ -3665,6 +3692,15 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
             value = family_buckets.get(bucket)
             count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
             print(f"{family}_{bucket}_count={count}")
+    linkage = payload.get("linkage") if isinstance(payload.get("linkage"), dict) else {}
+    for family in ("progress", "watchlist"):
+        family_linkage = linkage.get(family) if isinstance(linkage, dict) else None
+        if not isinstance(family_linkage, dict):
+            continue
+        for key in ("with_stale_series", "with_current_series", "with_missing_series"):
+            value = family_linkage.get(key)
+            count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+            print(f"{family}_{key}_count={count}")
     total_count = payload.get("total_count")
     if isinstance(total_count, int) and not isinstance(total_count, bool):
         print(f"total_stale_count={total_count}")
@@ -3729,6 +3765,15 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
                 value = family_buckets.get(bucket)
                 count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
                 print(f"{prefix}.{family}_{bucket}_count={count}")
+        provider_linkage = provider_payload.get("linkage") if isinstance(provider_payload.get("linkage"), dict) else {}
+        for family in ("progress", "watchlist"):
+            family_linkage = provider_linkage.get(family) if isinstance(provider_linkage, dict) else None
+            if not isinstance(family_linkage, dict):
+                continue
+            for key in ("with_stale_series", "with_current_series", "with_missing_series"):
+                value = family_linkage.get(key)
+                count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+                print(f"{prefix}.{family}_{key}_count={count}")
         provider_total = provider_payload.get("total_count")
         if isinstance(provider_total, int) and not isinstance(provider_total, bool):
             print(f"{prefix}.total_stale_count={provider_total}")
