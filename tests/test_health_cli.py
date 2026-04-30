@@ -1491,6 +1491,10 @@ class HealthCheckCliTests(unittest.TestCase):
         )
         self.assertEqual(1, payload["age_buckets"]["progress"]["older_31_plus_days"])
         self.assertEqual(1, payload["age_buckets"]["watchlist"]["older_8_30_days"])
+        self.assertEqual(39.583, payload["age_ranges_days"]["series"]["oldest_age_days"])
+        self.assertEqual(4.583, payload["age_ranges_days"]["series"]["newest_age_days"])
+        self.assertEqual(39.583, payload["age_ranges_days"]["progress"]["oldest_age_days"])
+        self.assertEqual(13.583, payload["age_ranges_days"]["watchlist"]["oldest_age_days"])
 
     def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
         with connect(self.config.db_path) as conn:
@@ -1512,7 +1516,8 @@ class HealthCheckCliTests(unittest.TestCase):
             )
             conn.commit()
 
-        exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
+        with patch("mal_updater.cli._utcnow", return_value=datetime(2026, 4, 29, 8, 0, 0, tzinfo=timezone.utc)):
+            exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
 
         self.assertEqual(0, exit_code)
         lines = stdout.strip().splitlines()
@@ -1524,6 +1529,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("watchlist_stale_count=0", lines)
         self.assertIn("series_oldest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertIn("series_newest_last_seen_at=2026-04-24 18:00:00", lines)
+        self.assertIn("series_oldest_age_days=4.583", lines)
+        self.assertIn("series_newest_age_days=4.583", lines)
         self.assertTrue(any(line.startswith("series_") and line.endswith("_count=1") for line in lines))
         self.assertIn("total_stale_count=1", lines)
         self.assertIn("policy=diagnostic_only_no_archive_or_prune", lines)
@@ -1579,6 +1586,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(2, payload["last_seen_ranges"]["series"]["count"])
         self.assertEqual("2026-04-24 18:00:00", payload["last_seen_ranges"]["series"]["oldest_last_seen_at"])
         self.assertEqual("2026-04-24 18:00:00", payload["last_seen_ranges"]["series"]["newest_last_seen_at"])
+        self.assertIn("oldest_age_days", payload["age_ranges_days"]["series"])
         self.assertEqual(1, payload["providers"]["crunchyroll"]["counts"]["series"])
         self.assertEqual(1, payload["providers"]["hidive"]["counts"]["watchlist"])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])

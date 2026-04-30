@@ -3295,6 +3295,55 @@ def _format_sqlite_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_sqlite_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    for parser in (
+        lambda raw: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+        lambda raw: datetime.fromisoformat(raw.replace("Z", "+00:00")),
+    ):
+        try:
+            parsed = parser(text)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _stale_row_age_days(reference_now: datetime, timestamp: object) -> float | None:
+    parsed = _parse_sqlite_timestamp(timestamp)
+    if parsed is None:
+        return None
+    age_seconds = max(0.0, (reference_now.astimezone(timezone.utc) - parsed).total_seconds())
+    return round(age_seconds / 86400, 3)
+
+
+def _provider_stale_row_age_ranges(
+    last_seen_ranges: dict[str, dict[str, object]],
+    *,
+    reference_now: datetime,
+) -> dict[str, dict[str, object]]:
+    age_ranges: dict[str, dict[str, object]] = {}
+    for family in ("series", "progress", "watchlist"):
+        family_range = last_seen_ranges.get(family) if isinstance(last_seen_ranges, dict) else None
+        if not isinstance(family_range, dict):
+            age_ranges[family] = {"count": 0, "oldest_age_days": None, "newest_age_days": None}
+            continue
+        count = family_range.get("count")
+        safe_count = int(count) if isinstance(count, int) and not isinstance(count, bool) else 0
+        oldest_age_days = _stale_row_age_days(reference_now, family_range.get("oldest_last_seen_at")) if safe_count else None
+        newest_age_days = _stale_row_age_days(reference_now, family_range.get("newest_last_seen_at")) if safe_count else None
+        age_ranges[family] = {
+            "count": safe_count,
+            "oldest_age_days": oldest_age_days,
+            "newest_age_days": newest_age_days,
+        }
+    return age_ranges
+
+
 def _build_provider_stale_rows_payload(
     *,
     db_path: Path,
@@ -3302,7 +3351,9 @@ def _build_provider_stale_rows_payload(
     cutoff: str | None,
     safe_limit: int,
     older_than_days: float | None = None,
+    reference_now: datetime | None = None,
 ) -> dict[str, object]:
+    reference_now = reference_now or _utcnow()
     cutoff_source = "explicit"
     sync_run: dict[str, object] | None = None
     base_cutoff = cutoff.strip() if isinstance(cutoff, str) and cutoff.strip() else None
@@ -3311,7 +3362,7 @@ def _build_provider_stale_rows_payload(
     safe_older_than_days = older_than_days
     if older_than_days is not None:
         safe_older_than_days = max(0.0, float(older_than_days))
-        age_cutoff = _format_sqlite_timestamp(_utcnow() - timedelta(days=safe_older_than_days))
+        age_cutoff = _format_sqlite_timestamp(reference_now - timedelta(days=safe_older_than_days))
     if effective_cutoff is None:
         sync_run = get_latest_completed_sync_run(db_path, provider=provider, mode="full_refresh")
         if isinstance(sync_run, dict):
@@ -3342,7 +3393,6 @@ def _build_provider_stale_rows_payload(
 
     counts = get_provider_stale_row_counts(db_path, provider=provider, cutoff=effective_cutoff)
     last_seen_ranges = get_provider_stale_row_last_seen_ranges(db_path, provider=provider, cutoff=effective_cutoff)
-    reference_now = _utcnow()
     age_bucket_cutoffs = {
         "seven_day_cutoff": _format_sqlite_timestamp(reference_now - timedelta(days=7)),
         "thirty_day_cutoff": _format_sqlite_timestamp(reference_now - timedelta(days=30)),
@@ -3366,6 +3416,7 @@ def _build_provider_stale_rows_payload(
         "counts": counts,
         "total_count": sum(value for value in counts.values() if isinstance(value, int)),
         "last_seen_ranges": last_seen_ranges,
+        "age_ranges_days": _provider_stale_row_age_ranges(last_seen_ranges, reference_now=reference_now),
         "age_bucket_cutoffs": age_bucket_cutoffs,
         "age_buckets": age_buckets,
         "sample_limit": safe_limit,
@@ -3405,6 +3456,17 @@ def _aggregate_provider_stale_row_last_seen_ranges(provider_payloads: dict[str, 
     return aggregated
 
 
+def _aggregate_provider_stale_row_age_ranges(
+    provider_payloads: dict[str, dict[str, object]],
+    *,
+    reference_now: datetime,
+) -> dict[str, dict[str, object]]:
+    return _provider_stale_row_age_ranges(
+        _aggregate_provider_stale_row_last_seen_ranges(provider_payloads),
+        reference_now=reference_now,
+    )
+
+
 def _aggregate_provider_stale_row_age_buckets(provider_payloads: dict[str, dict[str, object]]) -> dict[str, dict[str, int]]:
     aggregated: dict[str, dict[str, int]] = {}
     for family in ("series", "progress", "watchlist"):
@@ -3434,6 +3496,7 @@ def _cmd_provider_stale_rows(
     ensure_directories(config)
     bootstrap_database(config.db_path)
     safe_limit = max(1, min(25, int(limit)))
+    reference_now = _utcnow()
 
     if provider == "all":
         provider_payloads = {
@@ -3443,6 +3506,7 @@ def _cmd_provider_stale_rows(
                 cutoff=cutoff,
                 safe_limit=safe_limit,
                 older_than_days=older_than_days,
+                reference_now=reference_now,
             )
             for slug in list_provider_slugs()
         }
@@ -3470,6 +3534,7 @@ def _cmd_provider_stale_rows(
             "counts": counts,
             "total_count": sum(counts.values()),
             "last_seen_ranges": _aggregate_provider_stale_row_last_seen_ranges(provider_payloads),
+            "age_ranges_days": _aggregate_provider_stale_row_age_ranges(provider_payloads, reference_now=reference_now),
             "age_bucket_cutoffs": next(
                 (payload.get("age_bucket_cutoffs") for payload in provider_payloads.values() if isinstance(payload.get("age_bucket_cutoffs"), dict)),
                 None,
@@ -3477,7 +3542,10 @@ def _cmd_provider_stale_rows(
             "age_buckets": _aggregate_provider_stale_row_age_buckets(provider_payloads),
             "sample_limit": safe_limit,
             "age_cutoff": min(age_cutoffs) if age_cutoffs else None,
-            "older_than_days": older_than_days,
+            "older_than_days": next(
+                (payload.get("older_than_days") for payload in provider_payloads.values() if isinstance(payload.get("older_than_days"), (int, float)) and not isinstance(payload.get("older_than_days"), bool)),
+                None,
+            ),
             "read_only": True,
             "policy": "diagnostic_only_no_archive_or_prune",
         }
@@ -3493,6 +3561,7 @@ def _cmd_provider_stale_rows(
         cutoff=cutoff,
         safe_limit=safe_limit,
         older_than_days=older_than_days,
+        reference_now=reference_now,
     )
     if output_format == "summary":
         _print_provider_stale_rows_summary(payload)
@@ -3547,6 +3616,17 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
             print(f"{family}_oldest_last_seen_at={oldest}")
         if isinstance(newest, str) and newest:
             print(f"{family}_newest_last_seen_at={newest}")
+    age_ranges_days = payload.get("age_ranges_days") if isinstance(payload.get("age_ranges_days"), dict) else {}
+    for family in ("series", "progress", "watchlist"):
+        family_age_range = age_ranges_days.get(family) if isinstance(age_ranges_days, dict) else None
+        if not isinstance(family_age_range, dict):
+            continue
+        oldest_age_days = family_age_range.get("oldest_age_days")
+        newest_age_days = family_age_range.get("newest_age_days")
+        if isinstance(oldest_age_days, (int, float)) and not isinstance(oldest_age_days, bool):
+            print(f"{family}_oldest_age_days={oldest_age_days:g}")
+        if isinstance(newest_age_days, (int, float)) and not isinstance(newest_age_days, bool):
+            print(f"{family}_newest_age_days={newest_age_days:g}")
     age_buckets = payload.get("age_buckets") if isinstance(payload.get("age_buckets"), dict) else {}
     for family in ("series", "progress", "watchlist"):
         family_buckets = age_buckets.get(family) if isinstance(age_buckets, dict) else None
@@ -3600,6 +3680,17 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
                 print(f"{prefix}.{family}_oldest_last_seen_at={oldest}")
             if isinstance(newest, str) and newest:
                 print(f"{prefix}.{family}_newest_last_seen_at={newest}")
+        provider_age_ranges_days = provider_payload.get("age_ranges_days") if isinstance(provider_payload.get("age_ranges_days"), dict) else {}
+        for family in ("series", "progress", "watchlist"):
+            family_age_range = provider_age_ranges_days.get(family) if isinstance(provider_age_ranges_days, dict) else None
+            if not isinstance(family_age_range, dict):
+                continue
+            oldest_age_days = family_age_range.get("oldest_age_days")
+            newest_age_days = family_age_range.get("newest_age_days")
+            if isinstance(oldest_age_days, (int, float)) and not isinstance(oldest_age_days, bool):
+                print(f"{prefix}.{family}_oldest_age_days={oldest_age_days:g}")
+            if isinstance(newest_age_days, (int, float)) and not isinstance(newest_age_days, bool):
+                print(f"{prefix}.{family}_newest_age_days={newest_age_days:g}")
         provider_age_buckets = provider_payload.get("age_buckets") if isinstance(provider_payload.get("age_buckets"), dict) else {}
         for family in ("series", "progress", "watchlist"):
             family_buckets = provider_age_buckets.get(family) if isinstance(provider_age_buckets, dict) else None
