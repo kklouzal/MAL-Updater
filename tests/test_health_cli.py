@@ -1385,6 +1385,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("2026-04-24 18:00:00", payload["last_seen_ranges"]["series"]["newest_last_seen_at"])
         self.assertEqual(1, len(payload["samples"]["series"]))
         self.assertEqual("series-3", payload["samples"]["series"][0]["provider_series_id"])
+        self.assertIn("age_days", payload["samples"]["series"][0])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
 
     def test_provider_stale_rows_can_filter_to_rows_older_than_age_threshold(self) -> None:
@@ -1495,6 +1496,9 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(4.583, payload["age_ranges_days"]["series"]["newest_age_days"])
         self.assertEqual(39.583, payload["age_ranges_days"]["progress"]["oldest_age_days"])
         self.assertEqual(13.583, payload["age_ranges_days"]["watchlist"]["oldest_age_days"])
+        self.assertEqual(39.583, payload["samples"]["series"][0]["age_days"])
+        self.assertEqual(39.583, payload["samples"]["progress"][0]["age_days"])
+        self.assertEqual(13.583, payload["samples"]["watchlist"][0]["age_days"])
 
     def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
         with connect(self.config.db_path) as conn:

@@ -3344,6 +3344,32 @@ def _provider_stale_row_age_ranges(
     return age_ranges
 
 
+def _provider_stale_row_samples_with_ages(
+    samples: dict[str, list[dict[str, object]]],
+    *,
+    reference_now: datetime,
+) -> dict[str, list[dict[str, object]]]:
+    """Attach exact age-in-days diagnostics to stale row samples.
+
+    The sample payload is operator evidence only. Adding age to the sampled rows
+    keeps retention-policy review grounded in the same timestamp math as the
+    aggregate ranges without making any archive/prune decision.
+    """
+    annotated: dict[str, list[dict[str, object]]] = {}
+    for family in ("series", "progress", "watchlist"):
+        family_samples = samples.get(family) if isinstance(samples, dict) else None
+        annotated_rows: list[dict[str, object]] = []
+        if isinstance(family_samples, list):
+            for row in family_samples:
+                if not isinstance(row, dict):
+                    continue
+                annotated_row = dict(row)
+                annotated_row["age_days"] = _stale_row_age_days(reference_now, annotated_row.get("last_seen_at"))
+                annotated_rows.append(annotated_row)
+        annotated[family] = annotated_rows
+    return annotated
+
+
 def _build_provider_stale_rows_payload(
     *,
     db_path: Path,
@@ -3404,7 +3430,10 @@ def _build_provider_stale_rows_payload(
         seven_day_cutoff=age_bucket_cutoffs["seven_day_cutoff"],
         thirty_day_cutoff=age_bucket_cutoffs["thirty_day_cutoff"],
     )
-    samples = list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit)
+    samples = _provider_stale_row_samples_with_ages(
+        list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit),
+        reference_now=reference_now,
+    )
     return {
         "provider": provider,
         "cutoff": effective_cutoff,
