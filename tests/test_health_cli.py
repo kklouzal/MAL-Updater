@@ -1558,6 +1558,17 @@ class HealthCheckCliTests(unittest.TestCase):
             {"with_stale_series": 1, "with_current_series": 1, "with_missing_series": 1},
             payload["linkage"]["watchlist"],
         )
+        progress_samples = {row["provider_episode_id"]: row for row in payload["samples"]["progress"]}
+        self.assertEqual("stale_series", progress_samples["episode-stale"]["linked_series_posture"])
+        self.assertEqual("2026-04-20 18:00:00", progress_samples["episode-stale"]["linked_series_last_seen_at"])
+        self.assertEqual("current_series", progress_samples["episode-current"]["linked_series_posture"])
+        self.assertEqual("2026-04-26 18:00:00", progress_samples["episode-current"]["linked_series_last_seen_at"])
+        self.assertEqual("missing_series", progress_samples["episode-missing"]["linked_series_posture"])
+        self.assertIsNone(progress_samples["episode-missing"]["linked_series_last_seen_at"])
+        watchlist_samples = {row["provider_series_id"]: row for row in payload["samples"]["watchlist"]}
+        self.assertEqual("stale_series", watchlist_samples["stale-series"]["linked_series_posture"])
+        self.assertEqual("current_series", watchlist_samples["current-series"]["linked_series_posture"])
+        self.assertEqual("missing_series", watchlist_samples["missing-series"]["linked_series_posture"])
 
         exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
         self.assertEqual(0, exit_code)

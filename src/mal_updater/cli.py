@@ -2608,6 +2608,7 @@ def _cmd_health_check(
                 provider=latest_provider,
                 cutoff=latest_started_at,
                 limit=5,
+                series_cutoff=latest_started_at,
             )
     provider_counts_by_provider = snapshot.get("provider_counts_by_provider") if isinstance(snapshot.get("provider_counts_by_provider"), dict) else None
     partial_sync_coverage = _build_partial_sync_coverage(
@@ -2648,6 +2649,7 @@ def _cmd_health_check(
                 provider=latest_provider,
                 cutoff=latest_full_refresh_started_at,
                 limit=5,
+                series_cutoff=latest_full_refresh_started_at,
             )
             full_refresh_coverage = _build_partial_sync_coverage(
                 latest_full_refresh,
@@ -3436,7 +3438,13 @@ def _build_provider_stale_rows_payload(
         thirty_day_cutoff=age_bucket_cutoffs["thirty_day_cutoff"],
     )
     samples = _provider_stale_row_samples_with_ages(
-        list_provider_stale_row_samples(db_path, provider=provider, cutoff=effective_cutoff, limit=safe_limit),
+        list_provider_stale_row_samples(
+            db_path,
+            provider=provider,
+            cutoff=effective_cutoff,
+            limit=safe_limit,
+            series_cutoff=base_cutoff,
+        ),
         reference_now=reference_now,
     )
     linkage = get_provider_stale_row_linkage(

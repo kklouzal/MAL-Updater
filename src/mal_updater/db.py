@@ -1091,23 +1091,35 @@ def get_provider_stale_row_linkage(
     return linkage
 
 
+def _provider_stale_sample_linkage(linked_series_last_seen_at: object, *, series_cutoff: str) -> str:
+    if not linked_series_last_seen_at:
+        return "missing_series"
+    if str(linked_series_last_seen_at) < series_cutoff:
+        return "stale_series"
+    return "current_series"
+
+
 def list_provider_stale_row_samples(
     db_path: Path,
     *,
     provider: str,
     cutoff: str,
     limit: int = 5,
+    series_cutoff: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return small operator-facing samples of cached provider rows older than a cutoff.
 
     The samples intentionally remain read-only diagnostics. They give health-check
     output enough context to decide whether stale/deleted upstream rows should be
     left as classified residue, refreshed again, or handled by a future archive/prune
-    workflow without making that destructive policy choice automatically.
+    workflow without making that destructive policy choice automatically. Child-row
+    samples also expose whether their linked provider-series row is stale, current,
+    or missing so aggregate linkage counts can be audited against concrete examples.
     """
     if not provider or not cutoff:
         return {"series": [], "progress": [], "watchlist": []}
     safe_limit = max(1, min(25, int(limit)))
+    effective_series_cutoff = series_cutoff or cutoff
     with connect(db_path) as conn:
         series_rows = conn.execute(
             """
@@ -1125,6 +1137,7 @@ def list_provider_stale_row_samples(
                 p.provider_episode_id,
                 p.provider_series_id,
                 s.title AS series_title,
+                s.last_seen_at AS linked_series_last_seen_at,
                 p.episode_number,
                 p.episode_title,
                 p.last_watched_at,
@@ -1143,6 +1156,7 @@ def list_provider_stale_row_samples(
             SELECT
                 w.provider_series_id,
                 s.title,
+                s.last_seen_at AS linked_series_last_seen_at,
                 w.status,
                 w.added_at,
                 w.last_seen_at
@@ -1172,6 +1186,11 @@ def list_provider_stale_row_samples(
                 "provider_episode_id": str(row["provider_episode_id"]),
                 "provider_series_id": str(row["provider_series_id"]),
                 "series_title": row["series_title"],
+                "linked_series_last_seen_at": row["linked_series_last_seen_at"],
+                "linked_series_posture": _provider_stale_sample_linkage(
+                    row["linked_series_last_seen_at"],
+                    series_cutoff=effective_series_cutoff,
+                ),
                 "episode_number": row["episode_number"],
                 "episode_title": row["episode_title"],
                 "last_watched_at": row["last_watched_at"],
@@ -1183,6 +1202,11 @@ def list_provider_stale_row_samples(
             {
                 "provider_series_id": str(row["provider_series_id"]),
                 "title": row["title"],
+                "linked_series_last_seen_at": row["linked_series_last_seen_at"],
+                "linked_series_posture": _provider_stale_sample_linkage(
+                    row["linked_series_last_seen_at"],
+                    series_cutoff=effective_series_cutoff,
+                ),
                 "status": row["status"],
                 "added_at": row["added_at"],
                 "last_seen_at": row["last_seen_at"],
