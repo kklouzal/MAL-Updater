@@ -1299,6 +1299,66 @@ class RecommendationTests(unittest.TestCase):
         )
         self.assertGreater(results[0].priority, results[1].priority)
 
+    def test_discovery_candidate_tempers_low_mean_even_without_metadata_rich_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Baseline Pick", mean=7.2, popularity=800, genres=["Romance"], studios=["Madhouse"], source="manga")
+        self._cache_metadata(400, title="Low Mean Pick", mean=6.4, popularity=800, genres=["Romance"], studios=["Madhouse"], source="manga")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Baseline Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Low Mean Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(0, results[0].context["catalog_quality_penalty"])
+        self.assertEqual(2, results[1].context["catalog_quality_penalty"])
+        self.assertEqual("low", results[1].context["catalog_low_mean_band"])
+        self.assertIsNone(results[1].context["catalog_niche_popularity_band"])
+        self.assertIn(
+            "global catalog quality/adoption calibration slightly tempered this candidate (low MAL mean)",
+            results[1].reasons,
+        )
+        self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_tempers_very_niche_catalog_adoption_even_without_metadata_rich_tie(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Baseline Adoption Pick", mean=7.4, popularity=1000, genres=["Romance"], studios=["Madhouse"], source="manga")
+        self._cache_metadata(400, title="Very Niche Pick", mean=7.4, popularity=11000, genres=["Romance"], studios=["Madhouse"], source="manga")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Baseline Adoption Pick", "num_recommendations": 20, "raw": {}},
+            {"target_mal_anime_id": 400, "target_title": "Very Niche Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(0, results[0].context["catalog_quality_penalty"])
+        self.assertEqual(2, results[1].context["catalog_quality_penalty"])
+        self.assertIsNone(results[1].context["catalog_low_mean_band"])
+        self.assertEqual("very_niche", results[1].context["catalog_niche_popularity_band"])
+        self.assertIn(
+            "global catalog quality/adoption calibration slightly tempered this candidate (very niche catalog adoption)",
+            results[1].reasons,
+        )
+        self.assertGreater(results[0].priority, results[1].priority)
+
     def test_discovery_candidate_prefers_metadata_rich_alignment_when_votes_tie(self) -> None:
         self._insert_series(
             "seed-a",

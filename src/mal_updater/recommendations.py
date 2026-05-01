@@ -544,6 +544,28 @@ def _discovery_catalog_quality_bonus(*, mean: float | None, popularity: int | No
     return min(bonus, 3), mean_band, popularity_band
 
 
+def _discovery_catalog_quality_penalty(*, mean: float | None, popularity: int | None) -> tuple[int, str | None, str | None]:
+    """Small global dampener for weak catalog signals in otherwise-flat discovery races."""
+    penalty = 0
+    mean_band: str | None = None
+    popularity_band: str | None = None
+    if mean is not None:
+        if mean < 6.5:
+            penalty += 2
+            mean_band = "low"
+        elif mean < 7.0:
+            penalty += 1
+            mean_band = "modest"
+    if popularity is not None:
+        if popularity > 10000:
+            penalty += 2
+            popularity_band = "very_niche"
+        elif popularity > 5000:
+            penalty += 1
+            popularity_band = "niche"
+    return min(penalty, 3), mean_band, popularity_band
+
+
 def _metadata_start_season(meta: Any) -> dict[str, Any] | None:
     start_season = getattr(meta, "start_season", None) if meta is not None else None
     if not isinstance(start_season, dict):
@@ -973,6 +995,10 @@ def _build_discovery_recommendations(
             mean=mean,
             popularity=popularity,
         )
+        catalog_quality_penalty, catalog_low_mean_band, catalog_niche_popularity_band = _discovery_catalog_quality_penalty(
+            mean=mean,
+            popularity=popularity,
+        )
         start_season = _metadata_start_season(meta)
         start_season_label = _format_start_season(start_season)
         freshness_bonus, freshness_bucket, catalog_age_in_seasons, freshness_penalty = _discovery_candidate_freshness_profile(start_season)
@@ -1096,6 +1122,7 @@ def _build_discovery_recommendations(
         priority -= seed_quality_penalty
         priority -= mixed_signal_penalty
         priority -= neutral_support_penalty
+        priority -= catalog_quality_penalty
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
@@ -1141,6 +1168,20 @@ def _build_discovery_recommendations(
                 reasons.append(
                     "global catalog quality/adoption calibration slightly favored this candidate ("
                     + ", ".join(catalog_quality_fragments)
+                    + ")"
+                )
+        if catalog_quality_penalty > 0:
+            catalog_penalty_fragments: list[str] = []
+            if catalog_low_mean_band is not None:
+                catalog_penalty_fragments.append(f"{catalog_low_mean_band} MAL mean")
+            if catalog_niche_popularity_band is not None:
+                catalog_penalty_fragments.append(
+                    "very niche catalog adoption" if catalog_niche_popularity_band == "very_niche" else "niche catalog adoption"
+                )
+            if catalog_penalty_fragments:
+                reasons.append(
+                    "global catalog quality/adoption calibration slightly tempered this candidate ("
+                    + ", ".join(catalog_penalty_fragments)
                     + ")"
                 )
         if freshness_bonus > 0 and start_season_label is not None:
@@ -1215,6 +1256,9 @@ def _build_discovery_recommendations(
                     "catalog_quality_bonus": catalog_quality_bonus,
                     "catalog_mean_band": catalog_mean_band,
                     "catalog_popularity_band": catalog_popularity_band,
+                    "catalog_quality_penalty": catalog_quality_penalty,
+                    "catalog_low_mean_band": catalog_low_mean_band,
+                    "catalog_niche_popularity_band": catalog_niche_popularity_band,
                     "start_season": start_season,
                     "start_season_label": start_season_label,
                     "freshness_bucket": freshness_bucket,
