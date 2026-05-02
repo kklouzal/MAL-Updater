@@ -999,6 +999,7 @@ def _build_discovery_recommendations(
             mean=mean,
             popularity=popularity,
         )
+        catalog_quality_adjustment = catalog_quality_bonus - catalog_quality_penalty
         start_season = _metadata_start_season(meta)
         start_season_label = _format_start_season(start_season)
         freshness_bonus, freshness_bucket, catalog_age_in_seasons, freshness_penalty = _discovery_candidate_freshness_profile(start_season)
@@ -1259,6 +1260,7 @@ def _build_discovery_recommendations(
                     "catalog_quality_penalty": catalog_quality_penalty,
                     "catalog_low_mean_band": catalog_low_mean_band,
                     "catalog_niche_popularity_band": catalog_niche_popularity_band,
+                    "catalog_quality_adjustment": catalog_quality_adjustment,
                     "start_season": start_season,
                     "start_season_label": start_season_label,
                     "freshness_bucket": freshness_bucket,

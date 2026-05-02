@@ -1261,7 +1261,9 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(2, results[0].context["catalog_quality_bonus"])
         self.assertEqual("elite", results[0].context["catalog_mean_band"])
         self.assertIsNone(results[0].context["catalog_popularity_band"])
+        self.assertEqual(2, results[0].context["catalog_quality_adjustment"])
         self.assertEqual(0, results[1].context["catalog_quality_bonus"])
+        self.assertEqual(0, results[1].context["catalog_quality_adjustment"])
         self.assertIn(
             "global catalog quality/adoption calibration slightly favored this candidate (elite MAL mean)",
             results[0].reasons,
@@ -1320,7 +1322,9 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["catalog_quality_penalty"])
+        self.assertEqual(0, results[0].context["catalog_quality_adjustment"])
         self.assertEqual(2, results[1].context["catalog_quality_penalty"])
+        self.assertEqual(-2, results[1].context["catalog_quality_adjustment"])
         self.assertEqual("low", results[1].context["catalog_low_mean_band"])
         self.assertIsNone(results[1].context["catalog_niche_popularity_band"])
         self.assertIn(
@@ -1350,7 +1354,9 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["catalog_quality_penalty"])
+        self.assertEqual(0, results[0].context["catalog_quality_adjustment"])
         self.assertEqual(2, results[1].context["catalog_quality_penalty"])
+        self.assertEqual(-2, results[1].context["catalog_quality_adjustment"])
         self.assertIsNone(results[1].context["catalog_low_mean_band"])
         self.assertEqual("very_niche", results[1].context["catalog_niche_popularity_band"])
         self.assertIn(
@@ -1358,6 +1364,30 @@ class RecommendationTests(unittest.TestCase):
             results[1].reasons,
         )
         self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_exposes_net_catalog_quality_adjustment(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Sci-Fi"], studios=["Bones"], source="light_novel")
+        self._cache_metadata(300, title="Elite Niche Pick", mean=8.7, popularity=12000, genres=["Romance"], studios=["Madhouse"], source="manga")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Elite Niche Pick", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:300"], [item.provider_series_id for item in results])
+        self.assertEqual(2, results[0].context["catalog_quality_bonus"])
+        self.assertEqual(2, results[0].context["catalog_quality_penalty"])
+        self.assertEqual(0, results[0].context["catalog_quality_adjustment"])
+        self.assertEqual("elite", results[0].context["catalog_mean_band"])
+        self.assertEqual("very_niche", results[0].context["catalog_niche_popularity_band"])
 
     def test_discovery_candidate_prefers_metadata_rich_alignment_when_votes_tie(self) -> None:
         self._insert_series(

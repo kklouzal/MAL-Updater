@@ -278,7 +278,7 @@ and preserve matching reason/detail/countdown metadata when that context exists.
 ### Decision
 Keep discovery ranking primarily driven by support and overlap evidence, but allow a **small global catalog quality/adoption calibration** even when a candidate is not inside a metadata-rich tie.
 
-When discovery candidates are otherwise fairly flat, higher MAL mean and broader catalog adoption may contribute a bounded `catalog_quality_bonus` plus explainable `catalog_mean_band` / `catalog_popularity_band` metadata. This calibration should stay modest and should not replace support-count, vote-spread, freshness, or metadata-affinity posture as the main ranking driver.
+When discovery candidates are otherwise fairly flat, higher MAL mean and broader catalog adoption may contribute a bounded `catalog_quality_bonus` plus explainable `catalog_mean_band` / `catalog_popularity_band` metadata, while low-mean or very-niche candidates may receive a bounded `catalog_quality_penalty`; recommendation context also exposes the net `catalog_quality_adjustment` for auditability. This calibration should stay modest and should not replace support-count, vote-spread, freshness, or metadata-affinity posture as the main ranking driver.
 
 ### Why
 - recommendation ordering already used coarse mean/popularity signals, but some flatter races still needed a more explicit and inspectable tie-break outside the metadata-rich path
