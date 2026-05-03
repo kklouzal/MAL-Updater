@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import ensure_directories, load_config
+from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
 from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
 from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, _recommendation_metadata_refresh_command, run_pending_tasks
 
@@ -431,6 +432,82 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         metadata_state = state["tasks"]["recommend_metadata_refresh"]
         self.assertEqual("recommend_metadata_refresh:limit=4:discovery_target_limit=7", metadata_state["execution_signature"])
+
+    def test_run_pending_tasks_executes_recommendations_webhook_push_lane(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendations_webhook_push_every_seconds = 1
+        self.config.service.task_execute_limits["push_recommendations_webhook"] = 6
+        self.config.openclaw.recommendations_webhook_enabled = True
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_crunchyroll": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        preview = OpenClawRecommendationDeliveryResult(status="dry_run", request_url="http://127.0.0.1:18789/hooks/agent", payload={}, request_id="abc123")
+        delivered = OpenClawRecommendationDeliveryResult(status="delivered", request_url="http://127.0.0.1:18789/hooks/agent", payload={}, http_status=200, request_id="abc123")
+        with patch("mal_updater.service_runtime.deliver_recommendations_via_openclaw", side_effect=[preview, delivered]):
+            result = run_pending_tasks(self.config)
+
+        webhook_result = next(item for item in result["results"] if item["task"] == "push_recommendations_webhook")
+        self.assertEqual("ok", webhook_result["status"])
+        self.assertEqual("delivered", webhook_result["delivery_status"])
+        self.assertEqual(6, webhook_result["delivery_limit"])
+        self.assertEqual("abc123", webhook_result["request_id"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        webhook_state = state["tasks"]["push_recommendations_webhook"]
+        self.assertEqual("push_recommendations_webhook:limit=6", webhook_state["execution_signature"])
+        self.assertEqual("abc123", webhook_state["last_delivery_request_id"])
+
+    def test_run_pending_tasks_skips_unchanged_recommendations_webhook_push_lane(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendations_webhook_push_every_seconds = 1
+        self.config.service.task_execute_limits["push_recommendations_webhook"] = 6
+        self.config.openclaw.recommendations_webhook_enabled = True
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_crunchyroll": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "push_recommendations_webhook": {"last_delivery_request_id": "abc123"},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        preview = OpenClawRecommendationDeliveryResult(status="dry_run", request_url="http://127.0.0.1:18789/hooks/agent", payload={}, request_id="abc123")
+        with patch("mal_updater.service_runtime.deliver_recommendations_via_openclaw", return_value=preview) as deliver:
+            result = run_pending_tasks(self.config)
+
+        webhook_result = next(item for item in result["results"] if item["task"] == "push_recommendations_webhook")
+        self.assertEqual("ok", webhook_result["status"])
+        self.assertEqual("unchanged", webhook_result["delivery_status"])
+        self.assertEqual(1, deliver.call_count)
 
     def test_run_pending_tasks_resets_stale_sync_apply_projection_when_execution_signature_changes(self) -> None:
         now = time.time()

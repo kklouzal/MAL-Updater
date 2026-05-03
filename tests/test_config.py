@@ -5,7 +5,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from mal_updater.config import load_config, load_mal_secrets
+from mal_updater.config import load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
 
 
 class ConfigLoadingTests(unittest.TestCase):
@@ -27,6 +27,9 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.mal.bind_host, "0.0.0.0")
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.1:8765/callback")
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").resolve())
+            self.assertFalse(config.openclaw.recommendations_webhook_enabled)
+            self.assertEqual("", config.openclaw.recommendations_webhook_url)
+            self.assertEqual(20.0, config.openclaw.recommendations_webhook_timeout_seconds)
             self.assertEqual(0, config.service.full_refresh_every_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
@@ -76,16 +79,28 @@ class ConfigLoadingTests(unittest.TestCase):
                     redirect_host = "127.0.0.50"
                     redirect_port = 9999
 
+                    [openclaw]
+                    recommendations_webhook_enabled = true
+                    recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
+                    recommendations_webhook_timeout_seconds = 9.5
+                    recommendations_webhook_channel = "discord"
+                    recommendations_webhook_to = "channel:1487239758487748761"
+
                     [secret_files]
                     mal_client_id = "ids/client-id.txt"
+                    openclaw_hook_token = "tokens/openclaw-hook-token.txt"
                     """
                 ).strip()
                 + "\n",
                 encoding="utf-8",
             )
+            token_file = root / ".MAL-Updater" / "private" / "tokens" / "openclaw-hook-token.txt"
+            token_file.parent.mkdir(parents=True, exist_ok=True)
+            token_file.write_text("secret-token\n", encoding="utf-8")
 
             config = load_config(root)
             secrets = load_mal_secrets(config)
+            hook_token, hook_token_path = load_openclaw_recommendations_hook_token(config)
 
             self.assertEqual(config.completion_threshold, 0.95)
             self.assertEqual(config.contract_version, "2.0")
@@ -97,7 +112,14 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.db_path, (root / ".MAL-Updater" / "var" / "custom.sqlite3").resolve())
             self.assertEqual(config.mal.bind_host, "127.0.0.1")
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.50:9999/callback")
+            self.assertTrue(config.openclaw.recommendations_webhook_enabled)
+            self.assertEqual("http://127.0.0.1:18789/hooks/agent", config.openclaw.recommendations_webhook_url)
+            self.assertEqual(9.5, config.openclaw.recommendations_webhook_timeout_seconds)
+            self.assertEqual("discord", config.openclaw.recommendations_webhook_channel)
+            self.assertEqual("channel:1487239758487748761", config.openclaw.recommendations_webhook_to)
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "private" / "ids" / "client-id.txt").resolve())
+            self.assertEqual(hook_token, "secret-token")
+            self.assertEqual(hook_token_path, token_file.resolve())
 
     def test_settings_file_loads_provider_budget_tables(self) -> None:
         with tempfile.TemporaryDirectory() as td:

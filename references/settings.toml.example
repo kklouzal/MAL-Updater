@@ -29,11 +29,19 @@ locale = "en-US"
 request_spacing_seconds = 22.5
 request_spacing_jitter_seconds = 7.5
 
+[openclaw]
+recommendations_webhook_enabled = false
+recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
+recommendations_webhook_timeout_seconds = 20.0
+recommendations_webhook_channel = "discord"
+recommendations_webhook_to = "channel:1487239758487748761"
+
 [service]
 sync_every_seconds = 21600
 full_refresh_every_seconds = 0  # disabled by default; reserve full refresh for initial bootstrap or explicit recovery
 health_every_seconds = 43200
 mal_refresh_every_seconds = 21600
+recommendations_webhook_push_every_seconds = 0  # disabled by default; set >0 to let the daemon push changed recommendation digests into OpenClaw
 loop_sleep_seconds = 30
 crunchyroll_hourly_limit = 180  # legacy Crunchyroll-specific override
 source_provider_hourly_limit = 180
@@ -52,6 +60,7 @@ sync_apply = 48  # built-in default shown explicitly here; override only when th
 
 [service.task_execute_limits]
 sync_apply = 8  # built-in default shown explicitly here; unattended apply runs should advance MAL in bounded batches instead of trying a full aggregate pass
+push_recommendations_webhook = 20  # optional daemon push batch size for recommendation delivery into OpenClaw
 
 [service.task_projected_request_counts]
 mal_refresh = 1  # built-in default shown explicitly here; fresh installs now seed unattended MAL token refresh with a small non-zero request-cost estimate, but learned history can replace the seed once real runs exist
@@ -109,3 +118,4 @@ mal_access_token = "mal_access_token.txt"
 mal_refresh_token = "mal_refresh_token.txt"
 crunchyroll_username = "crunchyroll_username.txt"
 crunchyroll_password = "crunchyroll_password.txt"
+openclaw_hook_token = "openclaw_hook_token.txt"

@@ -22,6 +22,7 @@ from .config import (
 from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
 from .mal_client import MalApiError, MalClient
+from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .request_tracking import (
     estimate_budget_recovery_seconds,
     estimate_budget_recovery_seconds_for_ratio,
@@ -257,6 +258,8 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
     specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
     if int(config.service.recommendation_metadata_refresh_every_seconds) > 0:
         specs.append(TaskSpec("recommend_metadata_refresh", config.service.recommendation_metadata_refresh_every_seconds, budget_provider="mal"))
+    if int(config.service.recommendations_webhook_push_every_seconds) > 0 and config.openclaw.recommendations_webhook_enabled:
+        specs.append(TaskSpec("push_recommendations_webhook", config.service.recommendations_webhook_push_every_seconds, budget_provider=None))
     specs.append(TaskSpec("health", config.service.health_every_seconds, budget_provider=None))
     return specs
 
@@ -389,6 +392,50 @@ def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
     ]
 
 
+def _recommendations_webhook_push_limit(config: AppConfig) -> int:
+    push_limit = config.service.execute_limit_for("push_recommendations_webhook")
+    if push_limit is None:
+        push_limit = 20
+    return max(0, int(push_limit))
+
+
+def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, Any]) -> dict[str, Any]:
+    delivery_limit = _recommendations_webhook_push_limit(config)
+    preview = deliver_recommendations_via_openclaw(config, limit=delivery_limit, include_dormant=False, dry_run=True)
+    request_id = preview.request_id
+    previous_request_id = task_state.get("last_delivery_request_id")
+    if request_id and previous_request_id == request_id:
+        return {
+            "status": "ok",
+            "label": "push_recommendations_webhook",
+            "delivery_status": "unchanged",
+            "delivery_limit": delivery_limit,
+            "request_id": request_id,
+            "request_url": preview.request_url,
+        }
+    delivery = deliver_recommendations_via_openclaw(config, limit=delivery_limit, include_dormant=False, dry_run=False)
+    result = {
+        "status": "ok",
+        "label": "push_recommendations_webhook",
+        "delivery_status": delivery.status,
+        "delivery_limit": delivery_limit,
+        "request_id": delivery.request_id,
+        "request_url": delivery.request_url,
+        "http_status": delivery.http_status,
+    }
+    if delivery.reason is not None:
+        result["reason"] = delivery.reason
+    if delivery.response_text is not None:
+        result["response_text"] = delivery.response_text
+    if delivery.status == "delivered" and delivery.request_id:
+        task_state["last_delivery_request_id"] = delivery.request_id
+        task_state["last_delivery_http_status"] = delivery.http_status
+    elif delivery.status == "no_recommendations":
+        task_state.pop("last_delivery_request_id", None)
+        task_state.pop("last_delivery_http_status", None)
+    return result
+
+
 def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: str | None = None) -> str | None:
     if spec.name == "sync_apply":
         apply_limit = config.service.execute_limit_for("sync_apply")
@@ -403,6 +450,8 @@ def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: 
         if discovery_target_limit is None:
             discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
         return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
+    if spec.name == "push_recommendations_webhook":
+        return f"push_recommendations_webhook:limit={_recommendations_webhook_push_limit(config)}"
     if spec.name.startswith("sync_fetch_"):
         return f"{spec.name}:mode={fetch_mode or 'incremental'}"
     return None
@@ -956,6 +1005,16 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
                             result[key] = max(0, int(value))
+            elif spec.name == "push_recommendations_webhook":
+                try:
+                    result = _push_recommendations_webhook_task(config, task_state)
+                except OpenClawDeliveryError as exc:
+                    result = {
+                        "status": "error",
+                        "label": "push_recommendations_webhook",
+                        "reason": str(exc),
+                    }
+                result["delivery_limit"] = _recommendations_webhook_push_limit(config)
             elif spec.name == "health":
                 result = _run_subprocess(
                     config,

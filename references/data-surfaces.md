@@ -49,6 +49,7 @@ PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat --include-dormant
 PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata
+PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 20
 ```
 
 Use this surface when the user wants:
@@ -56,6 +57,8 @@ Use this surface when the user wants:
 - new season / dubbed-episode style recommendation output
 - dormant-but-cached discovery candidates for debugging / audit
 - recommendation metadata refresh
+- pushing a recommendation digest into OpenClaw's webhook ingress for chat delivery
+- checking whether the optional daemon-backed recommendation webhook push lane is enabled and current via `service-status`
 
 ## Review queue / mapping state
 

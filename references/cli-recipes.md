@@ -96,6 +96,10 @@ PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat --include-dormant
 PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata
 PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata --include-discovery-targets --discovery-target-limit 50
+PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 20
+PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 20 --dry-run
+# optional daemon lane: set service.recommendations_webhook_push_every_seconds > 0 and keep openclaw webhook settings populated
+PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 ```
 
 ## Tests

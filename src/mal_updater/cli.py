@@ -18,6 +18,7 @@ import stat
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
 from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, auth_failure_remediation, classify_auth_style_failure
 from .config import ensure_directories, load_config, load_mal_secrets
+from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
     crunchyroll_login_with_credentials,
@@ -6115,6 +6116,29 @@ def _cmd_recommend_refresh_metadata(
     return 0
 
 
+def _cmd_push_recommendations_webhook(
+    project_root: Path | None,
+    limit: int,
+    include_dormant: bool,
+    dry_run: bool,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    try:
+        result = deliver_recommendations_via_openclaw(
+            config,
+            limit=_normalize_limit(limit),
+            include_dormant=include_dormant,
+            dry_run=dry_run,
+        )
+    except OpenClawDeliveryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(result.as_dict(), indent=2))
+    return 0 if result.status in {"dry_run", "delivered", "no_recommendations"} else 1
+
+
 def _cmd_sync(_: Path | None) -> int:
     raise SystemExit(
         "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals or 'apply-sync' for the approved-mapping-only executor."
@@ -6436,6 +6460,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="How many discovered target anime to hydrate when --include-discovery-targets is used (use 0 for all discovered targets)",
     )
+    push_recommendations_webhook = subparsers.add_parser(
+        "push-recommendations-webhook",
+        help="Send the current recommendation digest to OpenClaw via the configured webhook ingress",
+    )
+    push_recommendations_webhook.add_argument("--limit", type=int, default=20, help="How many recommendations to consider (use 0 for all)")
+    push_recommendations_webhook.add_argument(
+        "--include-dormant",
+        action="store_true",
+        help="Include discovery candidates that are not currently matched to a registered provider catalog",
+    )
+    push_recommendations_webhook.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build the outbound payload without performing the webhook POST",
+    )
     subparsers.add_parser("sync", help="Reserved for future sync orchestration")
     return parser
 
@@ -6677,6 +6716,13 @@ def main() -> int:
             args.limit,
             args.include_discovery_targets,
             args.discovery_target_limit,
+        )
+    if args.command == "push-recommendations-webhook":
+        return _cmd_push_recommendations_webhook(
+            args.project_root,
+            args.limit,
+            args.include_dormant,
+            args.dry_run,
         )
     if args.command == "sync":
         return _cmd_sync(args.project_root)

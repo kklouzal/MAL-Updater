@@ -25,6 +25,7 @@ DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS = 0.2
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 22.5
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 7.5
+DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAL_CLIENT_ID_FILE = "mal_client_id.txt"
 DEFAULT_MAL_CLIENT_SECRET_FILE = "mal_client_secret.txt"
 DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
@@ -36,6 +37,7 @@ DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 6 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
+DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
 DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
@@ -139,12 +141,22 @@ class CrunchyrollSettings:
 
 
 @dataclass(slots=True)
+class OpenClawSettings:
+    recommendations_webhook_enabled: bool = False
+    recommendations_webhook_url: str = ""
+    recommendations_webhook_timeout_seconds: float = DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS
+    recommendations_webhook_channel: str = "discord"
+    recommendations_webhook_to: str = ""
+
+
+@dataclass(slots=True)
 class ServiceSettings:
     sync_every_seconds: int = DEFAULT_SERVICE_SYNC_EVERY_SECONDS
     full_refresh_every_seconds: int = DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS
     health_every_seconds: int = DEFAULT_SERVICE_HEALTH_EVERY_SECONDS
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
     recommendation_metadata_refresh_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS
+    recommendations_webhook_push_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
     source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
@@ -302,6 +314,7 @@ class AppConfig:
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     mal: MalSettings = field(default_factory=MalSettings)
     crunchyroll: CrunchyrollSettings = field(default_factory=CrunchyrollSettings)
+    openclaw: OpenClawSettings = field(default_factory=OpenClawSettings)
     service: ServiceSettings = field(default_factory=ServiceSettings)
 
     @property
@@ -498,6 +511,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     paths_section = _get_table(settings, "paths")
     mal_section = _get_table(settings, "mal")
     crunchyroll_section = _get_table(settings, "crunchyroll")
+    openclaw_section = _get_table(settings, "openclaw")
     service_section = _get_table(settings, "service")
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
@@ -621,6 +635,34 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 )
             ),
         ),
+        openclaw=OpenClawSettings(
+            recommendations_webhook_enabled=(
+                str(os.getenv("MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_ENABLED", openclaw_section.get("recommendations_webhook_enabled", False))).strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
+            recommendations_webhook_url=os.getenv(
+                "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_URL",
+                _get_str(openclaw_section, "recommendations_webhook_url", ""),
+            ),
+            recommendations_webhook_timeout_seconds=float(
+                os.getenv(
+                    "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS",
+                    _get_float(
+                        openclaw_section,
+                        "recommendations_webhook_timeout_seconds",
+                        DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS,
+                    ),
+                )
+            ),
+            recommendations_webhook_channel=os.getenv(
+                "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_CHANNEL",
+                _get_str(openclaw_section, "recommendations_webhook_channel", "discord"),
+            ),
+            recommendations_webhook_to=os.getenv(
+                "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TO",
+                _get_str(openclaw_section, "recommendations_webhook_to", ""),
+            ),
+        ),
         service=ServiceSettings(
             sync_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_SYNC_EVERY_SECONDS", _get_int(service_section, "sync_every_seconds", DEFAULT_SERVICE_SYNC_EVERY_SECONDS))),
             full_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_FULL_REFRESH_EVERY_SECONDS", _get_int(service_section, "full_refresh_every_seconds", DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS))),
@@ -633,6 +675,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                         service_section,
                         "recommendation_metadata_refresh_every_seconds",
                         DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS,
+                    ),
+                )
+            ),
+            recommendations_webhook_push_every_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS",
+                    _get_int(
+                        service_section,
+                        "recommendations_webhook_push_every_seconds",
+                        DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS,
                     ),
                 )
             ),
@@ -847,6 +899,19 @@ def load_mal_secrets(config: AppConfig) -> MalSecrets:
         access_token_path=access_token_path,
         refresh_token_path=refresh_token_path,
     )
+
+
+def load_openclaw_recommendations_hook_token(config: AppConfig) -> tuple[str | None, Path]:
+    secret_files_section = config.secret_files if isinstance(config.secret_files, dict) else {}
+    token_path = _resolve_secret_path(
+        "MAL_UPDATER_OPENCLAW_HOOK_TOKEN_FILE",
+        secret_files_section,
+        "openclaw_hook_token",
+        secrets_dir=config.secrets_dir,
+        default_file="openclaw_hook_token.txt",
+    )
+    token = os.getenv("MAL_UPDATER_OPENCLAW_HOOK_TOKEN") or _read_secret_file(token_path)
+    return token, token_path
 
 
 def ensure_directories(config: AppConfig) -> None:
