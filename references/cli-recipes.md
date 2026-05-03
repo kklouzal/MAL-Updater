@@ -93,6 +93,7 @@ PYTHONPATH=src python3 -m mal_updater.cli exact-approved-sync-cycle --full-refre
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat
+PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat --include-dormant
 PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata
 PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata --include-discovery-targets --discovery-target-limit 50
 ```

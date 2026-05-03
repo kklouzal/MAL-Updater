@@ -47,12 +47,14 @@ Use:
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat
+PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20 --flat --include-dormant
 PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata
 ```
 
 Use this surface when the user wants:
 - recommended anime to resume/watch next
 - new season / dubbed-episode style recommendation output
+- dormant-but-cached discovery candidates for debugging / audit
 - recommendation metadata refresh
 
 ## Review queue / mapping state
