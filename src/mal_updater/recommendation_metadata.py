@@ -85,7 +85,8 @@ def refresh_recommendation_metadata(
 ) -> MetadataRefreshSummary:
     mappings = list_series_mappings(config.db_path, approved_only=False)
     metadata_by_id = get_mal_anime_metadata_map(config.db_path)
-    anime_ids = _rank_refresh_ids(sorted({int(mapping.mal_anime_id) for mapping in mappings}), metadata_by_id)
+    mapped_anime_ids = {int(mapping.mal_anime_id) for mapping in mappings}
+    anime_ids = _rank_refresh_ids(sorted(mapped_anime_ids), metadata_by_id)
     if limit is not None and limit > 0:
         anime_ids = anime_ids[:limit]
 
@@ -187,6 +188,7 @@ def refresh_recommendation_metadata(
                 item[0],
             ),
         )
+        ranked_targets = [(target_id, info) for target_id, info in ranked_targets if target_id not in mapped_anime_ids]
         if discovery_target_limit is not None and discovery_target_limit > 0:
             ranked_targets = ranked_targets[:discovery_target_limit]
         discovery_considered = len(ranked_targets)

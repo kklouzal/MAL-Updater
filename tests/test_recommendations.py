@@ -1728,6 +1728,91 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn(9100, metadata_by_id)
         self.assertIn(9200, metadata_by_id)
 
+    def test_discovery_target_metadata_refresh_skips_already_mapped_titles(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "seed-b",
+            title="Mapped Follow-Up",
+            season_title="Mapped Follow-Up (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._map_series("seed-b", 200)
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "") -> dict:
+            payloads = {
+                100: {
+                    "id": 100,
+                    "title": "Seed A",
+                    "alternative_titles": {},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "mean": 8.1,
+                    "popularity": 500,
+                    "start_season": {"year": 2020, "season": "winter"},
+                    "related_anime": [],
+                    "recommendations": [
+                        {"node": {"id": 200, "title": "Mapped Follow-Up"}, "num_recommendations": 50},
+                        {"node": {"id": 300, "title": "Unmapped Discovery"}, "num_recommendations": 10},
+                    ],
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+                },
+                200: {
+                    "id": 200,
+                    "title": "Mapped Follow-Up",
+                    "alternative_titles": {},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "mean": 8.0,
+                    "popularity": 600,
+                    "start_season": {"year": 2021, "season": "spring"},
+                    "related_anime": [],
+                    "recommendations": [],
+                    "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+                },
+                300: {
+                    "id": 300,
+                    "title": "Unmapped Discovery",
+                    "alternative_titles": {"en": "Unmapped Discovery"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 24,
+                    "mean": 8.4,
+                    "popularity": 140,
+                    "start_season": {"year": 2022, "season": "fall"},
+                    "my_list_status": {"status": "plan_to_watch", "num_episodes_watched": 0},
+                },
+            }
+            return payloads[anime_id]
+
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details) as get_details:
+            summary = refresh_recommendation_metadata(
+                self.config,
+                limit=1,
+                include_discovery_targets=True,
+                discovery_target_limit=1,
+            )
+
+        self.assertEqual(1, summary.considered)
+        self.assertEqual(1, summary.refreshed)
+        self.assertEqual(1, summary.discovery_considered)
+        self.assertEqual(1, summary.discovery_refreshed)
+        requested_ids = [call.args[0] for call in get_details.call_args_list]
+        self.assertEqual([100, 300], requested_ids)
+
+        metadata_by_id = get_mal_anime_metadata_map(self.config.db_path)
+        self.assertIn(300, metadata_by_id)
+        self.assertNotIn(200, metadata_by_id)
+
     def test_discovery_target_metadata_refresh_persists_my_list_status_and_suppresses_candidate(self) -> None:
         self._insert_series(
             "seed-a",
