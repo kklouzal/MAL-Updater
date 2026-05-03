@@ -243,8 +243,8 @@ class HealthCheckCliTests(unittest.TestCase):
             exit_code, stdout = self._run_health_check_cycle_raw("--auto-run-recommended")
 
         self.assertEqual(0, exit_code)
-        self.assertIn("auto_remediation_safe_candidate_reason_code=refresh_full_snapshot", stdout)
-        self.assertIn("auto_remediation_action=skipped_not_allowlisted", stdout)
+        self.assertNotIn("auto_remediation_safe_candidate_reason_code=refresh_full_snapshot", stdout)
+        self.assertIn("auto_remediation_action=none", stdout)
         self.assertNotIn("auto_remediation_result=completed", stdout)
 
     def test_health_check_cycle_passes_mapping_review_tuning_into_saved_health_payload(self) -> None:
@@ -1302,13 +1302,9 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(5, partial["fields"]["series"]["provider_total_count"])
         self.assertAlmostEqual(0.4, partial["fields"]["series"]["coverage_ratio"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
-        self.assertEqual(1, len(maintenance_commands))
-        self.assertEqual("refresh_full_snapshot", maintenance_commands[0]["reason_code"])
-        self.assertTrue(maintenance_commands[0]["automation_safe"])
-        self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
-        self.assertEqual(
-            ["crunchyroll-fetch-snapshot", "--full-refresh", "--out", ".MAL-Updater/cache/live-crunchyroll-snapshot.json", "--ingest"],
-            maintenance_commands[0]["command_args"],
+        self.assertNotIn(
+            "refresh_full_snapshot",
+            {command["reason_code"] for command in maintenance_commands},
         )
 
     def test_health_check_classifies_full_refresh_gaps_as_stale_provider_rows(self) -> None:
@@ -1807,7 +1803,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertFalse(payload["ready"])
         self.assertIn("No cutoff", payload["detail"])
 
-    def test_health_check_keeps_incremental_stale_gaps_on_full_refresh_remediation(self) -> None:
+    def test_health_check_classifies_incremental_gaps_as_backfill_pending_without_full_refresh_remediation(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
         crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
@@ -1847,13 +1843,13 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("latest_sync_run_partial_coverage", warning_codes)
-        self.assertNotIn("latest_sync_run_stale_provider_rows", warning_codes)
+        self.assertIn("latest_sync_run_stale_provider_rows", warning_codes)
+        self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
         partial = payload["partial_sync_coverage"]
-        self.assertFalse(partial["fully_explained_by_stale_rows"])
+        self.assertTrue(partial["fully_explained_by_stale_rows"])
         self.assertEqual(3, partial["fields"]["series"]["older_last_seen_row_count"])
-        self.assertNotIn("classification", partial["fields"]["series"])
-        self.assertIn(
+        self.assertEqual("incremental_backfill_pending_provider_rows", partial["fields"]["series"]["classification"])
+        self.assertNotIn(
             "refresh_full_snapshot",
             {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
         )
@@ -1921,7 +1917,7 @@ class HealthCheckCliTests(unittest.TestCase):
             {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
         )
 
-    def test_health_check_prefers_full_refresh_over_incremental_refresh_when_partial_coverage_exists(self) -> None:
+    def test_health_check_prefers_incremental_refresh_when_partial_coverage_snapshot_is_stale(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
         crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
@@ -1952,8 +1948,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual(1, len(maintenance_commands))
-        self.assertEqual("refresh_full_snapshot", maintenance_commands[0]["reason_code"])
-        self.assertNotIn("refresh_ingested_snapshot", {command["reason_code"] for command in maintenance_commands})
+        self.assertEqual("refresh_ingested_snapshot", maintenance_commands[0]["reason_code"])
+        self.assertNotIn("refresh_full_snapshot", {command["reason_code"] for command in maintenance_commands})
 
     def test_health_check_can_focus_recommendations_on_one_issue_type(self) -> None:
         replace_review_queue_entries(

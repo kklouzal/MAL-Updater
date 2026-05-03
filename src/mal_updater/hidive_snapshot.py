@@ -19,6 +19,7 @@ SYNC_BOUNDARY_SCHEMA_VERSION = 1
 HISTORY_BOUNDARY_MARKER_LIMIT = 25
 CONTINUE_BOUNDARY_MARKER_LIMIT = 25
 FAVOURITE_BOUNDARY_MARKER_LIMIT = 25
+INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
 
 
 @dataclass(slots=True)
@@ -28,6 +29,8 @@ class _SyncBoundary:
     history_markers: list[str]
     continue_markers: list[str]
     favourite_markers: list[str]
+    history_backfill_markers: list[str]
+    favourite_backfill_markers: list[str]
 
 
 @dataclass(slots=True)
@@ -126,7 +129,20 @@ def _load_sync_boundary(state_paths: HidiveStatePaths) -> _SyncBoundary | None:
         history_markers=[str(item) for item in history.get("first_seen", []) if item],
         continue_markers=[str(item) for item in continue_watching.get("first_seen", []) if item],
         favourite_markers=[str(item) for item in favourites.get("first_seen", []) if item],
+        history_backfill_markers=[str(item) for item in history.get("backfill_seen", []) if item],
+        favourite_backfill_markers=[str(item) for item in favourites.get("backfill_seen", []) if item],
     )
+
+
+def _unique_fingerprints(entries: list[dict[str, Any]], fingerprint_func, limit: int) -> list[str]:
+    markers: list[str] = []
+    for item in entries:
+        fp = fingerprint_func(item)
+        if fp and fp not in markers:
+            markers.append(fp)
+        if len(markers) >= limit:
+            break
+    return markers
 
 
 def _write_sync_boundary(
@@ -137,36 +153,22 @@ def _write_sync_boundary(
     history_items: list[dict[str, Any]],
     continue_items: list[dict[str, Any]],
     favourite_items: list[dict[str, Any]],
+    history_backfill_items: list[dict[str, Any]] | None = None,
+    favourite_backfill_items: list[dict[str, Any]] | None = None,
 ) -> None:
     state_paths.root.mkdir(parents=True, exist_ok=True)
-    history_markers = []
-    for item in history_items:
-        fp = _history_item_fingerprint(item)
-        if fp and fp not in history_markers:
-            history_markers.append(fp)
-        if len(history_markers) >= HISTORY_BOUNDARY_MARKER_LIMIT:
-            break
-    continue_markers = []
-    for item in continue_items:
-        fp = _continue_item_fingerprint(item)
-        if fp and fp not in continue_markers:
-            continue_markers.append(fp)
-        if len(continue_markers) >= CONTINUE_BOUNDARY_MARKER_LIMIT:
-            break
-    favourite_markers = []
-    for item in favourite_items:
-        fp = _favourite_item_fingerprint(item)
-        if fp and fp not in favourite_markers:
-            favourite_markers.append(fp)
-        if len(favourite_markers) >= FAVOURITE_BOUNDARY_MARKER_LIMIT:
-            break
+    history_markers = _unique_fingerprints(history_items, _history_item_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
+    continue_markers = _unique_fingerprints(continue_items, _continue_item_fingerprint, CONTINUE_BOUNDARY_MARKER_LIMIT)
+    favourite_markers = _unique_fingerprints(favourite_items, _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
+    history_backfill_markers = _unique_fingerprints(history_backfill_items or [], _history_item_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
+    favourite_backfill_markers = _unique_fingerprints(favourite_backfill_items or [], _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
     payload = {
         "schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
         "generated_at": generated_at,
         "account_id_hint": account_id_hint,
-        "history": {"marker_limit": HISTORY_BOUNDARY_MARKER_LIMIT, "retained_count": len(history_markers), "first_seen": history_markers},
+        "history": {"marker_limit": HISTORY_BOUNDARY_MARKER_LIMIT, "retained_count": len(history_markers), "first_seen": history_markers, "backfill_seen": history_backfill_markers, "backfill_retained_count": len(history_backfill_markers)},
         "continue_watching": {"marker_limit": CONTINUE_BOUNDARY_MARKER_LIMIT, "retained_count": len(continue_markers), "first_seen": continue_markers},
-        "favourites": {"marker_limit": FAVOURITE_BOUNDARY_MARKER_LIMIT, "retained_count": len(favourite_markers), "first_seen": favourite_markers},
+        "favourites": {"marker_limit": FAVOURITE_BOUNDARY_MARKER_LIMIT, "retained_count": len(favourite_markers), "first_seen": favourite_markers, "backfill_seen": favourite_backfill_markers, "backfill_retained_count": len(favourite_backfill_markers)},
     }
     state_paths.sync_boundary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     state_paths.sync_boundary_path.chmod(0o600)
@@ -253,12 +255,22 @@ def _continue_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
     )
 
 
-def _fetch_history_items(session: HidiveSession, *, history_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], int, bool]:
+def _fetch_history_items(
+    session: HidiveSession,
+    *,
+    history_markers: set[str] | None = None,
+    backfill_markers: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool]:
     page = 1
     size = 100
     items: list[dict[str, Any]] = []
+    backfill_items: list[dict[str, Any]] = []
     pages_fetched = 0
+    backfill_pages_fetched = 0
     stopped_early = False
+    backfill_exhausted = False
+    front_boundary_seen = not history_markers
+    backfill_cursor_seen = not backfill_markers
     while True:
         payload = session.json_get("/customer/history/vod", params={"size": size, "page": page})
         pages_fetched += 1
@@ -269,14 +281,24 @@ def _fetch_history_items(session: HidiveSession, *, history_markers: set[str] | 
             raise HidiveSnapshotError("HIDIVE history payload did not include a vods list")
         batch = [item for item in vods if isinstance(item, dict)]
         items.extend(batch)
-        if history_markers and any((_history_item_fingerprint(item) in history_markers) for item in batch):
-            stopped_early = True
-            break
+        batch_markers = {_history_item_fingerprint(item) for item in batch}
+        if not front_boundary_seen and history_markers and history_markers.intersection(batch_markers):
+            front_boundary_seen = True
+        elif front_boundary_seen and not backfill_cursor_seen and backfill_markers and backfill_markers.intersection(batch_markers):
+            backfill_cursor_seen = True
+        elif front_boundary_seen and backfill_cursor_seen and history_markers:
+            backfill_items.extend(batch)
+            backfill_pages_fetched += 1
+            if backfill_pages_fetched >= INCREMENTAL_BACKFILL_PAGE_LIMIT:
+                stopped_early = True
+                break
         total_pages = _safe_int(payload.get("totalPages")) or 1
         if page >= total_pages or not vods:
+            if front_boundary_seen:
+                backfill_exhausted = True
             break
         page += 1
-    return items, pages_fetched, stopped_early
+    return items, backfill_items, pages_fetched, backfill_pages_fetched, stopped_early, backfill_exhausted
 
 
 def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], bool]:
@@ -300,12 +322,22 @@ def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] 
     return [], False
 
 
-def _fetch_favourite_items(session: HidiveSession, *, favourite_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], int, bool]:
+def _fetch_favourite_items(
+    session: HidiveSession,
+    *,
+    favourite_markers: set[str] | None = None,
+    backfill_markers: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool]:
     page = 1
     size = 100
     items: list[dict[str, Any]] = []
+    backfill_items: list[dict[str, Any]] = []
     pages_fetched = 0
+    backfill_pages_fetched = 0
     stopped_early = False
+    backfill_exhausted = False
+    front_boundary_seen = not favourite_markers
+    backfill_cursor_seen = not backfill_markers
     while True:
         payload = session.json_get("/favourite/vods", params={"size": size, "page": page})
         pages_fetched += 1
@@ -317,14 +349,24 @@ def _fetch_favourite_items(session: HidiveSession, *, favourite_markers: set[str
             raise HidiveSnapshotError("HIDIVE favourites payload did not include an events/vods list")
         batch = [item for item in events if isinstance(item, dict)]
         items.extend(batch)
-        if favourite_markers and any((_favourite_item_fingerprint(item) in favourite_markers) for item in batch):
-            stopped_early = True
-            break
+        batch_markers = {_favourite_item_fingerprint(item) for item in batch}
+        if not front_boundary_seen and favourite_markers and favourite_markers.intersection(batch_markers):
+            front_boundary_seen = True
+        elif front_boundary_seen and not backfill_cursor_seen and backfill_markers and backfill_markers.intersection(batch_markers):
+            backfill_cursor_seen = True
+        elif front_boundary_seen and backfill_cursor_seen and favourite_markers:
+            backfill_items.extend(batch)
+            backfill_pages_fetched += 1
+            if backfill_pages_fetched >= INCREMENTAL_BACKFILL_PAGE_LIMIT:
+                stopped_early = True
+                break
         total_pages = _safe_int(payload.get("totalPages")) or 1
         if page >= total_pages or not events:
+            if front_boundary_seen:
+                backfill_exhausted = True
             break
         page += 1
-    return items, pages_fetched, stopped_early
+    return items, backfill_items, pages_fetched, backfill_pages_fetched, stopped_early, backfill_exhausted
 
 
 def _favourite_item_to_series(item: dict[str, Any]) -> SeriesRef | None:
@@ -385,17 +427,19 @@ def fetch_snapshot(
         boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
         if boundary and boundary.account_id_hint and session.token.account_id and boundary.account_id_hint != session.token.account_id:
             boundary = None
-        history_items, history_pages_fetched, history_stopped_early = _fetch_history_items(
+        history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted = _fetch_history_items(
             session,
             history_markers=set(boundary.history_markers) if boundary else None,
+            backfill_markers=set(boundary.history_backfill_markers) if boundary else None,
         )
         continue_items, continue_stopped_early = _fetch_continue_items(
             session,
             continue_markers=set(boundary.continue_markers) if boundary else None,
         )
-        favourite_items, favourite_pages_fetched, favourite_stopped_early = _fetch_favourite_items(
+        favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = _fetch_favourite_items(
             session,
             favourite_markers=set(boundary.favourite_markers) if boundary else None,
+            backfill_markers=set(boundary.favourite_backfill_markers) if boundary else None,
         )
     except HidiveAuthError as exc:
         raise
@@ -422,11 +466,15 @@ def fetch_snapshot(
             "history_count": len(history_items),
             "history_pages_fetched": history_pages_fetched,
             "history_stopped_early": history_stopped_early,
+            "history_backfill_pages_fetched": history_backfill_pages_fetched,
+            "history_backfill_exhausted": history_backfill_exhausted,
             "continue_count": len(continue_items),
             "continue_stopped_early": continue_stopped_early,
             "favourite_count": len(favourite_items),
             "favourite_pages_fetched": favourite_pages_fetched,
             "favourite_stopped_early": favourite_stopped_early,
+            "favourite_backfill_pages_fetched": favourite_backfill_pages_fetched,
+            "favourite_backfill_exhausted": favourite_backfill_exhausted,
             "sync_boundary_present": boundary is not None,
             "sync_boundary_mode": "incremental" if use_incremental_boundary else "full_refresh",
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
@@ -445,6 +493,8 @@ def fetch_snapshot(
         history_items=history_items,
         continue_items=continue_items,
         favourite_items=favourite_items,
+        history_backfill_items=[] if history_backfill_exhausted else history_backfill_items,
+        favourite_backfill_items=[] if favourite_backfill_exhausted else favourite_backfill_items,
     )
     return HidiveFetchResult(
         snapshot=snapshot,

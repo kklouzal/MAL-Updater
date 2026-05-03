@@ -20,6 +20,7 @@ class HidiveProvider:
         favourites=True,
         rich_progress=True,
         token_refresh=True,
+        incremental_boundaries=True,
     )
 
     def fetch_snapshot(

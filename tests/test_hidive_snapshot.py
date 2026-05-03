@@ -157,6 +157,24 @@ class HidiveSnapshotTests(unittest.TestCase):
                 "page": 1,
                 "totalPages": 9,
             }
+            history_backfill_payload = {
+                "vods": [
+                    {
+                        "id": 1002,
+                        "title": "Episode 11",
+                        "duration": 1440,
+                        "watchedAt": 1770400000000,
+                        "episodeInformation": {
+                            "seasonNumber": 1,
+                            "episodeNumber": 11,
+                            "seasonTitle": "Season 1",
+                            "seriesInformation": {"id": 3560, "title": "Dusk Beyond the End of the World"},
+                        },
+                    }
+                ],
+                "page": 2,
+                "totalPages": 9,
+            }
             home_payload = {
                 "buckets": [
                     {
@@ -180,10 +198,11 @@ class HidiveSnapshotTests(unittest.TestCase):
                 ]
             }
             favourites_payload = {"events": [{"id": 5005, "title": "Favorite Show"}], "page": 1, "totalPages": 99}
+            favourites_backfill_payload = {"events": [{"id": 5006, "title": "Older Favorite Show"}], "page": 2, "totalPages": 99}
             with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
                 HidiveSession,
                 "json_get",
-                side_effect=[history_payload, home_payload, favourites_payload],
+                side_effect=[history_payload, history_backfill_payload, home_payload, favourites_payload, favourites_backfill_payload],
             ):
                 result = fetch_snapshot(load_config(root))
 

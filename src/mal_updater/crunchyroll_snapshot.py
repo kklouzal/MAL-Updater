@@ -47,6 +47,7 @@ DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
 SYNC_BOUNDARY_SCHEMA_VERSION = 1
 HISTORY_BOUNDARY_MARKER_LIMIT = 200
 WATCHLIST_BOUNDARY_MARKER_LIMIT = 200
+INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
 
 
 @dataclass(slots=True)
@@ -71,6 +72,8 @@ class _SyncBoundary:
     account_id_hint: str | None
     history_markers: list[str]
     watchlist_markers: list[str]
+    history_backfill_markers: list[str]
+    watchlist_backfill_markers: list[str]
 
 
 @dataclass(slots=True)
@@ -592,7 +595,20 @@ def _load_sync_boundary(state_paths: CrunchyrollStatePaths) -> _SyncBoundary | N
         account_id_hint=str(payload.get("account_id_hint")) if payload.get("account_id_hint") else None,
         history_markers=[str(item) for item in history.get("first_seen", []) if item],
         watchlist_markers=[str(item) for item in watchlist.get("first_seen", []) if item],
+        history_backfill_markers=[str(item) for item in history.get("backfill_seen", []) if item],
+        watchlist_backfill_markers=[str(item) for item in watchlist.get("backfill_seen", []) if item],
     )
+
+
+def _unique_fingerprints(entries: list[dict[str, Any]], fingerprint_func, limit: int) -> list[str]:
+    markers: list[str] = []
+    for entry in entries:
+        fingerprint = fingerprint_func(entry)
+        if fingerprint and fingerprint not in markers:
+            markers.append(fingerprint)
+        if len(markers) >= limit:
+            break
+    return markers
 
 
 def _write_sync_boundary(
@@ -602,22 +618,14 @@ def _write_sync_boundary(
     account_id_hint: str | None,
     history_entries: list[dict[str, Any]],
     watchlist_entries: list[dict[str, Any]],
+    history_backfill_entries: list[dict[str, Any]] | None = None,
+    watchlist_backfill_entries: list[dict[str, Any]] | None = None,
 ) -> None:
     state_paths.root.mkdir(parents=True, exist_ok=True)
-    history_markers = []
-    for entry in history_entries:
-        fingerprint = _history_entry_fingerprint(entry)
-        if fingerprint and fingerprint not in history_markers:
-            history_markers.append(fingerprint)
-        if len(history_markers) >= HISTORY_BOUNDARY_MARKER_LIMIT:
-            break
-    watchlist_markers = []
-    for entry in watchlist_entries:
-        fingerprint = _watchlist_entry_fingerprint(entry)
-        if fingerprint and fingerprint not in watchlist_markers:
-            watchlist_markers.append(fingerprint)
-        if len(watchlist_markers) >= WATCHLIST_BOUNDARY_MARKER_LIMIT:
-            break
+    history_markers = _unique_fingerprints(history_entries, _history_entry_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
+    watchlist_markers = _unique_fingerprints(watchlist_entries, _watchlist_entry_fingerprint, WATCHLIST_BOUNDARY_MARKER_LIMIT)
+    history_backfill_markers = _unique_fingerprints(history_backfill_entries or [], _history_entry_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
+    watchlist_backfill_markers = _unique_fingerprints(watchlist_backfill_entries or [], _watchlist_entry_fingerprint, WATCHLIST_BOUNDARY_MARKER_LIMIT)
     payload = {
         "schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
         "generated_at": generated_at,
@@ -626,11 +634,15 @@ def _write_sync_boundary(
             "marker_limit": HISTORY_BOUNDARY_MARKER_LIMIT,
             "retained_count": len(history_markers),
             "first_seen": history_markers,
+            "backfill_seen": history_backfill_markers,
+            "backfill_retained_count": len(history_backfill_markers),
         },
         "watchlist": {
             "marker_limit": WATCHLIST_BOUNDARY_MARKER_LIMIT,
             "retained_count": len(watchlist_markers),
             "first_seen": watchlist_markers,
+            "backfill_seen": watchlist_backfill_markers,
+            "backfill_retained_count": len(watchlist_backfill_markers),
         },
     }
     state_paths.sync_boundary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -707,10 +719,17 @@ def _fetch_snapshot_once(
         boundary = None
     history_markers = set(boundary.history_markers) if boundary else set()
     watchlist_markers = set(boundary.watchlist_markers) if boundary else set()
+    history_backfill_markers = set(boundary.history_backfill_markers) if boundary else set()
+    watchlist_backfill_markers = set(boundary.watchlist_backfill_markers) if boundary else set()
 
     history_entries: list[dict[str, Any]] = []
+    history_backfill_entries: list[dict[str, Any]] = []
     history_pages_fetched = 0
+    history_backfill_pages_fetched = 0
     history_stopped_early = False
+    history_backfill_exhausted = False
+    history_front_boundary_seen = not history_markers
+    history_backfill_cursor_seen = not history_backfill_markers
     page = 1
     while True:
         history_payload = session.authorized_json_get(
@@ -725,20 +744,37 @@ def _fetch_snapshot_once(
             raise CrunchyrollSnapshotError("Crunchyroll watch-history response did not include a data list")
         batch = [item for item in data if isinstance(item, dict)]
         history_entries.extend(batch)
-        if history_markers and any((_history_entry_fingerprint(item) in history_markers) for item in batch):
-            history_stopped_early = True
-            break
+        batch_markers = {_history_entry_fingerprint(item) for item in batch}
+        if not history_front_boundary_seen and history_markers.intersection(batch_markers):
+            history_front_boundary_seen = True
+        elif history_front_boundary_seen and not history_backfill_cursor_seen and history_backfill_markers.intersection(batch_markers):
+            history_backfill_cursor_seen = True
+        elif history_front_boundary_seen and history_backfill_cursor_seen and use_incremental_boundary and boundary:
+            history_backfill_entries.extend(batch)
+            history_backfill_pages_fetched += 1
+            if history_backfill_pages_fetched >= INCREMENTAL_BACKFILL_PAGE_LIMIT:
+                history_stopped_early = True
+                break
         total = history_payload.get("total")
         if len(batch) < 100:
+            if history_front_boundary_seen:
+                history_backfill_exhausted = True
             break
         if isinstance(total, int) and len(history_entries) >= total:
+            if history_front_boundary_seen:
+                history_backfill_exhausted = True
             break
         page += 1
 
     watchlist_data: list[dict[str, Any]] = []
+    watchlist_backfill_entries: list[dict[str, Any]] = []
     watchlist_total: int | None = None
     watchlist_pages_fetched = 0
+    watchlist_backfill_pages_fetched = 0
     watchlist_stopped_early = False
+    watchlist_backfill_exhausted = False
+    watchlist_front_boundary_seen = not watchlist_markers
+    watchlist_backfill_cursor_seen = not watchlist_backfill_markers
     watchlist_start = 0
     while True:
         watchlist_payload = session.authorized_json_get(
@@ -753,18 +789,32 @@ def _fetch_snapshot_once(
             raise CrunchyrollSnapshotError("Crunchyroll watchlist response did not include a data list")
         batch = [item for item in data if isinstance(item, dict)]
         watchlist_data.extend(batch)
-        if watchlist_markers and any((_watchlist_entry_fingerprint(item) in watchlist_markers) for item in batch):
-            watchlist_stopped_early = True
-            break
+        batch_markers = {_watchlist_entry_fingerprint(item) for item in batch}
+        if not watchlist_front_boundary_seen and watchlist_markers.intersection(batch_markers):
+            watchlist_front_boundary_seen = True
+        elif watchlist_front_boundary_seen and not watchlist_backfill_cursor_seen and watchlist_backfill_markers.intersection(batch_markers):
+            watchlist_backfill_cursor_seen = True
+        elif watchlist_front_boundary_seen and watchlist_backfill_cursor_seen and use_incremental_boundary and boundary:
+            watchlist_backfill_entries.extend(batch)
+            watchlist_backfill_pages_fetched += 1
+            if watchlist_backfill_pages_fetched >= INCREMENTAL_BACKFILL_PAGE_LIMIT:
+                watchlist_stopped_early = True
+                break
         total = watchlist_payload.get("total")
         if isinstance(total, int):
             watchlist_total = total
         if not batch:
+            if watchlist_front_boundary_seen:
+                watchlist_backfill_exhausted = True
             break
         watchlist_start += len(batch)
         if len(batch) < 100:
+            if watchlist_front_boundary_seen:
+                watchlist_backfill_exhausted = True
             break
         if watchlist_total is not None and len(watchlist_data) >= watchlist_total:
+            if watchlist_front_boundary_seen:
+                watchlist_backfill_exhausted = True
             break
 
     progress = [item for item in (_progress_from_history_entry(entry) for entry in history_entries) if item is not None]
@@ -806,10 +856,14 @@ def _fetch_snapshot_once(
             "history_count": len(history_entries),
             "history_pages_fetched": history_pages_fetched,
             "history_stopped_early": history_stopped_early,
+            "history_backfill_pages_fetched": history_backfill_pages_fetched,
+            "history_backfill_exhausted": history_backfill_exhausted,
             "history_boundary_marker_count": len(history_markers),
             "watchlist_count": len(watchlist_entries),
             "watchlist_pages_fetched": watchlist_pages_fetched,
             "watchlist_stopped_early": watchlist_stopped_early,
+            "watchlist_backfill_pages_fetched": watchlist_backfill_pages_fetched,
+            "watchlist_backfill_exhausted": watchlist_backfill_exhausted,
             "watchlist_boundary_marker_count": len(watchlist_markers),
             "transport": "curl_cffi:chrome124" if curl_requests is not None else "requests",
             "request_spacing_seconds": config.crunchyroll.request_spacing_seconds,
@@ -823,6 +877,8 @@ def _fetch_snapshot_once(
         account_id_hint=account_id,
         history_entries=history_entries,
         watchlist_entries=watchlist_data,
+        history_backfill_entries=[] if history_backfill_exhausted else history_backfill_entries,
+        watchlist_backfill_entries=[] if watchlist_backfill_exhausted else watchlist_backfill_entries,
     )
     _write_session_state(
         state_paths=session.state_paths,

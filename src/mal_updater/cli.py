@@ -1723,8 +1723,12 @@ def _build_partial_sync_coverage(
             stale_samples = stale_row_samples.get(provider_field) if isinstance(stale_row_samples, dict) else None
             if isinstance(stale_samples, list) and stale_samples:
                 field_payload["older_last_seen_samples"] = stale_samples
-            if mode == "full_refresh" and stale_count == missing_count:
-                field_payload["classification"] = "stale_or_deleted_provider_rows"
+            if stale_count == missing_count:
+                field_payload["classification"] = (
+                    "stale_or_deleted_provider_rows"
+                    if mode == "full_refresh"
+                    else "incremental_backfill_pending_provider_rows"
+                )
                 stale_explained_fields[provider_field] = field_payload
         partial_fields[provider_field] = field_payload
 
@@ -2329,16 +2333,7 @@ def _build_health_maintenance_commands(
         "hidive": "HIDIVE",
     }
 
-    partial_coverage_needs_refresh = isinstance(partial_sync_coverage, dict) and partial_sync_coverage.get("fully_explained_by_stale_rows") is not True
-    if provider_ready.get(refresh_provider) and partial_coverage_needs_refresh:
-        add_command(
-            "refresh_full_snapshot",
-            f"Run a full-refresh {provider_label.get(refresh_provider, refresh_provider)} ingest so untouched older rows are refreshed instead of only the incremental overlap page",
-            [*provider_refresh_args[refresh_provider], "--full-refresh", "--out", str(provider_snapshot_output[refresh_provider]), "--ingest"],
-            automation_safe=True,
-            requires_auth_interaction=False,
-        )
-    elif provider_ready.get(refresh_provider) and snapshot_needs_refresh:
+    if provider_ready.get(refresh_provider) and snapshot_needs_refresh:
         add_command(
             "refresh_ingested_snapshot",
             f"Fetch a fresh {provider_label.get(refresh_provider, refresh_provider)} snapshot and ingest it so health state is current again",
@@ -2740,10 +2735,21 @@ def _cmd_health_check(
         )
     if isinstance(partial_sync_coverage, dict):
         fully_explained_by_stale_rows = partial_sync_coverage.get("fully_explained_by_stale_rows") is True
+        detail = "Latest completed ingest touched fewer provider rows than currently exist in the local cache; freshness is only partial until incremental backfill catches up"
+        if fully_explained_by_stale_rows:
+            classifications = {
+                field.get("classification")
+                for field in (partial_sync_coverage.get("fields") or {}).values()
+                if isinstance(field, dict)
+            }
+            if classifications == {"stale_or_deleted_provider_rows"}:
+                detail = "Latest ingest touched fewer rows than the local cache, and the gap is fully explained by older last_seen rows that may be stale/deleted upstream"
+            else:
+                detail = "Latest incremental ingest intentionally touched front-of-line rows while older cached rows remain queued for slow incremental backfill"
         warnings.append(
             {
                 "code": "latest_sync_run_stale_provider_rows" if fully_explained_by_stale_rows else "latest_sync_run_partial_coverage",
-                "detail": "Latest ingest touched fewer rows than the local cache, and the gap is fully explained by older last_seen rows that may be stale/deleted upstream" if fully_explained_by_stale_rows else "Latest completed ingest touched fewer provider rows than currently exist in the local cache; freshness is only partial until a full refresh runs",
+                "detail": detail,
                 "sync_run_id": partial_sync_coverage.get("sync_run_id"),
                 "fields": partial_sync_coverage.get("fields"),
             }

@@ -343,7 +343,9 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             )
 
             history_page = [self._history_entry(idx) for idx in range(1, 100)] + [previous_history[0]]
+            history_backfill_page = [self._history_entry(idx) for idx in range(101, 151)]
             watchlist_page = [self._watchlist_entry(idx) for idx in range(1, 100)] + [previous_watchlist[0]]
+            watchlist_backfill_page = [self._watchlist_entry(idx) for idx in range(101, 121)]
             calls: list[tuple[str, dict[str, object] | None]] = []
 
             def fake_get(url: str, *, params: dict[str, object] | None = None):
@@ -351,9 +353,15 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                 if url == CRUNCHYROLL_ME_URL:
                     return {"account_id": "acct-123", "email": "user@example.com"}
                 if url.endswith("/watch-history"):
-                    return {"total": 350, "data": history_page}
+                    if params and params.get("page") == 1:
+                        return {"total": 150, "data": history_page}
+                    if params and params.get("page") == 2:
+                        return {"total": 150, "data": history_backfill_page}
                 if url.endswith("/watchlist"):
-                    return {"total": 250, "data": watchlist_page}
+                    if params and params.get("start") == 0:
+                        return {"total": 120, "data": watchlist_page}
+                    if params and params.get("start") == 100:
+                        return {"total": 120, "data": watchlist_backfill_page}
                 raise AssertionError(url)
 
             with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
@@ -361,8 +369,8 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
 
             watch_history_calls = [item for item in calls if item[0].endswith("/watch-history")]
             watchlist_calls = [item for item in calls if item[0].endswith("/watchlist")]
-            self.assertEqual(len(watch_history_calls), 1)
-            self.assertEqual(len(watchlist_calls), 1)
+            self.assertEqual(len(watch_history_calls), 2)
+            self.assertEqual(len(watchlist_calls), 2)
             self.assertTrue(result.snapshot.raw["history_stopped_early"])
             self.assertTrue(result.snapshot.raw["watchlist_stopped_early"])
             self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "incremental")
@@ -371,6 +379,8 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertEqual(saved["account_id_hint"], "acct-123")
             self.assertGreaterEqual(saved["history"]["retained_count"], 1)
             self.assertGreaterEqual(saved["watchlist"]["retained_count"], 1)
+            self.assertGreaterEqual(saved["history"]["backfill_retained_count"], 1)
+            self.assertGreaterEqual(saved["watchlist"]["backfill_retained_count"], 1)
 
     def test_fetch_snapshot_full_refresh_ignores_existing_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
