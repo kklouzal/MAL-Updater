@@ -50,7 +50,7 @@ from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
 from .recommendation_metadata import refresh_recommendation_metadata
-from .recommendations import build_recommendations, group_recommendations
+from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
 from .service_runtime import run_pending_tasks, run_service_loop
 from .sync_planner import (
@@ -6095,16 +6095,17 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
+    normalized_limit = _normalize_limit(limit)
     results = build_recommendations(
         config,
-        limit=_normalize_limit(limit),
+        limit=normalized_limit if flat else 0,
         require_provider_availability=not include_dormant,
     )
     payload: object
     if flat:
         payload = [item.as_dict() for item in results]
     else:
-        payload = group_recommendations(results)
+        payload = trim_grouped_recommendations(group_recommendations(results), normalized_limit)
     print(json.dumps(payload, indent=2))
     return 0
 

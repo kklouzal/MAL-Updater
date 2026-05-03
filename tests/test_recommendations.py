@@ -20,7 +20,7 @@ from mal_updater.db import (
     upsert_series_mapping,
 )
 from mal_updater.recommendation_metadata import refresh_recommendation_metadata
-from mal_updater.recommendations import Recommendation, build_recommendations, group_recommendations
+from mal_updater.recommendations import Recommendation, build_recommendations, group_recommendations, trim_grouped_recommendations
 
 
 class RecommendationTests(unittest.TestCase):
@@ -2781,6 +2781,33 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("cr-next", payload[0]["provider_series_id"])
         self.assertEqual(["crunchyroll", "hidive"], payload[0]["providers"])
 
+    def test_trim_grouped_recommendations_preserves_section_visibility_under_global_limit(self) -> None:
+        sections = [
+            {
+                "key": "continue_next",
+                "count": 2,
+                "items": [{"provider_series_id": "c1"}, {"provider_series_id": "c2"}],
+            },
+            {
+                "key": "discovery_candidates",
+                "count": 2,
+                "items": [{"provider_series_id": "d1"}, {"provider_series_id": "d2"}],
+            },
+            {
+                "key": "resume_backlog",
+                "count": 3,
+                "items": [{"provider_series_id": "r1"}, {"provider_series_id": "r2"}, {"provider_series_id": "r3"}],
+            },
+        ]
+
+        trimmed = trim_grouped_recommendations(sections, 4)
+
+        self.assertEqual(["continue_next", "discovery_candidates", "resume_backlog"], [section["key"] for section in trimmed])
+        self.assertEqual([2, 1, 1], [section["count"] for section in trimmed])
+        self.assertEqual("c2", trimmed[0]["items"][1]["provider_series_id"])
+        self.assertEqual(2, trimmed[1]["total_count"])
+        self.assertEqual(3, trimmed[2]["total_count"])
+
     def test_group_recommendations_keeps_unknown_kinds_under_other(self) -> None:
         grouped = group_recommendations(
             [
@@ -2837,6 +2864,67 @@ class RecommendationTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(["continue_next"], [section["key"] for section in payload])
         self.assertEqual("series-next", payload[0]["items"][0]["provider_series_id"])
+
+    def test_recommend_cli_grouped_limit_does_not_let_backlog_starve_discovery(self) -> None:
+        for index in range(5):
+            provider_series_id = f"seed-{index}"
+            self._insert_series(
+                provider_series_id,
+                title=f"Discovery Seed {index}",
+                season_title=f"Discovery Seed {index} (English Dub)",
+                watchlist_status="fully_watched",
+            )
+            self._insert_progress(
+                provider_series_id,
+                f"{provider_series_id}-1",
+                episode_number=1,
+                completion_ratio=1.0,
+                last_watched_at=f"2026-03-{index + 1:02d}T01:00:00Z",
+            )
+            self._map_series(provider_series_id, 100 + index)
+            self._cache_metadata(100 + index, title=f"Discovery Seed {index}")
+            self._cache_recommendations(
+                100 + index,
+                [{"target_mal_anime_id": 9000, "target_title": "Discovery Winner", "num_recommendations": 30 - index, "raw": {}}],
+            )
+
+        self._cache_metadata(9000, title="Discovery Winner")
+        self._insert_series(
+            "discovery-winner",
+            title="Discovery Winner",
+            season_title="Discovery Winner (English Dub)",
+            watchlist_status="available",
+        )
+
+        for index in range(4):
+            backlog_series_id = f"backlog-{index}"
+            self._insert_series(
+                backlog_series_id,
+                title=f"Backlog Show {index}",
+                season_title=f"Backlog Show {index} (English Dub)",
+                watchlist_status="available",
+            )
+            recent = (datetime.now(timezone.utc) - timedelta(days=10 + index)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            self._insert_progress(backlog_series_id, f"{backlog_series_id}-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+            self._insert_progress(backlog_series_id, f"{backlog_series_id}-2", episode_number=2, completion_ratio=0.0, last_watched_at=recent)
+
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "recommend",
+            "--limit",
+            "2",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertLessEqual(len(payload), 2)
+        self.assertIn("discovery_candidates", [section["key"] for section in payload])
+        discovery_section = next(section for section in payload if section["key"] == "discovery_candidates")
+        self.assertEqual("discovery-winner", discovery_section["items"][0]["provider_series_id"])
 
     def test_recommend_cli_hides_dormant_discovery_candidates_by_default(self) -> None:
         self._insert_series(

@@ -227,6 +227,64 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
     return sections
 
 
+def trim_grouped_recommendations(sections: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    if limit is None or limit <= 0:
+        return sections
+    remaining = int(limit)
+    normalized_sections: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        source_items = section.get("items")
+        if not isinstance(source_items, list) or not source_items:
+            continue
+        copied = dict(section)
+        copied["items"] = []
+        copied["count"] = 0
+        copied["total_count"] = len(source_items)
+        copied["_source_items"] = source_items
+        normalized_sections.append(copied)
+    if not normalized_sections:
+        return []
+
+    for section in normalized_sections:
+        if remaining <= 0:
+            break
+        source_items = section.get("_source_items")
+        if not isinstance(source_items, list) or not source_items:
+            continue
+        section["items"] = [source_items[0]]
+        section["count"] = 1
+        remaining -= 1
+
+    cursor_by_key = {str(section.get("key")): int(section.get("count", 0)) for section in normalized_sections}
+    while remaining > 0:
+        advanced = False
+        for section in normalized_sections:
+            source_items = section.get("_source_items")
+            if not isinstance(source_items, list):
+                continue
+            key = str(section.get("key"))
+            cursor = cursor_by_key.get(key, 0)
+            if cursor >= len(source_items):
+                continue
+            section_items = section.get("items")
+            if not isinstance(section_items, list):
+                continue
+            section_items.append(source_items[cursor])
+            cursor_by_key[key] = cursor + 1
+            section["count"] = len(section_items)
+            remaining -= 1
+            advanced = True
+            if remaining <= 0:
+                break
+        if not advanced:
+            break
+    for section in normalized_sections:
+        section.pop("_source_items", None)
+    return normalized_sections
+
+
 def build_recommendations(
     config: AppConfig,
     limit: int | None = 20,

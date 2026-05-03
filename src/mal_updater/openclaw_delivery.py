@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import AppConfig, load_openclaw_recommendations_hook_token
-from .recommendations import build_recommendations, group_recommendations
+from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 
 
 class OpenClawDeliveryError(RuntimeError):
@@ -137,10 +137,10 @@ def build_recommendation_delivery_payload(
     normalized_mode = _normalize_delivery_mode(delivery_mode or config.openclaw.recommendations_webhook_delivery_mode)
     items = build_recommendations(
         config,
-        limit=limit,
+        limit=0,
         require_provider_availability=not include_dormant,
     )
-    grouped_sections = group_recommendations(items)
+    grouped_sections = trim_grouped_recommendations(group_recommendations(items), limit)
     delivery_sections = _trimmed_delivery_sections(config, grouped_sections, delivery_mode=normalized_mode)
     item_count = sum(int(section.get("count", 0)) for section in delivery_sections if isinstance(section, dict))
     fresh_item_count = sum(
