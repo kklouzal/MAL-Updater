@@ -1499,6 +1499,10 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(39.583, payload["samples"]["series"][0]["age_days"])
         self.assertEqual(39.583, payload["samples"]["progress"][0]["age_days"])
         self.assertEqual(13.583, payload["samples"]["watchlist"][0]["age_days"])
+        self.assertEqual("manual_retention_policy_candidate", payload["retention_review"]["posture"])
+        self.assertTrue(payload["retention_review"]["review_candidate"])
+        self.assertEqual(2, payload["retention_review"]["older_31_plus_days_count"])
+        self.assertEqual("diagnostic_only_no_archive_or_prune", payload["retention_review"]["policy"])
 
     def test_provider_stale_rows_reports_child_row_series_linkage(self) -> None:
         with connect(self.config.db_path) as conn:
@@ -1569,6 +1573,9 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("stale_series", watchlist_samples["stale-series"]["linked_series_posture"])
         self.assertEqual("current_series", watchlist_samples["current-series"]["linked_series_posture"])
         self.assertEqual("missing_series", watchlist_samples["missing-series"]["linked_series_posture"])
+        self.assertEqual("current_series_child_residue", payload["retention_review"]["posture"])
+        self.assertTrue(payload["retention_review"]["review_candidate"])
+        self.assertEqual(2, payload["retention_review"]["current_linked_child_count"])
 
         exit_code, stdout = self._run_provider_stale_rows_raw("--provider", "crunchyroll", "--format", "summary")
         self.assertEqual(0, exit_code)
@@ -1579,6 +1586,9 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("watchlist_with_stale_series_count=1", lines)
         self.assertIn("watchlist_with_current_series_count=1", lines)
         self.assertIn("watchlist_with_missing_series_count=1", lines)
+        self.assertIn("retention_posture=current_series_child_residue", lines)
+        self.assertIn("retention_review_candidate=True", lines)
+        self.assertIn("retention_current_linked_child_count=2", lines)
 
     def test_provider_stale_rows_summary_emits_terse_read_only_counts(self) -> None:
         with connect(self.config.db_path) as conn:
@@ -1616,6 +1626,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("series_oldest_age_days=4.583", lines)
         self.assertIn("series_newest_age_days=4.583", lines)
         self.assertTrue(any(line.startswith("series_") and line.endswith("_count=1") for line in lines))
+        self.assertIn("retention_posture=recent_residue_observe", lines)
+        self.assertIn("retention_review_candidate=False", lines)
         self.assertIn("total_stale_count=1", lines)
         self.assertIn("policy=diagnostic_only_no_archive_or_prune", lines)
         self.assertIn("read_only=True", lines)
@@ -1673,6 +1685,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("oldest_age_days", payload["age_ranges_days"]["series"])
         self.assertEqual(1, payload["providers"]["crunchyroll"]["counts"]["series"])
         self.assertEqual(1, payload["providers"]["hidive"]["counts"]["watchlist"])
+        self.assertEqual("aging_residue_observe", payload["retention_review"]["posture"])
+        self.assertFalse(payload["retention_review"]["review_candidate"])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
 
     def test_provider_stale_rows_all_reports_age_filter_fields(self) -> None:
@@ -1748,6 +1762,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("provider.crunchyroll.series_oldest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertIn("provider.crunchyroll.series_newest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertTrue(any(line.startswith("provider.crunchyroll.series_") and line.endswith("_count=1") for line in lines))
+        self.assertIn("retention_posture=aging_residue_observe", lines)
+        self.assertIn("provider.crunchyroll.retention_posture=aging_residue_observe", lines)
         self.assertIn("provider.hidive.ready=False", lines)
         self.assertTrue(any(line.startswith("provider.hidive.detail=No cutoff") for line in lines))
 
@@ -1857,7 +1873,7 @@ class HealthCheckCliTests(unittest.TestCase):
             )
             conn.commit()
 
-        exit_code, payload = self._run_health_check("--stale-hours", "168")
+        exit_code, payload = self._run_health_check("--stale-hours", "240")
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}

@@ -3373,6 +3373,87 @@ def _provider_stale_row_samples_with_ages(
     return annotated
 
 
+def _provider_stale_row_retention_review(
+    counts: dict[str, object],
+    age_buckets: dict[str, dict[str, object]],
+    linkage: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Build a policy-neutral retention-review hint for stale provider rows.
+
+    This deliberately does not recommend deletion. It condenses the age/linkage
+    evidence into a stable operator field so callers can tell whether residue is
+    merely fresh post-refresh noise or old enough to deserve a manual
+    archive/prune/retain policy discussion.
+    """
+    total_count = sum(value for value in counts.values() if isinstance(value, int) and not isinstance(value, bool))
+    old_31_plus_count = 0
+    recent_0_7_count = 0
+    older_8_30_count = 0
+    for family_buckets in age_buckets.values():
+        if not isinstance(family_buckets, dict):
+            continue
+        recent = family_buckets.get("recent_0_7_days")
+        middle = family_buckets.get("older_8_30_days")
+        old = family_buckets.get("older_31_plus_days")
+        if isinstance(recent, int) and not isinstance(recent, bool):
+            recent_0_7_count += recent
+        if isinstance(middle, int) and not isinstance(middle, bool):
+            older_8_30_count += middle
+        if isinstance(old, int) and not isinstance(old, bool):
+            old_31_plus_count += old
+
+    current_linked_child_count = 0
+    missing_series_child_count = 0
+    stale_linked_child_count = 0
+    for family_linkage in linkage.values():
+        if not isinstance(family_linkage, dict):
+            continue
+        current = family_linkage.get("with_current_series")
+        missing = family_linkage.get("with_missing_series")
+        stale = family_linkage.get("with_stale_series")
+        if isinstance(current, int) and not isinstance(current, bool):
+            current_linked_child_count += current
+        if isinstance(missing, int) and not isinstance(missing, bool):
+            missing_series_child_count += missing
+        if isinstance(stale, int) and not isinstance(stale, bool):
+            stale_linked_child_count += stale
+
+    if total_count <= 0:
+        posture = "empty"
+        next_step = "no_retention_review_needed"
+        review_candidate = False
+    elif current_linked_child_count > 0:
+        posture = "current_series_child_residue"
+        next_step = "review_current-linked_child_rows_before_any_archive_or_prune_policy"
+        review_candidate = True
+    elif old_31_plus_count > 0 or missing_series_child_count > 0:
+        posture = "manual_retention_policy_candidate"
+        next_step = "compare_samples_against_provider_behavior_before_choosing_retain_archive_or_prune"
+        review_candidate = True
+    elif older_8_30_count > 0:
+        posture = "aging_residue_observe"
+        next_step = "recheck_after_next_full_refresh_or_escalate_if_age_bucket_grows"
+        review_candidate = False
+    else:
+        posture = "recent_residue_observe"
+        next_step = "leave_classified_as_recent_residue_and_recheck_after_future_full_refresh"
+        review_candidate = False
+
+    return {
+        "posture": posture,
+        "review_candidate": review_candidate,
+        "total_count": total_count,
+        "recent_0_7_days_count": recent_0_7_count,
+        "older_8_30_days_count": older_8_30_count,
+        "older_31_plus_days_count": old_31_plus_count,
+        "current_linked_child_count": current_linked_child_count,
+        "stale_linked_child_count": stale_linked_child_count,
+        "missing_series_child_count": missing_series_child_count,
+        "next_step": next_step,
+        "policy": "diagnostic_only_no_archive_or_prune",
+    }
+
+
 def _build_provider_stale_rows_payload(
     *,
     db_path: Path,
@@ -3420,6 +3501,18 @@ def _build_provider_stale_rows_payload(
                 "progress": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
                 "watchlist": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
             },
+            "retention_review": _provider_stale_row_retention_review(
+                {"series": 0, "progress": 0, "watchlist": 0},
+                {
+                    "series": {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0},
+                    "progress": {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0},
+                    "watchlist": {"recent_0_7_days": 0, "older_8_30_days": 0, "older_31_plus_days": 0},
+                },
+                {
+                    "progress": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
+                    "watchlist": {"with_stale_series": 0, "with_current_series": 0, "with_missing_series": 0},
+                },
+            ),
             "ready": False,
             "detail": "No cutoff was provided and no completed full-refresh sync run exists for this provider.",
         }
@@ -3450,6 +3543,7 @@ def _build_provider_stale_rows_payload(
     linkage = get_provider_stale_row_linkage(
         db_path, provider=provider, cutoff=effective_cutoff, series_cutoff=base_cutoff
     )
+    retention_review = _provider_stale_row_retention_review(counts, age_buckets, linkage)
     return {
         "provider": provider,
         "cutoff": effective_cutoff,
@@ -3467,6 +3561,7 @@ def _build_provider_stale_rows_payload(
         "sample_limit": safe_limit,
         "samples": samples,
         "linkage": linkage,
+        "retention_review": retention_review,
         "ready": True,
         "read_only": True,
         "policy": "diagnostic_only_no_archive_or_prune",
@@ -3587,6 +3682,8 @@ def _cmd_provider_stale_rows(
             for payload in provider_payloads.values()
             if isinstance(payload.get("age_cutoff"), str)
         ]
+        aggregated_age_buckets = _aggregate_provider_stale_row_age_buckets(provider_payloads)
+        aggregated_linkage = _aggregate_provider_stale_row_linkage(provider_payloads)
         payload = {
             "provider": "all",
             "providers": provider_payloads,
@@ -3602,8 +3699,9 @@ def _cmd_provider_stale_rows(
                 (payload.get("age_bucket_cutoffs") for payload in provider_payloads.values() if isinstance(payload.get("age_bucket_cutoffs"), dict)),
                 None,
             ),
-            "age_buckets": _aggregate_provider_stale_row_age_buckets(provider_payloads),
-            "linkage": _aggregate_provider_stale_row_linkage(provider_payloads),
+            "age_buckets": aggregated_age_buckets,
+            "linkage": aggregated_linkage,
+            "retention_review": _provider_stale_row_retention_review(counts, aggregated_age_buckets, aggregated_linkage),
             "sample_limit": safe_limit,
             "age_cutoff": min(age_cutoffs) if age_cutoffs else None,
             "older_than_days": next(
@@ -3709,6 +3807,26 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
             value = family_linkage.get(key)
             count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
             print(f"{family}_{key}_count={count}")
+    retention_review = payload.get("retention_review") if isinstance(payload.get("retention_review"), dict) else {}
+    retention_posture = retention_review.get("posture") if isinstance(retention_review, dict) else None
+    if isinstance(retention_posture, str) and retention_posture:
+        print(f"retention_posture={retention_posture}")
+    retention_review_candidate = retention_review.get("review_candidate") if isinstance(retention_review, dict) else None
+    if isinstance(retention_review_candidate, bool):
+        print(f"retention_review_candidate={retention_review_candidate}")
+    for key in (
+        "recent_0_7_days_count",
+        "older_8_30_days_count",
+        "older_31_plus_days_count",
+        "current_linked_child_count",
+        "missing_series_child_count",
+    ):
+        value = retention_review.get(key) if isinstance(retention_review, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool):
+            print(f"retention_{key}={value}")
+    retention_next_step = retention_review.get("next_step") if isinstance(retention_review, dict) else None
+    if isinstance(retention_next_step, str) and retention_next_step:
+        print(f"retention_next_step={retention_next_step}")
     total_count = payload.get("total_count")
     if isinstance(total_count, int) and not isinstance(total_count, bool):
         print(f"total_stale_count={total_count}")
@@ -3782,6 +3900,13 @@ def _print_provider_stale_rows_summary(payload: dict[str, object]) -> None:
                 value = family_linkage.get(key)
                 count = int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
                 print(f"{prefix}.{family}_{key}_count={count}")
+        provider_retention_review = provider_payload.get("retention_review") if isinstance(provider_payload.get("retention_review"), dict) else {}
+        provider_retention_posture = provider_retention_review.get("posture") if isinstance(provider_retention_review, dict) else None
+        if isinstance(provider_retention_posture, str) and provider_retention_posture:
+            print(f"{prefix}.retention_posture={provider_retention_posture}")
+        provider_retention_review_candidate = provider_retention_review.get("review_candidate") if isinstance(provider_retention_review, dict) else None
+        if isinstance(provider_retention_review_candidate, bool):
+            print(f"{prefix}.retention_review_candidate={provider_retention_review_candidate}")
         provider_total = provider_payload.get("total_count")
         if isinstance(provider_total, int) and not isinstance(provider_total, bool):
             print(f"{prefix}.total_stale_count={provider_total}")
