@@ -316,6 +316,21 @@ class ServiceStatusTests(unittest.TestCase):
                             },
                             "next_due_at": fetch_next_due
                         },
+                        "push_recommendations_webhook": {
+                            "last_run_at": "2026-03-20T21:54:30Z",
+                            "last_status": "ok",
+                            "every_seconds": 21600,
+                            "budget_scope": "none",
+                            "next_due_at": "2026-03-21T03:54:30Z",
+                            "last_result": {
+                                "status": "ok",
+                                "label": "push_recommendations_webhook",
+                                "delivery_status": "delivered",
+                                "request_id": "abc123",
+                                "request_url": "http://127.0.0.1:18789/hooks/agent",
+                                "http_status": 200
+                            }
+                        },
                     },
                 },
                 indent=2,
@@ -442,6 +457,11 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertRegex(stdout, r"task_sync_fetch_crunchyroll_planned_full_refresh_overdue_seconds=\d+")
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_budget_deferred=True", stdout)
         self.assertIn("task_sync_fetch_crunchyroll_planned_full_refresh_deferred_reason=periodic_cadence", stdout)
+        self.assertIn("task_push_recommendations_webhook_last_status=ok", stdout)
+        self.assertIn("task_push_recommendations_webhook_last_result_delivery_status=delivered", stdout)
+        self.assertIn("task_push_recommendations_webhook_last_result_request_id=abc123", stdout)
+        self.assertIn("task_push_recommendations_webhook_last_result_request_url=http://127.0.0.1:18789/hooks/agent", stdout)
+        self.assertIn("task_push_recommendations_webhook_last_result_http_status=200", stdout)
         self.assertIn("service_log_last_line=line-2", stdout)
 
     def test_doctor_service_surfaces_planned_full_refresh_reason_for_overdue_fetch_lane(self) -> None:

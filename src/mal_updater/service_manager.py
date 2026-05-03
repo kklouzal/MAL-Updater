@@ -95,6 +95,10 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
         "deferred_full_refresh_reason",
         "access_token_path",
         "refresh_token_path",
+        "delivery_status",
+        "request_id",
+        "request_url",
+        "http_status",
     ):
         field_value = value.get(field)
         if field_value is not None:

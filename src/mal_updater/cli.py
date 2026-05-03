@@ -1628,6 +1628,18 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
                 last_result_stderr_snippet = last_result.get("stderr_snippet") if isinstance(last_result.get("stderr_snippet"), str) else None
                 if last_result_stderr_snippet is not None:
                     print(f"task_{task_name}_last_result_stderr_snippet={last_result_stderr_snippet}")
+                last_result_delivery_status = last_result.get("delivery_status") if isinstance(last_result.get("delivery_status"), str) else None
+                if last_result_delivery_status is not None:
+                    print(f"task_{task_name}_last_result_delivery_status={last_result_delivery_status}")
+                last_result_request_id = last_result.get("request_id") if isinstance(last_result.get("request_id"), str) else None
+                if last_result_request_id is not None:
+                    print(f"task_{task_name}_last_result_request_id={last_result_request_id}")
+                last_result_request_url = last_result.get("request_url") if isinstance(last_result.get("request_url"), str) else None
+                if last_result_request_url is not None:
+                    print(f"task_{task_name}_last_result_request_url={last_result_request_url}")
+                last_result_http_status = last_result.get("http_status") if isinstance(last_result.get("http_status"), int) else None
+                if last_result_http_status is not None:
+                    print(f"task_{task_name}_last_result_http_status={last_result_http_status}")
 
     service_log_tail = payload.get("service_log_tail")
     if isinstance(service_log_tail, list) and service_log_tail:
