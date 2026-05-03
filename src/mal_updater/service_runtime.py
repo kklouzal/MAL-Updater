@@ -242,6 +242,8 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
     for provider in _available_source_providers(config):
         specs.append(TaskSpec(f"sync_fetch_{provider}", config.service.sync_every_seconds, budget_provider=provider))
     specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
+    if int(config.service.recommendation_metadata_refresh_every_seconds) > 0:
+        specs.append(TaskSpec("recommend_metadata_refresh", config.service.recommendation_metadata_refresh_every_seconds, budget_provider="mal"))
     specs.append(TaskSpec("health", config.service.health_every_seconds, budget_provider=None))
     return specs
 
@@ -354,12 +356,40 @@ def _apply_sync_command(config: AppConfig) -> list[str]:
     ]
 
 
+def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
+    seed_limit = config.service.execute_limit_for("recommend_metadata_refresh")
+    if seed_limit is None:
+        seed_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_refresh", 0)
+    discovery_target_limit = config.service.execute_limit_for("recommend_metadata_discovery_targets")
+    if discovery_target_limit is None:
+        discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
+    return [
+        "python3",
+        "-m",
+        "mal_updater.cli",
+        "recommend-refresh-metadata",
+        "--limit",
+        str(max(0, int(seed_limit))),
+        "--include-discovery-targets",
+        "--discovery-target-limit",
+        str(max(0, int(discovery_target_limit))),
+    ]
+
+
 def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: str | None = None) -> str | None:
     if spec.name == "sync_apply":
         apply_limit = config.service.execute_limit_for("sync_apply")
         if apply_limit is None:
             apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
         return f"sync_apply:limit={max(0, int(apply_limit))}"
+    if spec.name == "recommend_metadata_refresh":
+        seed_limit = config.service.execute_limit_for("recommend_metadata_refresh")
+        if seed_limit is None:
+            seed_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_refresh", 0)
+        discovery_target_limit = config.service.execute_limit_for("recommend_metadata_discovery_targets")
+        if discovery_target_limit is None:
+            discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
+        return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
     if spec.name.startswith("sync_fetch_"):
         return f"{spec.name}:mode={fetch_mode or 'incremental'}"
     return None
@@ -893,6 +923,20 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 if apply_limit is None:
                     apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
                 result["apply_limit"] = max(0, int(apply_limit))
+            elif spec.name == "recommend_metadata_refresh":
+                result = _run_subprocess(
+                    config,
+                    _recommendation_metadata_refresh_command(config),
+                    label="recommend_metadata_refresh",
+                )
+                seed_limit = config.service.execute_limit_for("recommend_metadata_refresh")
+                if seed_limit is None:
+                    seed_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_refresh", 0)
+                discovery_target_limit = config.service.execute_limit_for("recommend_metadata_discovery_targets")
+                if discovery_target_limit is None:
+                    discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
+                result["refresh_limit"] = max(0, int(seed_limit))
+                result["discovery_target_limit"] = max(0, int(discovery_target_limit))
             elif spec.name == "health":
                 result = _run_subprocess(
                     config,

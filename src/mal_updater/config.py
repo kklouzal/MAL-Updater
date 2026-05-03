@@ -35,6 +35,7 @@ DEFAULT_SERVICE_SYNC_EVERY_SECONDS = 6 * 60 * 60
 DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 6 * 60 * 60
+DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
 DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
@@ -51,13 +52,17 @@ DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS = {
 }
 DEFAULT_SERVICE_TASK_HOURLY_LIMITS = {
     "sync_apply": 48,
+    "recommend_metadata_refresh": 24,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
     "mal_refresh": 1,
     "sync_apply": 8,
+    "recommend_metadata_refresh": 8,
 }
 DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
     "sync_apply": 8,
+    "recommend_metadata_refresh": 3,
+    "recommend_metadata_discovery_targets": 5,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE = {
     "sync_fetch_crunchyroll": {
@@ -76,9 +81,11 @@ DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS = {
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS = {
     "mal_refresh": 3,
     "sync_apply": 3,
+    "recommend_metadata_refresh": 5,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_PERCENTILES = {
     "sync_apply": 0.9,
+    "recommend_metadata_refresh": 0.9,
 }
 DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES = {
     "crunchyroll": 0.9,
@@ -137,6 +144,7 @@ class ServiceSettings:
     full_refresh_every_seconds: int = DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS
     health_every_seconds: int = DEFAULT_SERVICE_HEALTH_EVERY_SECONDS
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
+    recommendation_metadata_refresh_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
     source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
@@ -618,6 +626,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             full_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_FULL_REFRESH_EVERY_SECONDS", _get_int(service_section, "full_refresh_every_seconds", DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS))),
             health_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_EVERY_SECONDS", _get_int(service_section, "health_every_seconds", DEFAULT_SERVICE_HEALTH_EVERY_SECONDS))),
             mal_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_MAL_REFRESH_EVERY_SECONDS", _get_int(service_section, "mal_refresh_every_seconds", DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS))),
+            recommendation_metadata_refresh_every_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS",
+                    _get_int(
+                        service_section,
+                        "recommendation_metadata_refresh_every_seconds",
+                        DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS,
+                    ),
+                )
+            ),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
             crunchyroll_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_CRUNCHYROLL_HOURLY_LIMIT", _get_int(service_section, "crunchyroll_hourly_limit", DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT))),
             source_provider_hourly_limit=int(

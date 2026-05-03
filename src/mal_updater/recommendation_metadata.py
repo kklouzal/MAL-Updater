@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -23,6 +24,7 @@ class _DiscoveredTargetStats:
 
 from .config import AppConfig, load_mal_secrets
 from .db import (
+    get_mal_anime_metadata_map,
     list_series_mappings,
     replace_mal_anime_relations,
     replace_mal_recommendation_edges,
@@ -39,9 +41,39 @@ DETAIL_FIELDS = (
 class MetadataRefreshSummary:
     considered: int
     refreshed: int
+    discovery_considered: int = 0
+    discovery_refreshed: int = 0
 
     def as_dict(self) -> dict[str, Any]:
-        return {"considered": self.considered, "refreshed": self.refreshed}
+        return {
+            "considered": self.considered,
+            "refreshed": self.refreshed,
+            "discovery_considered": self.discovery_considered,
+            "discovery_refreshed": self.discovery_refreshed,
+        }
+
+
+def _metadata_age_sort_value(fetched_at: str | None) -> tuple[int, str]:
+    if not fetched_at:
+        return (0, "")
+    value = str(fetched_at).strip()
+    if not value:
+        return (0, "")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return (1, value)
+    return (1, parsed.astimezone(timezone.utc).isoformat())
+
+
+def _rank_refresh_ids(anime_ids: list[int], metadata_by_id: dict[int, Any]) -> list[int]:
+    return sorted(
+        anime_ids,
+        key=lambda anime_id: (
+            _metadata_age_sort_value(getattr(metadata_by_id.get(anime_id), "fetched_at", None)),
+            anime_id,
+        ),
+    )
 
 
 def refresh_recommendation_metadata(
@@ -52,7 +84,8 @@ def refresh_recommendation_metadata(
     discovery_target_limit: int | None = None,
 ) -> MetadataRefreshSummary:
     mappings = list_series_mappings(config.db_path, approved_only=False)
-    anime_ids = sorted({int(mapping.mal_anime_id) for mapping in mappings})
+    metadata_by_id = get_mal_anime_metadata_map(config.db_path)
+    anime_ids = _rank_refresh_ids(sorted({int(mapping.mal_anime_id) for mapping in mappings}), metadata_by_id)
     if limit is not None and limit > 0:
         anime_ids = anime_ids[:limit]
 
@@ -140,10 +173,13 @@ def refresh_recommendation_metadata(
         )
         refreshed += 1
 
+    discovery_considered = 0
+    discovery_refreshed = 0
     if include_discovery_targets and discovered_targets:
         ranked_targets = sorted(
             discovered_targets.items(),
             key=lambda item: (
+                _metadata_age_sort_value(getattr(metadata_by_id.get(item[0]), "fetched_at", None)),
                 -item[1].supporting_sources,
                 -item[1].total_recommendation_votes,
                 -item[1].cross_seed_support_votes,
@@ -153,6 +189,7 @@ def refresh_recommendation_metadata(
         )
         if discovery_target_limit is not None and discovery_target_limit > 0:
             ranked_targets = ranked_targets[:discovery_target_limit]
+        discovery_considered = len(ranked_targets)
         for target_id, _info in ranked_targets:
             details = client.get_anime_details(
                 target_id,
@@ -185,4 +222,10 @@ def refresh_recommendation_metadata(
                 start_season=details.get("start_season") if isinstance(details.get("start_season"), dict) else None,
                 raw=details,
             )
-    return MetadataRefreshSummary(considered=len(anime_ids), refreshed=refreshed)
+            discovery_refreshed += 1
+    return MetadataRefreshSummary(
+        considered=len(anime_ids),
+        refreshed=refreshed,
+        discovery_considered=discovery_considered,
+        discovery_refreshed=discovery_refreshed,
+    )

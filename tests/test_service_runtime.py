@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, run_pending_tasks
+from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, _recommendation_metadata_refresh_command, run_pending_tasks
 
 
 class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
@@ -364,6 +364,64 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             _apply_sync_command(self.config),
         )
 
+    def test_recommendation_metadata_refresh_command_uses_bounded_service_limits(self) -> None:
+        self.config.service.task_execute_limits["recommend_metadata_refresh"] = 4
+        self.config.service.task_execute_limits["recommend_metadata_discovery_targets"] = 7
+        self.assertEqual(
+            [
+                "python3",
+                "-m",
+                "mal_updater.cli",
+                "recommend-refresh-metadata",
+                "--limit",
+                "4",
+                "--include-discovery-targets",
+                "--discovery-target-limit",
+                "7",
+            ],
+            _recommendation_metadata_refresh_command(self.config),
+        )
+
+    def test_run_pending_tasks_executes_recommendation_metadata_refresh_slow_lane(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 1
+        self.config.service.task_execute_limits["recommend_metadata_refresh"] = 4
+        self.config.service.task_execute_limits["recommend_metadata_discovery_targets"] = 7
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_crunchyroll": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._budget_gate", return_value=(True, None, {"provider": "mal", "request_count": 0})), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "recommend_metadata_refresh", "returncode": 0, "stdout": "{}", "stderr": ""},
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        metadata_result = next(item for item in result["results"] if item["task"] == "recommend_metadata_refresh")
+        self.assertEqual("ok", metadata_result["status"])
+        self.assertEqual(4, metadata_result["refresh_limit"])
+        self.assertEqual(7, metadata_result["discovery_target_limit"])
+        self.assertEqual(_recommendation_metadata_refresh_command(self.config), run_subprocess.call_args.args[1])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        metadata_state = state["tasks"]["recommend_metadata_refresh"]
+        self.assertEqual("recommend_metadata_refresh:limit=4:discovery_target_limit=7", metadata_state["execution_signature"])
+
     def test_run_pending_tasks_resets_stale_sync_apply_projection_when_execution_signature_changes(self) -> None:
         now = time.time()
         self.config.service.sync_every_seconds = 0
@@ -431,6 +489,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         (self.project_root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt").write_text("secret\n", encoding="utf-8")
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
 
     def _write_request_events(self, provider: str, offsets_seconds: list[int]) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
