@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig
-from .db import get_mal_anime_metadata_map, get_mal_anime_relations_map, get_mal_recommendation_edges_map, list_series_mappings
+from .db import PersistedSeriesMapping, get_mal_anime_metadata_map, get_mal_anime_relations_map, get_mal_recommendation_edges_map, list_series_mappings
 from .mapping import normalize_title
 from .sync_planner import ProviderSeriesState, load_provider_series_states
 
@@ -293,9 +293,14 @@ def build_recommendations(
 ) -> list[Recommendation]:
     states = load_provider_series_states(config, limit=None)
     state_by_id = {(state.provider, state.provider_series_id): state for state in states}
+    persisted_mappings = list_series_mappings(config.db_path, approved_only=False)
     mapping_by_series = {
         (mapping.provider, mapping.provider_series_id): int(mapping.mal_anime_id)
-        for mapping in list_series_mappings(config.db_path, approved_only=False)
+        for mapping in persisted_mappings
+    }
+    mapping_info_by_series = {
+        (mapping.provider, mapping.provider_series_id): mapping
+        for mapping in persisted_mappings
     }
     metadata_by_id = get_mal_anime_metadata_map(config.db_path)
     relations_by_id = get_mal_anime_relations_map(config.db_path)
@@ -324,7 +329,11 @@ def build_recommendations(
     )
     recommendations.extend(_build_new_episode_recommendations(states))
     recommendations = _dedupe_recommendations(recommendations)
-    recommendations = _merge_cross_provider_recommendations(recommendations, mapping_by_series=mapping_by_series)
+    recommendations = _merge_cross_provider_recommendations(
+        recommendations,
+        mapping_by_series=mapping_by_series,
+        mapping_info_by_series=mapping_info_by_series,
+    )
     recommendations.sort(key=_recommendation_sort_key)
     if limit is None or limit <= 0:
         return recommendations
@@ -443,8 +452,12 @@ def _dedupe_recommendations(items: list[Recommendation]) -> list[Recommendation]
 _CROSS_PROVIDER_MERGE_KINDS = frozenset({"new_season", "new_dubbed_episode", "resume_backlog"})
 
 
+def _mapping_is_trusted_for_cross_provider_merge(mapping: PersistedSeriesMapping | None) -> bool:
+    return bool(mapping and mapping.approved_by_user)
+
+
 def _merge_cross_provider_recommendations(
-    items: list[Recommendation], *, mapping_by_series: dict[tuple[str, str], int]
+    items: list[Recommendation], *, mapping_by_series: dict[tuple[str, str], int], mapping_info_by_series: dict[tuple[str, str], PersistedSeriesMapping]
 ) -> list[Recommendation]:
     grouped: dict[tuple[str, int], list[Recommendation]] = defaultdict(list)
     passthrough: list[Recommendation] = []
@@ -453,9 +466,29 @@ def _merge_cross_provider_recommendations(
         if provider is None or provider == "mal" or item.kind not in _CROSS_PROVIDER_MERGE_KINDS:
             passthrough.append(item)
             continue
-        mal_anime_id = mapping_by_series.get((provider, item.provider_series_id))
+        mapping_key = (provider, item.provider_series_id)
+        mal_anime_id = mapping_by_series.get(mapping_key)
         if mal_anime_id is None:
             passthrough.append(item)
+            continue
+        mapping = mapping_info_by_series.get(mapping_key)
+        if not _mapping_is_trusted_for_cross_provider_merge(mapping):
+            passthrough.append(
+                Recommendation(
+                    kind=item.kind,
+                    priority=item.priority,
+                    provider=item.provider,
+                    provider_series_id=item.provider_series_id,
+                    title=item.title,
+                    season_title=item.season_title,
+                    reasons=list(item.reasons),
+                    context={
+                        **item.context,
+                        "cross_provider_reconciliation_status": "needs_review",
+                        "reconciliation_blocked_reason": "unapproved_mapping",
+                    },
+                )
+            )
             continue
         grouped[(item.kind, mal_anime_id)].append(item)
 
@@ -476,6 +509,7 @@ def _merge_cross_provider_recommendations(
         available_via_providers = sorted({item.provider for item in bucket if item.provider})
         availability_priority_bonus = _availability_priority_bonus(len(available_via_providers))
         merged_context["cross_provider_merged"] = True
+        merged_context["cross_provider_reconciliation_status"] = "trusted"
         merged_context["available_via_providers"] = available_via_providers
         merged_context["availability_priority_bonus"] = availability_priority_bonus
         merged_context["alternate_provider_series"] = [

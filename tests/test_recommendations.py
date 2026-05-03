@@ -2349,6 +2349,61 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("hidive", item.context["alternate_provider_series"][0]["provider"])
         self.assertEqual("hd-s2", item.context["alternate_provider_series"][0]["provider_series_id"])
 
+    def test_build_recommendations_does_not_merge_cross_provider_items_when_mapping_is_unapproved(self) -> None:
+        self._insert_series(
+            "base-show",
+            title="Needs Review Show",
+            season_title="Needs Review Show (English Dub)",
+            season_number=1,
+            watchlist_status="fully_watched",
+            provider="crunchyroll",
+        )
+        self._insert_progress(
+            "base-show",
+            "base-show-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-10T01:00:00Z",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "cr-next",
+            title="Needs Review Show",
+            season_title="Needs Review Show Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="crunchyroll",
+        )
+        self._insert_series(
+            "hd-next",
+            title="Needs Review Show",
+            season_title="Needs Review Show Season 2 (English Dub)",
+            season_number=2,
+            watchlist_status="available",
+            provider="hidive",
+        )
+
+        self._map_series("cr-next", 9100, provider="crunchyroll")
+        upsert_series_mapping(
+            self.config.db_path,
+            provider="hidive",
+            provider_series_id="hd-next",
+            mal_anime_id=9100,
+            confidence=0.92,
+            mapping_source="live_search",
+            approved_by_user=False,
+            notes=None,
+        )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "new_season"]
+
+        self.assertEqual(2, len(results))
+        by_series_id = {item.provider_series_id: item for item in results}
+        self.assertNotIn("available via multiple providers: Crunchyroll + HIDIVE", by_series_id["cr-next"].reasons)
+        self.assertEqual("needs_review", by_series_id["hd-next"].context["cross_provider_reconciliation_status"])
+        self.assertEqual("unapproved_mapping", by_series_id["hd-next"].context["reconciliation_blocked_reason"])
+        self.assertNotIn("cross_provider_merged", by_series_id["cr-next"].context)
+
     def test_group_recommendations_splits_known_kinds_into_named_sections(self) -> None:
         grouped = group_recommendations(
             [
