@@ -13,6 +13,7 @@ from unittest.mock import patch
 from mal_updater.cli import main as cli_main
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.db import bootstrap_database, connect, replace_review_queue_entries
+from mal_updater.health_cycle import _run_auto_command
 
 
 class HealthCheckCliTests(unittest.TestCase):
@@ -133,6 +134,38 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIsNone(payload["review_queue"]["recommended_next"])
         self.assertEqual([], payload["review_queue"]["recommended_worklist"])
         self.assertIsNone(payload["review_queue"]["recommended_apply_worklist"])
+
+    def test_health_check_cycle_runs_cli_auto_commands_against_configured_project_root(self) -> None:
+        selection = {
+            "reason_code": "refresh_mapping_review_backlog",
+            "command_args": ["review-mappings", "--limit", "2", "--mapping-limit", "5", "--persist-review-queue"],
+            "execution_mode": "cli",
+        }
+
+        with patch("mal_updater.health_cycle.subprocess.run") as run_mock:
+            run_mock.return_value = unittest.mock.Mock(returncode=0)
+            _run_auto_command(selection, project_root=self.project_root)
+
+        run_mock.assert_called_once()
+        command = run_mock.call_args.args[0]
+        self.assertEqual(
+            [
+                "python3",
+                "-m",
+                "mal_updater.cli",
+                "--project-root",
+                str(self.project_root),
+                "review-mappings",
+                "--limit",
+                "2",
+                "--mapping-limit",
+                "5",
+                "--persist-review-queue",
+            ],
+            command,
+        )
+        self.assertEqual(self.project_root, run_mock.call_args.kwargs["cwd"])
+        self.assertIn("PYTHONPATH", run_mock.call_args.kwargs["env"])
 
     def test_health_check_cycle_can_run_direct_install_script_commands(self) -> None:
         self._provision_repo_owned_automation_assets()

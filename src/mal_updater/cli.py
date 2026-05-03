@@ -6154,7 +6154,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_check_cycle.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
     health_check_cycle.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present in the final summary")
     health_check_cycle.add_argument("--auto-run-recommended", action="store_true", help="Automatically run one allowlisted automation-safe maintenance command when recommended")
-    health_check_cycle.add_argument("--auto-run-reason-codes", default="refresh_ingested_snapshot", help="Comma-separated allowlist of maintenance reason codes eligible for auto-remediation; include refresh_full_snapshot only for explicit recovery")
+    health_check_cycle.add_argument("--auto-run-reason-codes", default="refresh_ingested_snapshot", help="Comma-separated allowlist of maintenance reason codes eligible for auto-remediation; CLI remediations run against --project-root; include refresh_full_snapshot only for explicit recovery")
     health_check_cycle.add_argument("--review-issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional review_queue issue type to use when building recommended_next/recommended_worklist")
     health_check_cycle.add_argument("--review-worklist-limit", type=int, default=3, help="How many ranked review backlog drilldowns to include in recommended_worklist (use 0 to suppress it)")
     health_check_cycle.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved provider->MAL mapping coverage falls below this ratio (default: 0.8)")

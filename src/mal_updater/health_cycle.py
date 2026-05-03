@@ -174,7 +174,7 @@ def _select_auto_command(payload: dict[str, object], *, allow_reason_codes: set[
     return None
 
 
-def _run_auto_command(selection: dict[str, object]) -> None:
+def _run_auto_command(selection: dict[str, object], *, project_root: Path) -> None:
     env = dict(os.environ)
     command_args = [str(part) for part in selection.get("command_args", [])]
     if selection.get("execution_mode") == "direct":
@@ -182,13 +182,13 @@ def _run_auto_command(selection: dict[str, object]) -> None:
         subprocess_env = env
         command_display = " ".join(shlex.quote(part) for part in command)
     else:
-        command = ["python3", "-m", "mal_updater.cli", *command_args]
+        command = ["python3", "-m", "mal_updater.cli", "--project-root", str(project_root), *command_args]
         subprocess_env = {**env, "PYTHONPATH": str(_SOURCE_ROOT)}
         command_display = "PYTHONPATH=src " + " ".join(shlex.quote(part) for part in command)
     print("auto_remediation=enabled")
     print("auto_remediation_reason_code=" + str(selection["reason_code"]))
     print("auto_remediation_command=" + command_display)
-    result = subprocess.run(command, check=False, env=subprocess_env, cwd=None if selection.get("execution_mode") == "direct" else os.getcwd())
+    result = subprocess.run(command, check=False, env=subprocess_env, cwd=project_root)
     if result.returncode != 0:
         raise HealthCycleAutoRemediationError(
             f"auto remediation failed with exit code {result.returncode}",
@@ -263,7 +263,7 @@ def run_health_check_cycle(
                     else:
                         print("auto_remediation=disabled")
                 else:
-                    _run_auto_command(selected)
+                    _run_auto_command(selected, project_root=config.project_root)
                     _print_prefixed("re-running health-check after optional remediation")
                     _run_health_check_json(
                         config,
