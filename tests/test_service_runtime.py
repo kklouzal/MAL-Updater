@@ -408,7 +408,13 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
 
         with patch("mal_updater.service_runtime._budget_gate", return_value=(True, None, {"provider": "mal", "request_count": 0})), patch(
             "mal_updater.service_runtime._run_subprocess",
-            return_value={"status": "ok", "label": "recommend_metadata_refresh", "returncode": 0, "stdout": "{}", "stderr": ""},
+            return_value={
+                "status": "ok",
+                "label": "recommend_metadata_refresh",
+                "returncode": 0,
+                "stdout": json.dumps({"considered": 4, "refreshed": 4, "discovery_considered": 7, "discovery_refreshed": 5}),
+                "stderr": "",
+            },
         ) as run_subprocess:
             result = run_pending_tasks(self.config)
 
@@ -416,6 +422,10 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.assertEqual("ok", metadata_result["status"])
         self.assertEqual(4, metadata_result["refresh_limit"])
         self.assertEqual(7, metadata_result["discovery_target_limit"])
+        self.assertEqual(4, metadata_result["considered"])
+        self.assertEqual(4, metadata_result["refreshed"])
+        self.assertEqual(7, metadata_result["discovery_considered"])
+        self.assertEqual(5, metadata_result["discovery_refreshed"])
         self.assertEqual(_recommendation_metadata_refresh_command(self.config), run_subprocess.call_args.args[1])
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))

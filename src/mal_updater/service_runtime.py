@@ -211,6 +211,19 @@ def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[s
     return payload
 
 
+def _parse_json_stdout(result: dict[str, Any]) -> dict[str, Any] | None:
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def _refresh_mal_tokens(config: AppConfig) -> dict[str, Any]:
     secrets = load_mal_secrets(config)
     if not (secrets.client_id and secrets.refresh_token):
@@ -937,6 +950,12 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
                 result["refresh_limit"] = max(0, int(seed_limit))
                 result["discovery_target_limit"] = max(0, int(discovery_target_limit))
+                parsed_stdout = _parse_json_stdout(result)
+                if parsed_stdout is not None:
+                    for key in ("considered", "refreshed", "discovery_considered", "discovery_refreshed"):
+                        value = parsed_stdout.get(key)
+                        if isinstance(value, int):
+                            result[key] = max(0, int(value))
             elif spec.name == "health":
                 result = _run_subprocess(
                     config,
