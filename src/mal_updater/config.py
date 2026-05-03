@@ -26,6 +26,14 @@ DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 22.5
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 7.5
 DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS = 20.0
+DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE = "fresh"
+DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_SECTION_LIMITS = {
+    "continue_next": 5,
+    "fresh_dubbed_episodes": 5,
+    "discovery_candidates": 3,
+    "resume_backlog": 2,
+    "other": 2,
+}
 DEFAULT_MAL_CLIENT_ID_FILE = "mal_client_id.txt"
 DEFAULT_MAL_CLIENT_SECRET_FILE = "mal_client_secret.txt"
 DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
@@ -147,6 +155,8 @@ class OpenClawSettings:
     recommendations_webhook_timeout_seconds: float = DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS
     recommendations_webhook_channel: str = "discord"
     recommendations_webhook_to: str = ""
+    recommendations_webhook_delivery_mode: str = DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE
+    recommendations_webhook_section_limits: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_SECTION_LIMITS))
 
 
 @dataclass(slots=True)
@@ -512,6 +522,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     mal_section = _get_table(settings, "mal")
     crunchyroll_section = _get_table(settings, "crunchyroll")
     openclaw_section = _get_table(settings, "openclaw")
+    openclaw_section_limits_section = _get_nested_table(settings, "openclaw", "recommendations_webhook_section_limits")
     service_section = _get_table(settings, "service")
     service_provider_limits_section = _get_nested_table(settings, "service", "provider_hourly_limits")
     service_task_limits_section = _get_nested_table(settings, "service", "task_hourly_limits")
@@ -662,6 +673,25 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TO",
                 _get_str(openclaw_section, "recommendations_webhook_to", ""),
             ),
+            recommendations_webhook_delivery_mode=str(
+                os.getenv(
+                    "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE",
+                    _get_str(
+                        openclaw_section,
+                        "recommendations_webhook_delivery_mode",
+                        DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE,
+                    ),
+                )
+            ).strip().lower()
+            or DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE,
+            recommendations_webhook_section_limits={
+                **DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_SECTION_LIMITS,
+                **{
+                    str(key): max(0, int(value))
+                    for key, value in openclaw_section_limits_section.items()
+                    if isinstance(key, str) and isinstance(value, (int, float))
+                },
+            },
         ),
         service=ServiceSettings(
             sync_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_SYNC_EVERY_SECONDS", _get_int(service_section, "sync_every_seconds", DEFAULT_SERVICE_SYNC_EVERY_SECONDS))),

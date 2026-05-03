@@ -1631,6 +1631,37 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("already-here", results[0].provider_series_id)
         self.assertEqual("crunchyroll", results[0].provider)
         self.assertEqual(["crunchyroll"], results[0].context["available_via_providers"])
+        self.assertEqual("title_alias", results[0].context["availability_confidence"])
+        self.assertEqual(["title_alias"], results[0].context["availability_match_kinds"])
+
+    def test_discovery_candidate_prefers_mapped_provider_availability_confidence(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "mapped-here",
+            title="Mapped Here",
+            season_title="Mapped Here (English Dub)",
+            watchlist_status="available",
+        )
+        self._map_series("seed-a", 100)
+        self._map_series("mapped-here", 300)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(300, title="Mapped Here")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Mapped Here", "num_recommendations": 20, "raw": {}},
+        ])
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("mapped", results[0].context["availability_confidence"])
+        self.assertEqual(["mapped_mal"], results[0].context["availability_match_kinds"])
+        self.assertEqual("mapped_mal", results[0].context["available_provider_series"][0]["availability_match_kind"])
 
     def test_provider_required_discovery_ignores_fully_watched_provider_catalog_matches(self) -> None:
         self._insert_series(

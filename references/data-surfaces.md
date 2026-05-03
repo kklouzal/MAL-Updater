@@ -58,7 +58,8 @@ Use this surface when the user wants:
 - dormant-but-cached discovery candidates for debugging / audit
 - recommendation metadata refresh
 - pushing a recommendation digest into OpenClaw's webhook ingress for chat delivery
-- checking whether the optional daemon-backed recommendation webhook push lane is enabled and current via `service-status`
+- choosing manual delivery posture (`--delivery-mode fresh|digest|all`) when you want a broader or narrower send than the daemon default
+- checking whether the optional daemon-backed recommendation webhook push lane is enabled and current via `service-status`, including current delivery mode / dedupe posture
 
 ## Review queue / mapping state
 
@@ -93,6 +94,7 @@ Use this surface when the user wants:
 - proposed MAL mutations before live writes
 - exact-approved live apply behavior
 - snapshot refresh / ingest state
+- health-driven recovery posture, including whether the daemon is planning an incremental repair fetch vs a heavier full-refresh recovery pass
 
 ## Auth surfaces
 

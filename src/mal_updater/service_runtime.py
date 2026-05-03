@@ -314,45 +314,57 @@ def _provider_from_refresh_command_args(command_args: object) -> str | None:
         return None
     if command_args[0] == "crunchyroll-fetch-snapshot":
         return "crunchyroll"
+    if len(command_args) >= 2 and command_args[0] == "sync-source" and isinstance(command_args[1], str):
+        return str(command_args[1])
     if len(command_args) >= 3 and command_args[0] == "provider-fetch-snapshot" and command_args[1] == "--provider" and isinstance(command_args[2], str):
         return str(command_args[2])
     return None
 
 
 
-def _provider_fetch_requested_by_health(config: AppConfig, provider: str, task_state: dict[str, Any]) -> bool:
-    if int(config.service.full_refresh_every_seconds) <= 0:
-        return False
+def _provider_fetch_health_request(config: AppConfig, provider: str, task_state: dict[str, Any]) -> dict[str, Any] | None:
     path = config.health_latest_json_path
     if not path.exists():
-        return False
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
+        return None
     if not isinstance(payload, dict):
-        return False
+        return None
     maintenance = payload.get("maintenance")
     if not isinstance(maintenance, dict):
-        return False
+        return None
     commands = maintenance.get("recommended_commands")
     if not isinstance(commands, list):
-        return False
+        return None
     try:
         health_mtime = path.stat().st_mtime
     except OSError:
-        return False
-    last_full_refresh_epoch = task_state.get("last_successful_full_refresh_epoch")
-    if isinstance(last_full_refresh_epoch, (int, float)) and float(last_full_refresh_epoch) >= float(health_mtime):
-        return False
+        return None
+    last_handled_mtime = task_state.get("last_health_request_handled_mtime")
+    if isinstance(last_handled_mtime, (int, float)) and float(last_handled_mtime) >= float(health_mtime):
+        return None
     for command in commands:
         if not isinstance(command, dict):
             continue
-        if command.get("reason_code") != "refresh_full_snapshot":
+        reason_code = command.get("reason_code")
+        if reason_code not in {"refresh_ingested_snapshot", "refresh_full_snapshot"}:
             continue
-        if _provider_from_refresh_command_args(command.get("command_args")) == provider:
-            return True
-    return False
+        if _provider_from_refresh_command_args(command.get("command_args")) != provider:
+            continue
+        if reason_code == "refresh_full_snapshot" and int(config.service.full_refresh_every_seconds) <= 0:
+            continue
+        if reason_code == "refresh_full_snapshot":
+            last_full_refresh_epoch = task_state.get("last_successful_full_refresh_epoch")
+            if isinstance(last_full_refresh_epoch, (int, float)) and float(last_full_refresh_epoch) >= float(health_mtime):
+                continue
+        return {
+            "reason_code": reason_code,
+            "mode": "full_refresh" if reason_code == "refresh_full_snapshot" else "incremental",
+            "health_mtime": float(health_mtime),
+        }
+    return None
 
 
 
@@ -401,24 +413,56 @@ def _recommendations_webhook_push_limit(config: AppConfig) -> int:
 
 def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, Any]) -> dict[str, Any]:
     delivery_limit = _recommendations_webhook_push_limit(config)
-    preview = deliver_recommendations_via_openclaw(config, limit=delivery_limit, include_dormant=False, dry_run=True)
+    delivery_mode = config.openclaw.recommendations_webhook_delivery_mode
+    preview = deliver_recommendations_via_openclaw(
+        config,
+        limit=delivery_limit,
+        include_dormant=False,
+        delivery_mode=delivery_mode,
+        dry_run=True,
+    )
+    structured_payload = preview.payload.get("structured_payload") if isinstance(preview.payload, dict) else None
+    item_fingerprints = []
+    if isinstance(structured_payload, dict):
+        raw_fingerprints = structured_payload.get("item_fingerprints")
+        if isinstance(raw_fingerprints, list):
+            item_fingerprints = [str(value) for value in raw_fingerprints if isinstance(value, str) and value]
     request_id = preview.request_id
     previous_request_id = task_state.get("last_delivery_request_id")
+    previous_fingerprints = task_state.get("last_delivery_item_fingerprints") if isinstance(task_state.get("last_delivery_item_fingerprints"), list) else []
     if request_id and previous_request_id == request_id:
         return {
             "status": "ok",
             "label": "push_recommendations_webhook",
             "delivery_status": "unchanged",
             "delivery_limit": delivery_limit,
+            "delivery_mode": delivery_mode,
             "request_id": request_id,
             "request_url": preview.request_url,
         }
-    delivery = deliver_recommendations_via_openclaw(config, limit=delivery_limit, include_dormant=False, dry_run=False)
+    if item_fingerprints and previous_fingerprints == item_fingerprints:
+        return {
+            "status": "ok",
+            "label": "push_recommendations_webhook",
+            "delivery_status": "unchanged_items",
+            "delivery_limit": delivery_limit,
+            "delivery_mode": delivery_mode,
+            "request_id": request_id,
+            "request_url": preview.request_url,
+        }
+    delivery = deliver_recommendations_via_openclaw(
+        config,
+        limit=delivery_limit,
+        include_dormant=False,
+        delivery_mode=delivery_mode,
+        dry_run=False,
+    )
     result = {
         "status": "ok",
         "label": "push_recommendations_webhook",
         "delivery_status": delivery.status,
         "delivery_limit": delivery_limit,
+        "delivery_mode": delivery_mode,
         "request_id": delivery.request_id,
         "request_url": delivery.request_url,
         "http_status": delivery.http_status,
@@ -430,9 +474,11 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
     if delivery.status == "delivered" and delivery.request_id:
         task_state["last_delivery_request_id"] = delivery.request_id
         task_state["last_delivery_http_status"] = delivery.http_status
+        task_state["last_delivery_item_fingerprints"] = item_fingerprints
     elif delivery.status == "no_recommendations":
         task_state.pop("last_delivery_request_id", None)
         task_state.pop("last_delivery_http_status", None)
+        task_state.pop("last_delivery_item_fingerprints", None)
     return result
 
 
@@ -451,7 +497,7 @@ def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: 
             discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
         return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
     if spec.name == "push_recommendations_webhook":
-        return f"push_recommendations_webhook:limit={_recommendations_webhook_push_limit(config)}"
+        return f"push_recommendations_webhook:limit={_recommendations_webhook_push_limit(config)}:mode={config.openclaw.recommendations_webhook_delivery_mode}"
     if spec.name.startswith("sync_fetch_"):
         return f"{spec.name}:mode={fetch_mode or 'incremental'}"
     return None
@@ -495,16 +541,19 @@ def _maybe_reset_task_projection_state_for_signature(
 
 
 
-def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any], *, now: float) -> tuple[str | None, list[str]]:
+def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any], *, now: float) -> tuple[str | None, list[str], dict[str, Any] | None]:
     if not spec.name.startswith("sync_fetch_"):
-        return None, []
+        return None, [], None
     provider = spec.name.removeprefix("sync_fetch_")
     full_refresh_reasons: list[str] = []
+    health_request = _provider_fetch_health_request(config, provider, task_state)
     if _provider_fetch_requires_full_refresh(config, task_state, now=now):
         full_refresh_reasons.append("periodic_cadence")
-    if _provider_fetch_requested_by_health(config, provider, task_state):
+    if isinstance(health_request, dict) and health_request.get("mode") == "full_refresh":
         full_refresh_reasons.append("health_recommended")
-    return ("full_refresh" if full_refresh_reasons else "incremental"), full_refresh_reasons
+    if isinstance(health_request, dict) and health_request.get("mode") == "incremental":
+        return "incremental", ["health_recommended_incremental"], health_request
+    return ("full_refresh" if full_refresh_reasons else "incremental"), full_refresh_reasons, health_request
 
 
 
@@ -832,10 +881,11 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         task_state["budget_scope"] = config.service.budget_scope_for(spec.budget_provider, task_name=spec.name)
         task_state["every_seconds"] = int(spec.every_seconds)
         last_run = float(task_state.get("last_run_epoch", 0))
-        if now - last_run < spec.every_seconds:
+        planned_fetch_mode, planned_full_refresh_reasons, health_request = _planned_fetch_mode(config, spec, task_state, now=now)
+        health_requested_run = isinstance(health_request, dict)
+        if now - last_run < spec.every_seconds and not health_requested_run:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
-        planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now)
         _maybe_reset_task_projection_state_for_signature(config, spec, task_state, fetch_mode=planned_fetch_mode)
         backoff_until_epoch = float(task_state.get("budget_backoff_until_epoch", 0))
         if backoff_until_epoch > now:
@@ -977,6 +1027,8 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result["fetch_mode"] = planned_fetch_mode or "incremental"
                 if full_refresh_reasons:
                     result["full_refresh_reason"] = "+".join(full_refresh_reasons)
+                if isinstance(health_request, dict) and isinstance(health_request.get("reason_code"), str):
+                    result["health_request_reason_code"] = str(health_request["reason_code"])
                 if downgrade_reason:
                     result["deferred_full_refresh_reason"] = downgrade_reason
             elif spec.name == "sync_apply":
@@ -1057,6 +1109,10 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             if spec.name.startswith("sync_fetch_") and fetch_succeeded:
                 task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
                 task_state["last_fetch_mode_at"] = finished_at
+                if isinstance(health_request, dict) and isinstance(health_request.get("health_mtime"), (int, float)):
+                    task_state["last_health_request_handled_mtime"] = float(health_request["health_mtime"])
+                    if isinstance(health_request.get("reason_code"), str):
+                        task_state["last_health_request_reason_code"] = str(health_request["reason_code"])
                 if full_refresh_requested:
                     task_state["last_full_refresh_reason"] = result.get("full_refresh_reason")
                     task_state["last_successful_full_refresh_epoch"] = finished_epoch

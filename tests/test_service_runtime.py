@@ -259,6 +259,67 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         sync_args = run_subprocess.call_args_list[0].args[1]
         self.assertNotIn("--full-refresh", sync_args)
 
+    def test_run_pending_tasks_honors_health_requested_incremental_fetch_even_before_cadence_due(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "maintenance": {
+                        "recommended_commands": [
+                            {
+                                "reason_code": "refresh_ingested_snapshot",
+                                "command_args": ["sync-source", "crunchyroll"],
+                            }
+                        ]
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_crunchyroll": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("refresh_ingested_snapshot", sync_result["health_request_reason_code"])
+        self.assertEqual("health_recommended_incremental", sync_result["full_refresh_reason"])
+        sync_args = run_subprocess.call_args_list[0].args[1]
+        self.assertNotIn("--full-refresh", sync_args)
+
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("refresh_ingested_snapshot", sync_state["last_health_request_reason_code"])
+        self.assertIn("last_health_request_handled_mtime", sync_state)
+
     def test_run_pending_tasks_does_not_mark_failed_full_refresh_as_successful(self) -> None:
         stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
         previous_success = stale_anchor - 120
@@ -458,8 +519,19 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        preview = OpenClawRecommendationDeliveryResult(status="dry_run", request_url="http://127.0.0.1:18789/hooks/agent", payload={}, request_id="abc123")
-        delivered = OpenClawRecommendationDeliveryResult(status="delivered", request_url="http://127.0.0.1:18789/hooks/agent", payload={}, http_status=200, request_id="abc123")
+        preview = OpenClawRecommendationDeliveryResult(
+            status="dry_run",
+            request_url="http://127.0.0.1:18789/hooks/agent",
+            payload={"structured_payload": {"item_fingerprints": ["fp-1"]}},
+            request_id="abc123",
+        )
+        delivered = OpenClawRecommendationDeliveryResult(
+            status="delivered",
+            request_url="http://127.0.0.1:18789/hooks/agent",
+            payload={"structured_payload": {"item_fingerprints": ["fp-1"]}},
+            http_status=200,
+            request_id="abc123",
+        )
         with patch("mal_updater.service_runtime.deliver_recommendations_via_openclaw", side_effect=[preview, delivered]):
             result = run_pending_tasks(self.config)
 
@@ -471,8 +543,9 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         webhook_state = state["tasks"]["push_recommendations_webhook"]
-        self.assertEqual("push_recommendations_webhook:limit=6", webhook_state["execution_signature"])
+        self.assertEqual("push_recommendations_webhook:limit=6:mode=fresh", webhook_state["execution_signature"])
         self.assertEqual("abc123", webhook_state["last_delivery_request_id"])
+        self.assertEqual(["fp-1"], webhook_state["last_delivery_item_fingerprints"])
 
     def test_run_pending_tasks_skips_unchanged_recommendations_webhook_push_lane(self) -> None:
         now = time.time()
@@ -492,7 +565,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
                         "sync_fetch_crunchyroll": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
                         "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
                         "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
-                        "push_recommendations_webhook": {"last_delivery_request_id": "abc123"},
+                        "push_recommendations_webhook": {"last_delivery_request_id": "abc123", "last_delivery_item_fingerprints": ["fp-1"]},
                     },
                 },
                 indent=2,
@@ -500,7 +573,12 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        preview = OpenClawRecommendationDeliveryResult(status="dry_run", request_url="http://127.0.0.1:18789/hooks/agent", payload={}, request_id="abc123")
+        preview = OpenClawRecommendationDeliveryResult(
+            status="dry_run",
+            request_url="http://127.0.0.1:18789/hooks/agent",
+            payload={"structured_payload": {"item_fingerprints": ["fp-1"]}},
+            request_id="abc123",
+        )
         with patch("mal_updater.service_runtime.deliver_recommendations_via_openclaw", return_value=preview) as deliver:
             result = run_pending_tasks(self.config)
 

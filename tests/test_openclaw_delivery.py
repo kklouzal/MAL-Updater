@@ -44,6 +44,13 @@ recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
 recommendations_webhook_timeout_seconds = 7.0
 recommendations_webhook_channel = "discord"
 recommendations_webhook_to = "channel:1487239758487748761"
+recommendations_webhook_delivery_mode = "fresh"
+
+[openclaw.recommendations_webhook_section_limits]
+continue_next = 5
+fresh_dubbed_episodes = 5
+discovery_candidates = 3
+resume_backlog = 2
 
 [secret_files]
 openclaw_hook_token = "openclaw_hook_token.txt"
@@ -55,8 +62,11 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         ensure_directories(self.config)
         (self.config.secrets_dir / "openclaw_hook_token.txt").write_text("test-token\n", encoding="utf-8")
 
-    def test_build_recommendation_delivery_payload_groups_sections(self) -> None:
-        fake_sections = [{"key": "discovery_candidates", "count": 2, "items": [{"title": "A"}, {"title": "B"}]}]
+    def test_build_recommendation_delivery_payload_applies_delivery_policy(self) -> None:
+        fake_sections = [
+            {"key": "continue_next", "count": 2, "items": [{"title": "A"}, {"title": "B"}]},
+            {"key": "resume_backlog", "count": 2, "items": [{"title": "C"}, {"title": "D"}]},
+        ]
         with (
             patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[object(), object()]),
             patch("mal_updater.openclaw_delivery.group_recommendations", return_value=fake_sections),
@@ -66,9 +76,12 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertEqual("mal_updater.recommendations", payload["event"])
         self.assertEqual(5, payload["limit"])
         self.assertFalse(payload["include_dormant"])
+        self.assertEqual("fresh", payload["delivery_mode"])
         self.assertEqual(1, payload["section_count"])
         self.assertEqual(2, payload["item_count"])
-        self.assertEqual(fake_sections, payload["sections"])
+        self.assertEqual("continue_next", payload["sections"][0]["key"])
+        self.assertEqual("fresh", payload["sections"][0]["delivery_tier"])
+        self.assertEqual(2, len(payload["item_fingerprints"]))
 
     def test_deliver_recommendations_via_openclaw_posts_payload(self) -> None:
         fake_sections = [{"key": "continue_next", "count": 1, "items": [{"title": "Test Show"}]}]
@@ -91,6 +104,8 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertEqual("channel:1487239758487748761", posted["to"])
         self.assertIn("MAL-Updater recommendation webhook event.", posted["message"])
         self.assertIn("Test Show", posted["message"])
+        self.assertIn("Delivery posture:", posted["message"])
+        self.assertEqual("fresh", result.payload["structured_payload"]["delivery_mode"])
         self.assertEqual(7.0, urlopen_mock.call_args.kwargs["timeout"])
 
     def test_deliver_recommendations_via_openclaw_returns_no_recommendations_without_post(self) -> None:
@@ -124,8 +139,9 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertEqual(0, exit_code)
         payload = json.loads(stdout.getvalue())
         self.assertEqual("dry_run", payload["status"])
-        self.assertTrue(payload["payload"]["deliver"])
-        self.assertIn("CLI Show", payload["payload"]["message"])
+        self.assertTrue(payload["payload"]["hook_request"]["deliver"])
+        self.assertEqual("fresh", payload["payload"]["structured_payload"]["delivery_mode"])
+        self.assertIn("CLI Show", payload["payload"]["hook_request"]["message"])
 
 
 if __name__ == "__main__":

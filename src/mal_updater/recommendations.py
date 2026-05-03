@@ -803,9 +803,15 @@ def _candidate_available_states(
     candidate_title_aliases: set[str],
     availability_by_mal_id: dict[int, list[ProviderSeriesState]],
     availability_by_title_alias: dict[str, list[ProviderSeriesState]],
-) -> list[ProviderSeriesState]:
+) -> tuple[list[ProviderSeriesState], dict[tuple[str, str], str]]:
     states: list[ProviderSeriesState] = []
-    states.extend(state for state in availability_by_mal_id.get(target_id, []) if _is_discovery_watchable_provider_state(state))
+    match_kind_by_state: dict[tuple[str, str], str] = {}
+    for state in availability_by_mal_id.get(target_id, []):
+        if not _is_discovery_watchable_provider_state(state):
+            continue
+        key = (state.provider, state.provider_series_id)
+        states.append(state)
+        match_kind_by_state[key] = "mapped_mal"
     seen = {(state.provider, state.provider_series_id) for state in states}
     for alias in candidate_title_aliases:
         for state in availability_by_title_alias.get(alias, []):
@@ -815,7 +821,8 @@ def _candidate_available_states(
             if key not in seen:
                 states.append(state)
                 seen.add(key)
-    return states
+            match_kind_by_state.setdefault(key, "title_alias")
+    return states, match_kind_by_state
 
 
 _DISCOVERY_FRANCHISE_RELATION_TYPES = frozenset(
@@ -1011,7 +1018,7 @@ def _build_discovery_recommendations(
                     continue
         candidate_title_aliases = _metadata_title_aliases(meta)
         candidate_title_aliases.update(_normalized_title_aliases(bucket.get("title")))
-        available_states = _candidate_available_states(
+        available_states, availability_match_kind_by_state = _candidate_available_states(
             target_id=target_id,
             candidate_title_aliases=candidate_title_aliases,
             availability_by_mal_id=availability_by_mal_id,
@@ -1021,6 +1028,16 @@ def _build_discovery_recommendations(
             continue
         primary_available_state = _select_primary_available_state(available_states) if available_states else None
         available_via_providers = sorted({state.provider for state in available_states})
+        availability_match_kinds = sorted({availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias") for state in available_states})
+        if "mapped_mal" in availability_match_kinds:
+            availability_confidence = "mapped"
+            availability_confidence_bonus = 6
+        elif available_states:
+            availability_confidence = "title_alias"
+            availability_confidence_bonus = 2
+        else:
+            availability_confidence = "none"
+            availability_confidence_bonus = 0
         mean = meta.mean if meta is not None else None
         popularity = meta.popularity if meta is not None else None
         votes_by_source = bucket.get("votes_by_source") or {}
@@ -1182,7 +1199,7 @@ def _build_discovery_recommendations(
         )
         support_balance_bonus = min(effective_cross_seed_support_votes // 5, 8)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
-        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + metadata_affinity_bonus + metadata_quality_bonus + catalog_quality_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + metadata_affinity_bonus + metadata_quality_bonus + catalog_quality_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus + availability_confidence_bonus
         priority -= freshness_penalty
         priority -= stale_support_penalty
         priority -= seed_quality_penalty
@@ -1286,7 +1303,10 @@ def _build_discovery_recommendations(
         if meta is None:
             reasons.append("full MAL metadata for this discovery candidate is not cached yet")
         if available_via_providers:
-            reasons.append(f"available via registered provider catalog: {_format_provider_label(available_via_providers)}")
+            if availability_confidence == "mapped":
+                reasons.append(f"available via mapped provider catalog match: {_format_provider_label(available_via_providers)}")
+            else:
+                reasons.append(f"available via title-alias provider catalog match: {_format_provider_label(available_via_providers)}")
         title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
         items.append(
             Recommendation(
@@ -1301,6 +1321,9 @@ def _build_discovery_recommendations(
                     "mal_anime_id": target_id,
                     "availability_visible": bool(available_states),
                     "available_via_providers": available_via_providers,
+                    "availability_confidence": availability_confidence,
+                    "availability_confidence_bonus": availability_confidence_bonus,
+                    "availability_match_kinds": availability_match_kinds,
                     "available_provider_series": [
                         {
                             "provider": state.provider,
@@ -1308,6 +1331,7 @@ def _build_discovery_recommendations(
                             "title": state.title,
                             "season_title": state.season_title,
                             "watchlist_status": state.watchlist_status,
+                            "availability_match_kind": availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias"),
                         }
                         for state in available_states
                     ],

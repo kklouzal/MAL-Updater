@@ -6132,6 +6132,7 @@ def _cmd_push_recommendations_webhook(
     project_root: Path | None,
     limit: int,
     include_dormant: bool,
+    delivery_mode: str | None,
     dry_run: bool,
 ) -> int:
     config = load_config(project_root)
@@ -6142,6 +6143,7 @@ def _cmd_push_recommendations_webhook(
             config,
             limit=_normalize_limit(limit),
             include_dormant=include_dormant,
+            delivery_mode=delivery_mode,
             dry_run=dry_run,
         )
     except OpenClawDeliveryError as exc:
@@ -6483,6 +6485,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include discovery candidates that are not currently matched to a registered provider catalog",
     )
     push_recommendations_webhook.add_argument(
+        "--delivery-mode",
+        choices=["fresh", "digest", "all"],
+        default=None,
+        help="Override the OpenClaw delivery policy (defaults to config; the daemon should usually stay on 'fresh')",
+    )
+    push_recommendations_webhook.add_argument(
         "--dry-run",
         action="store_true",
         help="Build the outbound payload without performing the webhook POST",
@@ -6734,6 +6742,7 @@ def main() -> int:
             args.project_root,
             args.limit,
             args.include_dormant,
+            args.delivery_mode,
             args.dry_run,
         )
     if args.command == "sync":

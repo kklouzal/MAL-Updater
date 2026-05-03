@@ -118,10 +118,12 @@ def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state
     provider = task_name.removeprefix("sync_fetch_")
     spec = TaskSpec(name=task_name, every_seconds=int(task_state.get("every_seconds", 0) or 0), budget_provider=provider)
     now_dt = datetime.now(timezone.utc)
-    planned_fetch_mode, planned_full_refresh_reasons = _planned_fetch_mode(config, spec, task_state, now=now_dt.timestamp())
+    planned_fetch_mode, planned_full_refresh_reasons, health_request = _planned_fetch_mode(config, spec, task_state, now=now_dt.timestamp())
     if planned_fetch_mode is None:
         return {}
     summary: dict[str, Any] = {"planned_fetch_mode": planned_fetch_mode}
+    if isinstance(health_request, dict) and isinstance(health_request.get("reason_code"), str):
+        summary["planned_health_request_reason_code"] = str(health_request["reason_code"])
     if planned_full_refresh_reasons:
         summary["planned_full_refresh_reason"] = "+".join(planned_full_refresh_reasons)
         if "periodic_cadence" in planned_full_refresh_reasons:

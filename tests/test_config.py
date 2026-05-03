@@ -30,6 +30,9 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertFalse(config.openclaw.recommendations_webhook_enabled)
             self.assertEqual("", config.openclaw.recommendations_webhook_url)
             self.assertEqual(20.0, config.openclaw.recommendations_webhook_timeout_seconds)
+            self.assertEqual("fresh", config.openclaw.recommendations_webhook_delivery_mode)
+            self.assertEqual(5, config.openclaw.recommendations_webhook_section_limits["continue_next"])
+            self.assertEqual(2, config.openclaw.recommendations_webhook_section_limits["resume_backlog"])
             self.assertEqual(0, config.service.full_refresh_every_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
@@ -85,6 +88,11 @@ class ConfigLoadingTests(unittest.TestCase):
                     recommendations_webhook_timeout_seconds = 9.5
                     recommendations_webhook_channel = "discord"
                     recommendations_webhook_to = "channel:1487239758487748761"
+                    recommendations_webhook_delivery_mode = "all"
+
+                    [openclaw.recommendations_webhook_section_limits]
+                    continue_next = 7
+                    resume_backlog = 4
 
                     [secret_files]
                     mal_client_id = "ids/client-id.txt"
@@ -117,6 +125,9 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(9.5, config.openclaw.recommendations_webhook_timeout_seconds)
             self.assertEqual("discord", config.openclaw.recommendations_webhook_channel)
             self.assertEqual("channel:1487239758487748761", config.openclaw.recommendations_webhook_to)
+            self.assertEqual("all", config.openclaw.recommendations_webhook_delivery_mode)
+            self.assertEqual(7, config.openclaw.recommendations_webhook_section_limits["continue_next"])
+            self.assertEqual(4, config.openclaw.recommendations_webhook_section_limits["resume_backlog"])
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "private" / "ids" / "client-id.txt").resolve())
             self.assertEqual(hook_token, "secret-token")
             self.assertEqual(hook_token_path, token_file.resolve())
