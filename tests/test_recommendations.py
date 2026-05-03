@@ -268,6 +268,32 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("mal", discovery[0].provider)
         self.assertEqual([7100], discovery[0].context["supporting_mal_anime_ids"])
 
+    def test_provider_required_discovery_hides_dormant_unavailable_candidates(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(300, title="Dormant Candidate")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Dormant Candidate", "num_recommendations": 20, "raw": {}},
+        ])
+
+        visible = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+        dormant = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], visible)
+        self.assertEqual(1, len(dormant))
+        self.assertFalse(dormant[0].context["availability_visible"])
+
     def test_relation_backed_new_season_recommendation_detects_title_drift(self) -> None:
         self._insert_series(
             "sg",
@@ -1578,7 +1604,7 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(["mal:400"], [item.provider_series_id for item in results])
 
-    def test_discovery_candidate_skips_titles_already_present_in_provider_catalog(self) -> None:
+    def test_discovery_candidate_surfaces_titles_available_in_provider_catalog(self) -> None:
         self._insert_series(
             "seed-a",
             title="Seed A",
@@ -1601,7 +1627,39 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual([], results)
+        self.assertEqual(1, len(results))
+        self.assertEqual("already-here", results[0].provider_series_id)
+        self.assertEqual("crunchyroll", results[0].provider)
+        self.assertEqual(["crunchyroll"], results[0].context["available_via_providers"])
+
+    def test_provider_required_discovery_ignores_fully_watched_provider_catalog_matches(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_series(
+            "already-watched",
+            title="Already Watched",
+            season_title="Already Watched (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(300, title="Already Watched")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Already Watched", "num_recommendations": 20, "raw": {}},
+        ])
+
+        visible = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual([], visible)
 
     def test_discovery_target_metadata_refresh_considers_hidive_mappings(self) -> None:
         self._insert_series(
@@ -2663,6 +2721,45 @@ class RecommendationTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(["continue_next"], [section["key"] for section in payload])
         self.assertEqual("series-next", payload[0]["items"][0]["provider_series_id"])
+
+    def test_recommend_cli_hides_dormant_discovery_candidates_by_default(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(300, title="Dormant Candidate")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Dormant Candidate", "num_recommendations": 20, "raw": {}},
+        ])
+
+        default_argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "recommend",
+            "--limit",
+            "0",
+            "--flat",
+        ]
+        with patch("sys.argv", default_argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            default_exit_code = cli_main()
+
+        include_argv = [*default_argv, "--include-dormant"]
+        with patch("sys.argv", include_argv), patch("sys.stdout", new_callable=io.StringIO) as include_stdout:
+            include_exit_code = cli_main()
+
+        self.assertEqual(0, default_exit_code)
+        self.assertEqual(0, include_exit_code)
+        self.assertEqual([], json.loads(stdout.getvalue()))
+        included = json.loads(include_stdout.getvalue())
+        self.assertEqual(1, len(included))
+        self.assertEqual("mal:300", included[0]["provider_series_id"])
+        self.assertFalse(included[0]["context"]["availability_visible"])
 
     def test_recommend_cli_flat_flag_preserves_legacy_list_output(self) -> None:
         self._insert_series(

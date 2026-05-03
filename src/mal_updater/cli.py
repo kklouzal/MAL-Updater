@@ -6078,11 +6078,15 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
     return 0 if apply_exit_code == 0 else 1
 
 
-def _cmd_recommend(project_root: Path | None, limit: int, flat: bool) -> int:
+def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_dormant: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
-    results = build_recommendations(config, limit=_normalize_limit(limit))
+    results = build_recommendations(
+        config,
+        limit=_normalize_limit(limit),
+        require_provider_availability=not include_dormant,
+    )
     payload: object
     if flat:
         payload = [item.as_dict() for item in results]
@@ -6411,6 +6415,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recommend.add_argument("--limit", type=int, default=20, help="How many recommendations to emit (use 0 for all)")
     recommend.add_argument("--flat", action="store_true", help="Emit the legacy single flat JSON list instead of grouped sections")
+    recommend.add_argument(
+        "--include-dormant",
+        action="store_true",
+        help="Include discovery candidates that are not currently matched to a registered provider catalog; hidden by default",
+    )
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",
         help="Refresh MAL metadata/relation cache for mapped anime so recommendations can use richer continuation evidence",
@@ -6661,7 +6670,7 @@ def main() -> int:
     if args.command == "apply-sync":
         return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
     if args.command == "recommend":
-        return _cmd_recommend(args.project_root, args.limit, args.flat)
+        return _cmd_recommend(args.project_root, args.limit, args.flat, args.include_dormant)
     if args.command == "recommend-refresh-metadata":
         return _cmd_recommend_refresh_metadata(
             args.project_root,

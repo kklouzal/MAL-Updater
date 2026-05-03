@@ -227,7 +227,12 @@ def group_recommendations(items: list[Recommendation]) -> list[dict[str, Any]]:
     return sections
 
 
-def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Recommendation]:
+def build_recommendations(
+    config: AppConfig,
+    limit: int | None = 20,
+    *,
+    require_provider_availability: bool = False,
+) -> list[Recommendation]:
     states = load_provider_series_states(config, limit=None)
     state_by_id = {(state.provider, state.provider_series_id): state for state in states}
     mapping_by_series = {
@@ -256,6 +261,7 @@ def build_recommendations(config: AppConfig, limit: int | None = 20) -> list[Rec
             metadata_by_id=metadata_by_id,
             relations_by_id=relations_by_id,
             recommendation_edges_by_id=recommendation_edges_by_id,
+            require_provider_availability=require_provider_availability,
         )
     )
     recommendations.extend(_build_new_episode_recommendations(states))
@@ -753,13 +759,63 @@ def _metadata_title_aliases(meta: Any) -> set[str]:
                 for synonym in synonyms:
                     aliases.update(_normalized_title_aliases(synonym))
     return aliases
+def _provider_availability_by_mal_id(
+    states: list[ProviderSeriesState],
+    *,
+    mapping_by_series: dict[tuple[str, str], int],
+) -> dict[int, list[ProviderSeriesState]]:
+    state_by_key = {(state.provider, state.provider_series_id): state for state in states}
+    available: dict[int, list[ProviderSeriesState]] = defaultdict(list)
+    for series_key, mal_anime_id in mapping_by_series.items():
+        state = state_by_key.get(series_key)
+        if state is not None:
+            available[int(mal_anime_id)].append(state)
+    return available
 
 
-def _provider_catalog_title_aliases(states: list[ProviderSeriesState]) -> set[str]:
-    aliases: set[str] = set()
+def _provider_availability_by_title_alias(states: list[ProviderSeriesState]) -> dict[str, list[ProviderSeriesState]]:
+    available: dict[str, list[ProviderSeriesState]] = defaultdict(list)
     for state in states:
-        aliases.update(_normalized_title_aliases(state.title, state.season_title))
-    return aliases
+        for alias in _normalized_title_aliases(state.title, state.season_title):
+            available[alias].append(state)
+    return available
+
+
+def _select_primary_available_state(states: list[ProviderSeriesState]) -> ProviderSeriesState:
+    return sorted(
+        states,
+        key=lambda state: (
+            state.watchlist_status != "never_watched",
+            state.provider,
+            state.title.lower(),
+            state.provider_series_id,
+        ),
+    )[0]
+
+
+def _is_discovery_watchable_provider_state(state: ProviderSeriesState) -> bool:
+    return state.watchlist_status not in {"fully_watched", "in_progress"}
+
+
+def _candidate_available_states(
+    *,
+    target_id: int,
+    candidate_title_aliases: set[str],
+    availability_by_mal_id: dict[int, list[ProviderSeriesState]],
+    availability_by_title_alias: dict[str, list[ProviderSeriesState]],
+) -> list[ProviderSeriesState]:
+    states: list[ProviderSeriesState] = []
+    states.extend(state for state in availability_by_mal_id.get(target_id, []) if _is_discovery_watchable_provider_state(state))
+    seen = {(state.provider, state.provider_series_id) for state in states}
+    for alias in candidate_title_aliases:
+        for state in availability_by_title_alias.get(alias, []):
+            if not _is_discovery_watchable_provider_state(state):
+                continue
+            key = (state.provider, state.provider_series_id)
+            if key not in seen:
+                states.append(state)
+                seen.add(key)
+    return states
 
 
 _DISCOVERY_FRANCHISE_RELATION_TYPES = frozenset(
@@ -784,6 +840,7 @@ def _build_discovery_recommendations(
     metadata_by_id: dict[int, Any],
     relations_by_id: dict[int, list[Any]],
     recommendation_edges_by_id: dict[int, list[Any]],
+    require_provider_availability: bool = False,
 ) -> list[Recommendation]:
     seed_weights: dict[int, int] = {}
     seed_recent_activity_bonus: dict[int, int] = {}
@@ -813,7 +870,7 @@ def _build_discovery_recommendations(
         is_neutral_seed, neutral_seed_score = _discovery_seed_score_is_neutral(meta)
         completion_bonus = _discovery_seed_completion_bonus(state)
         seed_status = _discovery_seed_status_value(meta)
-         
+
         if seed_status == "dropped":
             dropped_seed_ids.add(mal_anime_id)
         if seed_penalty_score is not None and seed_penalty_score <= 4:
@@ -861,8 +918,8 @@ def _build_discovery_recommendations(
 
     candidate_scores: dict[int, dict[str, Any]] = {}
     watched_ids = set(seed_weights)
-    mapped_ids = set(mapping_by_series.values())
-    provider_catalog_aliases = _provider_catalog_title_aliases(states)
+    availability_by_mal_id = _provider_availability_by_mal_id(states, mapping_by_series=mapping_by_series)
+    availability_by_title_alias = _provider_availability_by_title_alias(states)
     direct_franchise_relation_targets_by_source: dict[int, set[int]] = {}
     globally_related_franchise_targets: set[int] = set()
     for source_id in seed_weights:
@@ -876,7 +933,7 @@ def _build_discovery_recommendations(
     for source_id, weight in seed_weights.items():
         for edge in recommendation_edges_by_id.get(source_id, [])[:15]:
             target_id = edge.target_mal_anime_id
-            if target_id in watched_ids or target_id in mapped_ids:
+            if target_id in watched_ids:
                 continue
             if target_id in globally_related_franchise_targets:
                 continue
@@ -954,8 +1011,16 @@ def _build_discovery_recommendations(
                     continue
         candidate_title_aliases = _metadata_title_aliases(meta)
         candidate_title_aliases.update(_normalized_title_aliases(bucket.get("title")))
-        if candidate_title_aliases & provider_catalog_aliases:
+        available_states = _candidate_available_states(
+            target_id=target_id,
+            candidate_title_aliases=candidate_title_aliases,
+            availability_by_mal_id=availability_by_mal_id,
+            availability_by_title_alias=availability_by_title_alias,
+        )
+        if require_provider_availability and not available_states:
             continue
+        primary_available_state = _select_primary_available_state(available_states) if available_states else None
+        available_via_providers = sorted({state.provider for state in available_states})
         mean = meta.mean if meta is not None else None
         popularity = meta.popularity if meta is not None else None
         votes_by_source = bucket.get("votes_by_source") or {}
@@ -1220,18 +1285,32 @@ def _build_discovery_recommendations(
             reasons.append(f"MAL mean score: {mean}")
         if meta is None:
             reasons.append("full MAL metadata for this discovery candidate is not cached yet")
+        if available_via_providers:
+            reasons.append(f"available via registered provider catalog: {_format_provider_label(available_via_providers)}")
         title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
         items.append(
             Recommendation(
                 kind="discovery_candidate",
                 priority=priority,
-                provider="mal",
-                provider_series_id=f"mal:{target_id}",
-                title=title,
-                season_title=None,
+                provider=primary_available_state.provider if primary_available_state is not None else "mal",
+                provider_series_id=primary_available_state.provider_series_id if primary_available_state is not None else f"mal:{target_id}",
+                title=primary_available_state.title if primary_available_state is not None else title,
+                season_title=primary_available_state.season_title if primary_available_state is not None else None,
                 reasons=reasons,
                 context={
                     "mal_anime_id": target_id,
+                    "availability_visible": bool(available_states),
+                    "available_via_providers": available_via_providers,
+                    "available_provider_series": [
+                        {
+                            "provider": state.provider,
+                            "provider_series_id": state.provider_series_id,
+                            "title": state.title,
+                            "season_title": state.season_title,
+                            "watchlist_status": state.watchlist_status,
+                        }
+                        for state in available_states
+                    ],
                     "supporting_source_count": support_count,
                     "base_effective_supporting_seed_count": base_effective_supporting_seed_count,
                     "stale_consensus_discount": stale_consensus_discount,
