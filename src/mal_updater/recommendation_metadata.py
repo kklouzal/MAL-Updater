@@ -33,7 +33,7 @@ from .db import (
 from .mal_client import MalClient
 
 DETAIL_FIELDS = (
-    "id,title,alternative_titles,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,related_anime,recommendations,my_list_status"
+    "id,title,alternative_titles,main_picture,synopsis,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,related_anime,recommendations,my_list_status"
 )
 
 
@@ -195,7 +195,7 @@ def refresh_recommendation_metadata(
         for target_id, _info in ranked_targets:
             details = client.get_anime_details(
                 target_id,
-                fields="id,title,alternative_titles,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,my_list_status",
+                fields="id,title,alternative_titles,main_picture,synopsis,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,my_list_status",
             )
             alternative_titles = details.get("alternative_titles") or {}
             aliases: list[str] = []

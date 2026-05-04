@@ -81,7 +81,7 @@ class Recommendation:
 
     def as_dict(self) -> dict[str, Any]:
         providers = self.available_providers()
-        return {
+        payload = {
             "kind": self.kind,
             "priority": self.priority,
             "provider": self.provider,
@@ -95,6 +95,11 @@ class Recommendation:
             "reasons": self.reasons,
             "context": self.context,
         }
+        for key in ("cover_image_url", "synopsis", "why_recommended"):
+            value = self.context.get(key)
+            if isinstance(value, str) and value.strip():
+                payload[key] = value.strip()
+        return payload
 
 
 @dataclass(slots=True, frozen=True)
@@ -144,6 +149,57 @@ _PROVIDER_DISPLAY_NAMES = {
 def _format_provider_label(providers: list[str]) -> str:
     names = [_PROVIDER_DISPLAY_NAMES.get(provider, provider.replace("_", " ").title()) for provider in providers]
     return " + ".join(names)
+
+
+def _compact_text(value: object, *, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    compact = " ".join(value.split()).strip()
+    if not compact:
+        return None
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _mal_main_picture_url(meta: object) -> str | None:
+    raw = getattr(meta, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    picture = raw.get("main_picture")
+    if not isinstance(picture, dict):
+        return None
+    for key in ("large", "medium"):
+        value = picture.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _mal_synopsis(meta: object, *, max_chars: int = 420) -> str | None:
+    raw = getattr(meta, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    return _compact_text(raw.get("synopsis"), max_chars=max_chars)
+
+
+def _discovery_why_recommended(
+    *,
+    support_count: int,
+    votes: int,
+    provider_label: str,
+    mean: float | None,
+    start_season_label: str | None,
+) -> str:
+    pieces = [f"recommended from {support_count} watched seed title(s)"]
+    if votes > 0:
+        pieces.append(f"{votes} MAL recommendation vote(s)")
+    if start_season_label:
+        pieces.append(start_season_label)
+    if mean is not None:
+        pieces.append(f"MAL {mean:.2f}")
+    pieces.append(f"available on {provider_label}")
+    return "; ".join(pieces) + "."
 
 
 def _section_provider_metadata(items: list[Recommendation]) -> dict[str, Any]:
@@ -1400,6 +1456,16 @@ def _build_discovery_recommendations(
             else:
                 reasons.append(f"available via title-alias provider catalog match: {_format_provider_label(available_via_providers)}")
         title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
+        cover_image_url = _mal_main_picture_url(meta) if meta is not None else None
+        synopsis = _mal_synopsis(meta) if meta is not None else None
+        provider_label = _format_provider_label(available_via_providers) if available_via_providers else "provider catalog"
+        why_recommended = _discovery_why_recommended(
+            support_count=support_count,
+            votes=int(bucket["votes"]),
+            provider_label=provider_label,
+            mean=mean,
+            start_season_label=start_season_label,
+        )
         items.append(
             Recommendation(
                 kind="discovery_candidate",
@@ -1411,6 +1477,9 @@ def _build_discovery_recommendations(
                 reasons=reasons,
                 context={
                     "mal_anime_id": target_id,
+                    "cover_image_url": cover_image_url,
+                    "synopsis": synopsis,
+                    "why_recommended": why_recommended,
                     "availability_visible": bool(available_states),
                     "available_via_providers": available_via_providers,
                     "availability_confidence": availability_confidence,
