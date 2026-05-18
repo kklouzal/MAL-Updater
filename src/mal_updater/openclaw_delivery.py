@@ -101,6 +101,51 @@ def _trimmed_delivery_sections(config: AppConfig, sections: list[dict[str, objec
     return trimmed_sections
 
 
+def _recommendation_delivery_item_fingerprint(section_key: str, item: dict[str, object]) -> str:
+    basis = json.dumps(
+        {
+            "section": section_key,
+            "kind": item.get("kind"),
+            "provider_series_id": item.get("provider_series_id"),
+            "title": item.get("title"),
+            "season_title": item.get("season_title"),
+            "provider": item.get("provider"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def _filter_delivery_sections_by_item_fingerprint(
+    sections: list[dict[str, object]],
+    suppressed_fingerprints: set[str],
+) -> list[dict[str, object]]:
+    if not suppressed_fingerprints:
+        return sections
+    filtered_sections: list[dict[str, object]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section_key = str(section.get("key") or "other")
+        source_items = section.get("items")
+        if not isinstance(source_items, list):
+            continue
+        visible_items = [
+            item
+            for item in source_items
+            if isinstance(item, dict) and _recommendation_delivery_item_fingerprint(section_key, item) not in suppressed_fingerprints
+        ]
+        if not visible_items:
+            continue
+        copied = dict(section)
+        copied["items"] = visible_items
+        copied["count"] = len(visible_items)
+        copied["suppressed_recent_count"] = len(source_items) - len(visible_items)
+        filtered_sections.append(copied)
+    return filtered_sections
+
+
 def recommendation_delivery_item_fingerprints(payload: dict[str, object]) -> list[str]:
     sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     fingerprints: list[str] = []
@@ -111,19 +156,7 @@ def recommendation_delivery_item_fingerprints(payload: dict[str, object]) -> lis
         for item in section.get("items") or []:
             if not isinstance(item, dict):
                 continue
-            basis = json.dumps(
-                {
-                    "section": section_key,
-                    "kind": item.get("kind"),
-                    "provider_series_id": item.get("provider_series_id"),
-                    "title": item.get("title"),
-                    "season_title": item.get("season_title"),
-                    "provider": item.get("provider"),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            fingerprints.append(hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24])
+            fingerprints.append(_recommendation_delivery_item_fingerprint(section_key, item))
     return sorted(set(fingerprints))
 
 
@@ -133,6 +166,7 @@ def build_recommendation_delivery_payload(
     limit: int | None,
     include_dormant: bool,
     delivery_mode: str | None = None,
+    suppress_item_fingerprints: set[str] | None = None,
 ) -> dict[str, object]:
     normalized_mode = _normalize_delivery_mode(delivery_mode or config.openclaw.recommendations_webhook_delivery_mode)
     items = build_recommendations(
@@ -140,7 +174,11 @@ def build_recommendation_delivery_payload(
         limit=0,
         require_provider_availability=not include_dormant,
     )
-    grouped_sections = trim_grouped_recommendations(group_recommendations(items), limit)
+    grouped_sections = _filter_delivery_sections_by_item_fingerprint(
+        group_recommendations(items),
+        set(suppress_item_fingerprints or set()),
+    )
+    grouped_sections = trim_grouped_recommendations(grouped_sections, limit)
     delivery_sections = _trimmed_delivery_sections(config, grouped_sections, delivery_mode=normalized_mode)
     item_count = sum(int(section.get("count", 0)) for section in delivery_sections if isinstance(section, dict))
     fresh_item_count = sum(
@@ -210,6 +248,7 @@ def deliver_recommendations_via_openclaw(
     limit: int | None,
     include_dormant: bool,
     delivery_mode: str | None = None,
+    suppress_item_fingerprints: set[str] | None = None,
     dry_run: bool = False,
 ) -> OpenClawRecommendationDeliveryResult:
     payload = build_recommendation_delivery_payload(
@@ -217,6 +256,7 @@ def deliver_recommendations_via_openclaw(
         limit=limit,
         include_dormant=include_dormant,
         delivery_mode=delivery_mode,
+        suppress_item_fingerprints=suppress_item_fingerprints,
     )
     token, token_path = load_openclaw_recommendations_hook_token(config)
     request_url = (config.openclaw.recommendations_webhook_url or "").strip()

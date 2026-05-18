@@ -546,6 +546,8 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.assertEqual("push_recommendations_webhook:limit=6:mode=fresh", webhook_state["execution_signature"])
         self.assertEqual("abc123", webhook_state["last_delivery_request_id"])
         self.assertEqual(["fp-1"], webhook_state["last_delivery_item_fingerprints"])
+        self.assertIn("fp-1", webhook_state["delivery_item_fingerprint_history"])
+        self.assertIsInstance(webhook_state["last_delivery_epoch"], float)
 
     def test_run_pending_tasks_skips_unchanged_recommendations_webhook_push_lane(self) -> None:
         now = time.time()
@@ -586,6 +588,66 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.assertEqual("ok", webhook_result["status"])
         self.assertEqual("unchanged", webhook_result["delivery_status"])
         self.assertEqual(1, deliver.call_count)
+
+    def test_run_pending_tasks_uses_recent_delivery_history_as_item_cooldown(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendations_webhook_push_every_seconds = 1
+        self.config.service.task_execute_limits["push_recommendations_webhook"] = 6
+        self.config.openclaw.recommendations_webhook_enabled = True
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_fetch_crunchyroll": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "push_recommendations_webhook": {
+                            "delivery_item_fingerprint_history": {
+                                "recent-fp": now - 60,
+                                "expired-fp": now - (91 * 24 * 60 * 60),
+                            }
+                        },
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        preview = OpenClawRecommendationDeliveryResult(
+            status="dry_run",
+            request_url="http://127.0.0.1:18789/hooks/agent",
+            payload={"structured_payload": {"item_fingerprints": ["new-fp"]}},
+            request_id="new-request",
+        )
+        delivered = OpenClawRecommendationDeliveryResult(
+            status="delivered",
+            request_url="http://127.0.0.1:18789/hooks/agent",
+            payload={"structured_payload": {"item_fingerprints": ["new-fp"]}},
+            http_status=200,
+            request_id="new-request",
+        )
+        with patch("mal_updater.service_runtime.deliver_recommendations_via_openclaw", side_effect=[preview, delivered]) as deliver:
+            result = run_pending_tasks(self.config)
+
+        webhook_result = next(item for item in result["results"] if item["task"] == "push_recommendations_webhook")
+        self.assertEqual("delivered", webhook_result["delivery_status"])
+        self.assertEqual(1, webhook_result["suppressed_recent_item_count"])
+        for call in deliver.call_args_list:
+            self.assertTrue(call.kwargs["include_dormant"])
+            self.assertEqual({"recent-fp"}, call.kwargs["suppress_item_fingerprints"])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        history = state["tasks"]["push_recommendations_webhook"]["delivery_item_fingerprint_history"]
+        self.assertIn("recent-fp", history)
+        self.assertIn("new-fp", history)
+        self.assertNotIn("expired-fp", history)
 
     def test_run_pending_tasks_resets_stale_sync_apply_projection_when_execution_signature_changes(self) -> None:
         now = time.time()

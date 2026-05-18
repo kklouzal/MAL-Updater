@@ -9,7 +9,11 @@ from unittest.mock import patch
 
 from mal_updater.cli import main as cli_main
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.openclaw_delivery import build_recommendation_delivery_payload, deliver_recommendations_via_openclaw
+from mal_updater.openclaw_delivery import (
+    build_recommendation_delivery_payload,
+    deliver_recommendations_via_openclaw,
+    recommendation_delivery_item_fingerprints,
+)
 
 
 class _Response:
@@ -107,6 +111,37 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertIn("Delivery posture:", posted["message"])
         self.assertEqual("fresh", result.payload["structured_payload"]["delivery_mode"])
         self.assertEqual(7.0, urlopen_mock.call_args.kwargs["timeout"])
+
+    def test_build_recommendation_delivery_payload_suppresses_recent_items_before_trimming(self) -> None:
+        fake_sections = [
+            {
+                "key": "discovery_candidates",
+                "count": 4,
+                "items": [
+                    {"kind": "discovery_candidate", "provider_series_id": "mal:1", "title": "Old Pick"},
+                    {"kind": "discovery_candidate", "provider_series_id": "mal:2", "title": "New Pick A"},
+                    {"kind": "discovery_candidate", "provider_series_id": "mal:3", "title": "New Pick B"},
+                    {"kind": "discovery_candidate", "provider_series_id": "mal:4", "title": "New Pick C"},
+                ],
+            }
+        ]
+        old_fingerprint = recommendation_delivery_item_fingerprints(
+            {"sections": [{"key": "discovery_candidates", "items": [fake_sections[0]["items"][0]]}]}
+        )[0]
+        with (
+            patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[object()]),
+            patch("mal_updater.openclaw_delivery.group_recommendations", return_value=fake_sections),
+        ):
+            payload = build_recommendation_delivery_payload(
+                self.config,
+                limit=2,
+                include_dormant=True,
+                delivery_mode="digest",
+                suppress_item_fingerprints={old_fingerprint},
+            )
+
+        self.assertEqual(["New Pick A", "New Pick B"], [item["title"] for item in payload["sections"][0]["items"]])
+        self.assertEqual(1, payload["sections"][0]["suppressed_recent_count"])
 
     def test_deliver_recommendations_via_openclaw_returns_no_recommendations_without_post(self) -> None:
         with (

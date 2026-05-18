@@ -38,6 +38,7 @@ class TaskSpec:
     budget_provider: str | None = None
 
 
+_RECOMMENDATIONS_WEBHOOK_REPEAT_COOLDOWN_SECONDS = 90 * 24 * 60 * 60
 _BUDGET_GATE_WINDOW_SECONDS = 3600
 _FAILURE_BACKOFF_MIN_SECONDS = 300
 _AUTO_PROJECTED_REQUEST_PERCENTILE = 0.9
@@ -411,14 +412,60 @@ def _recommendations_webhook_push_limit(config: AppConfig) -> int:
     return max(0, int(push_limit))
 
 
+def _delivery_fingerprint_history(task_state: dict[str, Any], *, now_epoch: float) -> dict[str, float]:
+    raw_history = task_state.get("delivery_item_fingerprint_history")
+    history: dict[str, float] = {}
+    if isinstance(raw_history, dict):
+        for fingerprint, delivered_epoch in raw_history.items():
+            if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            if isinstance(delivered_epoch, (int, float)):
+                history[fingerprint] = float(delivered_epoch)
+    legacy_fingerprints = task_state.get("last_delivery_item_fingerprints")
+    if isinstance(legacy_fingerprints, list):
+        legacy_epoch = task_state.get("last_delivery_epoch") or task_state.get("last_run_epoch") or now_epoch
+        if isinstance(legacy_epoch, (int, float)):
+            for fingerprint in legacy_fingerprints:
+                if isinstance(fingerprint, str) and fingerprint:
+                    history.setdefault(fingerprint, float(legacy_epoch))
+    return history
+
+
+def _recent_delivery_fingerprints(task_state: dict[str, Any], *, now_epoch: float) -> set[str]:
+    cutoff_epoch = now_epoch - _RECOMMENDATIONS_WEBHOOK_REPEAT_COOLDOWN_SECONDS
+    return {
+        fingerprint
+        for fingerprint, delivered_epoch in _delivery_fingerprint_history(task_state, now_epoch=now_epoch).items()
+        if delivered_epoch >= cutoff_epoch
+    }
+
+
+def _record_delivery_fingerprints(task_state: dict[str, Any], item_fingerprints: list[str], *, now_epoch: float) -> None:
+    cutoff_epoch = now_epoch - _RECOMMENDATIONS_WEBHOOK_REPEAT_COOLDOWN_SECONDS
+    history = {
+        fingerprint: delivered_epoch
+        for fingerprint, delivered_epoch in _delivery_fingerprint_history(task_state, now_epoch=now_epoch).items()
+        if delivered_epoch >= cutoff_epoch
+    }
+    for fingerprint in item_fingerprints:
+        if fingerprint:
+            history[fingerprint] = now_epoch
+    task_state["delivery_item_fingerprint_history"] = dict(sorted(history.items()))
+    task_state["last_delivery_item_fingerprints"] = item_fingerprints
+    task_state["last_delivery_epoch"] = now_epoch
+
+
 def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, Any]) -> dict[str, Any]:
+    now_epoch = time.time()
     delivery_limit = _recommendations_webhook_push_limit(config)
     delivery_mode = config.openclaw.recommendations_webhook_delivery_mode
+    suppressed_fingerprints = _recent_delivery_fingerprints(task_state, now_epoch=now_epoch)
     preview = deliver_recommendations_via_openclaw(
         config,
         limit=delivery_limit,
-        include_dormant=False,
+        include_dormant=True,
         delivery_mode=delivery_mode,
+        suppress_item_fingerprints=suppressed_fingerprints,
         dry_run=True,
     )
     structured_payload = preview.payload.get("structured_payload") if isinstance(preview.payload, dict) else None
@@ -429,7 +476,18 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
             item_fingerprints = [str(value) for value in raw_fingerprints if isinstance(value, str) and value]
     request_id = preview.request_id
     previous_request_id = task_state.get("last_delivery_request_id")
-    previous_fingerprints = task_state.get("last_delivery_item_fingerprints") if isinstance(task_state.get("last_delivery_item_fingerprints"), list) else []
+    if not item_fingerprints:
+        return {
+            "status": "ok",
+            "label": "push_recommendations_webhook",
+            "delivery_status": "unchanged_recent_items",
+            "delivery_limit": delivery_limit,
+            "delivery_mode": delivery_mode,
+            "request_id": request_id,
+            "request_url": preview.request_url,
+            "suppressed_recent_item_count": len(suppressed_fingerprints),
+            "repeat_cooldown_days": 90,
+        }
     if request_id and previous_request_id == request_id:
         return {
             "status": "ok",
@@ -439,22 +497,15 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
             "delivery_mode": delivery_mode,
             "request_id": request_id,
             "request_url": preview.request_url,
-        }
-    if item_fingerprints and previous_fingerprints == item_fingerprints:
-        return {
-            "status": "ok",
-            "label": "push_recommendations_webhook",
-            "delivery_status": "unchanged_items",
-            "delivery_limit": delivery_limit,
-            "delivery_mode": delivery_mode,
-            "request_id": request_id,
-            "request_url": preview.request_url,
+            "suppressed_recent_item_count": len(suppressed_fingerprints),
+            "repeat_cooldown_days": 90,
         }
     delivery = deliver_recommendations_via_openclaw(
         config,
         limit=delivery_limit,
-        include_dormant=False,
+        include_dormant=True,
         delivery_mode=delivery_mode,
+        suppress_item_fingerprints=suppressed_fingerprints,
         dry_run=False,
     )
     result = {
@@ -466,6 +517,8 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
         "request_id": delivery.request_id,
         "request_url": delivery.request_url,
         "http_status": delivery.http_status,
+        "suppressed_recent_item_count": len(suppressed_fingerprints),
+        "repeat_cooldown_days": 90,
     }
     if delivery.reason is not None:
         result["reason"] = delivery.reason
@@ -474,11 +527,12 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
     if delivery.status == "delivered" and delivery.request_id:
         task_state["last_delivery_request_id"] = delivery.request_id
         task_state["last_delivery_http_status"] = delivery.http_status
-        task_state["last_delivery_item_fingerprints"] = item_fingerprints
+        _record_delivery_fingerprints(task_state, item_fingerprints, now_epoch=now_epoch)
     elif delivery.status == "no_recommendations":
         task_state.pop("last_delivery_request_id", None)
         task_state.pop("last_delivery_http_status", None)
         task_state.pop("last_delivery_item_fingerprints", None)
+        task_state.pop("last_delivery_epoch", None)
     return result
 
 

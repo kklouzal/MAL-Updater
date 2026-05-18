@@ -49,6 +49,7 @@ _ROMAN = {
 }
 
 _FRESH_DUBBED_EPISODE_WINDOW_DAYS = 21
+_DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED = 60
 
 _SEASON_ORDER = {
     "winter": 0,
@@ -198,7 +199,10 @@ def _discovery_why_recommended(
         pieces.append(start_season_label)
     if mean is not None:
         pieces.append(f"MAL {mean:.2f}")
-    pieces.append(f"available on {provider_label}")
+    if provider_label:
+        pieces.append(f"available on {provider_label}")
+    else:
+        pieces.append("MAL catalog discovery candidate")
     return "; ".join(pieces) + "."
 
 
@@ -1086,7 +1090,7 @@ def _build_discovery_recommendations(
         direct_franchise_relation_targets_by_source[source_id] = direct_targets
         globally_related_franchise_targets.update(direct_targets)
     for source_id, weight in seed_weights.items():
-        for edge in recommendation_edges_by_id.get(source_id, [])[:15]:
+        for edge in recommendation_edges_by_id.get(source_id, [])[:_DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED]:
             target_id = edge.target_mal_anime_id
             if target_id in watched_ids:
                 continue
@@ -1458,7 +1462,7 @@ def _build_discovery_recommendations(
         title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
         cover_image_url = _mal_main_picture_url(meta) if meta is not None else None
         synopsis = _mal_synopsis(meta) if meta is not None else None
-        provider_label = _format_provider_label(available_via_providers) if available_via_providers else "provider catalog"
+        provider_label = _format_provider_label(available_via_providers) if available_via_providers else ""
         why_recommended = _discovery_why_recommended(
             support_count=support_count,
             votes=int(bucket["votes"]),
