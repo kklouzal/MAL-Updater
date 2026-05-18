@@ -143,6 +143,52 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertEqual(["New Pick A", "New Pick B"], [item["title"] for item in payload["sections"][0]["items"]])
         self.assertEqual(1, payload["sections"][0]["suppressed_recent_count"])
 
+    def test_build_recommendation_delivery_payload_caps_dormant_discovery_items(self) -> None:
+        class _Item:
+            def __init__(self, title: str, provider_series_id: str, available: bool) -> None:
+                self.kind = "discovery_candidate"
+                self.provider_series_id = provider_series_id
+                self.title = title
+                self.context = {"availability_visible": available}
+
+            def as_dict(self) -> dict[str, object]:
+                return {
+                    "kind": self.kind,
+                    "provider_series_id": self.provider_series_id,
+                    "title": self.title,
+                    "context": self.context,
+                }
+
+        provider_item = _Item("Provider Pick", "provider-1", True)
+        dormant_items = [
+            provider_item,
+            _Item("Dormant Pick A", "mal:1", False),
+            _Item("Dormant Pick B", "mal:2", False),
+        ]
+
+        def fake_group(items: list[object]) -> list[dict[str, object]]:
+            return [
+                {
+                    "key": "discovery_candidates",
+                    "count": len(items),
+                    "items": [item.as_dict() for item in items],
+                }
+            ]
+
+        with (
+            patch("mal_updater.openclaw_delivery.build_recommendations", side_effect=[[provider_item], dormant_items]),
+            patch("mal_updater.openclaw_delivery.group_recommendations", side_effect=fake_group),
+        ):
+            payload = build_recommendation_delivery_payload(
+                self.config,
+                limit=10,
+                include_dormant=True,
+                delivery_mode="digest",
+                max_dormant_discovery_items=1,
+            )
+
+        self.assertEqual(["Provider Pick", "Dormant Pick A"], [item["title"] for item in payload["sections"][0]["items"]])
+
     def test_deliver_recommendations_via_openclaw_returns_no_recommendations_without_post(self) -> None:
         with (
             patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[]),

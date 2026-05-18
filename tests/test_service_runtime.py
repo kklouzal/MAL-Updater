@@ -642,6 +642,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         for call in deliver.call_args_list:
             self.assertTrue(call.kwargs["include_dormant"])
             self.assertEqual({"recent-fp"}, call.kwargs["suppress_item_fingerprints"])
+            self.assertEqual(1, call.kwargs["max_dormant_discovery_items"])
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         history = state["tasks"]["push_recommendations_webhook"]["delivery_item_fingerprint_history"]

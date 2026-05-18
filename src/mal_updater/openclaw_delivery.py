@@ -146,6 +146,46 @@ def _filter_delivery_sections_by_item_fingerprint(
     return filtered_sections
 
 
+def _demote_dormant_discovery_items(config: AppConfig, sections: list[dict[str, object]]) -> list[dict[str, object]]:
+    demoted_sections: list[dict[str, object]] = []
+    for section in sections:
+        if not isinstance(section, dict) or section.get("key") != "discovery_candidates":
+            demoted_sections.append(section)
+            continue
+        source_items = section.get("items")
+        if not isinstance(source_items, list):
+            demoted_sections.append(section)
+            continue
+        provider_items: list[dict[str, object]] = []
+        dormant_items: list[dict[str, object]] = []
+        other_items: list[object] = []
+        for item in source_items:
+            if not isinstance(item, dict):
+                other_items.append(item)
+                continue
+            context = item.get("context")
+            if isinstance(context, dict) and context.get("availability_visible") is False:
+                dormant_items.append(item)
+            else:
+                provider_items.append(item)
+        limit = max(0, int(config.openclaw.recommendations_webhook_section_limits.get("discovery_candidates", len(source_items))))
+        if dormant_items and limit > 0:
+            visible_provider_count = max(0, limit - 1)
+            ordered_items = [
+                *provider_items[:visible_provider_count],
+                dormant_items[0],
+                *provider_items[visible_provider_count:],
+                *dormant_items[1:],
+                *other_items,
+            ]
+        else:
+            ordered_items = [*provider_items, *dormant_items, *other_items]
+        copied = dict(section)
+        copied["items"] = ordered_items
+        demoted_sections.append(copied)
+    return demoted_sections
+
+
 def recommendation_delivery_item_fingerprints(payload: dict[str, object]) -> list[str]:
     sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     fingerprints: list[str] = []
@@ -167,17 +207,41 @@ def build_recommendation_delivery_payload(
     include_dormant: bool,
     delivery_mode: str | None = None,
     suppress_item_fingerprints: set[str] | None = None,
+    max_dormant_discovery_items: int | None = None,
 ) -> dict[str, object]:
     normalized_mode = _normalize_delivery_mode(delivery_mode or config.openclaw.recommendations_webhook_delivery_mode)
-    items = build_recommendations(
-        config,
-        limit=0,
-        require_provider_availability=not include_dormant,
-    )
+    suppressed_fingerprints = set(suppress_item_fingerprints or set())
+    if include_dormant and max_dormant_discovery_items is not None:
+        items = build_recommendations(config, limit=0, require_provider_availability=True)
+        dormant_limit = max(0, int(max_dormant_discovery_items))
+        if dormant_limit > 0:
+            provider_item_keys = {(item.kind, item.provider_series_id) for item in items}
+            dormant_items: list[object] = []
+            for item in build_recommendations(config, limit=0, require_provider_availability=False):
+                if item.kind != "discovery_candidate":
+                    continue
+                if (item.kind, item.provider_series_id) in provider_item_keys:
+                    continue
+                if item.context.get("availability_visible"):
+                    continue
+                fingerprint = _recommendation_delivery_item_fingerprint("discovery_candidates", item.as_dict())
+                if fingerprint in suppressed_fingerprints:
+                    continue
+                dormant_items.append(item)
+                if len(dormant_items) >= dormant_limit:
+                    break
+            items.extend(dormant_items)
+    else:
+        items = build_recommendations(
+            config,
+            limit=0,
+            require_provider_availability=not include_dormant,
+        )
     grouped_sections = _filter_delivery_sections_by_item_fingerprint(
         group_recommendations(items),
-        set(suppress_item_fingerprints or set()),
+        suppressed_fingerprints,
     )
+    grouped_sections = _demote_dormant_discovery_items(config, grouped_sections)
     grouped_sections = trim_grouped_recommendations(grouped_sections, limit)
     delivery_sections = _trimmed_delivery_sections(config, grouped_sections, delivery_mode=normalized_mode)
     item_count = sum(int(section.get("count", 0)) for section in delivery_sections if isinstance(section, dict))
@@ -249,6 +313,7 @@ def deliver_recommendations_via_openclaw(
     include_dormant: bool,
     delivery_mode: str | None = None,
     suppress_item_fingerprints: set[str] | None = None,
+    max_dormant_discovery_items: int | None = None,
     dry_run: bool = False,
 ) -> OpenClawRecommendationDeliveryResult:
     payload = build_recommendation_delivery_payload(
@@ -257,6 +322,7 @@ def deliver_recommendations_via_openclaw(
         include_dormant=include_dormant,
         delivery_mode=delivery_mode,
         suppress_item_fingerprints=suppress_item_fingerprints,
+        max_dormant_discovery_items=max_dormant_discovery_items,
     )
     token, token_path = load_openclaw_recommendations_hook_token(config)
     request_url = (config.openclaw.recommendations_webhook_url or "").strip()

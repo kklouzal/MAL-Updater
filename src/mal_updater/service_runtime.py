@@ -466,6 +466,7 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
         include_dormant=True,
         delivery_mode=delivery_mode,
         suppress_item_fingerprints=suppressed_fingerprints,
+        max_dormant_discovery_items=1,
         dry_run=True,
     )
     structured_payload = preview.payload.get("structured_payload") if isinstance(preview.payload, dict) else None
@@ -506,6 +507,7 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
         include_dormant=True,
         delivery_mode=delivery_mode,
         suppress_item_fingerprints=suppressed_fingerprints,
+        max_dormant_discovery_items=1,
         dry_run=False,
     )
     result = {
