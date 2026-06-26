@@ -43,7 +43,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         return exit_code, stdout.getvalue()
 
     def test_bootstrap_audit_json_exposes_provider_readiness_and_recommended_commands(self) -> None:
-        exit_code, stdout = self._run_bootstrap_audit_raw()
+        with patch("importlib.util.find_spec", return_value=None):
+            exit_code, stdout = self._run_bootstrap_audit_raw()
         payload = json.loads(stdout)
 
         self.assertEqual(0, exit_code)
@@ -177,7 +178,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
 
-        exit_code, stdout = self._run_bootstrap_audit_raw()
+        with patch("importlib.util.find_spec", return_value=None):
+            exit_code, stdout = self._run_bootstrap_audit_raw()
         payload = json.loads(stdout)
 
         self.assertEqual(0, exit_code)
@@ -217,13 +219,13 @@ class BootstrapAuditCliTests(unittest.TestCase):
         payload = json.loads(stdout)
 
         self.assertEqual(0, exit_code)
-        self.assertEqual("daemon-expected-for-unattended", payload["summary"]["operation_mode"])
+        self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
         self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
-        self.assertTrue(payload["summary"]["daemon_expected"])
+        self.assertFalse(payload["summary"]["daemon_expected"])
         self.assertEqual(1, payload["summary"]["intended_provider_count"])
-        self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
-        self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
-        self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
+        self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
+        self.assertEqual("bootstrap-provider-staged", payload["operation_modes"]["mode"])
+        self.assertEqual("blocked-missing-transport", payload["providers"]["crunchyroll"]["operation_mode"])
 
     def test_bootstrap_audit_surfaces_health_recommended_provider_full_refresh(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
@@ -712,7 +714,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,
         )
-        self.assertIn("partially_staged_provider_count=1", stdout)
+        self.assertIn("partially_staged_provider_count=2", stdout)
 
     def test_bootstrap_audit_carries_health_mapping_review_recommendation(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"

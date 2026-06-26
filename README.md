@@ -53,7 +53,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 
 1. Run `bootstrap-audit`
 2. Create the external runtime dirs and SQLite DB with `init`
-3. Create the MyAnimeList app and configure the redirect URI reported by `status`
+3. Create the MyAnimeList app and configure the callback URI printed by the bootstrap helper or reported by `status`
 4. Stage the MAL client id in `.MAL-Updater/secrets/`
 5. Run `mal-auth-login` to persist MAL access/refresh tokens
 6. For each source provider you want enabled, stage that provider's credentials in `.MAL-Updater/secrets/`
@@ -84,7 +84,8 @@ PYTHONPATH=src python3 -m mal_updater.cli exact-approved-sync-cycle
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --provider all
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only
-PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute
+# Live MAL writes are intentionally not part of the routine smoke-check flow.
+# Use dry-run-sync first; only run apply-sync --execute after explicit operator approval.
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
 ```
 
@@ -163,3 +164,30 @@ Use the upstream issue tracker for bug reports, integration problems, unexpected
 - Operations: `references/OPERATIONS.md`
 - Automation: `references/AUTOMATION.md`
 - MAL OAuth details: `references/MAL_OAUTH.md`
+
+## Production bootstrap script
+
+For an interactive production setup, run the repo-owned bootstrap helper from any current directory:
+
+```bash
+/Warehouse/MAL-Updater/scripts/bootstrap.sh
+```
+
+The script resolves the repository root from its own location, creates or reuses a repo-local virtualenv at `.venv` by default, installs the package in editable mode with the Crunchyroll extra into that virtualenv (`.venv/bin/python -m pip install -e '.[crunchyroll]'`), runs CLI/bootstrap/audit/health steps with the same virtualenv Python, stages credentials, runs auth bootstraps, prints read-only audit/health summaries, and installs the user-level systemd service with `scripts/install_user_systemd_units.sh` rendered to use that same Python. During bootstrap it detects the host LAN IPv4 address (`ip route get 1.1.1.1`, then `hostname -I` fallback), prompts to accept or override it, and updates the resolved runtime `settings.toml` (normally `.MAL-Updater/config/settings.toml`) so `mal-auth-login` listens on `0.0.0.0:8765` while advertising `http://<host-ip>:8765/callback`. Register the exact callback URI printed by the script in the MyAnimeList API app before accepting the MAL OAuth login step. Set `MAL_UPDATER_BOOTSTRAP_REDIRECT_HOST=<ip-or-hostname>` to override the detected redirect host non-interactively. It prompts before dependency install, each auth step, and service start/restart; service installation/enabling remains handled by the repo-owned install script. Set `MAL_UPDATER_BOOTSTRAP_VENV=/path/to/venv` to use a different virtualenv path, or `PYTHON_BIN=/path/to/python3` to choose the interpreter used to create the virtualenv.
+
+Credential prompts never echo passwords/secrets, and existing credential files can be kept without displaying their contents. By default, files are written under the resolved runtime secrets directory, normally `.MAL-Updater/secrets/`, with directory mode `700` and one-line secret files mode `600`:
+
+- `mal_client_id.txt`
+- `mal_client_secret.txt`
+- `crunchyroll_username.txt`
+- `crunchyroll_password.txt`
+- `hidive_username.txt`
+- `hidive_password.txt`
+
+The auth steps are interactive and may require browser/callback or provider network access:
+
+- `mal-auth-login`
+- `provider-auth-login --provider crunchyroll`
+- `provider-auth-login --provider hidive`
+
+The bootstrap script intentionally does **not** run `apply-sync --execute` or any destructive/live MAL write path beyond OAuth/provider token exchange. It also avoids live provider fetches; use the normal audited CLI flow after bootstrap when you are ready to fetch snapshots or sync.

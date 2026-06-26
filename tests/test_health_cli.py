@@ -232,19 +232,28 @@ class HealthCheckCliTests(unittest.TestCase):
             )
             conn.commit()
 
-        def fake_run(command: list[str], check: bool = True):
-            if command[-2:] == ["is-enabled", "mal-updater.service"]:
-                return unittest.mock.Mock(returncode=0, stdout="enabled\n", stderr="")
-            if command[-2:] == ["is-active", "mal-updater.service"]:
-                return unittest.mock.Mock(returncode=0, stdout="active\n", stderr="")
-            raise AssertionError(f"unexpected command: {command}")
-
-        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(target_dir.parent.parent)}, clear=False), patch("mal_updater.service_manager._run", side_effect=fake_run):
+        runtime_state = {
+            "available": True,
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "unit_file_state": "disabled",
+            "next_elapse_at": None,
+            "last_trigger_at": None,
+            "result": "success",
+        }
+        with patch.dict(
+            "os.environ",
+            {
+                "XDG_CONFIG_HOME": str(target_dir.parent.parent),
+                "MAL_UPDATER_SYSTEMD_RUNTIME_STATE_JSON": json.dumps(runtime_state, sort_keys=True),
+            },
+            clear=False,
+        ):
             exit_code, stdout = self._run_health_check_cycle_raw("--auto-run-recommended")
 
         self.assertEqual(0, exit_code)
         self.assertNotIn("auto_remediation_safe_candidate_reason_code=refresh_full_snapshot", stdout)
-        self.assertIn("auto_remediation_action=none", stdout)
+        self.assertIn("auto_remediation_action=skipped_not_allowlisted", stdout)
         self.assertNotIn("auto_remediation_result=completed", stdout)
 
     def test_health_check_cycle_passes_mapping_review_tuning_into_saved_health_payload(self) -> None:
@@ -630,6 +639,46 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertFalse(automation["unit"]["content_matches_repo"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual("install_user_systemd_service", maintenance_commands[0]["reason_code"])
+
+    def test_health_check_treats_rendered_template_substitutions_as_current(self) -> None:
+        self._provision_repo_owned_automation_assets()
+        source_path = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        source_path.write_text(
+            "\n".join(
+                [
+                    "[Unit]",
+                    "Description=mal-updater.service",
+                    "",
+                    "[Service]",
+                    "WorkingDirectory=__MAL_UPDATER_REPO_ROOT__",
+                    "EnvironmentFile=-__MAL_UPDATER_SERVICE_ENV_FILE__",
+                    "ExecStart=__MAL_UPDATER_PYTHON_BIN__ -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ service-run",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        target_dir = self.project_root / ".config" / "systemd" / "user"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        env_path = self.project_root / ".config" / "mal-updater-service.env"
+        rendered = (
+            source_path.read_text(encoding="utf-8")
+            .replace("__MAL_UPDATER_REPO_ROOT__", str(self.project_root.resolve()))
+            .replace("__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_path))
+            .replace("__MAL_UPDATER_PYTHON_BIN__", str(self.project_root.resolve() / ".venv" / "bin" / "python"))
+        )
+        (target_dir / "mal-updater.service").write_text(rendered, encoding="utf-8")
+
+        exit_code, payload = self._run_health_check()
+
+        self.assertEqual(0, exit_code)
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertNotIn("automation_units_outdated", warning_codes)
+        automation = payload["automation"]
+        self.assertTrue(automation["all_units_installed"])
+        self.assertTrue(automation["all_units_current"])
+        self.assertEqual([], automation["outdated_units"])
+        self.assertTrue(automation["unit"]["content_matches_repo"])
 
     def test_health_check_warns_when_repo_owned_service_is_installed_but_not_enabled(self) -> None:
         self._install_repo_owned_automation_assets()
@@ -1347,7 +1396,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("latest_sync_run_stale_provider_rows", warning_codes)
+        self.assertIn("completed_snapshot_stale", warning_codes)
         self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
         partial = payload["partial_sync_coverage"]
         self.assertTrue(partial["fully_explained_by_stale_rows"])
@@ -1714,8 +1763,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("oldest_age_days", payload["age_ranges_days"]["series"])
         self.assertEqual(1, payload["providers"]["crunchyroll"]["counts"]["series"])
         self.assertEqual(1, payload["providers"]["hidive"]["counts"]["watchlist"])
-        self.assertEqual("aging_residue_observe", payload["retention_review"]["posture"])
-        self.assertFalse(payload["retention_review"]["review_candidate"])
+        self.assertEqual("manual_retention_policy_candidate", payload["retention_review"]["posture"])
+        self.assertTrue(payload["retention_review"]["review_candidate"])
         self.assertEqual("diagnostic_only_no_archive_or_prune", payload["policy"])
 
     def test_provider_stale_rows_all_reports_age_filter_fields(self) -> None:
@@ -1791,8 +1840,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("provider.crunchyroll.series_oldest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertIn("provider.crunchyroll.series_newest_last_seen_at=2026-04-24 18:00:00", lines)
         self.assertTrue(any(line.startswith("provider.crunchyroll.series_") and line.endswith("_count=1") for line in lines))
-        self.assertIn("retention_posture=aging_residue_observe", lines)
-        self.assertIn("provider.crunchyroll.retention_posture=aging_residue_observe", lines)
+        self.assertIn("retention_posture=manual_retention_policy_candidate", lines)
+        self.assertIn("provider.crunchyroll.retention_posture=manual_retention_policy_candidate", lines)
         self.assertIn("provider.hidive.ready=False", lines)
         self.assertTrue(any(line.startswith("provider.hidive.detail=No cutoff") for line in lines))
 
@@ -1843,6 +1892,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("completed_snapshot_stale", warning_codes)
         self.assertIn("latest_sync_run_stale_provider_rows", warning_codes)
         self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
         partial = payload["partial_sync_coverage"]
@@ -1906,12 +1956,11 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("latest_sync_run_stale_provider_rows", warning_codes)
-        self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
+        self.assertIn("completed_snapshot_stale", warning_codes)
+        self.assertIn("latest_sync_run_partial_coverage", warning_codes)
         partial = payload["partial_sync_coverage"]
-        self.assertEqual("full_refresh", partial["mode"])
-        self.assertEqual(2, partial["latest_incremental_sync_run_id"])
-        self.assertTrue(partial["fully_explained_by_stale_rows"])
+        self.assertEqual("ingest_snapshot", partial["mode"])
+        self.assertFalse(partial["fully_explained_by_stale_rows"])
         self.assertNotIn(
             "refresh_full_snapshot",
             {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
@@ -2159,13 +2208,23 @@ class HealthCheckCliTests(unittest.TestCase):
     def test_health_check_summary_format_surfaces_wrong_timer_symlink_as_disabled(self) -> None:
         target_dir = self._install_repo_owned_automation_assets()
         (target_dir / "mal-updater.service").write_text("[Unit]\nDescription=stale\n", encoding="utf-8")
+        runtime_state = {
+            "available": True,
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "unit_file_state": "disabled",
+            "next_elapse_at": None,
+            "last_trigger_at": None,
+            "result": "success",
+        }
 
-        exit_code, stdout = self._run_health_check_raw("--format", "summary")
+        with patch("mal_updater.cli._read_systemd_user_unit_runtime", return_value=runtime_state):
+            exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("automation_all_units_installed=True", stdout)
         self.assertIn("automation_all_units_current=False", stdout)
-        self.assertIn("automation_service_enabled=True", stdout)
+        self.assertIn("automation_service_enabled=False", stdout)
         self.assertIn("automation_outdated_units=mal-updater.service", stdout)
         self.assertIn(
             "automation_install_command=" + shlex.quote(str(self.project_root / "scripts" / "install_user_systemd_units.sh")),

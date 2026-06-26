@@ -11,6 +11,7 @@ RELOAD_DAEMON=1
 START_SERVICE=0
 COPY_SERVICE_ENV=1
 DRY_RUN=0
+SERVICE_PYTHON_BIN="${MAL_UPDATER_SERVICE_PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 
 usage() {
   cat <<'EOF'
@@ -25,6 +26,7 @@ Options:
   --start-service             After install/reload, start the service immediately.
   --no-daemon-reload          Skip `systemctl --user daemon-reload`.
   --no-service-env            Do not copy the example service env file.
+  --service-python-bin PATH   Python executable for the rendered service (default: repo .venv).
   --dry-run                   Print planned actions without changing anything.
   -h, --help                  Show this help.
 EOF
@@ -64,16 +66,18 @@ render_unit() {
     printf '[dry-run] render %q -> %q\n' "$source_path" "$target_path"
     return 0
   fi
-  python3 - "$source_path" "$target_path" "$ROOT_DIR" "$SERVICE_ENV_TARGET" <<'PY'
+  python3 - "$source_path" "$target_path" "$ROOT_DIR" "$SERVICE_ENV_TARGET" "$SERVICE_PYTHON_BIN" <<'PY'
 from pathlib import Path
 import sys
 source_path = Path(sys.argv[1])
 target_path = Path(sys.argv[2])
 repo_root = Path(sys.argv[3]).resolve()
 service_env_target = sys.argv[4]
+service_python_bin = sys.argv[5]
 text = source_path.read_text(encoding='utf-8')
 text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
 text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
+text = text.replace('__MAL_UPDATER_PYTHON_BIN__', service_python_bin)
 target_path.parent.mkdir(parents=True, exist_ok=True)
 target_path.write_text(text, encoding='utf-8')
 PY
@@ -102,6 +106,11 @@ while [[ $# -gt 0 ]]; do
     --no-daemon-reload)
       RELOAD_DAEMON=0
       shift
+      ;;
+    --service-python-bin)
+      [[ $# -ge 2 ]] || { echo "missing value for $1" >&2; exit 2; }
+      SERVICE_PYTHON_BIN="$2"
+      shift 2
       ;;
     --no-service-env)
       COPY_SERVICE_ENV=0
@@ -136,16 +145,19 @@ log "repo_root=$ROOT_DIR"
 log "source_dir=$SOURCE_DIR"
 log "target_dir=$TARGET_DIR"
 log "service_env_target=$SERVICE_ENV_TARGET"
+log "service_python_bin=$SERVICE_PYTHON_BIN"
 
-rendered_content="$(python3 - "$SOURCE_PATH" "$ROOT_DIR" "$SERVICE_ENV_TARGET" <<'PY'
+rendered_content="$(python3 - "$SOURCE_PATH" "$ROOT_DIR" "$SERVICE_ENV_TARGET" "$SERVICE_PYTHON_BIN" <<'PY'
 from pathlib import Path
 import sys
 source_path = Path(sys.argv[1])
 repo_root = Path(sys.argv[2]).resolve()
 service_env_target = sys.argv[3]
+service_python_bin = sys.argv[4]
 text = source_path.read_text(encoding='utf-8')
 text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
 text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
+text = text.replace('__MAL_UPDATER_PYTHON_BIN__', service_python_bin)
 print(text, end='')
 PY
 )"

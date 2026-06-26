@@ -72,8 +72,10 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             rendered = copied_path.read_text(encoding="utf-8")
             self.assertNotIn("__MAL_UPDATER_REPO_ROOT__", rendered)
             self.assertNotIn("__MAL_UPDATER_SERVICE_ENV_FILE__", rendered)
+            self.assertNotIn("__MAL_UPDATER_PYTHON_BIN__", rendered)
             self.assertNotIn("__MAL_UPDATER_WORKSPACE_ROOT__", rendered)
             self.assertIn(str(self.repo_root), rendered)
+            self.assertIn(f"ExecStart={self.repo_root}/.venv/bin/python -m mal_updater.cli", rendered)
 
             expected_env = (self.source_dir / "mal-updater-service.env.example").read_text(encoding="utf-8")
             self.assertEqual(expected_env, env_target.read_text(encoding="utf-8"))
@@ -112,6 +114,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
                 unit_path.read_text(encoding="utf-8")
                 .replace("__MAL_UPDATER_REPO_ROOT__", str(self.repo_root))
                 .replace("__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_target))
+                .replace("__MAL_UPDATER_PYTHON_BIN__", str(self.repo_root / ".venv" / "bin" / "python"))
             )
             (target_dir / unit_path.name).write_text(rendered_unchanged, encoding="utf-8")
 

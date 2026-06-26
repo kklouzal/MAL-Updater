@@ -461,16 +461,6 @@ def _provider_bootstrap_guidance_status(
             **_guidance_command_fields(command=None),
         }
 
-    if not transport_ready:
-        return {
-            "mode": "blocked-missing-transport",
-            "intended": True,
-            "partially_staged": True,
-            "ready": False,
-            "details": f"{title} bootstrap state is staged but required transport support is missing on this host, so finish transport setup before relying on unattended fetches.",
-            **_guidance_command_fields(command=None),
-        }
-
     if credentials_present and session_present and isinstance(auth_issue, dict):
         reason = auth_issue.get("reason")
         auth_failure_kind = str(auth_issue.get("auth_failure_kind") or "") or None
@@ -539,6 +529,16 @@ def _provider_bootstrap_guidance_status(
                 automation_safe=True,
                 requires_auth_interaction=False,
             ),
+        }
+
+    if not transport_ready:
+        return {
+            "mode": "blocked-missing-transport",
+            "intended": True,
+            "partially_staged": True,
+            "ready": False,
+            "details": f"{title} bootstrap state is staged but required transport support is missing on this host, so finish transport setup before relying on unattended fetches.",
+            **_guidance_command_fields(command=None),
         }
 
     if credentials_present and session_present:
@@ -646,6 +646,7 @@ def _bootstrap_operation_mode_status(
     mal_oauth_present: bool,
     crunchyroll_credentials_present: bool,
     crunchyroll_session_present: bool,
+    crunchyroll_transport_ready: bool,
     hidive_credentials_present: bool,
     hidive_session_present: bool,
 ) -> dict[str, object]:
@@ -653,10 +654,12 @@ def _bootstrap_operation_mode_status(
         "crunchyroll": {
             "credentials_present": crunchyroll_credentials_present,
             "session_present": crunchyroll_session_present,
+            "transport_ready": crunchyroll_transport_ready,
         },
         "hidive": {
             "credentials_present": hidive_credentials_present,
             "session_present": hidive_session_present,
+            "transport_ready": True,
         },
     }
     intended_provider_count = sum(
@@ -667,7 +670,7 @@ def _bootstrap_operation_mode_status(
     ready_provider_count = sum(
         1
         for payload in provider_states.values()
-        if payload["credentials_present"] and payload["session_present"]
+        if payload["credentials_present"] and payload["session_present"] and payload["transport_ready"]
     )
     partially_staged_provider_count = max(0, intended_provider_count - ready_provider_count)
     unattended_ready = runtime_initialized and mal_oauth_present and intended_provider_count > 0 and partially_staged_provider_count == 0
@@ -812,6 +815,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
         mal_oauth_present=mal_oauth_present and not isinstance(mal_auth_issue, dict),
         crunchyroll_credentials_present=crunchyroll_credentials_present,
         crunchyroll_session_present=crunchyroll_session_present and not isinstance(provider_auth_issues.get("crunchyroll"), dict),
+        crunchyroll_transport_ready=dependency_checks["curl_cffi"],
         hidive_credentials_present=hidive_credentials_present,
         hidive_session_present=hidive_session_present and not isinstance(provider_auth_issues.get("hidive"), dict),
     )
@@ -872,18 +876,6 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             user_action_required=True,
             applies_to="host",
         )
-    if not dependency_checks["curl_cffi"]:
-        add_onboarding_step(
-            step="install-optional-crunchyroll-transport",
-            details="Install the optional crunchyroll extra (`pip install -e '.[crunchyroll]'`) for browser-TLS impersonation against Crunchyroll.",
-            user_action_required=False,
-            command="python3 -m pip install -e '.[crunchyroll]'",
-            command_args=["python3", "-m", "pip", "install", "-e", ".[crunchyroll]"],
-            applies_to="crunchyroll",
-            automation_safe=True,
-            requires_auth_interaction=False,
-        )
-
     if not mal_app_present:
         add_onboarding_step(
             step="create-mal-app",
@@ -944,7 +936,7 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
             automation_safe=False,
             requires_auth_interaction=False,
         )
-    elif isinstance(provider_auth_issues.get("crunchyroll"), dict) and dependency_checks["curl_cffi"]:
+    elif isinstance(provider_auth_issues.get("crunchyroll"), dict):
         auth_issue_reason = provider_auth_issues["crunchyroll"].get("reason")
         failure_label = _describe_auth_failure_kind({
             "kind": str(provider_auth_issues["crunchyroll"].get("auth_failure_kind")),
@@ -1054,6 +1046,18 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
                 automation_safe=review_recommendation.get("automation_safe") is True,
                 requires_auth_interaction=review_recommendation.get("requires_auth_interaction") is True,
             )
+    crunchyroll_intended_for_transport = crunchyroll_credentials_present or crunchyroll_session_present
+    if crunchyroll_intended_for_transport and not dependency_checks["curl_cffi"]:
+        add_onboarding_step(
+            step="install-optional-crunchyroll-transport",
+            details="Install the optional crunchyroll extra (`pip install -e '.[crunchyroll]'`) for browser-TLS impersonation against Crunchyroll.",
+            user_action_required=False,
+            command="python3 -m pip install -e '.[crunchyroll]'",
+            command_args=["python3", "-m", "pip", "install", "-e", ".[crunchyroll]"],
+            applies_to="crunchyroll",
+            automation_safe=True,
+            requires_auth_interaction=False,
+        )
     if not dependency_checks["systemctl"]:
         add_onboarding_step(
             step="install-service-manager",
@@ -1833,6 +1837,19 @@ def _format_systemd_usec_timestamp(value: str) -> str | None:
 
 
 def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
+    test_runtime_state = os.environ.get("MAL_UPDATER_SYSTEMD_RUNTIME_STATE_JSON")
+    if test_runtime_state:
+        try:
+            payload = json.loads(test_runtime_state)
+        except json.JSONDecodeError as exc:
+            return {"available": False, "error": f"invalid MAL_UPDATER_SYSTEMD_RUNTIME_STATE_JSON: {exc}"}
+        if not isinstance(payload, dict):
+            return {"available": False, "error": "MAL_UPDATER_SYSTEMD_RUNTIME_STATE_JSON must decode to an object"}
+        unit_payload = payload.get(unit_name) if unit_name in payload else payload
+        if not isinstance(unit_payload, dict):
+            return {"available": False, "error": f"runtime state override for {unit_name} must be an object"}
+        return dict(unit_payload)
+
     properties = [
         "ActiveState",
         "SubState",
@@ -1881,10 +1898,23 @@ def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
 
 
 
-def _render_systemd_unit_template(source_path: Path, project_root: Path, env_path: Path) -> str:
+def _render_systemd_unit_template(
+    source_path: Path,
+    project_root: Path,
+    env_path: Path,
+    python_bin: Path | str | None = None,
+) -> str:
     text = source_path.read_text(encoding="utf-8")
-    return text.replace("__MAL_UPDATER_REPO_ROOT__", str(project_root)).replace(
-        "__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_path)
+    resolved_project_root = project_root.resolve()
+    service_python_bin = str(
+        python_bin
+        or os.environ.get("MAL_UPDATER_SERVICE_PYTHON_BIN")
+        or (resolved_project_root / ".venv" / "bin" / "python")
+    )
+    return (
+        text.replace("__MAL_UPDATER_REPO_ROOT__", str(resolved_project_root))
+        .replace("__MAL_UPDATER_SERVICE_ENV_FILE__", str(env_path))
+        .replace("__MAL_UPDATER_PYTHON_BIN__", service_python_bin)
     )
 
 

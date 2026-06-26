@@ -389,15 +389,27 @@ def _get_nested_table(data: dict[str, Any], parent: str, child: str) -> dict[str
 
 
 def _get_dotted_nested_tables(data: dict[str, Any], *parts: str) -> dict[str, dict[str, Any]]:
-    prefix = ".".join(parts) + "."
     tables: dict[str, dict[str, Any]] = {}
+
+    current: Any = data
+    for part in parts:
+        if not isinstance(current, dict):
+            current = None
+            break
+        current = current.get(part)
+    if isinstance(current, dict):
+        for key, value in current.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                tables[key] = dict(value)
+
+    prefix = ".".join(parts) + "."
     for key, value in data.items():
         if not isinstance(key, str) or not key.startswith(prefix) or not isinstance(value, dict):
             continue
         suffix = key[len(prefix):]
         if not suffix:
             continue
-        tables[suffix] = dict(value)
+        tables[suffix] = {**tables.get(suffix, {}), **dict(value)}
     return tables
 
 

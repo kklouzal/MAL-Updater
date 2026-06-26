@@ -7,7 +7,7 @@ Type=simple
 WorkingDirectory=__MAL_UPDATER_REPO_ROOT__
 Environment=PYTHONPATH=__MAL_UPDATER_REPO_ROOT__/src
 EnvironmentFile=-__MAL_UPDATER_SERVICE_ENV_FILE__
-ExecStart=python3 -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ service-run
+ExecStart=__MAL_UPDATER_PYTHON_BIN__ -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ service-run
 Restart=always
 RestartSec=15
 
