@@ -64,6 +64,8 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 
 Normal unattended operation now assumes **all credentialed providers stay enabled** and are swept by separate background fetch lanes before aggregate MAL planning/apply runs.
 
+Provider pacing/politeness policy: Crunchyroll and HIDIVE access must stay account-scoped and title/detail-specific. Do not use MAL-Updater to crawl or scrape whole Crunchyroll/HIDIVE libraries; provider fetch/full-refresh commands are for the signed-in account's currently reachable history/watchlist/continue-watching surfaces, and recommendation enrichment should query provider details only for specific titles when needed. MAL metadata/recommendation refreshes may cover broader mapped/recommended MAL IDs, but keep them paced by the client throttling, prefer bounded limits for catch-up work, and spread large refreshes over time.
+
 See `references/bootstrap-onboarding.md` for the detailed agent-facing flow.
 
 ## Core commands

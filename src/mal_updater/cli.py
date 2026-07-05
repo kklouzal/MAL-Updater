@@ -6280,7 +6280,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_auth_login.add_argument("--no-verify", action="store_true", help="Skip any provider-specific follow-up account verification step")
     provider_fetch_snapshot = subparsers.add_parser(
         "provider-fetch-snapshot",
-        help="Fetch a live normalized snapshot from a named content provider",
+        help="Fetch account-scoped history/watchlist details from a named content provider; not a whole-library crawler",
     )
     provider_fetch_snapshot.add_argument("--provider", required=True, choices=list_provider_slugs(), help="Provider slug")
     provider_fetch_snapshot.add_argument("--profile", default="default", help="Provider state profile name")
@@ -6289,7 +6289,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_fetch_snapshot.add_argument(
         "--full-refresh",
         action="store_true",
-        help="Ignore provider-local incremental boundaries and fetch the full currently reachable history/watchlist surfaces",
+        help="Ignore provider-local incremental boundaries and re-fetch account-scoped history/watchlist surfaces only; never crawl whole Crunchyroll/HIDIVE libraries",
     )
     crunchyroll_auth_login = subparsers.add_parser(
         "crunchyroll-auth-login",
@@ -6299,7 +6299,7 @@ def build_parser() -> argparse.ArgumentParser:
     crunchyroll_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /accounts/v1/me token check")
     crunchyroll_fetch_snapshot = subparsers.add_parser(
         "crunchyroll-fetch-snapshot",
-        help="Use the Python Crunchyroll transport to fetch a live normalized snapshot",
+        help="Use the Python Crunchyroll transport to fetch account-scoped history/watchlist details; not a whole-library crawler",
     )
     crunchyroll_fetch_snapshot.add_argument("--profile", default="default", help="Crunchyroll state profile name")
     crunchyroll_fetch_snapshot.add_argument("--out", type=Path, default=None, help="Optional JSON file path to write the fetched snapshot")
@@ -6307,7 +6307,7 @@ def build_parser() -> argparse.ArgumentParser:
     crunchyroll_fetch_snapshot.add_argument(
         "--full-refresh",
         action="store_true",
-        help="Ignore the local incremental sync boundary and fetch the full currently reachable Crunchyroll history/watchlist pages",
+        help="Ignore the local incremental sync boundary and re-fetch account-scoped Crunchyroll history/watchlist pages only; never crawl whole libraries",
     )
     validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a normalized provider snapshot JSON payload")
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
@@ -6527,9 +6527,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",
-        help="Refresh MAL metadata/relation cache for mapped anime so recommendations can use richer continuation evidence",
+        help="Refresh paced MAL metadata/relation cache for mapped anime; provider lookups remain title-specific only",
     )
-    recommend_refresh.add_argument("--limit", type=int, default=0, help="How many mapped MAL anime to refresh (use 0 for all)")
+    recommend_refresh.add_argument("--limit", type=int, default=0, help="How many mapped MAL anime to refresh (use 0 for all; MAL refreshes are paced by client throttling and should be spread over time)")
     recommend_refresh.add_argument(
         "--include-discovery-targets",
         action="store_true",
