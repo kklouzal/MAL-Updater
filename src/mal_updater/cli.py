@@ -31,6 +31,7 @@ from .provider_registry import get_provider, list_provider_slugs
 from . import providers as _providers  # noqa: F401
 from .db import (
     bootstrap_database,
+    get_mal_recommendation_harvest_coverage,
     get_latest_completed_sync_run,
     get_operational_snapshot,
     get_provider_stale_row_age_buckets,
@@ -49,6 +50,7 @@ from .db import (
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
+from .recommendation_dashboard import write_recommendation_dashboard
 from .recommendation_metadata import refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
@@ -6140,6 +6142,20 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
     return 0
 
 
+def _cmd_recommend_dashboard(project_root: Path | None, output: Path, limit: int, include_dormant: bool) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    results = build_recommendations(
+        config,
+        limit=_normalize_limit(limit),
+        require_provider_availability=not include_dormant,
+    )
+    written = write_recommendation_dashboard(output, results)
+    print(json.dumps({"status": "ok", "output": str(written), "recommendation_count": len(results)}, indent=2))
+    return 0
+
+
 def _cmd_recommend_refresh_metadata(
     project_root: Path | None,
     limit: int,
@@ -6156,6 +6172,15 @@ def _cmd_recommend_refresh_metadata(
         discovery_target_limit=_normalize_limit(discovery_target_limit),
     )
     print(json.dumps(summary.as_dict(), indent=2))
+    return 0
+
+
+def _cmd_recommend_coverage(project_root: Path | None, stale_after_days: int) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    payload = get_mal_recommendation_harvest_coverage(config.db_path, stale_after_days=stale_after_days)
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -6489,6 +6514,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include discovery candidates that are not currently matched to a registered provider catalog; hidden by default",
     )
+    recommend_dashboard = subparsers.add_parser(
+        "recommend-dashboard",
+        help="Write a dependency-free sortable local HTML recommendation dashboard",
+    )
+    recommend_dashboard.add_argument("--output", required=True, type=Path, help="HTML file to write")
+    recommend_dashboard.add_argument("--limit", type=int, default=20, help="How many recommendations to include (use 0 for all)")
+    recommend_dashboard.add_argument(
+        "--include-dormant",
+        action="store_true",
+        help="Include discovery candidates that are not currently matched to a registered provider catalog; hidden by default",
+    )
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",
         help="Refresh MAL metadata/relation cache for mapped anime so recommendations can use richer continuation evidence",
@@ -6504,6 +6540,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="How many discovered target anime to hydrate when --include-discovery-targets is used (use 0 for all discovered targets)",
+    )
+    recommend_coverage = subparsers.add_parser(
+        "recommend-coverage",
+        help="Report read-only MAL recommendation harvest coverage for mapped/watched MAL anime IDs",
+    )
+    recommend_coverage.add_argument(
+        "--stale-after-days",
+        type=int,
+        default=14,
+        help="Mark recommendation source caches older than this many days as stale (use 0 to disable stale marking)",
     )
     push_recommendations_webhook = subparsers.add_parser(
         "push-recommendations-webhook",
@@ -6761,6 +6807,8 @@ def main() -> int:
         return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
     if args.command == "recommend":
         return _cmd_recommend(args.project_root, args.limit, args.flat, args.include_dormant)
+    if args.command == "recommend-dashboard":
+        return _cmd_recommend_dashboard(args.project_root, args.output, args.limit, args.include_dormant)
     if args.command == "recommend-refresh-metadata":
         return _cmd_recommend_refresh_metadata(
             args.project_root,
@@ -6768,6 +6816,8 @@ def main() -> int:
             args.include_discovery_targets,
             args.discovery_target_limit,
         )
+    if args.command == "recommend-coverage":
+        return _cmd_recommend_coverage(args.project_root, args.stale_after_days)
     if args.command == "push-recommendations-webhook":
         return _cmd_push_recommendations_webhook(
             args.project_root,

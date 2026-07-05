@@ -59,6 +59,40 @@ _SEASON_ORDER = {
 }
 
 
+
+
+@dataclass(slots=True)
+class DiscoveryScorecard:
+    consensus: float
+    affinity: float
+    seed_quality: float
+    source_rating: float
+    quality: float
+    availability: float
+    dub_watchable: float
+    confidence: float
+    total: float
+    reasons: list[str] = field(default_factory=list)
+    features: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        components = {
+            "consensus": round(self.consensus, 2),
+            "affinity": round(self.affinity, 2),
+            "seed_quality": round(self.seed_quality, 2),
+            "source_rating": round(self.source_rating, 2),
+            "quality": round(self.quality, 2),
+            "availability": round(self.availability, 2),
+            "dub_watchable": round(self.dub_watchable, 2),
+            "confidence": round(self.confidence, 2),
+        }
+        return {
+            "total": round(self.total, 2),
+            "components": components,
+            "reasons": list(self.reasons),
+            "features": dict(self.features),
+        }
+
 @dataclass(slots=True)
 class Recommendation:
     kind: str
@@ -82,6 +116,7 @@ class Recommendation:
 
     def as_dict(self) -> dict[str, Any]:
         providers = self.available_providers()
+        scorecard = self.context.get("scorecard") if isinstance(self.context, dict) else None
         payload = {
             "kind": self.kind,
             "priority": self.priority,
@@ -96,6 +131,13 @@ class Recommendation:
             "reasons": self.reasons,
             "context": self.context,
         }
+        if isinstance(scorecard, dict):
+            payload["scorecard"] = scorecard
+            payload["scorecard_total"] = scorecard.get("total")
+            components = scorecard.get("components")
+            if isinstance(components, dict):
+                for name, value in components.items():
+                    payload[f"score_{name}"] = value
         for key in ("cover_image_url", "synopsis", "why_recommended"):
             value = self.context.get(key)
             if isinstance(value, str) and value.strip():
@@ -1077,6 +1119,11 @@ def _build_discovery_recommendations(
 
     candidate_scores: dict[int, dict[str, Any]] = {}
     watched_ids = set(seed_weights)
+    harvested_source_ids = set(recommendation_edges_by_id)
+    if not require_provider_availability:
+        for source_id, edges in recommendation_edges_by_id.items():
+            if edges and source_id not in seed_weights:
+                seed_weights[source_id] = 1
     availability_by_mal_id = _provider_availability_by_mal_id(states, mapping_by_series=mapping_by_series)
     availability_by_title_alias = _provider_availability_by_title_alias(states)
     direct_franchise_relation_targets_by_source: dict[int, set[int]] = {}
@@ -1092,7 +1139,7 @@ def _build_discovery_recommendations(
     for source_id, weight in seed_weights.items():
         for edge in recommendation_edges_by_id.get(source_id, [])[:_DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED]:
             target_id = edge.target_mal_anime_id
-            if target_id in watched_ids:
+            if target_id in watched_ids or target_id in harvested_source_ids:
                 continue
             if target_id in globally_related_franchise_targets:
                 continue
@@ -1470,6 +1517,73 @@ def _build_discovery_recommendations(
             mean=mean,
             start_season_label=start_season_label,
         )
+
+        scorecard_features = {
+            "mal_anime_id": target_id,
+            "supporting_source_count": support_count,
+            "aggregated_recommendation_votes": int(bucket["votes"]),
+            "best_single_source_votes": best_single_source_votes,
+            "effective_supporting_seed_count": round(effective_supporting_seed_count, 3),
+            "shared_genres": shared_genres,
+            "shared_studios": shared_studios,
+            "source_overlap_score": source_overlap_score,
+            "mean": mean,
+            "popularity": popularity,
+            "provider_availability": available_via_providers,
+            "provider_availability_tags": {
+                provider: (provider in available_via_providers) for provider in ("crunchyroll", "hidive")
+            },
+            "english_dub_signal": (
+                "present"
+                if any(_is_english_dub_series(state) for state in available_states)
+                else ("absent" if available_states else "unknown")
+            ),
+            "metadata_cached": meta is not None,
+        }
+        consensus_score = min(100.0, 35.0 + (effective_supporting_seed_count * 18.0) + min(float(bucket["votes"]), 60.0) * 0.45)
+        affinity_score = min(100.0, (genre_overlap_score * 55.0) + (studio_overlap_score * 25.0) + (source_overlap_score * 20.0) + (metadata_affinity_bonus * 3.0))
+        if not metadata_match_dimensions:
+            affinity_score = 50.0 if meta is None else max(35.0, affinity_score)
+        seed_quality_score = max(0.0, min(100.0, 55.0 + (seed_quality_bonus * 4.0) - (seed_quality_penalty * 5.0) - (mixed_signal_penalty * 3.0) - (neutral_support_penalty * 3.0)))
+        if best_supporting_seed_score is not None:
+            seed_quality_score = max(seed_quality_score, min(100.0, best_supporting_seed_score * 10.0))
+        source_rating_score = 50.0 if mean is None else max(0.0, min(100.0, mean * 10.0))
+        quality_score = max(0.0, min(100.0, 55.0 + metadata_quality_bonus * 3.0 + catalog_quality_bonus * 3.0 - catalog_quality_penalty * 3.0 + freshness_bonus * 2.0 - freshness_penalty * 2.0))
+        availability_score = 100.0 if availability_confidence == "mapped" else (78.0 if available_states else 25.0)
+        dub_signal = scorecard_features["english_dub_signal"]
+        dub_watchable_score = 100.0 if dub_signal == "present" else (55.0 if available_states else 35.0)
+        confidence_score = max(0.0, min(100.0, 35.0 + (support_count * 12.0) + (20.0 if meta is not None else 0.0) + (20.0 if available_states else 0.0) + (8.0 if availability_confidence == "mapped" else 0.0)))
+        scorecard_reasons = [
+            f"consensus from {support_count} seed title(s) and {int(bucket['votes'])} MAL recommendation vote(s)",
+            f"availability: {_format_provider_label(available_via_providers) if available_via_providers else 'no mapped/alias provider availability found'}",
+            f"English dub signal: {dub_signal}",
+        ]
+        if mean is not None:
+            scorecard_reasons.append(f"source-rating influence from MAL mean {mean}")
+        if shared_genres:
+            scorecard_reasons.append("affinity via shared genre(s): " + ", ".join(shared_genres[:5]))
+        scorecard = DiscoveryScorecard(
+            consensus=consensus_score,
+            affinity=affinity_score,
+            seed_quality=seed_quality_score,
+            source_rating=source_rating_score,
+            quality=quality_score,
+            availability=availability_score,
+            dub_watchable=dub_watchable_score,
+            confidence=confidence_score,
+            total=(
+                consensus_score * 0.22
+                + affinity_score * 0.16
+                + seed_quality_score * 0.14
+                + source_rating_score * 0.12
+                + quality_score * 0.12
+                + availability_score * 0.12
+                + dub_watchable_score * 0.06
+                + confidence_score * 0.06
+            ),
+            reasons=scorecard_reasons,
+            features=scorecard_features,
+        ).as_dict()
         items.append(
             Recommendation(
                 kind="discovery_candidate",
@@ -1567,6 +1681,10 @@ def _build_discovery_recommendations(
                     "media_type": meta.media_type if meta is not None else None,
                     "num_episodes": meta.num_episodes if meta is not None else None,
                     "metadata_cached": meta is not None,
+                    "scorecard": scorecard,
+                    "scorecard_total": scorecard["total"],
+                    "provider_availability_tags": scorecard_features["provider_availability_tags"],
+                    "english_dub_signal": scorecard_features["english_dub_signal"],
                 },
             )
         )

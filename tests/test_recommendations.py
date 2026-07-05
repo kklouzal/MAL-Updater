@@ -268,6 +268,39 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("mal", discovery[0].provider)
         self.assertEqual([7100], discovery[0].context["supporting_mal_anime_ids"])
 
+    def test_discovery_candidate_exports_scorecard_provider_tags_and_dub_signal(self) -> None:
+        self._insert_series(
+            "seed-score",
+            title="Seed Score",
+            season_title="Seed Score (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-score", "seed-score-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-score", 8100)
+        self._insert_series(
+            "candidate-hidive",
+            title="Scorecard Discovery",
+            season_title="Scorecard Discovery (English Dub)",
+            watchlist_status="never_watched",
+            provider="hidive",
+        )
+        self._cache_metadata(8100, title="Seed Score", genres=["Adventure"], mean=9.0)
+        self._cache_metadata(8200, title="Scorecard Discovery", genres=["Adventure"], mean=8.4, popularity=220)
+        self._cache_recommendations(8100, [{"target_mal_anime_id": 8200, "target_title": "Scorecard Discovery", "num_recommendations": 24, "raw": {}}])
+
+        results = build_recommendations(self.config, limit=0)
+
+        item = next(item for item in results if item.kind == "discovery_candidate" and item.context["mal_anime_id"] == 8200)
+        scorecard = item.context["scorecard"]
+        self.assertEqual(scorecard, item.as_dict()["scorecard"])
+        self.assertEqual(scorecard["total"], item.as_dict()["scorecard_total"])
+        self.assertIn("consensus", scorecard["components"])
+        self.assertTrue(all(0 <= value <= 100 for value in scorecard["components"].values()))
+        self.assertEqual({"crunchyroll": False, "hidive": True}, item.context["provider_availability_tags"])
+        self.assertEqual("present", item.context["english_dub_signal"])
+        self.assertEqual("present", scorecard["features"]["english_dub_signal"])
+        self.assertIn("Scorecard Discovery", item.title)
+
     def test_provider_required_discovery_hides_dormant_unavailable_candidates(self) -> None:
         self._insert_series(
             "seed-a",
@@ -602,6 +635,47 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(0, results[1].context["cross_seed_support_votes"])
         self.assertGreater(results[0].context["support_balance_bonus"], results[1].context["support_balance_bonus"])
         self.assertGreater(results[0].priority, results[1].priority)
+
+    def test_discovery_candidate_can_come_from_harvested_dormant_edge_without_provider_availability(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._cache_metadata(200, title="Harvested Pick", mean=8.1, popularity=400)
+        self._cache_recommendations(
+            100,
+            [
+                {"target_mal_anime_id": 200, "target_title": "Harvested Pick", "num_recommendations": 12, "raw": {}},
+                {"target_mal_anime_id": 100, "target_title": "Dormant Seed", "num_recommendations": 99, "raw": {}},
+            ],
+        )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["mal:200"], [item.provider_series_id for item in results])
+        self.assertEqual("Harvested Pick", results[0].title)
+        self.assertEqual(12, results[0].context["aggregated_recommendation_votes"])
+        self.assertEqual([100], results[0].context["supporting_mal_anime_ids"])
+        self.assertEqual("none", results[0].context["availability_confidence"])
+
+    def test_discovery_candidate_suppresses_mal_listed_harvested_target(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._cache_metadata(
+            200,
+            title="Already Listed Pick",
+            mean=8.1,
+            popularity=400,
+            my_list_status={"status": "plan_to_watch", "num_episodes_watched": 0},
+        )
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 200, "target_title": "Already Listed Pick", "num_recommendations": 12, "raw": {}}],
+        )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], results)
 
     def test_discovery_candidate_prefers_more_recent_start_season_when_support_ties(self) -> None:
         self._insert_series(
@@ -2919,6 +2993,64 @@ class RecommendationTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(["continue_next"], [section["key"] for section in payload])
         self.assertEqual("series-next", payload[0]["items"][0]["provider_series_id"])
+
+    def test_recommend_coverage_reports_fresh_stale_and_unharvested_sources(self) -> None:
+        self._insert_series("fresh-seed", title="Fresh Seed", watchlist_status="fully_watched")
+        self._insert_progress("fresh-seed", "fresh-seed-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("fresh-seed", 100)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 900, "target_title": "Target", "num_recommendations": 3, "raw": {}}],
+        )
+
+        self._insert_series("stale-seed", title="Stale Seed", watchlist_status="fully_watched")
+        self._map_series("stale-seed", 200)
+        self._cache_recommendations(
+            200,
+            [{"target_mal_anime_id": 901, "target_title": "Old Target", "num_recommendations": 1, "raw": {}}],
+        )
+        with connect(self.config.db_path) as conn:
+            conn.execute("UPDATE mal_recommendation_harvest_status SET fetched_at = '2000-01-01 00:00:00' WHERE source_mal_anime_id = 200")
+            conn.execute("UPDATE mal_anime_recommendations SET fetched_at = '2000-01-01 00:00:00' WHERE source_mal_anime_id = 200")
+            conn.commit()
+
+        self._insert_series("missing-seed", title="Missing Seed", watchlist_status="available")
+        self._map_series("missing-seed", 300)
+
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "recommend-coverage",
+            "--stale-after-days",
+            "14",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            {"mapped_sources": 3, "watched_sources": 3, "fresh": 1, "stale": 1, "unharvested": 1, "total_edges": 2, "fresh_coverage_ratio": 1 / 3},
+            payload["summary"],
+        )
+        statuses = {source["mal_anime_id"]: source["status"] for source in payload["sources"]}
+        self.assertEqual({100: "fresh", 200: "stale", 300: "unharvested"}, statuses)
+
+    def test_recommend_coverage_counts_empty_harvest_as_fresh(self) -> None:
+        self._insert_series("empty-seed", title="Empty Seed", watchlist_status="fully_watched")
+        self._map_series("empty-seed", 400)
+        self._cache_recommendations(400, [])
+
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend-coverage"]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, payload["summary"]["fresh"])
+        self.assertEqual(0, payload["sources"][0]["edge_count"])
+        self.assertEqual("fresh", payload["sources"][0]["status"])
 
     def test_recommend_cli_grouped_limit_does_not_let_backlog_starve_discovery(self) -> None:
         for index in range(5):

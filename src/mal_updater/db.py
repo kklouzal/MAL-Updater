@@ -10,6 +10,7 @@ MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "001_initial.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "002_mal_metadata_cache.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "003_mal_recommendation_edges.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "004_mal_recommendation_harvest_status.sql",
 ]
 
 
@@ -531,7 +532,88 @@ def replace_mal_recommendation_edges(
                     json.dumps(edge["raw"], ensure_ascii=False, sort_keys=True),
                 ),
             )
+        conn.execute(
+            """
+            INSERT INTO mal_recommendation_harvest_status (source_mal_anime_id, status, num_edges, fetched_at)
+            VALUES (?, 'fetched', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(source_mal_anime_id) DO UPDATE SET
+                status = excluded.status,
+                num_edges = excluded.num_edges,
+                fetched_at = excluded.fetched_at
+            """,
+            (int(source_mal_anime_id), len(edges)),
+        )
         conn.commit()
+
+
+def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: int = 14) -> dict[str, Any]:
+    stale_after_days = max(int(stale_after_days), 0)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            WITH mapped AS (
+                SELECT
+                    m.mal_anime_id,
+                    COUNT(DISTINCT m.provider || ':' || m.provider_series_id) AS mapped_series_count,
+                    MAX(CASE WHEN w.provider_series_id IS NOT NULL OR p.provider_episode_id IS NOT NULL THEN 1 ELSE 0 END) AS watched
+                FROM mal_series_mapping m
+                LEFT JOIN provider_watchlist w
+                    ON w.provider = m.provider AND w.provider_series_id = m.provider_series_id
+                LEFT JOIN provider_episode_progress p
+                    ON p.provider = m.provider AND p.provider_series_id = m.provider_series_id
+                GROUP BY m.mal_anime_id
+            ), edge_counts AS (
+                SELECT source_mal_anime_id, COUNT(*) AS edge_count, MAX(fetched_at) AS edge_fetched_at
+                FROM mal_anime_recommendations
+                WHERE source_kind = 'mal_recommendation'
+                GROUP BY source_mal_anime_id
+            )
+            SELECT
+                mapped.mal_anime_id,
+                mapped.mapped_series_count,
+                mapped.watched,
+                COALESCE(status.num_edges, edge_counts.edge_count, 0) AS edge_count,
+                COALESCE(status.fetched_at, edge_counts.edge_fetched_at) AS fetched_at,
+                status.status AS harvest_status
+            FROM mapped
+            LEFT JOIN edge_counts ON edge_counts.source_mal_anime_id = mapped.mal_anime_id
+            LEFT JOIN mal_recommendation_harvest_status status ON status.source_mal_anime_id = mapped.mal_anime_id
+            ORDER BY mapped.mal_anime_id ASC
+            """
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    summary = {"mapped_sources": 0, "watched_sources": 0, "fresh": 0, "stale": 0, "unharvested": 0, "total_edges": 0}
+    for row in rows:
+        fetched_at = row["fetched_at"]
+        status = "unharvested"
+        if fetched_at:
+            status = "fresh"
+            if stale_after_days > 0:
+                with connect(db_path) as conn:
+                    is_stale = conn.execute(
+                        "SELECT datetime(?) < datetime('now', ?)",
+                        (fetched_at, f"-{stale_after_days} days"),
+                    ).fetchone()[0]
+                status = "stale" if is_stale else "fresh"
+        edge_count = int(row["edge_count"] or 0)
+        watched = bool(row["watched"])
+        summary["mapped_sources"] += 1
+        summary["watched_sources"] += 1 if watched else 0
+        summary[status] += 1
+        summary["total_edges"] += edge_count
+        items.append(
+            {
+                "mal_anime_id": int(row["mal_anime_id"]),
+                "mapped_series_count": int(row["mapped_series_count"] or 0),
+                "watched": watched,
+                "edge_count": edge_count,
+                "fetched_at": fetched_at,
+                "status": status,
+            }
+        )
+    coverage = None if summary["mapped_sources"] == 0 else (summary["fresh"] / summary["mapped_sources"])
+    summary["fresh_coverage_ratio"] = coverage
+    return {"summary": summary, "sources": items}
 
 
 def get_mal_recommendation_edges_map(db_path: Path) -> dict[int, list[MalRecommendationEdge]]:
