@@ -12,7 +12,7 @@ import requests
 
 try:
     from curl_cffi import requests as curl_requests
-except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+except ModuleNotFoundError:  # pragma: no cover - dependency/install health check covers broken environments
     curl_requests = None
 
 from .auth import write_secret_file
@@ -181,7 +181,7 @@ def crunchyroll_login_with_credentials(
     if response.status_code >= 400:
         message = f"Crunchyroll credential login failed: HTTP {response.status_code}"
         if response.status_code == 403 and curl_requests is None:
-            message += " (likely blocked by Cloudflare; install optional curl_cffi support for browser-TLS impersonation)"
+            message += " (likely blocked by Cloudflare; install or refresh required curl_cffi browser-TLS transport support)"
         try:
             payload = response.json()
         except ValueError:

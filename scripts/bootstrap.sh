@@ -264,8 +264,8 @@ printf 'Python:     %s\n' "$PYTHON_BIN"
 
 ensure_venv
 
-if prompt_yes_no "Install/update Python package dependencies with: $PYTHON_BIN -m pip install -e '.[crunchyroll]'?" "$PIP_INSTALL_DEFAULT"; then
-  "$PYTHON_BIN" -m pip install -e '.[crunchyroll]'
+if prompt_yes_no "Install/update Python package dependencies with: $PYTHON_BIN -m pip install -e .?" "$PIP_INSTALL_DEFAULT"; then
+  "$PYTHON_BIN" -m pip install -e .
 else
   printf 'Skipped dependency install. Existing environment must already provide required packages.\n'
 fi

@@ -1049,11 +1049,11 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     crunchyroll_intended_for_transport = crunchyroll_credentials_present or crunchyroll_session_present
     if crunchyroll_intended_for_transport and not dependency_checks["curl_cffi"]:
         add_onboarding_step(
-            step="install-optional-crunchyroll-transport",
-            details="Install the optional crunchyroll extra (`pip install -e '.[crunchyroll]'`) for browser-TLS impersonation against Crunchyroll.",
+            step="install-required-crunchyroll-transport",
+            details="Install or refresh the project dependencies (`pip install -e .`) so required curl_cffi browser-TLS transport support is available for Crunchyroll.",
             user_action_required=False,
-            command="python3 -m pip install -e '.[crunchyroll]'",
-            command_args=["python3", "-m", "pip", "install", "-e", ".[crunchyroll]"],
+            command="python3 -m pip install -e .",
+            command_args=["python3", "-m", "pip", "install", "-e", "."],
             applies_to="crunchyroll",
             automation_safe=True,
             requires_auth_interaction=False,
