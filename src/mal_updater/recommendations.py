@@ -423,6 +423,7 @@ def build_recommendations(
         _build_discovery_recommendations(
             states,
             mapping_by_series=mapping_by_series,
+            mapping_info_by_series=mapping_info_by_series,
             metadata_by_id=metadata_by_id,
             relations_by_id=relations_by_id,
             recommendation_edges_by_id=recommendation_edges_by_id,
@@ -1182,6 +1183,7 @@ def _build_discovery_recommendations(
     states: list[ProviderSeriesState],
     *,
     mapping_by_series: dict[tuple[str, str], int],
+    mapping_info_by_series: dict[tuple[str, str], PersistedSeriesMapping],
     metadata_by_id: dict[int, Any],
     relations_by_id: dict[int, list[Any]],
     recommendation_edges_by_id: dict[int, list[Any]],
@@ -1367,17 +1369,14 @@ def _build_discovery_recommendations(
             availability_by_mal_id=availability_by_mal_id,
             availability_by_title_alias=availability_by_title_alias,
         )
-        english_dub_states = [
-            state
-            for state in available_states
-            if state.provider in {"crunchyroll", "hidive"} and _is_english_dub_series(state)
+        provider_available_states = [
+            state for state in available_states if state.provider in {"crunchyroll", "hidive"}
         ]
-        if require_provider_availability and (not available_states or not english_dub_states):
+        english_dub_states = [state for state in provider_available_states if _is_english_dub_series(state)]
+        if require_provider_availability and (not provider_available_states or not english_dub_states):
             continue
-        if not require_provider_availability and available_states and not english_dub_states:
-            continue
-        primary_available_state = _select_primary_available_state(english_dub_states) if english_dub_states else None
-        available_via_providers = sorted({state.provider for state in english_dub_states})
+        primary_available_state = _select_primary_available_state(english_dub_states or provider_available_states) if provider_available_states else None
+        available_via_providers = sorted({state.provider for state in provider_available_states})
         availability_match_kinds = sorted({availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias") for state in available_states})
         if "mapped_mal" in availability_match_kinds:
             availability_confidence = "mapped"
@@ -1691,7 +1690,7 @@ def _build_discovery_recommendations(
             "provider_availability_tags": {
                 provider: (provider in available_via_providers) for provider in ("crunchyroll", "hidive")
             },
-            "english_dub_signal": "present" if english_dub_states else "unknown",
+            "english_dub_signal": "present" if english_dub_states else ("unknown" if provider_available_states else "none"),
             "metadata_cached": meta is not None,
         }
         consensus_score = min(100.0, 35.0 + (effective_supporting_seed_count * 18.0) + min(float(bucket["votes"]), 60.0) * 0.45)
@@ -1770,6 +1769,16 @@ def _build_discovery_recommendations(
                             "season_title": state.season_title,
                             "watchlist_status": state.watchlist_status,
                             "availability_match_kind": availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias"),
+                            "mapping_confidence": (
+                                mapping_info_by_series[(state.provider, state.provider_series_id)].confidence
+                                if (state.provider, state.provider_series_id) in mapping_info_by_series
+                                else None
+                            ),
+                            "mapping_source": (
+                                mapping_info_by_series[(state.provider, state.provider_series_id)].mapping_source
+                                if (state.provider, state.provider_series_id) in mapping_info_by_series
+                                else None
+                            ),
                         }
                         for state in available_states
                     ],

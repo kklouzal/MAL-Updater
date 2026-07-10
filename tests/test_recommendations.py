@@ -580,7 +580,73 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(dormant[0].context["availability_visible"])
         self.assertEqual([], dormant[0].context["available_via_providers"])
         self.assertEqual("none", dormant[0].context["availability_confidence"])
-        self.assertEqual("unknown", dormant[0].context["english_dub_signal"])
+        self.assertEqual("none", dormant[0].context["english_dub_signal"])
+
+    def test_discovery_candidate_surfaces_provider_availability_when_dub_unknown(self) -> None:
+        self._insert_series(
+            "seed-unknown-dub",
+            title="Seed Unknown Dub",
+            season_title="Seed Unknown Dub (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress(
+            "seed-unknown-dub",
+            "seed-unknown-dub-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-03-01T01:00:00Z",
+        )
+        self._map_series("seed-unknown-dub", 100)
+        self._insert_series(
+            "hidive-unknown-dub",
+            title="Provider Visible Discovery",
+            season_title="Provider Visible Discovery",
+            watchlist_status="never_watched",
+            provider="hidive",
+        )
+        upsert_series_mapping(
+            self.config.db_path,
+            provider="hidive",
+            provider_series_id="hidive-unknown-dub",
+            mal_anime_id=300,
+            confidence=0.91,
+            mapping_source="reverse_provider_title_search",
+            approved_by_user=False,
+            notes=None,
+        )
+        self._cache_metadata(100, title="Seed Unknown Dub", genres=["Adventure"], mean=8.8)
+        self._cache_metadata(300, title="Provider Visible Discovery", genres=["Adventure"], mean=8.1, popularity=250)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 300, "target_title": "Provider Visible Discovery", "num_recommendations": 20, "raw": {}}],
+            make_targets_available=False,
+        )
+
+        visible = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=False)
+            if item.kind == "discovery_candidate" and item.context["mal_anime_id"] == 300
+        ]
+        require_dub = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate" and item.context["mal_anime_id"] == 300
+        ]
+
+        self.assertEqual([], require_dub)
+        self.assertEqual(1, len(visible))
+        item = visible[0]
+        self.assertEqual("hidive", item.provider)
+        self.assertEqual("hidive-unknown-dub", item.provider_series_id)
+        self.assertEqual(["hidive"], item.context["available_via_providers"])
+        self.assertEqual({"crunchyroll": False, "hidive": True}, item.context["provider_availability_tags"])
+        self.assertEqual("unknown", item.context["english_dub_signal"])
+        self.assertFalse(item.context.get("english_dub", False))
+        self.assertEqual("mapped", item.context["availability_confidence"])
+        self.assertEqual(["mapped_mal"], item.context["availability_match_kinds"])
+        self.assertEqual(1, len(item.context["available_provider_series"]))
+        self.assertEqual("reverse_provider_title_search", item.context["available_provider_series"][0].get("mapping_source", "reverse_provider_title_search"))
+        self.assertEqual("mapped_mal", item.context["available_provider_series"][0]["availability_match_kind"])
 
     def test_relation_backed_new_season_recommendation_detects_title_drift(self) -> None:
         self._insert_series(
@@ -3501,7 +3567,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("mal", payload[0]["provider"])
         self.assertEqual("none", payload[0]["context"]["availability_confidence"])
 
-    def test_recommend_cli_excludes_provider_available_non_english_dub_discovery(self) -> None:
+    def test_recommend_cli_surfaces_provider_available_non_english_dub_discovery_as_unknown(self) -> None:
         self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")
         self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
         self._map_series("seed-a", 100)
@@ -3515,7 +3581,12 @@ class RecommendationTests(unittest.TestCase):
             exit_code = cli_main()
 
         self.assertEqual(0, exit_code)
-        self.assertEqual([], json.loads(stdout.getvalue()))
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, len(payload))
+        self.assertEqual("Sub Only Candidate", payload[0]["title"])
+        self.assertEqual(["crunchyroll"], payload[0]["context"]["available_via_providers"])
+        self.assertEqual("unknown", payload[0]["context"]["english_dub_signal"])
+        self.assertFalse(payload[0]["context"].get("english_dub", False))
 
     def test_recommend_cli_includes_provider_available_english_dub_discovery_with_title_and_genres(self) -> None:
         self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")

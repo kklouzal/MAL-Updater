@@ -124,8 +124,11 @@ def _english_dub_status(item: Recommendation) -> str:
     signal = item.context.get("english_dub_signal")
     if isinstance(raw, bool):
         return "yes" if raw else ""
-    if str(signal).strip().lower() in {"present", "yes", "true", "english dub"}:
+    normalized_signal = str(signal).strip().lower()
+    if normalized_signal in {"present", "yes", "true", "english dub"}:
         return "yes"
+    if normalized_signal == "unknown":
+        return "unknown"
     haystack = " ".join(value for value in (item.title, item.season_title or "") if value)
     return "yes" if "english dub" in haystack.lower() or "(dub)" in haystack.lower() else ""
 

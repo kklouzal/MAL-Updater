@@ -273,6 +273,37 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["title"], "Available Candidate")
             self.assertEqual(payload["recommendations"]["sections"]["discovery_high_confidence"][0]["title"], "MAL Only Candidate")
 
+    def test_live_dashboard_shows_provider_availability_when_english_dub_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "hidive",
+                        "title": "Provider Visible Dub Unknown",
+                        "provider_series_id": "hi-unknown",
+                        "priority": 90,
+                        "available_via_providers": ["hidive"],
+                        "context": {"mal_anime_id": 200, "english_dub_signal": "unknown"},
+                    },
+                ],
+                run_id="run-unknown-dub",
+                generated_at="2026-07-05T20:00:00Z",
+            )
+
+            payload = build_dashboard_payload(db_path)
+
+            row = payload["recommendations"]["sections"]["discovery_high_confidence"][0]
+            self.assertEqual("Provider Visible Dub Unknown", row["title"])
+            self.assertEqual(["hidive"], row["availability_providers"])
+            self.assertEqual("hidive", row["evidence"]["availability_provider_label"])
+            self.assertEqual("unknown", row["dub_signal"])
+            self.assertEqual("unknown", row["evidence"]["dub_signal"])
+            self.assertEqual([], payload["recommendations"]["sections"].get("discovery_available_now", []))
+
 
     def test_live_dashboard_payload_limit_is_per_section_not_global(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
