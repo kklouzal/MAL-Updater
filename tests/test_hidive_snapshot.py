@@ -104,7 +104,7 @@ class HidiveSnapshotTests(unittest.TestCase):
                 "json_get",
                 side_effect=[history_payload, home_payload, favourites_payload],
             ):
-                result = fetch_snapshot(load_config(root))
+                result = fetch_snapshot(load_config(root), use_incremental_boundary=False)
 
         self.assertEqual(result.snapshot.provider, "hidive")
         self.assertEqual(3, len(result.snapshot.series))
@@ -119,8 +119,72 @@ class HidiveSnapshotTests(unittest.TestCase):
         self.assertEqual('Favorites', result.snapshot.watchlist[0].list_name)
         self.assertEqual({"history": True, "continue_watching": True, "watchlists": True}, result.snapshot.raw["supports"])
         self.assertFalse(result.snapshot.raw["sync_boundary_present"])
-        self.assertEqual("incremental", result.snapshot.raw["sync_boundary_mode"])
+        self.assertEqual("full_refresh", result.snapshot.raw["sync_boundary_mode"])
         self.assertEqual(str(session.state_paths.sync_boundary_path), result.snapshot.raw["sync_boundary_path"])
+
+    def test_default_fetch_without_boundary_uses_account_refresh_surfaces(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            session.state_paths.root.mkdir(parents=True, exist_ok=True)
+
+            history_payload = {
+                "vods": [
+                    {
+                        "id": 1001,
+                        "title": "Episode 12",
+                        "duration": 1440,
+                        "watchedAt": 1770504571302,
+                        "episodeInformation": {
+                            "seasonNumber": 1,
+                            "episodeNumber": 12,
+                            "seasonTitle": "Season 1",
+                            "seriesInformation": {"id": 3560, "title": "Dusk Beyond the End of the World"},
+                        },
+                    }
+                ],
+                "page": 1,
+                "totalPages": 1,
+            }
+            home_payload = {
+                "buckets": [
+                    {
+                        "name": "CONTINUE WATCHING",
+                        "contentList": [
+                            {
+                                "id": 2002,
+                                "title": "Episode 3",
+                                "duration": 1500,
+                                "watchedAt": 1770600000000,
+                                "watchProgress": 600,
+                                "episodeInformation": {
+                                    "seasonNumber": 2,
+                                    "episodeNumber": 3,
+                                    "seasonTitle": "Season 2",
+                                    "seriesInformation": {"id": 4000, "title": "Example Continue Show"},
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+            favourites_payload = {"events": [{"id": 5005, "title": "Favorite Show"}], "page": 1, "totalPages": 1}
+
+            with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+                HidiveSession,
+                "json_get",
+                side_effect=[history_payload, home_payload, favourites_payload],
+            ):
+                result = fetch_snapshot(load_config(root))
+
+        self.assertEqual("full_refresh", result.snapshot.raw["sync_boundary_mode"])
+        self.assertFalse(result.snapshot.raw["hot_surface_only"])
+        self.assertEqual({"history": True, "continue_watching": True, "watchlists": True}, result.snapshot.raw["supports"])
+        self.assertEqual(1, result.snapshot.raw["history_pages_fetched"])
+        self.assertEqual(1, result.snapshot.raw["favourite_pages_fetched"])
+        self.assertEqual(1, result.continue_count)
+        self.assertEqual(1, result.favourite_count)
 
     def test_fetch_snapshot_stops_early_when_incremental_boundary_matches(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -206,10 +270,15 @@ class HidiveSnapshotTests(unittest.TestCase):
             ):
                 result = fetch_snapshot(load_config(root))
 
-        self.assertTrue(result.snapshot.raw["history_stopped_early"])
-        self.assertTrue(result.snapshot.raw["continue_stopped_early"])
-        self.assertTrue(result.snapshot.raw["favourite_stopped_early"])
+        self.assertFalse(result.snapshot.raw["history_stopped_early"])
+        self.assertFalse(result.snapshot.raw["continue_stopped_early"])
+        self.assertFalse(result.snapshot.raw["favourite_stopped_early"])
         self.assertTrue(result.snapshot.raw["sync_boundary_present"])
+        self.assertEqual("hot", result.snapshot.raw["sync_boundary_mode"])
+        self.assertTrue(result.snapshot.raw["hot_surface_only"])
+        self.assertEqual({"history": True, "continue_watching": False, "watchlists": False}, result.snapshot.raw["supports"])
+        self.assertEqual(1, result.snapshot.raw["history_pages_fetched"])
+        self.assertEqual(0, result.snapshot.raw["favourite_pages_fetched"])
 
 
 if __name__ == "__main__":

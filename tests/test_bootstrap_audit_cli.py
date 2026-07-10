@@ -465,6 +465,33 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("maintenance_recommended_auto_automation_safe=True", stdout)
         self.assertIn("maintenance_recommended_auto_requires_auth_interaction=False", stdout)
 
+    def test_bootstrap_audit_marks_missing_curl_cffi_as_blocking_crunchyroll_dependency(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+
+        def fake_find_spec(name: str):
+            if name == "curl_cffi":
+                return None
+            return object()
+
+        with patch("importlib.util.find_spec", side_effect=fake_find_spec):
+            exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertFalse(payload["ready"])
+        self.assertFalse(payload["dependencies"]["checks"]["curl_cffi"])
+        self.assertIn("curl_cffi", payload["dependencies"]["missing"])
+        transport_step = next(
+            item for item in payload["onboarding_steps"] if item["step"] == "install-required-crunchyroll-transport"
+        )
+        self.assertEqual("crunchyroll", transport_step["applies_to"])
+        self.assertIn("required curl_cffi", transport_step["details"])
+        self.assertEqual(["python3", "-m", "pip", "install", "-e", "."], transport_step["command_args"])
+
     def test_bootstrap_audit_does_not_treat_flock_as_a_required_runtime_dependency(self) -> None:
         with patch("mal_updater.cli.shutil.which") as which:
             which.side_effect = lambda command: None if command == "flock" else f"/usr/bin/{command}"

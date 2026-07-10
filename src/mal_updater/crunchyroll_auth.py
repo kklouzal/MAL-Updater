@@ -8,8 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
-
 try:
     from curl_cffi import requests as curl_requests
 except ModuleNotFoundError:  # pragma: no cover - dependency/install health check covers broken environments
@@ -29,6 +27,14 @@ DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
 
 class CrunchyrollAuthError(RuntimeError):
     pass
+
+
+def _require_curl_requests():
+    if curl_requests is None:
+        raise CrunchyrollAuthError(
+            "Crunchyroll requires curl_cffi browser-TLS transport; install project dependencies with `python3 -m pip install -e .`."
+        )
+    return curl_requests
 
 
 @dataclass(slots=True)
@@ -132,17 +138,13 @@ def _write_session_state(
 
 
 def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float):
-    if curl_requests is not None:
-        return curl_requests.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
-    return requests.post(url, data=data, headers=headers, timeout=timeout_seconds)
-
+    transport = _require_curl_requests()
+    return transport.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
 
 
 def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float):
-    if curl_requests is not None:
-        return curl_requests.get(url, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
-    return requests.get(url, headers=headers, timeout=timeout_seconds)
-
+    transport = _require_curl_requests()
+    return transport.get(url, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
 
 
 def crunchyroll_login_with_credentials(

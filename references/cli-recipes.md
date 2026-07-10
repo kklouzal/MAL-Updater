@@ -99,9 +99,14 @@ PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-metadata --include-d
 PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 20 --delivery-mode digest
 PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 20 --dry-run
+PYTHONPATH=src python3 -m mal_updater.cli recommend-snapshots --limit 16 --format summary
+PYTHONPATH=src python3 -m mal_updater.cli dashboard-serve
+PYTHONPATH=src python3 -m mal_updater.cli dashboard-serve --limit 16
 # optional daemon lane: set service.recommendations_webhook_push_every_seconds > 0, keep openclaw webhook settings populated, and leave delivery_mode on `fresh` unless you intentionally want noisier unattended posts
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 ```
+
+`dashboard-serve` is local/read-only and exposes the latest persisted recommendation snapshot at `/api/dashboard`; it defaults to 16 recommendation rows, and `/api/dashboard?limit=N` remains available for temporary per-request overrides. The live dashboard renders friendlier recommendation sections (for example `discovery_candidate` as “Title recommendations / discovery” with MAL user-recommendation context, and `resume_backlog` as “Resume backlog”) and badges the key evidence operators need for triage: MAL recommendation votes, seed count/compact seed titles or ids, availability providers, dub signal, and MAL watch status.
 
 ## Tests
 

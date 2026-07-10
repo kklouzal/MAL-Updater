@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import load_config
+import mal_updater.crunchyroll_auth as crunchyroll_auth
 from mal_updater.crunchyroll_auth import (
     CrunchyrollAuthError,
     crunchyroll_login_with_credentials,
@@ -26,6 +27,16 @@ class _FakeResponse:
 
 
 class CrunchyrollAuthTests(unittest.TestCase):
+    def test_crunchyroll_http_requires_curl_cffi_transport(self) -> None:
+        with patch.object(crunchyroll_auth, "curl_requests", None):
+            with self.assertRaisesRegex(CrunchyrollAuthError, "requires curl_cffi"):
+                crunchyroll_auth._http_post(
+                    "https://example.invalid/token",
+                    data={},
+                    headers={},
+                    timeout_seconds=1.0,
+                )
+
     def test_load_crunchyroll_credentials_reads_secret_file_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

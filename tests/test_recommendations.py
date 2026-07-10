@@ -14,11 +14,14 @@ from mal_updater.db import (
     bootstrap_database,
     connect,
     get_mal_anime_metadata_map,
+    insert_recommendation_snapshot_rows,
+    list_latest_recommendation_snapshot_rows,
     replace_mal_anime_relations,
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
     upsert_series_mapping,
 )
+from mal_updater.mal_client import MalApiError
 from mal_updater.recommendation_metadata import refresh_recommendation_metadata
 from mal_updater.recommendations import Recommendation, build_recommendations, group_recommendations, trim_grouped_recommendations
 
@@ -34,6 +37,167 @@ class RecommendationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_recommendation_snapshot_helper_round_trip(self) -> None:
+        inserted = insert_recommendation_snapshot_rows(
+            self.config.db_path,
+            [
+                {
+                    "kind": "discovery_candidate",
+                    "provider": "crunchyroll",
+                    "providers": ["crunchyroll", "hidive"],
+                    "provider_series_id": "series-1",
+                    "title": "Snapshot Show",
+                    "priority": 42,
+                    "reasons": ["because"],
+                    "scorecard": {"total": 12.5},
+                    "context": {"mal_anime_id": 123, "availability_confidence": 0.75, "dub_signal": "dubbed"},
+                },
+                {
+                    "kind": "discovery_candidate",
+                    "provider": "mal",
+                    "provider_series_id": "mal:456",
+                    "title": "Context Only Availability",
+                    "priority": 41,
+                    "context": {
+                        "mal_anime_id": 456,
+                        "available_via_providers": ["crunchyroll"],
+                        "english_dub_signal": "present",
+                        "scorecard": {"total": 11.0},
+                    },
+                },
+            ],
+            run_id="run-test",
+            generated_at="2026-07-05T17:55:00+00:00",
+        )
+
+        self.assertEqual(2, inserted)
+        rows = list_latest_recommendation_snapshot_rows(self.config.db_path)
+        self.assertEqual(2, len(rows))
+        self.assertEqual("run-test", rows[0].run_id)
+        self.assertEqual("Snapshot Show", rows[0].title)
+        self.assertEqual(123, rows[0].mal_anime_id)
+        self.assertEqual(12.5, rows[0].score)
+        self.assertEqual(["crunchyroll", "hidive"], rows[0].availability_providers)
+        context_only = next(row for row in rows if row.title == "Context Only Availability")
+        self.assertEqual(456, context_only.mal_anime_id)
+        self.assertEqual(11.0, context_only.score)
+        self.assertEqual(["crunchyroll"], context_only.availability_providers)
+        self.assertEqual("present", context_only.dub_signal)
+
+    def test_cli_recommend_persist_snapshot_records_grouped_items(self) -> None:
+        item = Recommendation(
+            kind="discovery_candidate",
+            priority=9,
+            provider_series_id="mal:999",
+            title="Grouped Candidate",
+            season_title=None,
+            provider="mal",
+            reasons=["cached MAL graph support"],
+            context={"mal_anime_id": 999, "scorecard": {"total": 33.0}},
+        )
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "recommend",
+            "--persist-snapshot",
+            "--include-dormant",
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", new_callable=io.StringIO),
+            patch("mal_updater.cli.build_recommendations", return_value=[item]),
+        ):
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        rows = list_latest_recommendation_snapshot_rows(self.config.db_path)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("Grouped Candidate", rows[0].title)
+        self.assertEqual("discovery_candidate", rows[0].kind)
+        self.assertEqual(33.0, rows[0].score)
+
+    def test_cli_recommend_persist_snapshot_includes_mal_only_candidates_by_default(self) -> None:
+        item = Recommendation(
+            kind="discovery_candidate",
+            priority=91,
+            provider_series_id="mal:1234",
+            title="MAL Only Candidate",
+            season_title=None,
+            provider="mal",
+            reasons=["cached MAL graph support"],
+            context={"mal_anime_id": 1234, "scorecard": {"total": 40.0}},
+        )
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend", "--persist-snapshot"]
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", new_callable=io.StringIO),
+            patch("mal_updater.cli.build_recommendations", return_value=[item]) as build_mock,
+        ):
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(False, build_mock.call_args.kwargs["require_provider_availability"])
+        rows = list_latest_recommendation_snapshot_rows(self.config.db_path)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("MAL Only Candidate", rows[0].title)
+        self.assertEqual("mal", rows[0].provider)
+
+    def test_cli_recommend_persist_snapshot_uses_full_candidate_limit_not_display_sections(self) -> None:
+        recommendations = [
+            Recommendation(
+                kind="discovery_candidate",
+                priority=200 - index,
+                provider_series_id=f"mal:{index}",
+                title=f"MAL Only Candidate {index}",
+                season_title=None,
+                provider="mal",
+                reasons=["cached MAL graph support"],
+                context={"mal_anime_id": index, "scorecard": {"total": float(200 - index)}},
+            )
+            for index in range(1, 83)
+        ]
+        recommendations.extend(
+            Recommendation(
+                kind="discovery_candidate",
+                priority=100 - index,
+                provider_series_id=f"cr:{index}",
+                title=f"Available Candidate {index}",
+                season_title=None,
+                provider="crunchyroll",
+                reasons=["provider availability"],
+                context={"mal_anime_id": 1000 + index, "available_via_providers": ["crunchyroll"], "english_dub_signal": "present"},
+            )
+            for index in range(1, 6)
+        )
+        recommendations.extend(
+            Recommendation(
+                kind="resume_backlog",
+                priority=50 - index,
+                provider_series_id=f"hi:{index}",
+                title=f"Resume Backlog {index}",
+                season_title=None,
+                provider="hidive",
+                reasons=["resume"],
+                context={"scorecard": {"total": float(50 - index)}},
+            )
+            for index in range(1, 19)
+        )
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend", "--limit", "100", "--persist-snapshot"]
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", new_callable=io.StringIO),
+            patch("mal_updater.cli.build_recommendations", return_value=recommendations),
+        ):
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        rows = list_latest_recommendation_snapshot_rows(self.config.db_path, limit=120)
+        self.assertEqual(100, len(rows))
+        self.assertEqual(82, sum(1 for row in rows if row.provider == "mal" and row.kind == "discovery_candidate"))
+        self.assertEqual(5, sum(1 for row in rows if row.provider == "crunchyroll" and row.kind == "discovery_candidate"))
+        self.assertGreater(sum(1 for row in rows if row.kind == "resume_backlog"), 0)
+
     def _insert_series(
         self,
         provider_series_id: str,
@@ -47,7 +211,7 @@ class RecommendationTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO provider_series (provider, provider_series_id, title, season_title, season_number, raw_json)
+                INSERT OR IGNORE INTO provider_series (provider, provider_series_id, title, season_title, season_number, raw_json)
                 VALUES (?, ?, ?, ?, ?, '{}')
                 """,
                 (provider, provider_series_id, title, season_title, season_number),
@@ -106,6 +270,7 @@ class RecommendationTests(unittest.TestCase):
         mal_anime_id: int,
         *,
         title: str,
+        title_english: str | None = None,
         mean: float | None = None,
         popularity: int | None = None,
         genres: list[str] | None = None,
@@ -113,6 +278,7 @@ class RecommendationTests(unittest.TestCase):
         source: str | None = None,
         start_season: dict | None = None,
         my_list_status: dict | None = None,
+        num_episodes: int = 12,
     ) -> None:
         raw = {"id": mal_anime_id, "title": title}
         if genres:
@@ -127,12 +293,12 @@ class RecommendationTests(unittest.TestCase):
             self.config.db_path,
             mal_anime_id=mal_anime_id,
             title=title,
-            title_english=None,
+            title_english=title_english,
             title_japanese=None,
             alternative_titles=[],
             media_type="tv",
             status="finished_airing",
-            num_episodes=12,
+            num_episodes=num_episodes,
             mean=mean,
             popularity=popularity,
             start_season=start_season,
@@ -142,8 +308,23 @@ class RecommendationTests(unittest.TestCase):
     def _cache_relations(self, mal_anime_id: int, relations: list[dict]) -> None:
         replace_mal_anime_relations(self.config.db_path, mal_anime_id=mal_anime_id, relations=relations)
 
-    def _cache_recommendations(self, mal_anime_id: int, edges: list[dict]) -> None:
+    def _cache_recommendations(self, mal_anime_id: int, edges: list[dict], *, make_targets_available: bool = True) -> None:
         replace_mal_recommendation_edges(self.config.db_path, source_mal_anime_id=mal_anime_id, hop_distance=1, edges=edges)
+        if not make_targets_available:
+            return
+        for edge in edges:
+            target_id = edge.get("target_mal_anime_id")
+            target_title = edge.get("target_title") or f"MAL {target_id}"
+            if target_id is None:
+                continue
+            provider_series_id = f"available-target-{target_id}"
+            self._insert_series(
+                provider_series_id,
+                title=target_title,
+                season_title=f"{target_title} (English Dub)",
+                watchlist_status=None,
+            )
+            self._map_series(provider_series_id, int(target_id))
 
     def test_new_dubbed_episode_recommendation_detects_contiguous_tail_gap(self) -> None:
         self._insert_series(
@@ -165,6 +346,74 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("new_dubbed_episode", item.kind)
         self.assertEqual("series-1", item.provider_series_id)
         self.assertEqual(1, item.context["contiguous_tail_gap"])
+
+    def test_completed_mal_target_suppresses_continuation_noise(self) -> None:
+        self._insert_series(
+            "series-1",
+            title="Completed Show",
+            season_title="Completed Show (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._map_series("series-1", 101)
+        self._cache_metadata(
+            101,
+            title="Completed Show",
+            my_list_status={"status": "completed", "num_episodes_watched": 12},
+            num_episodes=12,
+        )
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_progress("series-1", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-2", episode_number=2, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-3", episode_number=3, completion_ratio=0.2, last_watched_at=recent)
+
+        results = build_recommendations(self.config, limit=0)
+
+        self.assertEqual([], [item for item in results if item.provider_series_id == "series-1"])
+
+    def test_incomplete_watching_mal_target_keeps_continuation(self) -> None:
+        self._insert_series(
+            "series-1",
+            title="Watching Show",
+            season_title="Watching Show (English Dub)",
+            watchlist_status="in_progress",
+        )
+        self._map_series("series-1", 102)
+        self._cache_metadata(
+            102,
+            title="Watching Show",
+            my_list_status={"status": "watching", "num_episodes_watched": 2},
+            num_episodes=12,
+        )
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_progress("series-1", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-2", episode_number=2, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-3", episode_number=3, completion_ratio=0.2, last_watched_at=recent)
+
+        item = build_recommendations(self.config, limit=0)[0]
+
+        self.assertEqual("new_dubbed_episode", item.kind)
+        self.assertEqual("watching", item.context["mal_watch_status"])
+        self.assertEqual(2, item.context["mal_num_episodes_watched"])
+
+    def test_missing_mal_watch_metadata_keeps_continuation_with_uncertainty(self) -> None:
+        self._insert_series(
+            "series-1",
+            title="Metadata Missing Show",
+            season_title="Metadata Missing Show (English Dub)",
+            watchlist_status="in_progress",
+        )
+        self._map_series("series-1", 103)
+        self._cache_metadata(103, title="Metadata Missing Show")
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_progress("series-1", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-2", episode_number=2, completion_ratio=1.0, last_watched_at=recent)
+        self._insert_progress("series-1", "ep-3", episode_number=3, completion_ratio=0.2, last_watched_at=recent)
+
+        item = build_recommendations(self.config, limit=0)[0]
+
+        self.assertEqual("new_dubbed_episode", item.kind)
+        self.assertTrue(item.context["mal_watch_metadata_uncertain"])
+        self.assertIn("avoiding over-suppression", item.context["mal_inclusion_rationale"])
 
     def test_new_season_recommendation_detects_completed_predecessor(self) -> None:
         self._insert_series(
@@ -218,8 +467,8 @@ class RecommendationTests(unittest.TestCase):
         )
         self._map_series("hidive-s1", 5100, provider="hidive")
         self._map_series("hidive-s2", 5200, provider="hidive")
-        self._cache_metadata(5100, title="HIDIVE Show")
-        self._cache_metadata(5200, title="HIDIVE Show Season 2")
+        self._cache_metadata(5100, title="HIDIVE Show", my_list_status={"status": "completed", "num_episodes_watched": 12})
+        self._cache_metadata(5200, title="HIDIVE Show Season 2", my_list_status={"status": "plan_to_watch", "num_episodes_watched": 0})
         self._cache_relations(
             5100,
             [
@@ -263,9 +512,9 @@ class RecommendationTests(unittest.TestCase):
 
         results = build_recommendations(self.config, limit=0)
 
-        discovery = [item for item in results if item.kind == "discovery_candidate" and item.provider_series_id == "mal:7200"]
+        discovery = [item for item in results if item.kind == "discovery_candidate" and item.provider_series_id == "available-target-7200"]
         self.assertEqual(1, len(discovery))
-        self.assertEqual("mal", discovery[0].provider)
+        self.assertEqual("crunchyroll", discovery[0].provider)
         self.assertEqual([7100], discovery[0].context["supporting_mal_anime_ids"])
 
     def test_discovery_candidate_exports_scorecard_provider_tags_and_dub_signal(self) -> None:
@@ -284,9 +533,10 @@ class RecommendationTests(unittest.TestCase):
             watchlist_status="never_watched",
             provider="hidive",
         )
+        self._map_series("candidate-hidive", 8200, provider="hidive")
         self._cache_metadata(8100, title="Seed Score", genres=["Adventure"], mean=9.0)
         self._cache_metadata(8200, title="Scorecard Discovery", genres=["Adventure"], mean=8.4, popularity=220)
-        self._cache_recommendations(8100, [{"target_mal_anime_id": 8200, "target_title": "Scorecard Discovery", "num_recommendations": 24, "raw": {}}])
+        self._cache_recommendations(8100, [{"target_mal_anime_id": 8200, "target_title": "Scorecard Discovery", "num_recommendations": 24, "raw": {}}], make_targets_available=False)
 
         results = build_recommendations(self.config, limit=0)
 
@@ -311,10 +561,10 @@ class RecommendationTests(unittest.TestCase):
         self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
         self._map_series("seed-a", 100)
         self._cache_metadata(100, title="Seed A")
-        self._cache_metadata(300, title="Dormant Candidate")
+        self._cache_metadata(300, title="Dormant Candidate", mean=8.1, popularity=250)
         self._cache_recommendations(100, [
             {"target_mal_anime_id": 300, "target_title": "Dormant Candidate", "num_recommendations": 20, "raw": {}},
-        ])
+        ], make_targets_available=False)
 
         visible = [
             item
@@ -325,7 +575,12 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual([], visible)
         self.assertEqual(1, len(dormant))
+        self.assertEqual("mal:300", dormant[0].provider_series_id)
+        self.assertEqual("mal", dormant[0].provider)
         self.assertFalse(dormant[0].context["availability_visible"])
+        self.assertEqual([], dormant[0].context["available_via_providers"])
+        self.assertEqual("none", dormant[0].context["availability_confidence"])
+        self.assertEqual("unknown", dormant[0].context["english_dub_signal"])
 
     def test_relation_backed_new_season_recommendation_detects_title_drift(self) -> None:
         self._insert_series(
@@ -590,7 +845,7 @@ class RecommendationTests(unittest.TestCase):
         discovery = [item for item in results if item.kind == "discovery_candidate"]
         self.assertEqual(1, len(discovery))
         item = discovery[0]
-        self.assertEqual("mal:300", item.provider_series_id)
+        self.assertEqual("available-target-300", item.provider_series_id)
         self.assertEqual(2, item.context["supporting_source_count"])
         self.assertEqual(35, item.context["aggregated_recommendation_votes"])
         self.assertEqual(20, item.context["best_single_source_votes"])
@@ -630,13 +885,13 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(10, results[0].context["cross_seed_support_votes"])
         self.assertEqual(0, results[1].context["cross_seed_support_votes"])
         self.assertGreater(results[0].context["support_balance_bonus"], results[1].context["support_balance_bonus"])
         self.assertGreater(results[0].priority, results[1].priority)
 
-    def test_discovery_candidate_can_come_from_harvested_dormant_edge_without_provider_availability(self) -> None:
+    def test_discovery_candidate_can_come_from_harvested_dormant_edge_with_provider_dub_availability(self) -> None:
         self._insert_series("dormant-seed", title="Dormant Seed")
         self._map_series("dormant-seed", 100)
         self._cache_metadata(100, title="Dormant Seed")
@@ -651,11 +906,13 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:200"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-200"], [item.provider_series_id for item in results])
         self.assertEqual("Harvested Pick", results[0].title)
         self.assertEqual(12, results[0].context["aggregated_recommendation_votes"])
         self.assertEqual([100], results[0].context["supporting_mal_anime_ids"])
-        self.assertEqual("none", results[0].context["availability_confidence"])
+        self.assertEqual("mapped", results[0].context["availability_confidence"])
+        self.assertTrue(results[0].context["availability_visible"])
+        self.assertEqual("present", results[0].context["english_dub_signal"])
 
     def test_discovery_candidate_suppresses_mal_listed_harvested_target(self) -> None:
         self._insert_series("dormant-seed", title="Dormant Seed")
@@ -676,6 +933,59 @@ class RecommendationTests(unittest.TestCase):
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
         self.assertEqual([], results)
+
+    def test_discovery_candidate_suppresses_mapped_provider_watched_target(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._insert_series("watched-target", title="Already Watched Pick", watchlist_status="fully_watched")
+        self._map_series("watched-target", 200)
+        self._cache_metadata(200, title="Already Watched Pick", mean=8.1, popularity=400)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 200, "target_title": "Already Watched Pick", "num_recommendations": 12, "raw": {}}],
+        )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], results)
+
+    def test_discovery_candidate_suppresses_title_alias_provider_progress_target(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._insert_series("alias-target", title="Already Watched Pick")
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_progress("alias-target", "alias-ep-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent)
+        self._cache_metadata(200, title="Already Watched Pick", mean=8.1, popularity=400)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 200, "target_title": "Already Watched Pick", "num_recommendations": 12, "raw": {}}],
+        )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], results)
+
+    def test_discovery_candidate_keeps_unwatched_new_season_provider_match_with_guard_context(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._insert_series("new-season", title="Fresh Pick", season_title="Fresh Pick Season 2 (English Dub)", watchlist_status="not_started")
+        self._map_series("new-season", 200)
+        self._cache_metadata(200, title="Fresh Pick", mean=8.1, popularity=400)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 200, "target_title": "Fresh Pick", "num_recommendations": 12, "raw": {}}],
+            make_targets_available=False,
+        )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(["new-season"], [item.provider_series_id for item in results])
+        self.assertTrue(results[0].context["suppression_checked"])
+        self.assertEqual([], results[0].context["suppression_evidence"])
+        self.assertIn("suppression guard", " ".join(results[0].reasons))
 
     def test_discovery_candidate_prefers_more_recent_start_season_when_support_ties(self) -> None:
         self._insert_series(
@@ -700,7 +1010,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["freshness_bonus"], results[1].context["freshness_bonus"])
         self.assertEqual("current_or_upcoming", results[0].context["freshness_bucket"])
         self.assertEqual(current_season.title() + " " + str(now.year), results[0].context["start_season_label"])
@@ -730,7 +1040,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual("aging_catalog", results[0].context["freshness_bucket"])
         self.assertEqual(2, results[0].context["freshness_penalty"])
         self.assertEqual("legacy_catalog", results[1].context["freshness_bucket"])
@@ -771,7 +1081,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["recent_seed_activity_bonus"], results[1].context["recent_seed_activity_bonus"])
         self.assertLess(results[0].context["freshest_supporting_seed_days"], results[1].context["freshest_supporting_seed_days"])
         self.assertEqual(0, results[0].context["stale_support_penalty"])
@@ -812,7 +1122,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(3, results[0].context["seed_quality_bonus"])
         self.assertEqual(3, results[1].context["seed_quality_bonus"])
         self.assertEqual(0, results[0].context["stale_supporting_seed_count"])
@@ -866,7 +1176,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:400", "mal:500"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-400", "available-target-500"], [item.provider_series_id for item in results])
         stale_heavy = results[1]
         self.assertEqual(3, stale_heavy.context["supporting_source_count"])
         self.assertEqual(3, stale_heavy.context["base_effective_supporting_seed_count"])
@@ -910,7 +1220,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["seed_quality_bonus"], results[1].context["seed_quality_bonus"])
         self.assertEqual(10, results[0].context["best_supporting_seed_score"])
         self.assertIn("higher-confidence seed taste signals", " ".join(results[0].reasons))
@@ -953,7 +1263,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["seed_quality_bonus"], results[1].context["seed_quality_bonus"])
         self.assertIsNone(results[0].context["best_supporting_seed_score"])
         self.assertIn("stronger seed engagement signals", " ".join(results[0].reasons))
@@ -989,7 +1299,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["neutral_supporting_seed_count"])
         self.assertEqual(1, results[1].context["neutral_supporting_seed_count"])
         self.assertEqual({200: 6}, results[1].context["neutral_supporting_seed_scores"])
@@ -1028,7 +1338,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["seed_quality_penalty"])
         self.assertEqual(0, results[0].context["disliked_supporting_seed_count"])
 
@@ -1063,7 +1373,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300"], [item.provider_series_id for item in results])
         self.assertGreater(results[0].context["seed_quality_bonus"], 0)
         self.assertEqual(3, results[0].context["seed_quality_penalty"])
         self.assertEqual(10, results[0].context["best_supporting_seed_score"])
@@ -1113,9 +1423,9 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual({"mal:300", "mal:400"}, {item.provider_series_id for item in results})
-        neutral_heavy = next(item for item in results if item.provider_series_id == "mal:400")
-        clean_support = next(item for item in results if item.provider_series_id == "mal:300")
+        self.assertEqual({"available-target-300", "available-target-400"}, {item.provider_series_id for item in results})
+        neutral_heavy = next(item for item in results if item.provider_series_id == "available-target-400")
+        clean_support = next(item for item in results if item.provider_series_id == "available-target-300")
         self.assertEqual(2, neutral_heavy.context["neutral_supporting_seed_count"])
         self.assertAlmostEqual(2 / 3, neutral_heavy.context["neutral_support_ratio"])
         self.assertEqual(1, neutral_heavy.context["effective_supporting_seed_count"])
@@ -1161,7 +1471,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:400", "mal:500"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-400", "available-target-500"], [item.provider_series_id for item in results])
         fresh_spread, stale_spread = results
         self.assertEqual(10, fresh_spread.context["effective_cross_seed_support_votes"])
         self.assertEqual(6, stale_spread.context["effective_cross_seed_support_votes"])
@@ -1210,7 +1520,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         majority_negative = results[1]
         self.assertEqual(2, majority_negative.context["negative_supporting_seed_count"])
         self.assertAlmostEqual(2 / 3, majority_negative.context["negative_support_ratio"])
@@ -1275,7 +1585,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(["Sci-Fi"], results[0].context["shared_genres"])
         self.assertGreater(results[0].context["genre_overlap_score"], 0)
         self.assertIn("shared seed genres: Sci-Fi", results[0].reasons)
@@ -1302,7 +1612,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(["Bones"], results[0].context["shared_studios"])
         self.assertGreater(results[0].context["studio_overlap_score"], 0)
         self.assertIn("shared seed studios: Bones", results[0].reasons)
@@ -1329,7 +1639,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual("light_novel", results[0].context["source"])
         self.assertGreater(results[0].context["source_overlap_score"], 0)
         self.assertIn("shared seed source material: light_novel", results[0].reasons)
@@ -1356,7 +1666,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["metadata_match_dimensions"])
         self.assertEqual(2, results[0].context["catalog_quality_bonus"])
         self.assertEqual("elite", results[0].context["catalog_mean_band"])
@@ -1389,7 +1699,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["metadata_match_dimensions"])
         self.assertEqual(1, results[0].context["catalog_quality_bonus"])
         self.assertIsNone(results[0].context["catalog_mean_band"])
@@ -1420,7 +1730,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["catalog_quality_penalty"])
         self.assertEqual(0, results[0].context["catalog_quality_adjustment"])
         self.assertEqual(2, results[1].context["catalog_quality_penalty"])
@@ -1452,7 +1762,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(0, results[0].context["catalog_quality_penalty"])
         self.assertEqual(0, results[0].context["catalog_quality_adjustment"])
         self.assertEqual(2, results[1].context["catalog_quality_penalty"])
@@ -1482,7 +1792,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300"], [item.provider_series_id for item in results])
         self.assertEqual(2, results[0].context["catalog_quality_bonus"])
         self.assertEqual(2, results[0].context["catalog_quality_penalty"])
         self.assertEqual(0, results[0].context["catalog_quality_adjustment"])
@@ -1508,7 +1818,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(3, results[0].context["metadata_match_dimensions"])
         self.assertGreater(results[0].context["metadata_affinity_bonus"], 0)
         self.assertEqual(1, results[1].context["metadata_match_dimensions"])
@@ -1535,7 +1845,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(3, results[0].context["metadata_match_dimensions"])
         self.assertEqual(3, results[1].context["metadata_match_dimensions"])
         self.assertGreater(results[0].context["metadata_affinity_bonus"], results[1].context["metadata_affinity_bonus"])
@@ -1560,7 +1870,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(3, results[0].context["metadata_match_dimensions"])
         self.assertEqual(2, results[0].context["metadata_quality_bonus"])
         self.assertEqual("elite", results[0].context["metadata_mean_band"])
@@ -1591,7 +1901,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:300", "mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-300", "available-target-400"], [item.provider_series_id for item in results])
         self.assertEqual(3, results[0].context["metadata_match_dimensions"])
         self.assertEqual(1, results[0].context["metadata_quality_bonus"])
         self.assertIsNone(results[0].context["metadata_mean_band"])
@@ -1634,7 +1944,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-400"], [item.provider_series_id for item in results])
 
     def test_discovery_candidate_skips_franchise_relations_even_when_edge_comes_from_different_seed(self) -> None:
         self._insert_series(
@@ -1676,7 +1986,7 @@ class RecommendationTests(unittest.TestCase):
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
-        self.assertEqual(["mal:400"], [item.provider_series_id for item in results])
+        self.assertEqual(["available-target-400"], [item.provider_series_id for item in results])
 
     def test_discovery_candidate_surfaces_titles_available_in_provider_catalog(self) -> None:
         self._insert_series(
@@ -1697,7 +2007,7 @@ class RecommendationTests(unittest.TestCase):
         self._cache_metadata(300, title="Already Here")
         self._cache_recommendations(100, [
             {"target_mal_anime_id": 300, "target_title": "Already Here", "num_recommendations": 20, "raw": {}},
-        ])
+        ], make_targets_available=False)
 
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
@@ -1832,6 +2142,54 @@ class RecommendationTests(unittest.TestCase):
         metadata_by_id = get_mal_anime_metadata_map(self.config.db_path)
         self.assertIn(9100, metadata_by_id)
         self.assertIn(9200, metadata_by_id)
+
+    def test_recommendation_metadata_refresh_continues_after_mal_detail_failure(self) -> None:
+        self._insert_series("seed-a", title="Seed A", watchlist_status="fully_watched")
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._insert_series("seed-b", title="Seed B", watchlist_status="fully_watched")
+        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._map_series("seed-b", 200)
+        self._insert_series("seed-c", title="Seed C", watchlist_status="fully_watched")
+        self._insert_progress("seed-c", "seed-c-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-03T01:00:00Z")
+        self._map_series("seed-c", 300)
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "") -> dict:
+            if anime_id == 200:
+                raise MalApiError("MAL API anime details failed for anime_id=200: HTTP 504")
+            return {
+                "id": anime_id,
+                "title": f"Seed {anime_id}",
+                "alternative_titles": {},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 12,
+                "mean": 8.0,
+                "popularity": anime_id,
+                "start_season": {"year": 2020, "season": "winter"},
+                "related_anime": [],
+                "recommendations": [],
+                "my_list_status": {"status": "completed", "num_episodes_watched": 12},
+            }
+
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details) as get_details:
+            summary = refresh_recommendation_metadata(self.config)
+
+        self.assertEqual(3, summary.considered)
+        self.assertEqual(2, summary.refreshed)
+        self.assertEqual(1, len(summary.failures or []))
+        failure = (summary.failures or [])[0]
+        self.assertEqual(200, failure.mal_anime_id)
+        self.assertEqual("mapped_metadata", failure.stage)
+        self.assertIn("HTTP 504", failure.error)
+        self.assertEqual([100, 200, 300], [call.args[0] for call in get_details.call_args_list])
+        self.assertEqual(1, summary.as_dict()["failed"])
+        self.assertEqual(200, summary.as_dict()["failures"][0]["mal_anime_id"])
+
+        metadata_by_id = get_mal_anime_metadata_map(self.config.db_path)
+        self.assertIn(100, metadata_by_id)
+        self.assertNotIn(200, metadata_by_id)
+        self.assertIn(300, metadata_by_id)
 
     def test_discovery_target_metadata_refresh_skips_already_mapped_titles(self) -> None:
         self._insert_series(
@@ -2005,7 +2363,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(3, metadata_by_id[300].raw["my_list_status"]["num_episodes_watched"])
 
         results = build_recommendations(self.config, limit=0)
-        discovery = [item for item in results if item.kind == "discovery_candidate" and item.provider_series_id == "mal:300"]
+        discovery = [item for item in results if item.kind == "discovery_candidate" and item.provider_series_id == "available-target-300"]
         self.assertEqual([], discovery)
 
     def test_discovery_target_limit_prefers_higher_aggregate_votes_when_support_count_ties(self) -> None:
@@ -3001,6 +3359,7 @@ class RecommendationTests(unittest.TestCase):
         self._cache_recommendations(
             100,
             [{"target_mal_anime_id": 900, "target_title": "Target", "num_recommendations": 3, "raw": {}}],
+            make_targets_available=False,
         )
 
         self._insert_series("stale-seed", title="Stale Seed", watchlist_status="fully_watched")
@@ -3008,6 +3367,7 @@ class RecommendationTests(unittest.TestCase):
         self._cache_recommendations(
             200,
             [{"target_mal_anime_id": 901, "target_title": "Old Target", "num_recommendations": 1, "raw": {}}],
+            make_targets_available=False,
         )
         with connect(self.config.db_path) as conn:
             conn.execute("UPDATE mal_recommendation_harvest_status SET fetched_at = '2000-01-01 00:00:00' WHERE source_mal_anime_id = 200")
@@ -3073,6 +3433,7 @@ class RecommendationTests(unittest.TestCase):
             self._cache_recommendations(
                 100 + index,
                 [{"target_mal_anime_id": 9000, "target_title": "Discovery Winner", "num_recommendations": 30 - index, "raw": {}}],
+                make_targets_available=False,
             )
 
         self._cache_metadata(9000, title="Discovery Winner")
@@ -3082,6 +3443,7 @@ class RecommendationTests(unittest.TestCase):
             season_title="Discovery Winner (English Dub)",
             watchlist_status="available",
         )
+        self._map_series("discovery-winner", 9000)
 
         for index in range(4):
             backlog_series_id = f"backlog-{index}"
@@ -3113,7 +3475,7 @@ class RecommendationTests(unittest.TestCase):
         discovery_section = next(section for section in payload if section["key"] == "discovery_candidates")
         self.assertEqual("discovery-winner", discovery_section["items"][0]["provider_series_id"])
 
-    def test_recommend_cli_hides_dormant_discovery_candidates_by_default(self) -> None:
+    def test_recommend_cli_includes_mal_only_discovery_candidates(self) -> None:
         self._insert_series(
             "seed-a",
             title="Seed A",
@@ -3126,31 +3488,55 @@ class RecommendationTests(unittest.TestCase):
         self._cache_metadata(300, title="Dormant Candidate")
         self._cache_recommendations(100, [
             {"target_mal_anime_id": 300, "target_title": "Dormant Candidate", "num_recommendations": 20, "raw": {}},
-        ])
+        ], make_targets_available=False)
 
-        default_argv = [
-            "mal-updater",
-            "--project-root",
-            str(self.project_root),
-            "recommend",
-            "--limit",
-            "0",
-            "--flat",
-        ]
-        with patch("sys.argv", default_argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            default_exit_code = cli_main()
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend", "--limit", "0", "--flat"]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
 
-        include_argv = [*default_argv, "--include-dormant"]
-        with patch("sys.argv", include_argv), patch("sys.stdout", new_callable=io.StringIO) as include_stdout:
-            include_exit_code = cli_main()
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, len(payload))
+        self.assertEqual("mal:300", payload[0]["provider_series_id"])
+        self.assertEqual("mal", payload[0]["provider"])
+        self.assertEqual("none", payload[0]["context"]["availability_confidence"])
 
-        self.assertEqual(0, default_exit_code)
-        self.assertEqual(0, include_exit_code)
+    def test_recommend_cli_excludes_provider_available_non_english_dub_discovery(self) -> None:
+        self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(301, title="Sub Only Candidate")
+        self._cache_recommendations(100, [{"target_mal_anime_id": 301, "target_title": "Sub Only Candidate", "num_recommendations": 20, "raw": {}}], make_targets_available=False)
+        self._insert_series("sub-only", title="Sub Only Candidate", season_title="Sub Only Candidate", watchlist_status="available")
+
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend", "--limit", "0", "--flat"]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
         self.assertEqual([], json.loads(stdout.getvalue()))
-        included = json.loads(include_stdout.getvalue())
-        self.assertEqual(1, len(included))
-        self.assertEqual("mal:300", included[0]["provider_series_id"])
-        self.assertFalse(included[0]["context"]["availability_visible"])
+
+    def test_recommend_cli_includes_provider_available_english_dub_discovery_with_title_and_genres(self) -> None:
+        self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A", genres=["Action"])
+        self._cache_metadata(302, title="Romaji Candidate", title_english="English Candidate", genres=["Comedy", "Fantasy"])
+        self._cache_recommendations(100, [{"target_mal_anime_id": 302, "target_title": "Romaji Candidate", "num_recommendations": 20, "raw": {}}], make_targets_available=False)
+        self._insert_series("dubbed", title="Romaji Candidate", season_title="Romaji Candidate (English Dub)", watchlist_status="available")
+
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend", "--limit", "0", "--flat"]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, len(payload))
+        self.assertEqual("dubbed", payload[0]["provider_series_id"])
+        self.assertEqual("English Candidate", payload[0]["context"]["english_title"])
+        self.assertEqual(["Comedy", "Fantasy"], payload[0]["context"]["genres"])
+        self.assertEqual("present", payload[0]["scorecard"]["features"]["english_dub_signal"])
 
     def test_recommend_cli_flat_flag_preserves_legacy_list_output(self) -> None:
         self._insert_series(

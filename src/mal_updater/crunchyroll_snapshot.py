@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import requests
 
 try:
     from curl_cffi import requests as curl_requests
@@ -36,6 +35,14 @@ class CrunchyrollSnapshotError(RuntimeError):
     pass
 
 
+def _require_curl_requests():
+    if curl_requests is None:
+        raise CrunchyrollSnapshotError(
+            "Crunchyroll requires curl_cffi browser-TLS transport; install project dependencies with `python3 -m pip install -e .`."
+        )
+    return curl_requests
+
+
 class CrunchyrollUnauthorizedError(CrunchyrollSnapshotError):
     def __init__(self, url: str, status_code: int):
         super().__init__(f"Crunchyroll GET failed for {url}: HTTP {status_code}")
@@ -48,6 +55,8 @@ SYNC_BOUNDARY_SCHEMA_VERSION = 1
 HISTORY_BOUNDARY_MARKER_LIMIT = 200
 WATCHLIST_BOUNDARY_MARKER_LIMIT = 200
 INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
+CRUNCHYROLL_HISTORY_PAGE_LIMIT = 1000
+CRUNCHYROLL_WATCHLIST_PAGE_LIMIT = 1000
 
 
 @dataclass(slots=True)
@@ -117,7 +126,7 @@ class _CrunchyrollAuthSession:
     account_email: str | None = None
     credential_rebootstrap_attempted: bool = False
 
-    def authorized_json_get(self, url: str, *, params: dict[str, Any] | None = None) -> Any:
+    def authorized_json_get(self, url: str, *, params: dict[str, Any] | None = None, phase: str | None = None) -> Any:
         last_unauthorized: CrunchyrollUnauthorizedError | None = None
         refresh_error: CrunchyrollAuthError | None = None
         for attempt in range(3):
@@ -128,6 +137,7 @@ class _CrunchyrollAuthSession:
                     timeout_seconds=self.timeout_seconds,
                     params=params,
                     pacer=self.pacer,
+                    phase=phase,
                 )
             except CrunchyrollUnauthorizedError as exc:
                 last_unauthorized = exc
@@ -215,28 +225,34 @@ def _now_string() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _request_timeout(timeout_seconds: float) -> tuple[float, float]:
+    return (timeout_seconds, timeout_seconds)
+
+
+def _log_fetch_progress(message: str) -> None:
+    print(f"[crunchyroll-fetch] {message}", file=sys.stderr, flush=True)
+
+
 def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float):
+    transport = _require_curl_requests()
+    request_exception = getattr(getattr(transport, "exceptions", None), "RequestException", Exception)
     try:
-        if curl_requests is not None:
-            response = curl_requests.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
-        else:
-            response = requests.post(url, data=data, headers=headers, timeout=timeout_seconds)
+        response = transport.post(url, data=data, headers=headers, timeout=_request_timeout(timeout_seconds), impersonate="chrome124")
         record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code)
         return response
-    except requests.RequestException as exc:
+    except request_exception as exc:
         record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="request_error", error=str(exc))
         raise
 
 
 def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, params: dict[str, Any] | None = None):
+    transport = _require_curl_requests()
+    request_exception = getattr(getattr(transport, "exceptions", None), "RequestException", Exception)
     try:
-        if curl_requests is not None:
-            response = curl_requests.get(url, headers=headers, timeout=timeout_seconds, params=params, impersonate="chrome124")
-        else:
-            response = requests.get(url, headers=headers, timeout=timeout_seconds, params=params)
+        response = transport.get(url, headers=headers, timeout=_request_timeout(timeout_seconds), params=params, impersonate="chrome124")
         record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code)
         return response
-    except requests.RequestException as exc:
+    except request_exception as exc:
         record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="request_error", error=str(exc))
         raise
 
@@ -366,15 +382,20 @@ def _authorized_json_get(
     timeout_seconds: float,
     params: dict[str, Any] | None = None,
     pacer: _CrunchyrollRequestPacer | None = None,
+    phase: str | None = None,
 ) -> Any:
     if pacer is not None:
         pacer.wait_turn()
-    response = _http_get(
-        url,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout_seconds=timeout_seconds,
-        params=params,
-    )
+    phase_label = phase or "GET"
+    try:
+        response = _http_get(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout_seconds=timeout_seconds,
+            params=params,
+        )
+    except Exception as exc:
+        raise CrunchyrollSnapshotError(f"Crunchyroll {phase_label} request failed for {url}: {exc}") from exc
     if response.status_code == 401:
         raise CrunchyrollUnauthorizedError(url, response.status_code)
     if response.status_code >= 400:
@@ -702,9 +723,15 @@ def _fetch_snapshot_once(
     session: _CrunchyrollAuthSession,
     *,
     use_incremental_boundary: bool = True,
+    max_history_pages: int | None = None,
+    max_watchlist_pages: int | None = None,
+    history_start_page: int = 1,
+    watchlist_start: int = 0,
 ) -> CrunchyrollFetchResult:
     config = session.config
-    account_payload = session.authorized_json_get(CRUNCHYROLL_ME_URL)
+    hot_mode = use_incremental_boundary
+    _log_fetch_progress(f"account endpoint={CRUNCHYROLL_ME_URL}")
+    account_payload = session.authorized_json_get(CRUNCHYROLL_ME_URL, phase="account")
     if not isinstance(account_payload, dict):
         raise CrunchyrollSnapshotError("Crunchyroll account response was not a JSON object")
     account_id = str(account_payload.get("account_id") or session.token.account_id or "") or None
@@ -730,11 +757,18 @@ def _fetch_snapshot_once(
     history_backfill_exhausted = False
     history_front_boundary_seen = not history_markers
     history_backfill_cursor_seen = not history_backfill_markers
-    page = 1
+    history_partial = False
+    next_history_page: int | None = None
+    page = max(1, history_start_page)
     while True:
+        if page > CRUNCHYROLL_HISTORY_PAGE_LIMIT:
+            raise CrunchyrollSnapshotError(f"Crunchyroll watch-history exceeded page guard ({CRUNCHYROLL_HISTORY_PAGE_LIMIT})")
+        history_url = f"https://www.crunchyroll.com/content/v2/{account_id}/watch-history"
+        _log_fetch_progress(f"watch-history page={page} endpoint={history_url}")
         history_payload = session.authorized_json_get(
-            f"https://www.crunchyroll.com/content/v2/{account_id}/watch-history",
+            history_url,
             params={"page": page, "page_size": 100, "locale": config.crunchyroll.locale},
+            phase=f"watch-history page {page}",
         )
         history_pages_fetched += 1
         if not isinstance(history_payload, dict):
@@ -760,9 +794,16 @@ def _fetch_snapshot_once(
             if history_front_boundary_seen:
                 history_backfill_exhausted = True
             break
-        if isinstance(total, int) and len(history_entries) >= total:
+        if isinstance(total, int) and (page * 100) >= total:
             if history_front_boundary_seen:
                 history_backfill_exhausted = True
+            break
+        if hot_mode:
+            break
+        if max_history_pages is not None and history_pages_fetched >= max_history_pages:
+            history_partial = True
+            history_stopped_early = True
+            next_history_page = page + 1
             break
         page += 1
 
@@ -775,11 +816,19 @@ def _fetch_snapshot_once(
     watchlist_backfill_exhausted = False
     watchlist_front_boundary_seen = not watchlist_markers
     watchlist_backfill_cursor_seen = not watchlist_backfill_markers
-    watchlist_start = 0
-    while True:
+    watchlist_partial = False
+    next_watchlist_start: int | None = None
+    initial_watchlist_start = max(0, watchlist_start)
+    watchlist_start = initial_watchlist_start
+    while not hot_mode:
+        if watchlist_pages_fetched >= CRUNCHYROLL_WATCHLIST_PAGE_LIMIT:
+            raise CrunchyrollSnapshotError(f"Crunchyroll watchlist exceeded page guard ({CRUNCHYROLL_WATCHLIST_PAGE_LIMIT})")
+        watchlist_url = f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist"
+        _log_fetch_progress(f"watchlist start={watchlist_start} endpoint={watchlist_url}")
         watchlist_payload = session.authorized_json_get(
-            f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist",
+            watchlist_url,
             params={"locale": config.crunchyroll.locale, "n": 100, "start": watchlist_start},
+            phase=f"watchlist start {watchlist_start}",
         )
         watchlist_pages_fetched += 1
         if not isinstance(watchlist_payload, dict):
@@ -812,9 +861,14 @@ def _fetch_snapshot_once(
             if watchlist_front_boundary_seen:
                 watchlist_backfill_exhausted = True
             break
-        if watchlist_total is not None and len(watchlist_data) >= watchlist_total:
+        if watchlist_total is not None and watchlist_start >= watchlist_total:
             if watchlist_front_boundary_seen:
                 watchlist_backfill_exhausted = True
+            break
+        if max_watchlist_pages is not None and watchlist_pages_fetched >= max_watchlist_pages:
+            watchlist_partial = True
+            watchlist_stopped_early = True
+            next_watchlist_start = watchlist_start
             break
 
     progress = [item for item in (_progress_from_history_entry(entry) for entry in history_entries) if item is not None]
@@ -847,20 +901,30 @@ def _fetch_snapshot_once(
             "session_state_path": str(session.state_paths.session_state_path),
             "sync_boundary_path": str(session.state_paths.sync_boundary_path),
             "sync_boundary_present": boundary is not None,
-            "sync_boundary_mode": "incremental" if use_incremental_boundary else "full_refresh",
+            "sync_boundary_mode": "hot" if hot_mode else "full_refresh",
+            "hot_surface_only": hot_mode,
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
             "sync_boundary_account_match": None if boundary is None else boundary.account_id_hint == account_id,
             "refresh_token_present": session.state_paths.refresh_token_path.exists(),
             "device_id_present": session.state_paths.device_id_path.exists(),
             "device_type_hint": session.token.device_type,
+            "partial": history_partial or watchlist_partial,
             "history_count": len(history_entries),
+            "history_start_page": max(1, history_start_page),
             "history_pages_fetched": history_pages_fetched,
+            "history_page_limit_applied": max_history_pages,
+            "history_partial": history_partial,
+            "history_next_page": next_history_page,
             "history_stopped_early": history_stopped_early,
             "history_backfill_pages_fetched": history_backfill_pages_fetched,
             "history_backfill_exhausted": history_backfill_exhausted,
             "history_boundary_marker_count": len(history_markers),
             "watchlist_count": len(watchlist_entries),
+            "watchlist_start": initial_watchlist_start,
             "watchlist_pages_fetched": watchlist_pages_fetched,
+            "watchlist_page_limit_applied": max_watchlist_pages,
+            "watchlist_partial": watchlist_partial,
+            "watchlist_next_start": next_watchlist_start,
             "watchlist_stopped_early": watchlist_stopped_early,
             "watchlist_backfill_pages_fetched": watchlist_backfill_pages_fetched,
             "watchlist_backfill_exhausted": watchlist_backfill_exhausted,
@@ -871,24 +935,26 @@ def _fetch_snapshot_once(
             "auth_source": session.auth_source,
         },
     )
-    _write_sync_boundary(
-        state_paths=session.state_paths,
-        generated_at=generated_at,
-        account_id_hint=account_id,
-        history_entries=history_entries,
-        watchlist_entries=watchlist_data,
-        history_backfill_entries=[] if history_backfill_exhausted else history_backfill_entries,
-        watchlist_backfill_entries=[] if watchlist_backfill_exhausted else watchlist_backfill_entries,
-    )
+    is_partial = history_partial or watchlist_partial
+    if not is_partial:
+        _write_sync_boundary(
+            state_paths=session.state_paths,
+            generated_at=generated_at,
+            account_id_hint=account_id,
+            history_entries=history_entries,
+            watchlist_entries=watchlist_data,
+            history_backfill_entries=[] if history_backfill_exhausted else history_backfill_entries,
+            watchlist_backfill_entries=[] if watchlist_backfill_exhausted else watchlist_backfill_entries,
+        )
     _write_session_state(
         state_paths=session.state_paths,
         profile=session.profile,
         locale=config.crunchyroll.locale,
         device_type=session.token.device_type,
         account_id=account_id,
-        last_error=None,
-        success=True,
-        phase="python_live_snapshot",
+        last_error="partial snapshot; sync boundary not advanced" if is_partial else None,
+        success=not is_partial,
+        phase="python_live_snapshot_partial" if is_partial else "python_live_snapshot",
     )
     return CrunchyrollFetchResult(
         snapshot=snapshot,
@@ -903,6 +969,10 @@ def fetch_snapshot(
     profile: str = "default",
     timeout_seconds: float = 30.0,
     use_incremental_boundary: bool = True,
+    max_history_pages: int | None = None,
+    max_watchlist_pages: int | None = None,
+    history_start_page: int = 1,
+    watchlist_start: int = 0,
 ) -> CrunchyrollFetchResult:
     pacer = _CrunchyrollRequestPacer(
         config.crunchyroll.request_spacing_seconds,
@@ -914,7 +984,14 @@ def fetch_snapshot(
         timeout_seconds=timeout_seconds,
         pacer=pacer,
     )
-    return _fetch_snapshot_once(session, use_incremental_boundary=use_incremental_boundary)
+    return _fetch_snapshot_once(
+        session,
+        use_incremental_boundary=use_incremental_boundary,
+        max_history_pages=max_history_pages,
+        max_watchlist_pages=max_watchlist_pages,
+        history_start_page=history_start_page,
+        watchlist_start=watchlist_start,
+    )
 
 
 def snapshot_to_dict(snapshot: CrunchyrollSnapshot) -> dict[str, Any]:

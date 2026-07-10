@@ -82,6 +82,12 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchy
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
+PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --dry-run
+PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --metadata-limit 25 --discovery-target-limit 25 --recommendation-limit 100 --provider-max-history-pages 2 --provider-max-watchlist-pages 2
+# Default unattended service cadence is semi-fast but conservative: hourly MAL refresh,
+# provider sync/apply, health, recommendation metadata refresh, and recommend-maintain
+# checks; webhook lanes keep their existing defaults/overrides. Provider/MAL budget
+# guards still skip or back off any task when pacing limits are reached.
 PYTHONPATH=src python3 -m mal_updater.cli exact-approved-sync-cycle
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --provider all

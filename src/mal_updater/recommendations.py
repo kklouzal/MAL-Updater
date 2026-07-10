@@ -418,7 +418,7 @@ def build_recommendations(
             relations_by_id=relations_by_id,
         )
     )
-    recommendations.extend(_build_new_season_recommendations(states))
+    recommendations.extend(_build_new_season_recommendations(states, mapping_by_series=mapping_by_series, metadata_by_id=metadata_by_id))
     recommendations.extend(
         _build_discovery_recommendations(
             states,
@@ -429,7 +429,7 @@ def build_recommendations(
             require_provider_availability=require_provider_availability,
         )
     )
-    recommendations.extend(_build_new_episode_recommendations(states))
+    recommendations.extend(_build_new_episode_recommendations(states, mapping_by_series=mapping_by_series, metadata_by_id=metadata_by_id))
     recommendations = _dedupe_recommendations(recommendations)
     recommendations = _merge_cross_provider_recommendations(
         recommendations,
@@ -442,7 +442,12 @@ def build_recommendations(
     return recommendations[:limit]
 
 
-def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> list[Recommendation]:
+def _build_new_episode_recommendations(
+    states: list[ProviderSeriesState],
+    *,
+    mapping_by_series: dict[tuple[str, str], int] | None = None,
+    metadata_by_id: dict[int, Any] | None = None,
+) -> list[Recommendation]:
     items: list[Recommendation] = []
     for state in states:
         if not _is_english_dub_series(state):
@@ -456,6 +461,14 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
         if tail_gap is None or tail_gap <= 0:
             continue
 
+        suppress, mal_context, suppression_rationale = _should_suppress_mapped_continuation_target(
+            state,
+            mapping_by_series=mapping_by_series,
+            metadata_by_id=metadata_by_id,
+        )
+        if suppress:
+            continue
+
         days_since_watch = _days_since(state.last_watched_at)
         is_recent = days_since_watch is not None and days_since_watch <= _FRESH_DUBBED_EPISODE_WINDOW_DAYS
         kind = "new_dubbed_episode" if is_recent else "resume_backlog"
@@ -467,7 +480,16 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
             reasons.append("this looks more like a backlog continuation than a fresh release alert")
         if state.last_watched_at:
             reasons.append(f"most recent watch activity: {state.last_watched_at}")
+        if mal_context.get("mal_watch_status") or mal_context.get("mal_num_episodes_watched") is not None:
+            watched = mal_context.get("mal_num_episodes_watched")
+            total = mal_context.get("mal_num_episodes")
+            watched_fragment = f" ({watched}/{total if total is not None else '?'} MAL episodes watched)" if watched is not None else ""
+            reasons.append(f"MAL watch status: {mal_context.get('mal_watch_status') or 'unknown'}{watched_fragment}")
+        elif mal_context.get("mal_watch_metadata_uncertain"):
+            reasons.append("MAL watch metadata is missing/partial, so this continuation was kept conservatively")
         priority = _episode_recommendation_priority(state, tail_gap, kind)
+        if suppression_rationale is not None:
+            mal_context["mal_suppression_rationale"] = suppression_rationale
         items.append(
             Recommendation(
                 kind=kind,
@@ -486,6 +508,7 @@ def _build_new_episode_recommendations(states: list[ProviderSeriesState]) -> lis
                     "watchlist_status": state.watchlist_status,
                     "last_watched_at": state.last_watched_at,
                     "days_since_last_watch": days_since_watch,
+                    **mal_context,
                 },
             )
         )
@@ -857,6 +880,64 @@ def _metadata_my_list_status(meta: Any) -> dict[str, Any] | None:
     return my_list_status if isinstance(my_list_status, dict) else None
 
 
+def _metadata_mal_watch_context(meta: Any) -> dict[str, Any]:
+    my_list_status = _metadata_my_list_status(meta)
+    status = None
+    watched = None
+    if my_list_status is not None:
+        raw_status = my_list_status.get("status")
+        status = raw_status.strip().lower() if isinstance(raw_status, str) and raw_status.strip() else None
+        raw_watched = my_list_status.get("num_episodes_watched")
+        watched = raw_watched if isinstance(raw_watched, int) else None
+    total = getattr(meta, "num_episodes", None) if meta is not None else None
+    total = total if isinstance(total, int) and total > 0 else None
+    completed = status == "completed" or (watched is not None and total is not None and watched >= total)
+    uncertain = meta is None or my_list_status is None or (status is None and watched is None)
+    return {
+        "mal_watch_status": status,
+        "mal_num_episodes_watched": watched,
+        "mal_num_episodes": total,
+        "mal_watch_metadata_uncertain": uncertain,
+        "mal_target_completed": completed,
+    }
+
+
+def _provider_has_unwatched_tail(state: ProviderSeriesState) -> bool:
+    total = getattr(state, "available_episode_count", None) or getattr(state, "latest_episode_number", None) or state.max_episode_number
+    if total is None or total <= 0:
+        return False
+    return state.completed_episode_count < int(total)
+
+
+def _mapped_mal_watch_context(
+    state: ProviderSeriesState,
+    *,
+    mapping_by_series: dict[tuple[str, str], int] | None,
+    metadata_by_id: dict[int, Any] | None,
+) -> tuple[int | None, dict[str, Any]]:
+    mal_id = (mapping_by_series or {}).get((state.provider, state.provider_series_id))
+    meta = (metadata_by_id or {}).get(mal_id) if mal_id is not None else None
+    context = _metadata_mal_watch_context(meta)
+    context["mal_anime_id"] = mal_id
+    return mal_id, context
+
+
+def _should_suppress_mapped_continuation_target(
+    state: ProviderSeriesState,
+    *,
+    mapping_by_series: dict[tuple[str, str], int] | None,
+    metadata_by_id: dict[int, Any] | None,
+) -> tuple[bool, dict[str, Any], str | None]:
+    _, context = _mapped_mal_watch_context(state, mapping_by_series=mapping_by_series, metadata_by_id=metadata_by_id)
+    if context["mal_target_completed"]:
+        return True, context, "mapped MAL target is already completed on MAL"
+    if context["mal_watch_metadata_uncertain"]:
+        context["mal_inclusion_rationale"] = "MAL watch metadata missing/partial; avoiding over-suppression"
+    else:
+        context["mal_inclusion_rationale"] = "mapped MAL target is not completed or provider progress shows an unwatched tail"
+    return False, context, None
+
+
 def _discovery_seed_status_value(meta: Any) -> str | None:
     my_list_status = _metadata_my_list_status(meta)
     if not isinstance(my_list_status, dict):
@@ -990,6 +1071,69 @@ def _select_primary_available_state(states: list[ProviderSeriesState]) -> Provid
 def _is_discovery_watchable_provider_state(state: ProviderSeriesState) -> bool:
     return state.watchlist_status not in {"fully_watched", "in_progress"}
 
+
+
+
+def _provider_state_completion_evidence(state: ProviderSeriesState) -> str | None:
+    if state.watchlist_status in {"fully_watched", "completed"}:
+        return f"provider watchlist status is {state.watchlist_status}"
+    if state.watchlist_status == "in_progress":
+        return "provider watchlist status is in_progress"
+    if state.completed_episode_count > 0:
+        return f"provider progress has {state.completed_episode_count} completed episode(s)"
+    if state.max_completed_episode_number is not None and state.max_completed_episode_number > 0:
+        return f"provider progress completed through episode {state.max_completed_episode_number}"
+    return None
+
+
+def _candidate_suppression_evidence(
+    *,
+    target_id: int,
+    candidate_title_aliases: set[str],
+    metadata_by_id: dict[int, Any],
+    availability_by_mal_id: dict[int, list[ProviderSeriesState]],
+    availability_by_title_alias: dict[str, list[ProviderSeriesState]],
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    meta = metadata_by_id.get(target_id)
+    if meta is not None:
+        my_list_status = meta.raw.get("my_list_status") if isinstance(meta.raw, dict) else None
+        if isinstance(my_list_status, dict):
+            status_value = my_list_status.get("status")
+            watched_count = my_list_status.get("num_episodes_watched")
+            if status_value in {"completed", "watching", "on_hold", "dropped", "plan_to_watch"}:
+                evidence.append({"kind": "mal_list_status", "mal_anime_id": target_id, "status": status_value})
+            if isinstance(watched_count, int) and watched_count > 0:
+                evidence.append({"kind": "mal_list_progress", "mal_anime_id": target_id, "num_episodes_watched": watched_count})
+
+    seen: set[tuple[str, str, str]] = set()
+    for match_kind, matched_states in (
+        ("mapped_mal", availability_by_mal_id.get(target_id, [])),
+        ("title_alias", [state for alias in candidate_title_aliases for state in availability_by_title_alias.get(alias, [])]),
+    ):
+        for state in matched_states:
+            state_key = (match_kind, state.provider, state.provider_series_id)
+            if state_key in seen:
+                continue
+            seen.add(state_key)
+            reason = _provider_state_completion_evidence(state)
+            if reason is None:
+                continue
+            evidence.append(
+                {
+                    "kind": "provider_watch_history",
+                    "match_kind": match_kind,
+                    "provider": state.provider,
+                    "provider_series_id": state.provider_series_id,
+                    "title": state.title,
+                    "season_title": state.season_title,
+                    "watchlist_status": state.watchlist_status,
+                    "completed_episode_count": state.completed_episode_count,
+                    "max_completed_episode_number": state.max_completed_episode_number,
+                    "reason": reason,
+                }
+            )
+    return evidence
 
 def _candidate_available_states(
     *,
@@ -1206,27 +1350,34 @@ def _build_discovery_recommendations(
             continue
         if meta is not None and meta.media_type not in (None, "tv", "movie", "ova", "ona", "special"):
             continue
-        if meta is not None:
-            my_list_status = meta.raw.get("my_list_status") if isinstance(meta.raw, dict) else None
-            if isinstance(my_list_status, dict):
-                status_value = my_list_status.get("status")
-                watched_count = my_list_status.get("num_episodes_watched")
-                if status_value in {"completed", "watching", "on_hold", "dropped", "plan_to_watch"}:
-                    continue
-                if isinstance(watched_count, int) and watched_count > 0:
-                    continue
         candidate_title_aliases = _metadata_title_aliases(meta)
         candidate_title_aliases.update(_normalized_title_aliases(bucket.get("title")))
+        suppression_evidence = _candidate_suppression_evidence(
+            target_id=target_id,
+            candidate_title_aliases=candidate_title_aliases,
+            metadata_by_id=metadata_by_id,
+            availability_by_mal_id=availability_by_mal_id,
+            availability_by_title_alias=availability_by_title_alias,
+        )
+        if suppression_evidence:
+            continue
         available_states, availability_match_kind_by_state = _candidate_available_states(
             target_id=target_id,
             candidate_title_aliases=candidate_title_aliases,
             availability_by_mal_id=availability_by_mal_id,
             availability_by_title_alias=availability_by_title_alias,
         )
-        if require_provider_availability and not available_states:
+        english_dub_states = [
+            state
+            for state in available_states
+            if state.provider in {"crunchyroll", "hidive"} and _is_english_dub_series(state)
+        ]
+        if require_provider_availability and (not available_states or not english_dub_states):
             continue
-        primary_available_state = _select_primary_available_state(available_states) if available_states else None
-        available_via_providers = sorted({state.provider for state in available_states})
+        if not require_provider_availability and available_states and not english_dub_states:
+            continue
+        primary_available_state = _select_primary_available_state(english_dub_states) if english_dub_states else None
+        available_via_providers = sorted({state.provider for state in english_dub_states})
         availability_match_kinds = sorted({availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias") for state in available_states})
         if "mapped_mal" in availability_match_kinds:
             availability_confidence = "mapped"
@@ -1405,6 +1556,8 @@ def _build_discovery_recommendations(
         priority -= mixed_signal_penalty
         priority -= neutral_support_penalty
         priority -= catalog_quality_penalty
+        if availability_confidence == "none":
+            priority -= 41
         reasons = [
             f"recommended by {support_count} watched/mapped seed title(s)",
         ]
@@ -1506,7 +1659,12 @@ def _build_discovery_recommendations(
                 reasons.append(f"available via mapped provider catalog match: {_format_provider_label(available_via_providers)}")
             else:
                 reasons.append(f"available via title-alias provider catalog match: {_format_provider_label(available_via_providers)}")
+        reasons.append("suppression guard found no exact MAL-list, mapped-provider, or title-alias provider watch-history evidence for this candidate")
         title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
+        english_title = getattr(meta, "title_english", None) if meta is not None else None
+        if not isinstance(english_title, str) or not english_title.strip():
+            english_title = None
+        genre_names = sorted(_metadata_genre_names(meta)) if meta is not None else []
         cover_image_url = _mal_main_picture_url(meta) if meta is not None else None
         synopsis = _mal_synopsis(meta) if meta is not None else None
         provider_label = _format_provider_label(available_via_providers) if available_via_providers else ""
@@ -1533,11 +1691,7 @@ def _build_discovery_recommendations(
             "provider_availability_tags": {
                 provider: (provider in available_via_providers) for provider in ("crunchyroll", "hidive")
             },
-            "english_dub_signal": (
-                "present"
-                if any(_is_english_dub_series(state) for state in available_states)
-                else ("absent" if available_states else "unknown")
-            ),
+            "english_dub_signal": "present" if english_dub_states else "unknown",
             "metadata_cached": meta is not None,
         }
         consensus_score = min(100.0, 35.0 + (effective_supporting_seed_count * 18.0) + min(float(bucket["votes"]), 60.0) * 0.45)
@@ -1598,11 +1752,16 @@ def _build_discovery_recommendations(
                     "cover_image_url": cover_image_url,
                     "synopsis": synopsis,
                     "why_recommended": why_recommended,
+                    "english_title": english_title,
+                    "genres": genre_names,
                     "availability_visible": bool(available_states),
                     "available_via_providers": available_via_providers,
                     "availability_confidence": availability_confidence,
                     "availability_confidence_bonus": availability_confidence_bonus,
                     "availability_match_kinds": availability_match_kinds,
+                    "suppression_checked": True,
+                    "suppression_evidence": [],
+                    "suppression_guard": "included only after checking exact MAL list status/progress plus mapped-provider and normalized title-alias provider watch-history evidence",
                     "available_provider_series": [
                         {
                             "provider": state.provider,
@@ -1725,7 +1884,25 @@ def _build_relation_backed_new_season_recommendations(
             best_predecessor = predecessor_state
             break
         if best_predecessor is not None and state.completed_episode_count <= 0:
+            suppress, mal_context, _ = _should_suppress_mapped_continuation_target(
+                state,
+                mapping_by_series=mapping_by_series,
+                metadata_by_id=metadata_by_id,
+            )
+            if suppress:
+                continue
             title_hint = metadata_by_id.get(current_anime_id).title if current_anime_id in metadata_by_id else state.title
+            reasons = [
+                "English dub is available",
+                f"MAL relation metadata links this title as a continuation after {best_predecessor.season_title or best_predecessor.title}",
+            ]
+            if mal_context.get("mal_watch_status") or mal_context.get("mal_num_episodes_watched") is not None:
+                watched = mal_context.get("mal_num_episodes_watched")
+                total = mal_context.get("mal_num_episodes")
+                watched_fragment = f" ({watched}/{total if total is not None else '?'} MAL episodes watched)" if watched is not None else ""
+                reasons.append(f"target MAL watch status: {mal_context.get('mal_watch_status') or 'unknown'}{watched_fragment}")
+            elif mal_context.get("mal_watch_metadata_uncertain"):
+                reasons.append("target MAL watch metadata is missing/partial; keeping relation-backed season candidate conservatively")
             items.append(
                 Recommendation(
                     kind="new_season",
@@ -1734,10 +1911,7 @@ def _build_relation_backed_new_season_recommendations(
                     provider_series_id=state.provider_series_id,
                     title=state.title,
                     season_title=state.season_title,
-                    reasons=[
-                        "English dub is available",
-                        f"MAL relation metadata links this title as a continuation after {best_predecessor.season_title or best_predecessor.title}",
-                    ],
+                    reasons=reasons,
                     context={
                         "provider": state.provider,
                         "relation_backed": True,
@@ -1745,6 +1919,7 @@ def _build_relation_backed_new_season_recommendations(
                         "metadata_title": title_hint,
                         "predecessor_provider_series_id": best_predecessor.provider_series_id,
                         "predecessor_title": best_predecessor.season_title or best_predecessor.title,
+                        **mal_context,
                     },
                 )
             )
@@ -1760,7 +1935,25 @@ def _build_relation_backed_new_season_recommendations(
                         continue
                     if sequel_state.completed_episode_count > 0:
                         continue
+                    suppress, mal_context, _ = _should_suppress_mapped_continuation_target(
+                        sequel_state,
+                        mapping_by_series=mapping_by_series,
+                        metadata_by_id=metadata_by_id,
+                    )
+                    if suppress:
+                        continue
                     title_hint = metadata_by_id.get(relation.related_mal_anime_id).title if relation.related_mal_anime_id in metadata_by_id else sequel_state.title
+                    reasons = [
+                        "English dub is available",
+                        f"MAL relation metadata links this as a sequel to {state.season_title or state.title}",
+                    ]
+                    if mal_context.get("mal_watch_status") or mal_context.get("mal_num_episodes_watched") is not None:
+                        watched = mal_context.get("mal_num_episodes_watched")
+                        total = mal_context.get("mal_num_episodes")
+                        watched_fragment = f" ({watched}/{total if total is not None else '?'} MAL episodes watched)" if watched is not None else ""
+                        reasons.append(f"target MAL watch status: {mal_context.get('mal_watch_status') or 'unknown'}{watched_fragment}")
+                    elif mal_context.get("mal_watch_metadata_uncertain"):
+                        reasons.append("target MAL watch metadata is missing/partial; keeping relation-backed sequel conservatively")
                     items.append(
                         Recommendation(
                             kind="new_season",
@@ -1769,10 +1962,7 @@ def _build_relation_backed_new_season_recommendations(
                             provider_series_id=sequel_state.provider_series_id,
                             title=sequel_state.title,
                             season_title=sequel_state.season_title,
-                            reasons=[
-                                "English dub is available",
-                                f"MAL relation metadata links this as a sequel to {state.season_title or state.title}",
-                            ],
+                            reasons=reasons,
                             context={
                                 "provider": sequel_state.provider,
                                 "relation_backed": True,
@@ -1781,13 +1971,19 @@ def _build_relation_backed_new_season_recommendations(
                                 "predecessor_provider_series_id": state.provider_series_id,
                                 "predecessor_title": state.season_title or state.title,
                                 "predecessor_provider": state.provider,
+                                **mal_context,
                             },
                         )
                     )
     return items
 
 
-def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list[Recommendation]:
+def _build_new_season_recommendations(
+    states: list[ProviderSeriesState],
+    *,
+    mapping_by_series: dict[tuple[str, str], int] | None = None,
+    metadata_by_id: dict[int, Any] | None = None,
+) -> list[Recommendation]:
     items: list[Recommendation] = []
     by_franchise: dict[str, list[tuple[int, ProviderSeriesState]]] = {}
     for state in states:
@@ -1811,12 +2007,26 @@ def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list
                 continue
             if predecessor.provider_series_id == state.provider_series_id:
                 continue
+            suppress, mal_context, _ = _should_suppress_mapped_continuation_target(
+                state,
+                mapping_by_series=mapping_by_series,
+                metadata_by_id=metadata_by_id,
+            )
+            if suppress:
+                continue
             reasons = [
                 "English dub is available",
                 f"a later season appears available after completing {predecessor.season_title or predecessor.title}",
             ]
             if state.watchlist_status:
                 reasons.append(f"{state.provider.title()} watchlist status: {state.watchlist_status}")
+            if mal_context.get("mal_watch_status") or mal_context.get("mal_num_episodes_watched") is not None:
+                watched = mal_context.get("mal_num_episodes_watched")
+                total = mal_context.get("mal_num_episodes")
+                watched_fragment = f" ({watched}/{total if total is not None else '?'} MAL episodes watched)" if watched is not None else ""
+                reasons.append(f"target MAL watch status: {mal_context.get('mal_watch_status') or 'unknown'}{watched_fragment}")
+            elif mal_context.get("mal_watch_metadata_uncertain"):
+                reasons.append("target MAL watch metadata is missing/partial; keeping season candidate conservatively")
             priority = 100 - min(max(installment - 1, 0), 10)
             if state.completed_episode_count <= 0:
                 priority += 5
@@ -1837,6 +2047,7 @@ def _build_new_season_recommendations(states: list[ProviderSeriesState]) -> list
                         "predecessor_completed_episode_count": predecessor.completed_episode_count,
                         "predecessor_max_episode_number": predecessor.max_episode_number,
                         "watchlist_status": state.watchlist_status,
+                        **mal_context,
                     },
                 )
             )

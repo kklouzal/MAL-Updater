@@ -28,6 +28,27 @@ from tests.test_validation_ingestion import sample_snapshot
 
 
 class MappingTests(unittest.TestCase):
+    def _map_with_search_results(self, series: SeriesMappingInput, nodes: list[dict]):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": node} for node in nodes]}):
+                return map_series(client, series)
+
     def test_normalize_title_strips_dub_and_season_noise(self) -> None:
         self.assertEqual(
             normalize_title("BOFURI: I Don’t Want to Get Hurt, so I’ll Max Out My Defense. Season 2 (English Dub)"),
@@ -37,6 +58,176 @@ class MappingTests(unittest.TestCase):
     def test_normalize_title_splits_letter_digit_boundaries(self) -> None:
         self.assertEqual(normalize_title("PERSONA5 the Animation"), "persona 5 the animation")
         self.assertEqual(normalize_title("Ver1.1a"), "ver 1 1 a")
+
+    def test_auxiliary_provider_movie_season_stays_review_gated_against_tv_series(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="konosuba-movie-season",
+                title="KONOSUBA -God's blessing on this wonderful world!",
+                season_title="Movie Season 1",
+                season_number=1,
+                max_episode_number=11,
+                completed_episode_count=11,
+            ),
+            [
+                {
+                    "id": 38040,
+                    "title": "Kono Subarashii Sekai ni Shukufuku wo! Movie: Kurenai Densetsu",
+                    "alternative_titles": {"en": "KONOSUBA -God's blessing on this wonderful world!- Legend of Crimson"},
+                    "media_type": "movie",
+                    "num_episodes": 1,
+                },
+                {
+                    "id": 30831,
+                    "title": "Kono Subarashii Sekai ni Shukufuku wo!",
+                    "alternative_titles": {"en": "KONOSUBA -God's blessing on this wonderful world!"},
+                    "media_type": "tv",
+                    "num_episodes": 10,
+                },
+            ],
+        )
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 30831)
+
+    def test_crunchyroll_season_metadata_title_conflict_blocks_auto_approval(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="metadata-title-conflict",
+                title="Example Show",
+                season_title="Example Show Season 2",
+                season_number=1,
+                max_episode_number=12,
+            ),
+            [
+                {
+                    "id": 202,
+                    "title": "Example Show Season 2",
+                    "alternative_titles": {"en": "Example Show Season 2"},
+                    "media_type": "tv",
+                    "num_episodes": 12,
+                },
+                {
+                    "id": 101,
+                    "title": "Example Show",
+                    "alternative_titles": {"en": "Example Show"},
+                    "media_type": "tv",
+                    "num_episodes": 12,
+                },
+            ],
+        )
+
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertTrue(
+            any(reason.startswith("provider_season_metadata_conflict=metadata:1;title:2") for reason in result.chosen_candidate.match_reasons)
+        )
+
+    def test_split_cour_bundle_evidence_remains_review_when_entries_are_separate_mal_nodes(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="split-cour-bundle",
+                title="Example Saga",
+                season_title="Example Saga Season 2",
+                season_number=2,
+                max_episode_number=24,
+                completed_episode_count=24,
+            ),
+            [
+                {
+                    "id": 2001,
+                    "title": "Example Saga 2nd Season Part 1",
+                    "alternative_titles": {"en": "Example Saga Season 2"},
+                    "media_type": "tv",
+                    "num_episodes": 12,
+                },
+                {
+                    "id": 2002,
+                    "title": "Example Saga 2nd Season Part 2",
+                    "alternative_titles": {"en": "Example Saga Season 2 Part 2"},
+                    "media_type": "tv",
+                    "num_episodes": 12,
+                },
+            ],
+        )
+
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertTrue(
+            any(reason.startswith("aggregated_episode_numbering_suspected=24>12") for reason in result.chosen_candidate.match_reasons)
+        )
+
+    def test_exact_tv_candidate_wins_over_unknown_duplicate_title(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="world-trigger",
+                title="World Trigger",
+                season_title="World Trigger (English Dub)",
+                season_number=1,
+            ),
+            [
+                {"id": 63048, "title": "World Trigger (Unknown)", "media_type": "unknown", "num_episodes": None},
+                {"id": 24405, "title": "World Trigger", "media_type": "tv", "num_episodes": 73},
+            ],
+        )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 24405)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_exact_tv_candidate_wins_over_movie_duplicate_title(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="afro-samurai",
+                title="Afro Samurai",
+                season_title="Afro Samurai",
+                season_number=1,
+                max_episode_number=5,
+            ),
+            [
+                {"id": 13709, "title": "Afro Samurai Movie", "media_type": "movie", "num_episodes": 1},
+                {"id": 1292, "title": "Afro Samurai", "media_type": "tv", "num_episodes": 5},
+            ],
+        )
+
+        self.assertEqual(result.status, "exact")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 1292)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_exact_provider_season_subtitle_beats_base_title_trim(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="blue-exorcist-kyoto",
+                title="Blue Exorcist",
+                season_title="Blue Exorcist: Kyoto Saga",
+                season_number=1,
+                max_episode_number=25,
+            ),
+            [
+                {
+                    "id": 9919,
+                    "title": "Ao no Exorcist",
+                    "alternative_titles": {"en": "Blue Exorcist", "synonyms": []},
+                    "media_type": "tv",
+                    "num_episodes": 25,
+                },
+                {
+                    "id": 33506,
+                    "title": "Ao no Exorcist: Kyoto Fujouou-hen",
+                    "alternative_titles": {"en": "Blue Exorcist: Kyoto Saga", "synonyms": []},
+                    "media_type": "tv",
+                    "num_episodes": 12,
+                },
+            ],
+        )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 33506)
+        self.assertIn("exact_provider_season_title", result.chosen_candidate.match_reasons)
+        self.assertFalse(should_auto_approve_mapping(result))
 
     def test_map_series_does_not_treat_large_terminal_unit_number_as_installment(self) -> None:
         with tempfile.TemporaryDirectory() as td:

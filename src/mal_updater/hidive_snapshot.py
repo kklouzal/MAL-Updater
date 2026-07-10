@@ -260,6 +260,7 @@ def _fetch_history_items(
     *,
     history_markers: set[str] | None = None,
     backfill_markers: set[str] | None = None,
+    max_pages: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool]:
     page = 1
     size = 100
@@ -296,6 +297,8 @@ def _fetch_history_items(
         if page >= total_pages or not vods:
             if front_boundary_seen:
                 backfill_exhausted = True
+            break
+        if max_pages is not None and pages_fetched >= max_pages:
             break
         page += 1
     return items, backfill_items, pages_fetched, backfill_pages_fetched, stopped_early, backfill_exhausted
@@ -427,20 +430,31 @@ def fetch_snapshot(
         boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
         if boundary and boundary.account_id_hint and session.token.account_id and boundary.account_id_hint != session.token.account_id:
             boundary = None
+        # HIDIVE's hot path intentionally limits history to the first page and skips
+        # account-scope continue/favourites surfaces.  Only use that abbreviated
+        # mode once we have a matching local boundary; first-run or account-swapped
+        # snapshots need a bounded account refresh so normal provider use is not
+        # reduced to page-1 history forever.
+        hot_mode = use_incremental_boundary and boundary is not None
         history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted = _fetch_history_items(
             session,
             history_markers=set(boundary.history_markers) if boundary else None,
             backfill_markers=set(boundary.history_backfill_markers) if boundary else None,
+            max_pages=1 if hot_mode else None,
         )
-        continue_items, continue_stopped_early = _fetch_continue_items(
-            session,
-            continue_markers=set(boundary.continue_markers) if boundary else None,
-        )
-        favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = _fetch_favourite_items(
-            session,
-            favourite_markers=set(boundary.favourite_markers) if boundary else None,
-            backfill_markers=set(boundary.favourite_backfill_markers) if boundary else None,
-        )
+        if hot_mode:
+            continue_items, continue_stopped_early = [], False
+            favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = [], [], 0, 0, False, False
+        else:
+            continue_items, continue_stopped_early = _fetch_continue_items(
+                session,
+                continue_markers=set(boundary.continue_markers) if boundary else None,
+            )
+            favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = _fetch_favourite_items(
+                session,
+                favourite_markers=set(boundary.favourite_markers) if boundary else None,
+                backfill_markers=set(boundary.favourite_backfill_markers) if boundary else None,
+            )
     except HidiveAuthError as exc:
         raise
     except Exception as exc:
@@ -476,13 +490,14 @@ def fetch_snapshot(
             "favourite_backfill_pages_fetched": favourite_backfill_pages_fetched,
             "favourite_backfill_exhausted": favourite_backfill_exhausted,
             "sync_boundary_present": boundary is not None,
-            "sync_boundary_mode": "incremental" if use_incremental_boundary else "full_refresh",
+            "sync_boundary_mode": "hot" if hot_mode else "full_refresh",
+            "hot_surface_only": hot_mode,
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
             "sync_boundary_path": str(session.state_paths.sync_boundary_path),
             "supports": {
                 "history": True,
-                "continue_watching": True,
-                "watchlists": True,
+                "continue_watching": not hot_mode,
+                "watchlists": not hot_mode,
             },
         },
     )

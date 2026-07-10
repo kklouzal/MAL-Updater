@@ -30,11 +30,21 @@ from .db import (
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
 )
-from .mal_client import MalClient
+from .mal_client import MalApiError, MalClient
 
 DETAIL_FIELDS = (
     "id,title,alternative_titles,main_picture,synopsis,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,related_anime,recommendations,my_list_status"
 )
+
+
+@dataclass(slots=True)
+class MetadataRefreshFailure:
+    mal_anime_id: int
+    stage: str
+    error: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"mal_anime_id": self.mal_anime_id, "stage": self.stage, "error": self.error}
 
 
 @dataclass(slots=True)
@@ -43,13 +53,17 @@ class MetadataRefreshSummary:
     refreshed: int
     discovery_considered: int = 0
     discovery_refreshed: int = 0
+    failures: list[MetadataRefreshFailure] | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        failures = self.failures or []
         return {
             "considered": self.considered,
             "refreshed": self.refreshed,
             "discovery_considered": self.discovery_considered,
             "discovery_refreshed": self.discovery_refreshed,
+            "failed": len(failures),
+            "failures": [failure.as_dict() for failure in failures],
         }
 
 
@@ -92,9 +106,14 @@ def refresh_recommendation_metadata(
 
     client = MalClient(config, load_mal_secrets(config))
     refreshed = 0
+    failures: list[MetadataRefreshFailure] = []
     discovered_targets: dict[int, _DiscoveredTargetStats] = {}
     for anime_id in anime_ids:
-        details = client.get_anime_details(anime_id, fields=DETAIL_FIELDS)
+        try:
+            details = client.get_anime_details(anime_id, fields=DETAIL_FIELDS)
+        except (MalApiError, TimeoutError) as exc:
+            failures.append(MetadataRefreshFailure(mal_anime_id=anime_id, stage="mapped_metadata", error=str(exc)))
+            continue
         alternative_titles = details.get("alternative_titles") or {}
         aliases: list[str] = []
         if isinstance(alternative_titles, dict):
@@ -193,10 +212,14 @@ def refresh_recommendation_metadata(
             ranked_targets = ranked_targets[:discovery_target_limit]
         discovery_considered = len(ranked_targets)
         for target_id, _info in ranked_targets:
-            details = client.get_anime_details(
-                target_id,
-                fields="id,title,alternative_titles,main_picture,synopsis,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,my_list_status",
-            )
+            try:
+                details = client.get_anime_details(
+                    target_id,
+                    fields="id,title,alternative_titles,main_picture,synopsis,media_type,status,num_episodes,mean,popularity,start_season,source,genres,studios,my_list_status",
+                )
+            except (MalApiError, TimeoutError) as exc:
+                failures.append(MetadataRefreshFailure(mal_anime_id=target_id, stage="discovery_metadata", error=str(exc)))
+                continue
             alternative_titles = details.get("alternative_titles") or {}
             aliases: list[str] = []
             if isinstance(alternative_titles, dict):
@@ -230,4 +253,5 @@ def refresh_recommendation_metadata(
         refreshed=refreshed,
         discovery_considered=discovery_considered,
         discovery_refreshed=discovery_refreshed,
+        failures=failures,
     )

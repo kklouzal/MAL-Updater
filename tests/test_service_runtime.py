@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 import time
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
 from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, _recommendation_metadata_refresh_command, run_pending_tasks
+from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, _recommendation_metadata_refresh_command, _run_subprocess, run_pending_tasks
 
 
 class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
@@ -45,7 +46,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_run_pending_tasks_seeds_full_refresh_anchor_from_first_incremental_fetch(self) -> None:
+    def test_run_pending_tasks_seeds_full_refresh_anchor_from_first_hot_fetch(self) -> None:
         with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
             "mal_updater.service_runtime._run_subprocess",
             side_effect=[
@@ -57,15 +58,40 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
             result = run_pending_tasks(self.config)
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
-        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("hot", sync_result["fetch_mode"])
         sync_args = run_subprocess.call_args_list[0].args[1]
         self.assertNotIn("--full-refresh", sync_args)
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = state["tasks"]["sync_fetch_crunchyroll"]
-        self.assertEqual("incremental", sync_state["last_fetch_mode"])
+        self.assertEqual("hot", sync_state["last_fetch_mode"])
         self.assertIn("full_refresh_anchor_epoch", sync_state)
         self.assertNotIn("last_successful_full_refresh_epoch", sync_state)
+
+    def test_run_pending_tasks_persists_and_clears_running_subprocess_state(self) -> None:
+        observed_state: dict[str, object] = {}
+
+        def fake_run(config, args, *, label):
+            nonlocal observed_state
+            if label == "sync_fetch_crunchyroll":
+                observed_state = json.loads(config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_fetch_crunchyroll"]
+            return {"status": "ok", "label": label, "returncode": 0, "stdout": "", "stderr": "", "command": "safe"}
+
+        with patch("mal_updater.service_runtime._run_subprocess", side_effect=fake_run):
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual("running", observed_state["execution_state"])
+        self.assertIn("running_started_at", observed_state)
+        self.assertIn("crunchyroll-fetch-snapshot", str(observed_state["running_command"]))
+        self.assertNotIn("secret", str(observed_state["running_command"]))
+        self.assertEqual(self.config.service.task_timeout_seconds, observed_state["running_timeout_seconds"])
+
+        final_state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual("idle", final_state["execution_state"])
+        self.assertNotIn("running_started_at", final_state)
+        self.assertNotIn("running_command", final_state)
+        self.assertNotIn("running_timeout_seconds", final_state)
 
     def test_run_pending_tasks_requests_periodic_provider_full_refresh_when_anchor_is_stale(self) -> None:
         stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
@@ -106,7 +132,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         self.assertIn("last_successful_full_refresh_epoch", sync_state)
         self.assertGreater(sync_state["full_refresh_anchor_epoch"], stale_anchor)
 
-    def test_run_pending_tasks_downgrades_budget_blocked_full_refresh_to_incremental_fetch(self) -> None:
+    def test_run_pending_tasks_downgrades_budget_blocked_full_refresh_to_hot_fetch(self) -> None:
         stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
         state = {
             "started_at": "2026-03-20T20:00:00Z",
@@ -126,7 +152,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
             "mal_updater.service_runtime._budget_gate",
             side_effect=[
                 (False, "crunchyroll_budget_projected_critical ratio=0.000 projected_ratio=1.000 projected_requests=55 cooldown=1800s", {"provider": "crunchyroll", "projected_request_source": "configured_full_refresh", "projected_request_count": 55}),
-                (True, None, {"provider": "crunchyroll", "projected_request_source": "observed_incremental_smoothed", "projected_request_count": 4}),
+                (True, None, {"provider": "crunchyroll", "projected_request_source": "observed_hot_smoothed", "projected_request_count": 4}),
                 (True, None, {"provider": "mal"}),
                 (True, None, None),
             ],
@@ -141,14 +167,14 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
             result = run_pending_tasks(self.config)
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
-        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("hot", sync_result["fetch_mode"])
         self.assertEqual("periodic_cadence", sync_result["deferred_full_refresh_reason"])
         sync_args = run_subprocess.call_args_list[0].args[1]
         self.assertNotIn("--full-refresh", sync_args)
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
-        self.assertEqual("incremental", sync_state["last_fetch_mode"])
+        self.assertEqual("hot", sync_state["last_fetch_mode"])
         self.assertEqual(stale_anchor, sync_state["full_refresh_anchor_epoch"])
         self.assertNotIn("last_successful_full_refresh_epoch", sync_state)
 
@@ -254,7 +280,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
             result = run_pending_tasks(self.config)
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
-        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("hot", sync_result["fetch_mode"])
         self.assertNotIn("full_refresh_reason", sync_result)
         sync_args = run_subprocess.call_args_list[0].args[1]
         self.assertNotIn("--full-refresh", sync_args)
@@ -309,9 +335,9 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
             result = run_pending_tasks(self.config)
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
-        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("hot", sync_result["fetch_mode"])
         self.assertEqual("refresh_ingested_snapshot", sync_result["health_request_reason_code"])
-        self.assertEqual("health_recommended_incremental", sync_result["full_refresh_reason"])
+        self.assertEqual("health_recommended_hot", sync_result["full_refresh_reason"])
         sync_args = run_subprocess.call_args_list[0].args[1]
         self.assertNotIn("--full-refresh", sync_args)
 
@@ -329,7 +355,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
                 "mal_refresh": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
                 "health": {"last_run_epoch": time.time(), "last_run_at": "2026-03-20T20:00:00Z"},
                 "sync_fetch_crunchyroll": {
-                    "last_fetch_mode": "incremental",
+                    "last_fetch_mode": "hot",
                     "last_fetch_mode_at": "2026-03-20T18:00:00Z",
                     "last_successful_full_refresh_epoch": previous_success,
                     "last_successful_full_refresh_at": "2026-03-20T17:58:00Z",
@@ -358,7 +384,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
-        self.assertEqual("incremental", sync_state["last_fetch_mode"])
+        self.assertEqual("hot", sync_state["last_fetch_mode"])
         self.assertEqual(previous_success, sync_state["last_successful_full_refresh_epoch"])
         self.assertEqual(stale_anchor, sync_state["full_refresh_anchor_epoch"])
         self.assertEqual("auth", sync_state["failure_backoff_class"])
@@ -385,7 +411,7 @@ class ServiceRuntimeHealthCommandTests(unittest.TestCase):
 
         self.assertEqual(
             [
-                "python3",
+                sys.executable,
                 "-m",
                 "mal_updater.cli",
                 "--project-root",
@@ -414,7 +440,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.config.service.task_execute_limits["sync_apply"] = 6
         self.assertEqual(
             [
-                "python3",
+                sys.executable,
                 "-m",
                 "mal_updater.cli",
                 "apply-sync",
@@ -431,7 +457,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.config.service.task_execute_limits["recommend_metadata_discovery_targets"] = 7
         self.assertEqual(
             [
-                "python3",
+                sys.executable,
                 "-m",
                 "mal_updater.cli",
                 "recommend-refresh-metadata",
@@ -907,7 +933,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.config.service.provider_hourly_limits["hidive"] = 72
         self.config.service.full_refresh_every_seconds = 86400
         self.config.service.task_projected_request_counts["sync_fetch_hidive"] = 14
-        self.config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"] = {"full_refresh": 70, "incremental": 5}
+        self.config.service.task_projected_request_counts_by_mode["sync_fetch_hidive"] = {"full_refresh": 70, "hot": 5}
         stale_anchor = datetime.now(timezone.utc).timestamp() - 90000
         self.config.service_state_path.write_text(
             json.dumps(
@@ -950,17 +976,17 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
 
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_hidive")
         self.assertEqual("ok", sync_result["status"])
-        self.assertEqual("incremental", sync_result["fetch_mode"])
+        self.assertEqual("hot", sync_result["fetch_mode"])
         self.assertEqual("periodic_cadence", sync_result["deferred_full_refresh_reason"])
         self.assertEqual(5, sync_result["next_projected_request_count"])
-        self.assertEqual("configured_incremental", sync_result["next_projected_request_source"])
+        self.assertEqual("configured_hot", sync_result["next_projected_request_source"])
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = state["tasks"]["sync_fetch_hidive"]
-        self.assertEqual("incremental", sync_state["last_fetch_mode"])
+        self.assertEqual("hot", sync_state["last_fetch_mode"])
         self.assertEqual(stale_anchor, sync_state["full_refresh_anchor_epoch"])
         self.assertEqual(5, sync_state["projected_request_count"])
-        self.assertEqual("configured_incremental", sync_state["projected_request_source"])
+        self.assertEqual("configured_hot", sync_state["projected_request_source"])
 
 
     def test_run_pending_tasks_learns_observed_request_delta_for_future_budgeting(self) -> None:
@@ -1001,9 +1027,9 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual(2, sync_state["last_request_delta"])
-        self.assertEqual({"incremental": 2}, sync_state["last_request_delta_by_mode"])
+        self.assertEqual({"hot": 2}, sync_state["last_request_delta_by_mode"])
         self.assertEqual(2, sync_state["projected_request_count"])
-        self.assertEqual("observed_incremental_smoothed", sync_state["projected_request_source"])
+        self.assertEqual("observed_hot_smoothed", sync_state["projected_request_source"])
 
     def test_run_pending_tasks_smooths_observed_request_delta_history_for_budgeting(self) -> None:
         self.config.service.sync_every_seconds = 0
@@ -1037,9 +1063,9 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual([2, 8, 2], sync_state["last_request_delta_history"])
-        self.assertEqual({"incremental": [2, 8, 2]}, sync_state["last_request_delta_history_by_mode"])
+        self.assertEqual({"hot": [2, 8, 2]}, sync_state["last_request_delta_history_by_mode"])
         self.assertEqual(4, sync_state["projected_request_count"])
-        self.assertEqual("observed_incremental_smoothed", sync_state["projected_request_source"])
+        self.assertEqual("observed_hot_smoothed", sync_state["projected_request_source"])
 
     def test_run_pending_tasks_uses_task_percentile_projection_and_history_window_for_budgeting(self) -> None:
         self.config.service.sync_every_seconds = 0
@@ -1075,15 +1101,15 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual([8, 2, 20], sync_state["last_request_delta_history"])
-        self.assertEqual({"incremental": [8, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
+        self.assertEqual({"hot": [8, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
         projected_count, projected_source = _projected_request_count(
             self.config,
             TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
             sync_state,
-            fetch_mode="incremental",
+            fetch_mode="hot",
         )
         self.assertEqual(20, projected_count)
-        self.assertEqual("observed_incremental_p75", projected_source)
+        self.assertEqual("observed_hot_p75", projected_source)
 
     def test_run_pending_tasks_uses_provider_projection_defaults_when_task_override_absent(self) -> None:
         self.config.service.sync_every_seconds = 0
@@ -1119,16 +1145,16 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual([8, 2, 20], sync_state["last_request_delta_history"])
-        self.assertEqual({"incremental": [8, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
+        self.assertEqual({"hot": [8, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
 
         projected_count, projected_source = _projected_request_count(
             self.config,
             TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
             sync_state,
-            fetch_mode="incremental",
+            fetch_mode="hot",
         )
         self.assertEqual(20, projected_count)
-        self.assertEqual("observed_incremental_p75", projected_source)
+        self.assertEqual("observed_hot_p75", projected_source)
 
     def test_projected_request_count_uses_built_in_mal_refresh_default(self) -> None:
         projected_count, projected_source = _projected_request_count(
@@ -1163,10 +1189,10 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
             self.config,
             TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
             {},
-            fetch_mode="incremental",
+            fetch_mode="hot",
         )
         self.assertEqual(4, projected_count)
-        self.assertEqual("configured_incremental", projected_source)
+        self.assertEqual("configured_hot", projected_source)
 
     def test_projected_request_count_uses_built_in_crunchyroll_full_refresh_default(self) -> None:
         projected_count, projected_source = _projected_request_count(
@@ -1183,10 +1209,10 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
             self.config,
             TaskSpec("sync_fetch_hidive", self.config.service.sync_every_seconds, budget_provider="hidive"),
             {},
-            fetch_mode="incremental",
+            fetch_mode="hot",
         )
         self.assertEqual(4, projected_count)
-        self.assertEqual("configured_incremental", projected_source)
+        self.assertEqual("configured_hot", projected_source)
 
     def test_projected_request_count_treats_built_in_mal_refresh_default_as_cold_start_seed(self) -> None:
         projected_count, projected_source = _projected_request_count(
@@ -1267,11 +1293,11 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual([2, 12, 2, 20], sync_state["last_request_delta_history"])
-        self.assertEqual({"incremental": [2, 12, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
+        self.assertEqual({"hot": [2, 12, 2, 20]}, sync_state["last_request_delta_history_by_mode"])
         self.assertEqual(20, sync_state["projected_request_count"])
-        self.assertEqual("observed_incremental_auto_p90", sync_state["projected_request_source"])
+        self.assertEqual("observed_hot_auto_p90", sync_state["projected_request_source"])
         self.assertEqual(7, sync_state["projected_request_history_window"])
-        self.assertEqual("incremental", sync_state["projected_request_history_mode"])
+        self.assertEqual("hot", sync_state["projected_request_history_mode"])
         self.assertEqual(4, sync_state["projected_request_history_sample_count"])
         self.assertEqual(0.9, sync_state["projected_request_percentile"])
         self.assertEqual("auto", sync_state["projected_request_percentile_source"])
@@ -1280,10 +1306,10 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
             self.config,
             TaskSpec("sync_fetch_crunchyroll", self.config.service.sync_every_seconds, budget_provider="crunchyroll"),
             sync_state,
-            fetch_mode="incremental",
+            fetch_mode="hot",
         )
         self.assertEqual(20, projected_count)
-        self.assertEqual("observed_incremental_auto_p90", projected_source)
+        self.assertEqual("observed_hot_auto_p90", projected_source)
 
     def test_run_pending_tasks_clears_budget_backoff_after_successful_run(self) -> None:
         state = {
@@ -1486,3 +1512,161 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertNotIn("failure_backoff_floor_seconds", sync_state)
         self.assertNotIn("failure_backoff_consecutive_failures", sync_state)
         self.assertEqual("ok", sync_state["last_status"])
+
+class ServiceRuntimeRecommendMaintainTaskTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.project_root = Path(self.temp_dir.name)
+        self.config = load_config(self.project_root)
+        ensure_directories(self.config)
+        self.config.service.sync_every_seconds = 60 * 60
+        self.config.service.health_every_seconds = 60 * 60
+        self.config.service.mal_refresh_every_seconds = 60 * 60
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendations_webhook_push_every_seconds = 0
+        self.assertEqual(60 * 60, self.config.service.recommend_maintain_every_seconds)
+
+    def test_recommend_maintain_runs_as_recurring_service_task_and_sets_next_due(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-07-06T00:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": time.time()},
+                        "sync_apply": {"last_run_epoch": time.time()},
+                        "health": {"last_run_epoch": time.time()},
+                        "recommend_maintain": {"last_status": "dry_run", "execution_state": "awaiting_schedule", "last_run_epoch": 0},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "recommend_maintain", "returncode": 0, "stdout": "", "stderr": ""},
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual(["recommend_maintain"], [item["task"] for item in result["results"]])
+        command = run_subprocess.call_args.args[1]
+        self.assertIn("recommend-maintain", command)
+        self.assertIn("--skip-provider-refresh", command)
+        self.assertNotIn("--dry-run", command)
+
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        task_state = saved["tasks"]["recommend_maintain"]
+        self.assertEqual("ok", task_state["last_status"])
+        self.assertEqual("idle", task_state["execution_state"])
+        self.assertEqual(60 * 60, task_state["every_seconds"])
+        self.assertIn("next_due_epoch", task_state)
+        self.assertIn("next_due_at", task_state)
+        self.assertGreater(task_state["next_due_epoch"], task_state["last_run_epoch"])
+
+    def test_recommend_maintain_initial_state_schedules_one_hour_due(self) -> None:
+        before = time.time()
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-07-06T00:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": before},
+                        "sync_apply": {"last_run_epoch": before},
+                        "health": {"last_run_epoch": before},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._run_subprocess") as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual([], result["results"])
+        run_subprocess.assert_not_called()
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        task_state = saved["tasks"]["recommend_maintain"]
+        self.assertEqual("scheduled", task_state["last_status"])
+        self.assertEqual("idle", task_state["execution_state"])
+        self.assertEqual(60 * 60, task_state["every_seconds"])
+        self.assertGreaterEqual(task_state["next_due_epoch"], before + 60 * 60)
+        self.assertLessEqual(task_state["next_due_epoch"], time.time() + 60 * 60 + 5)
+
+    def test_recommend_maintain_waits_until_next_interval(self) -> None:
+        now = time.time()
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-07-06T00:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now},
+                        "sync_apply": {"last_run_epoch": now},
+                        "health": {"last_run_epoch": now},
+                        "recommend_maintain": {"last_status": "ok", "last_run_epoch": now},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._run_subprocess") as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual([], result["results"])
+        run_subprocess.assert_not_called()
+
+    def test_env_configures_recommend_maintain_interval(self) -> None:
+        with patch.dict(os.environ, {"MAL_UPDATER_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS": "1234"}):
+            config = load_config(self.project_root)
+        self.assertEqual(1234, config.service.recommend_maintain_every_seconds)
+
+class ServiceRuntimeSubprocessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.project_root = Path(self.temp_dir.name)
+        (self.project_root / "src").mkdir(parents=True)
+        self.config = load_config(self.project_root)
+        ensure_directories(self.config)
+
+    def test_run_subprocess_logs_observable_command_without_secret_value(self) -> None:
+        self.config.service.task_timeout_seconds = 30
+        result = _run_subprocess(
+            self.config,
+            [sys.executable, "-c", "print('ok')", "--client-secret", "super-secret"],
+            label="diagnostic",
+        )
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(30, result["timeout_seconds"])
+        self.assertFalse(result["timed_out"])
+        self.assertIn("--client-secret '<redacted>'", result["command"])
+        self.assertNotIn("super-secret", result["command"])
+        log_text = self.config.service_log_path.read_text()
+        self.assertIn("task=diagnostic status=started", log_text)
+        self.assertIn("timeout_seconds=30", log_text)
+        self.assertIn("status=ok", log_text)
+        self.assertNotIn("super-secret", log_text)
+
+    def test_run_subprocess_timeout_returns_status_reason_and_log(self) -> None:
+        self.config.service.task_timeout_seconds = 1
+        result = _run_subprocess(
+            self.config,
+            [sys.executable, "-c", "import time; time.sleep(2)"],
+            label="slow_crunchyroll_fetch",
+        )
+
+        self.assertEqual("error", result["status"])
+        self.assertEqual("subprocess_timeout", result["reason"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(1, result["timeout_seconds"])
+        self.assertIsNone(result["returncode"])
+        self.assertIn("time.sleep(2)", result["command"])
+        log_text = self.config.service_log_path.read_text()
+        self.assertIn("task=slow_crunchyroll_fetch status=started", log_text)
+        self.assertIn("reason=subprocess_timeout", log_text)
+        self.assertIn("timeout_seconds=1", log_text)

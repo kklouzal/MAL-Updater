@@ -25,6 +25,16 @@ class ProviderFetchResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class ProviderSearchResult:
+    provider_series_id: str
+    title: str
+    season_title: str | None = None
+    url: str | None = None
+    audio_locales: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 class ProviderModule(Protocol):
     slug: str
     display_name: str
@@ -36,6 +46,10 @@ class ProviderModule(Protocol):
         *,
         profile: str = "default",
         full_refresh: bool = False,
+        max_history_pages: int | None = None,
+        max_watchlist_pages: int | None = None,
+        history_start_page: int = 1,
+        watchlist_start: int = 0,
     ) -> ProviderFetchResult:
         ...
 

@@ -101,7 +101,7 @@ class _FakeProvider:
     def __init__(self) -> None:
         self.full_refresh_requests: list[bool] = []
 
-    def fetch_snapshot(self, config, *, profile: str = "default", full_refresh: bool = False) -> ProviderFetchResult:
+    def fetch_snapshot(self, config, *, profile: str = "default", full_refresh: bool = False, **_: object) -> ProviderFetchResult:
         self.full_refresh_requests.append(full_refresh)
         return ProviderFetchResult(
             snapshot=ProviderSnapshot(

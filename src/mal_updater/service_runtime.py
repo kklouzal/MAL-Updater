@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import shlex
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -192,12 +194,71 @@ def _record_observed_request_delta(
     task_state["last_request_delta_history_by_mode"] = history_by_mode
 
 
+_SENSITIVE_ARG_NAMES = {"--token", "--access-token", "--refresh-token", "--client-secret", "--password", "--secret"}
+_SENSITIVE_ARG_PREFIXES = ("token=", "access_token=", "refresh_token=", "client_secret=", "password=", "secret=")
+
+
+def _redacted_command(args: list[str]) -> str:
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        lowered = arg.lower()
+        if lowered in _SENSITIVE_ARG_NAMES:
+            redacted.append(arg)
+            redact_next = True
+        elif any(lowered.startswith(prefix) for prefix in _SENSITIVE_ARG_PREFIXES):
+            name = arg.split("=", 1)[0]
+            redacted.append(f"{name}=<redacted>")
+        elif any(lowered.startswith(f"{name}=") for name in _SENSITIVE_ARG_NAMES):
+            name = arg.split("=", 1)[0]
+            redacted.append(f"{name}=<redacted>")
+        else:
+            redacted.append(arg)
+    return shlex.join(redacted)
+
+
 def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[str, Any]:
     env = {
         **__import__("os").environ,
         "PYTHONPATH": str(config.project_root / "src"),
     }
-    result = subprocess.run(args, cwd=config.project_root, text=True, capture_output=True, check=False, env=env)
+    timeout_seconds = max(1, int(config.service.task_timeout_seconds))
+    command = _redacted_command(args)
+    started = time.monotonic()
+    _append_log(config, f"task={label} status=started timeout_seconds={timeout_seconds} command={command}")
+    try:
+        result = subprocess.run(
+            args,
+            cwd=config.project_root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration_seconds = round(time.monotonic() - started, 3)
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        payload = {
+            "status": "error",
+            "label": label,
+            "returncode": None,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": True,
+            "timeout_seconds": timeout_seconds,
+            "duration_seconds": duration_seconds,
+            "command": command,
+            "reason": "subprocess_timeout",
+        }
+        _append_log(config, f"task={label} status=error reason=subprocess_timeout timeout_seconds={timeout_seconds} duration_seconds={duration_seconds} command={command}")
+        return payload
+    duration_seconds = round(time.monotonic() - started, 3)
     status = "ok" if result.returncode == 0 else "error"
     payload = {
         "status": status,
@@ -205,12 +266,44 @@ def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[s
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        "timed_out": False,
+        "timeout_seconds": timeout_seconds,
+        "duration_seconds": duration_seconds,
+        "command": command,
     }
     if result.returncode == 0:
-        _append_log(config, f"task={label} status=ok")
+        _append_log(config, f"task={label} status=ok returncode=0 duration_seconds={duration_seconds} command={command}")
     else:
-        _append_log(config, f"task={label} status=error returncode={result.returncode} stderr={result.stderr.strip() or result.stdout.strip()}")
+        detail = (result.stderr.strip() or result.stdout.strip()).splitlines()[0:1]
+        detail_text = detail[0] if detail else ""
+        _append_log(config, f"task={label} status=error returncode={result.returncode} duration_seconds={duration_seconds} command={command} stderr={detail_text}")
     return payload
+
+
+def _mark_task_running(config: AppConfig, state: dict[str, Any], task_name: str, args: list[str]) -> tuple[float, str]:
+    """Persist operator-visible task state before a blocking subprocess starts."""
+    started_epoch = time.time()
+    started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    timeout_seconds = max(1, int(config.service.task_timeout_seconds))
+    task_state = state.setdefault("tasks", {}).setdefault(task_name, {})
+    task_state.update(
+        {
+            "execution_state": "running",
+            "running_started_epoch": started_epoch,
+            "running_started_at": started_at,
+            "running_command": _redacted_command(args),
+            "running_timeout_seconds": timeout_seconds,
+            "last_started_at": started_at,
+        }
+    )
+    state["last_loop_at"] = _now_iso()
+    _save_state(config, state)
+    return started_epoch, started_at
+
+
+def _clear_task_running(task_state: dict[str, Any]) -> None:
+    for key in ("running_started_epoch", "running_started_at", "running_command", "running_timeout_seconds"):
+        task_state.pop(key, None)
 
 
 def _parse_json_stdout(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -259,6 +352,8 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
     specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
     if int(config.service.recommendation_metadata_refresh_every_seconds) > 0:
         specs.append(TaskSpec("recommend_metadata_refresh", config.service.recommendation_metadata_refresh_every_seconds, budget_provider="mal"))
+    if int(config.service.recommend_maintain_every_seconds) > 0:
+        specs.append(TaskSpec("recommend_maintain", config.service.recommend_maintain_every_seconds, budget_provider=None))
     if int(config.service.recommendations_webhook_push_every_seconds) > 0 and config.openclaw.recommendations_webhook_enabled:
         specs.append(TaskSpec("push_recommendations_webhook", config.service.recommendations_webhook_push_every_seconds, budget_provider=None))
     specs.append(TaskSpec("health", config.service.health_every_seconds, budget_provider=None))
@@ -270,7 +365,7 @@ def _provider_fetch_command(config: AppConfig, provider: str, *, full_refresh: b
     if provider == "crunchyroll":
         snapshot_path = config.cache_dir / "live-crunchyroll-snapshot.json"
         command = [
-            "python3",
+            sys.executable,
             "-m",
             "mal_updater.cli",
             "crunchyroll-fetch-snapshot",
@@ -281,7 +376,7 @@ def _provider_fetch_command(config: AppConfig, provider: str, *, full_refresh: b
     elif provider == "hidive":
         snapshot_path = config.cache_dir / "live-hidive-snapshot.json"
         command = [
-            "python3",
+            sys.executable,
             "-m",
             "mal_updater.cli",
             "provider-fetch-snapshot",
@@ -295,7 +390,162 @@ def _provider_fetch_command(config: AppConfig, provider: str, *, full_refresh: b
         raise ValueError(f"unsupported provider fetch task: {provider}")
     if full_refresh:
         command.append("--full-refresh")
+    if provider == "crunchyroll":
+        _append_positive_int_arg(command, "--max-history-pages", config.service.crunchyroll_provider_max_history_pages)
+        _append_positive_int_arg(command, "--max-watchlist-pages", config.service.crunchyroll_provider_max_watchlist_pages)
     return command
+
+
+def _append_positive_int_arg(command: list[str], flag: str, value: int | None) -> None:
+    if value is not None and int(value) > 0:
+        command.extend([flag, str(int(value))])
+
+
+def _remove_flag_with_value(command: list[str], flag: str) -> None:
+    while flag in command:
+        index = command.index(flag)
+        del command[index : index + 2]
+
+
+def maintenance_cycle_plan(
+    config: AppConfig,
+    *,
+    metadata_limit: int = 25,
+    discovery_target_limit: int = 25,
+    recommendation_limit: int = 100,
+    mapping_limit: int = 25,
+    provider_max_history_pages: int | None = None,
+    provider_max_watchlist_pages: int | None = None,
+    include_provider_refresh: bool = True,
+) -> list[dict[str, Any]]:
+    """Build the unattended, write-conservative maintenance command sequence.
+
+    Commands are intentionally CLI-shaped so the daemon/service and tests exercise the same
+    surface as an operator.  Provider chunk limits are passed through only where supported;
+    the ingest command already refuses to record partial Crunchyroll chunks as completed full
+    refreshes.
+    """
+
+    commands: list[dict[str, Any]] = []
+    if include_provider_refresh:
+        for provider in _available_source_providers(config):
+            command = _provider_fetch_command(config, provider, full_refresh=False)
+            if provider == "crunchyroll":
+                if provider_max_history_pages is not None:
+                    _remove_flag_with_value(command, "--max-history-pages")
+                    _append_positive_int_arg(command, "--max-history-pages", provider_max_history_pages)
+                if provider_max_watchlist_pages is not None:
+                    _remove_flag_with_value(command, "--max-watchlist-pages")
+                    _append_positive_int_arg(command, "--max-watchlist-pages", provider_max_watchlist_pages)
+            commands.append({"label": f"maintain_provider_refresh_{provider}", "args": command})
+
+    commands.extend(
+        [
+            {
+                "label": "maintain_safe_mapping_review",
+                "args": [
+                    sys.executable,
+                    "-m",
+                    "mal_updater.cli",
+                    "apply-sync",
+                    "--limit",
+                    str(max(0, int(mapping_limit))),
+                    "--exact-approved-only",
+                ],
+            },
+            {
+                "label": "maintain_recommend_metadata",
+                "args": [
+                    sys.executable,
+                    "-m",
+                    "mal_updater.cli",
+                    "recommend-refresh-metadata",
+                    "--limit",
+                    str(max(0, int(metadata_limit))),
+                    "--include-discovery-targets",
+                    "--discovery-target-limit",
+                    str(max(0, int(discovery_target_limit))),
+                ],
+            },
+            {
+                "label": "maintain_recommend_snapshot",
+                "args": [
+                    sys.executable,
+                    "-m",
+                    "mal_updater.cli",
+                    "recommend",
+                    "--limit",
+                    str(max(0, int(recommendation_limit))),
+                    "--persist-snapshot",
+                ],
+            },
+            {
+                "label": "maintain_health",
+                "args": [sys.executable, "-m", "mal_updater.cli", "health-check", "--format", "json"],
+            },
+        ]
+    )
+    return commands
+
+
+def run_maintenance_cycle(
+    config: AppConfig,
+    *,
+    dry_run: bool = False,
+    metadata_limit: int = 25,
+    discovery_target_limit: int = 25,
+    recommendation_limit: int = 100,
+    mapping_limit: int = 25,
+    provider_max_history_pages: int | None = None,
+    provider_max_watchlist_pages: int | None = None,
+    include_provider_refresh: bool = True,
+) -> dict[str, Any]:
+    plan = maintenance_cycle_plan(
+        config,
+        metadata_limit=metadata_limit,
+        discovery_target_limit=discovery_target_limit,
+        recommendation_limit=recommendation_limit,
+        mapping_limit=mapping_limit,
+        provider_max_history_pages=provider_max_history_pages,
+        provider_max_watchlist_pages=provider_max_watchlist_pages,
+        include_provider_refresh=include_provider_refresh,
+    )
+    state = _load_state(config)
+    task_state = state.setdefault("tasks", {}).setdefault("recommend_maintain", {})
+    started_epoch = time.time()
+    started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    if dry_run:
+        task_state.update({"last_status": "dry_run", "last_plan_size": len(plan), "last_run_at": started_at})
+        state["last_maintenance_cycle_at"] = started_at
+        _save_state(config, state)
+        return {"status": "dry_run", "commands": plan, "state_file": str(config.service_state_path)}
+
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for step in plan:
+        command_args = list(step["args"])
+        _mark_task_running(config, state, "recommend_maintain", command_args)
+        result = _run_subprocess(config, command_args, label=str(step["label"]))
+        results.append(result)
+        if result.get("status") != "ok":
+            failures.append({"label": step["label"], "returncode": result.get("returncode"), "stderr": result.get("stderr")})
+
+    finished_epoch = time.time()
+    finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    status = "ok" if not failures else "partial_error"
+    task_state.update({"last_status": status, "last_run_at": finished_at, "last_run_epoch": finished_epoch, "last_failure_count": len(failures), "execution_state": "idle"})
+    _clear_task_running(task_state)
+    _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
+    if int(config.service.recommend_maintain_every_seconds) > 0:
+        _set_task_next_due(task_state, base_epoch=finished_epoch, every_seconds=config.service.recommend_maintain_every_seconds)
+    if failures:
+        task_state["last_errors"] = failures
+    else:
+        task_state.pop("last_errors", None)
+    state["last_maintenance_cycle_at"] = finished_at
+    _save_state(config, state)
+    return {"status": status, "results": results, "failures": failures, "state_file": str(config.service_state_path)}
 
 
 
@@ -362,7 +612,7 @@ def _provider_fetch_health_request(config: AppConfig, provider: str, task_state:
                 continue
         return {
             "reason_code": reason_code,
-            "mode": "full_refresh" if reason_code == "refresh_full_snapshot" else "incremental",
+            "mode": "full_refresh" if reason_code == "refresh_full_snapshot" else "hot",
             "health_mtime": float(health_mtime),
         }
     return None
@@ -374,7 +624,7 @@ def _apply_sync_command(config: AppConfig) -> list[str]:
     if apply_limit is None:
         apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
     return [
-        "python3",
+        sys.executable,
         "-m",
         "mal_updater.cli",
         "apply-sync",
@@ -393,7 +643,7 @@ def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
     if discovery_target_limit is None:
         discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
     return [
-        "python3",
+        sys.executable,
         "-m",
         "mal_updater.cli",
         "recommend-refresh-metadata",
@@ -402,6 +652,53 @@ def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
         "--include-discovery-targets",
         "--discovery-target-limit",
         str(max(0, int(discovery_target_limit))),
+    ]
+
+
+def _recommendation_snapshot_command(config: AppConfig) -> list[str]:
+    snapshot_limit = config.service.execute_limit_for("recommendation_snapshot")
+    if snapshot_limit is None:
+        snapshot_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
+    return [
+        sys.executable,
+        "-m",
+        "mal_updater.cli",
+        "recommend",
+        "--limit",
+        str(max(0, int(snapshot_limit))),
+        "--persist-snapshot",
+    ]
+
+
+def _recommend_maintain_command(config: AppConfig) -> list[str]:
+    metadata_limit = config.service.execute_limit_for("recommend_metadata_refresh")
+    if metadata_limit is None:
+        metadata_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_refresh", 0)
+    discovery_target_limit = config.service.execute_limit_for("recommend_metadata_discovery_targets")
+    if discovery_target_limit is None:
+        discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
+    recommendation_limit = config.service.execute_limit_for("recommendation_snapshot")
+    if recommendation_limit is None:
+        recommendation_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
+    mapping_limit = config.service.execute_limit_for("sync_apply")
+    if mapping_limit is None:
+        mapping_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
+    return [
+        sys.executable,
+        "-m",
+        "mal_updater.cli",
+        "recommend-maintain",
+        "--metadata-limit",
+        str(max(0, int(metadata_limit))),
+        "--discovery-target-limit",
+        str(max(0, int(discovery_target_limit))),
+        "--recommendation-limit",
+        str(max(0, int(recommendation_limit))),
+        "--mapping-limit",
+        str(max(0, int(mapping_limit))),
+        # The daemon's provider fetch tasks own provider backoff/auth state; the
+        # recurring maintenance task only advances recommendation maintenance.
+        "--skip-provider-refresh",
     ]
 
 
@@ -552,10 +849,15 @@ def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: 
         if discovery_target_limit is None:
             discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
         return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
+    if spec.name == "recommendation_snapshot":
+        snapshot_limit = config.service.execute_limit_for("recommendation_snapshot")
+        if snapshot_limit is None:
+            snapshot_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
+        return f"recommendation_snapshot:limit={max(0, int(snapshot_limit))}"
     if spec.name == "push_recommendations_webhook":
         return f"push_recommendations_webhook:limit={_recommendations_webhook_push_limit(config)}:mode={config.openclaw.recommendations_webhook_delivery_mode}"
     if spec.name.startswith("sync_fetch_"):
-        return f"{spec.name}:mode={fetch_mode or 'incremental'}"
+        return f"{spec.name}:mode={fetch_mode or 'hot'}"
     return None
 
 
@@ -607,9 +909,9 @@ def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str,
         full_refresh_reasons.append("periodic_cadence")
     if isinstance(health_request, dict) and health_request.get("mode") == "full_refresh":
         full_refresh_reasons.append("health_recommended")
-    if isinstance(health_request, dict) and health_request.get("mode") == "incremental":
-        return "incremental", ["health_recommended_incremental"], health_request
-    return ("full_refresh" if full_refresh_reasons else "incremental"), full_refresh_reasons, health_request
+    if isinstance(health_request, dict) and health_request.get("mode") in {"hot", "incremental"}:
+        return "hot", ["health_recommended_hot"], health_request
+    return ("full_refresh" if full_refresh_reasons else "hot"), full_refresh_reasons, health_request
 
 
 
@@ -626,11 +928,11 @@ def _maybe_downgrade_fetch_mode_for_budget(
 ) -> tuple[bool, str | None, dict[str, Any] | None, str | None, list[str], str | None, dict[str, Any] | None]:
     if allowed or not spec.name.startswith("sync_fetch_") or planned_fetch_mode != "full_refresh":
         return allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, None, None
-    incremental_allowed, incremental_reason, incremental_usage = _budget_gate(config, spec, task_state, fetch_mode="incremental")
-    if not incremental_allowed:
-        return allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, None, incremental_usage
+    hot_allowed, hot_reason, hot_usage = _budget_gate(config, spec, task_state, fetch_mode="hot")
+    if not hot_allowed:
+        return allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, None, hot_usage
     deferred_reason = "+".join(planned_full_refresh_reasons) if planned_full_refresh_reasons else "budget_deferred"
-    return True, None, incremental_usage, "incremental", [], deferred_reason, incremental_usage
+    return True, None, hot_usage, "hot", [], deferred_reason, hot_usage
 
 
 
@@ -678,6 +980,8 @@ def _projected_request_count(
     built_in_mode_default = None
     if fetch_mode:
         built_in_mode_default = DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.get(spec.name, {}).get(fetch_mode)
+        if built_in_mode_default is None and fetch_mode == "hot":
+            built_in_mode_default = DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.get(spec.name, {}).get("incremental")
     built_in_task_default = DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS.get(spec.name)
     task_wide_configured = config.service.task_projected_request_counts.get(spec.name)
 
@@ -936,6 +1240,14 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         task_state["budget_provider"] = spec.budget_provider
         task_state["budget_scope"] = config.service.budget_scope_for(spec.budget_provider, task_name=spec.name)
         task_state["every_seconds"] = int(spec.every_seconds)
+        if spec.name == "recommend_maintain" and "last_run_epoch" not in task_state:
+            if task_state.get("last_status") == "scheduled" and float(task_state.get("next_due_epoch", 0)) > now:
+                continue
+            if not task_state.get("last_status"):
+                task_state["last_status"] = "scheduled"
+                task_state["execution_state"] = "idle"
+                _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+                continue
         last_run = float(task_state.get("last_run_epoch", 0))
         planned_fetch_mode, planned_full_refresh_reasons, health_request = _planned_fetch_mode(config, spec, task_state, now=now)
         health_requested_run = isinstance(health_request, dict)
@@ -991,7 +1303,10 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 }
             )
             continue
-        allowed, reason, usage = _budget_gate(config, spec, task_state, fetch_mode=planned_fetch_mode)
+        if spec.budget_provider is None:
+            allowed, reason, usage = True, None, None
+        else:
+            allowed, reason, usage = _budget_gate(config, spec, task_state, fetch_mode=planned_fetch_mode)
         downgrade_reason = None
         downgrade_usage = None
         allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, downgrade_reason, downgrade_usage = _maybe_downgrade_fetch_mode_for_budget(
@@ -1075,12 +1390,10 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             elif spec.name.startswith("sync_fetch_"):
                 provider = spec.name.removeprefix("sync_fetch_")
                 full_refresh_reasons = list(planned_full_refresh_reasons)
-                result = _run_subprocess(
-                    config,
-                    _provider_fetch_command(config, provider, full_refresh=full_refresh_requested),
-                    label=spec.name,
-                )
-                result["fetch_mode"] = planned_fetch_mode or "incremental"
+                command_args = _provider_fetch_command(config, provider, full_refresh=full_refresh_requested)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label=spec.name)
+                result["fetch_mode"] = planned_fetch_mode or "hot"
                 if full_refresh_reasons:
                     result["full_refresh_reason"] = "+".join(full_refresh_reasons)
                 if isinstance(health_request, dict) and isinstance(health_request.get("reason_code"), str):
@@ -1088,17 +1401,17 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 if downgrade_reason:
                     result["deferred_full_refresh_reason"] = downgrade_reason
             elif spec.name == "sync_apply":
-                result = _run_subprocess(config, _apply_sync_command(config), label="sync_apply")
+                command_args = _apply_sync_command(config)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label="sync_apply")
                 apply_limit = config.service.execute_limit_for("sync_apply")
                 if apply_limit is None:
                     apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
                 result["apply_limit"] = max(0, int(apply_limit))
             elif spec.name == "recommend_metadata_refresh":
-                result = _run_subprocess(
-                    config,
-                    _recommendation_metadata_refresh_command(config),
-                    label="recommend_metadata_refresh",
-                )
+                command_args = _recommendation_metadata_refresh_command(config)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label="recommend_metadata_refresh")
                 seed_limit = config.service.execute_limit_for("recommend_metadata_refresh")
                 if seed_limit is None:
                     seed_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_refresh", 0)
@@ -1113,6 +1426,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
                             result[key] = max(0, int(value))
+            elif spec.name == "recommendation_snapshot":
+                command_args = _recommendation_snapshot_command(config)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label="recommendation_snapshot")
+                snapshot_limit = config.service.execute_limit_for("recommendation_snapshot")
+                if snapshot_limit is None:
+                    snapshot_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
+                result["snapshot_limit"] = max(0, int(snapshot_limit))
+            elif spec.name == "recommend_maintain":
+                command_args = _recommend_maintain_command(config)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label="recommend_maintain")
             elif spec.name == "push_recommendations_webhook":
                 try:
                     result = _push_recommendations_webhook_task(config, task_state)
@@ -1124,11 +1449,9 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     }
                 result["delivery_limit"] = _recommendations_webhook_push_limit(config)
             elif spec.name == "health":
-                result = _run_subprocess(
-                    config,
-                    ["python3", "-m", "mal_updater.cli", "--project-root", str(config.project_root), "health-check-cycle"],
-                    label="health",
-                )
+                command_args = [sys.executable, "-m", "mal_updater.cli", "--project-root", str(config.project_root), "health-check-cycle"]
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label="health")
             else:
                 result = {"status": "skipped", "reason": "unknown_task"}
             finished_epoch = time.time()
@@ -1159,11 +1482,13 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     result["request_delta_by_mode"] = {fetch_mode_for_history: observed_request_delta}
             task_status = result.get("status", "ok")
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": task_status, "last_result": result})
+            task_state["execution_state"] = "idle"
+            _clear_task_running(task_state)
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             fetch_succeeded = task_status != "error"
             if spec.name.startswith("sync_fetch_") and fetch_succeeded:
-                task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "incremental"
+                task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "hot"
                 task_state["last_fetch_mode_at"] = finished_at
                 if isinstance(health_request, dict) and isinstance(health_request.get("health_mtime"), (int, float)):
                     task_state["last_health_request_handled_mtime"] = float(health_request["health_mtime"])
@@ -1205,6 +1530,7 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             finished_epoch = time.time()
             finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
+            _clear_task_running(task_state)
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             task_state.pop("last_skip_reason", None)

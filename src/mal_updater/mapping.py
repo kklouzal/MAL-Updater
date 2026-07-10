@@ -11,6 +11,7 @@ from typing import Any
 
 _AUTO_APPROVAL_BLOCKERS = (
     "season_number_mismatch=",
+    "provider_season_metadata_conflict=",
     "installment_hint_conflict=",
     "episode_evidence_exceeds_candidate_count=",
     "completed_evidence_exceeds_candidate_count=",
@@ -863,6 +864,15 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     if best_strict_norm == query_strict_norm and best_strict_norm:
         score = max(score, 0.995)
         reasons.append("exact_normalized_title")
+        season_title_strict_norm = normalize_title_strict(series.season_title)
+        series_title_strict_norm = normalize_title_strict(series.title)
+        if (
+            season_title_strict_norm
+            and query_strict_norm == season_title_strict_norm
+            and season_title_strict_norm != series_title_strict_norm
+        ):
+            score += 0.05
+            reasons.append("exact_provider_season_title")
     elif query_strict_norm and best_strict_norm and (
         query_strict_norm in best_strict_norm or best_strict_norm in query_strict_norm
     ):
@@ -1123,9 +1133,15 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     if media_type == "movie":
         if best_strict_norm == query_strict_norm and best_strict_norm:
             reasons.append("movie_type_allowed_for_exact_title")
+            if not provider_auxiliary_markers and multi_episode_provider_series:
+                score -= 0.06
+                reasons.append("movie_penalty_for_multi_episode_series")
         else:
             score -= 0.05
             reasons.append("movie_penalty")
+    elif media_type == "unknown":
+        score -= 0.03
+        reasons.append("unknown_media_type_penalty")
     score = max(0.0, min(score, 1.0))
     return score, reasons
 
@@ -1146,7 +1162,6 @@ def _candidate_positive_signal_count(candidate: MappingCandidate) -> int:
             )
         )
         or reason == "final_season_hint_match"
-        or reason == "movie_type_allowed_for_exact_title"
     )
 
 
@@ -1164,16 +1179,32 @@ def _candidate_penalty_count(candidate: MappingCandidate) -> int:
     penalty_reasons = sum(1 for reason in candidate.match_reasons if reason.startswith(penalty_prefixes))
     if candidate.media_type in {"special", "tv_special", "pv"}:
         penalty_reasons += 1
+    if candidate.media_type == "unknown":
+        penalty_reasons += 1
     return penalty_reasons
 
 
-def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, int, int, str, int]:
+def _candidate_media_type_priority(candidate: MappingCandidate) -> int:
+    media_type = candidate.media_type or ""
+    if media_type in {"tv", "ona"}:
+        return 3
+    if media_type in {"ova", "special", "tv_special"}:
+        return 2
+    if media_type == "movie":
+        return 1
+    if media_type == "unknown":
+        return 0
+    return 1
+
+
+def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, int, int, int, str, int]:
     return (
         candidate.score,
         int("exact_normalized_title" in candidate.match_reasons),
         _candidate_positive_signal_count(candidate),
         -_candidate_penalty_count(candidate),
         int("candidate_extra_title_suffix" not in candidate.match_reasons),
+        _candidate_media_type_priority(candidate),
         int(not re.search(r"\(\d{4}\)\s*$", candidate.title)),
         len(normalize_title_strict(candidate.matched_query)),
         candidate.title.lower(),
@@ -1195,6 +1226,8 @@ def _candidate_is_explainably_weaker(series: SeriesMappingInput, candidate: Mapp
     if any(reason.startswith(weaker_prefixes) for reason in candidate.match_reasons):
         return True
     if candidate.media_type in {"special", "tv_special", "pv"}:
+        return True
+    if candidate.media_type == "unknown" and "unknown_media_type_penalty" in candidate.match_reasons:
         return True
     if candidate.media_type in {"ova", "ona", "movie"} and candidate.num_episodes == 1 and max(
         series.completed_episode_count or 0,
@@ -1767,6 +1800,15 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
         return True
     if (
         not has_specific_installment_context
+        and not _provider_auxiliary_markers(series)
+        and top.media_type == "tv"
+        and second.media_type == "movie"
+        and "exact_normalized_title" in second.match_reasons
+        and "movie_type_allowed_for_exact_title" in second.match_reasons
+    ):
+        return True
+    if (
+        not has_specific_installment_context
         and top.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
         and second.media_type not in {"ova", "ona", "special", "tv_special", "pv", "music", "cm"}
         and _candidate_is_non_exact_franchise_extension(second)
@@ -1787,18 +1829,39 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
     if result.status != "exact" or result.chosen_candidate is None:
         return False
     reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
+    provider_auxiliary_markers = _provider_auxiliary_markers(result.series)
+    if (
+        result.chosen_candidate.media_type == "tv"
+        and result.series.season_title
+        and re.search(r"\b(?:movie|ova|special|extras?)\s+season\b", result.series.season_title, re.IGNORECASE)
+    ):
+        return False
+    if provider_auxiliary_markers and result.chosen_candidate.media_type == "tv":
+        candidate_auxiliary_markers = _candidate_auxiliary_markers(result.chosen_candidate.raw)
+        if not (provider_auxiliary_markers & candidate_auxiliary_markers):
+            return False
     has_exact_title = "exact_normalized_title" in result.chosen_candidate.match_reasons
     has_split_cour_match = any(reason.startswith("season_to_split_match=") for reason in reasons)
+    has_aggregated_episode_drift_match = any(
+        reason.startswith("aggregated_episode_numbering_suspected=") for reason in reasons
+    )
+    has_minor_episode_drift_match = any(
+        reason.startswith((
+            "minor_episode_overflow_suspected=",
+            "minor_completed_episode_overflow_suspected=",
+        ))
+        for reason in reasons
+    )
+    has_safe_aggregated_episode_drift_match = has_aggregated_episode_drift_match and (
+        result.series.completed_episode_count is None
+        or result.chosen_candidate.num_episodes is None
+        or result.series.completed_episode_count <= result.chosen_candidate.num_episodes
+    )
+    if has_aggregated_episode_drift_match and not has_safe_aggregated_episode_drift_match:
+        return False
     has_explainable_episode_drift_match = (
         any(reason.startswith("season_number_match=") for reason in reasons)
-        and any(
-            reason.startswith((
-                "aggregated_episode_numbering_suspected=",
-                "minor_episode_overflow_suspected=",
-                "minor_completed_episode_overflow_suspected=",
-            ))
-            for reason in reasons
-        )
+        and (has_safe_aggregated_episode_drift_match or has_minor_episode_drift_match)
     )
     second_candidate = result.candidates[1] if len(result.candidates) > 1 else None
     has_safe_bundle_resolution = _supports_exact_bundle_auto_resolution(

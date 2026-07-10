@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mal_updater.config import load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
 
@@ -33,7 +35,15 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual("fresh", config.openclaw.recommendations_webhook_delivery_mode)
             self.assertEqual(5, config.openclaw.recommendations_webhook_section_limits["continue_next"])
             self.assertEqual(2, config.openclaw.recommendations_webhook_section_limits["resume_backlog"])
+            self.assertEqual(60 * 60, config.service.sync_every_seconds)
             self.assertEqual(0, config.service.full_refresh_every_seconds)
+            self.assertEqual(60 * 60, config.service.health_every_seconds)
+            self.assertEqual(60 * 60, config.service.mal_refresh_every_seconds)
+            self.assertEqual(60 * 60, config.service.recommendation_metadata_refresh_every_seconds)
+            self.assertEqual(60 * 60, config.service.recommend_maintain_every_seconds)
+            self.assertEqual(10, config.service.crunchyroll_provider_max_history_pages)
+            self.assertEqual(2, config.service.crunchyroll_provider_max_watchlist_pages)
+            self.assertEqual(900, config.service.task_timeout_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
             self.assertEqual(1, config.service.task_projected_request_counts["mal_refresh"])
@@ -58,6 +68,24 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(7200, config.service.auth_failure_backoff_floor_seconds_for("crunchyroll"))
             self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("mal", task_name="sync_apply"))
             self.assertEqual("task", config.service.budget_scope_for("mal", task_name="sync_apply"))
+
+    def test_env_overrides_service_crunchyroll_provider_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            with patch.dict(
+                os.environ,
+                {
+                    "MAL_UPDATER_SERVICE_CRUNCHYROLL_PROVIDER_MAX_HISTORY_PAGES": "8",
+                    "MAL_UPDATER_SERVICE_CRUNCHYROLL_PROVIDER_MAX_WATCHLIST_PAGES": "2",
+                    "MAL_UPDATER_SERVICE_TASK_TIMEOUT_SECONDS": "123",
+                },
+            ):
+                config = load_config(root)
+
+        self.assertEqual(8, config.service.crunchyroll_provider_max_history_pages)
+        self.assertEqual(2, config.service.crunchyroll_provider_max_watchlist_pages)
+        self.assertEqual(123, config.service.task_timeout_seconds)
 
     def test_settings_file_overrides_paths_and_secret_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:

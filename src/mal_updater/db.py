@@ -10,7 +10,9 @@ MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "001_initial.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "002_mal_metadata_cache.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "003_mal_recommendation_edges.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "004_provider_search_cache.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "004_mal_recommendation_harvest_status.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "005_recommendation_score_snapshots.sql",
 ]
 
 
@@ -59,6 +61,21 @@ class MalAnimeMetadata:
     updated_at: str
 
 
+
+
+@dataclass(slots=True)
+class ProviderTitleSearchCacheEntry:
+    provider: str
+    normalized_query: str
+    query: str
+    candidate_mal_anime_id: int | None
+    candidate_title: str | None
+    matches: list[dict[str, Any]]
+    status: str
+    fetched_at: str
+    expires_at: str
+
+
 @dataclass(slots=True)
 class MalAnimeRelation:
     mal_anime_id: int
@@ -80,6 +97,26 @@ class MalRecommendationEdge:
     source_kind: str
     raw: dict[str, Any]
     fetched_at: str
+
+
+@dataclass(slots=True)
+class RecommendationSnapshotRow:
+    id: int
+    run_id: str
+    generated_at: str
+    kind: str
+    provider: str | None
+    title: str
+    provider_series_id: str | None
+    mal_anime_id: int | None
+    score: float | None
+    priority: int | None
+    reasons: list[Any]
+    scorecard: dict[str, Any] | None
+    context: dict[str, Any] | None
+    availability_providers: list[str]
+    dub_signal: str | None
+    availability_confidence: float | None
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -114,6 +151,133 @@ def bootstrap_database(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with connect(db_path) as conn:
         apply_migrations(conn)
+
+
+def insert_recommendation_snapshot_rows(
+    db_path: Path,
+    rows: Iterable[dict[str, Any]],
+    *,
+    run_id: str,
+    generated_at: str,
+) -> int:
+    prepared: list[tuple[Any, ...]] = []
+    for row in rows:
+        context = row.get("context") if isinstance(row.get("context"), dict) else None
+        scorecard = row.get("scorecard") if isinstance(row.get("scorecard"), dict) else None
+        if scorecard is None and isinstance(context, dict) and isinstance(context.get("scorecard"), dict):
+            scorecard = context.get("scorecard")
+        providers = row.get("available_via_providers")
+        if not isinstance(providers, list) and isinstance(context, dict):
+            providers = context.get("available_via_providers")
+        if not isinstance(providers, list):
+            providers = row.get("providers")
+        if not isinstance(providers, list):
+            providers = []
+        providers = [p for p in providers if isinstance(p, str) and p.lower() != "mal"]
+        dub_signal = row.get("dub_signal")
+        if not dub_signal and isinstance(context, dict):
+            dub_signal = context.get("dub_signal") or context.get("english_dub_signal")
+        reasons = row.get("reasons") if isinstance(row.get("reasons"), list) else []
+        prepared.append(
+            (
+                run_id,
+                generated_at,
+                row.get("kind"),
+                row.get("provider"),
+                row.get("title"),
+                row.get("provider_series_id"),
+                _coerce_int(row.get("mal_anime_id") or (context or {}).get("mal_anime_id")),
+                _coerce_float(row.get("scorecard_total") or row.get("score") or (scorecard or {}).get("total")),
+                _coerce_int(row.get("priority")),
+                json.dumps(reasons, sort_keys=True),
+                json.dumps(scorecard, sort_keys=True) if scorecard is not None else None,
+                json.dumps(context, sort_keys=True) if context is not None else None,
+                json.dumps(providers, sort_keys=True),
+                dub_signal,
+                _coerce_float(row.get("availability_confidence") or (context or {}).get("availability_confidence")),
+            )
+        )
+    if not prepared:
+        return 0
+    with connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO recommendation_score_snapshots (
+                run_id, generated_at, kind, provider, title, provider_series_id, mal_anime_id,
+                score, priority, reasons_json, scorecard_json, context_json,
+                availability_providers_json, dub_signal, availability_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            prepared,
+        )
+        conn.commit()
+    return len(prepared)
+
+
+def list_latest_recommendation_snapshot_rows(db_path: Path, *, limit: int | None = 100) -> list[RecommendationSnapshotRow]:
+    with connect(db_path) as conn:
+        run = conn.execute(
+            "SELECT run_id FROM recommendation_score_snapshots ORDER BY generated_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if run is None:
+            return []
+        sql = """
+            SELECT * FROM recommendation_score_snapshots
+            WHERE run_id = ?
+            ORDER BY priority DESC, score DESC, title COLLATE NOCASE ASC, id ASC
+            """
+        params: tuple[Any, ...]
+        if limit is None:
+            params = (run["run_id"],)
+        else:
+            sql += " LIMIT ?"
+            params = (run["run_id"], max(1, int(limit)))
+        rows = conn.execute(sql, params).fetchall()
+    return [_recommendation_snapshot_row_from_db(row) for row in rows]
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return None if value is None or value == "" else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        return None if value is None or value == "" else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_json_value(value: str | None, fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def _recommendation_snapshot_row_from_db(row: sqlite3.Row) -> RecommendationSnapshotRow:
+    return RecommendationSnapshotRow(
+        id=int(row["id"]),
+        run_id=str(row["run_id"]),
+        generated_at=str(row["generated_at"]),
+        kind=str(row["kind"]),
+        provider=row["provider"],
+        title=str(row["title"]),
+        provider_series_id=row["provider_series_id"],
+        mal_anime_id=row["mal_anime_id"],
+        score=row["score"],
+        priority=row["priority"],
+        reasons=_load_json_value(row["reasons_json"], []),
+        scorecard=_load_json_value(row["scorecard_json"], None),
+        context=_load_json_value(row["context_json"], None),
+        availability_providers=_load_json_value(row["availability_providers_json"], []),
+        dub_signal=row["dub_signal"],
+        availability_confidence=row["availability_confidence"],
+    )
 
 
 def get_series_mapping(db_path: Path, provider: str, provider_series_id: str) -> PersistedSeriesMapping | None:
@@ -1296,3 +1460,79 @@ def list_provider_stale_row_samples(
             for row in watchlist_rows
         ],
     }
+
+
+def get_provider_title_search_cache(
+    db_path: Path,
+    *,
+    provider: str,
+    normalized_query: str,
+    now: str | None = None,
+) -> ProviderTitleSearchCacheEntry | None:
+    with connect(db_path) as conn:
+        clause = "provider = ? AND normalized_query = ?"
+        params: list[object] = [provider, normalized_query]
+        if now is not None:
+            clause += " AND expires_at > ?"
+            params.append(now)
+        row = conn.execute(
+            f"""
+            SELECT provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
+                   matches_json, status, fetched_at, expires_at
+            FROM provider_title_search_cache
+            WHERE {clause}
+            """,
+            params,
+        ).fetchone()
+    if row is None:
+        return None
+    return ProviderTitleSearchCacheEntry(
+        provider=str(row["provider"]),
+        normalized_query=str(row["normalized_query"]),
+        query=str(row["query"]),
+        candidate_mal_anime_id=None if row["candidate_mal_anime_id"] is None else int(row["candidate_mal_anime_id"]),
+        candidate_title=row["candidate_title"],
+        matches=json.loads(row["matches_json"] or "[]"),
+        status=str(row["status"]),
+        fetched_at=str(row["fetched_at"]),
+        expires_at=str(row["expires_at"]),
+    )
+
+
+def upsert_provider_title_search_cache(
+    db_path: Path,
+    *,
+    provider: str,
+    normalized_query: str,
+    query: str,
+    candidate_mal_anime_id: int | None,
+    candidate_title: str | None,
+    matches: list[dict[str, Any]],
+    status: str,
+    fetched_at: str,
+    expires_at: str,
+) -> ProviderTitleSearchCacheEntry:
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_title_search_cache (
+                provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
+                matches_json, status, fetched_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, normalized_query) DO UPDATE SET
+                query = excluded.query,
+                candidate_mal_anime_id = excluded.candidate_mal_anime_id,
+                candidate_title = excluded.candidate_title,
+                matches_json = excluded.matches_json,
+                status = excluded.status,
+                fetched_at = excluded.fetched_at,
+                expires_at = excluded.expires_at
+            """,
+            (provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
+             json.dumps(matches, ensure_ascii=False, sort_keys=True), status, fetched_at, expires_at),
+        )
+        conn.commit()
+    entry = get_provider_title_search_cache(db_path, provider=provider, normalized_query=normalized_query)
+    if entry is None:
+        raise RuntimeError("Provider title search cache disappeared after upsert")
+    return entry

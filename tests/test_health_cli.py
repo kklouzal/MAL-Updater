@@ -1332,7 +1332,7 @@ class HealthCheckCliTests(unittest.TestCase):
                 (
                     "crunchyroll",
                     "1.0",
-                    "ingest_snapshot",
+                    "hot",
                     "completed",
                     json.dumps({"series_count": 2, "progress_count": 1, "watchlist_count": 1}, sort_keys=True),
                 ),
@@ -1345,11 +1345,8 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertFalse(payload["healthy"])
         warning_codes = {warning["code"] for warning in payload["warnings"]}
         self.assertIn("missing_mal_auth_material", warning_codes)
-        self.assertIn("latest_sync_run_partial_coverage", warning_codes)
-        partial = payload["partial_sync_coverage"]
-        self.assertEqual(2, partial["fields"]["series"]["latest_sync_run_count"])
-        self.assertEqual(5, partial["fields"]["series"]["provider_total_count"])
-        self.assertAlmostEqual(0.4, partial["fields"]["series"]["coverage_ratio"])
+        self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
+        self.assertIsNone(payload["partial_sync_coverage"])
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertNotIn(
             "refresh_full_snapshot",
@@ -1899,10 +1896,111 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(partial["fully_explained_by_stale_rows"])
         self.assertEqual(3, partial["fields"]["series"]["older_last_seen_row_count"])
         self.assertEqual("incremental_backfill_pending_provider_rows", partial["fields"]["series"]["classification"])
+        self.assertEqual(
+            {
+                "latest_sync_run_touched_count": 2,
+                "provider_total_count": 5,
+                "remaining_row_count": 3,
+                "coverage_ratio": 0.4,
+            },
+            partial["backfill_progress"],
+        )
+        stale_warning = next(warning for warning in payload["warnings"] if warning["code"] == "latest_sync_run_stale_provider_rows")
+        self.assertEqual("ingest_snapshot", stale_warning["mode"])
+        self.assertEqual(3, stale_warning["backfill_progress"]["remaining_row_count"])
+        inspect_command = next(
+            command
+            for command in payload["maintenance"]["recommended_commands"]
+            if command["reason_code"] == "inspect_incremental_backfill_provider_rows"
+        )
+        self.assertEqual(
+            ["provider-stale-rows", "--provider", "crunchyroll", "--limit", "20"],
+            inspect_command["command_args"],
+        )
+        self.assertTrue(inspect_command["automation_safe"])
         self.assertNotIn(
             "refresh_full_snapshot",
             {command["reason_code"] for command in payload["maintenance"]["recommended_commands"]},
         )
+
+    def test_health_check_treats_recent_linked_incremental_child_residue_as_operator_visible(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (self.config.secrets_dir / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '-1 hours'))",
+                ("crunchyroll", "series-1", "Example Show", "Example Show", 1, "{}"),
+            )
+            conn.execute(
+                "INSERT INTO provider_episode_progress(provider, provider_episode_id, provider_series_id, episode_number, episode_title, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '-3 hours'))",
+                ("crunchyroll", "episode-1", "series-1", 1, "Episode 1", "{}"),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, datetime('now', '-2 hours'), CURRENT_TIMESTAMP, ?)",
+                ("crunchyroll", "1.0", "ingest_snapshot", "completed", json.dumps({"series_count": 1, "progress_count": 0}, sort_keys=True)),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_health_check("--stale-hours", "24")
+
+        self.assertEqual(0, exit_code)
+        stale_warning = next(warning for warning in payload["warnings"] if warning["code"] == "latest_sync_run_stale_provider_rows")
+        self.assertEqual("info", stale_warning["severity"])
+        self.assertEqual("operator_visible", stale_warning["health_posture"])
+        self.assertTrue(stale_warning["automation_safe"])
+        self.assertEqual("incremental_backfill_pending_provider_rows", stale_warning["fields"]["progress"]["classification"])
+        self.assertEqual("current_series", stale_warning["fields"]["progress"]["older_last_seen_samples"][0]["linked_series_posture"])
+        inspect_command = next(
+            command
+            for command in payload["maintenance"]["recommended_commands"]
+            if command["reason_code"] == "inspect_incremental_backfill_provider_rows"
+        )
+        self.assertEqual(["provider-stale-rows", "--provider", "crunchyroll", "--limit", "20"], inspect_command["command_args"])
+        self.assertTrue(inspect_command["automation_safe"])
+        self.assertNotIn(
+            "latest_sync_run_stale_provider_rows",
+            {warning["code"] for warning in payload["warnings"] if warning.get("health_posture") == "unhealthy"},
+        )
+
+    def test_health_check_keeps_unlinked_incremental_child_residue_unhealthy(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '-2 hours'))",
+                ("crunchyroll", "series-1", "Example Show", "Example Show", 1, "{}"),
+            )
+            conn.execute(
+                "INSERT INTO provider_episode_progress(provider, provider_episode_id, provider_series_id, episode_number, episode_title, raw_json, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '-2 hours'))",
+                ("crunchyroll", "episode-1", "series-1", 1, "Episode 1", "{}"),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, datetime('now', '-1 hours'), CURRENT_TIMESTAMP, ?)",
+                ("crunchyroll", "1.0", "ingest_snapshot", "completed", json.dumps({"series_count": 1, "progress_count": 0}, sort_keys=True)),
+            )
+            conn.commit()
+
+        exit_code, payload = self._run_health_check("--stale-hours", "24")
+
+        self.assertEqual(0, exit_code)
+        stale_warning = next(warning for warning in payload["warnings"] if warning["code"] == "latest_sync_run_stale_provider_rows")
+        self.assertEqual("warning", stale_warning["severity"])
+        self.assertEqual("unhealthy", stale_warning["health_posture"])
+        self.assertFalse(stale_warning["automation_safe"])
+        self.assertEqual("stale_series", stale_warning["fields"]["progress"]["older_last_seen_samples"][0]["linked_series_posture"])
 
     def test_health_check_does_not_recommend_repeat_full_refresh_after_recent_full_refresh_stale_rows(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")

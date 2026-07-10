@@ -7,13 +7,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import load_config
+import mal_updater.crunchyroll_snapshot as crunchyroll_snapshot
 from mal_updater.crunchyroll_auth import resolve_crunchyroll_state_paths
 from mal_updater.crunchyroll_auth import CrunchyrollAuthError, CrunchyrollBootstrapResult
 from mal_updater.crunchyroll_snapshot import (
     CRUNCHYROLL_ME_URL,
     CrunchyrollAccessToken,
+    CrunchyrollSnapshotError,
     CrunchyrollUnauthorizedError,
     _CrunchyrollAuthSession,
+    _authorized_json_get,
     _CrunchyrollRequestPacer,
     _fetch_snapshot_once,
     _write_sync_boundary,
@@ -21,6 +24,15 @@ from mal_updater.crunchyroll_snapshot import (
 
 
 class CrunchyrollAuthRecoveryTests(unittest.TestCase):
+    def test_crunchyroll_snapshot_http_requires_curl_cffi_transport(self) -> None:
+        with patch.object(crunchyroll_snapshot, "curl_requests", None):
+            with self.assertRaisesRegex(CrunchyrollSnapshotError, "requires curl_cffi"):
+                crunchyroll_snapshot._http_get(
+                    "https://example.invalid/history",
+                    headers={},
+                    timeout_seconds=1.0,
+                )
+
     def _build_session(self, root: Path) -> _CrunchyrollAuthSession:
         config = load_config(root)
         state_paths = resolve_crunchyroll_state_paths(config)
@@ -47,7 +59,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             session = self._build_session(root)
             calls: list[str] = []
 
-            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None):
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None):
                 calls.append(access_token)
                 if len(calls) == 1:
                     raise CrunchyrollUnauthorizedError(url, 401)
@@ -83,7 +95,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             session = self._build_session(root)
             calls: list[str] = []
 
-            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None):
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None):
                 calls.append(access_token)
                 if len(calls) == 1:
                     raise CrunchyrollUnauthorizedError(url, 401)
@@ -127,7 +139,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             session = self._build_session(root)
             calls: list[tuple[str, dict[str, object] | None]] = []
 
-            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None):
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None):
                 calls.append((access_token, params))
                 raise CrunchyrollUnauthorizedError(url, 401)
 
@@ -254,6 +266,7 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                 timeout_seconds: float,
                 params=None,
                 pacer=None,
+                phase=None,
             ):
                 calls.append((url, access_token, params))
                 if url == CRUNCHYROLL_ME_URL:
@@ -299,11 +312,6 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                         "refreshed-access-token",
                         {"page": 1, "page_size": 100, "locale": "en-US"},
                     ),
-                    (
-                        "https://www.crunchyroll.com/content/v2/discover/acct-123/watchlist",
-                        "refreshed-access-token",
-                        {"locale": "en-US", "n": 100, "start": 0},
-                    ),
                 ],
             )
             self.assertEqual(session.auth_source, "refresh_token_recovery")
@@ -315,9 +323,11 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertEqual(result.snapshot.account_id_hint, "acct-123")
             self.assertEqual(result.snapshot.raw["auth_source"], "refresh_token_recovery")
             self.assertEqual(result.snapshot.raw["history_count"], 1)
-            self.assertEqual(result.snapshot.raw["watchlist_count"], 1)
+            self.assertEqual(result.snapshot.raw["watchlist_count"], 0)
             self.assertFalse(result.snapshot.raw["history_stopped_early"])
             self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
+            self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "hot")
+            self.assertTrue(result.snapshot.raw["hot_surface_only"])
             mock_refresh.assert_called_once()
             mock_login.assert_not_called()
 
@@ -348,7 +358,7 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             watchlist_backfill_page = [self._watchlist_entry(idx) for idx in range(101, 121)]
             calls: list[tuple[str, dict[str, object] | None]] = []
 
-            def fake_get(url: str, *, params: dict[str, object] | None = None):
+            def fake_get(url: str, *, params: dict[str, object] | None = None, phase: str | None = None):
                 calls.append((url, params))
                 if url == CRUNCHYROLL_ME_URL:
                     return {"account_id": "acct-123", "email": "user@example.com"}
@@ -369,18 +379,17 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
 
             watch_history_calls = [item for item in calls if item[0].endswith("/watch-history")]
             watchlist_calls = [item for item in calls if item[0].endswith("/watchlist")]
-            self.assertEqual(len(watch_history_calls), 2)
-            self.assertEqual(len(watchlist_calls), 2)
-            self.assertTrue(result.snapshot.raw["history_stopped_early"])
-            self.assertTrue(result.snapshot.raw["watchlist_stopped_early"])
-            self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "incremental")
+            self.assertEqual(len(watch_history_calls), 1)
+            self.assertEqual(len(watchlist_calls), 0)
+            self.assertFalse(result.snapshot.raw["history_stopped_early"])
+            self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
+            self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "hot")
+            self.assertTrue(result.snapshot.raw["hot_surface_only"])
             self.assertTrue(result.state_paths.sync_boundary_path.exists())
             saved = json.loads(result.state_paths.sync_boundary_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["account_id_hint"], "acct-123")
-            self.assertGreaterEqual(saved["history"]["retained_count"], 1)
-            self.assertGreaterEqual(saved["watchlist"]["retained_count"], 1)
-            self.assertGreaterEqual(saved["history"]["backfill_retained_count"], 1)
-            self.assertGreaterEqual(saved["watchlist"]["backfill_retained_count"], 1)
+            self.assertIn("history", saved)
+            self.assertIn("watchlist", saved)
 
     def test_fetch_snapshot_full_refresh_ignores_existing_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -404,7 +413,7 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             watchlist_page_2 = [self._watchlist_entry(idx) for idx in range(101, 121)]
             calls: list[tuple[str, dict[str, object] | None]] = []
 
-            def fake_get(url: str, *, params: dict[str, object] | None = None):
+            def fake_get(url: str, *, params: dict[str, object] | None = None, phase: str | None = None):
                 calls.append((url, params))
                 if url == CRUNCHYROLL_ME_URL:
                     return {"account_id": "acct-123", "email": "user@example.com"}
@@ -430,6 +439,101 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertFalse(result.snapshot.raw["history_stopped_early"])
             self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
             self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "full_refresh")
+
+    def test_authorized_json_get_wraps_request_error_with_phase_and_endpoint(self) -> None:
+        class FakeTransport:
+            class exceptions:
+                RequestException = TimeoutError
+
+            def get(self, url, *, headers, timeout, params=None, impersonate=None):
+                self.last_call = {"url": url, "timeout": timeout, "impersonate": impersonate}
+                raise TimeoutError("simulated timeout")
+
+        fake_transport = FakeTransport()
+        with patch("mal_updater.crunchyroll_snapshot.curl_requests", fake_transport):
+            with self.assertRaises(CrunchyrollSnapshotError) as ctx:
+                _authorized_json_get(
+                    "https://www.crunchyroll.com/content/v2/acct-123/watch-history",
+                    access_token="access-token",
+                    timeout_seconds=7.0,
+                    params={"page": 3},
+                    phase="watch-history page 3",
+                )
+
+        self.assertIn("watch-history page 3", str(ctx.exception))
+        self.assertIn("/watch-history", str(ctx.exception))
+        self.assertEqual(fake_transport.last_call["timeout"], (7.0, 7.0))
+        self.assertEqual(fake_transport.last_call["impersonate"], "chrome124")
+
+    def test_fetch_snapshot_aborts_on_history_page_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            calls = []
+
+            def fake_get(url: str, *, params: dict[str, object] | None = None, phase: str | None = None):
+                calls.append((url, params, phase))
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123", "email": "user@example.com"}
+                if url.endswith("/watch-history"):
+                    return {"total": 999999, "data": [self._history_entry(idx) for idx in range(100)]}
+                raise AssertionError((url, params, phase))
+
+            with patch("mal_updater.crunchyroll_snapshot.CRUNCHYROLL_HISTORY_PAGE_LIMIT", 2):
+                with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                    with self.assertRaises(CrunchyrollSnapshotError) as ctx:
+                        _fetch_snapshot_once(session, use_incremental_boundary=False)
+
+            self.assertIn("watch-history exceeded page guard", str(ctx.exception))
+            self.assertEqual(len([call for call in calls if call[0].endswith("/watch-history")]), 2)
+            self.assertEqual(calls[-1][2], "watch-history page 2")
+
+    def test_fetch_snapshot_page_caps_emit_partial_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            calls = []
+
+            def fake_get(url: str, *, params: dict[str, object] | None = None, phase: str | None = None):
+                calls.append((url, params, phase))
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123", "email": "user@example.com"}
+                if url.endswith("/watch-history"):
+                    page = int(params["page"])
+                    return {"total": 999999, "data": [self._history_entry(page * 100 + idx) for idx in range(100)]}
+                if url.endswith("/watchlist"):
+                    start = int(params["start"])
+                    return {"total": 999999, "data": [self._watchlist_entry(start + idx) for idx in range(100)]}
+                raise AssertionError((url, params, phase))
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                result = _fetch_snapshot_once(
+                    session,
+                    use_incremental_boundary=False,
+                    max_history_pages=2,
+                    max_watchlist_pages=1,
+                    history_start_page=5,
+                    watchlist_start=300,
+                )
+
+            raw = result.snapshot.raw
+            self.assertTrue(raw["partial"])
+            self.assertTrue(raw["history_partial"])
+            self.assertEqual(raw["history_start_page"], 5)
+            self.assertEqual(raw["history_pages_fetched"], 2)
+            self.assertEqual(raw["history_next_page"], 7)
+            self.assertTrue(raw["watchlist_partial"])
+            self.assertEqual(raw["watchlist_start"], 300)
+            self.assertEqual(raw["watchlist_pages_fetched"], 1)
+            self.assertEqual(raw["watchlist_next_start"], 400)
+            self.assertEqual([call[1]["page"] for call in calls if call[0].endswith("/watch-history")], [5, 6])
+            self.assertEqual([call[1]["start"] for call in calls if call[0].endswith("/watchlist")], [300])
+            self.assertFalse(result.state_paths.sync_boundary_path.exists())
+            session_state = json.loads(result.state_paths.session_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(session_state["crunchyroll_phase"], "python_live_snapshot_partial")
+            self.assertEqual(session_state["last_error"], "partial snapshot; sync boundary not advanced")
 
 
 if __name__ == "__main__":

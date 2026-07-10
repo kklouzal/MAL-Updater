@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import stat
+import uuid
 
 from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
 from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, auth_failure_remediation, classify_auth_style_failure
@@ -38,6 +39,8 @@ from .db import (
     get_provider_stale_row_counts,
     get_provider_stale_row_last_seen_ranges,
     get_provider_stale_row_linkage,
+    insert_recommendation_snapshot_rows,
+    list_latest_recommendation_snapshot_rows,
     list_provider_stale_row_samples,
     get_provider_series_title_map,
     get_provider_series_title_map_by_keys,
@@ -50,11 +53,12 @@ from .db import (
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
-from .recommendation_dashboard import write_recommendation_dashboard
+from .recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, serve_dashboard, write_recommendation_dashboard
+from .recommendation_enrichment import enrich_discovery_provider_availability
 from .recommendation_metadata import refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
-from .service_runtime import run_pending_tasks, run_service_loop
+from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
 from .sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
     build_dry_run_sync_plan,
@@ -196,6 +200,35 @@ def _cmd_service_run(project_root: Path | None) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     return run_service_loop(config)
+
+
+def _cmd_recommend_maintain(
+    project_root: Path | None,
+    *,
+    dry_run: bool,
+    metadata_limit: int,
+    discovery_target_limit: int,
+    recommendation_limit: int,
+    mapping_limit: int,
+    provider_max_history_pages: int | None,
+    provider_max_watchlist_pages: int | None,
+    skip_provider_refresh: bool,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    result = run_maintenance_cycle(
+        config,
+        dry_run=dry_run,
+        metadata_limit=metadata_limit,
+        discovery_target_limit=discovery_target_limit,
+        recommendation_limit=recommendation_limit,
+        mapping_limit=mapping_limit,
+        provider_max_history_pages=provider_max_history_pages,
+        provider_max_watchlist_pages=provider_max_watchlist_pages,
+        include_provider_refresh=not skip_provider_refresh,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") in {"ok", "dry_run"} else 1
 
 
 def _runtime_initialization_status(config) -> dict[str, object]:
@@ -1572,6 +1605,21 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
             execution_state_remaining_seconds = task_payload.get("execution_state_remaining_seconds") if isinstance(task_payload.get("execution_state_remaining_seconds"), int) else None
             if execution_state_remaining_seconds is not None:
                 print(f"task_{task_name}_execution_state_remaining_seconds={execution_state_remaining_seconds}")
+            execution_state_elapsed_seconds = task_payload.get("execution_state_elapsed_seconds") if isinstance(task_payload.get("execution_state_elapsed_seconds"), int) else None
+            if execution_state_elapsed_seconds is not None:
+                print(f"task_{task_name}_execution_state_elapsed_seconds={execution_state_elapsed_seconds}")
+            running_started_at = task_payload.get("running_started_at") if isinstance(task_payload.get("running_started_at"), str) else None
+            if running_started_at is not None:
+                print(f"task_{task_name}_running_started_at={running_started_at}")
+            running_command = task_payload.get("running_command") if isinstance(task_payload.get("running_command"), str) else None
+            if running_command is not None:
+                print(f"task_{task_name}_running_command={running_command}")
+            running_timeout_seconds = task_payload.get("running_timeout_seconds") if isinstance(task_payload.get("running_timeout_seconds"), int) else None
+            if running_timeout_seconds is not None:
+                print(f"task_{task_name}_running_timeout_seconds={running_timeout_seconds}")
+            running_duration_seconds = task_payload.get("running_duration_seconds") if isinstance(task_payload.get("running_duration_seconds"), (int, float)) else None
+            if running_duration_seconds is not None:
+                print(f"task_{task_name}_running_duration_seconds={running_duration_seconds}")
             budget_backoff_level = task_payload.get("budget_backoff_level") if isinstance(task_payload.get("budget_backoff_level"), str) else None
             if budget_backoff_level is not None:
                 print(f"task_{task_name}_budget_backoff_level={budget_backoff_level}")
@@ -1720,6 +1768,8 @@ def _build_partial_sync_coverage(
     partial_fields: dict[str, dict[str, object]] = {}
     stale_explained_fields: dict[str, dict[str, object]] = {}
     mode = latest_sync_run.get("mode") if isinstance(latest_sync_run, dict) else None
+    if mode == "hot":
+        return None
     for summary_field, provider_field in field_map.items():
         latest_value = latest_counts.get(summary_field)
         provider_value = provider_counts.get(provider_field)
@@ -1755,14 +1805,99 @@ def _build_partial_sync_coverage(
         return None
 
     fully_explained_by_stale_rows = bool(partial_fields) and set(stale_explained_fields) == set(partial_fields)
-    return {
+    result = {
         "provider": provider_name,
         "sync_run_id": latest_sync_run.get("id") if isinstance(latest_sync_run, dict) else None,
         "mode": mode,
         "fully_explained_by_stale_rows": fully_explained_by_stale_rows,
         "fields": partial_fields,
     }
+    total_provider_count = sum(
+        int(field.get("provider_total_count"))
+        for field in partial_fields.values()
+        if isinstance(field.get("provider_total_count"), int)
+    )
+    total_touched_count = sum(
+        int(field.get("latest_sync_run_count"))
+        for field in partial_fields.values()
+        if isinstance(field.get("latest_sync_run_count"), int)
+    )
+    total_missing_count = sum(
+        int(field.get("missing_count"))
+        for field in partial_fields.values()
+        if isinstance(field.get("missing_count"), int)
+    )
+    if total_provider_count > 0:
+        result["backfill_progress"] = {
+            "latest_sync_run_touched_count": total_touched_count,
+            "provider_total_count": total_provider_count,
+            "remaining_row_count": total_missing_count,
+            "coverage_ratio": round(total_touched_count / total_provider_count, 4),
+        }
+    return result
 
+
+
+def _classify_partial_sync_health_posture(
+    partial_sync_coverage: dict[str, object],
+    *,
+    latest_completed_age_seconds: float | None,
+    stale_hours: float,
+) -> dict[str, object]:
+    """Return operator severity/posture for partial coverage or stale-row residue.
+
+    Recent incremental residue that is fully explained by older child rows linked to
+    current provider series is expected during slow front-of-line backfill. Keep it
+    visible, but do not make the whole health check automation-unhealthy.
+    """
+    fields = partial_sync_coverage.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        return {"severity": "warning", "health_posture": "unhealthy", "automation_safe": False}
+
+    fully_explained = partial_sync_coverage.get("fully_explained_by_stale_rows") is True
+    mode = partial_sync_coverage.get("mode")
+    recent = latest_completed_age_seconds is None or latest_completed_age_seconds <= stale_hours * 3600
+    classifications = {
+        field.get("classification")
+        for field in fields.values()
+        if isinstance(field, dict)
+    }
+    only_incremental_backfill = classifications == {"incremental_backfill_pending_provider_rows"}
+
+    child_linkage_safe = True
+    has_child_residue = False
+    for family, field in fields.items():
+        if not isinstance(field, dict):
+            child_linkage_safe = False
+            continue
+        if family == "series":
+            child_linkage_safe = False
+            continue
+        if family in {"progress", "watchlist"}:
+            has_child_residue = True
+            samples = field.get("older_last_seen_samples")
+            if not isinstance(samples, list) or not samples:
+                child_linkage_safe = False
+                continue
+            for sample in samples:
+                if not isinstance(sample, dict) or sample.get("linked_series_posture") not in {"current", "current_series"}:
+                    child_linkage_safe = False
+                    break
+
+    if fully_explained and mode != "full_refresh" and recent and only_incremental_backfill and has_child_residue and child_linkage_safe:
+        return {
+            "severity": "info",
+            "health_posture": "operator_visible",
+            "automation_safe": True,
+            "rationale": "recent_incremental_backfill_child_rows_linked_to_current_series",
+        }
+
+    return {
+        "severity": "warning",
+        "health_posture": "unhealthy",
+        "automation_safe": False,
+        "rationale": "old_unlinked_series_or_partial_provider_residue_needs_operator_review",
+    }
 
 
 def _build_mapping_coverage_snapshot(
@@ -2387,6 +2522,35 @@ def _build_health_maintenance_commands(
             requires_auth_interaction=False,
         )
 
+    if isinstance(partial_sync_coverage, dict):
+        coverage_provider = partial_sync_coverage.get("provider")
+        fields = partial_sync_coverage.get("fields")
+        classifications: set[object] = set()
+        if isinstance(fields, dict):
+            classifications = {
+                field.get("classification")
+                for field in fields.values()
+                if isinstance(field, dict)
+            }
+        if (
+            isinstance(coverage_provider, str)
+            and coverage_provider
+            and provider_ready.get(coverage_provider)
+            and classifications == {"incremental_backfill_pending_provider_rows"}
+        ):
+            progress = partial_sync_coverage.get("backfill_progress")
+            remaining = progress.get("remaining_row_count") if isinstance(progress, dict) else None
+            detail = "Inspect older cached provider rows that remain queued behind bounded incremental backfill"
+            if isinstance(remaining, int):
+                detail = f"Inspect {remaining} older cached provider rows that remain queued behind bounded incremental backfill"
+            add_command(
+                "inspect_incremental_backfill_provider_rows",
+                detail,
+                ["provider-stale-rows", "--provider", coverage_provider, "--limit", "20"],
+                automation_safe=True,
+                requires_auth_interaction=False,
+            )
+
     missing_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
     outdated_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
     disabled_services = automation_installation.get("disabled_services") if isinstance(automation_installation, dict) else None
@@ -2791,11 +2955,22 @@ def _cmd_health_check(
                 detail = "Latest ingest touched fewer rows than the local cache, and the gap is fully explained by older last_seen rows that may be stale/deleted upstream"
             else:
                 detail = "Latest incremental ingest intentionally touched front-of-line rows while older cached rows remain queued for slow incremental backfill"
+        posture = _classify_partial_sync_health_posture(
+            partial_sync_coverage,
+            latest_completed_age_seconds=latest_completed_age_seconds,
+            stale_hours=stale_hours,
+        )
         warnings.append(
             {
                 "code": "latest_sync_run_stale_provider_rows" if fully_explained_by_stale_rows else "latest_sync_run_partial_coverage",
                 "detail": detail,
+                "severity": posture["severity"],
+                "health_posture": posture["health_posture"],
+                "automation_safe": posture["automation_safe"],
+                "rationale": posture.get("rationale"),
                 "sync_run_id": partial_sync_coverage.get("sync_run_id"),
+                "mode": partial_sync_coverage.get("mode"),
+                "backfill_progress": partial_sync_coverage.get("backfill_progress"),
                 "fields": partial_sync_coverage.get("fields"),
             }
         )
@@ -2983,8 +3158,14 @@ def _cmd_health_check(
         provider_auth_failures=provider_auth_failures,
     )
 
+    health_blocking_warnings = [
+        warning
+        for warning in warnings
+        if not (isinstance(warning, dict) and warning.get("health_posture") == "operator_visible")
+    ]
+
     payload = {
-        "healthy": not warnings,
+        "healthy": not health_blocking_warnings,
         "stale_hours_threshold": stale_hours,
         "warnings": warnings,
         "maintenance": {
@@ -3281,15 +3462,40 @@ def _cmd_provider_fetch_snapshot(
     out_path: Path | None,
     ingest: bool,
     full_refresh: bool,
+    max_history_pages: int | None = None,
+    max_watchlist_pages: int | None = None,
+    history_start_page: int = 1,
+    watchlist_start: int = 0,
 ) -> int:
+    for name, value in (("max-history-pages", max_history_pages), ("max-watchlist-pages", max_watchlist_pages)):
+        if value is not None and value < 1:
+            print(f"{name} must be >= 1", file=sys.stderr)
+            return 1
+    if history_start_page < 1:
+        print("history-start-page must be >= 1", file=sys.stderr)
+        return 1
+    if watchlist_start < 0:
+        print("watchlist-start must be >= 0", file=sys.stderr)
+        return 1
     config = load_config(project_root)
     ensure_directories(config)
     provider = get_provider(provider_slug)
+    if any(value is not None for value in (max_history_pages, max_watchlist_pages)) or history_start_page != 1 or watchlist_start != 0:
+        if provider_slug != "crunchyroll":
+            print("Page chunk controls are currently supported only for Crunchyroll", file=sys.stderr)
+            return 1
+    fetch_kwargs = {"profile": profile, "full_refresh": full_refresh}
+    if provider_slug == "crunchyroll":
+        fetch_kwargs.update(
+            max_history_pages=max_history_pages,
+            max_watchlist_pages=max_watchlist_pages,
+            history_start_page=history_start_page,
+            watchlist_start=watchlist_start,
+        )
     try:
         result = provider.fetch_snapshot(
             config,
-            profile=profile,
-            full_refresh=full_refresh,
+            **fetch_kwargs,
         )
     except (CrunchyrollAuthError, CrunchyrollSnapshotError) as exc:
         print(str(exc), file=sys.stderr)
@@ -3302,7 +3508,10 @@ def _cmd_provider_fetch_snapshot(
         print(f"Wrote {provider.display_name} snapshot to {target_path}")
 
     if ingest:
-        ingest_mode = "full_refresh" if full_refresh else "ingest_snapshot"
+        is_partial = bool(payload.get("raw", {}).get("partial")) if isinstance(payload.get("raw"), dict) else False
+        ingest_mode = "full_refresh" if full_refresh and not is_partial else "hot"
+        if full_refresh and is_partial:
+            print("Partial Crunchyroll snapshot detected; ingesting as hot instead of marking a completed full refresh", file=sys.stderr)
         summary = ingest_snapshot_payload(payload, config, mode=ingest_mode)
         print(json.dumps(summary.as_dict(), indent=2))
         return 0
@@ -3318,6 +3527,10 @@ def _cmd_crunchyroll_fetch_snapshot(
     out_path: Path | None,
     ingest: bool,
     full_refresh: bool,
+    max_history_pages: int | None = None,
+    max_watchlist_pages: int | None = None,
+    history_start_page: int = 1,
+    watchlist_start: int = 0,
 ) -> int:
     return _cmd_provider_fetch_snapshot(
         project_root,
@@ -3326,6 +3539,10 @@ def _cmd_crunchyroll_fetch_snapshot(
         out_path,
         ingest,
         full_refresh,
+        max_history_pages=max_history_pages,
+        max_watchlist_pages=max_watchlist_pages,
+        history_start_page=history_start_page,
+        watchlist_start=watchlist_start,
     )
 
 
@@ -5703,6 +5920,7 @@ def _cmd_review_queue_refresh_worklist(
     reason_family: str | None,
     fix_strategy_family: str | None,
     cluster_strategy_family: str | None,
+    output_format: str = "json",
 ) -> int:
     effective_issue_type = issue_type or "mapping_review"
     if effective_issue_type != "mapping_review":
@@ -5794,7 +6012,16 @@ def _cmd_review_queue_refresh_worklist(
         "selected_buckets": bucket_updates,
         "refresh": refresh_result,
     }
-    print(json.dumps(payload, indent=2))
+    if output_format == "summary":
+        print(f"issue_type_filter={payload['issue_type_filter']}")
+        print(f"selected_bucket_count={payload['selected_bucket_count']}")
+        print(f"selected_provider_series_ids={len(payload['selected_provider_series_ids'])}")
+        review_queue = refresh_result.get("review_queue") if isinstance(refresh_result, dict) else None
+        if isinstance(review_queue, dict):
+            print(f"review_queue_resolved={review_queue.get('resolved', 0)}")
+            print(f"review_queue_inserted={review_queue.get('inserted', 0)}")
+    else:
+        print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -6123,7 +6350,38 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
     return 0 if apply_exit_code == 0 else 1
 
 
-def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_dormant: bool) -> int:
+def _snapshot_candidate_rows(payload: object) -> list[dict[str, object]]:
+    if isinstance(payload, list) and all(isinstance(item, dict) and "items" in item for item in payload):
+        rows: list[dict[str, object]] = []
+        for section in payload:
+            if not isinstance(section, dict) or not isinstance(section.get("items"), list):
+                continue
+            for item in section["items"]:
+                if isinstance(item, dict):
+                    rows.append(item)
+        return rows
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _snapshot_recommendation_rows(results: list[object], limit: int | None) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in results:
+        if hasattr(item, "as_dict"):
+            row = item.as_dict()
+        elif isinstance(item, dict):
+            row = item
+        else:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+        if limit is not None and limit > 0 and len(rows) >= limit:
+            break
+    return rows
+
+
+def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_dormant: bool, persist_snapshot: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
@@ -6131,14 +6389,62 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
     results = build_recommendations(
         config,
         limit=normalized_limit if flat else 0,
-        require_provider_availability=not include_dormant,
+        require_provider_availability=False,
     )
     payload: object
     if flat:
         payload = [item.as_dict() for item in results]
     else:
         payload = trim_grouped_recommendations(group_recommendations(results), normalized_limit)
+    if persist_snapshot:
+        run_id = f"recommend-{uuid.uuid4()}"
+        generated_at = datetime.now(timezone.utc).isoformat()
+        insert_recommendation_snapshot_rows(
+            config.db_path,
+            _snapshot_recommendation_rows(results, normalized_limit),
+            run_id=run_id,
+            generated_at=generated_at,
+        )
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_recommend_snapshots(project_root: Path | None, limit: int, output_format: str = "json") -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    rows = list_latest_recommendation_snapshot_rows(config.db_path, limit=_normalize_limit(limit) or 100)
+    payload = [
+        {
+            "id": row.id,
+            "run_id": row.run_id,
+            "generated_at": row.generated_at,
+            "kind": row.kind,
+            "provider": row.provider,
+            "title": row.title,
+            "provider_series_id": row.provider_series_id,
+            "mal_anime_id": row.mal_anime_id,
+            "score": row.score,
+            "priority": row.priority,
+            "reasons": row.reasons,
+            "scorecard": row.scorecard,
+            "context": row.context,
+            "providers": row.availability_providers,
+            "dub_signal": row.dub_signal,
+            "availability_confidence": row.availability_confidence,
+        }
+        for row in rows
+    ]
+    if output_format == "summary":
+        run_id = payload[0].get("run_id") if payload else None
+        generated_at = payload[0].get("generated_at") if payload else None
+        print(f"recommendation_snapshot_rows={len(payload)}")
+        if run_id is not None:
+            print(f"run_id={run_id}")
+        if generated_at is not None:
+            print(f"generated_at={generated_at}")
+    else:
+        print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -6146,13 +6452,22 @@ def _cmd_recommend_dashboard(project_root: Path | None, output: Path, limit: int
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
+    display_limit = _normalize_limit(limit)
     results = build_recommendations(
         config,
-        limit=_normalize_limit(limit),
-        require_provider_availability=not include_dormant,
+        limit=None,
+        require_provider_availability=False,
     )
-    written = write_recommendation_dashboard(output, results)
-    print(json.dumps({"status": "ok", "output": str(written), "recommendation_count": len(results)}, indent=2))
+    written = write_recommendation_dashboard(output, results, limit=display_limit)
+    print(json.dumps({"status": "ok", "output": str(written), "recommendation_count": len(results), "display_limit_per_section": display_limit}, indent=2))
+    return 0
+
+
+def _cmd_dashboard_serve(project_root: Path | None, host: str, port: int, limit: int) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    serve_dashboard(config.db_path, host=host, port=port, limit=_normalize_limit(limit) or DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT)
     return 0
 
 
@@ -6170,6 +6485,22 @@ def _cmd_recommend_refresh_metadata(
         limit=_normalize_limit(limit),
         include_discovery_targets=include_discovery_targets,
         discovery_target_limit=_normalize_limit(discovery_target_limit),
+    )
+    print(json.dumps(summary.as_dict(), indent=2))
+    return 0
+
+
+def _cmd_recommend_enrich_provider_availability(project_root: Path | None, limit: int, provider: str | None, search_limit: int) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    provider_slugs = [provider] if provider else list(list_provider_slugs())
+    providers = [get_provider(slug) for slug in provider_slugs]
+    summary = enrich_discovery_provider_availability(
+        config,
+        providers=providers,
+        candidate_limit=_normalize_limit(limit) or 25,
+        search_limit=_normalize_limit(search_limit) or 10,
     )
     print(json.dumps(summary.as_dict(), indent=2))
     return 0
@@ -6291,6 +6622,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore provider-local incremental boundaries and re-fetch account-scoped history/watchlist surfaces only; never crawl whole Crunchyroll/HIDIVE libraries",
     )
+    provider_fetch_snapshot.add_argument("--max-history-pages", type=int, default=None, help="Crunchyroll only: stop after this many watch-history pages and mark snapshot raw.partial=true")
+    provider_fetch_snapshot.add_argument("--max-watchlist-pages", type=int, default=None, help="Crunchyroll only: stop after this many watchlist pages and mark snapshot raw.partial=true")
+    provider_fetch_snapshot.add_argument("--history-start-page", type=int, default=1, help="Crunchyroll only: first watch-history page to fetch for manual chunk resume")
+    provider_fetch_snapshot.add_argument("--watchlist-start", type=int, default=0, help="Crunchyroll only: first watchlist offset to fetch for manual chunk resume")
     crunchyroll_auth_login = subparsers.add_parser(
         "crunchyroll-auth-login",
         help="Use local Crunchyroll username/password secrets to stage Crunchyroll refresh-token auth material",
@@ -6309,6 +6644,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore the local incremental sync boundary and re-fetch account-scoped Crunchyroll history/watchlist pages only; never crawl whole libraries",
     )
+    crunchyroll_fetch_snapshot.add_argument("--max-history-pages", type=int, default=None, help="Stop after this many watch-history pages and mark snapshot raw.partial=true")
+    crunchyroll_fetch_snapshot.add_argument("--max-watchlist-pages", type=int, default=None, help="Stop after this many watchlist pages and mark snapshot raw.partial=true")
+    crunchyroll_fetch_snapshot.add_argument("--history-start-page", type=int, default=1, help="First watch-history page to fetch for manual chunk resume")
+    crunchyroll_fetch_snapshot.add_argument("--watchlist-start", type=int, default=0, help="First watchlist offset to fetch for manual chunk resume")
     validate_snapshot = subparsers.add_parser("validate-snapshot", help="Validate a normalized provider snapshot JSON payload")
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a normalized provider snapshot into SQLite")
@@ -6388,6 +6727,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_review_queue.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to show")
     list_review_queue.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter")
     list_review_queue.add_argument("--summary", action="store_true", help="Emit a compact summary of queue counts/decisions/reasons instead of every row")
+    list_review_queue.add_argument("--format", dest="output_format", default="json", choices=["json", "summary"], help="Output format: json rows (default) or summary JSON")
     list_review_queue.add_argument("--limit", type=int, default=0, help="Maximum number of filtered rows to emit in non-summary mode (use 0 for all)")
     list_review_queue.add_argument("--provider-series-id", default=None, help="Only show review rows for one exact provider_series_id")
     list_review_queue.add_argument("--title-cluster", default=None, help="Only show review rows whose normalized title cluster matches this value (for example: 'example show' or 'Example Show Season 2')")
@@ -6454,6 +6794,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply the ranked review-queue worklist in one shot by recomputing mapping_review buckets and refreshing the persisted rows",
     )
     review_queue_refresh_worklist.add_argument("--status", default="open", choices=["open", "resolved"], help="Review row status to inspect while selecting refresh buckets")
+    review_queue_refresh_worklist.add_argument("--format", dest="output_format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
     review_queue_refresh_worklist.add_argument("--issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional issue type filter (currently only mapping_review is supported)")
     review_queue_refresh_worklist.add_argument("--limit", type=int, default=3, help="How many ranked worklist buckets to refresh")
     review_queue_refresh_worklist.add_argument("--per-bucket-limit", type=int, default=20, help="Maximum number of matching rows to refresh per selected bucket (use 0 for all)")
@@ -6512,19 +6853,54 @@ def build_parser() -> argparse.ArgumentParser:
     recommend.add_argument(
         "--include-dormant",
         action="store_true",
-        help="Include discovery candidates that are not currently matched to a registered provider catalog; hidden by default",
+        help="Backward-compatible no-op: MAL/catalog discovery candidates are included by default",
     )
+    recommend.add_argument(
+        "--persist-snapshot",
+        action="store_true",
+        help="Persist the emitted recommendation rows as a scored snapshot for later comparison/export",
+    )
+    recommend_snapshots = subparsers.add_parser(
+        "recommend-snapshots",
+        help="List rows from the latest persisted recommendation snapshot",
+    )
+    recommend_snapshots.add_argument("--limit", type=int, default=100, help="Maximum rows to emit from the latest run")
+    recommend_snapshots.add_argument("--format", dest="output_format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
+    recommend_maintain = subparsers.add_parser(
+        "recommend-maintain",
+        help="Run one unattended, write-conservative recommendation maintenance cycle",
+    )
+    recommend_maintain.add_argument("--dry-run", action="store_true", help="Print the planned command sequence without invoking provider/MAL calls")
+    recommend_maintain.add_argument("--metadata-limit", type=int, default=25, help="Mapped MAL anime metadata rows to refresh this cycle")
+    recommend_maintain.add_argument("--discovery-target-limit", type=int, default=25, help="Discovery target anime metadata rows to hydrate this cycle")
+    recommend_maintain.add_argument("--recommendation-limit", type=int, default=100, help="Recommendation rows to persist in the snapshot")
+    recommend_maintain.add_argument("--mapping-limit", type=int, default=25, help="Provider rows to inspect in exact-approved-only sync dry-run review")
+    recommend_maintain.add_argument("--provider-max-history-pages", type=int, default=None, help="Crunchyroll chunk budget for history pages; partial chunks stay incremental")
+    recommend_maintain.add_argument("--provider-max-watchlist-pages", type=int, default=None, help="Crunchyroll chunk budget for watchlist pages; partial chunks stay incremental")
+    recommend_maintain.add_argument("--skip-provider-refresh", action="store_true", help="Skip provider snapshot refresh for this cycle")
     recommend_dashboard = subparsers.add_parser(
         "recommend-dashboard",
         help="Write a dependency-free sortable local HTML recommendation dashboard",
     )
     recommend_dashboard.add_argument("--output", required=True, type=Path, help="HTML file to write")
-    recommend_dashboard.add_argument("--limit", type=int, default=20, help="How many recommendations to include (use 0 for all)")
+    recommend_dashboard.add_argument(
+        "--limit",
+        type=int,
+        default=DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT,
+        help=f"How many recommendations to include (default: {DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT}; use 0 for all)",
+    )
     recommend_dashboard.add_argument(
         "--include-dormant",
         action="store_true",
-        help="Include discovery candidates that are not currently matched to a registered provider catalog; hidden by default",
+        help="Backward-compatible no-op: MAL/catalog discovery candidates are included by default",
     )
+    dashboard_serve = subparsers.add_parser(
+        "dashboard-serve",
+        help="Serve a live local HTTP dashboard from current SQLite/runtime state",
+    )
+    dashboard_serve.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    dashboard_serve.add_argument("--port", type=int, default=8766, help="Bind port (default: 8766)")
+    dashboard_serve.add_argument("--limit", type=int, default=DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, help="Maximum latest snapshot recommendation rows to expose (default: 16; use ?limit= on /api/dashboard to override per request)")
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",
         help="Refresh paced MAL metadata/relation cache for mapped anime; provider lookups remain title-specific only",
@@ -6541,6 +6917,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="How many discovered target anime to hydrate when --include-discovery-targets is used (use 0 for all discovered targets)",
     )
+    recommend_enrich = subparsers.add_parser(
+        "recommend-enrich-provider-availability",
+        help="Use bounded provider title search to enrich recommendation availability cache",
+    )
+    recommend_enrich.add_argument("--limit", type=int, default=25, help="Maximum recommendation candidates to inspect")
+    recommend_enrich.add_argument("--provider", choices=list(list_provider_slugs()), help="Provider slug to query; defaults to all registered providers")
+    recommend_enrich.add_argument("--search-limit", type=int, default=10, help="Maximum provider search results per query")
     recommend_coverage = subparsers.add_parser(
         "recommend-coverage",
         help="Report read-only MAL recommendation harvest coverage for mapped/watched MAL anime IDs",
@@ -6644,11 +7027,32 @@ def main() -> int:
     if args.command == "provider-auth-login":
         return _cmd_provider_auth_login(args.project_root, args.provider, args.profile, args.no_verify)
     if args.command == "provider-fetch-snapshot":
-        return _cmd_provider_fetch_snapshot(args.project_root, args.provider, args.profile, args.out, args.ingest, args.full_refresh)
+        return _cmd_provider_fetch_snapshot(
+            args.project_root,
+            args.provider,
+            args.profile,
+            args.out,
+            args.ingest,
+            args.full_refresh,
+            max_history_pages=args.max_history_pages,
+            max_watchlist_pages=args.max_watchlist_pages,
+            history_start_page=args.history_start_page,
+            watchlist_start=args.watchlist_start,
+        )
     if args.command == "crunchyroll-auth-login":
         return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
     if args.command == "crunchyroll-fetch-snapshot":
-        return _cmd_crunchyroll_fetch_snapshot(args.project_root, args.profile, args.out, args.ingest, args.full_refresh)
+        return _cmd_crunchyroll_fetch_snapshot(
+            args.project_root,
+            args.profile,
+            args.out,
+            args.ingest,
+            args.full_refresh,
+            max_history_pages=args.max_history_pages,
+            max_watchlist_pages=args.max_watchlist_pages,
+            history_start_page=args.history_start_page,
+            watchlist_start=args.watchlist_start,
+        )
     if args.command == "validate-snapshot":
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":
@@ -6700,7 +7104,7 @@ def main() -> int:
             args.project_root,
             args.status,
             args.issue_type,
-            args.summary,
+            args.summary or args.output_format == "summary",
             args.limit,
             args.provider_series_id,
             args.title_cluster,
@@ -6774,6 +7178,7 @@ def main() -> int:
             args.reason_family,
             args.fix_strategy_family,
             args.cluster_strategy_family,
+            args.output_format,
         )
     if args.command == "resolve-review-queue":
         return _cmd_resolve_review_queue(
@@ -6806,9 +7211,25 @@ def main() -> int:
     if args.command == "apply-sync":
         return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
     if args.command == "recommend":
-        return _cmd_recommend(args.project_root, args.limit, args.flat, args.include_dormant)
+        return _cmd_recommend(args.project_root, args.limit, args.flat, args.include_dormant, args.persist_snapshot)
+    if args.command == "recommend-snapshots":
+        return _cmd_recommend_snapshots(args.project_root, args.limit, args.output_format)
+    if args.command == "recommend-maintain":
+        return _cmd_recommend_maintain(
+            args.project_root,
+            dry_run=args.dry_run,
+            metadata_limit=args.metadata_limit,
+            discovery_target_limit=args.discovery_target_limit,
+            recommendation_limit=args.recommendation_limit,
+            mapping_limit=args.mapping_limit,
+            provider_max_history_pages=args.provider_max_history_pages,
+            provider_max_watchlist_pages=args.provider_max_watchlist_pages,
+            skip_provider_refresh=args.skip_provider_refresh,
+        )
     if args.command == "recommend-dashboard":
         return _cmd_recommend_dashboard(args.project_root, args.output, args.limit, args.include_dormant)
+    if args.command == "dashboard-serve":
+        return _cmd_dashboard_serve(args.project_root, args.host, args.port, args.limit)
     if args.command == "recommend-refresh-metadata":
         return _cmd_recommend_refresh_metadata(
             args.project_root,
@@ -6816,6 +7237,8 @@ def main() -> int:
             args.include_discovery_targets,
             args.discovery_target_limit,
         )
+    if args.command == "recommend-enrich-provider-availability":
+        return _cmd_recommend_enrich_provider_availability(args.project_root, args.limit, args.provider, args.search_limit)
     if args.command == "recommend-coverage":
         return _cmd_recommend_coverage(args.project_root, args.stale_after_days)
     if args.command == "push-recommendations-webhook":

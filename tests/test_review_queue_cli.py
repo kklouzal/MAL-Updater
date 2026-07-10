@@ -16,6 +16,7 @@ from mal_updater.db import (
     list_review_queue_entries,
     replace_review_queue_entries,
     update_review_queue_entry_statuses,
+    insert_recommendation_snapshot_rows,
 )
 from mal_updater.ingestion import ingest_snapshot_payload
 from tests.test_validation_ingestion import sample_snapshot
@@ -2263,3 +2264,121 @@ class ReviewQueueCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_list_review_queue_accepts_format_summary_alias(self) -> None:
+        replace_review_queue_entries(
+            self.config.db_path,
+            issue_type="mapping_review",
+            entries=[
+                {
+                    "provider": "crunchyroll",
+                    "provider_series_id": "series-format",
+                    "severity": "warning",
+                    "payload": {"decision": "review", "reasons": ["ambiguous_candidates"]},
+                },
+            ],
+        )
+
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "list-review-queue",
+            "--format",
+            "summary",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, payload["count"])
+        self.assertEqual({"review": 1}, payload["by_decision"])
+
+    def test_list_review_queue_accepts_format_json_rows(self) -> None:
+        replace_review_queue_entries(
+            self.config.db_path,
+            issue_type="mapping_review",
+            entries=[
+                {
+                    "provider": "crunchyroll",
+                    "provider_series_id": "series-json",
+                    "severity": "error",
+                    "payload": {"decision": "needs_manual_match", "reasons": ["missing_mal_id"]},
+                },
+            ],
+        )
+
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "list-review-queue",
+            "--format",
+            "json",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("series-json", payload[0]["provider_series_id"])
+        self.assertEqual("needs_manual_match", payload[0]["payload"]["decision"])
+
+    def test_recommend_snapshots_accepts_format_json_and_emits_availability_fields(self) -> None:
+        insert_recommendation_snapshot_rows(
+            self.config.db_path,
+            [
+                {
+                    "kind": "provider",
+                    "provider": "crunchyroll",
+                    "title": "Format Show",
+                    "provider_series_id": "fmt-1",
+                    "score": 7.5,
+                    "priority": 10,
+                    "reasons": ["available_now"],
+                    "context": {"available_via_providers": ["crunchyroll"], "dub_signal": "dubbed", "availability_confidence": 0.8},
+                }
+            ],
+            run_id="run-format",
+            generated_at="2026-07-06T02:00:00+00:00",
+        )
+
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "recommend-snapshots",
+            "--format",
+            "json",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("run-format", payload[0]["run_id"])
+        self.assertEqual(["crunchyroll"], payload[0]["providers"])
+        self.assertEqual("dubbed", payload[0]["dub_signal"])
+        self.assertEqual(0.8, payload[0]["availability_confidence"])
+        self.assertEqual("dubbed", payload[0]["context"]["dub_signal"])
+
+    def test_review_queue_refresh_worklist_accepts_format_json_without_selection(self) -> None:
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "review-queue-refresh-worklist",
+            "--format",
+            "json",
+            "--limit",
+            "0",
+        ]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("mapping_review", payload["issue_type_filter"])
+        self.assertEqual([], payload["selected_provider_series_ids"])
+        self.assertEqual({"resolved": 0, "inserted": 0}, payload["refresh"]["review_queue"])

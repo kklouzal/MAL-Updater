@@ -146,6 +146,19 @@ def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state
 
 
 def _derive_task_execution_state(task_state: dict[str, Any], *, now: datetime) -> dict[str, Any] | None:
+    if isinstance(task_state.get("running_started_epoch"), (int, float)):
+        payload: dict[str, Any] = {
+            "execution_state": "running",
+            "execution_state_reason": "subprocess_active",
+        }
+        timeout_seconds = task_state.get("running_timeout_seconds")
+        if isinstance(timeout_seconds, (int, float)):
+            started_epoch = float(task_state["running_started_epoch"])
+            elapsed = max(0, int(now.timestamp() - started_epoch))
+            payload["execution_state_elapsed_seconds"] = elapsed
+            payload["execution_state_remaining_seconds"] = max(0, int(timeout_seconds) - elapsed)
+        return payload
+
     failure_backoff_until = _parse_iso_timestamp(task_state.get("failure_backoff_until"))
     if failure_backoff_until is not None and failure_backoff_until > now:
         remaining = max(0, int((failure_backoff_until - now).total_seconds()))
@@ -226,6 +239,8 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         "projected_request_source",
         "projected_request_history_mode",
         "projected_request_percentile_source",
+        "running_started_at",
+        "running_command",
     ):
         field_value = value.get(field)
         if field_value is not None:
@@ -238,6 +253,11 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         summary["next_due_epoch"] = value["next_due_epoch"]
     if isinstance(value.get("last_duration_seconds"), (int, float)):
         summary["last_duration_seconds"] = float(value["last_duration_seconds"])
+    if isinstance(value.get("running_timeout_seconds"), (int, float)):
+        summary["running_timeout_seconds"] = int(value["running_timeout_seconds"])
+    if isinstance(value.get("running_started_epoch"), (int, float)):
+        duration = max(0.0, datetime.now(timezone.utc).timestamp() - float(value["running_started_epoch"]))
+        summary["running_duration_seconds"] = round(duration, 3)
     if isinstance(value.get("budget_backoff_remaining_seconds"), (int, float)):
         summary["budget_backoff_remaining_seconds"] = int(value["budget_backoff_remaining_seconds"])
     if isinstance(value.get("budget_backoff_floor_seconds"), (int, float)):

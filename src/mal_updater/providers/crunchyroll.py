@@ -27,11 +27,19 @@ class CrunchyrollProvider:
         *,
         profile: str = "default",
         full_refresh: bool = False,
+        max_history_pages: int | None = None,
+        max_watchlist_pages: int | None = None,
+        history_start_page: int = 1,
+        watchlist_start: int = 0,
     ) -> ProviderFetchResult:
         result = fetch_crunchyroll_snapshot(
             config,
             profile=profile,
             use_incremental_boundary=not full_refresh,
+            max_history_pages=max_history_pages,
+            max_watchlist_pages=max_watchlist_pages,
+            history_start_page=history_start_page,
+            watchlist_start=watchlist_start,
         )
         return ProviderFetchResult(
             snapshot=result.snapshot,
@@ -52,6 +60,94 @@ class CrunchyrollProvider:
     def write_snapshot_file(self, path: Path, snapshot: ProviderSnapshot) -> Path:
         return write_crunchyroll_snapshot_file(path, snapshot)
 
+    def search_title(self, config: AppConfig, query: str, *, limit: int = 10):
+        return _search_title(config, query, limit=limit)
+
 
 provider = CrunchyrollProvider()
 register_provider(provider)
+
+def _series_from_crunchyroll_item(item):
+    if not isinstance(item, dict):
+        return None
+    item_type = str(item.get("type") or "").lower()
+    if item_type and item_type not in {"series", "movie_listing"}:
+        return None
+    series_id = item.get("id") or item.get("series_id") or item.get("external_id")
+    title = item.get("title") or item.get("name")
+    if not series_id or not title:
+        return None
+    slug = item.get("slug_title")
+    url = item.get("url") or item.get("link")
+    if not url and slug:
+        url = f"https://www.crunchyroll.com/series/{series_id}/{slug}"
+    return {
+        "provider_series_id": str(series_id),
+        "title": str(title),
+        "season_title": item.get("season_title") or item.get("title"),
+        "url": url,
+        "audio_locales": item.get("audio_locales") if isinstance(item.get("audio_locales"), list) else [],
+        "raw": item,
+    }
+
+
+def _search_title(config, query: str, *, limit: int = 10):
+    """Bounded read-only Crunchyroll title search.
+
+    Uses Crunchyroll's authenticated content discover search endpoint and returns only
+    normalized summary rows for series-like items. This is intentionally a single
+    limited query, not a catalog crawl.
+    """
+    from ..crunchyroll_snapshot import CrunchyrollSnapshotError, _CrunchyrollRequestPacer, _start_auth_session
+
+    normalized_limit = max(1, min(int(limit or 10), 10))
+    q = str(query or "").strip()
+    if not q:
+        return []
+    pacer = _CrunchyrollRequestPacer(
+        spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
+        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_jitter_seconds", 0.0) or 0.0)),
+    )
+    session = _start_auth_session(
+        config,
+        profile="default",
+        timeout_seconds=float(getattr(config.crunchyroll, "request_timeout_seconds", 30.0) or 30.0),
+        pacer=pacer,
+    )
+    endpoint = "https://www.crunchyroll.com/content/v2/discover/search"
+    payload = session.authorized_json_get(
+        endpoint,
+        params={
+            "q": q,
+            "n": normalized_limit,
+            "locale": getattr(config.crunchyroll, "locale", "en-US") or "en-US",
+            "type": "series,movie_listing",
+        },
+        phase="title-search",
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise CrunchyrollSnapshotError("Unexpected Crunchyroll search response shape")
+    results = []
+    seen_ids: set[str] = set()
+    # Crunchyroll returns grouped buckets, not a flat item list. Prefer title-level
+    # buckets and ignore episode hits for reverse MAL-series matching.
+    for bucket_type in ("top_results", "series", "movie_listing"):
+        for bucket in data:
+            if not isinstance(bucket, dict) or bucket.get("type") != bucket_type:
+                continue
+            items = bucket.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                summary = _series_from_crunchyroll_item(item)
+                if summary is None:
+                    continue
+                provider_series_id = summary.get("provider_series_id")
+                if provider_series_id in seen_ids:
+                    continue
+                seen_ids.add(provider_series_id)
+                results.append(summary)
+                if len(results) >= normalized_limit:
+                    return results
+    return results

@@ -45,10 +45,11 @@ resume_backlog = 2
 other = 2
 
 [service]
-sync_every_seconds = 21600
+sync_every_seconds = 3600
 full_refresh_every_seconds = 0  # disabled by default; reserve full refresh for initial bootstrap or explicit recovery
-health_every_seconds = 43200
-mal_refresh_every_seconds = 21600
+health_every_seconds = 3600
+recommendation_metadata_refresh_every_seconds = 3600
+mal_refresh_every_seconds = 3600
 recommendations_webhook_push_every_seconds = 0  # disabled by default; set >0 to let the daemon push changed recommendation digests into OpenClaw using delivery_mode + item-aware dedupe
 loop_sleep_seconds = 30
 crunchyroll_hourly_limit = 180  # legacy Crunchyroll-specific override

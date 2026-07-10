@@ -40,11 +40,12 @@ DEFAULT_MAL_ACCESS_TOKEN_FILE = "mal_access_token.txt"
 DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
 DEFAULT_DB_FILE = "mal_updater.sqlite3"
 DEFAULT_RUNTIME_DIR_NAME = ".MAL-Updater"
-DEFAULT_SERVICE_SYNC_EVERY_SECONDS = 6 * 60 * 60
+DEFAULT_SERVICE_SYNC_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS = 0
-DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 12 * 60 * 60
-DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 6 * 60 * 60
-DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
+DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 60 * 60
+DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 60 * 60
+DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 60 * 60
+DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
@@ -53,6 +54,9 @@ DEFAULT_SERVICE_MAL_HOURLY_LIMIT = 120
 DEFAULT_SERVICE_SOURCE_PROVIDER_WARN_BACKOFF_FLOOR_SECONDS = 0
 DEFAULT_SERVICE_SOURCE_PROVIDER_CRITICAL_BACKOFF_FLOOR_SECONDS = 0
 DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS = 0
+DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_HISTORY_PAGES = 10
+DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_WATCHLIST_PAGES = 2
+DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_SERVICE_WARN_RATIO = 0.8
 DEFAULT_SERVICE_CRITICAL_RATIO = 0.95
 DEFAULT_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW = 5
@@ -73,13 +77,16 @@ DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
     "sync_apply": 8,
     "recommend_metadata_refresh": 3,
     "recommend_metadata_discovery_targets": 5,
+    "recommendation_snapshot": 100,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE = {
     "sync_fetch_crunchyroll": {
+        "hot": 4,
         "incremental": 4,
         "full_refresh": 55,
     },
     "sync_fetch_hidive": {
+        "hot": 4,
         "incremental": 4,
         "full_refresh": 71,
     },
@@ -166,8 +173,10 @@ class ServiceSettings:
     health_every_seconds: int = DEFAULT_SERVICE_HEALTH_EVERY_SECONDS
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
     recommendation_metadata_refresh_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS
+    recommend_maintain_every_seconds: int = DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS
     recommendations_webhook_push_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
+    task_timeout_seconds: int = DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
     source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
@@ -189,6 +198,8 @@ class ServiceSettings:
     task_warn_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_WARN_BACKOFF_FLOORS))
     task_critical_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_CRITICAL_BACKOFF_FLOORS))
     source_provider_auth_failure_backoff_floor_seconds: int = DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS
+    crunchyroll_provider_max_history_pages: int = DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_HISTORY_PAGES
+    crunchyroll_provider_max_watchlist_pages: int = DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_WATCHLIST_PAGES
     provider_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOORS))
     task_auth_failure_backoff_floor_seconds: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SERVICE_TASK_AUTH_FAILURE_BACKOFF_FLOORS))
     warn_ratio: float = DEFAULT_SERVICE_WARN_RATIO
@@ -211,6 +222,8 @@ class ServiceSettings:
             mode_map = self.task_projected_request_counts_by_mode.get(task_name)
             if isinstance(mode_map, dict):
                 value = mode_map.get(fetch_mode)
+                if value is None and fetch_mode == "hot":
+                    value = mode_map.get("incremental")
                 if isinstance(value, int):
                     return max(0, int(value)), f"configured_{fetch_mode}"
         value = self.task_projected_request_counts.get(task_name)
@@ -720,6 +733,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                     ),
                 )
             ),
+            recommend_maintain_every_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS",
+                    _get_int(
+                        service_section,
+                        "recommend_maintain_every_seconds",
+                        DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS,
+                    ),
+                )
+            ),
             recommendations_webhook_push_every_seconds=int(
                 os.getenv(
                     "MAL_UPDATER_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS",
@@ -731,6 +754,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 )
             ),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
+            task_timeout_seconds=max(1, int(os.getenv("MAL_UPDATER_SERVICE_TASK_TIMEOUT_SECONDS", _get_int(service_section, "task_timeout_seconds", DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS)))),
             crunchyroll_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_CRUNCHYROLL_HOURLY_LIMIT", _get_int(service_section, "crunchyroll_hourly_limit", DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT))),
             source_provider_hourly_limit=int(
                 os.getenv(
@@ -771,6 +795,26 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                     if isinstance(key, str) and isinstance(value, (int, float))
                 },
             },
+            crunchyroll_provider_max_history_pages=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_CRUNCHYROLL_PROVIDER_MAX_HISTORY_PAGES",
+                    _get_int(
+                        service_section,
+                        "crunchyroll_provider_max_history_pages",
+                        DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_HISTORY_PAGES,
+                    ),
+                )
+            ),
+            crunchyroll_provider_max_watchlist_pages=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_CRUNCHYROLL_PROVIDER_MAX_WATCHLIST_PAGES",
+                    _get_int(
+                        service_section,
+                        "crunchyroll_provider_max_watchlist_pages",
+                        DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_WATCHLIST_PAGES,
+                    ),
+                )
+            ),
             task_projected_request_counts_by_mode={
                 **{task_name: dict(mode_map) for task_name, mode_map in DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE.items()},
                 **{
