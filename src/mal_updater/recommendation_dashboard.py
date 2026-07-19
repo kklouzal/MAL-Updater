@@ -20,17 +20,21 @@ from .db import (
 from .recommendations import Recommendation
 
 DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT = 120
+STRICT_DISCOVERY_DIAGNOSTIC_COMMAND = "PYTHONPATH=src python3 -m mal_updater.cli recommend --include-dormant --limit 120"
+
+_PROVIDER_LABELS = {"crunchyroll": "Crunchyroll", "hidive": "HIDIVE", "mal": "MyAnimeList", "unknown": "Unknown"}
 
 _SECTION_METADATA: dict[str, dict[str, str]] = {
     "discovery_available_now": {
-        "label": "Discovery candidates",
-        "description": "Fresh discovery candidates with current Crunchyroll or HIDIVE availability and English dub evidence.",
+        "label": "Strict actionable discovery",
+        "description": "Actionable discovery titles require fresh verified Crunchyroll or HIDIVE availability plus explicit English dub evidence.",
         "title_label": "English title",
     },
     "discovery_high_confidence": {
-        "label": "High-confidence discovery",
-        "description": "Fresh MAL/catalog recommendation candidates that do not yet have provider availability evidence.",
+        "label": "Dormant discovery diagnostics",
+        "description": "Diagnostic-only recommendation candidates that do not currently satisfy strict provider+dub proof; do not treat these rows as actionable.",
         "title_label": "English title",
+        "diagnostic_only": "true",
     },
     "discovery_candidate": {
         "label": "Title recommendations / discovery",
@@ -77,6 +81,130 @@ def _compact_list(value: Any, *, limit: int = 6) -> list[Any]:
     return result
 
 
+def _compact_text(value: Any, *, limit: int = 220) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _provider_label(provider: Any) -> str:
+    key = str(provider or "").strip().lower()
+    return _PROVIDER_LABELS.get(key, key.replace("_", " ").title() if key else "Unknown")
+
+
+def _provider_badges(providers: Iterable[Any]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    badges: list[dict[str, str]] = []
+    for provider in providers:
+        key = str(provider or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        badges.append({"provider": key, "label": _provider_label(key)})
+    return badges
+
+
+def _format_scorecard(scorecard: Any) -> str:
+    if not isinstance(scorecard, dict):
+        return ""
+    parts: list[str] = []
+    total = scorecard.get("total")
+    if isinstance(total, int | float) and not isinstance(total, bool):
+        parts.append(f"total {total:g}")
+    components = scorecard.get("components")
+    if isinstance(components, dict):
+        for key in ("consensus", "affinity", "quality", "availability", "dub_watchable", "confidence"):
+            value = components.get(key)
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                parts.append(f"{key.replace('_', ' ')} {value:g}")
+    return "; ".join(parts)
+
+
+def _supporting_seed_details(context: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = context.get("supporting_seed_details") or context.get("top_supporting_seed_titles")
+    if isinstance(raw, list):
+        details: list[dict[str, Any]] = []
+        for item in raw[:5]:
+            if isinstance(item, dict):
+                details.append(
+                    {
+                        "mal_anime_id": item.get("mal_anime_id") or item.get("seed_mal_anime_id"),
+                        "title": item.get("title") or item.get("name") or "MAL seed",
+                        "num_recommendation_votes": item.get("num_recommendation_votes") or item.get("recommendation_votes") or item.get("votes"),
+                        "user_score": item.get("user_score"),
+                        "status": item.get("status") or item.get("mal_watch_status"),
+                    }
+                )
+            elif item is not None:
+                details.append({"title": str(item)})
+        if details:
+            return details
+    titles = _compact_list(context.get("supporting_seed_titles") or context.get("seed_titles"), limit=5)
+    ids = _compact_list(context.get("supporting_seed_ids") or context.get("supporting_seed_mal_anime_ids") or context.get("seed_mal_anime_ids") or context.get("seed_ids"), limit=5)
+    return [{"mal_anime_id": ids[index] if index < len(ids) else None, "title": str(title)} for index, title in enumerate(titles or ids)]
+
+
+def _format_seed_label(seed: dict[str, Any]) -> str:
+    parts = [str(seed.get("title") or seed.get("mal_anime_id") or "MAL seed")]
+    details: list[str] = []
+    votes = seed.get("num_recommendation_votes")
+    if votes is not None:
+        details.append(f"{votes} MAL vote{'s' if votes != 1 else ''}")
+    score = seed.get("user_score")
+    if score is not None:
+        details.append(f"score {score}")
+    status = seed.get("status")
+    if status:
+        details.append(str(status))
+    if details:
+        parts.append("(" + ", ".join(details) + ")")
+    return " ".join(parts)
+
+
+def _availability_evidence_details(context: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = context.get("provider_eligibility_evidence")
+    if not isinstance(raw, list):
+        return []
+    details: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip().lower()
+        details.append(
+            {
+                "provider": provider,
+                "label": _provider_label(provider),
+                "provider_series_id": item.get("provider_series_id"),
+                "provider_title": item.get("provider_title"),
+                "provider_url": item.get("provider_url"),
+                "identity_match_kind": item.get("identity_match_kind"),
+                "match_confidence": item.get("match_confidence"),
+                "review_status": item.get("review_status"),
+                "catalog_status": item.get("catalog_status"),
+                "english_dub_status": item.get("english_dub_status"),
+                "explicit_dub_evidence_source": item.get("explicit_dub_evidence_source"),
+                "fetched_at": item.get("fetched_at"),
+                "last_verified_at": item.get("last_verified_at"),
+                "expires_at": item.get("expires_at"),
+                "fresh": item.get("fresh"),
+                "expired": item.get("expired"),
+            }
+        )
+    return details
+
+
+def _format_evidence_freshness(details: list[dict[str, Any]]) -> str:
+    labels = []
+    for item in details:
+        provider = item.get("label") or _provider_label(item.get("provider"))
+        verified = item.get("last_verified_at") or item.get("fetched_at") or "unknown verification time"
+        expires = item.get("expires_at") or "unknown expiry"
+        state = "expired" if item.get("expired") else "fresh" if item.get("fresh") else "unknown freshness"
+        labels.append(f"{provider}: {state}; verified {verified}; expires {expires}")
+    return "; ".join(labels)
+
+
 def _watch_status_from_context(context: dict[str, Any]) -> str:
     mal_status = context.get("mal_watch_status") or ""
     mal_watched = _number(context.get("mal_num_episodes_watched"))
@@ -94,24 +222,96 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
     providers = row.get("availability_providers") or merged.get("available_via_providers") or merged.get("providers") or []
     if isinstance(providers, str):
         providers = [providers]
+    seed_details = _supporting_seed_details(merged)
     seed_ids = _compact_list(merged.get("supporting_seed_ids") or merged.get("supporting_seed_mal_anime_ids") or merged.get("seed_mal_anime_ids") or merged.get("seed_ids"))
     seed_titles = _compact_list(merged.get("supporting_seed_titles") or merged.get("seed_titles"))
     seed_count = _number(merged.get("supporting_source_count")) or _number(merged.get("source_count")) or len(seed_ids) or len(seed_titles) or 0
     votes = _number(merged.get("aggregated_recommendation_votes")) or _number(merged.get("total_votes")) or _number(merged.get("recommendation_votes")) or 0
-    dub = row.get("dub_signal") or merged.get("english_dub") or merged.get("dub_signal") or ""
-    if isinstance(dub, bool):
-        dub = "yes" if dub else ""
+    provider_series = merged.get("available_provider_series") if isinstance(merged.get("available_provider_series"), list) else []
+    eligibility_details = _availability_evidence_details(merged)
+    match_kinds = _compact_list(merged.get("availability_match_kinds") or [series.get("availability_match_kind") for series in provider_series if isinstance(series, dict)])
+    if not match_kinds and eligibility_details:
+        match_kinds = _compact_list([item.get("identity_match_kind") for item in eligibility_details])
+    match_sources = _compact_list([series.get("mapping_source") for series in provider_series if isinstance(series, dict)])
+    match_confidences = _compact_list([series.get("mapping_confidence") for series in provider_series if isinstance(series, dict)])
+    if not match_confidences and eligibility_details:
+        match_confidences = _compact_list([item.get("match_confidence") for item in eligibility_details])
+    dub_status = _dub_status(row.get("dub_signal") or merged.get("english_dub") or merged.get("dub_signal") or merged.get("english_dub_signal"))
+    review_needed = _review_needed(merged)
+    provider_badges = [
+        {
+            "provider": item.get("provider", ""),
+            "label": str(item.get("label") or _provider_label(item.get("provider"))),
+            "url": str(item.get("provider_url") or ""),
+            "title": str(item.get("provider_title") or ""),
+        }
+        for item in eligibility_details
+        if item.get("provider")
+    ] or _provider_badges(providers)
+    identity_label = ", ".join(str(value) for value in match_kinds)
+    review_labels = _compact_list([item.get("review_status") for item in eligibility_details])
+    catalog_labels = _compact_list([item.get("catalog_status") for item in eligibility_details])
+    english_dub_labels = _compact_list([item.get("english_dub_status") for item in eligibility_details])
+    verification_label = "; ".join(
+        part
+        for part in (
+            f"identity {identity_label}" if identity_label else "",
+            f"review {', '.join(str(value) for value in review_labels)}" if review_labels else "",
+            f"catalog {', '.join(str(value) for value in catalog_labels)}" if catalog_labels else "",
+            f"English dub {', '.join(str(value) for value in english_dub_labels)}" if english_dub_labels else "",
+        )
+        if part
+    )
+    scorecard = row.get("scorecard") or merged.get("scorecard")
     return {
         "mal_recommendation_votes": votes,
         "seed_count": seed_count,
         "seed_ids": seed_ids,
         "seed_titles": seed_titles,
         "compact_seeds": ", ".join(str(x) for x in (seed_titles or seed_ids)),
+        "top_supporting_seeds": seed_details,
+        "supporting_seed_label": "; ".join(_format_seed_label(seed) for seed in seed_details),
         "availability_providers": list(providers) if isinstance(providers, list) else [],
         "availability_provider_label": ", ".join(str(x) for x in providers) if isinstance(providers, list) else "",
-        "dub_signal": str(dub or ""),
+        "provider_badges": provider_badges,
+        "availability_match_kinds": match_kinds,
+        "availability_match_kind_label": ", ".join(str(x) for x in match_kinds),
+        "availability_match_sources": match_sources,
+        "availability_match_source_label": ", ".join(str(x) for x in match_sources),
+        "availability_match_confidences": match_confidences,
+        "availability_match_confidence_label": ", ".join(str(x) for x in match_confidences),
+        "provider_eligibility_evidence": eligibility_details,
+        "verification_label": verification_label,
+        "evidence_freshness_label": _format_evidence_freshness(eligibility_details),
+        "dub_signal": dub_status,
+        "dub_status": dub_status,
+        "english_dub_present": dub_status == "present",
+        "review_needed": review_needed,
+        "review_label": "review needed" if review_needed else "",
         "mal_watch_status": _watch_status_from_context(merged),
+        "why_recommended": _compact_text(merged.get("why_recommended") or "; ".join(str(value) for value in row.get("reasons", []) if value)),
+        "scorecard_summary": _format_scorecard(scorecard),
     }
+
+
+def _dub_status(value: Any) -> str:
+    if isinstance(value, bool):
+        return "present" if value else "none"
+    normalized = str(value or "").strip().lower()
+    if normalized in {"present", "yes", "true", "english dub", "dubbed"}:
+        return "present"
+    if normalized in {"none", "no", "false", "subonly", "sub only"}:
+        return "none"
+    return "unknown"
+
+
+def _review_needed(context: dict[str, Any]) -> bool:
+    for key in ("review_needed", "availability_review_needed", "mapping_review_needed", "needs_review"):
+        if context.get(key) is True:
+            return True
+    if context.get("availability_match_kinds") == ["review_needed"]:
+        return True
+    return False
 
 
 def _truthy_provider(providers: Iterable[str], name: str) -> str:
@@ -133,6 +333,38 @@ def _english_dub_status(item: Recommendation) -> str:
     return "yes" if "english dub" in haystack.lower() or "(dub)" in haystack.lower() else ""
 
 
+def _availability_details(context: dict[str, Any]) -> dict[str, str]:
+    provider_series = context.get("available_provider_series") if isinstance(context.get("available_provider_series"), list) else []
+    match_kinds = _compact_list(context.get("availability_match_kinds") or [series.get("availability_match_kind") for series in provider_series if isinstance(series, dict)])
+    sources = _compact_list([series.get("mapping_source") for series in provider_series if isinstance(series, dict)])
+    confidences = _compact_list([series.get("mapping_confidence") for series in provider_series if isinstance(series, dict)])
+    return {
+        "availability_match_kind": ", ".join(str(value) for value in match_kinds),
+        "availability_match_source": ", ".join(str(value) for value in sources),
+        "availability_confidence": str(context.get("availability_confidence") if context.get("availability_confidence") is not None else ""),
+        "mapping_confidence": ", ".join(str(value) for value in confidences),
+        "review_needed": "yes" if _review_needed(context) else "",
+    }
+
+
+def _provider_evidence_html(badges: list[dict[str, Any]]) -> str:
+    if not badges:
+        return ""
+    parts: list[str] = []
+    for badge in badges:
+        label = escape(str(badge.get("label") or _provider_label(badge.get("provider"))))
+        css_provider = escape(str(badge.get("provider") or "unknown"))
+        url = str(badge.get("url") or "").strip()
+        title = str(badge.get("title") or "").strip()
+        body = f'<span class="provider-badge provider-{css_provider}">{label}</span>'
+        if url:
+            body = f'<a href="{escape(url, quote=True)}" rel="noreferrer noopener">{body}</a>'
+        if title:
+            body += f' <span class="meta">{escape(title)}</span>'
+        parts.append(body)
+    return "<br>".join(parts)
+
+
 def _number(value: Any) -> int | float | None:
     if isinstance(value, bool):
         return None
@@ -151,12 +383,31 @@ def _row(item: Recommendation) -> dict[str, Any]:
     completed = _number(context.get("completed_episode_count"))
     max_episode = _number(context.get("max_episode_number")) or _number(context.get("available_episode_count"))
     provider_progress = f"{completed}/{max_episode}" if completed is not None and max_episode is not None else (str(completed) if completed is not None else "")
+    availability_details = _availability_details(context)
     mal_status = _watch_status_from_context(context)
     english_title = context.get("english_title") if isinstance(context.get("english_title"), str) else ""
     genres = context.get("genres") if isinstance(context.get("genres"), list) else []
     display_title = english_title.strip() or item.season_title or item.title
     if english_title and item.season_title and item.season_title != english_title:
         display_title = f"{english_title} ({item.season_title})"
+    provider_evidence = _availability_evidence_details(context)
+    provider_badges = [
+        {"provider": item.get("provider"), "label": item.get("label"), "url": item.get("provider_url") or "", "title": item.get("provider_title") or ""}
+        for item in provider_evidence
+    ] or _provider_badges(providers)
+    seed_details = _supporting_seed_details(context)
+    identity_label = availability_details.get("availability_match_kind") or ", ".join(str(item.get("identity_match_kind")) for item in provider_evidence if item.get("identity_match_kind"))
+    verification_label = "; ".join(
+        part
+        for part in (
+            identity_label and f"identity {identity_label}",
+            provider_evidence and "review " + ", ".join(str(item.get("review_status")) for item in provider_evidence if item.get("review_status")),
+            provider_evidence and "catalog " + ", ".join(str(item.get("catalog_status")) for item in provider_evidence if item.get("catalog_status")),
+        )
+        if part
+    )
+    scorecard = context.get("scorecard") if isinstance(context.get("scorecard"), dict) else None
+    why_recommended = _compact_text(context.get("why_recommended"))
     return {
         "title": display_title,
         "score": item.priority,
@@ -165,6 +416,16 @@ def _row(item: Recommendation) -> dict[str, Any]:
         "crunchyroll": _truthy_provider(providers, "crunchyroll"),
         "hidive": _truthy_provider(providers, "hidive"),
         "english_dub": _english_dub_status(item),
+        "dub_status": _dub_status(context.get("english_dub_signal") or context.get("english_dub")),
+        "provider_evidence": "; ".join(str(badge.get("label")) for badge in provider_badges),
+        "provider_evidence_html": _provider_evidence_html(provider_badges),
+        "english_dub_evidence": "present" if _dub_status(context.get("english_dub_signal") or context.get("english_dub")) == "present" else _dub_status(context.get("english_dub_signal") or context.get("english_dub")),
+        "verification": verification_label,
+        "evidence_freshness": _format_evidence_freshness(provider_evidence),
+        "why_recommended": why_recommended,
+        "scorecard_summary": _format_scorecard(scorecard),
+        "seed_details": "; ".join(_format_seed_label(seed) for seed in seed_details),
+        **availability_details,
         "mal_mean": mal_mean if mal_mean is not None else "",
         "mal_popularity": mal_popularity if mal_popularity is not None else "",
         "genres": ", ".join(str(value) for value in genres),
@@ -185,12 +446,25 @@ _COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("total_votes", "Total votes", "number"),
     ("crunchyroll", "Crunchyroll", "text"),
     ("hidive", "HIDIVE", "text"),
+    ("provider_evidence", "Provider evidence", "text"),
     ("english_dub", "English dub", "text"),
+    ("english_dub_evidence", "English dub evidence", "text"),
+    ("dub_status", "Dub status", "text"),
+    ("verification", "Identity/review/catalog", "text"),
+    ("evidence_freshness", "Evidence freshness/expiry", "text"),
+    ("availability_match_kind", "Availability match", "text"),
+    ("availability_confidence", "Availability confidence", "text"),
+    ("availability_match_source", "Match source", "text"),
+    ("mapping_confidence", "Mapping confidence", "number"),
+    ("review_needed", "Review", "text"),
     ("mal_mean", "MAL mean", "number"),
     ("mal_popularity", "MAL popularity", "number"),
     ("genres", "Genres", "text"),
     ("provider_progress", "Provider progress", "text"),
     ("mal_watch_status", "MAL watch status", "text"),
+    ("why_recommended", "Why recommended", "text"),
+    ("scorecard_summary", "Scorecard", "text"),
+    ("seed_details", "Top watched seeds", "text"),
 )
 
 
@@ -250,8 +524,15 @@ def _recommendation_table(rows: list[dict[str, Any]], table_id: str, head_cells:
         head_cells = _table_head_cells(title_label=title_label)
     body_rows = []
     for row in rows:
-        cells = "".join(f'<td data-key="{escape(key)}">{escape(str(row[key]))}</td>' for key, _, _ in _COLUMNS)
-        body_rows.append(f'<tr data-kind="{escape(str(row["kind"]))}" data-providers="{escape(str(row["providers"]))}">{cells}</tr>')
+        cell_parts: list[str] = []
+        for key, _, _ in _COLUMNS:
+            value = row.get(key, "")
+            if key == "provider_evidence" and row.get("provider_evidence_html"):
+                cell_parts.append(f'<td data-key="{escape(key)}">{row["provider_evidence_html"]}</td>')
+            else:
+                cell_parts.append(f'<td data-key="{escape(key)}">{escape(str(value))}</td>')
+        cells = "".join(cell_parts)
+        body_rows.append(f'<tr data-kind="{escape(str(row.get("kind", "")))}" data-providers="{escape(str(row.get("providers", "")))}">{cells}</tr>')
     body = "\n".join(body_rows) or f'<tr><td colspan="{len(_COLUMNS)}">No recommendations found.</td></tr>'
     return f"""<table id="{escape(table_id)}" class="recommendations">
     <thead><tr>{head_cells}</tr></thead>
@@ -268,13 +549,47 @@ def _table_head_cells(*, title_label: str = "Title") -> str:
     )
 
 
-def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: str = "MAL-Updater recommendations", limit: int | None = None) -> str:
+def _dashboard_mode_banner(*, diagnostic_mode: bool) -> str:
+    if diagnostic_mode:
+        return (
+            '<section class="banner warn"><strong>Diagnostic mode:</strong> '
+            'Dormant/internal discovery candidates are included for operator inspection only. '
+            'Rows without verified current Crunchyroll/HIDIVE availability plus explicit English-dub evidence are not actionable.</section>'
+        )
+    return (
+        '<section class="banner good"><strong>Strict actionable dashboard:</strong> '
+        'Discovery rows are intended to require fresh verified Crunchyroll/HIDIVE availability and explicit English-dub evidence. '
+        'Use <code>--include-dormant</code> only for diagnostics.</section>'
+    )
+
+
+def _strict_empty_state_html(*, dormant_count: int = 0, pending_review_count: int = 0, stale_count: int = 0) -> str:
+    return (
+        '<section class="empty-state"><h2>No strict actionable discovery titles</h2>'
+        '<p>Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence.</p>'
+        f'<ul><li>Dormant/internal discovery candidates visible in diagnostics: {escape(str(dormant_count))}</li>'
+        f'<li>Provider evidence pending review: {escape(str(pending_review_count))}</li>'
+        f'<li>Stale or expired provider evidence: {escape(str(stale_count))}</li></ul>'
+        f'<p class="meta">Bounded next diagnostic command: <code>{escape(STRICT_DISCOVERY_DIAGNOSTIC_COMMAND)}</code></p></section>'
+    )
+
+
+def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: str = "MAL-Updater recommendations", limit: int | None = None, diagnostic_mode: bool = False) -> str:
     rows = [_row(item) for item in items]
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    strict_count = sum(1 for row in rows if _static_section_key(row) == "discovery_available_now")
+    dormant_count = sum(1 for row in rows if _static_section_key(row) == "discovery_high_confidence")
+    pending_review_count = sum(1 for row in rows if row.get("review_needed") == "yes")
+    stale_count = sum(1 for row in rows if "expired" in str(row.get("evidence_freshness", "")).lower() or "stale" in str(row.get("verification", "")).lower())
+    banner = _dashboard_mode_banner(diagnostic_mode=diagnostic_mode)
     if rows:
         sections = []
+        if strict_count == 0:
+            sections.append(_strict_empty_state_html(dormant_count=dormant_count, pending_review_count=pending_review_count, stale_count=stale_count))
         for index, (meta, section_rows, total_rows) in enumerate(_cap_sections(_static_sections(rows), limit=limit), start=1):
             description = f'<p class="meta">{escape(meta["description"])}</p>' if meta.get("description") else ""
+            if meta.get("diagnostic_only") == "true":
+                description += '<p class="warn"><strong>Diagnostic only:</strong> these dormant rows lack strict actionable provider+dub proof.</p>'
             count_label = _section_count_label(len(section_rows), total_rows)
             sections.append(
                 f'<section><h2>{escape(meta["label"])} ({escape(count_label)})</h2>{description}'
@@ -282,7 +597,7 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
             )
         body = "\n  ".join(sections)
     else:
-        body = _recommendation_table([], "recommendations")
+        body = _strict_empty_state_html() + _recommendation_table([], "recommendations")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -296,12 +611,15 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
     th, td {{ border: 1px solid #2b3642; padding: .45rem .6rem; vertical-align: top; }}
     th {{ cursor: pointer; position: sticky; top: 0; background: #243140; }}
     tbody tr:nth-child(even) {{ background: #121920; }}
-    .meta {{ color: #aebccc; }}
+    .meta {{ color: #aebccc; }} .warn {{ color: #ffd37a; }} .good {{ color: #b9f6ca; }}
+    .banner, .empty-state {{ background: #161d24; border: 1px solid #2b3642; border-radius: .6rem; padding: 1rem; }}
+    .provider-badge {{ display: inline-block; border: 1px solid #4b9fff; border-radius: 999px; padding: .05rem .45rem; font-weight: 700; }}
   </style>
 </head>
 <body>
   <h1>{escape(title)}</h1>
   <p class="meta">Generated {escape(generated_at)} from local recommendation data. Click any column header to sort.</p>
+  {banner}
   {body}
   <script>
   (() => {{
@@ -338,9 +656,9 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
 """
 
 
-def write_recommendation_dashboard(path: Path, items: Iterable[Recommendation], *, title: str = "MAL-Updater recommendations", limit: int | None = None) -> Path:
+def write_recommendation_dashboard(path: Path, items: Iterable[Recommendation], *, title: str = "MAL-Updater recommendations", limit: int | None = None, diagnostic_mode: bool = False) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_recommendation_dashboard(items, title=title, limit=limit), encoding="utf-8")
+    path.write_text(render_recommendation_dashboard(items, title=title, limit=limit, diagnostic_mode=diagnostic_mode), encoding="utf-8")
     return path
 
 
@@ -373,6 +691,28 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
         payload["display_title"] = row.title
     payload["genres"] = genres if isinstance(genres, list) else []
     payload["evidence"] = _snapshot_evidence(payload)
+    payload["provider_badges"] = payload["evidence"].get("provider_badges", [])
+    payload["provider_evidence"] = payload["evidence"].get("availability_provider_label", "")
+    payload["english_dub_evidence"] = "present" if payload["evidence"].get("english_dub_present") else payload["evidence"].get("dub_status", "unknown")
+    payload["verification"] = payload["evidence"].get("verification_label", "")
+    payload["evidence_freshness"] = payload["evidence"].get("evidence_freshness_label", "")
+    payload["why_recommended"] = payload["evidence"].get("why_recommended", "")
+    payload["scorecard_summary"] = payload["evidence"].get("scorecard_summary", "")
+    payload["seed_details"] = payload["evidence"].get("supporting_seed_label", "")
+    payload["availability"] = {
+        "providers": payload["evidence"].get("availability_providers", []),
+        "match_kinds": payload["evidence"].get("availability_match_kinds", []),
+        "match_sources": payload["evidence"].get("availability_match_sources", []),
+        "match_confidences": payload["evidence"].get("availability_match_confidences", []),
+        "confidence": row.availability_confidence,
+        "dub_status": payload["evidence"].get("dub_status", "unknown"),
+        "review_needed": payload["evidence"].get("review_needed", False),
+        "provider_badges": payload["evidence"].get("provider_badges", []),
+        "verification": payload["evidence"].get("verification_label", ""),
+        "freshness": payload["evidence"].get("evidence_freshness_label", ""),
+    }
+    payload["actionable"] = _is_displayable_discovery(payload) if row.kind == "discovery_candidate" else True
+    payload["diagnostic_only"] = row.kind == "discovery_candidate" and not payload["actionable"]
     return payload
 
 
@@ -412,6 +752,28 @@ def _recent_sync_runs(db_path: Path, *, limit: int = 8) -> list[dict[str, Any]]:
     return runs
 
 
+def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN provider IN ('crunchyroll', 'hidive')
+                    AND identity_match_kind IN ('approved_mapping', 'manual_verified', 'user_exact', 'auto_exact')
+                    AND review_status = 'verified'
+                    AND catalog_status = 'present'
+                    AND english_dub_status = 'present'
+                    AND datetime(expires_at) > datetime('now') THEN 1 ELSE 0 END) AS strict_current,
+                SUM(CASE WHEN review_status IN ('unknown', 'review-needed') OR catalog_status IN ('unknown', 'review-needed') OR english_dub_status IN ('unknown', 'review-needed') THEN 1 ELSE 0 END) AS pending_review,
+                SUM(CASE WHEN review_status = 'stale' OR catalog_status = 'stale' OR english_dub_status = 'stale' OR datetime(expires_at) <= datetime('now') THEN 1 ELSE 0 END) AS stale
+            FROM recommendation_provider_eligibility_evidence
+            """
+        ).fetchone()
+    if row is None:
+        return {"total": 0, "strict_current": 0, "pending_review": 0, "stale": 0}
+    return {key: int(row[key] or 0) for key in ("total", "strict_current", "pending_review", "stale")}
+
+
 def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14) -> dict[str, Any]:
     """Return the current dashboard model directly from SQLite state."""
     bootstrap_database(db_path)
@@ -428,6 +790,18 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
         section_totals[section_key] = section_totals.get(section_key, 0) + 1
         if len(sections.setdefault(section_key, [])) < display_limit:
             sections[section_key].append(row)
+    eligibility_counts = _eligibility_coverage_counts(db_path)
+    strict_actionable_count = section_totals.get("discovery_available_now", 0)
+    dormant_count = section_totals.get("discovery_high_confidence", 0)
+    coverage_state = {
+        "strict_actionable_count": strict_actionable_count,
+        "dormant_candidate_count": dormant_count,
+        "evidence_pending_review_count": eligibility_counts["pending_review"],
+        "stale_evidence_count": eligibility_counts["stale"],
+        "strict_current_evidence_count": eligibility_counts["strict_current"],
+        "message": "Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence." if strict_actionable_count == 0 else "Strict actionable discovery is populated from verified current provider+dub evidence.",
+        "next_diagnostic_command": STRICT_DISCOVERY_DIAGNOSTIC_COMMAND,
+    }
     latest_snapshot = _latest_snapshot_summary(db_path)
     latest_run = operational.get("latest_sync_run") or {}
     indicators: list[dict[str, str]] = []
@@ -440,10 +814,15 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
     cov_summary = coverage.get("summary") or {}
     if cov_summary.get("unharvested") or cov_summary.get("stale"):
         indicators.append({"level": "warning", "message": "Recommendation harvest coverage is stale or incomplete."})
+    if strict_actionable_count == 0:
+        indicators.append({"level": "warning", "message": coverage_state["message"]})
+    if dormant_count:
+        indicators.append({"level": "warning", "message": "Dormant discovery diagnostic rows are present; they are not actionable without strict provider+dub proof."})
+    section_metadata = {kind: _section_metadata_for(kind) for kind in (*_STATIC_SECTION_ORDER, *sections.keys())}
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "snapshot": latest_snapshot,
-        "recommendations": {"items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": {kind: _section_metadata_for(kind) for kind in sections}, "limit": max(1, int(limit)), "limit_scope": "per_section"},
+        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "limit": max(1, int(limit)), "limit_scope": "per_section"},
         "coverage": coverage,
         "operational": operational,
         "recent_sync_runs": _recent_sync_runs(db_path),
@@ -455,13 +834,17 @@ def render_dynamic_dashboard_html(*, title: str = "MAL-Updater live dashboard") 
     template = """<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <title>__TITLE__</title><style>
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#101418;color:#eef3f8}a{color:#8cc8ff}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem}.card{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}table{border-collapse:collapse;width:100%;background:#161d24;margin:.75rem 0 1.5rem}th,td{border:1px solid #2b3642;padding:.45rem .6rem;vertical-align:top}th{background:#243140;text-align:left}code{white-space:pre-wrap}
-</style></head><body><h1>__TITLE__</h1><p class=\"muted\">Live local view. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
-const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));
-const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${esc(JSON.stringify(v))}</div>`).join('') || '<span class=\"muted\">none</span>';
-function recTable(rows, meta = {}){ if(!rows?.length) return '<p class="muted">No rows in latest snapshot.</p>'; const progress = r => { const c = r.context || {}; const done = c.completed_episode_count ?? c.max_completed_episode_number; const max = c.max_episode_number ?? c.available_episode_count; return done != null && max != null ? `${done}/${max}` : (done != null ? `${done}` : ''); }; const titleLabel = meta.title_label || 'Title'; return `<table><thead><tr><th>Priority</th><th>${esc(titleLabel)}</th><th>Genres</th><th>Providers</th><th>MAL rec votes</th><th>Seeds</th><th>Dub</th><th>Provider progress</th><th>MAL watch status</th></tr></thead><tbody>${rows.map(r => { const e = r.evidence || {}; return `<tr><td>${esc(r.priority ?? r.score)}</td><td>${esc(r.display_title || r.english_title || r.title)}</td><td>${esc((r.genres || []).join(', '))}</td><td>${esc(e.availability_provider_label || (r.availability_providers || []).join(', '))}</td><td>${esc(e.mal_recommendation_votes ?? '')}</td><td>${esc(e.seed_count ?? '')}${e.compact_seeds ? ` <span class="muted">(${esc(e.compact_seeds)})</span>` : ''}</td><td>${esc(e.dub_signal || '')}</td><td>${esc(progress(r))}</td><td>${esc(e.mal_watch_status || '')}</td></tr>`; }).join('')}</tbody></table>`; }
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#101418;color:#eef3f8}a{color:#8cc8ff}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}table{border-collapse:collapse;width:100%;background:#161d24;margin:.75rem 0 1.5rem}th,td{border:1px solid #2b3642;padding:.45rem .6rem;vertical-align:top}th{background:#243140;text-align:left}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.05rem .45rem;font-weight:700;margin:.05rem .2rem .05rem 0}.diagnostic-row{opacity:.82}.diagnostic-label{color:#ffd37a;font-weight:700}code{white-space:pre-wrap}
+</style></head><body><h1>__TITLE__</h1><p class=\"muted\">Live local strict dashboard. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
+const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
+const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${esc(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
+const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ')); return badges.map(b => { const label = `<span class=\"provider-badge\">${esc(b.label || b.provider)}</span>`; const title = b.title ? ` <span class=\"muted\">${esc(b.title)}</span>` : ''; return `${b.url ? `<a href=\"${esc(b.url)}\" rel=\"noreferrer noopener\">${label}</a>` : label}${title}`; }).join('<br>'); };
+const seedDetails = e => (e?.top_supporting_seeds || []).map(s => { const bits = []; if (s.num_recommendation_votes != null) bits.push(`${s.num_recommendation_votes} MAL vote${s.num_recommendation_votes === 1 ? '' : 's'}`); if (s.user_score != null) bits.push(`score ${s.user_score}`); if (s.status) bits.push(s.status); return `${esc(s.title || s.mal_anime_id || 'MAL seed')}${bits.length ? ` <span class=\"muted\">(${esc(bits.join(', '))})</span>` : ''}`; }).join('<br>') || esc(e?.compact_seeds || '');
+const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary || '');
+function recTable(rows, meta = {}){ if(!rows?.length) return '<p class=\"muted\">No rows in latest snapshot.</p>'; const progress = r => { const c = r.context || {}; const done = c.completed_episode_count ?? c.max_completed_episode_number; const max = c.max_episode_number ?? c.available_episode_count; return done != null && max != null ? `${done}/${max}` : (done != null ? `${done}` : ''); }; const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Diagnostic only:</strong> these dormant rows lack strict provider+dub proof and are not actionable.</p>' : ''; return `${diag}<table><thead><tr><th>Priority</th><th>${esc(titleLabel)}</th><th>Provider proof</th><th>English dub</th><th>Identity/review/catalog</th><th>Freshness/expiry</th><th>Why recommended</th><th>Scorecard</th><th>Top watched seeds</th><th>Genres</th><th>Provider progress</th><th>MAL watch status</th></tr></thead><tbody>${rows.map(r => { const e = r.evidence || {}; const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">diagnostic only</div>' : ''; return `<tr class=\"${diagnostic}\"><td>${esc(r.priority ?? r.score)}</td><td>${diagnosticLabel}${esc(r.display_title || r.english_title || r.title)}</td><td>${providerBadges(r)}</td><td>${esc(r.english_dub_evidence || e.dub_signal || '')}</td><td>${esc(r.verification || e.verification_label || '')}</td><td>${esc(r.evidence_freshness || e.evidence_freshness_label || '')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc((r.genres || []).join(', '))}</td><td>${esc(progress(r))}</td><td>${esc(e.mal_watch_status || '')}</td></tr>`; }).join('')}</tbody></table>`; }
 function syncTable(runs){ if(!runs?.length) return '<p class=\"muted\">No sync runs recorded.</p>'; return `<table><thead><tr><th>ID</th><th>Provider</th><th>Mode</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.provider)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td><td>${esc(r.started_at)}</td><td>${esc(r.completed_at)}</td></tr>`).join('')}</tbody></table>`; }
-async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; document.getElementById('app').innerHTML = `<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Mappings</h2>${count(data.operational?.mappings)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div><section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Latest recommendation snapshot</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class="muted">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
+function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No strict actionable discovery titles</h2><p>${esc(state.message)}</p><ul><li>Dormant/internal candidates: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
+async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Diagnostic snapshot:</strong> dormant/internal rows may be present and are not actionable unless strict provider+dub proof is shown.</section>' : '<section class=\"banner good\"><strong>Strict actionable dashboard:</strong> discovery rows require verified current Crunchyroll/HIDIVE availability plus explicit English-dub evidence.</section>'; document.getElementById('app').innerHTML = `${mode}<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({strict_actionable: state.strict_actionable_count, dormant_diagnostics: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${emptyState(state)}<section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Latest recommendation snapshot</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
 refresh().catch(err => document.getElementById('app').innerHTML = `<p class=\"bad\">${esc(err.message)}</p>`); setInterval(refresh, 60000);
 </script></body></html>"""
     return template.replace("__TITLE__", escape(title))

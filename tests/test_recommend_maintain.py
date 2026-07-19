@@ -44,7 +44,9 @@ class RecommendMaintainTests(unittest.TestCase):
             [
                 "maintain_provider_refresh_crunchyroll",
                 "maintain_safe_mapping_review",
+                "maintain_mal_list_refresh",
                 "maintain_recommend_metadata",
+                "maintain_recommend_provider_eligibility",
                 "maintain_recommend_snapshot",
                 "maintain_health",
             ],
@@ -55,7 +57,9 @@ class RecommendMaintainTests(unittest.TestCase):
         self.assertEqual(provider_args[provider_args.index("--max-history-pages") + 1], "2")
         self.assertEqual(provider_args[provider_args.index("--max-watchlist-pages") + 1], "3")
         self.assertEqual(plan[1]["args"][-3:], ["--limit", "10", "--exact-approved-only"])
-        self.assertIn("--persist-snapshot", plan[3]["args"])
+        self.assertEqual(plan[2]["args"][-2:], ["--max-pages", "3"])
+        self.assertEqual(plan[4]["args"][-4:], ["--limit", "20", "--search-limit", "5"])
+        self.assertIn("--persist-snapshot", plan[5]["args"])
 
     def test_provider_fetch_command_caps_crunchyroll_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,7 +132,9 @@ class RecommendMaintainTests(unittest.TestCase):
             calls,
             [
                 "maintain_safe_mapping_review",
+                "maintain_mal_list_refresh",
                 "maintain_recommend_metadata",
+                "maintain_recommend_provider_eligibility",
                 "maintain_recommend_snapshot",
                 "maintain_health",
             ],

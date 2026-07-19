@@ -7,7 +7,17 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig
-from .db import PersistedSeriesMapping, get_mal_anime_metadata_map, get_mal_anime_relations_map, get_mal_recommendation_edges_map, list_series_mappings
+from .db import (
+    PersistedSeriesMapping,
+    RecommendationProviderEligibilityEvidence,
+    get_mal_anime_metadata_map,
+    get_mal_anime_relations_map,
+    get_mal_recommendation_edges_map,
+    list_mal_user_anime_list_cache,
+    list_recommendation_provider_eligibility_evidence_for_mal_ids,
+    list_series_mappings,
+    merge_mal_user_anime_list_cache_into_metadata,
+)
 from .mapping import normalize_title
 from .sync_planner import ProviderSeriesState, load_provider_series_states
 
@@ -50,6 +60,8 @@ _ROMAN = {
 
 _FRESH_DUBBED_EPISODE_WINDOW_DAYS = 21
 _DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED = 15
+_MAL_LIST_POSITIVE_DISCOVERY_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
+_MAL_LIST_SUPPRESS_DISCOVERY_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 
 _SEASON_ORDER = {
     "winter": 0,
@@ -231,6 +243,7 @@ def _discovery_why_recommended(
     support_count: int,
     votes: int,
     provider_label: str,
+    provider_title: str | None = None,
     mean: float | None,
     start_season_label: str | None,
 ) -> str:
@@ -242,7 +255,10 @@ def _discovery_why_recommended(
     if mean is not None:
         pieces.append(f"MAL {mean:.2f}")
     if provider_label:
-        pieces.append(f"available on {provider_label}")
+        if provider_title:
+            pieces.append(f"watchable dubbed as {provider_title} on {provider_label}")
+        else:
+            pieces.append(f"watchable dubbed on {provider_label}")
     else:
         pieces.append("MAL catalog discovery candidate")
     return "; ".join(pieces) + "."
@@ -391,7 +407,8 @@ def build_recommendations(
     config: AppConfig,
     limit: int | None = 20,
     *,
-    require_provider_availability: bool = False,
+    require_provider_availability: bool = True,
+    include_discovery_candidates_without_actionable_provider_evidence: bool = False,
 ) -> list[Recommendation]:
     states = load_provider_series_states(config, limit=None)
     state_by_id = {(state.provider, state.provider_series_id): state for state in states}
@@ -404,6 +421,7 @@ def build_recommendations(
         (mapping.provider, mapping.provider_series_id): mapping
         for mapping in persisted_mappings
     }
+    merge_mal_user_anime_list_cache_into_metadata(config.db_path)
     metadata_by_id = get_mal_anime_metadata_map(config.db_path)
     relations_by_id = get_mal_anime_relations_map(config.db_path)
     recommendation_edges_by_id = get_mal_recommendation_edges_map(config.db_path)
@@ -421,6 +439,7 @@ def build_recommendations(
     recommendations.extend(_build_new_season_recommendations(states, mapping_by_series=mapping_by_series, metadata_by_id=metadata_by_id))
     recommendations.extend(
         _build_discovery_recommendations(
+            config,
             states,
             mapping_by_series=mapping_by_series,
             mapping_info_by_series=mapping_info_by_series,
@@ -428,6 +447,7 @@ def build_recommendations(
             relations_by_id=relations_by_id,
             recommendation_edges_by_id=recommendation_edges_by_id,
             require_provider_availability=require_provider_availability,
+            include_discovery_candidates_without_actionable_provider_evidence=include_discovery_candidates_without_actionable_provider_evidence,
         )
     )
     recommendations.extend(_build_new_episode_recommendations(states, mapping_by_series=mapping_by_series, metadata_by_id=metadata_by_id))
@@ -548,6 +568,89 @@ def _days_since(last_watched_at: str | None) -> int | None:
         return None
     now = datetime.now(timezone.utc)
     return max((now - watched).days, 0)
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _provider_audio_locales_have_english(locales: list[Any]) -> bool:
+    normalized = {str(value).strip().lower().replace("_", "-") for value in locales if value is not None}
+    return bool(normalized & {"en", "en-us", "en-gb"})
+
+
+def _eligibility_is_actionable(evidence: RecommendationProviderEligibilityEvidence, *, now: str) -> bool:
+    return (
+        evidence.provider in {"crunchyroll", "hidive"}
+        and evidence.identity_match_kind in {"approved_mapping", "manual_verified", "user_exact", "auto_exact"}
+        and evidence.review_status == "verified"
+        and evidence.catalog_status == "present"
+        and evidence.english_dub_status == "present"
+        and evidence.expires_at > now
+        and _provider_audio_locales_have_english(evidence.audio_locales)
+    )
+
+
+def _provider_eligibility_evidence_by_mal_id(
+    config: AppConfig,
+    mal_anime_ids: set[int],
+    *,
+    actionable_only: bool,
+) -> dict[int, list[RecommendationProviderEligibilityEvidence]]:
+    now = _utc_iso_now()
+    evidence_rows = list_recommendation_provider_eligibility_evidence_for_mal_ids(
+        config.db_path,
+        mal_anime_ids,
+        actionable_only=actionable_only,
+        now=now,
+    )
+    result: dict[int, list[RecommendationProviderEligibilityEvidence]] = defaultdict(list)
+    for evidence in evidence_rows:
+        if actionable_only and not _eligibility_is_actionable(evidence, now=now):
+            continue
+        result[int(evidence.mal_anime_id)].append(evidence)
+    return result
+
+
+def _serialize_provider_eligibility_evidence(
+    evidence: RecommendationProviderEligibilityEvidence,
+    *,
+    now: str | None = None,
+) -> dict[str, Any]:
+    current = now or _utc_iso_now()
+    return {
+        "provider": evidence.provider,
+        "provider_series_id": evidence.provider_series_id,
+        "provider_title": evidence.provider_title,
+        "provider_url": evidence.provider_url,
+        "identity_match_kind": evidence.identity_match_kind,
+        "match_confidence": evidence.match_confidence,
+        "review_status": evidence.review_status,
+        "catalog_status": evidence.catalog_status,
+        "english_dub_status": evidence.english_dub_status,
+        "explicit_dub_evidence_source": evidence.explicit_dub_evidence_source,
+        "audio_locales": list(evidence.audio_locales),
+        "source_evidence": dict(evidence.source_evidence),
+        "fetched_at": evidence.fetched_at,
+        "expires_at": evidence.expires_at,
+        "last_verified_at": evidence.last_verified_at,
+        "fresh": evidence.expires_at > current,
+        "expired": evidence.expires_at <= current,
+    }
+
+
+def _select_primary_provider_evidence(evidence_rows: list[RecommendationProviderEligibilityEvidence]) -> RecommendationProviderEligibilityEvidence | None:
+    if not evidence_rows:
+        return None
+    return sorted(
+        evidence_rows,
+        key=lambda evidence: (
+            evidence.provider,
+            -(evidence.match_confidence or 0.0),
+            evidence.provider_title or "",
+            evidence.provider_series_id,
+        ),
+    )[0]
 
 
 def _freshness_boost(last_watched_at: str | None, kind: str) -> int:
@@ -903,6 +1006,42 @@ def _metadata_mal_watch_context(meta: Any) -> dict[str, Any]:
     }
 
 
+def _supporting_seed_details(
+    *,
+    supporting_source_ids: set[int],
+    votes_by_source: dict[int, int],
+    metadata_by_id: dict[int, Any],
+    seed_recent_activity_days: dict[int, int],
+) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for source_id in sorted(supporting_source_ids):
+        meta = metadata_by_id.get(source_id)
+        my_list_status = _metadata_my_list_status(meta)
+        user_score = None
+        status = None
+        watched = None
+        if isinstance(my_list_status, dict):
+            raw_score = my_list_status.get("score")
+            user_score = raw_score if isinstance(raw_score, int) and raw_score > 0 else None
+            raw_status = my_list_status.get("status")
+            status = raw_status if isinstance(raw_status, str) and raw_status else None
+            raw_watched = my_list_status.get("num_episodes_watched")
+            watched = raw_watched if isinstance(raw_watched, int) else None
+        details.append(
+            {
+                "mal_anime_id": source_id,
+                "title": getattr(meta, "title", None) or f"MAL anime {source_id}",
+                "num_recommendation_votes": int(votes_by_source.get(source_id, 0)),
+                "user_score": user_score,
+                "status": status,
+                "num_episodes_watched": watched,
+                "days_since_last_provider_watch": seed_recent_activity_days.get(source_id),
+            }
+        )
+    details.sort(key=lambda item: (-int(item.get("num_recommendation_votes") or 0), str(item.get("title") or ""), int(item["mal_anime_id"])))
+    return details[:5]
+
+
 def _provider_has_unwatched_tail(state: ProviderSeriesState) -> bool:
     total = getattr(state, "available_episode_count", None) or getattr(state, "latest_episode_number", None) or state.max_episode_number
     if total is None or total <= 0:
@@ -1092,10 +1231,14 @@ def _candidate_suppression_evidence(
     target_id: int,
     candidate_title_aliases: set[str],
     metadata_by_id: dict[int, Any],
+    mal_list_status_by_id: dict[int, str] | None = None,
     availability_by_mal_id: dict[int, list[ProviderSeriesState]],
     availability_by_title_alias: dict[str, list[ProviderSeriesState]],
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
+    cached_status = (mal_list_status_by_id or {}).get(target_id)
+    if cached_status in _MAL_LIST_SUPPRESS_DISCOVERY_STATUSES:
+        evidence.append({"kind": "mal_list_cache_status", "mal_anime_id": target_id, "status": cached_status})
     meta = metadata_by_id.get(target_id)
     if meta is not None:
         my_list_status = meta.raw.get("my_list_status") if isinstance(meta.raw, dict) else None
@@ -1180,6 +1323,7 @@ _DISCOVERY_FRANCHISE_RELATION_TYPES = frozenset(
 
 
 def _build_discovery_recommendations(
+    config: AppConfig,
     states: list[ProviderSeriesState],
     *,
     mapping_by_series: dict[tuple[str, str], int],
@@ -1187,8 +1331,11 @@ def _build_discovery_recommendations(
     metadata_by_id: dict[int, Any],
     relations_by_id: dict[int, list[Any]],
     recommendation_edges_by_id: dict[int, list[Any]],
-    require_provider_availability: bool = False,
+    require_provider_availability: bool = True,
+    include_discovery_candidates_without_actionable_provider_evidence: bool = False,
 ) -> list[Recommendation]:
+    if include_discovery_candidates_without_actionable_provider_evidence:
+        require_provider_availability = False
     seed_weights: dict[int, int] = {}
     seed_recent_activity_bonus: dict[int, int] = {}
     seed_recent_activity_days: dict[int, int] = {}
@@ -1202,22 +1349,20 @@ def _build_discovery_recommendations(
     positive_quality_seed_ids: set[int] = set()
     neutral_seed_ids: set[int] = set()
     neutral_seed_scores: dict[int, int] = {}
-    for state in states:
-        mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
-        if mal_anime_id is None:
-            continue
-        days_since_watch = _days_since(state.last_watched_at)
-        if state.watchlist_status == "fully_watched":
-            seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 3)
-        elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or days_since_watch in range(0, 91)):
-            seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 2)
+
+    mal_list_entries = list_mal_user_anime_list_cache(config.db_path)
+    mal_list_status_by_id = {
+        entry.mal_anime_id: (entry.list_status or "").strip().lower()
+        for entry in mal_list_entries
+        if (entry.list_status or "").strip().lower()
+    }
+
+    def _apply_seed_score_calibration(mal_anime_id: int, *, completion_bonus: int = 0) -> None:
         meta = metadata_by_id.get(mal_anime_id)
         score_bonus, seed_score = _discovery_seed_score_bonus(meta)
         score_penalty, seed_penalty_score = _discovery_seed_score_penalty(meta)
         is_neutral_seed, neutral_seed_score = _discovery_seed_score_is_neutral(meta)
-        completion_bonus = _discovery_seed_completion_bonus(state)
         seed_status = _discovery_seed_status_value(meta)
-
         if seed_status == "dropped":
             dropped_seed_ids.add(mal_anime_id)
         if seed_penalty_score is not None and seed_penalty_score <= 4:
@@ -1239,6 +1384,36 @@ def _build_discovery_recommendations(
             current_penalty_score = seed_penalty_scores.get(mal_anime_id)
             if current_penalty_score is None or seed_penalty_score < current_penalty_score:
                 seed_penalty_scores[mal_anime_id] = seed_penalty_score
+
+    cache_seed_meta_ids: set[int] = set()
+    for entry in mal_list_entries:
+        status = (entry.list_status or "").strip().lower()
+        if status not in _MAL_LIST_POSITIVE_DISCOVERY_SEED_STATUSES:
+            continue
+        mal_anime_id = int(entry.mal_anime_id)
+        if mal_anime_id not in metadata_by_id:
+            continue
+        cache_seed_meta_ids.add(mal_anime_id)
+        seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 2 if status == "watching" else 3)
+        _apply_seed_score_calibration(mal_anime_id)
+    for state in states:
+        mal_anime_id = mapping_by_series.get((state.provider, state.provider_series_id))
+        if mal_anime_id is None:
+            continue
+        meta = metadata_by_id.get(mal_anime_id)
+        seed_status = _discovery_seed_status_value(meta)
+        if seed_status in {"plan_to_watch", "dropped"}:
+            continue
+        cached_status = mal_list_status_by_id.get(mal_anime_id)
+        if cached_status in {"plan_to_watch", "dropped"}:
+            continue
+        days_since_watch = _days_since(state.last_watched_at)
+        if state.watchlist_status == "fully_watched":
+            seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 3)
+        elif state.watchlist_status == "in_progress" and (state.completed_episode_count >= 3 or days_since_watch in range(0, 91)):
+            seed_weights[mal_anime_id] = max(seed_weights.get(mal_anime_id, 0), 2)
+        completion_bonus = _discovery_seed_completion_bonus(state)
+        _apply_seed_score_calibration(mal_anime_id, completion_bonus=completion_bonus)
         recency_bonus = _discovery_seed_recency_bonus(days_since_watch)
         if recency_bonus > seed_recent_activity_bonus.get(mal_anime_id, 0):
             seed_recent_activity_bonus[mal_anime_id] = recency_bonus
@@ -1264,12 +1439,14 @@ def _build_discovery_recommendations(
             seed_source_weights[source] = seed_source_weights.get(source, 0) + weight
 
     candidate_scores: dict[int, dict[str, Any]] = {}
-    watched_ids = set(seed_weights)
     harvested_source_ids = set(recommendation_edges_by_id)
     if not require_provider_availability:
         for source_id, edges in recommendation_edges_by_id.items():
+            if mal_list_status_by_id.get(source_id) in {"plan_to_watch", "dropped"}:
+                continue
             if edges and source_id not in seed_weights:
                 seed_weights[source_id] = 1
+    watched_ids = set(seed_weights)
     availability_by_mal_id = _provider_availability_by_mal_id(states, mapping_by_series=mapping_by_series)
     availability_by_title_alias = _provider_availability_by_title_alias(states)
     direct_franchise_relation_targets_by_source: dict[int, set[int]] = {}
@@ -1283,6 +1460,11 @@ def _build_discovery_recommendations(
         direct_franchise_relation_targets_by_source[source_id] = direct_targets
         globally_related_franchise_targets.update(direct_targets)
     for source_id, weight in seed_weights.items():
+        if source_id in cache_seed_meta_ids:
+            seed_recent_activity_bonus.setdefault(source_id, 0)
+            seed_staleness_penalty.setdefault(source_id, 0)
+            seed_quality_bonus.setdefault(source_id, 0)
+            seed_quality_penalty.setdefault(source_id, 0)
         for edge in recommendation_edges_by_id.get(source_id, [])[:_DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED]:
             target_id = edge.target_mal_anime_id
             if target_id in watched_ids or target_id in harvested_source_ids:
@@ -1344,6 +1526,11 @@ def _build_discovery_recommendations(
             staleness_scale, _ = _discovery_seed_staleness_profile(seed_recent_activity_days.get(source_id))
             bucket["raw_score"] += weight * min(votes, 40) * staleness_scale
 
+    actionable_provider_evidence_by_mal_id = _provider_eligibility_evidence_by_mal_id(
+        config,
+        set(candidate_scores),
+        actionable_only=True,
+    )
     items: list[Recommendation] = []
     for target_id, bucket in candidate_scores.items():
         meta = metadata_by_id.get(target_id)
@@ -1358,6 +1545,7 @@ def _build_discovery_recommendations(
             target_id=target_id,
             candidate_title_aliases=candidate_title_aliases,
             metadata_by_id=metadata_by_id,
+            mal_list_status_by_id=mal_list_status_by_id,
             availability_by_mal_id=availability_by_mal_id,
             availability_by_title_alias=availability_by_title_alias,
         )
@@ -1369,24 +1557,56 @@ def _build_discovery_recommendations(
             availability_by_mal_id=availability_by_mal_id,
             availability_by_title_alias=availability_by_title_alias,
         )
-        provider_available_states = [
-            state for state in available_states if state.provider in {"crunchyroll", "hidive"}
-        ]
-        english_dub_states = [state for state in provider_available_states if _is_english_dub_series(state)]
-        if require_provider_availability and (not provider_available_states or not english_dub_states):
+        actionable_provider_evidence = actionable_provider_evidence_by_mal_id.get(target_id, [])
+        if require_provider_availability and not actionable_provider_evidence:
             continue
-        primary_available_state = _select_primary_available_state(english_dub_states or provider_available_states) if provider_available_states else None
-        available_via_providers = sorted({state.provider for state in provider_available_states})
-        availability_match_kinds = sorted({availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias") for state in available_states})
-        if "mapped_mal" in availability_match_kinds:
-            availability_confidence = "mapped"
+        if require_provider_availability:
+            provider_available_states = []
+            english_dub_states = []
+            primary_available_state = None
+            primary_provider_evidence = _select_primary_provider_evidence(actionable_provider_evidence)
+            available_via_providers = sorted({evidence.provider for evidence in actionable_provider_evidence})
+            availability_match_kinds = sorted({evidence.identity_match_kind for evidence in actionable_provider_evidence})
+            availability_confidence = "verified_provider_eligibility"
             availability_confidence_bonus = 6
-        elif available_states:
-            availability_confidence = "title_alias"
-            availability_confidence_bonus = 2
+            evidence_provider_series_ids = {(evidence.provider, evidence.provider_series_id) for evidence in actionable_provider_evidence}
+            available_states = [state for state in available_states if (state.provider, state.provider_series_id) in evidence_provider_series_ids]
         else:
-            availability_confidence = "none"
-            availability_confidence_bonus = 0
+            provider_available_states = [
+                state for state in available_states if state.provider in {"crunchyroll", "hidive"}
+            ]
+            # Discovery eligibility requires normalized provider audio/tag evidence;
+            # title markers such as "(English Dub)" are presentation hints only.
+            english_dub_states = []
+            primary_available_state = _select_primary_available_state(english_dub_states or provider_available_states) if provider_available_states else None
+            primary_provider_evidence = None
+            available_via_providers = sorted({state.provider for state in provider_available_states})
+            availability_match_kinds = sorted({availability_match_kind_by_state.get((state.provider, state.provider_series_id), "title_alias") for state in available_states})
+            if "mapped_mal" in availability_match_kinds:
+                availability_confidence = "mapped"
+                availability_confidence_bonus = 6
+            elif available_states:
+                availability_confidence = "title_alias"
+                availability_confidence_bonus = 2
+            else:
+                availability_confidence = "none"
+                availability_confidence_bonus = 0
+        if primary_provider_evidence is not None:
+            provider_title_for_why = primary_provider_evidence.provider_title
+            provider_url_for_why = primary_provider_evidence.provider_url
+            item_provider = primary_provider_evidence.provider
+            item_provider_series_id = primary_provider_evidence.provider_series_id
+            item_title = primary_provider_evidence.provider_title or (meta.title if meta is not None else str(bucket.get("title") or f"MAL anime {target_id}"))
+            item_season_title = None
+            english_dub_status = "present"
+        else:
+            provider_title_for_why = primary_available_state.title if primary_available_state is not None else None
+            provider_url_for_why = None
+            item_provider = primary_available_state.provider if primary_available_state is not None else "mal"
+            item_provider_series_id = primary_available_state.provider_series_id if primary_available_state is not None else f"mal:{target_id}"
+            item_title = primary_available_state.title if primary_available_state is not None else (meta.title if meta is not None else str(bucket.get("title") or f"MAL anime {target_id}"))
+            item_season_title = primary_available_state.season_title if primary_available_state is not None else None
+            english_dub_status = "present" if english_dub_states else ("unknown" if provider_available_states else "none")
         mean = meta.mean if meta is not None else None
         popularity = meta.popularity if meta is not None else None
         votes_by_source = bucket.get("votes_by_source") or {}
@@ -1654,12 +1874,13 @@ def _build_discovery_recommendations(
         if meta is None:
             reasons.append("full MAL metadata for this discovery candidate is not cached yet")
         if available_via_providers:
-            if availability_confidence == "mapped":
+            if availability_confidence == "verified_provider_eligibility":
+                reasons.append(f"verified dubbed provider eligibility: {_format_provider_label(available_via_providers)}")
+            elif availability_confidence == "mapped":
                 reasons.append(f"available via mapped provider catalog match: {_format_provider_label(available_via_providers)}")
             else:
                 reasons.append(f"available via title-alias provider catalog match: {_format_provider_label(available_via_providers)}")
         reasons.append("suppression guard found no exact MAL-list, mapped-provider, or title-alias provider watch-history evidence for this candidate")
-        title = meta.title if meta is not None else (bucket.get("title") or f"MAL anime {target_id}")
         english_title = getattr(meta, "title_english", None) if meta is not None else None
         if not isinstance(english_title, str) or not english_title.strip():
             english_title = None
@@ -1671,8 +1892,19 @@ def _build_discovery_recommendations(
             support_count=support_count,
             votes=int(bucket["votes"]),
             provider_label=provider_label,
+            provider_title=provider_title_for_why,
             mean=mean,
             start_season_label=start_season_label,
+        )
+        provider_evidence_chain = [
+            _serialize_provider_eligibility_evidence(evidence)
+            for evidence in actionable_provider_evidence
+        ]
+        supporting_seed_details = _supporting_seed_details(
+            supporting_source_ids=set(bucket["supporting_sources"]),
+            votes_by_source={int(k): int(v) for k, v in (bucket.get("votes_by_source") or {}).items() if isinstance(k, int)},
+            metadata_by_id=metadata_by_id,
+            seed_recent_activity_days={int(k): int(v) for k, v in (bucket.get("seed_recent_activity_days") or {}).items() if isinstance(k, int) and isinstance(v, int)},
         )
 
         scorecard_features = {
@@ -1690,7 +1922,9 @@ def _build_discovery_recommendations(
             "provider_availability_tags": {
                 provider: (provider in available_via_providers) for provider in ("crunchyroll", "hidive")
             },
-            "english_dub_signal": "present" if english_dub_states else ("unknown" if provider_available_states else "none"),
+            "english_dub_signal": english_dub_status,
+            "provider_eligibility_evidence": provider_evidence_chain,
+            "top_supporting_seed_titles": supporting_seed_details,
             "metadata_cached": meta is not None,
         }
         consensus_score = min(100.0, 35.0 + (effective_supporting_seed_count * 18.0) + min(float(bucket["votes"]), 60.0) * 0.45)
@@ -1702,10 +1936,10 @@ def _build_discovery_recommendations(
             seed_quality_score = max(seed_quality_score, min(100.0, best_supporting_seed_score * 10.0))
         source_rating_score = 50.0 if mean is None else max(0.0, min(100.0, mean * 10.0))
         quality_score = max(0.0, min(100.0, 55.0 + metadata_quality_bonus * 3.0 + catalog_quality_bonus * 3.0 - catalog_quality_penalty * 3.0 + freshness_bonus * 2.0 - freshness_penalty * 2.0))
-        availability_score = 100.0 if availability_confidence == "mapped" else (78.0 if available_states else 25.0)
+        availability_score = 100.0 if availability_confidence in {"mapped", "verified_provider_eligibility"} else (78.0 if available_states else 25.0)
         dub_signal = scorecard_features["english_dub_signal"]
         dub_watchable_score = 100.0 if dub_signal == "present" else (55.0 if available_states else 35.0)
-        confidence_score = max(0.0, min(100.0, 35.0 + (support_count * 12.0) + (20.0 if meta is not None else 0.0) + (20.0 if available_states else 0.0) + (8.0 if availability_confidence == "mapped" else 0.0)))
+        confidence_score = max(0.0, min(100.0, 35.0 + (support_count * 12.0) + (20.0 if meta is not None else 0.0) + (20.0 if (available_states or actionable_provider_evidence) else 0.0) + (8.0 if availability_confidence in {"mapped", "verified_provider_eligibility"} else 0.0)))
         scorecard_reasons = [
             f"consensus from {support_count} seed title(s) and {int(bucket['votes'])} MAL recommendation vote(s)",
             f"availability: {_format_provider_label(available_via_providers) if available_via_providers else 'no mapped/alias provider availability found'}",
@@ -1741,10 +1975,10 @@ def _build_discovery_recommendations(
             Recommendation(
                 kind="discovery_candidate",
                 priority=priority,
-                provider=primary_available_state.provider if primary_available_state is not None else "mal",
-                provider_series_id=primary_available_state.provider_series_id if primary_available_state is not None else f"mal:{target_id}",
-                title=primary_available_state.title if primary_available_state is not None else title,
-                season_title=primary_available_state.season_title if primary_available_state is not None else None,
+                provider=item_provider,
+                provider_series_id=item_provider_series_id,
+                title=item_title,
+                season_title=item_season_title,
                 reasons=reasons,
                 context={
                     "mal_anime_id": target_id,
@@ -1753,7 +1987,7 @@ def _build_discovery_recommendations(
                     "why_recommended": why_recommended,
                     "english_title": english_title,
                     "genres": genre_names,
-                    "availability_visible": bool(available_states),
+                    "availability_visible": bool(available_states or actionable_provider_evidence),
                     "available_via_providers": available_via_providers,
                     "availability_confidence": availability_confidence,
                     "availability_confidence_bonus": availability_confidence_bonus,
@@ -1781,12 +2015,33 @@ def _build_discovery_recommendations(
                             ),
                         }
                         for state in available_states
+                    ] or [
+                        {
+                            "provider": evidence["provider"],
+                            "provider_series_id": evidence["provider_series_id"],
+                            "title": evidence.get("provider_title"),
+                            "provider_url": evidence.get("provider_url"),
+                            "availability_match_kind": evidence.get("identity_match_kind"),
+                            "identity_match_kind": evidence.get("identity_match_kind"),
+                            "mapping_confidence": evidence.get("match_confidence"),
+                            "review_status": evidence.get("review_status"),
+                            "catalog_status": evidence.get("catalog_status"),
+                            "english_dub_status": evidence.get("english_dub_status"),
+                            "audio_locales": evidence.get("audio_locales"),
+                            "explicit_dub_evidence_source": evidence.get("explicit_dub_evidence_source"),
+                            "fetched_at": evidence.get("fetched_at"),
+                            "expires_at": evidence.get("expires_at"),
+                            "fresh": evidence.get("fresh"),
+                        }
+                        for evidence in provider_evidence_chain
                     ],
+                    "provider_eligibility_evidence": provider_evidence_chain,
                     "supporting_source_count": support_count,
                     "base_effective_supporting_seed_count": base_effective_supporting_seed_count,
                     "stale_consensus_discount": stale_consensus_discount,
                     "effective_supporting_seed_count": effective_supporting_seed_count,
                     "supporting_mal_anime_ids": sorted(bucket["supporting_sources"]),
+                    "supporting_seed_details": supporting_seed_details,
                     "aggregated_recommendation_votes": bucket["votes"],
                     "best_single_source_votes": best_single_source_votes,
                     "cross_seed_support_votes": cross_seed_support_votes,

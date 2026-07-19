@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+
+try:
+    from curl_cffi import requests as curl_requests
+except ModuleNotFoundError:  # pragma: no cover - dependency health is checked elsewhere
+    curl_requests = None
 
 from ..config import AppConfig
 from ..contracts import ProviderSnapshot
@@ -80,6 +85,33 @@ def _localized_title(hit: dict) -> str | None:
     return str(title) if title else None
 
 
+def _normalize_hidive_audio_tag_language(language: str) -> str | None:
+    normalized = " ".join(language.strip().replace("_", "-").split()).lower()
+    if normalized in {"english", "en", "en-us", "en-gb"}:
+        return "en-US"
+    if normalized in {"japanese", "ja", "ja-jp"}:
+        return "ja-JP"
+    return None
+
+
+def _audio_locales_from_hidive_tags(tags: Any) -> list[str]:
+    if not isinstance(tags, list):
+        return []
+    locales: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        prefix, sep, language = tag.partition("|")
+        if not sep or prefix.strip().casefold() != "audio":
+            continue
+        locale = _normalize_hidive_audio_tag_language(language)
+        if locale and locale not in seen:
+            seen.add(locale)
+            locales.append(locale)
+    return locales
+
+
 def _series_from_algolia_hit(hit: dict) -> ProviderSearchResult | None:
     if not isinstance(hit, dict) or hit.get("type") != "VOD_SERIES":
         return None
@@ -96,7 +128,7 @@ def _series_from_algolia_hit(hit: dict) -> ProviderSearchResult | None:
         title=title,
         season_title=title,
         url=str(url) if url else None,
-        audio_locales=[],
+        audio_locales=_audio_locales_from_hidive_tags(hit.get("tags")),
         raw=hit,
     )
 
@@ -130,13 +162,14 @@ def _search_title(config, query: str, *, limit: int = 10):
     q = str(query or "").strip()
     if not q:
         return []
+    if curl_requests is None:
+        raise RuntimeError("HIDIVE title search requires curl_cffi browser-TLS transport; install project dependencies with `python3 -m pip install -e .`.")
     timeout = float(getattr(config, "request_timeout_seconds", 30.0) or 30.0)
     params = urlencode({"query": q, "hitsPerPage": normalized_limit, "filters": HIDIVE_ALGOLIA_SERIES_FILTER})
-    body = json.dumps({"params": params}).encode("utf-8")
-    request = Request(
+    body = {"params": params}
+    response = curl_requests.post(
         HIDIVE_ALGOLIA_ENDPOINT,
-        data=body,
-        method="POST",
+        data=json.dumps(body),
         headers={
             "x-algolia-application-id": HIDIVE_ALGOLIA_APP_ID,
             "x-algolia-api-key": HIDIVE_ALGOLIA_API_KEY,
@@ -144,7 +177,9 @@ def _search_title(config, query: str, *, limit: int = 10):
             "accept": "application/json",
             "user-agent": "MAL-Updater/1.0 HIDIVE title search",
         },
+        timeout=(timeout, timeout),
+        impersonate="chrome124",
     )
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    response.raise_for_status()
+    payload = response.json()
     return _normalize_algolia_hits(payload, limit=normalized_limit)

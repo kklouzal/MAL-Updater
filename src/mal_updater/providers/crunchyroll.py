@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from ..config import AppConfig
 from ..contracts import ProviderSnapshot
@@ -67,6 +68,42 @@ class CrunchyrollProvider:
 provider = CrunchyrollProvider()
 register_provider(provider)
 
+
+def _normalize_audio_locales(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_locale in value:
+        if not isinstance(raw_locale, str):
+            continue
+        locale = raw_locale.strip().replace("_", "-")
+        if not locale:
+            continue
+        parts = [part for part in locale.split("-") if part]
+        if not parts:
+            continue
+        language = parts[0].lower()
+        if len(parts) == 1:
+            canonical = language
+        else:
+            canonical = "-".join([language, *[part.upper() if len(part) == 2 else part for part in parts[1:]]])
+        if canonical not in seen:
+            seen.add(canonical)
+            normalized.append(canonical)
+    return normalized
+
+
+def _audio_locales_from_crunchyroll_item(item: dict[str, Any]) -> list[str]:
+    top_level = _normalize_audio_locales(item.get("audio_locales"))
+    if top_level:
+        return top_level
+    series_metadata = item.get("series_metadata")
+    if isinstance(series_metadata, dict):
+        return _normalize_audio_locales(series_metadata.get("audio_locales"))
+    return []
+
+
 def _series_from_crunchyroll_item(item):
     if not isinstance(item, dict):
         return None
@@ -86,7 +123,7 @@ def _series_from_crunchyroll_item(item):
         "title": str(title),
         "season_title": item.get("season_title") or item.get("title"),
         "url": url,
-        "audio_locales": item.get("audio_locales") if isinstance(item.get("audio_locales"), list) else [],
+        "audio_locales": _audio_locales_from_crunchyroll_item(item),
         "raw": item,
     }
 

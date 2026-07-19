@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from socket import timeout as SocketTimeout
 from typing import Any, Callable, TypeVar
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .config import AppConfig, MalSecrets
@@ -40,6 +40,32 @@ class MalApiError(RuntimeError):
 
 _T = TypeVar("_T")
 _TIMEOUT_RETRY_ATTEMPTS = 2
+
+_MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
+
+
+def _same_mal_api_origin(url: str, base_url: str) -> bool:
+    parsed = urlparse(url)
+    base = urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    return parsed.scheme == base.scheme and parsed.netloc == base.netloc
+
+
+def _path_query_from_mal_api_url(url: str, base_url: str) -> str:
+    if not _same_mal_api_origin(url, base_url):
+        raise MalApiError("MAL API pagination next URL points outside configured HTTPS MAL API origin")
+    parsed = urlparse(url)
+    base = urlparse(base_url)
+    base_path = base.path.rstrip("/")
+    expected_path = f"{base_path}/users/@me/animelist" if base_path else "/users/@me/animelist"
+    if parsed.path != expected_path:
+        raise MalApiError("MAL API pagination next URL path is outside /users/@me/animelist")
+    relative_path = parsed.path[len(base_path):] if base_path else parsed.path
+    return f"{relative_path}?{parsed.query}" if parsed.query else relative_path
+
 _ANIME_SEARCH_NOISE_PATTERNS = (
     # Provider catalogs commonly append language/audio availability markers that
     # MAL rejects as noisy/invalid search text. Keep this suffix-oriented and
@@ -206,6 +232,57 @@ class MalClient:
             headers=self._build_auth_headers(require_user=False),
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
+
+
+    def iter_my_anime_list_pages(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+        fields: str = "list_status,num_episodes,media_type,status",
+        max_pages: int | None = None,
+    ):
+        if max_pages is None:
+            raise ValueError("max_pages is required for MAL anime-list pagination")
+        normalized_max_pages = int(max_pages)
+        if normalized_max_pages <= 0:
+            raise ValueError("max_pages must be positive")
+        normalized_limit = min(max(int(limit), 1), 100)
+        normalized_status = None
+        if status is not None:
+            normalized_status = str(status).strip().lower()
+            if normalized_status == "all":
+                normalized_status = None
+            elif normalized_status not in _MAL_LIST_STATUSES:
+                raise MalApiError(f"Unsupported MAL anime list status: {status}")
+        query = {"limit": normalized_limit, "fields": fields}
+        if normalized_status:
+            query["status"] = normalized_status
+        next_path = f"/users/@me/animelist?{urlencode(query)}"
+        pages = 0
+        while next_path and pages < normalized_max_pages:
+            pages += 1
+            payload = self._get_json(
+                next_path,
+                headers=self._build_auth_headers(require_user=True),
+                error_context="MAL API GET /users/@me/animelist failed",
+            )
+            yield payload
+            paging = payload.get("paging") if isinstance(payload, dict) else None
+            next_url = paging.get("next") if isinstance(paging, dict) else None
+            if isinstance(next_url, str) and next_url.strip():
+                next_path = _path_query_from_mal_api_url(next_url.strip(), self.config.mal.base_url)
+            else:
+                next_path = None
+
+    def get_my_anime_list_page(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+        fields: str = "list_status,num_episodes,media_type,status",
+    ) -> dict[str, Any]:
+        return next(self.iter_my_anime_list_pages(status=status, limit=limit, fields=fields, max_pages=1))
 
     def update_my_list_status(
         self,

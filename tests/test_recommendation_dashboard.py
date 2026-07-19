@@ -10,8 +10,8 @@ import json
 import io
 from unittest.mock import patch
 
-from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows
-from mal_updater.cli import build_parser
+from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows, upsert_recommendation_provider_eligibility_evidence
+from mal_updater.cli import build_parser, _cmd_recommend_snapshots
 from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_recommendation_dashboard, write_recommendation_dashboard
 from mal_updater.recommendations import Recommendation
 
@@ -85,7 +85,8 @@ class RecommendationDashboardTests(unittest.TestCase):
         html = render_recommendation_dashboard([item])
         self.assertIn("Dungeon People", html)
         self.assertIn("HIDIVE", html)
-        self.assertIn("Discovery candidates", html)
+        self.assertIn("Dormant discovery diagnostics", html)
+        self.assertIn("Diagnostic only", html)
 
     def test_static_dashboard_groups_discovery_and_backlog_sections(self) -> None:
         html = render_recommendation_dashboard(
@@ -122,12 +123,12 @@ class RecommendationDashboardTests(unittest.TestCase):
             ]
         )
 
-        self.assertIn("Discovery candidates", html)
-        self.assertIn("High-confidence discovery", html)
+        self.assertIn("Strict actionable discovery", html)
+        self.assertIn("Dormant discovery diagnostics", html)
         self.assertIn("Resume backlog", html)
         self.assertIn("MAL Only Candidate", html)
-        self.assertLess(html.index("Discovery candidates"), html.index("Available Candidate"))
-        self.assertLess(html.index("High-confidence discovery"), html.index("MAL Only Candidate"))
+        self.assertLess(html.index("Strict actionable discovery"), html.index("Available Candidate"))
+        self.assertLess(html.index("Dormant discovery diagnostics"), html.index("MAL Only Candidate"))
         self.assertLess(html.index("Resume backlog"), html.index("Resume Me"))
         self.assertGreaterEqual(html.count('class="recommendations"'), 3)
 
@@ -145,11 +146,11 @@ class RecommendationDashboardTests(unittest.TestCase):
 
         html = render_recommendation_dashboard(rows, limit=2)
 
-        self.assertIn("High-confidence discovery (2 of 5)", html)
+        self.assertIn("Dormant discovery diagnostics (2 of 5)", html)
         self.assertIn("Discovery 0", html)
         self.assertIn("Discovery 1", html)
         self.assertNotIn("Discovery 4", html)
-        self.assertIn("Discovery candidates (1)", html)
+        self.assertIn("Strict actionable discovery (1)", html)
         self.assertIn("Available Now", html)
         self.assertIn("Resume backlog (1)", html)
         self.assertIn("Resume Still Visible", html)
@@ -164,7 +165,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertIn("No recommendations found.", html)
             self.assertIn("Click any column header to sort", html)
 
-    def test_recommend_dashboard_cli_defaults_to_dashboard_limit_and_legacy_flag_help_is_noop(self) -> None:
+    def test_recommend_dashboard_cli_defaults_to_dashboard_limit_and_include_dormant_is_diagnostic(self) -> None:
         parser = build_parser()
 
         args = parser.parse_args(["recommend-dashboard", "--output", "recommendations.html"])
@@ -173,8 +174,10 @@ class RecommendationDashboardTests(unittest.TestCase):
         with patch("sys.stdout", new_callable=io.StringIO) as stdout, self.assertRaises(SystemExit):
             parser.parse_args(["recommend-dashboard", "--help"])
         help_text = stdout.getvalue()
-        self.assertNotIn("hidden by default", help_text)
-        self.assertIn("Backward-compatible no-op", help_text)
+        normalized_help = " ".join(help_text.split())
+        self.assertIn("Operator diagnostic", help_text)
+        self.assertIn("without actionable verified provider+dub eligibility", normalized_help)
+        self.assertNotIn("Backward-compatible no-op", help_text)
 
     def test_live_dashboard_payload_reads_current_database_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -224,7 +227,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["english_title"], "Fresh English Show")
             self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["genres"], ["Drama", "Sci-Fi"])
             self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["reasons"], [])
-            self.assertEqual(payload["recommendations"]["section_metadata"]["discovery_available_now"]["label"], "Discovery candidates")
+            self.assertEqual(payload["recommendations"]["section_metadata"]["discovery_available_now"]["label"], "Strict actionable discovery")
             self.assertEqual(payload["recommendations"]["section_metadata"]["discovery_available_now"]["title_label"], "English title")
             self.assertIn("English dub evidence", payload["recommendations"]["section_metadata"]["discovery_available_now"]["description"])
             self.assertEqual(payload["recommendations"]["section_metadata"]["resume_backlog"]["label"], "Resume backlog")
@@ -238,6 +241,194 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(payload["operational"]["provider_counts_by_provider"]["crunchyroll"]["series"], 1)
             self.assertEqual(payload["operational"]["mappings"]["approved"], 1)
             self.assertEqual(payload["recent_sync_runs"][0]["status"], "completed")
+
+    def test_static_dashboard_strict_discovery_row_shows_actionable_evidence(self) -> None:
+        item = Recommendation(
+            kind="discovery_candidate",
+            priority=98,
+            provider_series_id="cr-actionable",
+            title="Actionable Candidate",
+            season_title="Actionable Candidate",
+            provider="crunchyroll",
+            reasons=["fallback reason should stay concise"],
+            context={
+                "available_via_providers": ["crunchyroll"],
+                "english_dub_signal": "present",
+                "why_recommended": "Recommended because two completed favorites strongly support it.",
+                "scorecard": {"total": 88.5, "components": {"consensus": 90, "affinity": 70, "availability": 100, "dub_watchable": 100}},
+                "supporting_seed_details": [
+                    {"mal_anime_id": 100, "title": "Seed Favorite", "num_recommendation_votes": 17, "user_score": 9, "status": "completed"}
+                ],
+                "provider_eligibility_evidence": [
+                    {
+                        "provider": "crunchyroll",
+                        "provider_title": "Actionable Candidate",
+                        "provider_url": "https://www.crunchyroll.com/series/actionable",
+                        "identity_match_kind": "approved_mapping",
+                        "review_status": "verified",
+                        "catalog_status": "present",
+                        "english_dub_status": "present",
+                        "explicit_dub_evidence_source": "provider_audio_locale",
+                        "fetched_at": "2026-07-18T00:00:00Z",
+                        "last_verified_at": "2026-07-18T00:00:00Z",
+                        "expires_at": "2027-01-01T00:00:00Z",
+                        "fresh": True,
+                        "source_evidence": {"large": "raw-json-should-not-render"},
+                    }
+                ],
+            },
+        )
+
+        html = render_recommendation_dashboard([item])
+
+        self.assertIn("Strict actionable discovery", html)
+        self.assertIn("https://www.crunchyroll.com/series/actionable", html)
+        self.assertIn("English dub evidence", html)
+        self.assertIn("identity approved_mapping", html)
+        self.assertIn("review verified", html)
+        self.assertIn("catalog present", html)
+        self.assertIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", html)
+        self.assertIn("Recommended because two completed favorites strongly support it.", html)
+        self.assertIn("total 88.5", html)
+        self.assertIn("Seed Favorite (17 MAL votes, score 9, completed)", html)
+        self.assertNotIn("raw-json-should-not-render", html)
+
+    def test_live_dashboard_payload_exposes_multi_provider_url_seed_and_scorecard_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "crunchyroll",
+                        "title": "Multi Provider Actionable",
+                        "provider_series_id": "cr-multi",
+                        "priority": 99,
+                        "available_via_providers": ["crunchyroll", "hidive"],
+                        "context": {
+                            "mal_anime_id": 777,
+                            "english_dub_signal": "present",
+                            "why_recommended": "Both top watched seeds point at this title.",
+                            "scorecard": {"total": 91.25, "components": {"consensus": 95, "affinity": 80, "availability": 100, "dub_watchable": 100}},
+                            "supporting_seed_details": [
+                                {"mal_anime_id": 1, "title": "Seed One", "num_recommendation_votes": 13, "user_score": 10, "status": "completed"},
+                                {"mal_anime_id": 2, "title": "Seed Two", "num_recommendation_votes": 8, "user_score": 8, "status": "watching"},
+                            ],
+                            "provider_eligibility_evidence": [
+                                {
+                                    "provider": "crunchyroll",
+                                    "provider_title": "Multi Provider Actionable",
+                                    "provider_url": "https://www.crunchyroll.com/series/multi",
+                                    "identity_match_kind": "approved_mapping",
+                                    "match_confidence": 1.0,
+                                    "review_status": "verified",
+                                    "catalog_status": "present",
+                                    "english_dub_status": "present",
+                                    "fetched_at": "2026-07-18T00:00:00Z",
+                                    "last_verified_at": "2026-07-18T00:00:00Z",
+                                    "expires_at": "2027-01-01T00:00:00Z",
+                                    "fresh": True,
+                                },
+                                {
+                                    "provider": "hidive",
+                                    "provider_title": "Multi Provider Actionable",
+                                    "provider_url": "https://www.hidive.com/season/multi",
+                                    "identity_match_kind": "manual_verified",
+                                    "match_confidence": 0.98,
+                                    "review_status": "verified",
+                                    "catalog_status": "present",
+                                    "english_dub_status": "present",
+                                    "fetched_at": "2026-07-18T00:00:00Z",
+                                    "last_verified_at": "2026-07-18T00:00:00Z",
+                                    "expires_at": "2027-01-01T00:00:00Z",
+                                    "fresh": True,
+                                },
+                            ],
+                        },
+                    }
+                ],
+                run_id="run-actionable",
+                generated_at="2026-07-18T01:00:00Z",
+            )
+
+            payload = build_dashboard_payload(db_path)
+
+            row = payload["recommendations"]["sections"]["discovery_available_now"][0]
+            self.assertTrue(row["actionable"])
+            self.assertFalse(row["diagnostic_only"])
+            self.assertEqual(payload["recommendations"]["mode"], "strict_actionable")
+            self.assertEqual(["crunchyroll", "hidive"], row["availability"]["providers"])
+            self.assertEqual("https://www.crunchyroll.com/series/multi", row["provider_badges"][0]["url"])
+            self.assertEqual("https://www.hidive.com/season/multi", row["provider_badges"][1]["url"])
+            self.assertIn("identity approved_mapping, manual_verified", row["verification"])
+            self.assertIn("review verified", row["verification"])
+            self.assertIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", row["evidence_freshness"])
+            self.assertEqual("present", row["english_dub_evidence"])
+            self.assertIn("Both top watched seeds", row["why_recommended"])
+            self.assertIn("total 91.25", row["scorecard_summary"])
+            self.assertEqual("Seed One", row["evidence"]["top_supporting_seeds"][0]["title"])
+            self.assertIn("13 MAL votes", row["seed_details"])
+
+    def test_live_dashboard_empty_coverage_state_counts_diagnostics_without_claiming_actionable_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=500,
+                provider="crunchyroll",
+                provider_series_id="cr-review",
+                provider_title="Review Needed",
+                fetched_at="2026-07-18T00:00:00Z",
+                expires_at="2027-01-01T00:00:00Z",
+                review_status="review-needed",
+                catalog_status="unknown",
+                english_dub_status="unknown",
+            )
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=501,
+                provider="hidive",
+                provider_series_id="hi-stale",
+                provider_title="Stale Evidence",
+                fetched_at="2025-01-01T00:00:00Z",
+                expires_at="2000-01-01T00:00:00Z",
+                review_status="stale",
+                catalog_status="stale",
+                english_dub_status="stale",
+            )
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "mal",
+                        "title": "Dormant Only",
+                        "provider_series_id": "mal:500",
+                        "priority": 88,
+                        "context": {"mal_anime_id": 500, "english_dub_signal": "unknown"},
+                    }
+                ],
+                run_id="run-empty-strict",
+                generated_at="2026-07-18T02:00:00Z",
+            )
+
+            payload = build_dashboard_payload(db_path)
+            html = render_dynamic_dashboard_html()
+
+            state = payload["recommendations"]["coverage_state"]
+            self.assertEqual(0, state["strict_actionable_count"])
+            self.assertEqual(1, state["dormant_candidate_count"])
+            self.assertEqual(1, state["evidence_pending_review_count"])
+            self.assertEqual(1, state["stale_evidence_count"])
+            self.assertIn("Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence", state["message"])
+            self.assertIn("recommend --include-dormant --limit 120", state["next_diagnostic_command"])
+            self.assertEqual("diagnostic_snapshot", payload["recommendations"]["mode"])
+            self.assertTrue(payload["recommendations"]["sections"]["discovery_high_confidence"][0]["diagnostic_only"])
+            self.assertIn("Diagnostic snapshot", html)
+            self.assertIn("No strict actionable discovery titles", html)
 
     def test_live_dashboard_splits_mal_only_discovery_into_high_confidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -330,6 +521,157 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["title"], "Available Now")
             self.assertEqual(payload["recommendations"]["sections"]["resume_backlog"][0]["title"], "Resume Still Visible")
 
+    def test_dashboard_surfaces_availability_match_dub_and_review_columns(self) -> None:
+        item = Recommendation(
+            kind="discovery_candidate",
+            priority=91,
+            provider_series_id="cr-review",
+            title="Review Candidate",
+            season_title="Review Candidate",
+            provider="crunchyroll",
+            reasons=["available but needs mapping review"],
+            context={
+                "available_via_providers": ["crunchyroll"],
+                "availability_confidence": "title_alias",
+                "availability_match_kinds": ["title_alias"],
+                "available_provider_series": [
+                    {
+                        "provider": "crunchyroll",
+                        "provider_series_id": "cr-review",
+                        "availability_match_kind": "title_alias",
+                        "mapping_confidence": 0.62,
+                        "mapping_source": "provider_search",
+                    }
+                ],
+                "english_dub_signal": "none",
+                "review_needed": True,
+                "supporting_source_count": 1,
+            },
+        )
+
+        html = render_recommendation_dashboard([item])
+
+        for text in ("Dub status", "Availability match", "Availability confidence", "Match source", "Mapping confidence", "Review"):
+            self.assertIn(text, html)
+        for text in ("title_alias", "provider_search", "0.62", "none", "yes"):
+            self.assertIn(text, html)
+
+    def test_dashboard_api_payload_exposes_availability_match_dub_and_review_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "crunchyroll",
+                        "title": "Mapped Candidate",
+                        "provider_series_id": "cr-available",
+                        "priority": 101,
+                        "available_via_providers": ["crunchyroll"],
+                        "context": {
+                            "mal_anime_id": 5001,
+                            "english_dub_signal": "present",
+                            "availability_confidence": "mapped",
+                            "availability_match_kinds": ["mapped_mal"],
+                            "available_provider_series": [
+                                {
+                                    "provider": "crunchyroll",
+                                    "provider_series_id": "cr-available",
+                                    "availability_match_kind": "mapped_mal",
+                                    "mapping_confidence": 1.0,
+                                    "mapping_source": "approved_mapping",
+                                }
+                            ],
+                            "availability_review_needed": True,
+                        },
+                    },
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "hidive",
+                        "title": "Unknown Dub Candidate",
+                        "provider_series_id": "hi-unknown",
+                        "priority": 90,
+                        "available_via_providers": ["hidive"],
+                        "context": {"english_dub_signal": "unknown", "availability_match_kinds": ["title_alias"]},
+                    },
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "hidive",
+                        "title": "No Dub Candidate",
+                        "provider_series_id": "hi-none",
+                        "priority": 89,
+                        "available_via_providers": ["hidive"],
+                        "context": {"english_dub_signal": "none", "availability_match_kinds": ["title_alias"]},
+                    },
+                ],
+                run_id="run-availability",
+                generated_at="2026-07-11T02:00:00Z",
+            )
+
+            payload = build_dashboard_payload(db_path, limit=10)
+
+            rows = {row["title"]: row for section in payload["recommendations"]["sections"].values() for row in section}
+            mapped = rows["Mapped Candidate"]
+            self.assertEqual(["crunchyroll"], mapped["availability"]["providers"])
+            self.assertEqual(["mapped_mal"], mapped["availability"]["match_kinds"])
+            self.assertEqual(["approved_mapping"], mapped["availability"]["match_sources"])
+            self.assertEqual([1.0], mapped["availability"]["match_confidences"])
+            self.assertEqual("present", mapped["availability"]["dub_status"])
+            self.assertTrue(mapped["availability"]["review_needed"])
+            self.assertEqual("unknown", rows["Unknown Dub Candidate"]["availability"]["dub_status"])
+            self.assertEqual("none", rows["No Dub Candidate"]["availability"]["dub_status"])
+
+    def test_recommend_snapshots_cli_payload_includes_operator_availability_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            runtime_root = project_root / ".MAL-Updater"
+            db_path = runtime_root / "data" / "mal_updater.sqlite3"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {
+                        "kind": "discovery_candidate",
+                        "provider": "crunchyroll",
+                        "title": "CLI Candidate",
+                        "provider_series_id": "cr-cli",
+                        "priority": 99,
+                        "available_via_providers": ["crunchyroll"],
+                        "context": {
+                            "english_dub_signal": "unknown",
+                            "availability_match_kinds": ["title_alias"],
+                            "available_provider_series": [
+                                {
+                                    "provider": "crunchyroll",
+                                    "provider_series_id": "cr-cli",
+                                    "availability_match_kind": "title_alias",
+                                    "mapping_confidence": 0.7,
+                                    "mapping_source": "provider_search",
+                                }
+                            ],
+                            "review_needed": True,
+                        },
+                    }
+                ],
+                run_id="run-cli",
+                generated_at="2026-07-11T02:05:00Z",
+            )
+
+            with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                exit_code = _cmd_recommend_snapshots(project_root, limit=10, output_format="json")
+
+            self.assertEqual(0, exit_code)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(["crunchyroll"], payload[0]["availability"]["providers"])
+            self.assertEqual(["title_alias"], payload[0]["availability"]["match_kinds"])
+            self.assertEqual(["provider_search"], payload[0]["availability"]["match_sources"])
+            self.assertEqual([0.7], payload[0]["availability"]["match_confidences"])
+            self.assertEqual("unknown", payload[0]["availability"]["dub_status"])
+            self.assertTrue(payload[0]["availability"]["review_needed"])
+
     def test_dashboard_serve_cli_default_limit_is_polished_dashboard_default(self) -> None:
         args = build_parser().parse_args(["dashboard-serve"])
         self.assertEqual(args.limit, DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT)
@@ -341,7 +683,8 @@ class RecommendationDashboardTests(unittest.TestCase):
             html = render_dynamic_dashboard_html()
             self.assertIn("/api/dashboard", html)
             self.assertIn("Latest recommendation snapshot", html)
-            self.assertIn("MAL rec votes", html)
+            self.assertIn("Top watched seeds", html)
+            self.assertIn("MAL vote", html)
             self.assertIn("section_metadata", html)
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(db_path))

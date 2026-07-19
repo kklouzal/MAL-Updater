@@ -13,6 +13,8 @@ MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "004_provider_search_cache.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "004_mal_recommendation_harvest_status.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "005_recommendation_score_snapshots.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "006_recommendation_eligibility_evidence.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "007_mal_user_anime_list_cache.sql",
 ]
 
 
@@ -60,6 +62,62 @@ class MalAnimeMetadata:
     fetched_at: str
     updated_at: str
 
+
+@dataclass(slots=True)
+class MalUserAnimeListCacheEntry:
+    mal_anime_id: int
+    title: str
+    list_status: str | None
+    user_score: int | None
+    num_episodes_watched: int | None
+    start_date: str | None
+    finish_date: str | None
+    list_updated_at: str | None
+    node: dict[str, Any]
+    list_status_raw: dict[str, Any]
+    raw: dict[str, Any]
+    refresh_run_id: str
+    refresh_generation: int
+    fetched_at: str
+    last_seen_at: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class MalUserAnimeListRefreshSummary:
+    status: str
+    refresh_run_id: str
+    generation: int
+    pages: int = 0
+    items: int = 0
+    upserted: int = 0
+    pruned: int = 0
+    preserved_absent: int = 0
+    scored: int = 0
+    unscored: int = 0
+    metadata_rows_with_my_list_status: int = 0
+    by_status: dict[str, int] | None = None
+    partial: bool = False
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "refresh_run_id": self.refresh_run_id,
+            "generation": self.generation,
+            "pages": self.pages,
+            "items": self.items,
+            "upserted": self.upserted,
+            "pruned": self.pruned,
+            "preserved_absent": self.preserved_absent,
+            "scored": self.scored,
+            "unscored": self.unscored,
+            "metadata_rows_with_my_list_status": self.metadata_rows_with_my_list_status,
+            "by_status": dict(self.by_status or {}),
+            "partial": self.partial,
+            "error": self.error,
+        }
 
 
 
@@ -117,6 +175,29 @@ class RecommendationSnapshotRow:
     availability_providers: list[str]
     dub_signal: str | None
     availability_confidence: float | None
+    availability_confidence_label: str | None
+
+
+@dataclass(slots=True)
+class RecommendationProviderEligibilityEvidence:
+    mal_anime_id: int
+    provider: str
+    provider_series_id: str
+    provider_title: str | None
+    provider_url: str | None
+    identity_match_kind: str
+    match_confidence: float | None
+    review_status: str
+    catalog_status: str
+    english_dub_status: str
+    explicit_dub_evidence_source: str | None
+    audio_locales: list[Any]
+    source_evidence: dict[str, Any]
+    fetched_at: str
+    expires_at: str
+    last_verified_at: str | None
+    created_at: str
+    updated_at: str
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -177,6 +258,14 @@ def insert_recommendation_snapshot_rows(
         dub_signal = row.get("dub_signal")
         if not dub_signal and isinstance(context, dict):
             dub_signal = context.get("dub_signal") or context.get("english_dub_signal")
+        availability_confidence_raw = row.get("availability_confidence")
+        if availability_confidence_raw is None and isinstance(context, dict):
+            availability_confidence_raw = context.get("availability_confidence")
+        availability_confidence_label = row.get("availability_confidence_label")
+        if availability_confidence_label is None and isinstance(context, dict):
+            availability_confidence_label = context.get("availability_confidence_label") or context.get("availability_evidence_label")
+        if availability_confidence_label is None:
+            availability_confidence_label = _non_numeric_label(availability_confidence_raw)
         reasons = row.get("reasons") if isinstance(row.get("reasons"), list) else []
         prepared.append(
             (
@@ -194,7 +283,8 @@ def insert_recommendation_snapshot_rows(
                 json.dumps(context, sort_keys=True) if context is not None else None,
                 json.dumps(providers, sort_keys=True),
                 dub_signal,
-                _coerce_float(row.get("availability_confidence") or (context or {}).get("availability_confidence")),
+                _coerce_float(availability_confidence_raw),
+                None if availability_confidence_label is None else str(availability_confidence_label),
             )
         )
     if not prepared:
@@ -205,8 +295,8 @@ def insert_recommendation_snapshot_rows(
             INSERT INTO recommendation_score_snapshots (
                 run_id, generated_at, kind, provider, title, provider_series_id, mal_anime_id,
                 score, priority, reasons_json, scorecard_json, context_json,
-                availability_providers_json, dub_signal, availability_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                availability_providers_json, dub_signal, availability_confidence, availability_confidence_label
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             prepared,
         )
@@ -250,6 +340,12 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _non_numeric_label(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip() and _coerce_float(value) is None:
+        return value.strip()
+    return None
+
+
 def _load_json_value(value: str | None, fallback: Any) -> Any:
     if not value:
         return fallback
@@ -277,6 +373,7 @@ def _recommendation_snapshot_row_from_db(row: sqlite3.Row) -> RecommendationSnap
         availability_providers=_load_json_value(row["availability_providers_json"], []),
         dub_signal=row["dub_signal"],
         availability_confidence=row["availability_confidence"],
+        availability_confidence_label=row["availability_confidence_label"],
     )
 
 
@@ -559,6 +656,518 @@ def upsert_mal_anime_metadata(
         )
         conn.commit()
 
+
+_ALLOWED_MAL_USER_LIST_STATUSES = {"completed", "watching", "on_hold", "dropped", "plan_to_watch"}
+
+
+@dataclass(frozen=True, slots=True)
+class MalUserAnimeListRefreshGeneration:
+    refresh_run_id: str
+    generation: int
+    fetched_at: str
+
+
+def _normalize_mal_user_list_status(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in _ALLOWED_MAL_USER_LIST_STATUSES else None
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_mal_anime_id(value: Any) -> int | None:
+    mal_anime_id = _coerce_optional_int(value)
+    if mal_anime_id is None or mal_anime_id <= 0:
+        return None
+    return mal_anime_id
+
+
+def _clamp_optional_int(value: Any, *, minimum: int, maximum: int | None = None) -> int | None:
+    coerced = _coerce_optional_int(value)
+    if coerced is None:
+        return None
+    coerced = max(coerced, minimum)
+    if maximum is not None:
+        coerced = min(coerced, maximum)
+    return coerced
+
+
+def _next_mal_user_list_generation(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(refresh_generation), 0) + 1 AS generation FROM mal_user_anime_list_cache").fetchone()
+    return int(row["generation"] or 1)
+
+
+def begin_mal_user_anime_list_cache_refresh(
+    db_path: Path,
+    *,
+    refresh_run_id: str,
+    fetched_at: str,
+) -> MalUserAnimeListRefreshGeneration:
+    """Allocate a cache refresh generation without pruning any existing rows."""
+    if not str(refresh_run_id).strip():
+        raise ValueError("refresh_run_id is required")
+    if not str(fetched_at).strip():
+        raise ValueError("fetched_at is required")
+    conn = connect(db_path)
+    try:
+        generation = _next_mal_user_list_generation(conn)
+    finally:
+        conn.close()
+    return MalUserAnimeListRefreshGeneration(
+        refresh_run_id=str(refresh_run_id),
+        generation=generation,
+        fetched_at=str(fetched_at),
+    )
+
+
+def _mal_user_list_entry_from_row(row: sqlite3.Row) -> MalUserAnimeListCacheEntry:
+    return MalUserAnimeListCacheEntry(
+        mal_anime_id=int(row["mal_anime_id"]),
+        title=str(row["title"]),
+        list_status=row["list_status"],
+        user_score=None if row["user_score"] is None else int(row["user_score"]),
+        num_episodes_watched=None if row["num_episodes_watched"] is None else int(row["num_episodes_watched"]),
+        start_date=row["start_date"],
+        finish_date=row["finish_date"],
+        list_updated_at=row["list_updated_at"],
+        node=json.loads(row["node_json"] or "{}"),
+        list_status_raw=json.loads(row["list_status_json"] or "{}"),
+        raw=json.loads(row["raw_json"]),
+        refresh_run_id=str(row["refresh_run_id"]),
+        refresh_generation=int(row["refresh_generation"]),
+        fetched_at=str(row["fetched_at"]),
+        last_seen_at=str(row["last_seen_at"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _prepare_mal_user_list_cache_item(item: dict[str, Any], *, refresh_run_id: str, generation: int, fetched_at: str) -> tuple[Any, ...] | None:
+    node = item.get("node") if isinstance(item.get("node"), dict) else {}
+    mal_anime_id = _coerce_mal_anime_id(node.get("id"))
+    if mal_anime_id is None:
+        return None
+    title_raw = node.get("title")
+    title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else f"MAL anime {mal_anime_id}"
+    list_status_raw = item.get("list_status") if isinstance(item.get("list_status"), dict) else {}
+    status = _normalize_mal_user_list_status(list_status_raw.get("status"))
+    score = _clamp_optional_int(list_status_raw.get("score"), minimum=0, maximum=10)
+    watched = _clamp_optional_int(list_status_raw.get("num_episodes_watched"), minimum=0)
+    start_date = list_status_raw.get("start_date") if isinstance(list_status_raw.get("start_date"), str) else None
+    finish_date = list_status_raw.get("finish_date") if isinstance(list_status_raw.get("finish_date"), str) else None
+    list_updated_at = list_status_raw.get("updated_at") if isinstance(list_status_raw.get("updated_at"), str) else None
+    return (
+        mal_anime_id,
+        title,
+        status,
+        score,
+        watched,
+        start_date,
+        finish_date,
+        list_updated_at,
+        json.dumps(node, ensure_ascii=False, sort_keys=True),
+        json.dumps(list_status_raw, ensure_ascii=False, sort_keys=True),
+        json.dumps(item, ensure_ascii=False, sort_keys=True),
+        str(refresh_run_id),
+        int(generation),
+        str(fetched_at),
+        str(fetched_at),
+    )
+
+
+def _summarize_prepared_mal_user_list_rows(prepared: list[tuple[Any, ...]]) -> tuple[dict[str, int], int, int]:
+    by_status: dict[str, int] = {}
+    scored = 0
+    unscored = 0
+    for row in prepared:
+        status = row[2]
+        score = row[3]
+        if status:
+            by_status[str(status)] = by_status.get(str(status), 0) + 1
+        if score is not None and int(score) > 0:
+            scored += 1
+        else:
+            unscored += 1
+    return by_status, scored, unscored
+
+
+def upsert_mal_user_anime_list_cache_generation(
+    db_path: Path,
+    *,
+    items: Iterable[dict[str, Any]],
+    refresh_run_id: str,
+    generation: int,
+    fetched_at: str,
+) -> MalUserAnimeListRefreshSummary:
+    """Upsert rows for a refresh generation without deleting absent prior rows."""
+    prepared: list[tuple[Any, ...]] = []
+    seen_ids: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        row = _prepare_mal_user_list_cache_item(
+            item,
+            refresh_run_id=str(refresh_run_id),
+            generation=int(generation),
+            fetched_at=str(fetched_at),
+        )
+        if row is None:
+            continue
+        mal_anime_id = int(row[0])
+        if mal_anime_id in seen_ids:
+            continue
+        seen_ids.add(mal_anime_id)
+        prepared.append(row)
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO mal_user_anime_list_cache (
+                    mal_anime_id, title, list_status, user_score, num_episodes_watched,
+                    start_date, finish_date, list_updated_at, node_json, list_status_json,
+                    raw_json, refresh_run_id, refresh_generation, fetched_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mal_anime_id) DO UPDATE SET
+                    title = excluded.title,
+                    list_status = excluded.list_status,
+                    user_score = excluded.user_score,
+                    num_episodes_watched = excluded.num_episodes_watched,
+                    start_date = excluded.start_date,
+                    finish_date = excluded.finish_date,
+                    list_updated_at = excluded.list_updated_at,
+                    node_json = excluded.node_json,
+                    list_status_json = excluded.list_status_json,
+                    raw_json = excluded.raw_json,
+                    refresh_run_id = excluded.refresh_run_id,
+                    refresh_generation = excluded.refresh_generation,
+                    fetched_at = excluded.fetched_at,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                prepared,
+            )
+            preserved_absent = conn.execute(
+                "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+                (int(generation),),
+            ).fetchone()["n"]
+    finally:
+        conn.close()
+    by_status, scored, unscored = _summarize_prepared_mal_user_list_rows(prepared)
+    return MalUserAnimeListRefreshSummary(
+        status="upserted",
+        refresh_run_id=str(refresh_run_id),
+        generation=int(generation),
+        items=len(prepared),
+        upserted=len(prepared),
+        preserved_absent=int(preserved_absent or 0),
+        scored=scored,
+        unscored=unscored,
+        by_status=by_status,
+        partial=True,
+    )
+
+
+def finalize_mal_user_anime_list_cache_refresh(
+    db_path: Path,
+    *,
+    refresh_run_id: str,
+    generation: int,
+    proven_complete: bool,
+    delete_absent: bool = False,
+) -> MalUserAnimeListRefreshSummary:
+    """Finalize a refresh generation; absent rows are deleted only with explicit proof."""
+    if delete_absent and not proven_complete:
+        raise ValueError("delete_absent requires proven_complete=True")
+    conn = connect(db_path)
+    try:
+        with conn:
+            current = conn.execute(
+                """
+                SELECT list_status, user_score
+                FROM mal_user_anime_list_cache
+                WHERE refresh_generation = ? AND refresh_run_id = ?
+                """,
+                (int(generation), str(refresh_run_id)),
+            ).fetchall()
+            pruned = 0
+            if delete_absent:
+                pruned = conn.execute(
+                    "DELETE FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+                    (int(generation),),
+                ).rowcount
+            preserved_absent = conn.execute(
+                "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+                (int(generation),),
+            ).fetchone()["n"]
+    finally:
+        conn.close()
+    by_status: dict[str, int] = {}
+    scored = 0
+    unscored = 0
+    for row in current:
+        status = row["list_status"]
+        score = row["user_score"]
+        if status:
+            by_status[str(status)] = by_status.get(str(status), 0) + 1
+        if score is not None and int(score) > 0:
+            scored += 1
+        else:
+            unscored += 1
+    return MalUserAnimeListRefreshSummary(
+        status="ok" if proven_complete else "aborted",
+        refresh_run_id=str(refresh_run_id),
+        generation=int(generation),
+        items=len(current),
+        upserted=len(current),
+        pruned=int(pruned or 0),
+        preserved_absent=int(preserved_absent or 0),
+        scored=scored,
+        unscored=unscored,
+        by_status=by_status,
+        partial=not proven_complete,
+    )
+
+
+def abort_mal_user_anime_list_cache_refresh(
+    db_path: Path,
+    *,
+    refresh_run_id: str,
+    generation: int,
+    error: str | None = None,
+) -> MalUserAnimeListRefreshSummary:
+    summary = finalize_mal_user_anime_list_cache_refresh(
+        db_path,
+        refresh_run_id=refresh_run_id,
+        generation=generation,
+        proven_complete=False,
+        delete_absent=False,
+    )
+    summary.status = "aborted"
+    summary.error = error
+    return summary
+
+
+def replace_mal_user_anime_list_cache_generation(
+    db_path: Path,
+    *,
+    items: Iterable[dict[str, Any]],
+    refresh_run_id: str,
+    fetched_at: str,
+    prune_absent: bool = False,
+) -> MalUserAnimeListRefreshSummary:
+    """
+    Compatibility helper for callers that have already collected a refresh.
+
+    The default is intentionally non-pruning.  Passing prune_absent=True performs
+    the explicit proven-complete finalize step required before absent rows can be
+    deleted.
+    """
+    refresh = begin_mal_user_anime_list_cache_refresh(
+        db_path,
+        refresh_run_id=refresh_run_id,
+        fetched_at=fetched_at,
+    )
+    upsert = upsert_mal_user_anime_list_cache_generation(
+        db_path,
+        items=items,
+        refresh_run_id=refresh.refresh_run_id,
+        generation=refresh.generation,
+        fetched_at=refresh.fetched_at,
+    )
+    if not prune_absent:
+        upsert.status = "ok"
+        upsert.partial = False
+        return upsert
+    finalized = finalize_mal_user_anime_list_cache_refresh(
+        db_path,
+        refresh_run_id=refresh.refresh_run_id,
+        generation=refresh.generation,
+        proven_complete=True,
+        delete_absent=True,
+    )
+    finalized.pages = upsert.pages
+    return finalized
+
+
+def get_mal_user_anime_list_cache(db_path: Path, mal_anime_id: int) -> MalUserAnimeListCacheEntry | None:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM mal_user_anime_list_cache WHERE mal_anime_id = ?",
+            (int(mal_anime_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else _mal_user_list_entry_from_row(row)
+
+
+def list_mal_user_anime_list_cache(db_path: Path, *, statuses: Iterable[str] | None = None) -> list[MalUserAnimeListCacheEntry]:
+    params: list[Any] = []
+    where = ""
+    if statuses is not None:
+        normalized = sorted({status for status in (_normalize_mal_user_list_status(item) for item in statuses) if status})
+        if normalized:
+            where = f"WHERE list_status IN ({', '.join('?' for _ in normalized)})"
+            params.extend(normalized)
+        else:
+            where = "WHERE 0"
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM mal_user_anime_list_cache
+            {where}
+            ORDER BY mal_anime_id ASC
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_mal_user_list_entry_from_row(row) for row in rows]
+
+
+def count_mal_user_anime_list_cache(db_path: Path, *, statuses: Iterable[str] | None = None) -> int:
+    params: list[Any] = []
+    where = ""
+    if statuses is not None:
+        normalized = sorted({status for status in (_normalize_mal_user_list_status(item) for item in statuses) if status})
+        if normalized:
+            where = f"WHERE list_status IN ({', '.join('?' for _ in normalized)})"
+            params.extend(normalized)
+        else:
+            return 0
+    conn = connect(db_path)
+    try:
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM mal_user_anime_list_cache {where}", params).fetchone()
+    finally:
+        conn.close()
+    return int(row["n"] or 0)
+
+
+def get_mal_user_anime_list_cache_map(db_path: Path) -> dict[int, MalUserAnimeListCacheEntry]:
+    return {entry.mal_anime_id: entry for entry in list_mal_user_anime_list_cache(db_path)}
+
+
+def summarize_mal_user_anime_list_cache(db_path: Path) -> dict[str, Any]:
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT list_status, COUNT(*) AS n, SUM(CASE WHEN user_score IS NOT NULL AND user_score > 0 THEN 1 ELSE 0 END) AS scored
+            FROM mal_user_anime_list_cache
+            GROUP BY list_status
+            ORDER BY list_status ASC
+            """
+        ).fetchall()
+        freshness = conn.execute(
+            """
+            SELECT COUNT(*) AS total, MAX(refresh_generation) AS generation, MAX(last_seen_at) AS newest_seen_at, MIN(last_seen_at) AS oldest_seen_at
+            FROM mal_user_anime_list_cache
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+    by_status = {str(row["list_status"] or "unknown"): int(row["n"] or 0) for row in rows}
+    scored = sum(int(row["scored"] or 0) for row in rows)
+    total = int(freshness["total"] or 0)
+    return {
+        "total": total,
+        "by_status": by_status,
+        "scored": scored,
+        "unscored": max(total - scored, 0),
+        "generation": None if freshness["generation"] is None else int(freshness["generation"]),
+        "newest_seen_at": freshness["newest_seen_at"],
+        "oldest_seen_at": freshness["oldest_seen_at"],
+    }
+
+
+def _my_list_status_from_cache_entry(entry: MalUserAnimeListCacheEntry) -> dict[str, Any]:
+    payload = dict(entry.list_status_raw)
+    if entry.list_status:
+        payload["status"] = entry.list_status
+    if entry.user_score is not None:
+        payload["score"] = entry.user_score
+    if entry.num_episodes_watched is not None:
+        payload["num_episodes_watched"] = entry.num_episodes_watched
+    if entry.start_date:
+        payload["start_date"] = entry.start_date
+    if entry.finish_date:
+        payload["finish_date"] = entry.finish_date
+    if entry.list_updated_at:
+        payload["updated_at"] = entry.list_updated_at
+    return payload
+
+
+def merge_mal_user_anime_list_cache_into_metadata(db_path: Path, *, metadata_fetched_at_for_new_rows: str = "1970-01-01 00:00:00") -> int:
+    entries = list_mal_user_anime_list_cache(db_path)
+    if not entries:
+        return 0
+    changed = 0
+    conn = connect(db_path)
+    try:
+        with conn:
+            for entry in entries:
+                my_list_status = _my_list_status_from_cache_entry(entry)
+                row = conn.execute(
+                    "SELECT raw_json FROM mal_anime_metadata WHERE mal_anime_id = ?",
+                    (entry.mal_anime_id,),
+                ).fetchone()
+                if row is None:
+                    raw = {
+                        "id": entry.mal_anime_id,
+                        "title": entry.title,
+                        "my_list_status": my_list_status,
+                        "mal_user_anime_list_cache": {"refresh_run_id": entry.refresh_run_id, "refresh_generation": entry.refresh_generation},
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO mal_anime_metadata (
+                            mal_anime_id, title, title_english, title_japanese,
+                            alternative_titles_json, media_type, status, num_episodes,
+                            mean, popularity, start_season_json, raw_json, fetched_at, updated_at
+                        ) VALUES (?, ?, NULL, NULL, '[]', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            entry.mal_anime_id,
+                            entry.title,
+                            json.dumps(raw, ensure_ascii=False, sort_keys=True),
+                            metadata_fetched_at_for_new_rows,
+                        ),
+                    )
+                    changed += 1
+                    continue
+                raw = json.loads(row["raw_json"] or "{}")
+                if not isinstance(raw, dict):
+                    raw = {}
+                raw["my_list_status"] = my_list_status
+                raw["mal_user_anime_list_cache"] = {"refresh_run_id": entry.refresh_run_id, "refresh_generation": entry.refresh_generation}
+                conn.execute(
+                    """
+                    UPDATE mal_anime_metadata
+                    SET raw_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE mal_anime_id = ?
+                    """,
+                    (json.dumps(raw, ensure_ascii=False, sort_keys=True), entry.mal_anime_id),
+                )
+                changed += 1
+    finally:
+        conn.close()
+    return changed
 
 def replace_mal_anime_relations(db_path: Path, *, mal_anime_id: int, relations: list[dict[str, Any]]) -> None:
     with connect(db_path) as conn:
@@ -1460,6 +2069,233 @@ def list_provider_stale_row_samples(
             for row in watchlist_rows
         ],
     }
+
+
+_ALLOWED_ELIGIBILITY_PROVIDERS = {"crunchyroll", "hidive"}
+_ELIGIBILITY_STATUSES = {"unknown", "present", "absent", "stale", "review-needed"}
+_REVIEW_STATUSES = _ELIGIBILITY_STATUSES | {"verified"}
+
+
+def _validate_recommendation_eligibility_value(name: str, value: str, allowed: set[str]) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in allowed:
+        raise ValueError(f"{name} must be one of {sorted(allowed)}")
+    return normalized
+
+
+def _validate_recommendation_eligibility_provider(provider: str) -> str:
+    normalized = str(provider).strip().lower()
+    if normalized not in _ALLOWED_ELIGIBILITY_PROVIDERS:
+        raise ValueError("provider must be one of ['crunchyroll', 'hidive']")
+    return normalized
+
+
+def _recommendation_provider_eligibility_from_db(row: sqlite3.Row) -> RecommendationProviderEligibilityEvidence:
+    audio_locales = _load_json_value(row["audio_locales_json"], [])
+    source_evidence = _load_json_value(row["source_evidence_json"], {})
+    return RecommendationProviderEligibilityEvidence(
+        mal_anime_id=int(row["mal_anime_id"]),
+        provider=str(row["provider"]),
+        provider_series_id=str(row["provider_series_id"]),
+        provider_title=row["provider_title"],
+        provider_url=row["provider_url"],
+        identity_match_kind=str(row["identity_match_kind"]),
+        match_confidence=None if row["match_confidence"] is None else float(row["match_confidence"]),
+        review_status=str(row["review_status"]),
+        catalog_status=str(row["catalog_status"]),
+        english_dub_status=str(row["english_dub_status"]),
+        explicit_dub_evidence_source=row["explicit_dub_evidence_source"],
+        audio_locales=audio_locales if isinstance(audio_locales, list) else [],
+        source_evidence=source_evidence if isinstance(source_evidence, dict) else {},
+        fetched_at=str(row["fetched_at"]),
+        expires_at=str(row["expires_at"]),
+        last_verified_at=row["last_verified_at"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def upsert_recommendation_provider_eligibility_evidence(
+    db_path: Path,
+    *,
+    mal_anime_id: int,
+    provider: str,
+    provider_series_id: str,
+    fetched_at: str,
+    expires_at: str,
+    provider_title: str | None = None,
+    provider_url: str | None = None,
+    identity_match_kind: str = "unknown",
+    match_confidence: float | None = None,
+    review_status: str = "unknown",
+    catalog_status: str = "unknown",
+    english_dub_status: str = "unknown",
+    explicit_dub_evidence_source: str | None = None,
+    audio_locales: list[Any] | None = None,
+    source_evidence: dict[str, Any] | None = None,
+    last_verified_at: str | None = None,
+) -> RecommendationProviderEligibilityEvidence:
+    normalized_provider = _validate_recommendation_eligibility_provider(provider)
+    normalized_review_status = _validate_recommendation_eligibility_value("review_status", review_status, _REVIEW_STATUSES)
+    normalized_catalog_status = _validate_recommendation_eligibility_value("catalog_status", catalog_status, _ELIGIBILITY_STATUSES)
+    normalized_english_dub_status = _validate_recommendation_eligibility_value("english_dub_status", english_dub_status, _ELIGIBILITY_STATUSES)
+    if match_confidence is not None and not 0.0 <= float(match_confidence) <= 1.0:
+        raise ValueError("match_confidence must be between 0.0 and 1.0")
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO recommendation_provider_eligibility_evidence (
+                mal_anime_id, provider, provider_series_id, provider_title, provider_url,
+                identity_match_kind, match_confidence, review_status, catalog_status, english_dub_status,
+                explicit_dub_evidence_source, audio_locales_json, source_evidence_json,
+                fetched_at, expires_at, last_verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mal_anime_id, provider, provider_series_id) DO UPDATE SET
+                provider_title = excluded.provider_title,
+                provider_url = excluded.provider_url,
+                identity_match_kind = excluded.identity_match_kind,
+                match_confidence = excluded.match_confidence,
+                review_status = excluded.review_status,
+                catalog_status = excluded.catalog_status,
+                english_dub_status = excluded.english_dub_status,
+                explicit_dub_evidence_source = excluded.explicit_dub_evidence_source,
+                audio_locales_json = excluded.audio_locales_json,
+                source_evidence_json = excluded.source_evidence_json,
+                fetched_at = excluded.fetched_at,
+                expires_at = excluded.expires_at,
+                last_verified_at = excluded.last_verified_at,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                int(mal_anime_id), normalized_provider, provider_series_id, provider_title, provider_url,
+                str(identity_match_kind), None if match_confidence is None else float(match_confidence),
+                normalized_review_status, normalized_catalog_status, normalized_english_dub_status,
+                explicit_dub_evidence_source,
+                json.dumps(audio_locales or [], ensure_ascii=False, sort_keys=True),
+                json.dumps(source_evidence or {}, ensure_ascii=False, sort_keys=True),
+                fetched_at, expires_at, last_verified_at,
+            ),
+        )
+        conn.commit()
+    evidence = get_recommendation_provider_eligibility_evidence(
+        db_path, mal_anime_id=mal_anime_id, provider=normalized_provider, provider_series_id=provider_series_id
+    )
+    if evidence is None:
+        raise RuntimeError("Recommendation eligibility evidence disappeared after upsert")
+    return evidence
+
+
+def get_recommendation_provider_eligibility_evidence(
+    db_path: Path,
+    *,
+    mal_anime_id: int,
+    provider: str,
+    provider_series_id: str,
+) -> RecommendationProviderEligibilityEvidence | None:
+    normalized_provider = _validate_recommendation_eligibility_provider(provider)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM recommendation_provider_eligibility_evidence
+            WHERE mal_anime_id = ? AND provider = ? AND provider_series_id = ?
+            """,
+            (int(mal_anime_id), normalized_provider, provider_series_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return _recommendation_provider_eligibility_from_db(row)
+
+
+def list_recommendation_provider_eligibility_evidence_for_mal_ids(
+    db_path: Path,
+    mal_anime_ids: Iterable[int],
+    *,
+    provider: str | None = None,
+    actionable_only: bool = False,
+    now: str | None = None,
+) -> list[RecommendationProviderEligibilityEvidence]:
+    ids = sorted({int(value) for value in mal_anime_ids})
+    if not ids:
+        return []
+    normalized_provider = _validate_recommendation_eligibility_provider(provider) if provider is not None else None
+    conditions = [f"mal_anime_id IN ({', '.join('?' for _ in ids)})"]
+    params: list[object] = list(ids)
+    if normalized_provider is not None:
+        conditions.append("provider = ?")
+        params.append(normalized_provider)
+    if actionable_only:
+        conditions.extend(["review_status = 'verified'", "catalog_status = 'present'", "english_dub_status = 'present'"])
+        if now is not None:
+            conditions.append("expires_at > ?")
+            params.append(now)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM recommendation_provider_eligibility_evidence
+            WHERE {' AND '.join(conditions)}
+            ORDER BY mal_anime_id ASC, provider ASC, provider_series_id ASC
+            """,
+            params,
+        ).fetchall()
+    return [_recommendation_provider_eligibility_from_db(row) for row in rows]
+
+
+def mark_stale_recommendation_provider_eligibility_evidence(
+    db_path: Path,
+    *,
+    now: str,
+    mal_anime_id: int | None = None,
+    provider: str | None = None,
+) -> int:
+    conditions = ["expires_at <= ?", "(catalog_status != 'stale' OR english_dub_status != 'stale' OR review_status != 'stale')"]
+    params: list[object] = [now]
+    if mal_anime_id is not None:
+        conditions.append("mal_anime_id = ?")
+        params.append(int(mal_anime_id))
+    if provider is not None:
+        conditions.append("provider = ?")
+        params.append(_validate_recommendation_eligibility_provider(provider))
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE recommendation_provider_eligibility_evidence
+            SET review_status = 'stale', catalog_status = 'stale', english_dub_status = 'stale', updated_at = CURRENT_TIMESTAMP
+            WHERE {' AND '.join(conditions)}
+            """,
+            params,
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
+
+
+def delete_recommendation_provider_eligibility_evidence(
+    db_path: Path,
+    *,
+    mal_anime_id: int | None = None,
+    provider: str | None = None,
+    provider_series_id: str | None = None,
+    expired_before: str | None = None,
+) -> int:
+    conditions: list[str] = []
+    params: list[object] = []
+    if mal_anime_id is not None:
+        conditions.append("mal_anime_id = ?")
+        params.append(int(mal_anime_id))
+    if provider is not None:
+        conditions.append("provider = ?")
+        params.append(_validate_recommendation_eligibility_provider(provider))
+    if provider_series_id is not None:
+        conditions.append("provider_series_id = ?")
+        params.append(provider_series_id)
+    if expired_before is not None:
+        conditions.append("expires_at <= ?")
+        params.append(expired_before)
+    if not conditions:
+        raise ValueError("delete requires at least one selector")
+    with connect(db_path) as conn:
+        cursor = conn.execute(f"DELETE FROM recommendation_provider_eligibility_evidence WHERE {' AND '.join(conditions)}", params)
+        conn.commit()
+        return int(cursor.rowcount or 0)
 
 
 def get_provider_title_search_cache(

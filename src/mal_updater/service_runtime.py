@@ -46,6 +46,9 @@ _FAILURE_BACKOFF_MIN_SECONDS = 300
 _AUTO_PROJECTED_REQUEST_PERCENTILE = 0.9
 _AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY = 4
 _AUTO_PROJECTED_REQUEST_BURST_RATIO = 2.0
+_MAL_USER_LIST_REFRESH_MAX_PAGES = 3
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 20
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT = 5
 
 
 def _now_iso() -> str:
@@ -414,6 +417,7 @@ def maintenance_cycle_plan(
     discovery_target_limit: int = 25,
     recommendation_limit: int = 100,
     mapping_limit: int = 25,
+    mal_list_max_pages: int = _MAL_USER_LIST_REFRESH_MAX_PAGES,
     provider_max_history_pages: int | None = None,
     provider_max_watchlist_pages: int | None = None,
     include_provider_refresh: bool = True,
@@ -454,6 +458,17 @@ def maintenance_cycle_plan(
                 ],
             },
             {
+                "label": "maintain_mal_list_refresh",
+                "args": [
+                    sys.executable,
+                    "-m",
+                    "mal_updater.cli",
+                    "mal-list-refresh",
+                    "--max-pages",
+                    str(max(1, int(mal_list_max_pages))),
+                ],
+            },
+            {
                 "label": "maintain_recommend_metadata",
                 "args": [
                     sys.executable,
@@ -465,6 +480,19 @@ def maintenance_cycle_plan(
                     "--include-discovery-targets",
                     "--discovery-target-limit",
                     str(max(0, int(discovery_target_limit))),
+                ],
+            },
+            {
+                "label": "maintain_recommend_provider_eligibility",
+                "args": [
+                    sys.executable,
+                    "-m",
+                    "mal_updater.cli",
+                    "recommend-enrich-provider-availability",
+                    "--limit",
+                    str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT),
+                    "--search-limit",
+                    str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT),
                 ],
             },
             {
@@ -496,6 +524,7 @@ def run_maintenance_cycle(
     discovery_target_limit: int = 25,
     recommendation_limit: int = 100,
     mapping_limit: int = 25,
+    mal_list_max_pages: int = _MAL_USER_LIST_REFRESH_MAX_PAGES,
     provider_max_history_pages: int | None = None,
     provider_max_watchlist_pages: int | None = None,
     include_provider_refresh: bool = True,
@@ -506,6 +535,7 @@ def run_maintenance_cycle(
         discovery_target_limit=discovery_target_limit,
         recommendation_limit=recommendation_limit,
         mapping_limit=mapping_limit,
+        mal_list_max_pages=mal_list_max_pages,
         provider_max_history_pages=provider_max_history_pages,
         provider_max_watchlist_pages=provider_max_watchlist_pages,
         include_provider_refresh=include_provider_refresh,
@@ -696,6 +726,8 @@ def _recommend_maintain_command(config: AppConfig) -> list[str]:
         str(max(0, int(recommendation_limit))),
         "--mapping-limit",
         str(max(0, int(mapping_limit))),
+        "--mal-list-max-pages",
+        str(_MAL_USER_LIST_REFRESH_MAX_PAGES),
         # The daemon's provider fetch tasks own provider backoff/auth state; the
         # recurring maintenance task only advances recommendation maintenance.
         "--skip-provider-refresh",
@@ -760,10 +792,9 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
     preview = deliver_recommendations_via_openclaw(
         config,
         limit=delivery_limit,
-        include_dormant=True,
+        include_dormant=False,
         delivery_mode=delivery_mode,
         suppress_item_fingerprints=suppressed_fingerprints,
-        max_dormant_discovery_items=1,
         dry_run=True,
     )
     structured_payload = preview.payload.get("structured_payload") if isinstance(preview.payload, dict) else None
@@ -801,10 +832,9 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
     delivery = deliver_recommendations_via_openclaw(
         config,
         limit=delivery_limit,
-        include_dormant=True,
+        include_dormant=False,
         delivery_mode=delivery_mode,
         suppress_item_fingerprints=suppressed_fingerprints,
-        max_dormant_discovery_items=1,
         dry_run=False,
     )
     result = {

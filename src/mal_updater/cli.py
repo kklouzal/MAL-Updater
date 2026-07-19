@@ -55,7 +55,7 @@ from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
 from .recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, serve_dashboard, write_recommendation_dashboard
 from .recommendation_enrichment import enrich_discovery_provider_availability
-from .recommendation_metadata import refresh_recommendation_metadata
+from .recommendation_metadata import refresh_mal_user_anime_list_cache, refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
@@ -69,6 +69,37 @@ from .sync_planner import (
     persist_sync_review_queue,
 )
 from .validation import SnapshotValidationError, validate_snapshot_payload
+
+
+def _recommendation_dub_status(value: object) -> str:
+    if isinstance(value, bool):
+        return "present" if value else "none"
+    normalized = str(value or "").strip().lower()
+    if normalized in {"present", "yes", "true", "english dub", "dubbed"}:
+        return "present"
+    if normalized in {"none", "no", "false", "subonly", "sub only"}:
+        return "none"
+    return "unknown"
+
+
+def _recommendation_availability_payload(row: object) -> dict[str, object]:
+    context = getattr(row, "context", None) if isinstance(getattr(row, "context", None), dict) else {}
+    provider_series = context.get("available_provider_series") if isinstance(context.get("available_provider_series"), list) else []
+    match_kinds = context.get("availability_match_kinds")
+    if not isinstance(match_kinds, list):
+        match_kinds = [series.get("availability_match_kind") for series in provider_series if isinstance(series, dict) and series.get("availability_match_kind")]
+    match_sources = [series.get("mapping_source") for series in provider_series if isinstance(series, dict) and series.get("mapping_source")]
+    match_confidences = [series.get("mapping_confidence") for series in provider_series if isinstance(series, dict) and series.get("mapping_confidence") is not None]
+    review_needed = any(context.get(key) is True for key in ("review_needed", "availability_review_needed", "mapping_review_needed", "needs_review"))
+    return {
+        "providers": getattr(row, "availability_providers", []),
+        "match_kinds": match_kinds,
+        "match_sources": match_sources,
+        "match_confidences": match_confidences,
+        "confidence": getattr(row, "availability_confidence", None),
+        "dub_status": _recommendation_dub_status(getattr(row, "dub_signal", None) or context.get("english_dub_signal") or context.get("english_dub")),
+        "review_needed": review_needed,
+    }
 
 
 def _cmd_init(project_root: Path | None) -> int:
@@ -210,6 +241,7 @@ def _cmd_recommend_maintain(
     discovery_target_limit: int,
     recommendation_limit: int,
     mapping_limit: int,
+    mal_list_max_pages: int,
     provider_max_history_pages: int | None,
     provider_max_watchlist_pages: int | None,
     skip_provider_refresh: bool,
@@ -223,6 +255,7 @@ def _cmd_recommend_maintain(
         discovery_target_limit=discovery_target_limit,
         recommendation_limit=recommendation_limit,
         mapping_limit=mapping_limit,
+        mal_list_max_pages=mal_list_max_pages,
         provider_max_history_pages=provider_max_history_pages,
         provider_max_watchlist_pages=provider_max_watchlist_pages,
         include_provider_refresh=not skip_provider_refresh,
@@ -6389,7 +6422,8 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
     results = build_recommendations(
         config,
         limit=normalized_limit if flat else 0,
-        require_provider_availability=False,
+        require_provider_availability=not include_dormant,
+        include_discovery_candidates_without_actionable_provider_evidence=include_dormant,
     )
     payload: object
     if flat:
@@ -6432,6 +6466,7 @@ def _cmd_recommend_snapshots(project_root: Path | None, limit: int, output_forma
             "providers": row.availability_providers,
             "dub_signal": row.dub_signal,
             "availability_confidence": row.availability_confidence,
+            "availability": _recommendation_availability_payload(row),
         }
         for row in rows
     ]
@@ -6456,9 +6491,10 @@ def _cmd_recommend_dashboard(project_root: Path | None, output: Path, limit: int
     results = build_recommendations(
         config,
         limit=None,
-        require_provider_availability=False,
+        require_provider_availability=not include_dormant,
+        include_discovery_candidates_without_actionable_provider_evidence=include_dormant,
     )
-    written = write_recommendation_dashboard(output, results, limit=display_limit)
+    written = write_recommendation_dashboard(output, results, limit=display_limit, diagnostic_mode=include_dormant)
     print(json.dumps({"status": "ok", "output": str(written), "recommendation_count": len(results), "display_limit_per_section": display_limit}, indent=2))
     return 0
 
@@ -6469,6 +6505,49 @@ def _cmd_dashboard_serve(project_root: Path | None, host: str, port: int, limit:
     bootstrap_database(config.db_path)
     serve_dashboard(config.db_path, host=host, port=port, limit=_normalize_limit(limit) or DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT)
     return 0
+
+
+def _cmd_mal_list_refresh(
+    project_root: Path | None,
+    statuses: list[str] | None,
+    page_size: int,
+    max_pages: int,
+    complete: bool,
+    output_format: str,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    summary = refresh_mal_user_anime_list_cache(
+        config,
+        statuses=statuses or ["all"],
+        page_size=page_size,
+        max_pages=_normalize_limit(max_pages),
+        prune_on_complete=complete,
+    )
+    if output_format == "summary":
+        payload = summary.as_dict()
+        print(
+            " ".join(
+                [
+                    f"status={payload['status']}",
+                    f"partial={str(payload['partial']).lower()}",
+                    f"pages={payload['pages']}",
+                    f"items={payload['items']}",
+                    f"upserted={payload['upserted']}",
+                    f"pruned={payload['pruned']}",
+                    f"preserved_absent={payload['preserved_absent']}",
+                    f"scored={payload['scored']}",
+                    f"unscored={payload['unscored']}",
+                    f"by_status={json.dumps(payload['by_status'], sort_keys=True)}",
+                ]
+            )
+        )
+        if payload.get("error"):
+            print(f"detail={payload['error']}")
+    else:
+        print(json.dumps(summary.as_dict(), indent=2))
+    return 0 if summary.status in {"ok", "partial"} else 1
 
 
 def _cmd_recommend_refresh_metadata(
@@ -6490,7 +6569,7 @@ def _cmd_recommend_refresh_metadata(
     return 0
 
 
-def _cmd_recommend_enrich_provider_availability(project_root: Path | None, limit: int, provider: str | None, search_limit: int) -> int:
+def _cmd_recommend_enrich_provider_availability(project_root: Path | None, limit: int, provider: str | None, search_limit: int, dry_run: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
@@ -6501,6 +6580,7 @@ def _cmd_recommend_enrich_provider_availability(project_root: Path | None, limit
         providers=providers,
         candidate_limit=_normalize_limit(limit) or 25,
         search_limit=_normalize_limit(search_limit) or 10,
+        persist_review_queue=not dry_run,
     )
     print(json.dumps(summary.as_dict(), indent=2))
     return 0
@@ -6853,7 +6933,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend.add_argument(
         "--include-dormant",
         action="store_true",
-        help="Backward-compatible no-op: MAL/catalog discovery candidates are included by default",
+        help="Operator diagnostic: include dormant/internal discovery candidates without actionable verified provider+dub eligibility",
     )
     recommend.add_argument(
         "--persist-snapshot",
@@ -6875,6 +6955,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_maintain.add_argument("--discovery-target-limit", type=int, default=25, help="Discovery target anime metadata rows to hydrate this cycle")
     recommend_maintain.add_argument("--recommendation-limit", type=int, default=100, help="Recommendation rows to persist in the snapshot")
     recommend_maintain.add_argument("--mapping-limit", type=int, default=25, help="Provider rows to inspect in exact-approved-only sync dry-run review")
+    recommend_maintain.add_argument("--mal-list-max-pages", type=int, default=3, help="Official MAL @me anime-list pages to refresh before retaining older rows as a bounded partial cycle")
     recommend_maintain.add_argument("--provider-max-history-pages", type=int, default=None, help="Crunchyroll chunk budget for history pages; partial chunks stay incremental")
     recommend_maintain.add_argument("--provider-max-watchlist-pages", type=int, default=None, help="Crunchyroll chunk budget for watchlist pages; partial chunks stay incremental")
     recommend_maintain.add_argument("--skip-provider-refresh", action="store_true", help="Skip provider snapshot refresh for this cycle")
@@ -6892,7 +6973,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_dashboard.add_argument(
         "--include-dormant",
         action="store_true",
-        help="Backward-compatible no-op: MAL/catalog discovery candidates are included by default",
+        help="Operator diagnostic: include dormant/internal discovery candidates without actionable verified provider+dub eligibility",
     )
     dashboard_serve = subparsers.add_parser(
         "dashboard-serve",
@@ -6901,6 +6982,21 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_serve.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     dashboard_serve.add_argument("--port", type=int, default=8766, help="Bind port (default: 8766)")
     dashboard_serve.add_argument("--limit", type=int, default=DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, help="Maximum latest snapshot recommendation rows to expose (default: 16; use ?limit= on /api/dashboard to override per request)")
+    mal_list_refresh = subparsers.add_parser(
+        "mal-list-refresh",
+        help="Refresh the official read-only MAL @me anime list cache for recommendation seeds",
+    )
+    mal_list_refresh.add_argument(
+        "--status",
+        action="append",
+        choices=["all", "completed", "watching", "on_hold", "dropped", "plan_to_watch"],
+        default=None,
+        help="MAL list status to refresh (repeatable); default/all fetches every status and prunes absent rows only after a complete run",
+    )
+    mal_list_refresh.add_argument("--page-size", type=int, default=100, help="MAL page size, clamped by the client to 1-100")
+    mal_list_refresh.add_argument("--max-pages", type=int, default=3, help="Positive maximum pages to fetch before preserving existing cache as partial (default: 3)")
+    mal_list_refresh.add_argument("--complete", action="store_true", help="Opt in to pruning absent rows, but only if MAL pagination reaches a terminal page within --max-pages")
+    mal_list_refresh.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",
         help="Refresh paced MAL metadata/relation cache for mapped anime; provider lookups remain title-specific only",
@@ -6924,6 +7020,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_enrich.add_argument("--limit", type=int, default=25, help="Maximum recommendation candidates to inspect")
     recommend_enrich.add_argument("--provider", choices=list(list_provider_slugs()), help="Provider slug to query; defaults to all registered providers")
     recommend_enrich.add_argument("--search-limit", type=int, default=10, help="Maximum provider search results per query")
+    recommend_enrich.add_argument("--dry-run", action="store_true", help="Report/cache provider search candidates without replacing the review queue")
     recommend_coverage = subparsers.add_parser(
         "recommend-coverage",
         help="Report read-only MAL recommendation harvest coverage for mapped/watched MAL anime IDs",
@@ -7222,6 +7319,7 @@ def main() -> int:
             discovery_target_limit=args.discovery_target_limit,
             recommendation_limit=args.recommendation_limit,
             mapping_limit=args.mapping_limit,
+            mal_list_max_pages=args.mal_list_max_pages,
             provider_max_history_pages=args.provider_max_history_pages,
             provider_max_watchlist_pages=args.provider_max_watchlist_pages,
             skip_provider_refresh=args.skip_provider_refresh,
@@ -7230,6 +7328,8 @@ def main() -> int:
         return _cmd_recommend_dashboard(args.project_root, args.output, args.limit, args.include_dormant)
     if args.command == "dashboard-serve":
         return _cmd_dashboard_serve(args.project_root, args.host, args.port, args.limit)
+    if args.command == "mal-list-refresh":
+        return _cmd_mal_list_refresh(args.project_root, args.status, args.page_size, args.max_pages, args.complete, args.format)
     if args.command == "recommend-refresh-metadata":
         return _cmd_recommend_refresh_metadata(
             args.project_root,
@@ -7238,7 +7338,7 @@ def main() -> int:
             args.discovery_target_limit,
         )
     if args.command == "recommend-enrich-provider-availability":
-        return _cmd_recommend_enrich_provider_availability(args.project_root, args.limit, args.provider, args.search_limit)
+        return _cmd_recommend_enrich_provider_availability(args.project_root, args.limit, args.provider, args.search_limit, args.dry_run)
     if args.command == "recommend-coverage":
         return _cmd_recommend_coverage(args.project_root, args.stale_after_days)
     if args.command == "push-recommendations-webhook":

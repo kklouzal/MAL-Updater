@@ -217,7 +217,12 @@ def build_recommendation_delivery_payload(
         if dormant_limit > 0:
             provider_item_keys = {(item.kind, item.provider_series_id) for item in items}
             dormant_items: list[object] = []
-            for item in build_recommendations(config, limit=0, require_provider_availability=False):
+            for item in build_recommendations(
+                config,
+                limit=0,
+                require_provider_availability=False,
+                include_discovery_candidates_without_actionable_provider_evidence=True,
+            ):
                 if item.kind != "discovery_candidate":
                     continue
                 if (item.kind, item.provider_series_id) in provider_item_keys:
@@ -236,6 +241,7 @@ def build_recommendation_delivery_payload(
             config,
             limit=0,
             require_provider_availability=not include_dormant,
+            include_discovery_candidates_without_actionable_provider_evidence=include_dormant,
         )
     grouped_sections = _filter_delivery_sections_by_item_fingerprint(
         group_recommendations(items),
