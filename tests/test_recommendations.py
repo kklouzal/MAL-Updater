@@ -651,7 +651,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(dormant[0].context["availability_visible"])
         self.assertEqual([], dormant[0].context["available_via_providers"])
         self.assertEqual("none", dormant[0].context["availability_confidence"])
-        self.assertEqual("none", dormant[0].context["english_dub_signal"])
+        self.assertEqual("unknown", dormant[0].context["english_dub_signal"])
 
     def test_provider_required_discovery_uses_only_actionable_normalized_eligibility_evidence(self) -> None:
         self._insert_series("seed-actionable", title="Seed Actionable", season_title="Seed Actionable (English Dub)", watchlist_status="fully_watched")
@@ -711,6 +711,52 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("provider_audio_locale", item.context["provider_eligibility_evidence"][0]["explicit_dub_evidence_source"])
         self.assertEqual("Seed Actionable", item.context["supporting_seed_details"][0]["title"])
         self.assertEqual(9, item.context["supporting_seed_details"][0]["user_score"])
+
+    def test_diagnostic_discovery_carries_review_needed_provider_catalog_and_dub_evidence(self) -> None:
+        self._insert_series("seed-review-evidence", title="Seed Review Evidence", season_title="Seed Review Evidence (English Dub)", watchlist_status="fully_watched")
+        self._insert_progress("seed-review-evidence", "seed-review-evidence-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-review-evidence", 100)
+        self._cache_metadata(100, title="Seed Review Evidence", my_list_status={"status": "completed", "score": 9, "num_episodes_watched": 12})
+        self._cache_metadata(302, title="Review Needed Candidate", mean=8.0, popularity=300)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 302, "target_title": "Review Needed Candidate", "num_recommendations": 15, "raw": {}}],
+            make_targets_available=False,
+        )
+        self._cache_provider_eligibility(
+            302,
+            provider_series_id="cr-review-302",
+            provider_title="Review Needed Candidate",
+            identity_match_kind="provider_title_search",
+            review_status="review-needed",
+            catalog_status="present",
+            english_dub_status="present",
+        )
+
+        strict = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+        diagnostic = [
+            item
+            for item in build_recommendations(
+                self.config,
+                limit=0,
+                require_provider_availability=False,
+                include_discovery_candidates_without_actionable_provider_evidence=True,
+            )
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual([], strict)
+        self.assertEqual(1, len(diagnostic))
+        evidence = diagnostic[0].context["provider_eligibility_evidence"]
+        self.assertEqual("mal", diagnostic[0].provider)
+        self.assertEqual("provider_title_search", evidence[0]["identity_match_kind"])
+        self.assertEqual("review-needed", evidence[0]["review_status"])
+        self.assertEqual("present", evidence[0]["catalog_status"])
+        self.assertEqual("present", evidence[0]["english_dub_status"])
 
     def test_provider_required_discovery_merges_multiple_actionable_providers(self) -> None:
         self._insert_series("seed-multi", title="Seed Multi", season_title="Seed Multi (English Dub)", watchlist_status="fully_watched")

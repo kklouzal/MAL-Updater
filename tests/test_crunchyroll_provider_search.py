@@ -73,6 +73,31 @@ class CrunchyrollProviderSearchTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result["audio_locales"], [])
 
+    def test_cms_series_detail_merge_supplies_audio_without_changing_search_title(self) -> None:
+        match = {
+            "provider_series_id": "G6NQ5DWZ6",
+            "title": "My Hero Academia",
+            "season_title": "My Hero Academia",
+            "audio_locales": [],
+            "raw": {"source": "search"},
+        }
+        detail = {
+            "id": "G6NQ5DWZ6",
+            "title": "My Hero Academia",
+            "slug_title": "my-hero-academia",
+            "availability_status": "available",
+            "audio_locales": ["ja-JP", "en_US"],
+        }
+
+        result = crunchyroll._merge_search_result_with_detail(match, detail)
+
+        self.assertEqual(result["provider_series_id"], "G6NQ5DWZ6")
+        self.assertEqual(result["title"], "My Hero Academia")
+        self.assertEqual(result["audio_locales"], ["ja-JP", "en-US"])
+        self.assertEqual(result["catalog_status"], "present")
+        self.assertEqual(result["detail_evidence_source"], "crunchyroll_cms_series")
+        self.assertIn("detail", result["raw"])
+
     def test_search_normalization_dedupes_and_limits_grouped_results(self) -> None:
         payload = {
             "data": [

@@ -187,6 +187,57 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(info_rows, 1, "strong title-only matches may be queued for review")
         self.assertEqual(dub_rows, 0, "title-only English Dub labels are not explicit audio-locale evidence")
 
+    def test_crunchyroll_detail_evidence_hydrates_review_needed_catalog_and_dub_status(self):
+        self._insert_meta(222, english="Detail Needed")
+        self._recommendations(222)
+
+        class DetailProvider(FakeProvider):
+            slug = "crunchyroll"
+
+            def __init__(self):
+                super().__init__([{
+                    "provider_series_id": "cr-detail",
+                    "title": "Detail Needed",
+                    "audio_locales": [],
+                    "catalog_status": "present",
+                }])
+                self.detail_calls = []
+
+            def fetch_search_result_detail(self, config, match):
+                self.detail_calls.append(match["provider_series_id"])
+                return {
+                    **match,
+                    "audio_locales": ["ja-JP", "en-US"],
+                    "catalog_status": "present",
+                    "detail_evidence_source": "crunchyroll_cms_series",
+                }
+
+        provider = DetailProvider()
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            now=datetime(2026, 7, 19, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=222,
+            provider="crunchyroll",
+            provider_series_id="cr-detail",
+        )
+        self.assertEqual(["cr-detail"], provider.detail_calls)
+        self.assertEqual(1, summary.provider_detail_probes)
+        self.assertEqual(1, summary.eligibility_evidence_upserted)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("review-needed", evidence.review_status)
+        self.assertEqual("provider_title_search", evidence.identity_match_kind)
+        self.assertEqual("present", evidence.catalog_status)
+        self.assertEqual("present", evidence.english_dub_status)
+        self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
+        self.assertEqual("crunchyroll_cms_series", evidence.source_evidence["catalog_evidence_source"])
+
     def test_single_near_exact_match_auto_enriches_series_mapping(self):
         self._insert_meta(303, english="The Apothecary Diaries")
         self._recommendations(303)
@@ -287,8 +338,8 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertIsNotNone(evidence)
         assert evidence is not None
         self.assertEqual("review-needed", evidence.review_status)
-        self.assertEqual("unknown", evidence.catalog_status)
-        self.assertEqual("unknown", evidence.english_dub_status)
+        self.assertEqual("present", evidence.catalog_status)
+        self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("provider_audio_tag", evidence.explicit_dub_evidence_source)
         self.assertEqual("2026-07-26T00:00:00Z", evidence.expires_at)
 

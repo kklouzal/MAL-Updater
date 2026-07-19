@@ -246,6 +246,7 @@ def _discovery_why_recommended(
     provider_title: str | None = None,
     mean: float | None,
     start_season_label: str | None,
+    provider_dub_verified: bool = False,
 ) -> str:
     pieces = [f"recommended from {support_count} watched seed title(s)"]
     if votes > 0:
@@ -255,12 +256,20 @@ def _discovery_why_recommended(
     if mean is not None:
         pieces.append(f"MAL {mean:.2f}")
     if provider_label:
-        if provider_title:
+        if provider_dub_verified and provider_title:
             pieces.append(f"watchable dubbed as {provider_title} on {provider_label}")
-        else:
+        elif provider_dub_verified:
             pieces.append(f"watchable dubbed on {provider_label}")
+        elif provider_title:
+            pieces.append(
+                f"unverified provider match as {provider_title} on {provider_label}; provider availability and English dub evidence are not yet actionable"
+            )
+        else:
+            pieces.append(
+                f"unverified provider match on {provider_label}; provider availability and English dub evidence are not yet actionable"
+            )
     else:
-        pieces.append("MAL catalog discovery candidate")
+        pieces.append("MAL catalog discovery candidate; provider availability and English dub evidence are unknown/unverified")
     return "; ".join(pieces) + "."
 
 
@@ -1531,6 +1540,15 @@ def _build_discovery_recommendations(
         set(candidate_scores),
         actionable_only=True,
     )
+    diagnostic_provider_evidence_by_mal_id = (
+        _provider_eligibility_evidence_by_mal_id(
+            config,
+            set(candidate_scores),
+            actionable_only=False,
+        )
+        if include_discovery_candidates_without_actionable_provider_evidence and not require_provider_availability
+        else {}
+    )
     items: list[Recommendation] = []
     for target_id, bucket in candidate_scores.items():
         meta = metadata_by_id.get(target_id)
@@ -1606,7 +1624,7 @@ def _build_discovery_recommendations(
             item_provider_series_id = primary_available_state.provider_series_id if primary_available_state is not None else f"mal:{target_id}"
             item_title = primary_available_state.title if primary_available_state is not None else (meta.title if meta is not None else str(bucket.get("title") or f"MAL anime {target_id}"))
             item_season_title = primary_available_state.season_title if primary_available_state is not None else None
-            english_dub_status = "present" if english_dub_states else ("unknown" if provider_available_states else "none")
+            english_dub_status = "present" if english_dub_states else "unknown"
         mean = meta.mean if meta is not None else None
         popularity = meta.popularity if meta is not None else None
         votes_by_source = bucket.get("votes_by_source") or {}
@@ -1877,9 +1895,9 @@ def _build_discovery_recommendations(
             if availability_confidence == "verified_provider_eligibility":
                 reasons.append(f"verified dubbed provider eligibility: {_format_provider_label(available_via_providers)}")
             elif availability_confidence == "mapped":
-                reasons.append(f"available via mapped provider catalog match: {_format_provider_label(available_via_providers)}")
+                reasons.append(f"unverified mapped provider catalog match candidate: {_format_provider_label(available_via_providers)} (not watch-now eligible)")
             else:
-                reasons.append(f"available via title-alias provider catalog match: {_format_provider_label(available_via_providers)}")
+                reasons.append(f"unverified title-alias provider catalog match candidate: {_format_provider_label(available_via_providers)} (not watch-now eligible)")
         reasons.append("suppression guard found no exact MAL-list, mapped-provider, or title-alias provider watch-history evidence for this candidate")
         english_title = getattr(meta, "title_english", None) if meta is not None else None
         if not isinstance(english_title, str) or not english_title.strip():
@@ -1895,10 +1913,16 @@ def _build_discovery_recommendations(
             provider_title=provider_title_for_why,
             mean=mean,
             start_season_label=start_season_label,
+            provider_dub_verified=bool(actionable_provider_evidence),
+        )
+        context_provider_evidence = (
+            actionable_provider_evidence
+            if require_provider_availability
+            else diagnostic_provider_evidence_by_mal_id.get(target_id, actionable_provider_evidence)
         )
         provider_evidence_chain = [
             _serialize_provider_eligibility_evidence(evidence)
-            for evidence in actionable_provider_evidence
+            for evidence in context_provider_evidence
         ]
         supporting_seed_details = _supporting_seed_details(
             supporting_source_ids=set(bucket["supporting_sources"]),
@@ -1923,6 +1947,7 @@ def _build_discovery_recommendations(
                 provider: (provider in available_via_providers) for provider in ("crunchyroll", "hidive")
             },
             "english_dub_signal": english_dub_status,
+            "provider_dub_verified": bool(actionable_provider_evidence),
             "provider_eligibility_evidence": provider_evidence_chain,
             "top_supporting_seed_titles": supporting_seed_details,
             "metadata_cached": meta is not None,
@@ -1942,7 +1967,7 @@ def _build_discovery_recommendations(
         confidence_score = max(0.0, min(100.0, 35.0 + (support_count * 12.0) + (20.0 if meta is not None else 0.0) + (20.0 if (available_states or actionable_provider_evidence) else 0.0) + (8.0 if availability_confidence in {"mapped", "verified_provider_eligibility"} else 0.0)))
         scorecard_reasons = [
             f"consensus from {support_count} seed title(s) and {int(bucket['votes'])} MAL recommendation vote(s)",
-            f"availability: {_format_provider_label(available_via_providers) if available_via_providers else 'no mapped/alias provider availability found'}",
+            f"provider proof: {'verified current provider+dub evidence on ' + _format_provider_label(available_via_providers) if actionable_provider_evidence else (_format_provider_label(available_via_providers) + ' candidate; provider/dub evidence unverified' if available_via_providers else 'provider availability and dub evidence unknown/unverified')}",
             f"English dub signal: {dub_signal}",
         ]
         if mean is not None:
@@ -1988,6 +2013,9 @@ def _build_discovery_recommendations(
                     "english_title": english_title,
                     "genres": genre_names,
                     "availability_visible": bool(available_states or actionable_provider_evidence),
+                    "watch_now_eligible": bool(actionable_provider_evidence),
+                    "provider_dub_verified": bool(actionable_provider_evidence),
+                    "visibility_label": "Watchable now — verified provider+dub proof" if actionable_provider_evidence else "Discovery only — provider/dub unverified; not actionable",
                     "available_via_providers": available_via_providers,
                     "availability_confidence": availability_confidence,
                     "availability_confidence_bonus": availability_confidence_bonus,

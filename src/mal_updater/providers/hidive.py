@@ -67,6 +67,11 @@ class HidiveProvider:
     def search_title(self, config: AppConfig, query: str, *, limit: int = 10):
         return _search_title(config, query, limit=limit)
 
+    def fetch_search_result_detail(self, config: AppConfig, match):
+        # HIDIVE Algolia VOD_SERIES hits already carry the explicit Audio|... tags
+        # used as conservative catalog/dub evidence; no broader detail crawl here.
+        return match
+
 
 provider = HidiveProvider()
 register_provider(provider)
@@ -129,7 +134,7 @@ def _series_from_algolia_hit(hit: dict) -> ProviderSearchResult | None:
         season_title=title,
         url=str(url) if url else None,
         audio_locales=_audio_locales_from_hidive_tags(hit.get("tags")),
-        raw=hit,
+        raw={**hit, "catalog_status": "present", "catalog_evidence_source": "hidive_algolia_vod_series"},
     )
 
 

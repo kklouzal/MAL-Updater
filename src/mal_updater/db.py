@@ -304,11 +304,17 @@ def insert_recommendation_snapshot_rows(
     return len(prepared)
 
 
-def list_latest_recommendation_snapshot_rows(db_path: Path, *, limit: int | None = 100) -> list[RecommendationSnapshotRow]:
+def list_latest_recommendation_snapshot_rows(db_path: Path, *, limit: int | None = 100, kind: str | None = None) -> list[RecommendationSnapshotRow]:
     with connect(db_path) as conn:
-        run = conn.execute(
-            "SELECT run_id FROM recommendation_score_snapshots ORDER BY generated_at DESC, id DESC LIMIT 1"
-        ).fetchone()
+        if kind is None:
+            run = conn.execute(
+                "SELECT run_id FROM recommendation_score_snapshots ORDER BY generated_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            run = conn.execute(
+                "SELECT run_id FROM recommendation_score_snapshots WHERE kind = ? ORDER BY generated_at DESC, id DESC LIMIT 1",
+                (kind,),
+            ).fetchone()
         if run is None:
             return []
         sql = """
@@ -317,11 +323,13 @@ def list_latest_recommendation_snapshot_rows(db_path: Path, *, limit: int | None
             ORDER BY priority DESC, score DESC, title COLLATE NOCASE ASC, id ASC
             """
         params: tuple[Any, ...]
+        if kind is not None:
+            sql = sql.replace("WHERE run_id = ?", "WHERE run_id = ? AND kind = ?")
         if limit is None:
-            params = (run["run_id"],)
+            params = (run["run_id"],) if kind is None else (run["run_id"], kind)
         else:
             sql += " LIMIT ?"
-            params = (run["run_id"], max(1, int(limit)))
+            params = (run["run_id"], max(1, int(limit))) if kind is None else (run["run_id"], kind, max(1, int(limit)))
         rows = conn.execute(sql, params).fetchall()
     return [_recommendation_snapshot_row_from_db(row) for row in rows]
 

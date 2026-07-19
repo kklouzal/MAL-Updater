@@ -42,6 +42,8 @@ class EnrichmentSummary:
     ambiguous_matches: int = 0
     providers_skipped: list[str] = field(default_factory=list)
     provider_search_failures: int = 0
+    provider_detail_probes: int = 0
+    provider_detail_failures: int = 0
     failure_details: list[dict[str, str]] = field(default_factory=list)
     eligibility_evidence_upserted: int = 0
     verified_eligibility_evidence_upserted: int = 0
@@ -59,6 +61,8 @@ class EnrichmentSummary:
             "ambiguous_matches": self.ambiguous_matches,
             "providers_skipped": sorted(set(self.providers_skipped)),
             "provider_search_failures": self.provider_search_failures,
+            "provider_detail_probes": self.provider_detail_probes,
+            "provider_detail_failures": self.provider_detail_failures,
             "failure_details": self.failure_details,
             "eligibility_evidence_upserted": self.eligibility_evidence_upserted,
             "verified_eligibility_evidence_upserted": self.verified_eligibility_evidence_upserted,
@@ -130,6 +134,8 @@ def _match_to_dict(match: Any) -> dict[str, Any]:
         "season_title": str(season_title) if season_title is not None else None,
         "url": raw.get("url"),
         "audio_locales": raw.get("audio_locales") if isinstance(raw.get("audio_locales"), list) else [],
+        "catalog_status": raw.get("catalog_status") if raw.get("catalog_status") in {"present", "absent", "unknown"} else None,
+        "detail_evidence_source": raw.get("detail_evidence_source"),
         "raw": raw,
     }
 
@@ -146,10 +152,61 @@ def _is_english_dub_match(match: dict[str, Any]) -> bool:
     return bool(locales & {"en", "en-us", "en-gb"})
 
 
+def _audio_locales(match: dict[str, Any]) -> list[Any]:
+    return match.get("audio_locales") if isinstance(match.get("audio_locales"), list) else []
+
+
 def _explicit_dub_evidence_source(provider: str, match: dict[str, Any]) -> str | None:
     if not _is_english_dub_match(match):
         return None
     return "provider_audio_locale" if provider == "crunchyroll" else "provider_audio_tag"
+
+
+def _english_dub_status_from_match(provider: str, match: dict[str, Any]) -> str:
+    if _explicit_dub_evidence_source(provider, match) is not None:
+        return "present"
+    # Crunchyroll CMS/search audio_locales and HIDIVE Algolia Audio|... tags are
+    # explicit provider audio contracts. If one of those contracts is present but
+    # lacks English, record a conservative negative instead of pretending no
+    # provider evidence was checked. Empty/missing contracts remain unknown.
+    locales = _audio_locales(match)
+    if locales:
+        return "absent"
+    return "unknown"
+
+
+def _catalog_status_from_match(match: dict[str, Any]) -> str:
+    status = str(match.get("catalog_status") or "").strip().lower()
+    if status in {"present", "absent"}:
+        return status
+    raw = match.get("raw") if isinstance(match.get("raw"), dict) else {}
+    raw_status = str(raw.get("catalog_status") or "").strip().lower()
+    if raw_status in {"present", "absent"}:
+        return raw_status
+    # A normalized series-like provider search result is a catalog-presence
+    # signal. This does not verify MAL<->provider identity; review remains gated.
+    return "present"
+
+
+def _provider_detail_needed(provider: ProviderTitleSearchClient, match: dict[str, Any]) -> bool:
+    provider_slug = str(getattr(provider, "slug", "")).strip().lower()
+    if provider_slug == "crunchyroll":
+        return not _audio_locales(match)
+    return False
+
+
+def _fetch_provider_detail_if_available(
+    provider: ProviderTitleSearchClient,
+    config: AppConfig,
+    match: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    detail_func = getattr(provider, "fetch_search_result_detail", None)
+    if not callable(detail_func) or not _provider_detail_needed(provider, match):
+        return match, False
+    enriched = detail_func(config, match)
+    if enriched is None:
+        return match, True
+    return _match_to_dict(enriched), True
 
 
 def _upsert_search_eligibility_evidence(
@@ -174,7 +231,9 @@ def _upsert_search_eligibility_evidence(
         and int(getattr(mapping, "mal_anime_id", -1)) == int(mal_anime_id)
     )
     explicit_source = _explicit_dub_evidence_source(provider, match)
-    verified_actionable = approved_identity and explicit_source is not None
+    catalog_status = _catalog_status_from_match(match)
+    english_dub_status = _english_dub_status_from_match(provider, match)
+    verified_actionable = approved_identity and catalog_status == "present" and english_dub_status == "present"
     upsert_recommendation_provider_eligibility_evidence(
         config.db_path,
         mal_anime_id=int(mal_anime_id),
@@ -185,8 +244,8 @@ def _upsert_search_eligibility_evidence(
         identity_match_kind="approved_mapping" if approved_identity else "provider_title_search",
         match_confidence=(getattr(mapping, "confidence", None) if approved_identity else None),
         review_status="verified" if approved_identity else "review-needed",
-        catalog_status="present" if approved_identity else "unknown",
-        english_dub_status="present" if verified_actionable else "unknown",
+        catalog_status=catalog_status,
+        english_dub_status=english_dub_status,
         explicit_dub_evidence_source=explicit_source,
         audio_locales=match.get("audio_locales") if isinstance(match.get("audio_locales"), list) else [],
         source_evidence={
@@ -198,6 +257,10 @@ def _upsert_search_eligibility_evidence(
             "provider_series_id": str(provider_series_id),
             "match": match,
             "approved_mapping": bool(approved_identity),
+            "catalog_status": catalog_status,
+            "catalog_evidence_source": match.get("detail_evidence_source") or ("provider_title_search_result" if catalog_status == "present" else "provider_title_search_result_negative"),
+            "english_dub_status": english_dub_status,
+            "explicit_dub_evidence_source": explicit_source,
             "mapping_source": getattr(mapping, "mapping_source", None) if mapping is not None else None,
             "mapping_confidence": getattr(mapping, "confidence", None) if mapping is not None else None,
         },
@@ -331,6 +394,15 @@ def enrich_discovery_provider_availability(
                     match = selected[0]
                     provider_series_id = match.get("provider_series_id")
                     if provider_series_id:
+                        try:
+                            match, detail_attempted = _fetch_provider_detail_if_available(provider, config, match)
+                            if detail_attempted:
+                                summary.provider_detail_probes += 1
+                        except Exception as exc:  # detail enrichment is optional; keep the search hit evidence
+                            summary.provider_detail_failures += 1
+                            if len(summary.failure_details) < 10:
+                                summary.failure_details.append({"provider": str(provider.slug), "query": query, "detail_error": str(exc)})
+                        provider_series_id = match.get("provider_series_id") or provider_series_id
                         _ensure_provider_series(config, provider=provider.slug, match=match)
                         summary.strong_matches += 1
                         persisted, verified = _upsert_search_eligibility_evidence(

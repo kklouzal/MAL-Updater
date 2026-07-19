@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
+from .config import load_config
 from .db import (
     bootstrap_database,
     connect,
@@ -17,7 +18,7 @@ from .db import (
     list_latest_recommendation_snapshot_rows,
 )
 
-from .recommendations import Recommendation
+from .recommendations import Recommendation, build_recommendations
 
 DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT = 120
 STRICT_DISCOVERY_DIAGNOSTIC_COMMAND = "PYTHONPATH=src python3 -m mal_updater.cli recommend --include-dormant --limit 120"
@@ -26,13 +27,13 @@ _PROVIDER_LABELS = {"crunchyroll": "Crunchyroll", "hidive": "HIDIVE", "mal": "My
 
 _SECTION_METADATA: dict[str, dict[str, str]] = {
     "discovery_available_now": {
-        "label": "Strict actionable discovery",
+        "label": "Watchable now",
         "description": "Actionable discovery titles require fresh verified Crunchyroll or HIDIVE availability plus explicit English dub evidence.",
         "title_label": "English title",
     },
     "discovery_high_confidence": {
-        "label": "Dormant discovery diagnostics",
-        "description": "Diagnostic-only recommendation candidates that do not currently satisfy strict provider+dub proof; do not treat these rows as actionable.",
+        "label": "Ranked discovery recommendations",
+        "description": "Ranked MAL recommendation-graph discovery candidates. Provider availability and English-dub evidence may be unknown or unverified; these rows are not watch-now/actionable unless they also appear in Watchable now.",
         "title_label": "English title",
         "diagnostic_only": "true",
     },
@@ -252,6 +253,12 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
     review_labels = _compact_list([item.get("review_status") for item in eligibility_details])
     catalog_labels = _compact_list([item.get("catalog_status") for item in eligibility_details])
     english_dub_labels = _compact_list([item.get("english_dub_status") for item in eligibility_details])
+    if dub_status == "unknown" and english_dub_labels:
+        normalized_dub_labels = {str(value).strip().lower() for value in english_dub_labels}
+        if "present" in normalized_dub_labels:
+            dub_status = "present"
+        elif normalized_dub_labels <= {"absent", "none"}:
+            dub_status = "none"
     verification_label = "; ".join(
         part
         for part in (
@@ -292,6 +299,77 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
         "why_recommended": _compact_text(merged.get("why_recommended") or "; ".join(str(value) for value in row.get("reasons", []) if value)),
         "scorecard_summary": _format_scorecard(scorecard),
     }
+
+
+def _strict_actionability_failure_reasons(row: dict[str, Any]) -> list[str]:
+    evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else _snapshot_evidence(row)
+    details = evidence.get("provider_eligibility_evidence") if isinstance(evidence.get("provider_eligibility_evidence"), list) else []
+    if not details:
+        return [
+            "provider availability unverified",
+            "English-dub evidence unknown",
+        ]
+    reasons: list[str] = []
+    strict_provider_found = False
+    strict_catalog_found = False
+    strict_dub_found = False
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("provider") or "").strip().lower() in {"crunchyroll", "hidive"}:
+            strict_provider_found = True
+        if item.get("review_status") == "verified" and item.get("catalog_status") == "present" and item.get("fresh") is True:
+            strict_catalog_found = True
+        if item.get("english_dub_status") == "present":
+            strict_dub_found = True
+    if not strict_provider_found:
+        reasons.append("Crunchyroll/HIDIVE identity unverified")
+    if not strict_catalog_found:
+        reasons.append("current provider catalog presence unverified")
+    if not strict_dub_found:
+        reasons.append("English-dub evidence unknown")
+    return reasons or ["strict provider+dub proof incomplete"]
+
+
+def _mark_discovery_row_visibility(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("kind") != "discovery_candidate":
+        row["actionable"] = True
+        row["diagnostic_only"] = False
+        row["visibility_label"] = "actionable"
+        return row
+    actionable = _is_displayable_discovery(row)
+    row["actionable"] = actionable
+    row["diagnostic_only"] = not actionable
+    if actionable:
+        row["visibility_label"] = "Watchable now — verified provider+dub proof"
+        row["strict_actionability"] = {"eligible": True, "missing": []}
+    else:
+        missing = _strict_actionability_failure_reasons(row)
+        row["visibility_label"] = "Discovery only — provider/dub unverified; not actionable"
+        row["strict_actionability"] = {"eligible": False, "missing": missing}
+        row["unverified_evidence_label"] = "; ".join(missing)
+        if row.get("provider_evidence"):
+            row["provider_evidence"] = f"{row['provider_evidence']} (unverified)"
+        else:
+            row["provider_evidence"] = "unknown/unverified"
+        badges = row.get("provider_badges")
+        if isinstance(badges, list) and badges:
+            unverified_badges = []
+            for badge in badges:
+                if not isinstance(badge, dict):
+                    continue
+                label = str(badge.get("label") or _provider_label(badge.get("provider")))
+                unverified_badges.append({**badge, "label": f"{label} (unverified)", "url": ""})
+            row["provider_badges"] = unverified_badges
+            row["provider_evidence_html"] = _provider_evidence_html(unverified_badges)
+            evidence = row.get("evidence")
+            if isinstance(evidence, dict):
+                evidence["provider_badges"] = unverified_badges
+        if row.get("english_dub_evidence") in (None, "", "unknown"):
+            row["english_dub_evidence"] = "unknown/unverified"
+        elif row.get("english_dub_evidence") == "present":
+            row["english_dub_evidence"] = "present (unverified)"
+    return row
 
 
 def _dub_status(value: Any) -> str:
@@ -408,7 +486,20 @@ def _row(item: Recommendation) -> dict[str, Any]:
     )
     scorecard = context.get("scorecard") if isinstance(context.get("scorecard"), dict) else None
     why_recommended = _compact_text(context.get("why_recommended"))
-    return {
+    snapshot_evidence = _snapshot_evidence(
+        {
+            "kind": item.kind,
+            "provider": item.provider,
+            "title": item.title,
+            "provider_series_id": item.provider_series_id,
+            "priority": item.priority,
+            "reasons": item.reasons,
+            "context": context,
+            "availability_providers": context.get("available_via_providers") if isinstance(context.get("available_via_providers"), list) else [],
+        }
+    )
+    dub_status = str(snapshot_evidence.get("dub_status") or _dub_status(context.get("english_dub_signal") or context.get("english_dub")))
+    row = {
         "title": display_title,
         "score": item.priority,
         "source_count": source_count,
@@ -416,10 +507,11 @@ def _row(item: Recommendation) -> dict[str, Any]:
         "crunchyroll": _truthy_provider(providers, "crunchyroll"),
         "hidive": _truthy_provider(providers, "hidive"),
         "english_dub": _english_dub_status(item),
-        "dub_status": _dub_status(context.get("english_dub_signal") or context.get("english_dub")),
+        "dub_status": dub_status,
         "provider_evidence": "; ".join(str(badge.get("label")) for badge in provider_badges),
         "provider_evidence_html": _provider_evidence_html(provider_badges),
-        "english_dub_evidence": "present" if _dub_status(context.get("english_dub_signal") or context.get("english_dub")) == "present" else _dub_status(context.get("english_dub_signal") or context.get("english_dub")),
+        "provider_badges": provider_badges,
+        "english_dub_evidence": "present" if dub_status == "present" else dub_status,
         "verification": verification_label,
         "evidence_freshness": _format_evidence_freshness(provider_evidence),
         "why_recommended": why_recommended,
@@ -436,7 +528,10 @@ def _row(item: Recommendation) -> dict[str, Any]:
         "providers": ", ".join(providers),
         "availability_providers": context.get("available_via_providers") if isinstance(context.get("available_via_providers"), list) else [],
         "provider_series_id": item.provider_series_id,
+        "context": context,
+        "evidence": snapshot_evidence,
     }
+    return _mark_discovery_row_visibility(row)
 
 
 _COLUMNS: tuple[tuple[str, str, str], ...] = (
@@ -472,19 +567,32 @@ _STATIC_SECTION_ORDER: tuple[str, ...] = ("discovery_available_now", "discovery_
 
 
 def _is_displayable_discovery(row: dict[str, Any]) -> bool:
-    availability = row.get("availability_providers")
-    if not (isinstance(availability, list) and any(str(value).strip() for value in availability)):
-        return False
-    context = row.get("context") if isinstance(row.get("context"), dict) else {}
-    scorecard = row.get("scorecard") if isinstance(row.get("scorecard"), dict) else {}
-    features = scorecard.get("features") if isinstance(scorecard.get("features"), dict) else {}
-    dub_signal = row.get("english_dub") or context.get("english_dub_signal") or features.get("english_dub_signal") or context.get("english_dub")
-    return dub_signal is True or str(dub_signal).strip().lower() in {"present", "yes", "true", "english dub"}
+    evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else _snapshot_evidence(row)
+    details = evidence.get("provider_eligibility_evidence") if isinstance(evidence.get("provider_eligibility_evidence"), list) else []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider not in {"crunchyroll", "hidive"}:
+            continue
+        if item.get("identity_match_kind") not in {"approved_mapping", "manual_verified", "user_exact", "auto_exact"}:
+            continue
+        if item.get("review_status") != "verified" or item.get("catalog_status") != "present":
+            continue
+        if item.get("english_dub_status") != "present":
+            continue
+        if item.get("expired") is True:
+            continue
+        if item.get("fresh") is True:
+            return True
+    return False
 
 
 def _static_section_key(row: dict[str, Any]) -> str | None:
     kind = str(row.get("kind") or "unknown")
     if kind == "discovery_candidate":
+        if row.get("force_diagnostic_only") is True:
+            return "discovery_high_confidence"
         return "discovery_available_now" if _is_displayable_discovery(row) else "discovery_high_confidence"
     return kind
 
@@ -553,21 +661,21 @@ def _dashboard_mode_banner(*, diagnostic_mode: bool) -> str:
     if diagnostic_mode:
         return (
             '<section class="banner warn"><strong>Diagnostic mode:</strong> '
-            'Dormant/internal discovery candidates are included for operator inspection only. '
+            'Ranked discovery recommendations are included for operator inspection only. '
             'Rows without verified current Crunchyroll/HIDIVE availability plus explicit English-dub evidence are not actionable.</section>'
         )
     return (
-        '<section class="banner good"><strong>Strict actionable dashboard:</strong> '
-        'Discovery rows are intended to require fresh verified Crunchyroll/HIDIVE availability and explicit English-dub evidence. '
+        '<section class="banner good"><strong>Watchable now dashboard:</strong> '
+        'Actionable discovery rows require fresh verified Crunchyroll/HIDIVE identity/catalog presence and explicit English-dub evidence. '
         'Use <code>--include-dormant</code> only for diagnostics.</section>'
     )
 
 
 def _strict_empty_state_html(*, dormant_count: int = 0, pending_review_count: int = 0, stale_count: int = 0) -> str:
     return (
-        '<section class="empty-state"><h2>No strict actionable discovery titles</h2>'
+        '<section class="empty-state"><h2>No Watchable now discovery titles</h2>'
         '<p>Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence.</p>'
-        f'<ul><li>Dormant/internal discovery candidates visible in diagnostics: {escape(str(dormant_count))}</li>'
+        f'<ul><li>Ranked unverified discovery candidates visible in diagnostics: {escape(str(dormant_count))}</li>'
         f'<li>Provider evidence pending review: {escape(str(pending_review_count))}</li>'
         f'<li>Stale or expired provider evidence: {escape(str(stale_count))}</li></ul>'
         f'<p class="meta">Bounded next diagnostic command: <code>{escape(STRICT_DISCOVERY_DIAGNOSTIC_COMMAND)}</code></p></section>'
@@ -589,7 +697,7 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
         for index, (meta, section_rows, total_rows) in enumerate(_cap_sections(_static_sections(rows), limit=limit), start=1):
             description = f'<p class="meta">{escape(meta["description"])}</p>' if meta.get("description") else ""
             if meta.get("diagnostic_only") == "true":
-                description += '<p class="warn"><strong>Diagnostic only:</strong> these dormant rows lack strict actionable provider+dub proof.</p>'
+                description += '<p class="warn"><strong>Discovery only:</strong> these rows lack strict actionable provider+dub proof and are not watch-now eligible.</p>'
             count_label = _section_count_label(len(section_rows), total_rows)
             sections.append(
                 f'<section><h2>{escape(meta["label"])} ({escape(count_label)})</h2>{description}'
@@ -711,9 +819,7 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
         "verification": payload["evidence"].get("verification_label", ""),
         "freshness": payload["evidence"].get("evidence_freshness_label", ""),
     }
-    payload["actionable"] = _is_displayable_discovery(payload) if row.kind == "discovery_candidate" else True
-    payload["diagnostic_only"] = row.kind == "discovery_candidate" and not payload["actionable"]
-    return payload
+    return _mark_discovery_row_visibility(payload)
 
 
 def _latest_snapshot_summary(db_path: Path) -> dict[str, Any] | None:
@@ -774,12 +880,89 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
     return {key: int(row[key] or 0) for key in ("total", "strict_current", "pending_review", "stale")}
 
 
+def _project_root_from_db_path(db_path: Path) -> Path | None:
+    resolved = db_path.resolve()
+    for parent in (resolved.parent, *resolved.parents):
+        if parent.name == ".MAL-Updater":
+            return parent.parent
+    return None
+
+
+def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Build current diagnostic discovery rows from local SQLite-backed state only.
+
+    This intentionally uses the recommendation scorer over cached local state instead of any
+    provider/MAL network calls, so page requests can expose discovery visibility without
+    mutating strict persisted recommendation snapshots.
+    """
+    project_root = _project_root_from_db_path(db_path)
+    if project_root is None:
+        return [], None
+    try:
+        config = load_config(project_root)
+        if config.db_path.resolve() != db_path.resolve():
+            return [], None
+        results = build_recommendations(
+            config,
+            limit=max(1, int(limit)),
+            require_provider_availability=False,
+            include_discovery_candidates_without_actionable_provider_evidence=True,
+        )
+    except Exception:
+        return [], None
+    rows: list[dict[str, Any]] = []
+    for item in results:
+        if item.kind != "discovery_candidate":
+            continue
+        row = _row(item)
+        genres = item.context.get("genres")
+        if isinstance(genres, list):
+            row["genres"] = [str(value) for value in genres if value is not None]
+        rows.append(row)
+    if not rows:
+        return [], None
+    return rows, {
+        "run_id": "local-diagnostic-current",
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "item_count": len(rows),
+        "selection": "current local recommendation scorer with --include-dormant semantics; no provider network calls",
+    }
+
+
 def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14) -> dict[str, Any]:
     """Return the current dashboard model directly from SQLite state."""
     bootstrap_database(db_path)
     operational = get_operational_snapshot(db_path)
     coverage = get_mal_recommendation_harvest_coverage(db_path, stale_after_days=stale_after_days)
-    rows = [_snapshot_row_to_dict(row) for row in list_latest_recommendation_snapshot_rows(db_path, limit=None)]
+    latest_snapshot = _latest_snapshot_summary(db_path)
+    latest_run_id = latest_snapshot.get("run_id") if latest_snapshot else None
+    latest_raw_rows = list_latest_recommendation_snapshot_rows(db_path, limit=None)
+    rows = [_snapshot_row_to_dict(row) for row in latest_raw_rows]
+    latest_has_discovery = any(row.kind == "discovery_candidate" for row in latest_raw_rows)
+    diagnostic_source_snapshot: dict[str, Any] | None = None
+    if not latest_has_discovery:
+        current_rows, current_source = _current_ranked_discovery_rows_from_local_state(db_path, limit=limit)
+        if current_rows:
+            diagnostic_source_snapshot = current_source
+            for row in current_rows:
+                rows.append(row)
+        else:
+            diagnostic_raw_rows = list_latest_recommendation_snapshot_rows(db_path, limit=None, kind="discovery_candidate")
+            if diagnostic_raw_rows:
+                diagnostic_source_snapshot = {
+                    "run_id": diagnostic_raw_rows[0].run_id,
+                    "generated_at": max(row.generated_at for row in diagnostic_raw_rows),
+                    "item_count": len(diagnostic_raw_rows),
+                    "selection": "latest persisted snapshot run containing discovery_candidate rows",
+                }
+                for raw_row in diagnostic_raw_rows:
+                    row = _snapshot_row_to_dict(raw_row)
+                    row["force_diagnostic_only"] = True
+                    row["actionable"] = False
+                    row["diagnostic_only"] = True
+                    row["visibility_label"] = "Discovery only — provider/dub unverified; not actionable"
+                    row["strict_actionability"] = {"eligible": False, "missing": ["not present in latest strict snapshot"]}
+                    rows.append(row)
     sections: dict[str, list[dict[str, Any]]] = {}
     section_totals: dict[str, int] = {}
     display_limit = _section_display_budget(limit)
@@ -802,7 +985,6 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
         "message": "Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence." if strict_actionable_count == 0 else "Strict actionable discovery is populated from verified current provider+dub evidence.",
         "next_diagnostic_command": STRICT_DISCOVERY_DIAGNOSTIC_COMMAND,
     }
-    latest_snapshot = _latest_snapshot_summary(db_path)
     latest_run = operational.get("latest_sync_run") or {}
     indicators: list[dict[str, str]] = []
     if latest_snapshot is None:
@@ -818,11 +1000,13 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
         indicators.append({"level": "warning", "message": coverage_state["message"]})
     if dormant_count:
         indicators.append({"level": "warning", "message": "Dormant discovery diagnostic rows are present; they are not actionable without strict provider+dub proof."})
+    if diagnostic_source_snapshot is not None and diagnostic_source_snapshot.get("run_id") != latest_run_id:
+        indicators.append({"level": "warning", "message": "Ranked discovery recommendations are sourced from the latest persisted diagnostic discovery snapshot, not the latest strict snapshot."})
     section_metadata = {kind: _section_metadata_for(kind) for kind in (*_STATIC_SECTION_ORDER, *sections.keys())}
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "snapshot": latest_snapshot,
-        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "limit": max(1, int(limit)), "limit_scope": "per_section"},
+        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "diagnostic_source_snapshot": diagnostic_source_snapshot, "limit": max(1, int(limit)), "limit_scope": "per_section"},
         "coverage": coverage,
         "operational": operational,
         "recent_sync_runs": _recent_sync_runs(db_path),
@@ -838,13 +1022,14 @@ body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;backgro
 </style></head><body><h1>__TITLE__</h1><p class=\"muted\">Live local strict dashboard. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${esc(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
-const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ')); return badges.map(b => { const label = `<span class=\"provider-badge\">${esc(b.label || b.provider)}</span>`; const title = b.title ? ` <span class=\"muted\">${esc(b.title)}</span>` : ''; return `${b.url ? `<a href=\"${esc(b.url)}\" rel=\"noreferrer noopener\">${label}</a>` : label}${title}`; }).join('<br>'); };
+const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const label = `<span class=\"provider-badge\">${esc(b.label || b.provider)}</span>`; const title = b.title ? ` <span class=\"muted\">${esc(b.title)}</span>` : ''; return `${b.url ? `<a href=\"${esc(b.url)}\" rel=\"noreferrer noopener\">${label}</a>` : label}${title}`; }).join('<br>'); };
 const seedDetails = e => (e?.top_supporting_seeds || []).map(s => { const bits = []; if (s.num_recommendation_votes != null) bits.push(`${s.num_recommendation_votes} MAL vote${s.num_recommendation_votes === 1 ? '' : 's'}`); if (s.user_score != null) bits.push(`score ${s.user_score}`); if (s.status) bits.push(s.status); return `${esc(s.title || s.mal_anime_id || 'MAL seed')}${bits.length ? ` <span class=\"muted\">(${esc(bits.join(', '))})</span>` : ''}`; }).join('<br>') || esc(e?.compact_seeds || '');
 const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary || '');
-function recTable(rows, meta = {}){ if(!rows?.length) return '<p class=\"muted\">No rows in latest snapshot.</p>'; const progress = r => { const c = r.context || {}; const done = c.completed_episode_count ?? c.max_completed_episode_number; const max = c.max_episode_number ?? c.available_episode_count; return done != null && max != null ? `${done}/${max}` : (done != null ? `${done}` : ''); }; const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Diagnostic only:</strong> these dormant rows lack strict provider+dub proof and are not actionable.</p>' : ''; return `${diag}<table><thead><tr><th>Priority</th><th>${esc(titleLabel)}</th><th>Provider proof</th><th>English dub</th><th>Identity/review/catalog</th><th>Freshness/expiry</th><th>Why recommended</th><th>Scorecard</th><th>Top watched seeds</th><th>Genres</th><th>Provider progress</th><th>MAL watch status</th></tr></thead><tbody>${rows.map(r => { const e = r.evidence || {}; const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">diagnostic only</div>' : ''; return `<tr class=\"${diagnostic}\"><td>${esc(r.priority ?? r.score)}</td><td>${diagnosticLabel}${esc(r.display_title || r.english_title || r.title)}</td><td>${providerBadges(r)}</td><td>${esc(r.english_dub_evidence || e.dub_signal || '')}</td><td>${esc(r.verification || e.verification_label || '')}</td><td>${esc(r.evidence_freshness || e.evidence_freshness_label || '')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc((r.genres || []).join(', '))}</td><td>${esc(progress(r))}</td><td>${esc(e.mal_watch_status || '')}</td></tr>`; }).join('')}</tbody></table>`; }
+const genreText = r => Array.isArray(r.genres) ? r.genres.join(', ') : (r.genres ?? '');
+function recTable(rows, meta = {}){ if(!rows?.length) return '<p class=\"muted\">No rows in latest snapshot.</p>'; const progress = r => { const c = r.context || {}; const done = c.completed_episode_count ?? c.max_completed_episode_number; const max = c.max_episode_number ?? c.available_episode_count; return done != null && max != null ? `${done}/${max}` : (done != null ? `${done}` : ''); }; const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; return `${diag}<table><thead><tr><th>Priority</th><th>${esc(titleLabel)}</th><th>Provider proof</th><th>English dub</th><th>Identity/review/catalog</th><th>Freshness/expiry</th><th>Why recommended</th><th>Scorecard</th><th>Top watched seeds</th><th>Genres</th><th>Provider progress</th><th>MAL watch status</th></tr></thead><tbody>${rows.map(r => { const e = r.evidence || {}; const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">discovery only · unverified</div>' : ''; return `<tr class=\"${diagnostic}\"><td>${esc(r.priority ?? r.score)}</td><td>${diagnosticLabel}${esc(r.display_title || r.english_title || r.title)}</td><td>${providerBadges(r)}</td><td>${esc(r.english_dub_evidence || e.dub_signal || '')}</td><td>${esc(r.verification || e.verification_label || r.unverified_evidence_label || '')}</td><td>${esc(r.evidence_freshness || e.evidence_freshness_label || '')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td><td>${esc(progress(r))}</td><td>${esc(e.mal_watch_status || '')}</td></tr>`; }).join('')}</tbody></table>`; }
 function syncTable(runs){ if(!runs?.length) return '<p class=\"muted\">No sync runs recorded.</p>'; return `<table><thead><tr><th>ID</th><th>Provider</th><th>Mode</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.provider)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td><td>${esc(r.started_at)}</td><td>${esc(r.completed_at)}</td></tr>`).join('')}</tbody></table>`; }
-function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No strict actionable discovery titles</h2><p>${esc(state.message)}</p><ul><li>Dormant/internal candidates: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
-async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Diagnostic snapshot:</strong> dormant/internal rows may be present and are not actionable unless strict provider+dub proof is shown.</section>' : '<section class=\"banner good\"><strong>Strict actionable dashboard:</strong> discovery rows require verified current Crunchyroll/HIDIVE availability plus explicit English-dub evidence.</section>'; document.getElementById('app').innerHTML = `${mode}<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({strict_actionable: state.strict_actionable_count, dormant_diagnostics: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${emptyState(state)}<section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Latest recommendation snapshot</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
+function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
+async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown/unverified provider or dub evidence; only Watchable now is actionable.</section>' : '<section class=\"banner good\"><strong>Watchable now dashboard:</strong> actionable discovery rows require verified current Crunchyroll/HIDIVE identity/catalog presence plus explicit English-dub evidence.</section>'; document.getElementById('app').innerHTML = `${mode}<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({watchable_now: state.strict_actionable_count, ranked_unverified_discovery: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${emptyState(state)}<section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Recommendations</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
 refresh().catch(err => document.getElementById('app').innerHTML = `<p class=\"bad\">${esc(err.message)}</p>`); setInterval(refresh, 60000);
 </script></body></html>"""
     return template.replace("__TITLE__", escape(title))
