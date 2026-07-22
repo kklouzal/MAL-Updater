@@ -575,7 +575,7 @@ def _is_displayable_discovery(row: dict[str, Any]) -> bool:
         provider = str(item.get("provider") or "").strip().lower()
         if provider not in {"crunchyroll", "hidive"}:
             continue
-        if item.get("identity_match_kind") not in {"approved_mapping", "manual_verified", "user_exact", "auto_exact"}:
+        if item.get("identity_match_kind") not in {"approved_mapping", "manual_verified", "user_exact", "auto_exact", "provider_title_search_exact"}:
             continue
         if item.get("review_status") != "verified" or item.get("catalog_status") != "present":
             continue

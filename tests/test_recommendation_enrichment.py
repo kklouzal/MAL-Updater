@@ -231,8 +231,9 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(1, summary.eligibility_evidence_upserted)
         self.assertIsNotNone(evidence)
         assert evidence is not None
-        self.assertEqual("review-needed", evidence.review_status)
-        self.assertEqual("provider_title_search", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
+        self.assertEqual(0.9, evidence.match_confidence)
         self.assertEqual("present", evidence.catalog_status)
         self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
@@ -334,10 +335,12 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             provider_series_id="707",
         )
         self.assertEqual(1, summary.eligibility_evidence_upserted)
-        self.assertEqual(0, summary.verified_eligibility_evidence_upserted)
+        self.assertEqual(1, summary.verified_eligibility_evidence_upserted)
         self.assertIsNotNone(evidence)
         assert evidence is not None
-        self.assertEqual("review-needed", evidence.review_status)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
+        self.assertEqual(0.9, evidence.match_confidence)
         self.assertEqual("present", evidence.catalog_status)
         self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("provider_audio_tag", evidence.explicit_dub_evidence_source)
@@ -373,6 +376,22 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("present", evidence.catalog_status)
         self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("2026-07-26T01:00:00Z", evidence.expires_at)
+
+    def test_provider_search_result_raw_catalog_evidence_survives_normalization(self):
+        match = enrichment._match_to_dict(
+            ProviderSearchResult(
+                provider_series_id="2312",
+                title="Dungeon People",
+                season_title="Dungeon People",
+                url="https://www.hidive.com/season/2312",
+                audio_locales=["ja-JP", "en-US"],
+                raw={"type": "VOD_SERIES", "catalog_status": "present", "catalog_evidence_source": "hidive_algolia_vod_series", "tags": ["Audio|Japanese", "Audio|English"]},
+            )
+        )
+
+        self.assertEqual("present", match["catalog_status"])
+        self.assertEqual("hidive_algolia_vod_series", match["detail_evidence_source"])
+        self.assertEqual(["Audio|Japanese", "Audio|English"], match["raw"]["tags"])
 
     def test_hidive_false_negative_aliases_are_searched_and_queued(self):
         fixtures = [

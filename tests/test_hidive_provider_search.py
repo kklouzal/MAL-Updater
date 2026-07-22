@@ -75,6 +75,13 @@ class HidiveProviderSearchTests(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual(results[0].audio_locales, [])
 
+    def test_url_falls_back_to_stable_season_id_when_algolia_hit_has_no_slug(self) -> None:
+        payload = {"hits": [{"objectID": "VOD_SERIES_2312", "id": 2312, "type": "VOD_SERIES", "title": "Dungeon People", "tags": ["Audio|English"]}]}
+
+        results = hidive._normalize_algolia_hits(payload, limit=10)
+
+        self.assertEqual("https://www.hidive.com/season/2312", results[0].url)
+
     def test_normalize_algolia_hits_dedupes_and_applies_limit(self) -> None:
         payload = {
             "hits": [

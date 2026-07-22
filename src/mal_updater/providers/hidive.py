@@ -128,6 +128,8 @@ def _series_from_algolia_hit(hit: dict) -> ProviderSearchResult | None:
     url = hit.get("url") or hit.get("webUrl")
     if not url and slug:
         url = f"https://www.hidive.com/season/{slug}"
+    if not url:
+        url = f"https://www.hidive.com/season/{provider_series_id}"
     return ProviderSearchResult(
         provider_series_id=str(provider_series_id),
         title=title,

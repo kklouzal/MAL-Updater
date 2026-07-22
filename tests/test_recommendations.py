@@ -2417,6 +2417,38 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual([], visible)
 
+    def test_provider_required_discovery_accepts_verified_exact_title_search_evidence(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(300, title="Exact Search Target")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "Exact Search Target", "num_recommendations": 20, "raw": {}},
+        ], make_targets_available=False)
+        self._cache_provider_eligibility(
+            300,
+            provider_series_id="exact-search-target",
+            provider_title="Exact Search Target",
+            identity_match_kind="provider_title_search_exact",
+        )
+
+        visible = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual(1, len(visible))
+        self.assertEqual("exact-search-target", visible[0].provider_series_id)
+        self.assertEqual("present", visible[0].context["english_dub_signal"])
+        self.assertEqual("provider_title_search_exact", visible[0].context["provider_eligibility_evidence"][0]["identity_match_kind"])
+
     def test_discovery_target_metadata_refresh_considers_hidive_mappings(self) -> None:
         self._insert_series(
             "hidive-seed",

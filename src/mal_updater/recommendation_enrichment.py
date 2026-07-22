@@ -124,19 +124,35 @@ def _match_to_dict(match: Any) -> dict[str, Any]:
     if isinstance(match, dict):
         raw = dict(match)
     else:
-        raw = {name: getattr(match, name) for name in ("provider_series_id", "id", "title", "season_title", "url", "audio_locales") if hasattr(match, name)}
+        raw = {
+            name: getattr(match, name)
+            for name in (
+                "provider_series_id",
+                "id",
+                "title",
+                "season_title",
+                "url",
+                "audio_locales",
+                "catalog_status",
+                "detail_evidence_source",
+                "raw",
+            )
+            if hasattr(match, name)
+        }
+    provider_raw = raw.get("raw") if isinstance(raw.get("raw"), dict) else raw
     provider_series_id = raw.get("provider_series_id") or raw.get("id")
     title = raw.get("title") or raw.get("name")
     season_title = raw.get("season_title")
+    catalog_status = raw.get("catalog_status") or provider_raw.get("catalog_status")
     return {
         "provider_series_id": str(provider_series_id) if provider_series_id is not None else None,
         "title": str(title) if title is not None else None,
         "season_title": str(season_title) if season_title is not None else None,
         "url": raw.get("url"),
         "audio_locales": raw.get("audio_locales") if isinstance(raw.get("audio_locales"), list) else [],
-        "catalog_status": raw.get("catalog_status") if raw.get("catalog_status") in {"present", "absent", "unknown"} else None,
-        "detail_evidence_source": raw.get("detail_evidence_source"),
-        "raw": raw,
+        "catalog_status": catalog_status if catalog_status in {"present", "absent", "unknown"} else None,
+        "detail_evidence_source": raw.get("detail_evidence_source") or provider_raw.get("catalog_evidence_source"),
+        "raw": provider_raw,
     }
 
 
@@ -218,6 +234,7 @@ def _upsert_search_eligibility_evidence(
     query: str,
     match: dict[str, Any],
     mapping: Any | None,
+    search_identity_match_kind: str,
     fetched_at: str,
     expires_at: str,
 ) -> tuple[bool, bool]:
@@ -230,10 +247,14 @@ def _upsert_search_eligibility_evidence(
         and getattr(mapping, "approved_by_user", False)
         and int(getattr(mapping, "mal_anime_id", -1)) == int(mal_anime_id)
     )
+    title_search_verified = search_identity_match_kind == "provider_title_search_exact"
+    identity_match_kind = "approved_mapping" if approved_identity else search_identity_match_kind
+    match_confidence = getattr(mapping, "confidence", None) if approved_identity else (0.9 if title_search_verified else None)
     explicit_source = _explicit_dub_evidence_source(provider, match)
     catalog_status = _catalog_status_from_match(match)
     english_dub_status = _english_dub_status_from_match(provider, match)
-    verified_actionable = approved_identity and catalog_status == "present" and english_dub_status == "present"
+    verified_identity = approved_identity or title_search_verified
+    verified_actionable = verified_identity and catalog_status == "present" and english_dub_status == "present"
     upsert_recommendation_provider_eligibility_evidence(
         config.db_path,
         mal_anime_id=int(mal_anime_id),
@@ -241,9 +262,9 @@ def _upsert_search_eligibility_evidence(
         provider_series_id=str(provider_series_id),
         provider_title=match.get("title") or match.get("season_title"),
         provider_url=match.get("url"),
-        identity_match_kind="approved_mapping" if approved_identity else "provider_title_search",
-        match_confidence=(getattr(mapping, "confidence", None) if approved_identity else None),
-        review_status="verified" if approved_identity else "review-needed",
+        identity_match_kind=identity_match_kind,
+        match_confidence=match_confidence,
+        review_status="verified" if verified_identity else "review-needed",
         catalog_status=catalog_status,
         english_dub_status=english_dub_status,
         explicit_dub_evidence_source=explicit_source,
@@ -263,6 +284,7 @@ def _upsert_search_eligibility_evidence(
             "explicit_dub_evidence_source": explicit_source,
             "mapping_source": getattr(mapping, "mapping_source", None) if mapping is not None else None,
             "mapping_confidence": getattr(mapping, "confidence", None) if mapping is not None else None,
+            "search_identity_match_kind": search_identity_match_kind,
         },
         fetched_at=fetched_at,
         expires_at=expires_at,
@@ -284,6 +306,13 @@ def classify_provider_matches(query: str, matches: list[dict[str, Any]]) -> tupl
     if near or len(matches) > 1:
         return "ambiguous", near or matches
     return "none", []
+
+
+def _search_identity_match_kind(query: str, match: dict[str, Any]) -> str:
+    q = normalize_title(query)
+    if q and (normalize_title(match.get("title")) == q or normalize_title(match.get("season_title")) == q):
+        return "provider_title_search_exact"
+    return "provider_title_search"
 
 
 def _candidate_mal_id(item: Recommendation) -> int | None:
@@ -413,6 +442,7 @@ def enrich_discovery_provider_availability(
                             query=query,
                             match=match,
                             mapping=mappings_by_series.get((provider.slug, str(provider_series_id))),
+                            search_identity_match_kind=_search_identity_match_kind(query, match),
                             fetched_at=fetched_at,
                             expires_at=eligibility_expires_at,
                         )
