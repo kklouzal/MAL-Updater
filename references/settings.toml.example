@@ -34,7 +34,7 @@ recommendations_webhook_enabled = false
 recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
 recommendations_webhook_timeout_seconds = 20.0
 recommendations_webhook_channel = "discord"
-recommendations_webhook_to = "channel:1487239758487748761"
+recommendations_webhook_to = "channel:000000000000000000"
 recommendations_webhook_delivery_mode = "fresh"  # fresh=daemon-safe low-noise posture; use digest/all for manual broader sends
 
 [openclaw.recommendations_webhook_section_limits]

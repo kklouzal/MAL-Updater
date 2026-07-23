@@ -47,7 +47,7 @@ recommendations_webhook_enabled = true
 recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
 recommendations_webhook_timeout_seconds = 7.0
 recommendations_webhook_channel = "discord"
-recommendations_webhook_to = "channel:1487239758487748761"
+recommendations_webhook_to = "channel:000000000000000000"
 recommendations_webhook_delivery_mode = "fresh"
 
 [openclaw.recommendations_webhook_section_limits]
@@ -105,7 +105,7 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         posted = json.loads(request.data.decode("utf-8"))
         self.assertTrue(posted["deliver"])
         self.assertEqual("discord", posted["channel"])
-        self.assertEqual("channel:1487239758487748761", posted["to"])
+        self.assertEqual("channel:000000000000000000", posted["to"])
         self.assertIn("MAL-Updater recommendation webhook event.", posted["message"])
         self.assertIn("Test Show", posted["message"])
         self.assertIn("Delivery posture:", posted["message"])

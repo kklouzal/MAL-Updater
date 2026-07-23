@@ -115,7 +115,7 @@ class ConfigLoadingTests(unittest.TestCase):
                     recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
                     recommendations_webhook_timeout_seconds = 9.5
                     recommendations_webhook_channel = "discord"
-                    recommendations_webhook_to = "channel:1487239758487748761"
+                    recommendations_webhook_to = "channel:000000000000000000"
                     recommendations_webhook_delivery_mode = "all"
 
                     [openclaw.recommendations_webhook_section_limits]
@@ -152,7 +152,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual("http://127.0.0.1:18789/hooks/agent", config.openclaw.recommendations_webhook_url)
             self.assertEqual(9.5, config.openclaw.recommendations_webhook_timeout_seconds)
             self.assertEqual("discord", config.openclaw.recommendations_webhook_channel)
-            self.assertEqual("channel:1487239758487748761", config.openclaw.recommendations_webhook_to)
+            self.assertEqual("channel:000000000000000000", config.openclaw.recommendations_webhook_to)
             self.assertEqual("all", config.openclaw.recommendations_webhook_delivery_mode)
             self.assertEqual(7, config.openclaw.recommendations_webhook_section_limits["continue_next"])
             self.assertEqual(4, config.openclaw.recommendations_webhook_section_limits["resume_backlog"])
