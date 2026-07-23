@@ -4,9 +4,11 @@ import json
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from mal_updater.auth_utils import current_utc_timestamp_z
 from mal_updater.config import load_config
 import mal_updater.crunchyroll_auth as crunchyroll_auth
 from mal_updater.crunchyroll_auth import (
@@ -27,6 +29,12 @@ class _FakeResponse:
 
 
 class CrunchyrollAuthTests(unittest.TestCase):
+    def test_provider_timestamp_helper_preserves_utc_z_format(self) -> None:
+        self.assertEqual(
+            current_utc_timestamp_z(now=datetime(2026, 7, 23, 3, 1, 2, 345678, tzinfo=timezone.utc)),
+            "2026-07-23T03:01:02Z",
+        )
+
     def test_crunchyroll_http_requires_curl_cffi_transport(self) -> None:
         with patch.object(crunchyroll_auth, "curl_requests", None):
             with self.assertRaisesRegex(CrunchyrollAuthError, "requires curl_cffi"):
@@ -61,6 +69,45 @@ class CrunchyrollAuthTests(unittest.TestCase):
             self.assertEqual(credentials.password, "hunter2")
             self.assertEqual(credentials.username_path, (root / ".MAL-Updater" / "secrets" / "custom_username.txt").resolve())
             self.assertEqual(credentials.password_path, (root / ".MAL-Updater" / "secrets" / "custom_password.txt").resolve())
+
+    def test_crunchyroll_session_state_json_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            state_paths = resolve_crunchyroll_state_paths(config, profile="family-room")
+            state_paths.root.mkdir(parents=True)
+            state_paths.refresh_token_path.write_text("refresh-token\n", encoding="utf-8")
+            state_paths.device_id_path.write_text("device-id\n", encoding="utf-8")
+
+            with patch("mal_updater.crunchyroll_auth._now_string", side_effect=["2026-07-23T03:01:01Z", "2026-07-23T03:01:02Z"]):
+                crunchyroll_auth._write_session_state(
+                    state_paths=state_paths,
+                    profile="family-room",
+                    locale="en-US",
+                    device_type="ANDROIDTV",
+                    account_id="acct-42",
+                    last_error=None,
+                    success=True,
+                )
+
+            self.assertEqual(
+                state_paths.session_state_path.read_text(encoding="utf-8"),
+                json.dumps(
+                    {
+                        "profile": "family-room",
+                        "locale": "en-US",
+                        "refresh_token_present": True,
+                        "device_id_present": True,
+                        "device_type_hint": "ANDROIDTV",
+                        "last_login_attempt_at": "2026-07-23T03:01:01Z",
+                        "last_login_success_at": "2026-07-23T03:01:02Z",
+                        "last_account_id_hint": "acct-42",
+                        "last_error": None,
+                        "crunchyroll_phase": "ready",
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
 
     def test_crunchyroll_login_with_credentials_persists_refresh_token_and_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:

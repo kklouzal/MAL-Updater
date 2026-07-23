@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import importlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-    tomllib = None
+
+def _load_toml_parser(import_module: Callable[[str], Any] = importlib.import_module) -> Any:
+    try:
+        return import_module("tomllib")
+    except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11
+        if exc.name not in {None, "tomllib"}:
+            raise
+        return import_module("tomli")
+
+
+_toml_parser = _load_toml_parser()
 
 DEFAULT_COMPLETION_THRESHOLD = 0.95
 DEFAULT_CREDITS_SKIP_WINDOW_SECONDS = 120
@@ -475,51 +483,11 @@ def _resolve_secret_path(
     return _resolve_from(secrets_dir, str(raw_value))
 
 
-def _parse_toml_scalar(raw_value: str) -> Any:
-    value = raw_value.strip()
-    if value.startswith('"') and value.endswith('"'):
-        return value[1:-1]
-    lowered = value.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    try:
-        if "." in value:
-            return float(value)
-        return int(value)
-    except ValueError:
-        return value
-
-
-def _simple_toml_loads(text: str) -> dict[str, Any]:
-    root: dict[str, Any] = {}
-    current = root
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section_name = stripped[1:-1].strip()
-            current = root.setdefault(section_name, {})
-            if not isinstance(current, dict):
-                raise ValueError(f"TOML section conflict for [{section_name}]")
-            continue
-        if "=" not in stripped:
-            raise ValueError(f"Unsupported TOML line: {line}")
-        key, raw_value = stripped.split("=", 1)
-        current[key.strip()] = _parse_toml_scalar(raw_value)
-    return root
-
-
 def _read_toml_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    if tomllib is not None:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected top-level TOML table in {path}")
-        return data
-    data = _simple_toml_loads(path.read_text(encoding="utf-8"))
+    with path.open("rb") as fh:
+        data = _toml_parser.load(fh)
     if not isinstance(data, dict):
         raise ValueError(f"Expected top-level TOML table in {path}")
     return data

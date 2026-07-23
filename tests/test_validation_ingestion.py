@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from mal_updater.cli import _cmd_provider_fetch_snapshot
 from mal_updater.config import load_config
-from mal_updater.contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from mal_updater.contracts.crunchyroll import CrunchyrollSnapshot as CrunchyrollSnapshotCompatAlias
 from mal_updater.ingestion import ingest_snapshot_payload
 from mal_updater.provider_types import ProviderFetchResult
 from mal_updater.validation import SnapshotValidationError, validate_snapshot_payload
@@ -59,6 +60,10 @@ def sample_snapshot() -> dict:
 
 
 class ValidationTests(unittest.TestCase):
+    def test_crunchyroll_contract_alias_remains_compatible(self) -> None:
+        self.assertIs(CrunchyrollSnapshot, ProviderSnapshot)
+        self.assertIs(CrunchyrollSnapshotCompatAlias, ProviderSnapshot)
+
     def test_validate_snapshot_payload_returns_dataclass_model(self) -> None:
         snapshot = validate_snapshot_payload(sample_snapshot())
         self.assertEqual(snapshot.provider, "crunchyroll")
@@ -72,7 +77,19 @@ class ValidationTests(unittest.TestCase):
     def test_validate_snapshot_payload_rejects_invalid_ratio(self) -> None:
         payload = sample_snapshot()
         payload["progress"][0]["completion_ratio"] = 1.5
-        with self.assertRaises(SnapshotValidationError):
+        with self.assertRaisesRegex(SnapshotValidationError, "progress\\[0\\]\\.completion_ratio must be between 0 and 1"):
+            validate_snapshot_payload(payload)
+
+    def test_validate_snapshot_payload_rejects_missing_progress_keys_with_stable_message(self) -> None:
+        payload = sample_snapshot()
+        del payload["progress"][0]["rating"]
+        with self.assertRaisesRegex(SnapshotValidationError, "progress\\[0\\] is missing keys: rating"):
+            validate_snapshot_payload(payload)
+
+    def test_validate_snapshot_payload_rejects_extra_watchlist_keys_with_stable_message(self) -> None:
+        payload = sample_snapshot()
+        payload["watchlist"][0]["unexpected"] = "value"
+        with self.assertRaisesRegex(SnapshotValidationError, "watchlist\\[0\\] contains unexpected keys: unexpected"):
             validate_snapshot_payload(payload)
 
     def test_validate_snapshot_payload_rejects_progress_unknown_series(self) -> None:

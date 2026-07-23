@@ -53,7 +53,13 @@ from .db import (
 from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
-from .recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, serve_dashboard, write_recommendation_dashboard
+from .recommendation_dashboard import (
+    DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT,
+    recommendation_snapshot_availability_payload,
+    recommendation_snapshot_row_base_payload,
+    serve_dashboard,
+    write_recommendation_dashboard,
+)
 from .recommendation_enrichment import enrich_discovery_provider_availability
 from .recommendation_metadata import refresh_mal_user_anime_list_cache, refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
@@ -70,36 +76,6 @@ from .sync_planner import (
 )
 from .validation import SnapshotValidationError, validate_snapshot_payload
 
-
-def _recommendation_dub_status(value: object) -> str:
-    if isinstance(value, bool):
-        return "present" if value else "none"
-    normalized = str(value or "").strip().lower()
-    if normalized in {"present", "yes", "true", "english dub", "dubbed"}:
-        return "present"
-    if normalized in {"none", "no", "false", "subonly", "sub only"}:
-        return "none"
-    return "unknown"
-
-
-def _recommendation_availability_payload(row: object) -> dict[str, object]:
-    context = getattr(row, "context", None) if isinstance(getattr(row, "context", None), dict) else {}
-    provider_series = context.get("available_provider_series") if isinstance(context.get("available_provider_series"), list) else []
-    match_kinds = context.get("availability_match_kinds")
-    if not isinstance(match_kinds, list):
-        match_kinds = [series.get("availability_match_kind") for series in provider_series if isinstance(series, dict) and series.get("availability_match_kind")]
-    match_sources = [series.get("mapping_source") for series in provider_series if isinstance(series, dict) and series.get("mapping_source")]
-    match_confidences = [series.get("mapping_confidence") for series in provider_series if isinstance(series, dict) and series.get("mapping_confidence") is not None]
-    review_needed = any(context.get(key) is True for key in ("review_needed", "availability_review_needed", "mapping_review_needed", "needs_review"))
-    return {
-        "providers": getattr(row, "availability_providers", []),
-        "match_kinds": match_kinds,
-        "match_sources": match_sources,
-        "match_confidences": match_confidences,
-        "confidence": getattr(row, "availability_confidence", None),
-        "dub_status": _recommendation_dub_status(getattr(row, "dub_signal", None) or context.get("english_dub_signal") or context.get("english_dub")),
-        "review_needed": review_needed,
-    }
 
 
 def _cmd_init(project_root: Path | None) -> int:
@@ -1733,22 +1709,6 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
         last_log_line = service_log_tail[-1]
         if isinstance(last_log_line, str) and last_log_line:
             print(f"service_log_last_line={last_log_line}")
-
-
-def _parse_sqlite_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    normalized = value.strip().replace("T", " ")
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1]
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
 
 
 def _age_seconds_from_timestamp(value: object) -> float | None:
@@ -4504,13 +4464,14 @@ def _cmd_approve_mapping(
     confidence: float | None,
     notes: str | None,
     exact: bool,
+    provider: str = "crunchyroll",
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
     mapping = upsert_series_mapping(
         config.db_path,
-        provider="crunchyroll",
+        provider=provider,
         provider_series_id=provider_series_id,
         mal_anime_id=mal_anime_id,
         confidence=confidence,
@@ -6383,20 +6344,6 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
     return 0 if apply_exit_code == 0 else 1
 
 
-def _snapshot_candidate_rows(payload: object) -> list[dict[str, object]]:
-    if isinstance(payload, list) and all(isinstance(item, dict) and "items" in item for item in payload):
-        rows: list[dict[str, object]] = []
-        for section in payload:
-            if not isinstance(section, dict) or not isinstance(section.get("items"), list):
-                continue
-            for item in section["items"]:
-                if isinstance(item, dict):
-                    rows.append(item)
-        return rows
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    return []
-
 
 def _snapshot_recommendation_rows(results: list[object], limit: int | None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
@@ -6448,28 +6395,12 @@ def _cmd_recommend_snapshots(project_root: Path | None, limit: int, output_forma
     ensure_directories(config)
     bootstrap_database(config.db_path)
     rows = list_latest_recommendation_snapshot_rows(config.db_path, limit=_normalize_limit(limit) or 100)
-    payload = [
-        {
-            "id": row.id,
-            "run_id": row.run_id,
-            "generated_at": row.generated_at,
-            "kind": row.kind,
-            "provider": row.provider,
-            "title": row.title,
-            "provider_series_id": row.provider_series_id,
-            "mal_anime_id": row.mal_anime_id,
-            "score": row.score,
-            "priority": row.priority,
-            "reasons": row.reasons,
-            "scorecard": row.scorecard,
-            "context": row.context,
-            "providers": row.availability_providers,
-            "dub_signal": row.dub_signal,
-            "availability_confidence": row.availability_confidence,
-            "availability": _recommendation_availability_payload(row),
-        }
-        for row in rows
-    ]
+    payload = []
+    for row in rows:
+        item = recommendation_snapshot_row_base_payload(row)
+        item["providers"] = item.pop("availability_providers")
+        item["availability"] = recommendation_snapshot_availability_payload(row)
+        payload.append(item)
     if output_format == "summary":
         run_id = payload[0].get("run_id") if payload else None
         generated_at = payload[0].get("generated_at") if payload else None
@@ -6781,6 +6712,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_mapping = subparsers.add_parser("approve-mapping", help="Persist a user-approved provider -> MAL series mapping")
     approve_mapping.add_argument("provider_series_id", help="Provider provider_series_id to approve")
     approve_mapping.add_argument("mal_anime_id", type=int, help="Chosen MAL anime id")
+    approve_mapping.add_argument("--provider", default="crunchyroll", choices=list(list_provider_slugs()), help="Provider slug for this approval (default: crunchyroll)")
     approve_mapping.add_argument("--confidence", type=float, default=None, help="Optional confidence score to store alongside the approval")
     approve_mapping.add_argument("--notes", default=None, help="Optional operator note explaining the approval")
     approve_mapping.add_argument(
@@ -6981,7 +6913,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_serve.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     dashboard_serve.add_argument("--port", type=int, default=8766, help="Bind port (default: 8766)")
-    dashboard_serve.add_argument("--limit", type=int, default=DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, help="Maximum latest snapshot recommendation rows to expose (default: 16; use ?limit= on /api/dashboard to override per request)")
+    dashboard_serve.add_argument("--limit", type=int, default=DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, help=f"Maximum latest snapshot recommendation rows to expose (default: {DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT}; use ?limit= on /api/dashboard to override per request)")
     mal_list_refresh = subparsers.add_parser(
         "mal-list-refresh",
         help="Refresh the official read-only MAL @me anime list cache for recommendation seeds",
@@ -7052,7 +6984,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Build the outbound payload without performing the webhook POST",
     )
-    subparsers.add_parser("sync", help="Reserved for future sync orchestration")
+    subparsers.add_parser(
+        "sync",
+        help="Reserved for future sync orchestration",
+        description="Reserved for future sync orchestration",
+    )
     return parser
 
 
@@ -7185,6 +7121,7 @@ def main() -> int:
             args.confidence,
             args.notes,
             args.exact,
+            provider=args.provider,
         )
     if args.command == "dry-run-sync":
         return _cmd_dry_run_sync(

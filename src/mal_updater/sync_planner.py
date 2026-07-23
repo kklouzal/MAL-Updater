@@ -62,9 +62,11 @@ class SyncProposal:
     persisted_mapping_approved: bool = False
     completion_audit: dict[str, Any] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
+    provider: str = "crunchyroll"
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "provider": self.provider,
             "provider_series_id": self.provider_series_id,
             "provider_title": self.provider_title,
             "crunchyroll_title": self.provider_title,
@@ -536,6 +538,7 @@ def build_dry_run_sync_plan(
                     mapping_source=persisted.mapping_source if persisted else None,
                     persisted_mapping_approved=False,
                     reasons=reasons,
+                    provider=state.provider,
                 )
             )
             continue
@@ -563,6 +566,7 @@ def build_dry_run_sync_plan(
                     mapping_source=mapping_source,
                     persisted_mapping_approved=approved,
                     reasons=mapping_reasons,
+                    provider=state.provider,
                 )
             )
             continue
@@ -587,6 +591,7 @@ def build_dry_run_sync_plan(
                     mapping_source=mapping_source,
                     persisted_mapping_approved=approved,
                     reasons=mapping_reasons + [f"mal_details_lookup_failed:{exc}"],
+                    provider=state.provider,
                 )
             )
             continue
@@ -614,7 +619,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
             severity = "error"
         queue_entries.append(
             {
-                "provider": "crunchyroll",
+                "provider": proposal.provider,
                 "provider_series_id": proposal.provider_series_id,
                 "severity": severity,
                 "payload": proposal.as_dict(),
@@ -855,6 +860,7 @@ def _plan_status_update(
             persisted_mapping_approved=persisted_mapping_approved,
             completion_audit=state.completion_audit,
             reasons=reasons + ["no_actionable_provider_state"],
+            provider=state.provider,
         )
 
     current_watched = int((current_status or {}).get("num_episodes_watched") or 0)
@@ -879,6 +885,7 @@ def _plan_status_update(
             persisted_mapping_approved=persisted_mapping_approved,
             completion_audit=state.completion_audit,
             reasons=reasons + [f"refusing_to_decrease_mal_progress current={current_watched} proposed={proposed_watched}"],
+            provider=state.provider,
         )
 
     if current_watched == proposed_watched and current_list_status == proposed_status["status"]:
@@ -898,6 +905,7 @@ def _plan_status_update(
                 persisted_mapping_approved=persisted_mapping_approved,
                 completion_audit=state.completion_audit,
                 reasons=reasons + ["mal_already_matches_or_exceeds_proposal"],
+                provider=state.provider,
             )
         proposed_status = {
             "status": proposed_status["status"],
@@ -925,6 +933,7 @@ def _plan_status_update(
             persisted_mapping_approved=persisted_mapping_approved,
             completion_audit=state.completion_audit,
             reasons=reasons + ["refusing_to_downgrade_completed_mal_entry"],
+            provider=state.provider,
         )
 
     if current_status:
@@ -946,6 +955,7 @@ def _plan_status_update(
         persisted_mapping_approved=persisted_mapping_approved,
         completion_audit=state.completion_audit,
         reasons=reasons,
+        provider=state.provider,
     )
 
 

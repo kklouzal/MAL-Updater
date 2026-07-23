@@ -87,9 +87,12 @@ def _complete_sync_run(conn, sync_run_id: int, status: str, summary: dict[str, A
     )
 
 
+def _entry_json(entry: Any) -> str:
+    return json.dumps(asdict(entry), sort_keys=True)
+
+
 def _upsert_series(conn, provider: str, series_entries: list[Any]) -> None:
     for entry in series_entries:
-        raw_entry = asdict(entry)
         conn.execute(
             """
             INSERT INTO provider_series (
@@ -115,14 +118,13 @@ def _upsert_series(conn, provider: str, series_entries: list[Any]) -> None:
                 entry.title,
                 entry.season_title,
                 entry.season_number,
-                json.dumps(raw_entry, sort_keys=True),
+                _entry_json(entry),
             ),
         )
 
 
 def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
     for entry in progress_entries:
-        raw_entry = asdict(entry)
         conn.execute(
             """
             INSERT INTO provider_episode_progress (
@@ -169,14 +171,13 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 entry.audio_locale,
                 entry.subtitle_locale,
                 entry.rating,
-                json.dumps(raw_entry, sort_keys=True),
+                _entry_json(entry),
             ),
         )
 
 
 def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None:
     for entry in watchlist_entries:
-        raw_entry = asdict(entry)
         conn.execute(
             """
             INSERT INTO provider_watchlist (
@@ -199,6 +200,6 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None
                 entry.provider_series_id,
                 entry.added_at,
                 entry.status,
-                json.dumps(raw_entry, sort_keys=True),
+                _entry_json(entry),
             ),
         )

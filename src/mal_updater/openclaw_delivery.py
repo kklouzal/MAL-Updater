@@ -69,6 +69,23 @@ def _section_delivery_tier(section_key: str) -> str:
     return _SECTION_DELIVERY_TIERS.get(section_key, "digest")
 
 
+def _section_key(section: dict[str, object]) -> str:
+    return str(section.get("key") or "other")
+
+
+def _dict_delivery_items(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _copy_section_with_items(section: dict[str, object], items: list[dict[str, object]]) -> dict[str, object]:
+    copied = dict(section)
+    copied["items"] = items
+    copied["count"] = len(items)
+    return copied
+
+
 def _include_section_for_delivery(section_key: str, *, delivery_mode: str) -> bool:
     allowed = _DELIVERY_MODE_SECTION_KEYS.get(delivery_mode)
     if allowed is None:
@@ -80,19 +97,17 @@ def _trimmed_delivery_sections(config: AppConfig, sections: list[dict[str, objec
     limits = config.openclaw.recommendations_webhook_section_limits
     trimmed_sections: list[dict[str, object]] = []
     for section in sections:
-        section_key = str(section.get("key") or "other")
+        section_key = _section_key(section)
         if not _include_section_for_delivery(section_key, delivery_mode=delivery_mode):
             continue
-        items = [item for item in (section.get("items") or []) if isinstance(item, dict)]
+        items = _dict_delivery_items(section.get("items"))
         limit = max(0, int(limits.get(section_key, limits.get("other", len(items)))))
         if limit == 0:
             continue
         visible_items = items[:limit]
         if not visible_items:
             continue
-        trimmed_section = dict(section)
-        trimmed_section["items"] = visible_items
-        trimmed_section["count"] = len(visible_items)
+        trimmed_section = _copy_section_with_items(section, visible_items)
         trimmed_section["total_count"] = len(items)
         trimmed_section["truncated"] = len(visible_items) < len(items)
         trimmed_section["delivery_tier"] = _section_delivery_tier(section_key)
@@ -127,7 +142,7 @@ def _filter_delivery_sections_by_item_fingerprint(
     for section in sections:
         if not isinstance(section, dict):
             continue
-        section_key = str(section.get("key") or "other")
+        section_key = _section_key(section)
         source_items = section.get("items")
         if not isinstance(source_items, list):
             continue
@@ -138,9 +153,7 @@ def _filter_delivery_sections_by_item_fingerprint(
         ]
         if not visible_items:
             continue
-        copied = dict(section)
-        copied["items"] = visible_items
-        copied["count"] = len(visible_items)
+        copied = _copy_section_with_items(section, visible_items)
         copied["suppressed_recent_count"] = len(source_items) - len(visible_items)
         filtered_sections.append(copied)
     return filtered_sections
@@ -192,7 +205,7 @@ def recommendation_delivery_item_fingerprints(payload: dict[str, object]) -> lis
     for section in sections:
         if not isinstance(section, dict):
             continue
-        section_key = str(section.get("key") or "other")
+        section_key = _section_key(section)
         for item in section.get("items") or []:
             if not isinstance(item, dict):
                 continue

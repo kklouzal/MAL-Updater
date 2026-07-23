@@ -6,8 +6,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import load_config
+from mal_updater.contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from mal_updater.hidive_auth import HidiveSession, HidiveStatePaths, HidiveTokenSet
+import mal_updater.hidive_snapshot as hidive_snapshot
 from mal_updater.hidive_snapshot import fetch_snapshot
+from mal_updater.provider_snapshot import snapshot_to_dict as shared_snapshot_to_dict
+from mal_updater.provider_snapshot import write_snapshot_file as shared_write_snapshot_file
 
 
 class HidiveSnapshotTests(unittest.TestCase):
@@ -26,6 +30,60 @@ class HidiveSnapshotTests(unittest.TestCase):
             state_paths=state_paths,
             token=HidiveTokenSet(authorisation_token="access-token", refresh_token="refresh-token", account_id="acct-123"),
         )
+
+    def _sample_snapshot(self) -> ProviderSnapshot:
+        return ProviderSnapshot(
+            contract_version="1.0",
+            generated_at="2026-07-23T00:00:00Z",
+            provider="hidive",
+            account_id_hint="acct-123",
+            series=[SeriesRef(provider_series_id="2312", title="Dungeon People", season_title="Dungeon People", season_number=1)],
+            progress=[
+                EpisodeProgress(
+                    provider_episode_id="655788",
+                    provider_series_id="2312",
+                    episode_number=12,
+                    episode_title="Dungeon People Episode 12",
+                    playback_position_ms=600000,
+                    duration_ms=1500000,
+                    completion_ratio=0.4,
+                    last_watched_at="2026-07-22T00:00:00Z",
+                    audio_locale="en-US",
+                    subtitle_locale=None,
+                    rating="TV-14",
+                )
+            ],
+            watchlist=[WatchlistEntry(provider_series_id="2312", added_at="2026-07-21T00:00:00Z", list_name="Favorites")],
+            raw={"supports": {"history": True, "watchlists": True}, "nested": {"value": 2}},
+        )
+
+    def test_module_snapshot_serializer_matches_shared_exact_shape(self) -> None:
+        snapshot = self._sample_snapshot()
+
+        payload = hidive_snapshot.snapshot_to_dict(snapshot)
+
+        self.assertEqual(shared_snapshot_to_dict(snapshot), payload)
+        self.assertEqual(
+            ["contract_version", "generated_at", "provider", "account_id_hint", "series", "progress", "watchlist", "raw"],
+            list(payload.keys()),
+        )
+        self.assertEqual("hidive", payload["provider"])
+        self.assertEqual("2312", payload["series"][0]["provider_series_id"])
+        self.assertEqual("655788", payload["progress"][0]["provider_episode_id"])
+
+    def test_module_snapshot_writer_matches_shared_output(self) -> None:
+        snapshot = self._sample_snapshot()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module_path = root / "module" / "snapshot.json"
+            shared_path = root / "shared" / "snapshot.json"
+
+            returned_path = hidive_snapshot.write_snapshot_file(module_path, snapshot)
+            shared_write_snapshot_file(shared_path, snapshot)
+
+            self.assertEqual(module_path, returned_path)
+            self.assertEqual(shared_path.read_text(encoding="utf-8"), module_path.read_text(encoding="utf-8"))
+            self.assertTrue(module_path.read_text(encoding="utf-8").endswith("\n"))
 
     def test_fetch_snapshot_combines_history_and_continue_watching(self) -> None:
         with tempfile.TemporaryDirectory() as td:

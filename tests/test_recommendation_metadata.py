@@ -287,6 +287,29 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         self.assertEqual(0, summary.harvested_edge_count)
         self.assertEqual(1, summary.as_dict()["harvest_failed"])
 
+    def test_positive_cached_list_entries_join_seed_order_without_provider_mapping(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.config.db_path,
+            items=[
+                self._list_item(700, "Positive On Hold", "on_hold", score=6),
+                self._list_item(800, "Suppressed Plan To Watch", "plan_to_watch"),
+            ],
+            refresh_run_id="cached-list",
+            fetched_at="2026-07-19T00:00:00Z",
+            prune_absent=True,
+        )
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "") -> dict:
+            return self._seed_detail(anime_id)
+
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details) as get_details:
+            summary = refresh_recommendation_metadata(self.config)
+
+        self.assertEqual([700], [call.args[0] for call in get_details.call_args_list])
+        self.assertEqual(1, summary.eligible_seed_count)
+        self.assertEqual(1, summary.harvest_unharvested)
+        self.assertEqual(1, summary.refreshed)
+
     def test_failed_harvest_state_is_recorded_and_prioritized_for_retry(self) -> None:
         self._insert_series("seed-100", title="Seed 100")
         self._map_series("seed-100", 100)

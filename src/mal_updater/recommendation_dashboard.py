@@ -223,6 +223,8 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
     providers = row.get("availability_providers") or merged.get("available_via_providers") or merged.get("providers") or []
     if isinstance(providers, str):
         providers = [providers]
+    elif not isinstance(providers, list):
+        providers = []
     seed_details = _supporting_seed_details(merged)
     seed_ids = _compact_list(merged.get("supporting_seed_ids") or merged.get("supporting_seed_mal_anime_ids") or merged.get("seed_mal_anime_ids") or merged.get("seed_ids"))
     seed_titles = _compact_list(merged.get("supporting_seed_titles") or merged.get("seed_titles"))
@@ -287,6 +289,8 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
         "availability_match_source_label": ", ".join(str(x) for x in match_sources),
         "availability_match_confidences": match_confidences,
         "availability_match_confidence_label": ", ".join(str(x) for x in match_confidences),
+        "availability_confidence": merged.get("availability_confidence"),
+        "availability_confidence_label": merged.get("availability_confidence_label") or merged.get("availability_evidence_label"),
         "provider_eligibility_evidence": eligibility_details,
         "verification_label": verification_label,
         "evidence_freshness_label": _format_evidence_freshness(eligibility_details),
@@ -416,10 +420,13 @@ def _availability_details(context: dict[str, Any]) -> dict[str, str]:
     match_kinds = _compact_list(context.get("availability_match_kinds") or [series.get("availability_match_kind") for series in provider_series if isinstance(series, dict)])
     sources = _compact_list([series.get("mapping_source") for series in provider_series if isinstance(series, dict)])
     confidences = _compact_list([series.get("mapping_confidence") for series in provider_series if isinstance(series, dict)])
+    confidence_label = context.get("availability_confidence_label") or context.get("availability_evidence_label")
+    confidence = context.get("availability_confidence")
     return {
         "availability_match_kind": ", ".join(str(value) for value in match_kinds),
         "availability_match_source": ", ".join(str(value) for value in sources),
-        "availability_confidence": str(context.get("availability_confidence") if context.get("availability_confidence") is not None else ""),
+        "availability_confidence": str(confidence_label if confidence_label is not None else confidence if confidence is not None else ""),
+        "availability_confidence_label": str(confidence_label or ""),
         "mapping_confidence": ", ".join(str(value) for value in confidences),
         "review_needed": "yes" if _review_needed(context) else "",
     }
@@ -770,8 +777,19 @@ def write_recommendation_dashboard(path: Path, items: Iterable[Recommendation], 
     return path
 
 
-def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
-    payload = {
+def _availability_confidence_label(row: Any, context: dict[str, Any]) -> str | None:
+    label = getattr(row, "availability_confidence_label", None)
+    if label is None:
+        label = context.get("availability_confidence_label") or context.get("availability_evidence_label")
+    return None if label is None else str(label)
+
+
+def recommendation_snapshot_row_base_payload(row: Any, *, collapse_discovery_candidate_reasons: bool = False) -> dict[str, Any]:
+    context = getattr(row, "context", None) if isinstance(getattr(row, "context", None), dict) else {}
+    reasons = getattr(row, "reasons", [])
+    if collapse_discovery_candidate_reasons and getattr(row, "kind", None) == "discovery_candidate":
+        reasons = []
+    return {
         "id": row.id,
         "run_id": row.run_id,
         "generated_at": row.generated_at,
@@ -782,13 +800,49 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
         "mal_anime_id": row.mal_anime_id,
         "score": row.score,
         "priority": row.priority,
-        "reasons": [] if row.kind == "discovery_candidate" else row.reasons,
+        "reasons": reasons,
         "scorecard": row.scorecard,
         "context": row.context,
         "availability_providers": row.availability_providers,
         "dub_signal": row.dub_signal,
         "availability_confidence": row.availability_confidence,
+        "availability_confidence_label": _availability_confidence_label(row, context),
     }
+
+
+def recommendation_snapshot_availability_payload(row: Any, *, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    context = getattr(row, "context", None) if isinstance(getattr(row, "context", None), dict) else {}
+    if evidence is not None:
+        providers = evidence.get("availability_providers", [])
+        match_kinds = evidence.get("availability_match_kinds", [])
+        match_sources = evidence.get("availability_match_sources", [])
+        match_confidences = evidence.get("availability_match_confidences", [])
+        dub_status = evidence.get("dub_status", "unknown")
+        review_needed = evidence.get("review_needed", False)
+    else:
+        provider_series = context.get("available_provider_series") if isinstance(context.get("available_provider_series"), list) else []
+        match_kinds = context.get("availability_match_kinds")
+        if not isinstance(match_kinds, list):
+            match_kinds = [series.get("availability_match_kind") for series in provider_series if isinstance(series, dict) and series.get("availability_match_kind")]
+        match_sources = [series.get("mapping_source") for series in provider_series if isinstance(series, dict) and series.get("mapping_source")]
+        match_confidences = [series.get("mapping_confidence") for series in provider_series if isinstance(series, dict) and series.get("mapping_confidence") is not None]
+        providers = getattr(row, "availability_providers", [])
+        dub_status = _dub_status(getattr(row, "dub_signal", None) or context.get("english_dub_signal") or context.get("english_dub"))
+        review_needed = _review_needed(context)
+    return {
+        "providers": providers,
+        "match_kinds": match_kinds,
+        "match_sources": match_sources,
+        "match_confidences": match_confidences,
+        "confidence": getattr(row, "availability_confidence", None),
+        "confidence_label": _availability_confidence_label(row, context),
+        "dub_status": dub_status,
+        "review_needed": review_needed,
+    }
+
+
+def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
+    payload = recommendation_snapshot_row_base_payload(row, collapse_discovery_candidate_reasons=True)
     context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
     english_title = context.get("english_title")
     genres = context.get("genres")
@@ -807,18 +861,15 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
     payload["why_recommended"] = payload["evidence"].get("why_recommended", "")
     payload["scorecard_summary"] = payload["evidence"].get("scorecard_summary", "")
     payload["seed_details"] = payload["evidence"].get("supporting_seed_label", "")
-    payload["availability"] = {
-        "providers": payload["evidence"].get("availability_providers", []),
-        "match_kinds": payload["evidence"].get("availability_match_kinds", []),
-        "match_sources": payload["evidence"].get("availability_match_sources", []),
-        "match_confidences": payload["evidence"].get("availability_match_confidences", []),
-        "confidence": row.availability_confidence,
-        "dub_status": payload["evidence"].get("dub_status", "unknown"),
-        "review_needed": payload["evidence"].get("review_needed", False),
-        "provider_badges": payload["evidence"].get("provider_badges", []),
-        "verification": payload["evidence"].get("verification_label", ""),
-        "freshness": payload["evidence"].get("evidence_freshness_label", ""),
-    }
+    availability = recommendation_snapshot_availability_payload(row, evidence=payload["evidence"])
+    availability.update(
+        {
+            "provider_badges": payload["evidence"].get("provider_badges", []),
+            "verification": payload["evidence"].get("verification_label", ""),
+            "freshness": payload["evidence"].get("evidence_freshness_label", ""),
+        }
+    )
+    payload["availability"] = availability
     return _mark_discovery_row_visibility(payload)
 
 
@@ -1001,7 +1052,11 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
     if dormant_count:
         indicators.append({"level": "warning", "message": "Dormant discovery diagnostic rows are present; they are not actionable without strict provider+dub proof."})
     if diagnostic_source_snapshot is not None and diagnostic_source_snapshot.get("run_id") != latest_run_id:
-        indicators.append({"level": "warning", "message": "Ranked discovery recommendations are sourced from the latest persisted diagnostic discovery snapshot, not the latest strict snapshot."})
+        if diagnostic_source_snapshot.get("run_id") == "local-diagnostic-current":
+            message = "Ranked discovery recommendations are sourced from current local diagnostic scorer output, not persisted diagnostic data or the latest strict snapshot."
+        else:
+            message = "Ranked discovery recommendations are sourced from the latest persisted diagnostic discovery snapshot, not the latest strict snapshot."
+        indicators.append({"level": "warning", "message": message})
     section_metadata = {kind: _section_metadata_for(kind) for kind in (*_STATIC_SECTION_ORDER, *sections.keys())}
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),

@@ -7,9 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import load_config
+from mal_updater.contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 import mal_updater.crunchyroll_snapshot as crunchyroll_snapshot
 from mal_updater.crunchyroll_auth import resolve_crunchyroll_state_paths
 from mal_updater.crunchyroll_auth import CrunchyrollAuthError, CrunchyrollBootstrapResult
+from mal_updater.provider_snapshot import snapshot_to_dict as shared_snapshot_to_dict
+from mal_updater.provider_snapshot import write_snapshot_file as shared_write_snapshot_file
 from mal_updater.crunchyroll_snapshot import (
     CRUNCHYROLL_ME_URL,
     CrunchyrollAccessToken,
@@ -51,6 +54,60 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             ),
             auth_source="refresh_token",
         )
+
+    def _sample_snapshot(self) -> ProviderSnapshot:
+        return ProviderSnapshot(
+            contract_version="1.0",
+            generated_at="2026-07-23T00:00:00Z",
+            provider="crunchyroll",
+            account_id_hint="acct-123",
+            series=[SeriesRef(provider_series_id="SERIES1", title="Example", season_title="Example Season", season_number=1)],
+            progress=[
+                EpisodeProgress(
+                    provider_episode_id="EP1",
+                    provider_series_id="SERIES1",
+                    episode_number=1,
+                    episode_title="Episode One",
+                    playback_position_ms=120000,
+                    duration_ms=1440000,
+                    completion_ratio=0.5,
+                    last_watched_at="2026-07-22T00:00:00Z",
+                    audio_locale="ja-JP",
+                    subtitle_locale="en-US",
+                    rating="TV-14",
+                )
+            ],
+            watchlist=[WatchlistEntry(provider_series_id="SERIES1", added_at="2026-07-21T00:00:00Z", status="current")],
+            raw={"supports": {"history": True}, "nested": {"value": 1}},
+        )
+
+    def test_module_snapshot_serializer_matches_shared_exact_shape(self) -> None:
+        snapshot = self._sample_snapshot()
+
+        payload = crunchyroll_snapshot.snapshot_to_dict(snapshot)
+
+        self.assertEqual(shared_snapshot_to_dict(snapshot), payload)
+        self.assertEqual(
+            ["contract_version", "generated_at", "provider", "account_id_hint", "series", "progress", "watchlist", "raw"],
+            list(payload.keys()),
+        )
+        self.assertEqual("crunchyroll", payload["provider"])
+        self.assertEqual("SERIES1", payload["series"][0]["provider_series_id"])
+        self.assertEqual("EP1", payload["progress"][0]["provider_episode_id"])
+
+    def test_module_snapshot_writer_matches_shared_output(self) -> None:
+        snapshot = self._sample_snapshot()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            module_path = root / "module" / "snapshot.json"
+            shared_path = root / "shared" / "snapshot.json"
+
+            returned_path = crunchyroll_snapshot.write_snapshot_file(module_path, snapshot)
+            shared_write_snapshot_file(shared_path, snapshot)
+
+            self.assertEqual(module_path, returned_path)
+            self.assertEqual(shared_path.read_text(encoding="utf-8"), module_path.read_text(encoding="utf-8"))
+            self.assertTrue(module_path.read_text(encoding="utf-8").endswith("\n"))
 
     def test_authorized_json_get_recovers_401_by_refreshing_access_token(self) -> None:
         with tempfile.TemporaryDirectory() as td:

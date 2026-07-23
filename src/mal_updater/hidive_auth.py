@@ -1,16 +1,21 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from .auth import write_secret_file
+from .auth_utils import (
+    current_utc_timestamp_z,
+    decode_jwt_payload,
+    jwt_expiry_epoch,
+    login_session_timestamps,
+    seconds_until_jwt_expiry,
+)
 from .config import AppConfig, _read_secret_file, _resolve_secret_path
 from .request_tracking import record_api_request_event
 
@@ -169,34 +174,19 @@ class HidiveSession:
 
 
 def _now_string() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return current_utc_timestamp_z()
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
-    parts = token.split('.')
-    if len(parts) < 2:
-        return None
-    payload_part = parts[1] + ('=' * ((4 - len(parts[1]) % 4) % 4))
-    try:
-        decoded = base64.urlsafe_b64decode(payload_part.encode()).decode()
-        payload = json.loads(decoded)
-    except Exception:
-        return None
-    return payload if isinstance(payload, dict) else None
+    return decode_jwt_payload(token)
 
 
 def _jwt_expiry_epoch(token: str) -> int | None:
-    payload = _decode_jwt_payload(token)
-    exp = payload.get('exp') if isinstance(payload, dict) else None
-    return int(exp) if isinstance(exp, (int, float)) else None
+    return jwt_expiry_epoch(token)
 
 
 def _seconds_until_jwt_expiry(token: str, *, now_epoch: int | None = None) -> int | None:
-    exp = _jwt_expiry_epoch(token)
-    if exp is None:
-        return None
-    current = now_epoch if now_epoch is not None else int(datetime.now(timezone.utc).timestamp())
-    return exp - current
+    return seconds_until_jwt_expiry(token, now_epoch=now_epoch)
 
 
 def resolve_hidive_state_paths(config: AppConfig, profile: str = "default") -> HidiveStatePaths:
@@ -249,8 +239,7 @@ def _write_session_state(
         "profile": profile,
         "authorisation_token_present": state_paths.access_token_path.exists(),
         "refresh_token_present": state_paths.refresh_token_path.exists(),
-        "last_login_attempt_at": _now_string(),
-        "last_login_success_at": _now_string() if success else None,
+        **login_session_timestamps(success, now_string=_now_string),
         "last_account_id_hint": account_id,
         "last_account_name_hint": account_name,
         "last_error": last_error,

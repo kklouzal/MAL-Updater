@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mal_updater.config import load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
+from mal_updater.config import _load_toml_parser, _read_toml_file, load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
 
 
 class ConfigLoadingTests(unittest.TestCase):
@@ -282,6 +282,52 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("mal", task_name="sync_apply"))
             self.assertEqual("task", config.service.budget_scope_for("mal", task_name="sync_apply"))
             self.assertEqual("provider", config.service.budget_scope_for("hidive", task_name="sync_fetch_hidive"))
+
+    def test_settings_example_standard_toml_features_parse_and_preserve_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_dir = root / ".MAL-Updater" / "config"
+            config_dir.mkdir(parents=True)
+            example_text = (Path(__file__).resolve().parents[1] / "references" / "settings.toml.example").read_text(encoding="utf-8")
+            (config_dir / "settings.toml").write_text(example_text, encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "MAL_UPDATER_MAL_REDIRECT_PORT": "9876",
+                    "MAL_UPDATER_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE": "all",
+                    "MAL_UPDATER_SERVICE_SYNC_EVERY_SECONDS": "1800",
+                },
+                clear=False,
+            ):
+                config = load_config(root)
+
+            parsed = _read_toml_file(config.settings_path)
+
+            self.assertEqual("fresh", parsed["openclaw"]["recommendations_webhook_delivery_mode"])
+            self.assertEqual(0, parsed["service"]["full_refresh_every_seconds"])
+            self.assertEqual(180, parsed["service"]["crunchyroll_hourly_limit"])
+            self.assertEqual("all", config.openclaw.recommendations_webhook_delivery_mode)
+            self.assertEqual(9876, config.mal.redirect_port)
+            self.assertEqual(1800, config.service.sync_every_seconds)
+            self.assertEqual(0, config.service.full_refresh_every_seconds)
+            self.assertEqual(20, config.service.task_execute_limits["push_recommendations_webhook"])
+            self.assertEqual(55, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["full_refresh"])
+
+    def test_tomli_fallback_import_contract_uses_standard_parser(self) -> None:
+        calls: list[str] = []
+        tomli_parser = object()
+
+        def fake_import(name: str) -> object:
+            calls.append(name)
+            if name == "tomllib":
+                raise ModuleNotFoundError("No module named 'tomllib'", name="tomllib")
+            if name == "tomli":
+                return tomli_parser
+            raise AssertionError(f"unexpected import: {name}")
+
+        self.assertIs(_load_toml_parser(fake_import), tomli_parser)
+        self.assertEqual(["tomllib", "tomli"], calls)
 
 
 if __name__ == "__main__":

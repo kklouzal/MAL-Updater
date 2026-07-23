@@ -58,6 +58,8 @@ DEFAULT_METADATA_STALE_AFTER_DAYS = 14
 MAL_USER_LIST_POSITIVE_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
 MAL_USER_LIST_SUPPRESSION_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 MAL_USER_LIST_FIELDS = "list_status,num_episodes,media_type,status"
+HARVEST_RETRY_STATUSES = frozenset({"unharvested", "stale", "failed"})
+HARVEST_RETRY_ORDER = {"unharvested": 0, "failed": 1, "stale": 2}
 
 # Official MAL API v2 anime detail/search fields do not expose character or voice-actor
 # credits. Keep recommendation metadata on official catalog/list signals rather than
@@ -180,9 +182,7 @@ def _metadata_status(metadata: MalAnimeMetadata | None, *, stale_after_days: int
 
 
 def _has_my_list_status(metadata: MalAnimeMetadata | None) -> bool:
-    if metadata is None:
-        return False
-    my_list_status = metadata.raw.get("my_list_status") if isinstance(metadata.raw, dict) else None
+    my_list_status = _my_list_status_payload(metadata)
     if not isinstance(my_list_status, dict):
         return False
     status = my_list_status.get("status")
@@ -190,15 +190,23 @@ def _has_my_list_status(metadata: MalAnimeMetadata | None) -> bool:
 
 
 def _has_positive_my_list_status(metadata: MalAnimeMetadata | None) -> bool:
+    status = _my_list_status_value(metadata)
+    return status in MAL_USER_LIST_POSITIVE_SEED_STATUSES
+
+
+def _my_list_status_payload(metadata: MalAnimeMetadata | None) -> Any:
     if metadata is None:
-        return False
-    my_list_status = metadata.raw.get("my_list_status") if isinstance(metadata.raw, dict) else None
-    if not isinstance(my_list_status, dict):
-        return False
-    status = my_list_status.get("status")
+        return None
+    return metadata.raw.get("my_list_status") if isinstance(metadata.raw, dict) else None
+
+
+def _my_list_status_value(metadata: MalAnimeMetadata | None) -> str | None:
+    my_list_status = _my_list_status_payload(metadata)
+    status = my_list_status.get("status") if isinstance(my_list_status, dict) else None
     if not isinstance(status, str):
-        return False
-    return status.strip().lower() in MAL_USER_LIST_POSITIVE_SEED_STATUSES
+        return None
+    normalized = status.strip().lower()
+    return normalized or None
 
 
 def _load_mapped_seed_states(
@@ -294,8 +302,8 @@ def _rank_refresh_ids(anime_ids: list[int], metadata_by_id: dict[int, Any], seed
         if state is None:
             return (1, metadata_age, (1, ""), anime_id)
         harvest_age = _metadata_age_sort_value(state.harvest_fetched_at)
-        if state.eligible and state.harvest_status in {"unharvested", "stale", "failed"}:
-            harvest_order = {"unharvested": 0, "failed": 1, "stale": 2}.get(state.harvest_status, 3)
+        if state.eligible and state.harvest_status in HARVEST_RETRY_STATUSES:
+            harvest_order = HARVEST_RETRY_ORDER.get(state.harvest_status, 3)
             return (0, (harvest_order, harvest_age[1]), metadata_age, anime_id)
         if state.metadata_status in {"missing", "stale"}:
             metadata_order = 0 if state.metadata_status == "missing" else 1

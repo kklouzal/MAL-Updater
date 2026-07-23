@@ -13,6 +13,33 @@ class SnapshotValidationError(ValueError):
 
 ISO_SUFFIX = "Z"
 
+SNAPSHOT_REQUIRED_KEYS = {
+    "contract_version",
+    "generated_at",
+    "provider",
+    "series",
+    "progress",
+    "watchlist",
+    "raw",
+}
+SNAPSHOT_ALLOWED_KEYS = SNAPSHOT_REQUIRED_KEYS | {"account_id_hint"}
+SERIES_ALLOWED_KEYS = {"provider_series_id", "title", "season_title", "season_number"}
+PROGRESS_REQUIRED_KEYS = {
+    "provider_episode_id",
+    "provider_series_id",
+    "episode_number",
+    "episode_title",
+    "playback_position_ms",
+    "duration_ms",
+    "completion_ratio",
+    "last_watched_at",
+    "audio_locale",
+    "subtitle_locale",
+    "rating",
+}
+WATCHLIST_REQUIRED_KEYS = {"provider_series_id", "added_at", "status"}
+WATCHLIST_ALLOWED_KEYS = WATCHLIST_REQUIRED_KEYS | {"list_id", "list_name", "list_kind"}
+
 
 def _is_iso_datetime(value: str) -> bool:
     if not isinstance(value, str) or "T" not in value:
@@ -32,6 +59,26 @@ def _expect_type(value: Any, expected: type | tuple[type, ...], field: str) -> N
 def _expect_optional_type(value: Any, expected: type | tuple[type, ...], field: str) -> None:
     if value is not None:
         _expect_type(value, expected, field)
+
+
+def _expect_keys(item: dict[str, Any], *, required: set[str], allowed: set[str], field: str) -> None:
+    missing = sorted(required - set(item))
+    if missing:
+        raise SnapshotValidationError(f"{field} is missing keys: {', '.join(missing)}")
+    extras = sorted(set(item) - allowed)
+    if extras:
+        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
+
+
+def _expect_unique_id(value: str, seen: set[str], *, field: str, description: str) -> None:
+    if value in seen:
+        raise SnapshotValidationError(f"{field} duplicates an earlier {description}: {value}")
+    seen.add(value)
+
+
+def _expect_known_series_id(value: str, known_series_ids: set[str], field: str) -> None:
+    if value not in known_series_ids:
+        raise SnapshotValidationError(f"{field} references unknown series id: {value}")
 
 
 def _expect_non_negative_int(value: Any, field: str) -> None:
@@ -61,11 +108,7 @@ def _validate_series_item(item: Any, index: int) -> SeriesRef:
     _expect_type(title, str, f"{field}.title")
     _expect_optional_type(season_title, str, f"{field}.season_title")
     _expect_optional_type(season_number, int, f"{field}.season_number")
-
-    allowed = {"provider_series_id", "title", "season_title", "season_number"}
-    extras = sorted(set(item) - allowed)
-    if extras:
-        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
+    _expect_keys(item, required=set(), allowed=SERIES_ALLOWED_KEYS, field=field)
 
     return SeriesRef(
         provider_series_id=provider_series_id,
@@ -78,26 +121,7 @@ def _validate_series_item(item: Any, index: int) -> SeriesRef:
 def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     field = f"progress[{index}]"
     _expect_type(item, dict, field)
-
-    required = {
-        "provider_episode_id",
-        "provider_series_id",
-        "episode_number",
-        "episode_title",
-        "playback_position_ms",
-        "duration_ms",
-        "completion_ratio",
-        "last_watched_at",
-        "audio_locale",
-        "subtitle_locale",
-        "rating",
-    }
-    missing = sorted(required - set(item))
-    if missing:
-        raise SnapshotValidationError(f"{field} is missing keys: {', '.join(missing)}")
-    extras = sorted(set(item) - required)
-    if extras:
-        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
+    _expect_keys(item, required=PROGRESS_REQUIRED_KEYS, allowed=PROGRESS_REQUIRED_KEYS, field=field)
 
     _expect_type(item["provider_episode_id"], str, f"{field}.provider_episode_id")
     _expect_type(item["provider_series_id"], str, f"{field}.provider_series_id")
@@ -131,14 +155,7 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
 def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
     field = f"watchlist[{index}]"
     _expect_type(item, dict, field)
-    required = {"provider_series_id", "added_at", "status"}
-    allowed = required | {"list_id", "list_name", "list_kind"}
-    missing = sorted(required - set(item))
-    if missing:
-        raise SnapshotValidationError(f"{field} is missing keys: {', '.join(missing)}")
-    extras = sorted(set(item) - allowed)
-    if extras:
-        raise SnapshotValidationError(f"{field} contains unexpected keys: {', '.join(extras)}")
+    _expect_keys(item, required=WATCHLIST_REQUIRED_KEYS, allowed=WATCHLIST_ALLOWED_KEYS, field=field)
 
     provider_series_id = item["provider_series_id"]
     added_at = item["added_at"]
@@ -167,24 +184,7 @@ def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
 
 def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
     _expect_type(payload, dict, "snapshot")
-
-    required = {
-        "contract_version",
-        "generated_at",
-        "provider",
-        "series",
-        "progress",
-        "watchlist",
-        "raw",
-    }
-    missing = sorted(required - set(payload))
-    if missing:
-        raise SnapshotValidationError(f"snapshot is missing keys: {', '.join(missing)}")
-
-    allowed = required | {"account_id_hint"}
-    extras = sorted(set(payload) - allowed)
-    if extras:
-        raise SnapshotValidationError(f"snapshot contains unexpected keys: {', '.join(extras)}")
+    _expect_keys(payload, required=SNAPSHOT_REQUIRED_KEYS, allowed=SNAPSHOT_ALLOWED_KEYS, field="snapshot")
 
     contract_version = payload["contract_version"]
     generated_at = payload["generated_at"]
@@ -216,35 +216,40 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
 
     known_series_ids: set[str] = set()
     for index, item in enumerate(validated_series):
-        if item.provider_series_id in known_series_ids:
-            raise SnapshotValidationError(
-                f"series[{index}].provider_series_id duplicates an earlier series id: {item.provider_series_id}"
-            )
-        known_series_ids.add(item.provider_series_id)
+        _expect_unique_id(
+            item.provider_series_id,
+            known_series_ids,
+            field=f"series[{index}].provider_series_id",
+            description="series id",
+        )
 
     seen_episode_ids: set[str] = set()
     for index, item in enumerate(validated_progress):
-        if item.provider_episode_id in seen_episode_ids:
-            raise SnapshotValidationError(
-                f"progress[{index}].provider_episode_id duplicates an earlier episode id: {item.provider_episode_id}"
-            )
-        seen_episode_ids.add(item.provider_episode_id)
-        if item.provider_series_id not in known_series_ids:
-            raise SnapshotValidationError(
-                f"progress[{index}].provider_series_id references unknown series id: {item.provider_series_id}"
-            )
+        _expect_unique_id(
+            item.provider_episode_id,
+            seen_episode_ids,
+            field=f"progress[{index}].provider_episode_id",
+            description="episode id",
+        )
+        _expect_known_series_id(
+            item.provider_series_id,
+            known_series_ids,
+            f"progress[{index}].provider_series_id",
+        )
 
     seen_watchlist_series_ids: set[str] = set()
     for index, item in enumerate(validated_watchlist):
-        if item.provider_series_id in seen_watchlist_series_ids:
-            raise SnapshotValidationError(
-                f"watchlist[{index}].provider_series_id duplicates an earlier watchlist entry: {item.provider_series_id}"
-            )
-        seen_watchlist_series_ids.add(item.provider_series_id)
-        if item.provider_series_id not in known_series_ids:
-            raise SnapshotValidationError(
-                f"watchlist[{index}].provider_series_id references unknown series id: {item.provider_series_id}"
-            )
+        _expect_unique_id(
+            item.provider_series_id,
+            seen_watchlist_series_ids,
+            field=f"watchlist[{index}].provider_series_id",
+            description="watchlist entry",
+        )
+        _expect_known_series_id(
+            item.provider_series_id,
+            known_series_ids,
+            f"watchlist[{index}].provider_series_id",
+        )
 
     return ProviderSnapshot(
         contract_version=contract_version,

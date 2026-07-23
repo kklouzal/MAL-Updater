@@ -168,7 +168,7 @@ def _search_title(config, query: str, *, limit: int = 10):
         return []
     pacer = _CrunchyrollRequestPacer(
         spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
-        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_jitter_seconds", 0.0) or 0.0)),
+        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_jitter_seconds", 0.0) or 0.0)),
     )
     session = _start_auth_session(
         config,
@@ -265,7 +265,7 @@ def _fetch_search_result_detail(config: AppConfig, match: Any):
         return match
     pacer = _CrunchyrollRequestPacer(
         spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
-        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_jitter_seconds", 0.0) or 0.0)),
+        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_jitter_seconds", 0.0) or 0.0)),
     )
     session = _start_auth_session(
         config,

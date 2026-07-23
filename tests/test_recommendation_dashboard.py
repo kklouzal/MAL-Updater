@@ -201,6 +201,24 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn("without actionable verified provider+dub eligibility", normalized_help)
         self.assertNotIn("Backward-compatible no-op", help_text)
 
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout, self.assertRaises(SystemExit):
+            parser.parse_args(["dashboard-serve", "--help"])
+        serve_help_text = stdout.getvalue()
+        self.assertIn(f"default: {DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT}", serve_help_text)
+        self.assertNotIn("default: 16", serve_help_text)
+
+    def test_parser_excludes_dead_sync_placeholder_but_keeps_real_sync_commands(self) -> None:
+        parser = build_parser()
+        command_action = next(action for action in parser._actions if getattr(action, "choices", None))
+        commands = set(command_action.choices)
+
+        self.assertIn("dry-run-sync", commands)
+        self.assertIn("apply-sync", commands)
+        self.assertIn("dashboard-serve", commands)
+        self.assertNotIn("sync", commands)
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            parser.parse_args(["sync"])
+
     def test_live_dashboard_payload_reads_current_database_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
@@ -563,6 +581,42 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(["Action", "Comedy"], rows[0]["genres"])
             self.assertEqual("unknown/unverified", rows[0]["english_dub_evidence"])
 
+    def test_live_dashboard_indicator_labels_local_current_diagnostics_without_persisted_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            db_path = project_root / ".MAL-Updater" / "data" / "state.db"
+            db_path.parent.mkdir(parents=True)
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [{"kind": "resume_backlog", "provider": "crunchyroll", "title": "Strict Resume", "provider_series_id": "cr-resume", "priority": 80}],
+                run_id="run-strict-resume",
+                generated_at="2026-07-19T05:00:00Z",
+            )
+            item = Recommendation(
+                kind="discovery_candidate",
+                priority=101,
+                provider_series_id="mal:901",
+                title="Local Current Candidate",
+                season_title=None,
+                provider="mal",
+                context={"english_dub_signal": "unknown"},
+            )
+
+            with (
+                patch("mal_updater.recommendation_dashboard.load_config", return_value=SimpleNamespace(db_path=db_path)),
+                patch("mal_updater.recommendation_dashboard.build_recommendations", return_value=[item]),
+            ):
+                payload = build_dashboard_payload(db_path, limit=120)
+
+            self.assertEqual("run-strict-resume", payload["snapshot"]["run_id"])
+            self.assertEqual("local-diagnostic-current", payload["recommendations"]["diagnostic_source_snapshot"]["run_id"])
+            messages = [item["message"] for item in payload["indicators"]]
+            source_messages = [message for message in messages if "Ranked discovery recommendations are sourced" in message]
+            self.assertEqual(1, len(source_messages))
+            self.assertIn("current local diagnostic scorer output", source_messages[0])
+            self.assertNotIn("latest persisted diagnostic discovery snapshot", source_messages[0])
+
     def test_live_dashboard_splits_mal_only_discovery_into_high_confidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
@@ -706,7 +760,8 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "context": {
                             "mal_anime_id": 5001,
                             "english_dub_signal": "present",
-                            "availability_confidence": "mapped",
+                            "availability_confidence": 0.83,
+                            "availability_confidence_label": "mapped",
                             "availability_match_kinds": ["mapped_mal"],
                             "available_provider_series": [
                                 {
@@ -751,6 +806,10 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(["mapped_mal"], mapped["availability"]["match_kinds"])
             self.assertEqual(["approved_mapping"], mapped["availability"]["match_sources"])
             self.assertEqual([1.0], mapped["availability"]["match_confidences"])
+            self.assertEqual(0.83, mapped["availability_confidence"])
+            self.assertEqual("mapped", mapped["availability_confidence_label"])
+            self.assertEqual("mapped", mapped["availability"]["confidence_label"])
+            self.assertEqual("mapped", mapped["evidence"]["availability_confidence_label"])
             self.assertEqual("present", mapped["availability"]["dub_status"])
             self.assertTrue(mapped["availability"]["review_needed"])
             self.assertEqual("unknown", rows["Unknown Dub Candidate"]["availability"]["dub_status"])
@@ -775,6 +834,8 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "available_via_providers": ["crunchyroll"],
                         "context": {
                             "english_dub_signal": "unknown",
+                            "availability_confidence": 0.7,
+                            "availability_confidence_label": "title alias",
                             "availability_match_kinds": ["title_alias"],
                             "available_provider_series": [
                                 {
@@ -802,6 +863,9 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(["title_alias"], payload[0]["availability"]["match_kinds"])
             self.assertEqual(["provider_search"], payload[0]["availability"]["match_sources"])
             self.assertEqual([0.7], payload[0]["availability"]["match_confidences"])
+            self.assertEqual(0.7, payload[0]["availability_confidence"])
+            self.assertEqual("title alias", payload[0]["availability_confidence_label"])
+            self.assertEqual("title alias", payload[0]["availability"]["confidence_label"])
             self.assertEqual("unknown", payload[0]["availability"]["dub_status"])
             self.assertTrue(payload[0]["availability"]["review_needed"])
 

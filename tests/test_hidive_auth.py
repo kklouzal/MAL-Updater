@@ -7,7 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from mal_updater.auth_utils import decode_jwt_payload, jwt_expiry_epoch
 from mal_updater.config import load_config
+import mal_updater.hidive_auth as hidive_auth
 from mal_updater.hidive_auth import (
     HIDIVE_REFRESH_WINDOW_SECONDS,
     HidiveAuthError,
@@ -72,13 +74,64 @@ class HidiveAuthTests(unittest.TestCase):
             self.assertEqual(credentials.username, "user@example.com")
             self.assertEqual(credentials.password, "hunter2")
 
-    def test_seconds_until_jwt_expiry_decodes_exp_claim(self) -> None:
+    def test_hidive_jwt_helpers_decode_expiry_and_tolerate_invalid_tokens(self) -> None:
         token = (
             "eyJhbGciOiJIUzI1NiJ9."
             "eyJleHAiOjE3NzQwNjkyMzYsInN1YiI6IjU3MjQ2MnxkY2UuaGlkaXZlIn0."
             "signature"
         )
+        self.assertEqual({"exp": 1774069236, "sub": "572462|dce.hidive"}, decode_jwt_payload(token))
+        self.assertEqual(1774069236, jwt_expiry_epoch(token))
         self.assertEqual(1774069236 - 1774068636, _seconds_until_jwt_expiry(token, now_epoch=1774068636))
+        self.assertIsNone(decode_jwt_payload("not-a-jwt"))
+        self.assertIsNone(jwt_expiry_epoch("not-a-jwt"))
+        self.assertIsNone(_seconds_until_jwt_expiry("not-a-jwt", now_epoch=1774068636))
+
+    def test_hidive_session_state_json_contract_for_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            state_paths = resolve_hidive_state_paths(config, profile="family-room")
+            with patch("mal_updater.hidive_auth._now_string", return_value="2026-07-23T03:01:01Z"):
+                hidive_auth._write_session_state(
+                    state_paths=state_paths,
+                    profile="family-room",
+                    account_id=None,
+                    account_name=None,
+                    last_error="HIDIVE POST /login failed: HTTP 401: bad credentials",
+                    success=False,
+                    phase="auth_failed",
+                )
+
+            self.assertEqual(
+                state_paths.session_state_path.read_text(encoding="utf-8"),
+                json.dumps(
+                    {
+                        "profile": "family-room",
+                        "authorisation_token_present": False,
+                        "refresh_token_present": False,
+                        "last_login_attempt_at": "2026-07-23T03:01:01Z",
+                        "last_login_success_at": None,
+                        "last_account_id_hint": None,
+                        "last_account_name_hint": None,
+                        "last_error": "HIDIVE POST /login failed: HTTP 401: bad credentials",
+                        "hidive_phase": "auth_failed",
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
+
+    def test_hidive_profile_loader_preserves_id_and_name_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            with patch("mal_updater.hidive_auth._hidive_json_request") as mock_request:
+                mock_request.return_value = {"id": 42, "username": "example-user", "email": "fallback@example.com"}
+                account_id, account_name = hidive_auth._load_profile(config, "access-token", timeout_seconds=7.5)
+
+            self.assertEqual((account_id, account_name), ("42", "example-user"))
+            self.assertEqual(mock_request.call_args.args[:3], (config, "GET", "/user/profile"))
+            self.assertEqual(mock_request.call_args.kwargs["headers"]["Authorization"], "Bearer access-token")
+            self.assertEqual(mock_request.call_args.kwargs["timeout_seconds"], 7.5)
 
     def test_hidive_login_with_credentials_persists_tokens_and_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:

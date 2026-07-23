@@ -200,8 +200,18 @@ class RecommendationProviderEligibilityEvidence:
     updated_at: str
 
 
+class ManagedConnection(sqlite3.Connection):
+    """SQLite connection that preserves transaction context semantics and closes on exit."""
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=ManagedConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn

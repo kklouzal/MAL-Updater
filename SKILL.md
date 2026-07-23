@@ -39,8 +39,10 @@ For the most common operator/data tasks, use the repo-local CLI from `{baseDir}`
 - `PYTHONPATH=src python3 -m mal_updater.cli status`
 - `PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit`
 - `PYTHONPATH=src python3 -m mal_updater.cli service-status`
-- `PYTHONPATH=src python3 -m mal_updater.cli service-run-once`
 - `PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary`
+
+### Manual daemon pass / state-changing
+- `PYTHONPATH=src python3 -m mal_updater.cli service-run-once` — runs pending daemon tasks once, writes runtime state, and may invoke configured external lanes; use only with explicit operator intent and live-write warnings.
 
 ### Recommendations / recommendation-related data
 - `PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20`
@@ -68,7 +70,6 @@ Read-only first:
 - `bootstrap-audit`
 - `health-check`
 - `service-status`
-- `service-run-once`
 - `list-mappings`
 - `list-review-queue --summary`
 - `dry-run-sync`
@@ -84,6 +85,7 @@ Treat these as state-changing:
 - `scripts/install_user_systemd_units.sh`
 - `install-service`
 - `restart-service`
+- `service-run-once` (manual daemon pass; may write state and invoke configured external lanes)
 
 ## High-value references
 

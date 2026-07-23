@@ -143,6 +143,36 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertEqual(["New Pick A", "New Pick B"], [item["title"] for item in payload["sections"][0]["items"]])
         self.assertEqual(1, payload["sections"][0]["suppressed_recent_count"])
 
+    def test_build_recommendation_delivery_payload_preserves_section_order_limits_and_fingerprint_compatibility(self) -> None:
+        fake_sections = [
+            {"key": "resume_backlog", "count": 2, "items": [{"kind": "resume", "title": "Backlog A"}, {"kind": "resume", "title": "Backlog B"}]},
+            {"key": "discovery_candidates", "count": 4, "items": [
+                {"kind": "discovery_candidate", "provider_series_id": "mal:1", "title": "Discovery A", "context": {"availability_visible": True}},
+                {"kind": "discovery_candidate", "provider_series_id": "mal:2", "title": "Dormant B", "context": {"availability_visible": False}},
+                {"kind": "discovery_candidate", "provider_series_id": "mal:3", "title": "Discovery C", "context": {"availability_visible": True}},
+                {"kind": "discovery_candidate", "provider_series_id": "mal:4", "title": "Dormant D", "context": {"availability_visible": False}},
+            ]},
+            {"key": "continue_next", "count": 1, "items": [{"kind": "continue", "title": "Fresh A"}]},
+        ]
+        with (
+            patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[object()]),
+            patch("mal_updater.openclaw_delivery.group_recommendations", return_value=fake_sections),
+        ):
+            payload = build_recommendation_delivery_payload(self.config, limit=10, include_dormant=True, delivery_mode="all")
+
+        self.assertEqual(["resume_backlog", "discovery_candidates", "continue_next"], [section["key"] for section in payload["sections"]])
+        discovery = payload["sections"][1]
+        self.assertEqual(["Discovery A", "Discovery C", "Dormant B"], [item["title"] for item in discovery["items"]])
+        self.assertEqual(3, discovery["count"])
+        self.assertEqual(4, discovery["total_count"])
+        self.assertTrue(discovery["truncated"])
+        self.assertEqual("digest", discovery["delivery_tier"])
+        self.assertEqual(3, discovery["delivery_limit"])
+        self.assertEqual(
+            recommendation_delivery_item_fingerprints({"sections": payload["sections"]}),
+            payload["item_fingerprints"],
+        )
+
     def test_build_recommendation_delivery_payload_caps_dormant_discovery_items(self) -> None:
         class _Item:
             def __init__(self, title: str, provider_series_id: str, available: bool) -> None:

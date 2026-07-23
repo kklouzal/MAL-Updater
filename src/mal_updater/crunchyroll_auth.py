@@ -4,7 +4,6 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - dependency/install health chec
     curl_requests = None
 
 from .auth import write_secret_file
+from .auth_utils import current_utc_timestamp_z, login_session_timestamps
 from .config import AppConfig, _read_secret_file, _resolve_secret_path
 from .request_tracking import record_api_request_event
 
@@ -72,7 +72,7 @@ class CrunchyrollBootstrapResult:
 
 
 def _now_string() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return current_utc_timestamp_z()
 
 
 def resolve_crunchyroll_state_paths(config: AppConfig, profile: str = "default") -> CrunchyrollStatePaths:
@@ -127,8 +127,7 @@ def _write_session_state(
         "refresh_token_present": state_paths.refresh_token_path.exists(),
         "device_id_present": state_paths.device_id_path.exists(),
         "device_type_hint": device_type,
-        "last_login_attempt_at": _now_string(),
-        "last_login_success_at": _now_string() if success else None,
+        **login_session_timestamps(success, now_string=_now_string),
         "last_account_id_hint": account_id,
         "last_error": last_error,
         "crunchyroll_phase": "ready" if success else "auth_failed",

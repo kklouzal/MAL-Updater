@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
+from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .hidive_auth import HidiveAuthError, HidiveSession, HidiveStatePaths, start_hidive_session
 
 
@@ -520,19 +522,8 @@ def fetch_snapshot(
 
 
 def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:
-    return {
-        "contract_version": snapshot.contract_version,
-        "generated_at": snapshot.generated_at,
-        "provider": snapshot.provider,
-        "account_id_hint": snapshot.account_id_hint,
-        "series": [asdict(item) for item in snapshot.series],
-        "progress": [asdict(item) for item in snapshot.progress],
-        "watchlist": [asdict(item) for item in snapshot.watchlist],
-        "raw": snapshot.raw,
-    }
+    return _snapshot_to_dict(snapshot)
 
 
 def write_snapshot_file(path: Path, snapshot: ProviderSnapshot) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(snapshot_to_dict(snapshot), indent=2) + "\n", encoding="utf-8")
-    return path
+    return _write_snapshot_file(path, snapshot)

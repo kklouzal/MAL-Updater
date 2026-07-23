@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from mal_updater.providers import crunchyroll
 
@@ -134,6 +136,79 @@ class CrunchyrollProviderSearchTests(unittest.TestCase):
 
         self.assertEqual(["A", "B"], [result["provider_series_id"] for result in results])
         self.assertEqual(["en-US"], results[0]["audio_locales"])
+
+    def test_search_title_passes_configured_spacing_jitter_to_pacer_without_network(self) -> None:
+        payload = {
+            "data": [
+                {
+                    "type": "top_results",
+                    "items": [{"id": "GSEARCH", "title": "Search Result", "type": "series"}],
+                }
+            ]
+        }
+        config = SimpleNamespace(
+            crunchyroll=SimpleNamespace(
+                request_spacing_seconds=1.25,
+                request_spacing_jitter_seconds=0.75,
+                request_timeout_seconds=9.0,
+                locale="en-US",
+            )
+        )
+        captured = {}
+
+        class FakeSession:
+            def authorized_json_get(self, endpoint, *, params=None, phase=None):
+                return payload
+
+        def fake_start_auth_session(config_arg, *, profile, timeout_seconds, pacer):
+            captured["config"] = config_arg
+            captured["profile"] = profile
+            captured["timeout_seconds"] = timeout_seconds
+            captured["pacer"] = pacer
+            return FakeSession()
+
+        with patch("mal_updater.crunchyroll_snapshot._start_auth_session", side_effect=fake_start_auth_session):
+            results = crunchyroll._search_title(config, "Search Result", limit=3)
+
+        self.assertEqual(["GSEARCH"], [result["provider_series_id"] for result in results])
+        self.assertEqual(1.25, captured["pacer"].spacing_seconds)
+        self.assertEqual(0.75, captured["pacer"].jitter_seconds)
+        self.assertEqual(9.0, captured["timeout_seconds"])
+
+    def test_fetch_search_result_detail_passes_configured_spacing_jitter_to_pacer_without_network(self) -> None:
+        config = SimpleNamespace(
+            crunchyroll=SimpleNamespace(
+                request_spacing_seconds=2.5,
+                request_spacing_jitter_seconds=1.5,
+                request_timeout_seconds=8.0,
+                locale="en-US",
+            )
+        )
+        match = {"provider_series_id": "GDETAIL", "title": "Detail Result", "audio_locales": [], "raw": {}}
+        captured = {}
+
+        class FakeSession:
+            def authorized_json_get(self, endpoint, *, params=None, phase=None):
+                captured["endpoint"] = endpoint
+                captured["params"] = params
+                captured["phase"] = phase
+                return {"data": {"id": "GDETAIL", "title": "Detail Result", "audio_locales": ["en-US"]}}
+
+        def fake_start_auth_session(config_arg, *, profile, timeout_seconds, pacer):
+            captured["config"] = config_arg
+            captured["profile"] = profile
+            captured["timeout_seconds"] = timeout_seconds
+            captured["pacer"] = pacer
+            return FakeSession()
+
+        with patch("mal_updater.crunchyroll_snapshot._start_auth_session", side_effect=fake_start_auth_session):
+            result = crunchyroll._fetch_search_result_detail(config, match)
+
+        self.assertEqual(["en-US"], result["audio_locales"])
+        self.assertEqual(2.5, captured["pacer"].spacing_seconds)
+        self.assertEqual(1.5, captured["pacer"].jitter_seconds)
+        self.assertEqual(8.0, captured["timeout_seconds"])
+        self.assertEqual("title-detail", captured["phase"])
 
 
 if __name__ == "__main__":

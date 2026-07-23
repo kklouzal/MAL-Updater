@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import MalSecrets, load_config
-from mal_updater.db import list_review_queue_entries, list_series_mappings, upsert_series_mapping
+from mal_updater.db import bootstrap_database, list_review_queue_entries, list_series_mappings, upsert_series_mapping
 from mal_updater.ingestion import ingest_snapshot_payload
 from mal_updater.mal_client import MalClient
 from mal_updater.mapping import (
@@ -18,6 +19,7 @@ from mal_updater.mapping import (
 )
 from mal_updater.sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
+    SyncProposal,
     build_dry_run_sync_plan,
     build_mapping_review,
     execute_approved_sync,
@@ -5774,6 +5776,90 @@ class DryRunPlannerTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].payload["decision"], "skip")
+
+    def test_sync_review_queue_preserves_multi_provider_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+
+            proposals = [
+                SyncProposal(
+                    provider_series_id="cr-series-123",
+                    provider_title="Crunchyroll Review Show",
+                    mapping_status="no_candidates",
+                    confidence=0.0,
+                    mal_anime_id=None,
+                    mal_title=None,
+                    current_my_list_status=None,
+                    proposed_my_list_status=None,
+                    decision="review",
+                    reasons=["no_candidates"],
+                    provider="crunchyroll",
+                ),
+                SyncProposal(
+                    provider_series_id="hidive-series-123",
+                    provider_title="HIDIVE Review Show",
+                    mapping_status="no_candidates",
+                    confidence=0.0,
+                    mal_anime_id=None,
+                    mal_title=None,
+                    current_my_list_status=None,
+                    proposed_my_list_status=None,
+                    decision="review",
+                    reasons=["no_candidates"],
+                    provider="hidive",
+                ),
+            ]
+
+            self.assertEqual("crunchyroll", proposals[0].as_dict()["provider"])
+            self.assertEqual("hidive", proposals[1].as_dict()["provider"])
+            self.assertEqual("HIDIVE Review Show", proposals[1].as_dict()["crunchyroll_title"])
+
+            persist_sync_review_queue(config, proposals)
+            rows = list_review_queue_entries(config.db_path, status="open", issue_type="sync_review")
+
+        providers_by_series_id = {row.provider_series_id: row.provider for row in rows}
+        payload_providers_by_series_id = {row.provider_series_id: row.payload["provider"] for row in rows}
+        self.assertEqual(
+            {"cr-series-123": "crunchyroll", "hidive-series-123": "hidive"},
+            providers_by_series_id,
+        )
+        self.assertEqual(providers_by_series_id, payload_providers_by_series_id)
+
+    def test_build_dry_run_sync_plan_provider_all_keeps_crunchyroll_and_hidive_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            crunchyroll_payload = sample_snapshot()
+            crunchyroll_payload["series"][0]["provider_series_id"] = "crunchyroll-series-123"
+            crunchyroll_payload["progress"][0]["provider_series_id"] = "crunchyroll-series-123"
+            crunchyroll_payload["watchlist"][0]["provider_series_id"] = "crunchyroll-series-123"
+            hidive_payload = copy.deepcopy(sample_snapshot())
+            hidive_payload["provider"] = "hidive"
+            hidive_payload["series"][0]["provider_series_id"] = "hidive-series-123"
+            hidive_payload["series"][0]["title"] = "HIDIVE Example Show"
+            hidive_payload["series"][0]["season_title"] = "HIDIVE Example Show Season 1"
+            hidive_payload["progress"][0]["provider_series_id"] = "hidive-series-123"
+            hidive_payload["progress"][0]["provider_episode_id"] = "hidive-episode-456"
+            hidive_payload["watchlist"][0]["provider_series_id"] = "hidive-series-123"
+            ingest_snapshot_payload(crunchyroll_payload, config)
+            ingest_snapshot_payload(hidive_payload, config)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+            (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                proposals = build_dry_run_sync_plan(config, limit=None, mapping_limit=3, provider=None)
+
+        providers_by_series_id = {proposal.provider_series_id: proposal.provider for proposal in proposals}
+        self.assertEqual(
+            {"crunchyroll-series-123": "crunchyroll", "hidive-series-123": "hidive"},
+            providers_by_series_id,
+        )
+        self.assertEqual({proposal.provider for proposal in proposals}, {payload["provider"] for payload in (proposal.as_dict() for proposal in proposals)})
 
     def test_build_dry_run_sync_plan_fills_missing_finish_date_only_when_completed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
