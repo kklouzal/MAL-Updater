@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from mal_updater.cli import main as cli_main
+from mal_updater.cli import build_parser, main as cli_main
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.sync_planner import MAPPING_REVIEW_HEURISTICS_REVISION
 from mal_updater.db import bootstrap_database, connect, replace_review_queue_entries
@@ -104,6 +104,20 @@ class HealthCheckCliTests(unittest.TestCase):
         (target_dir / source_path.name).write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
         return target_dir
 
+    def test_health_help_marks_maintenance_review_limit_deprecated_and_ignored(self) -> None:
+        parser = build_parser()
+
+        for command in ("health-check", "health-check-cycle"):
+            with self.subTest(command=command):
+                with patch("sys.stdout", new_callable=io.StringIO) as stdout, self.assertRaises(SystemExit) as exc:
+                    parser.parse_args([command, "--help"])
+                self.assertEqual(0, exc.exception.code)
+                normalized_help = " ".join(stdout.getvalue().split())
+                self.assertIn("--maintenance-review-limit", normalized_help)
+                self.assertIn("Deprecated compatibility option", normalized_help)
+                self.assertIn("ignored", normalized_help)
+                self.assertIn("--limit 0", normalized_help)
+
     def test_health_check_flags_missing_auth_and_missing_completed_snapshot(self) -> None:
         exit_code, payload = self._run_health_check()
 
@@ -139,7 +153,7 @@ class HealthCheckCliTests(unittest.TestCase):
     def test_health_check_cycle_runs_cli_auto_commands_against_configured_project_root(self) -> None:
         selection = {
             "reason_code": "refresh_mapping_review_backlog",
-            "command_args": ["review-mappings", "--limit", "2", "--mapping-limit", "5", "--persist-review-queue"],
+            "command_args": ["review-mappings", "--limit", "0", "--mapping-limit", "5", "--persist-review-queue"],
             "execution_mode": "cli",
         }
 
@@ -158,7 +172,7 @@ class HealthCheckCliTests(unittest.TestCase):
                 str(self.project_root),
                 "review-mappings",
                 "--limit",
-                "2",
+                "0",
                 "--mapping-limit",
                 "5",
                 "--persist-review-queue",
@@ -303,9 +317,11 @@ class HealthCheckCliTests(unittest.TestCase):
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual("refresh_mapping_review_backlog", maintenance_commands[0]["reason_code"])
         self.assertEqual(
-            ["review-mappings", "--limit", "10", "--mapping-limit", "5", "--persist-review-queue"],
+            ["review-mappings", "--limit", "0", "--mapping-limit", "5", "--persist-review-queue"],
             maintenance_commands[0]["command_args"],
         )
+        self.assertIn("full scan", maintenance_commands[0]["detail"])
+        self.assertIn("--maintenance-review-limit=10 is not applied", maintenance_commands[0]["detail"])
         self.assertEqual([], payload["review_queue"]["recommended_worklist"])
 
     def test_health_check_cycle_passes_review_issue_type_into_saved_health_payload(self) -> None:
@@ -1005,9 +1021,11 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(maintenance_commands[0]["automation_safe"])
         self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
         self.assertEqual(
-            ["review-mappings", "--limit", "25", "--mapping-limit", "5", "--persist-review-queue"],
+            ["review-mappings", "--limit", "0", "--mapping-limit", "5", "--persist-review-queue"],
             maintenance_commands[0]["command_args"],
         )
+        self.assertIn("full scan", maintenance_commands[0]["detail"])
+        self.assertIn("--maintenance-review-limit=25 is not applied", maintenance_commands[0]["detail"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
 
@@ -1232,7 +1250,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_automation_command"])
 
-    def test_health_check_can_override_maintenance_review_limit(self) -> None:
+    def test_health_check_preserves_full_scan_rebuild_when_maintenance_review_limit_is_nonzero(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")
         crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
@@ -1264,9 +1282,10 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(1, len(maintenance_commands))
         self.assertEqual("refresh_mapping_review_backlog", maintenance_commands[0]["reason_code"])
         self.assertEqual(
-            ["review-mappings", "--limit", "10", "--mapping-limit", "5", "--persist-review-queue"],
+            ["review-mappings", "--limit", "0", "--mapping-limit", "5", "--persist-review-queue"],
             maintenance_commands[0]["command_args"],
         )
+        self.assertIn("--maintenance-review-limit=10 is not applied", maintenance_commands[0]["detail"])
 
     def test_health_check_uses_full_backlog_rebuild_shape_when_maintenance_review_limit_is_zero(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")

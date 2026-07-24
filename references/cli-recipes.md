@@ -62,7 +62,7 @@ PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 20 --mapping-limit 5 --persist-review-queue
+PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 0 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --summary --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli review-queue-next --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli review-queue-worklist --issue-type mapping_review --limit 5
@@ -74,7 +74,7 @@ PYTHONPATH=src python3 -m mal_updater.cli review-queue-refresh-worklist --issue-
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --mapping-limit 5 --persist-review-queue
+PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 0 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider hidive --limit 20
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider crunchyroll --limit 20

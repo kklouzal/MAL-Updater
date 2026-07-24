@@ -2604,13 +2604,14 @@ def _build_health_maintenance_commands(
         and coverage_ratio < mapping_coverage_threshold
     ):
         threshold_percent = int(round(mapping_coverage_threshold * 100))
-        recommended_review_limit = max(0, int(maintenance_review_limit))
-        review_command_args = ["review-mappings", "--limit", str(recommended_review_limit), "--mapping-limit", "5", "--persist-review-queue"]
-        detail = (
-            f"Run a bounded mapping review pass and persist the resulting residue because approved mapping coverage is still below {threshold_percent}%"
-        )
-        if recommended_review_limit == 0:
-            detail = f"Rebuild mapping review residue because approved mapping coverage is still below {threshold_percent}%"
+        requested_review_limit = max(0, int(maintenance_review_limit))
+        review_command_args = ["review-mappings", "--limit", "0", "--mapping-limit", "5", "--persist-review-queue"]
+        detail = f"Rebuild the full mapping review residue because approved mapping coverage is still below {threshold_percent}%"
+        if requested_review_limit > 0:
+            detail += (
+                f"; persisted review-queue replacement requires a full scan, so "
+                f"--maintenance-review-limit={requested_review_limit} is not applied to this command"
+            )
         add_command(
             "refresh_mapping_review_backlog",
             detail,
@@ -6589,7 +6590,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_check.add_argument("--review-worklist-limit", type=int, default=3, help="How many ranked review backlog drilldowns to include in recommended_worklist (use 0 to suppress it)")
     health_check.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
     health_check.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved provider->MAL mapping coverage falls below this ratio (default: 0.8)")
-    health_check.add_argument("--maintenance-review-limit", type=int, default=25, help="When coverage is low, cap the auto-recommended review-mappings series scan to this many series (use 0 for all)")
+    health_check.add_argument("--maintenance-review-limit", type=int, default=25, help="Deprecated compatibility option retained for older callers; ignored for persisted low-coverage mapping-review backlog recommendations, which always use a full scan (--limit 0) because partial review-queue replacement is unsafe")
     health_check_cycle = subparsers.add_parser("health-check-cycle", help="Run the repo-native health-check cycle with optional safe auto-remediation and summary output")
     health_check_cycle.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
     health_check_cycle.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present in the final summary")
@@ -6598,7 +6599,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_check_cycle.add_argument("--review-issue-type", default=None, choices=["mapping_review", "sync_review"], help="Optional review_queue issue type to use when building recommended_next/recommended_worklist")
     health_check_cycle.add_argument("--review-worklist-limit", type=int, default=3, help="How many ranked review backlog drilldowns to include in recommended_worklist (use 0 to suppress it)")
     health_check_cycle.add_argument("--mapping-coverage-threshold", type=float, default=0.8, help="Warn when approved provider->MAL mapping coverage falls below this ratio (default: 0.8)")
-    health_check_cycle.add_argument("--maintenance-review-limit", type=int, default=25, help="When coverage is low, cap the auto-recommended review-mappings series scan to this many series (use 0 for all)")
+    health_check_cycle.add_argument("--maintenance-review-limit", type=int, default=25, help="Deprecated compatibility option retained for older callers; ignored for persisted low-coverage mapping-review backlog recommendations, which always use a full scan (--limit 0) because partial review-queue replacement is unsafe")
     mal_auth = subparsers.add_parser("mal-auth-url", help="Generate a MAL OAuth authorization URL + PKCE verifier")
     mal_auth.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     mal_auth_login = subparsers.add_parser("mal-auth-login", help="Run a local loopback MAL OAuth flow and persist returned tokens")
