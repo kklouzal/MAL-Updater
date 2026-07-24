@@ -1,6 +1,6 @@
 # MAL-Updater provider/core architecture
 
-Date: 2026-03-20
+Date: 2026-03-20 (currentized 2026-07-24)
 
 This note describes the initial provider-agnostic refactor that separates MAL-Updater's common core from provider-specific source integration code.
 
@@ -8,8 +8,8 @@ This note describes the initial provider-agnostic refactor that separates MAL-Up
 
 - keep mapping, review queue, ingestion, sync planning, recommendations, and MAL writes in the common core
 - isolate provider-specific auth/session/fetch/normalization code behind a provider module boundary
-- preserve existing Crunchyroll behavior and operator commands while introducing a future-proof provider API
-- create a clean landing zone for HIDIVE implementation
+- preserve existing Crunchyroll behavior and operator commands while introducing a provider API shared by Crunchyroll and HIDIVE
+- keep HIDIVE auth, account snapshot, and title-search behavior isolated behind the same provider boundary
 
 ## New core seams
 
@@ -67,17 +67,19 @@ Current behavior:
 - returns normalized provider-neutral snapshot results
 - preserves existing incremental boundary behavior through the provider wrapper
 
-### HIDIVE provider skeleton
+### HIDIVE provider module
 
 New module:
 - `src/mal_updater/providers/hidive.py`
 
 Current behavior:
-- declares HIDIVE capabilities based on live reconnaissance
 - registers the provider slug
-- intentionally raises `NotImplementedError` for fetch/write until HIDIVE implementation lands
+- implements `provider-auth-login --provider hidive` through the HIDIVE credential login flow
+- implements `provider-fetch-snapshot --provider hidive` through normalized account-scoped snapshot fetching
+- writes snapshots through the shared provider snapshot serializer
+- exposes bounded read-only title search for recommendation enrichment via HIDIVE frontend Algolia `VOD_SERIES` results; episode/video hits are intentionally ignored for conservative provider-to-MAL matching
 
-This provides a stable target for future implementation without pretending support already exists.
+Supported HIDIVE snapshot surfaces today are account watch history, continue-watching progress, and favourites represented as normalized watchlist entries. `--full-refresh` fetches those account-scoped surfaces without crawling the full HIDIVE catalog. The incremental/hot path uses the HIDIVE sync boundary, keeps the newest history page current, and can skip continue/favourites until a full account refresh is due. Crunchyroll page chunk controls remain Crunchyroll-only; HIDIVE rejects them rather than pretending partial page resume exists.
 
 ## CLI changes
 
@@ -89,7 +91,7 @@ Added:
 
 Current behavior:
 - `provider-fetch-snapshot` dispatches through the provider registry
-- `provider-auth-login` currently supports only Crunchyroll and returns a clear not-yet-implemented message for other providers
+- `provider-auth-login` supports both registered source providers, Crunchyroll and HIDIVE
 
 ### Compatibility preserved
 
@@ -122,23 +124,24 @@ Some naming still reflects the original Crunchyroll-first evolution (for example
 
 ### HIDIVE characteristics
 - bearer-token login + refresh model
-- multiple useful data surfaces (history, continue-watching, favourites, future watchlists)
-- likely less provider-local state than Crunchyroll, but richer token lifecycle handling
+- provider-local runtime artifacts (authorisation token, refresh token, session state, sync boundary)
+- multiple useful account data surfaces (history, continue-watching, favourites-as-watchlist)
+- bounded title search through public frontend search metadata, used only for specific recommendation/mapping candidates
 
 The provider boundary intentionally does **not** assume one auth style or one fetch shape.
 It only requires the provider to emit a normalized snapshot contract the core understands.
 
 ## Recommended next implementation slice
 
-1. move provider-specific status/bootstrap reporting behind provider-aware helpers
-2. build smarter lane-specific daemon budgeting/cost modeling on top of the new generic source-provider defaults
-3. implement HIDIVE auth/session manager and snapshot fetcher under `providers/hidive.py`
-4. add richer watchlist fields (`list_id`, `list_name`, `list_kind`) to normalized ingestion/storage once HIDIVE watchlist enumeration is fully understood
+1. move remaining provider-specific status/bootstrap reporting behind provider-aware helpers
+2. keep refining lane-specific daemon budgeting/cost modeling on top of the generic source-provider defaults
+3. decide whether HIDIVE needs additional explicit service-budget tuning beyond the current built-in/provider-service budget tables
+4. add richer watchlist handling only if HIDIVE exposes more than the current favourites surface
 
 ## Current state
 
 After this refactor slice:
 - MAL-Updater has a real provider/core architecture spine
 - Crunchyroll is now represented as a provider module instead of the only implicit source model
-- HIDIVE has a registered placeholder module and confirmed recon docs
+- HIDIVE has implemented auth bootstrap, account-scoped snapshot fetch, snapshot serialization, and bounded title search behind the provider module
 - existing test suite remains green

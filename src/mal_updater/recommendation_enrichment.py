@@ -17,14 +17,20 @@ from .db import (
     upsert_recommendation_provider_eligibility_evidence,
 )
 from .mapping import normalize_title
+from .recommendation_actionability import (
+    PROVIDER_FRANCHISE_SHELL_CHILD_IDENTITY_KIND,
+    PROVIDER_TITLE_SEARCH_EXACT_IDENTITY_KIND,
+    STRICT_PROVIDER_ELIGIBILITY_PROVIDERS,
+    is_strict_provider_eligibility_actionable,
+    provider_audio_locales_have_english,
+    strict_provider_last_verified_at_for_persistence,
+)
 from .recommendations import Recommendation, build_recommendations
 
 PROVIDER_SEARCH_CACHE_TTL_DAYS = 365
 PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS = 7
 DISCOVERY_PROVIDER_SEARCH_REVIEW_ISSUE = "discovery_provider_search_match_review"
-DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS = frozenset({"crunchyroll", "hidive"})
-PROVIDER_TITLE_SEARCH_EXACT_IDENTITY_KIND = "provider_title_search_exact"
-PROVIDER_FRANCHISE_SHELL_CHILD_IDENTITY_KIND = "provider_franchise_shell_child_match"
+DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS = STRICT_PROVIDER_ELIGIBILITY_PROVIDERS
 VERIFIED_PROVIDER_SEARCH_IDENTITY_KINDS = frozenset({
     PROVIDER_TITLE_SEARCH_EXACT_IDENTITY_KIND,
     PROVIDER_FRANCHISE_SHELL_CHILD_IDENTITY_KIND,
@@ -688,8 +694,7 @@ def _is_english_dub_match(match: dict[str, Any]) -> bool:
     return empty audio_locales. Keep title-only markers such as "English Dub"
     out of availability gating so unknown rows are not promoted as dubbed.
     """
-    locales = {str(v).strip().lower().replace("_", "-") for v in match.get("audio_locales") or [] if v is not None}
-    return bool(locales & {"en", "en-us", "en-gb"})
+    return provider_audio_locales_have_english(_audio_locales(match))
 
 
 def _audio_locales(match: dict[str, Any]) -> list[Any]:
@@ -956,9 +961,18 @@ def _upsert_search_eligibility_evidence(
     catalog_status = _catalog_status_from_match(match)
     english_dub_status = _english_dub_status_from_match(provider, match)
     verified_identity = approved_identity or verified_search_identity
-    verified_actionable = verified_identity and catalog_status == "present" and english_dub_status == "present"
     audio_locales = match.get("audio_locales") if isinstance(match.get("audio_locales"), list) else []
-    last_verified_at = fetched_at if verified_actionable else None
+    evidence_candidate = {
+        "provider": provider,
+        "identity_match_kind": identity_match_kind,
+        "review_status": "verified" if verified_identity else "review-needed",
+        "catalog_status": catalog_status,
+        "english_dub_status": english_dub_status,
+        "audio_locales": audio_locales,
+        "expires_at": expires_at,
+    }
+    last_verified_at = strict_provider_last_verified_at_for_persistence(evidence_candidate, verified_at=fetched_at, now=fetched_at)
+    verified_actionable = is_strict_provider_eligibility_actionable({**evidence_candidate, "last_verified_at": last_verified_at}, now=fetched_at)
 
     existing = get_recommendation_provider_eligibility_evidence(
         config.db_path,
@@ -972,9 +986,17 @@ def _upsert_search_eligibility_evidence(
         audio_locales = _merge_audio_locales(existing.audio_locales, audio_locales)
         if explicit_source is None:
             explicit_source = existing.explicit_dub_evidence_source
-        verified_actionable = verified_identity and catalog_status == "present" and english_dub_status == "present"
-        if last_verified_at is None:
+        evidence_candidate.update(
+            {
+                "catalog_status": catalog_status,
+                "english_dub_status": english_dub_status,
+                "audio_locales": audio_locales,
+            }
+        )
+        last_verified_at = strict_provider_last_verified_at_for_persistence(evidence_candidate, verified_at=fetched_at, now=fetched_at)
+        if last_verified_at is None and is_strict_provider_eligibility_actionable(existing, now=fetched_at):
             last_verified_at = existing.last_verified_at
+        verified_actionable = is_strict_provider_eligibility_actionable({**evidence_candidate, "last_verified_at": last_verified_at}, now=fetched_at)
     upsert_recommendation_provider_eligibility_evidence(
         config.db_path,
         mal_anime_id=int(mal_anime_id),

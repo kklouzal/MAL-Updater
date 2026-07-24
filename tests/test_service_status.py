@@ -10,7 +10,9 @@ from unittest.mock import Mock, patch
 
 from mal_updater.cli import main as cli_main
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.service_manager import doctor_service
+from mal_updater.service_manager import doctor_service, service_status, unit_contents
+from mal_updater.service_systemd_status import build_automation_installation_status, read_systemd_user_unit_runtime
+from mal_updater.service_units import render_repo_systemd_unit_template
 
 
 class ServiceStatusTests(unittest.TestCase):
@@ -38,6 +40,38 @@ class ServiceStatusTests(unittest.TestCase):
         ):
             exit_code = cli_main()
         return exit_code, stdout.getvalue()
+
+    def test_unit_contents_renders_repo_owned_template_with_service_manager_inputs(self) -> None:
+        template_source = Path(__file__).resolve().parents[1] / "ops" / "systemd-user" / "mal-updater.service"
+        template_target = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        template_target.parent.mkdir(parents=True, exist_ok=True)
+        template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        fake_python = self.project_root / "venv" / "bin" / "python"
+
+        def fake_python_probe(command: list[str], **kwargs: object) -> Mock:
+            self.assertEqual(["python3", "-c", "import sys; print(sys.executable)"], command)
+            return Mock(stdout=f"{fake_python}\n")
+
+        with (
+            patch("mal_updater.service_manager.subprocess.run", side_effect=fake_python_probe),
+            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+        ):
+            rendered = unit_contents(self.config)
+
+        expected = render_repo_systemd_unit_template(
+            self.config.project_root,
+            fake_home / ".config" / "mal-updater-service.env",
+            fake_python,
+        )
+        self.assertEqual(expected, rendered)
+        self.assertIn(f"WorkingDirectory={self.config.project_root}", rendered)
+        self.assertIn(f"Environment=PYTHONPATH={self.config.project_root}/src", rendered)
+        self.assertIn(f"EnvironmentFile=-{fake_home}/.config/mal-updater-service.env", rendered)
+        self.assertIn(
+            f"ExecStart={fake_python} -m mal_updater.cli --project-root {self.config.project_root} service-run",
+            rendered,
+        )
 
     def test_doctor_service_includes_recent_task_state_and_log_tail(self) -> None:
         now = datetime.now(timezone.utc)
@@ -281,6 +315,101 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual({}, payload["task_state"])
         self.assertIsNone(payload["last_loop_at"])
         self.assertNotIn("api_usage", payload)
+
+    def test_service_status_returns_structured_unavailable_when_systemctl_oserror(self) -> None:
+        fake_home = self.project_root / "fake-home"
+        with (
+            patch("mal_updater.service_manager._run", side_effect=OSError("systemctl unavailable")),
+            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+        ):
+            payload = service_status()
+
+        self.assertFalse(payload["systemctl_available"])
+        self.assertEqual("unavailable", payload["systemctl_status"])
+        self.assertFalse(payload["enabled"])
+        self.assertFalse(payload["active"])
+        self.assertIn("OSError: systemctl unavailable", payload["systemctl_error"])
+        self.assertIn("is_enabled", payload["systemctl_errors"])
+        self.assertIn("is_active", payload["systemctl_errors"])
+
+    def test_service_status_summary_surfaces_systemctl_oserror(self) -> None:
+        with patch("mal_updater.service_manager._run", side_effect=OSError("systemctl unavailable")):
+            exit_code, stdout = self._run_service_status_raw("--format", "summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("systemctl_status=unavailable", stdout)
+        self.assertIn("systemctl_available=False", stdout)
+        self.assertIn("systemctl_error=is_enabled: OSError: systemctl unavailable", stdout)
+        self.assertIn("enabled=False", stdout)
+        self.assertIn("active=False", stdout)
+
+    def test_systemd_runtime_reader_reports_unavailable_without_crashing_on_oserror(self) -> None:
+        with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=OSError("systemctl unavailable")):
+            runtime_state = read_systemd_user_unit_runtime("mal-updater.service")
+
+        self.assertFalse(runtime_state["available"])
+        self.assertEqual("systemctl unavailable", runtime_state["error"])
+
+    def test_automation_installation_status_distinguishes_current_and_outdated_units(self) -> None:
+        source_path = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(
+            "\n".join(
+                [
+                    "[Unit]",
+                    "Description=MAL-Updater",
+                    "",
+                    "[Service]",
+                    "WorkingDirectory=__MAL_UPDATER_REPO_ROOT__",
+                    "EnvironmentFile=-__MAL_UPDATER_SERVICE_ENV_FILE__",
+                    "ExecStart=__MAL_UPDATER_PYTHON_BIN__ -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ service-run",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        script_path = self.project_root / "scripts" / "install_user_systemd_units.sh"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        target_dir = fake_home / ".config" / "systemd" / "user"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        env_path = fake_home / ".config" / "mal-updater-service.env"
+        rendered = render_repo_systemd_unit_template(self.project_root, env_path)
+        target_path = target_dir / "mal-updater.service"
+        target_path.write_text(rendered, encoding="utf-8")
+        runtime_state = {
+            "available": True,
+            "active_state": "active",
+            "sub_state": "running",
+            "unit_file_state": "enabled",
+            "next_elapse_at": None,
+            "last_trigger_at": None,
+            "result": "success",
+        }
+
+        with patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False):
+            current = build_automation_installation_status(
+                self.project_root,
+                runtime_reader=Mock(return_value=runtime_state),
+            )
+            target_path.write_text("[Unit]\nDescription=stale\n", encoding="utf-8")
+            outdated = build_automation_installation_status(
+                self.project_root,
+                runtime_reader=Mock(return_value=runtime_state),
+            )
+
+        self.assertIsNotNone(current)
+        self.assertTrue(current["all_units_installed"])
+        self.assertTrue(current["all_units_current"])
+        self.assertEqual([], current["outdated_units"])
+        self.assertTrue(current["service_enabled"])
+        self.assertTrue(current["service_active"])
+        self.assertIsNotNone(outdated)
+        self.assertTrue(outdated["all_units_installed"])
+        self.assertFalse(outdated["all_units_current"])
+        self.assertEqual(["mal-updater.service"], outdated["outdated_units"])
+        self.assertFalse(outdated["unit"]["content_matches_repo"])
 
     def test_service_status_summary_format_emits_operator_lines(self) -> None:
         now = datetime.now(timezone.utc)

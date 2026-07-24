@@ -9,8 +9,10 @@ from typing import Any
 
 from .config import AppConfig, ensure_directories, load_config
 from .service_runtime import TaskSpec, _planned_fetch_mode
+from .service_systemd_status import build_service_status_payload
+from .service_units import SERVICE_UNIT_NAME, render_repo_systemd_unit_template
 
-SERVICE_NAME = "mal-updater.service"
+SERVICE_NAME = SERVICE_UNIT_NAME
 _RECENT_LOG_LINES = 20
 _RESULT_SNIPPET_LIMIT = 240
 
@@ -310,22 +312,7 @@ def unit_contents(config: AppConfig | None = None) -> str:
     repo = config.project_root
     env_file = _service_env_path()
     python = Path(subprocess.run(["python3", "-c", "import sys; print(sys.executable)"], text=True, capture_output=True, check=True).stdout.strip())
-    return f"""[Unit]
-Description=MAL-Updater background sync daemon
-After=default.target
-
-[Service]
-Type=simple
-WorkingDirectory={repo}
-Environment=PYTHONPATH={repo / 'src'}
-EnvironmentFile=-{env_file}
-ExecStart={python} -m mal_updater.cli --project-root {repo} service-run
-Restart=always
-RestartSec=15
-
-[Install]
-WantedBy=default.target
-"""
+    return render_repo_systemd_unit_template(repo, env_file, python)
 
 
 def write_unit_file(config: AppConfig | None = None) -> Path:
@@ -341,19 +328,12 @@ def daemon_reload() -> None:
 
 
 def service_status() -> dict[str, Any]:
-    unit = _unit_path()
-    enabled = _run(["systemctl", "--user", "is-enabled", SERVICE_NAME], check=False)
-    active = _run(["systemctl", "--user", "is-active", SERVICE_NAME], check=False)
-    return {
-        "unit_path": str(unit),
-        "unit_exists": unit.exists(),
-        "enabled": enabled.returncode == 0 and enabled.stdout.strip() == "enabled",
-        "active": active.returncode == 0 and active.stdout.strip() == "active",
-        "enabled_raw": enabled.stdout.strip() or enabled.stderr.strip(),
-        "active_raw": active.stdout.strip() or active.stderr.strip(),
-        "env_path": str(_service_env_path()),
-        "env_exists": _service_env_path().exists(),
-    }
+    return build_service_status_payload(
+        unit_name=SERVICE_NAME,
+        unit_path=_unit_path(),
+        env_path=_service_env_path(),
+        runner=_run,
+    )
 
 
 def install_service(*, start_now: bool = True, config: AppConfig | None = None) -> ServiceCommandResult:

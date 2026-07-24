@@ -3,19 +3,122 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Iterable
 
-MIGRATIONS = [
-    Path(__file__).resolve().parents[2] / "migrations" / "001_initial.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "002_mal_metadata_cache.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "003_mal_recommendation_edges.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "004_provider_search_cache.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "004_mal_recommendation_harvest_status.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "005_recommendation_score_snapshots.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "006_recommendation_eligibility_evidence.sql",
-    Path(__file__).resolve().parents[2] / "migrations" / "007_mal_user_anime_list_cache.sql",
-]
+MIGRATION_FILENAMES: tuple[str, ...] = (
+    "001_initial.sql",
+    "002_mal_metadata_cache.sql",
+    "003_mal_recommendation_edges.sql",
+    "004_provider_search_cache.sql",
+    "004_mal_recommendation_harvest_status.sql",
+    "005_recommendation_score_snapshots.sql",
+    "006_recommendation_eligibility_evidence.sql",
+    "007_mal_user_anime_list_cache.sql",
+)
+
+_MIGRATIONS_PACKAGE = "mal_updater.migrations"
+
+# Historical ordering is intentionally explicit. The two 004 migrations already
+# exist in deployed databases under these exact filenames, so their duplicate
+# numeric prefix is allowed but must not be generalized to future migrations.
+ALLOWED_DUPLICATE_MIGRATION_PREFIXES: dict[str, tuple[str, ...]] = {
+    "004": (
+        "004_provider_search_cache.sql",
+        "004_mal_recommendation_harvest_status.sql",
+    ),
+}
+
+# Backwards-compatible iterable for callers that inspect migration resources:
+# Traversable entries expose `.name` and `.read_text()`, just like the Path
+# objects previously used here, but remain safe after wheel installation.
+def iter_migrations(filenames: tuple[str, ...] = MIGRATION_FILENAMES):
+    """Return migration resources in the exact order recorded in SQLite."""
+    return tuple(files(_MIGRATIONS_PACKAGE).joinpath(filename) for filename in filenames)
+
+
+MIGRATIONS = iter_migrations()
+
+
+def validate_migration_catalog(
+    filenames: tuple[str, ...] = MIGRATION_FILENAMES,
+    *,
+    packaged_filenames: tuple[str, ...] | None = None,
+    allowed_duplicate_prefixes: dict[str, tuple[str, ...]] | None = None,
+) -> None:
+    """Guard the explicit migration order and historical schema version names."""
+    if allowed_duplicate_prefixes is None:
+        allowed_duplicate_prefixes = ALLOWED_DUPLICATE_MIGRATION_PREFIXES
+
+    if len(filenames) != len(set(filenames)):
+        raise RuntimeError("migration catalog contains duplicate filenames")
+
+    if packaged_filenames is None:
+        packaged = tuple(
+            sorted(
+                child.name
+                for child in files(_MIGRATIONS_PACKAGE).iterdir()
+                if child.name.endswith(".sql")
+            )
+        )
+    else:
+        packaged = tuple(sorted(packaged_filenames))
+    cataloged = tuple(sorted(filenames))
+    if packaged != cataloged:
+        raise RuntimeError(
+            "packaged migration files do not match MIGRATION_FILENAMES: "
+            f"packaged={packaged!r}, cataloged={cataloged!r}"
+        )
+
+    allowed_duplicates = {
+        filename: prefix
+        for prefix, allowed_filenames in allowed_duplicate_prefixes.items()
+        for filename in allowed_filenames
+    }
+    seen_prefixes: dict[str, str] = {}
+    last_prefix_number = -1
+    for filename in filenames:
+        prefix = filename.split("_", 1)[0]
+        try:
+            prefix_number = int(prefix)
+        except ValueError as exc:
+            raise RuntimeError(
+                "migration filename does not start with a numeric prefix: "
+                f"{filename!r}"
+            ) from exc
+        if prefix_number < last_prefix_number:
+            raise RuntimeError(
+                "migration catalog order drifted: "
+                f"{filename!r} appears after a later prefix"
+            )
+        last_prefix_number = prefix_number
+        previous = seen_prefixes.get(prefix)
+        if previous is None:
+            seen_prefixes[prefix] = filename
+            continue
+        if (
+            allowed_duplicates.get(previous) == prefix
+            and allowed_duplicates.get(filename) == prefix
+        ):
+            continue
+        raise RuntimeError(
+            "migration catalog contains duplicate numeric prefix "
+            f"{prefix!r}: {previous!r}, {filename!r}"
+        )
+
+    for prefix, allowed_filenames in allowed_duplicate_prefixes.items():
+        actual = tuple(
+            filename for filename in filenames if filename.split("_", 1)[0] == prefix
+        )
+        if actual != allowed_filenames:
+            raise RuntimeError(
+                "historical duplicate migration order changed for prefix "
+                f"{prefix!r}: expected {allowed_filenames!r}, got {actual!r}"
+            )
+
+
+validate_migration_catalog()
 
 
 @dataclass(slots=True)

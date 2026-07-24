@@ -21,8 +21,8 @@ from .config import (
     load_config,
     load_mal_secrets,
 )
-from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
-from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
+from .crunchyroll_auth import load_crunchyroll_credentials
+from .hidive_auth import load_hidive_credentials
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .request_tracking import (
@@ -371,7 +371,9 @@ def _provider_fetch_command(config: AppConfig, provider: str, *, full_refresh: b
             sys.executable,
             "-m",
             "mal_updater.cli",
-            "crunchyroll-fetch-snapshot",
+            "provider-fetch-snapshot",
+            "--provider",
+            "crunchyroll",
             "--out",
             str(snapshot_path),
             "--ingest",
@@ -597,8 +599,10 @@ def _provider_from_refresh_command_args(command_args: object) -> str | None:
         return "crunchyroll"
     if len(command_args) >= 2 and command_args[0] == "sync-source" and isinstance(command_args[1], str):
         return str(command_args[1])
-    if len(command_args) >= 3 and command_args[0] == "provider-fetch-snapshot" and command_args[1] == "--provider" and isinstance(command_args[2], str):
-        return str(command_args[2])
+    if command_args[0] == "provider-fetch-snapshot":
+        for index, part in enumerate(command_args[:-1]):
+            if part == "--provider" and isinstance(command_args[index + 1], str):
+                return str(command_args[index + 1])
     return None
 
 
@@ -682,21 +686,6 @@ def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
         "--include-discovery-targets",
         "--discovery-target-limit",
         str(max(0, int(discovery_target_limit))),
-    ]
-
-
-def _recommendation_snapshot_command(config: AppConfig) -> list[str]:
-    snapshot_limit = config.service.execute_limit_for("recommendation_snapshot")
-    if snapshot_limit is None:
-        snapshot_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
-    return [
-        sys.executable,
-        "-m",
-        "mal_updater.cli",
-        "recommend",
-        "--limit",
-        str(max(0, int(snapshot_limit))),
-        "--persist-snapshot",
     ]
 
 
@@ -879,11 +868,6 @@ def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: 
         if discovery_target_limit is None:
             discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
         return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
-    if spec.name == "recommendation_snapshot":
-        snapshot_limit = config.service.execute_limit_for("recommendation_snapshot")
-        if snapshot_limit is None:
-            snapshot_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
-        return f"recommendation_snapshot:limit={max(0, int(snapshot_limit))}"
     if spec.name == "push_recommendations_webhook":
         return f"push_recommendations_webhook:limit={_recommendations_webhook_push_limit(config)}:mode={config.openclaw.recommendations_webhook_delivery_mode}"
     if spec.name.startswith("sync_fetch_"):
@@ -1456,14 +1440,6 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
                             result[key] = max(0, int(value))
-            elif spec.name == "recommendation_snapshot":
-                command_args = _recommendation_snapshot_command(config)
-                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
-                result = _run_subprocess(config, command_args, label="recommendation_snapshot")
-                snapshot_limit = config.service.execute_limit_for("recommendation_snapshot")
-                if snapshot_limit is None:
-                    snapshot_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
-                result["snapshot_limit"] = max(0, int(snapshot_limit))
             elif spec.name == "recommend_maintain":
                 command_args = _recommend_maintain_command(config)
                 started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)

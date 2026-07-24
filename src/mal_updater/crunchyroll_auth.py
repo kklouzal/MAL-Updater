@@ -5,7 +5,6 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 try:
     from curl_cffi import requests as curl_requests
@@ -15,7 +14,6 @@ except ModuleNotFoundError:  # pragma: no cover - dependency/install health chec
 from .auth import write_secret_file
 from .auth_utils import current_utc_timestamp_z, login_session_timestamps
 from .config import AppConfig, _read_secret_file, _resolve_secret_path
-from .request_tracking import record_api_request_event
 
 CRUNCHYROLL_TOKEN_URL = "https://www.crunchyroll.com/auth/v1/token"
 CRUNCHYROLL_ME_URL = "https://www.crunchyroll.com/accounts/v1/me"
@@ -181,8 +179,6 @@ def crunchyroll_login_with_credentials(
     response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds)
     if response.status_code >= 400:
         message = f"Crunchyroll credential login failed: HTTP {response.status_code}"
-        if response.status_code == 403 and curl_requests is None:
-            message += " (likely blocked by Cloudflare; install or refresh required curl_cffi browser-TLS transport support)"
         try:
             payload = response.json()
         except ValueError:

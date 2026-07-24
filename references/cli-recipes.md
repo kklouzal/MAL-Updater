@@ -12,12 +12,13 @@ PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
-PYTHONPATH=src python3 -m mal_updater.cli install-service
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 scripts/install_user_systemd_units.sh
 ```
+
+Use `scripts/install_user_systemd_units.sh` as the routine install path. `install-service` remains a lower-level compatibility/repair command; do not run both install paths during normal bootstrap.
 
 ## MAL auth
 
@@ -48,14 +49,16 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchy
 PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider hidive --cutoff "2026-04-25 17:59:00"
 ```
 
+`provider-auth-login` performs live provider login/bootstrap and writes local provider token/session state. `provider-fetch-snapshot` performs live provider reads and writes local snapshot/sync-boundary state; `--ingest` also mutates the local SQLite provider cache. Crunchyroll page chunk controls (`--max-history-pages`, `--max-watchlist-pages`, `--history-start-page`, `--watchlist-start`) are Crunchyroll-only. HIDIVE supports account history, continue-watching, favourites-as-watchlist snapshots, and full-refresh vs incremental boundary behavior, but not chunked page resume.
+
 `provider-stale-rows` is read-only. JSON and summary output include per-family stale counts, oldest/newest `last_seen_at` bounds, exact oldest/newest age-in-days ranges, coarse age-bucket counts (`recent_0_7_days`, `older_8_30_days`, `older_31_plus_days`), and linkage counts for stale progress/watchlist rows (`with_stale_series`, `with_current_series`, `with_missing_series`); JSON sample rows also include exact `age_days`, and child progress/watchlist samples include `linked_series_posture` plus `linked_series_last_seen_at`, so operators can judge concrete residue examples and dependency shape before deciding whether to leave, archive, or prune rows later. The payload and terse summary now also include a policy-neutral `retention_review` posture (`recent_residue_observe`, `aging_residue_observe`, `current_series_child_residue`, or `manual_retention_policy_candidate`) with review-candidate and next-step fields; this is diagnostic guidance only and still preserves `diagnostic_only_no_archive_or_prune`. Add `--older-than-days N` when you only want rows that are stale since the cutoff and have also been absent for at least `N` days.
 
 Compatibility wrappers still exist for Crunchyroll-specific debugging/bootstrap:
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
 ```
 
 ## Review queue triage

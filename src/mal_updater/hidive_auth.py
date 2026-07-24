@@ -11,8 +11,6 @@ import requests
 from .auth import write_secret_file
 from .auth_utils import (
     current_utc_timestamp_z,
-    decode_jwt_payload,
-    jwt_expiry_epoch,
     login_session_timestamps,
     seconds_until_jwt_expiry,
 )
@@ -175,14 +173,6 @@ class HidiveSession:
 
 def _now_string() -> str:
     return current_utc_timestamp_z()
-
-
-def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
-    return decode_jwt_payload(token)
-
-
-def _jwt_expiry_epoch(token: str) -> int | None:
-    return jwt_expiry_epoch(token)
 
 
 def _seconds_until_jwt_expiry(token: str, *, now_epoch: int | None = None) -> int | None:

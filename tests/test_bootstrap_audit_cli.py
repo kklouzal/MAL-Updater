@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import tempfile
@@ -7,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from mal_updater import bootstrap_guidance
 from mal_updater.cli import main as cli_main
+from mal_updater.config import load_config
 
 
 class BootstrapAuditCliTests(unittest.TestCase):
@@ -41,6 +44,29 @@ class BootstrapAuditCliTests(unittest.TestCase):
         ):
             exit_code = cli_main()
         return exit_code, stdout.getvalue()
+
+    def test_bootstrap_audit_imports_without_cli_cycle(self) -> None:
+        self.assertIsNotNone(bootstrap_guidance.build_bootstrap_audit_payload)
+        self.assertIsNotNone(bootstrap_guidance.render_bootstrap_audit_summary)
+
+    def test_bootstrap_guidance_render_matches_cli_json_and_summary(self) -> None:
+        with (
+            patch("importlib.util.find_spec", return_value=None),
+            patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.project_root / ".config")}, clear=False),
+        ):
+            config = load_config(self.project_root)
+            direct_payload = bootstrap_guidance.build_bootstrap_audit_payload(config)
+            exit_code, stdout = self._run_bootstrap_audit_raw()
+            summary_exit_code, summary_stdout = self._run_bootstrap_audit_raw("--summary")
+            summary_buffer = io.StringIO()
+            with contextlib.redirect_stdout(summary_buffer):
+                print(bootstrap_guidance.render_bootstrap_audit_summary(direct_payload), end="")
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(0, summary_exit_code)
+        self.assertEqual(direct_payload, json.loads(stdout))
+        self.assertEqual(bootstrap_guidance.render_bootstrap_audit_json(direct_payload), stdout)
+        self.assertEqual(summary_buffer.getvalue(), summary_stdout)
 
     def test_bootstrap_audit_json_exposes_provider_readiness_and_recommended_commands(self) -> None:
         with patch("importlib.util.find_spec", return_value=None):
@@ -110,7 +136,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
         crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
         (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
 
-        exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
+        with patch("importlib.util.find_spec", return_value=object()):
+            exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("runtime_initialized=False", stdout)
@@ -200,7 +227,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_automation_safe"])
         self.assertFalse(payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_requires_auth_interaction"])
 
-    def test_bootstrap_audit_marks_daemon_expected_once_mal_and_intended_provider_state_exist(self) -> None:
+    def test_bootstrap_audit_marks_daemon_expected_once_mal_provider_state_and_transport_exist(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"
         for relative in ("config", "data", "cache", "state", "secrets"):
             (runtime_root / relative).mkdir(parents=True, exist_ok=True)
@@ -215,7 +242,38 @@ class BootstrapAuditCliTests(unittest.TestCase):
         (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
         (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
 
-        exit_code, stdout = self._run_bootstrap_audit_raw()
+        with patch("importlib.util.find_spec", return_value=object()):
+            exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("daemon-expected-for-unattended", payload["summary"]["operation_mode"])
+        self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
+        self.assertTrue(payload["summary"]["daemon_expected"])
+        self.assertEqual(1, payload["summary"]["intended_provider_count"])
+        self.assertEqual(1, payload["summary"]["ready_provider_count"])
+        self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
+        self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
+        self.assertTrue(payload["providers"]["crunchyroll"]["ready"])
+        self.assertEqual("ready-for-unattended", payload["providers"]["crunchyroll"]["operation_mode"])
+
+    def test_bootstrap_audit_blocks_crunchyroll_unattended_readiness_when_transport_is_missing(self) -> None:
+        runtime_root = self.project_root / ".MAL-Updater"
+        for relative in ("config", "data", "cache", "state", "secrets"):
+            (runtime_root / relative).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "data" / "mal_updater.sqlite3").write_text("", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "mal_refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (runtime_root / "secrets" / "crunchyroll_password.txt").write_text("top-secret\n", encoding="utf-8")
+        crunchyroll_state_root = runtime_root / "state" / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("refresh-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        with patch("importlib.util.find_spec", return_value=None):
+            exit_code, stdout = self._run_bootstrap_audit_raw()
         payload = json.loads(stdout)
 
         self.assertEqual(0, exit_code)
@@ -223,8 +281,10 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
         self.assertFalse(payload["summary"]["daemon_expected"])
         self.assertEqual(1, payload["summary"]["intended_provider_count"])
+        self.assertEqual(0, payload["summary"]["ready_provider_count"])
         self.assertEqual(1, payload["summary"]["partially_staged_provider_count"])
         self.assertEqual("bootstrap-provider-staged", payload["operation_modes"]["mode"])
+        self.assertFalse(payload["providers"]["crunchyroll"]["ready"])
         self.assertEqual("blocked-missing-transport", payload["providers"]["crunchyroll"]["operation_mode"])
 
     def test_bootstrap_audit_surfaces_health_recommended_provider_full_refresh(self) -> None:
@@ -272,7 +332,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertTrue(payload["providers"]["crunchyroll"]["ready"])
         self.assertEqual("ready-health-recommends-full-refresh", payload["providers"]["crunchyroll"]["operation_mode"])
         self.assertEqual(
-            "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --full-refresh --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
+            "PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --full-refresh --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             payload["providers"]["crunchyroll"]["operation_guidance"]["next_command"],
         )
         self.assertEqual("refresh_full_snapshot", payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_reason_code"])
@@ -281,7 +341,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         refresh_command = next(
             item
             for item in payload["recommended_commands"]
-            if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --full-refresh --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest"
+            if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --full-refresh --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest"
         )
         self.assertEqual("refresh_full_snapshot", refresh_command["reason_code"])
         self.assertTrue(refresh_command["automation_safe"])
@@ -327,7 +387,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
+        with patch("importlib.util.find_spec", return_value=object()):
+            exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("provider_hidive_ready=True", stdout)
@@ -391,7 +452,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertTrue(payload["providers"]["crunchyroll"]["ready"])
         self.assertEqual("ready-health-recommends-snapshot-refresh", payload["providers"]["crunchyroll"]["operation_mode"])
         self.assertEqual(
-            "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
+            "PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             payload["providers"]["crunchyroll"]["operation_guidance"]["next_command"],
         )
         self.assertEqual("refresh_ingested_snapshot", payload["providers"]["crunchyroll"]["operation_guidance"]["next_command_reason_code"])
@@ -400,7 +461,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         refresh_command = next(
             item
             for item in payload["recommended_commands"]
-            if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest"
+            if item.get("command") == "PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest"
         )
         self.assertEqual("refresh_ingested_snapshot", refresh_command["reason_code"])
         self.assertTrue(refresh_command["automation_safe"])
@@ -713,7 +774,8 @@ class BootstrapAuditCliTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
+        with patch("importlib.util.find_spec", return_value=object()):
+            exit_code, stdout = self._run_bootstrap_audit_raw("--summary")
 
         self.assertEqual(0, exit_code)
         self.assertIn("provider_hidive_ready=False", stdout)
@@ -730,6 +792,9 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertIn("provider_hidive_next_command_requires_auth_interaction=False", stdout)
         self.assertIn("provider_hidive_next_command_auth_failure_kind=login_failure", stdout)
         self.assertIn("provider_hidive_next_command_auth_remediation_kind=login-bootstrap-failed", stdout)
+        self.assertIn("ready_provider_count=1", stdout)
+        self.assertIn("provider_crunchyroll_ready=True", stdout)
+        self.assertIn("provider_crunchyroll_operation_mode=ready-for-unattended", stdout)
         self.assertIn(
             "maintenance_recommended_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,
@@ -741,7 +806,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
             "next_command=PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive",
             stdout,
         )
-        self.assertIn("partially_staged_provider_count=2", stdout)
+        self.assertIn("partially_staged_provider_count=1", stdout)
 
     def test_bootstrap_audit_carries_health_mapping_review_recommendation(self) -> None:
         runtime_root = self.project_root / ".MAL-Updater"

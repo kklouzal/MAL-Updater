@@ -6,6 +6,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
@@ -18,8 +19,14 @@ from .db import (
     list_latest_recommendation_snapshot_rows,
 )
 
+from .recommendation_actionability import (
+    is_strict_provider_eligibility_actionable,
+    strict_provider_actionability_failure_reasons,
+)
 from .recommendations import Recommendation, build_recommendations
 
+DASHBOARD_MIN_RECOMMENDATION_LIMIT = 1
+DASHBOARD_MAX_RECOMMENDATION_LIMIT = 500
 DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT = 120
 STRICT_DISCOVERY_DIAGNOSTIC_COMMAND = "PYTHONPATH=src python3 -m mal_updater.cli recommend --include-dormant --limit 120"
 
@@ -305,34 +312,18 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _strict_actionability_failure_reasons(row: dict[str, Any]) -> list[str]:
+def _provider_eligibility_evidence_for_actionability(row: dict[str, Any]) -> list[Any]:
+    context = row.get("context") if isinstance(row.get("context"), dict) else {}
+    raw_details = context.get("provider_eligibility_evidence")
+    if isinstance(raw_details, list):
+        return raw_details
     evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else _snapshot_evidence(row)
-    details = evidence.get("provider_eligibility_evidence") if isinstance(evidence.get("provider_eligibility_evidence"), list) else []
-    if not details:
-        return [
-            "provider availability unverified",
-            "English-dub evidence unknown",
-        ]
-    reasons: list[str] = []
-    strict_provider_found = False
-    strict_catalog_found = False
-    strict_dub_found = False
-    for item in details:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("provider") or "").strip().lower() in {"crunchyroll", "hidive"}:
-            strict_provider_found = True
-        if item.get("review_status") == "verified" and item.get("catalog_status") == "present" and item.get("fresh") is True:
-            strict_catalog_found = True
-        if item.get("english_dub_status") == "present":
-            strict_dub_found = True
-    if not strict_provider_found:
-        reasons.append("Crunchyroll/HIDIVE identity unverified")
-    if not strict_catalog_found:
-        reasons.append("current provider catalog presence unverified")
-    if not strict_dub_found:
-        reasons.append("English-dub evidence unknown")
-    return reasons or ["strict provider+dub proof incomplete"]
+    details = evidence.get("provider_eligibility_evidence")
+    return details if isinstance(details, list) else []
+
+
+def _strict_actionability_failure_reasons(row: dict[str, Any]) -> list[str]:
+    return strict_provider_actionability_failure_reasons(_provider_eligibility_evidence_for_actionability(row))
 
 
 def _mark_discovery_row_visibility(row: dict[str, Any]) -> dict[str, Any]:
@@ -572,27 +563,130 @@ _COLUMNS: tuple[tuple[str, str, str], ...] = (
 
 _STATIC_SECTION_ORDER: tuple[str, ...] = ("discovery_available_now", "discovery_high_confidence", "resume_backlog")
 
+_DASHBOARD_REQUIRED_TABLES: frozenset[str] = frozenset(
+    {
+        "mal_anime_metadata",
+        "mal_anime_recommendations",
+        "mal_anime_relations",
+        "mal_recommendation_harvest_status",
+        "mal_series_mapping",
+        "mal_user_anime_list_cache",
+        "provider_episode_progress",
+        "provider_series",
+        "provider_watchlist",
+        "recommendation_provider_eligibility_evidence",
+        "recommendation_score_snapshots",
+        "review_queue",
+        "schema_migrations",
+        "sync_runs",
+    }
+)
+
+
+def _utc_now_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _read_sqlite_table_names(db_path: Path) -> set[str]:
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    finally:
+        conn.close()
+    return {str(row["name"]) for row in rows}
+
+
+def _dashboard_schema_unavailable_reason(db_path: Path) -> str | None:
+    if not db_path.exists():
+        return "dashboard database file is absent"
+    tables = _read_sqlite_table_names(db_path)
+    missing = sorted(_DASHBOARD_REQUIRED_TABLES - tables)
+    if missing:
+        preview = ", ".join(missing[:6])
+        if len(missing) > 6:
+            preview += f", … ({len(missing)} missing total)"
+        return f"dashboard database schema is not initialized or requires migration; missing table(s): {preview}"
+    return None
+
+
+def _is_schema_unavailable_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "no such table" in message or "no such column" in message
+
+
+def _empty_operational_snapshot() -> dict[str, Any]:
+    return {
+        "latest_sync_run": None,
+        "latest_completed_sync_run": None,
+        "provider_counts": {"series": 0, "progress": 0, "watchlist": 0},
+        "provider_counts_by_provider": {},
+        "provider_freshness": {"series_last_seen_at": None, "progress_last_seen_at": None, "watchlist_last_seen_at": None},
+        "provider_freshness_by_provider": {},
+        "review_queue": {},
+        "mappings": {"total": 0, "approved": 0, "by_source": {}, "by_provider": {}},
+    }
+
+
+def _empty_mal_recommendation_harvest_coverage() -> dict[str, Any]:
+    return {
+        "summary": {
+            "mapped_sources": 0,
+            "watched_sources": 0,
+            "fresh": 0,
+            "stale": 0,
+            "unharvested": 0,
+            "total_edges": 0,
+            "fresh_coverage_ratio": None,
+        },
+        "sources": [],
+    }
+
+
+def _unavailable_dashboard_payload(*, limit: int, reason: str) -> dict[str, Any]:
+    section_metadata = {kind: _section_metadata_for(kind) for kind in _STATIC_SECTION_ORDER}
+    coverage_state = {
+        "strict_actionable_count": 0,
+        "dormant_candidate_count": 0,
+        "evidence_pending_review_count": 0,
+        "stale_evidence_count": 0,
+        "strict_current_evidence_count": 0,
+        "message": f"Dashboard data unavailable: {reason}. Run an explicit initialization/startup command to apply migrations; payload reads do not bootstrap schema.",
+        "next_diagnostic_command": STRICT_DISCOVERY_DIAGNOSTIC_COMMAND,
+    }
+    return {
+        "generated_at": _utc_now_z(),
+        "snapshot": None,
+        "recommendations": {
+            "mode": "strict_actionable",
+            "strict_default": True,
+            "items": [],
+            "sections": {},
+            "section_totals": {},
+            "section_metadata": section_metadata,
+            "coverage_state": coverage_state,
+            "diagnostic_source_snapshot": None,
+            "limit": limit,
+            "limit_scope": "per_section",
+        },
+        "coverage": _empty_mal_recommendation_harvest_coverage(),
+        "operational": _empty_operational_snapshot(),
+        "recent_sync_runs": [],
+        "indicators": [
+            {"level": "warning", "message": "No persisted recommendation snapshot is available yet."},
+            {"level": "warning", "message": coverage_state["message"]},
+        ],
+    }
+
 
 def _is_displayable_discovery(row: dict[str, Any]) -> bool:
-    evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else _snapshot_evidence(row)
-    details = evidence.get("provider_eligibility_evidence") if isinstance(evidence.get("provider_eligibility_evidence"), list) else []
-    for item in details:
-        if not isinstance(item, dict):
-            continue
-        provider = str(item.get("provider") or "").strip().lower()
-        if provider not in {"crunchyroll", "hidive"}:
-            continue
-        if item.get("identity_match_kind") not in {"approved_mapping", "manual_verified", "user_exact", "auto_exact", "provider_title_search_exact"}:
-            continue
-        if item.get("review_status") != "verified" or item.get("catalog_status") != "present":
-            continue
-        if item.get("english_dub_status") != "present":
-            continue
-        if item.get("expired") is True:
-            continue
-        if item.get("fresh") is True:
-            return True
-    return False
+    return any(
+        is_strict_provider_eligibility_actionable(item)
+        for item in _provider_eligibility_evidence_for_actionability(row)
+        if isinstance(item, dict)
+    )
 
 
 def _static_section_key(row: dict[str, Any]) -> str | None:
@@ -615,8 +709,31 @@ def _static_sections(rows: list[dict[str, Any]]) -> list[tuple[dict[str, str], l
     return [(_section_metadata_for(key), grouped.get(key, []), len(grouped.get(key, []))) for key in ordered_keys]
 
 
+def normalize_dashboard_limit(value: Any, *, default: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT) -> int:
+    """Coerce dashboard row limits to the documented safe per-section range.
+
+    Invalid query values fall back to the request/server default; numeric values
+    clamp to ``DASHBOARD_MIN_RECOMMENDATION_LIMIT`` ..
+    ``DASHBOARD_MAX_RECOMMENDATION_LIMIT``.
+    """
+    try:
+        default_value = int(default)
+    except (TypeError, ValueError):
+        default_value = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT
+    default_value = min(DASHBOARD_MAX_RECOMMENDATION_LIMIT, max(DASHBOARD_MIN_RECOMMENDATION_LIMIT, default_value))
+    if value is None:
+        return default_value
+    if isinstance(value, str) and not value.strip():
+        return default_value
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return default_value
+    return min(DASHBOARD_MAX_RECOMMENDATION_LIMIT, max(DASHBOARD_MIN_RECOMMENDATION_LIMIT, candidate))
+
+
 def _section_display_budget(limit: int) -> int:
-    return max(1, int(limit))
+    return normalize_dashboard_limit(limit)
 
 
 def _cap_sections(
@@ -911,24 +1028,49 @@ def _recent_sync_runs(db_path: Path, *, limit: int = 8) -> list[dict[str, Any]]:
 
 def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
     with connect(db_path) as conn:
-        row = conn.execute(
+        rows = conn.execute(
             """
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN provider IN ('crunchyroll', 'hidive')
-                    AND identity_match_kind IN ('approved_mapping', 'manual_verified', 'user_exact', 'auto_exact')
-                    AND review_status = 'verified'
-                    AND catalog_status = 'present'
-                    AND english_dub_status = 'present'
-                    AND datetime(expires_at) > datetime('now') THEN 1 ELSE 0 END) AS strict_current,
-                SUM(CASE WHEN review_status IN ('unknown', 'review-needed') OR catalog_status IN ('unknown', 'review-needed') OR english_dub_status IN ('unknown', 'review-needed') THEN 1 ELSE 0 END) AS pending_review,
-                SUM(CASE WHEN review_status = 'stale' OR catalog_status = 'stale' OR english_dub_status = 'stale' OR datetime(expires_at) <= datetime('now') THEN 1 ELSE 0 END) AS stale
+            SELECT provider, identity_match_kind, review_status, catalog_status, english_dub_status,
+                   audio_locales_json, fetched_at, expires_at, last_verified_at
             FROM recommendation_provider_eligibility_evidence
             """
-        ).fetchone()
-    if row is None:
-        return {"total": 0, "strict_current": 0, "pending_review": 0, "stale": 0}
-    return {key: int(row[key] or 0) for key in ("total", "strict_current", "pending_review", "stale")}
+        ).fetchall()
+    counts = {"total": len(rows), "strict_current": 0, "pending_review": 0, "stale": 0}
+    for row in rows:
+        try:
+            audio_locales = json.loads(row["audio_locales_json"] or "[]")
+        except json.JSONDecodeError:
+            audio_locales = []
+        evidence = {
+            "provider": row["provider"],
+            "identity_match_kind": row["identity_match_kind"],
+            "review_status": row["review_status"],
+            "catalog_status": row["catalog_status"],
+            "english_dub_status": row["english_dub_status"],
+            "audio_locales": audio_locales if isinstance(audio_locales, list) else [],
+            "fetched_at": row["fetched_at"],
+            "expires_at": row["expires_at"],
+            "last_verified_at": row["last_verified_at"],
+        }
+        if is_strict_provider_eligibility_actionable(evidence):
+            counts["strict_current"] += 1
+        if row["review_status"] in {"unknown", "review-needed"} or row["catalog_status"] in {"unknown", "review-needed"} or row["english_dub_status"] in {"unknown", "review-needed"}:
+            counts["pending_review"] += 1
+        reasons = strict_provider_actionability_failure_reasons([evidence])
+        expires_at = str(row["expires_at"] or "").strip().replace("Z", "+00:00")
+        expired = False
+        if expires_at:
+            try:
+                expired_at = datetime.fromisoformat(expires_at)
+                if expired_at.tzinfo is None:
+                    expired_at = expired_at.replace(tzinfo=timezone.utc)
+                expired = expired_at.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+            except ValueError:
+                expired = False
+        verification_only_stale = reasons == ["current provider verification stale or missing"]
+        if row["review_status"] == "stale" or row["catalog_status"] == "stale" or row["english_dub_status"] == "stale" or expired or verification_only_stale:
+            counts["stale"] += 1
+    return counts
 
 
 def _project_root_from_db_path(db_path: Path) -> Path | None:
@@ -937,6 +1079,17 @@ def _project_root_from_db_path(db_path: Path) -> Path | None:
         if parent.name == ".MAL-Updater":
             return parent.parent
     return None
+
+
+def _local_diagnostic_unavailable_source(reason: str) -> dict[str, Any]:
+    return {
+        "run_id": "local-diagnostic-unavailable",
+        "generated_at": _utc_now_z(),
+        "item_count": 0,
+        "selection": "current local recommendation scorer unavailable; no writes attempted",
+        "unavailable": True,
+        "reason": reason,
+    }
 
 
 def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -958,9 +1111,12 @@ def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int
             limit=max(1, int(limit)),
             require_provider_availability=False,
             include_discovery_candidates_without_actionable_provider_evidence=True,
+            read_only=True,
         )
-    except Exception:
-        return [], None
+    except sqlite3.OperationalError as exc:
+        if _is_schema_unavailable_error(exc):
+            return [], _local_diagnostic_unavailable_source(str(exc))
+        raise
     rows: list[dict[str, Any]] = []
     for item in results:
         if item.kind != "discovery_candidate":
@@ -982,7 +1138,23 @@ def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int
 
 def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14) -> dict[str, Any]:
     """Return the current dashboard model directly from SQLite state."""
-    bootstrap_database(db_path)
+    display_limit = normalize_dashboard_limit(limit)
+    unavailable_reason = _dashboard_schema_unavailable_reason(db_path)
+    if unavailable_reason is not None:
+        return _unavailable_dashboard_payload(limit=display_limit, reason=unavailable_reason)
+    try:
+        return _build_dashboard_payload_from_initialized_schema(
+            db_path,
+            display_limit=display_limit,
+            stale_after_days=stale_after_days,
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_schema_unavailable_error(exc):
+            return _unavailable_dashboard_payload(limit=display_limit, reason=str(exc))
+        raise
+
+
+def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_limit: int, stale_after_days: int) -> dict[str, Any]:
     operational = get_operational_snapshot(db_path)
     coverage = get_mal_recommendation_harvest_coverage(db_path, stale_after_days=stale_after_days)
     latest_snapshot = _latest_snapshot_summary(db_path)
@@ -992,7 +1164,7 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
     latest_has_discovery = any(row.kind == "discovery_candidate" for row in latest_raw_rows)
     diagnostic_source_snapshot: dict[str, Any] | None = None
     if not latest_has_discovery:
-        current_rows, current_source = _current_ranked_discovery_rows_from_local_state(db_path, limit=limit)
+        current_rows, current_source = _current_ranked_discovery_rows_from_local_state(db_path, limit=display_limit)
         if current_rows:
             diagnostic_source_snapshot = current_source
             for row in current_rows:
@@ -1016,7 +1188,6 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
                     rows.append(row)
     sections: dict[str, list[dict[str, Any]]] = {}
     section_totals: dict[str, int] = {}
-    display_limit = _section_display_budget(limit)
     for row in rows:
         section_key = _static_section_key(row)
         if section_key is None:
@@ -1061,7 +1232,7 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "snapshot": latest_snapshot,
-        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "diagnostic_source_snapshot": diagnostic_source_snapshot, "limit": max(1, int(limit)), "limit_scope": "per_section"},
+        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "diagnostic_source_snapshot": diagnostic_source_snapshot, "limit": display_limit, "limit_scope": "per_section"},
         "coverage": coverage,
         "operational": operational,
         "recent_sync_runs": _recent_sync_runs(db_path),
@@ -1091,6 +1262,8 @@ refresh().catch(err => document.getElementById('app').innerHTML = `<p class=\"ba
 
 
 def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14) -> type[BaseHTTPRequestHandler]:
+    default_limit = normalize_dashboard_limit(limit)
+
     class DashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
@@ -1116,7 +1289,7 @@ def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECO
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
-            request_limit = int(query.get("limit", [limit])[0] or limit)
+            request_limit = normalize_dashboard_limit(query.get("limit", [None])[0], default=default_limit)
             if parsed.path in ("/", "/dashboard"):
                 self._send_html(render_dynamic_dashboard_html())
                 return
@@ -1130,7 +1303,7 @@ def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECO
 
 def serve_dashboard(db_path: Path, *, host: str = "127.0.0.1", port: int = 8766, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT) -> None:
     bootstrap_database(db_path)
-    server = ThreadingHTTPServer((host, int(port)), make_dashboard_handler(db_path, limit=limit))
+    server = ThreadingHTTPServer((host, int(port)), make_dashboard_handler(db_path, limit=normalize_dashboard_limit(limit)))
     print(f"Serving MAL-Updater dashboard at http://{host}:{server.server_port}/")
     try:
         server.serve_forever()

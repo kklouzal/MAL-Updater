@@ -8,36 +8,203 @@ from urllib.request import urlopen
 from http.server import ThreadingHTTPServer
 import json
 import io
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows, upsert_recommendation_provider_eligibility_evidence
+from mal_updater.config import load_config
+from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows, replace_mal_recommendation_edges, upsert_mal_anime_metadata, upsert_recommendation_provider_eligibility_evidence
 from mal_updater.cli import build_parser, _cmd_recommend_snapshots
-from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, _current_ranked_discovery_rows_from_local_state, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_recommendation_dashboard, write_recommendation_dashboard
-from mal_updater.recommendations import Recommendation
+from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_recommendation_dashboard, write_recommendation_dashboard
+from mal_updater.recommendations import Recommendation, build_recommendations
 
 
-def _verified_provider_evidence(provider: str = "crunchyroll", provider_series_id: str = "verified-1", provider_title: str = "Verified Candidate") -> dict[str, object]:
+def _verified_provider_evidence(
+    provider: str = "crunchyroll",
+    provider_series_id: str = "verified-1",
+    provider_title: str = "Verified Candidate",
+    *,
+    identity_match_kind: str = "approved_mapping",
+    audio_locales: list[str] | None = None,
+    last_verified_at: str | None = "2026-07-18T00:00:00Z",
+    expires_at: str = "2099-01-01T00:00:00Z",
+) -> dict[str, object]:
     return {
         "provider": provider,
         "provider_series_id": provider_series_id,
         "provider_title": provider_title,
         "provider_url": f"https://example.test/{provider}/{provider_series_id}",
-        "identity_match_kind": "approved_mapping",
+        "identity_match_kind": identity_match_kind,
         "match_confidence": 1.0,
         "review_status": "verified",
         "catalog_status": "present",
         "english_dub_status": "present",
         "explicit_dub_evidence_source": "provider_audio_locale",
+        "audio_locales": list(audio_locales if audio_locales is not None else ["en-US", "ja-JP"]),
         "fetched_at": "2026-07-18T00:00:00Z",
-        "last_verified_at": "2026-07-18T00:00:00Z",
-        "expires_at": "2099-01-01T00:00:00Z",
-        "fresh": True,
-        "expired": False,
+        "last_verified_at": last_verified_at,
+        "expires_at": expires_at,
+        "fresh": expires_at > "2026-07-24T00:00:00Z",
+        "expired": expires_at <= "2026-07-24T00:00:00Z",
     }
 
 
+_SQLITE_WRITE_ACTIONS = {
+    sqlite3.SQLITE_INSERT,
+    sqlite3.SQLITE_UPDATE,
+    sqlite3.SQLITE_DELETE,
+    sqlite3.SQLITE_CREATE_TABLE,
+    sqlite3.SQLITE_CREATE_INDEX,
+    sqlite3.SQLITE_CREATE_TRIGGER,
+    sqlite3.SQLITE_CREATE_VIEW,
+    sqlite3.SQLITE_CREATE_TEMP_TABLE,
+    sqlite3.SQLITE_CREATE_TEMP_INDEX,
+    sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+    sqlite3.SQLITE_CREATE_TEMP_VIEW,
+    sqlite3.SQLITE_DROP_TABLE,
+    sqlite3.SQLITE_DROP_INDEX,
+    sqlite3.SQLITE_DROP_TRIGGER,
+    sqlite3.SQLITE_DROP_VIEW,
+    sqlite3.SQLITE_DROP_TEMP_TABLE,
+    sqlite3.SQLITE_DROP_TEMP_INDEX,
+    sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+    sqlite3.SQLITE_DROP_TEMP_VIEW,
+    sqlite3.SQLITE_ALTER_TABLE,
+}
+
+
+def _query_only_connect_trap(write_actions: list[tuple[int, str | None, str | None]]):
+    def trapped_connect(db_path: Path):
+        conn = connect(db_path)
+        conn.execute("PRAGMA query_only = ON")
+
+        def authorizer(action: int, arg1: str | None, arg2: str | None, db_name: str | None, trigger: str | None) -> int:
+            if action in _SQLITE_WRITE_ACTIONS:
+                write_actions.append((action, arg1, arg2))
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(authorizer)
+        return conn
+
+    return trapped_connect
+
+
 class RecommendationDashboardTests(unittest.TestCase):
+    def test_strict_actionability_shared_semantics_cover_identity_locales_failures_and_counts(self) -> None:
+        accepted_cases = [
+            ("approved_mapping", ["en"]),
+            ("manual_verified", ["EN_US"]),
+            ("user_exact", ["en-GB"]),
+            ("auto_exact", ["ja-JP", "en-US"]),
+            ("provider_title_search_exact", ["en-us"]),
+            ("provider_franchise_shell_child_match", ["EN-gb", "ja-JP"]),
+        ]
+        for identity_kind, audio_locales in accepted_cases:
+            with self.subTest(identity_kind=identity_kind, audio_locales=audio_locales):
+                row = {
+                    "kind": "discovery_candidate",
+                    "context": {
+                        "provider_eligibility_evidence": [
+                            _verified_provider_evidence(identity_match_kind=identity_kind, audio_locales=audio_locales)
+                        ]
+                    },
+                }
+                self.assertTrue(_is_displayable_discovery(row))
+                self.assertEqual([], _strict_actionability_failure_reasons(row))
+
+        failure_cases = {
+            "legacy_identity": (
+                {"identity_match_kind": "provider_title_search"},
+                "Crunchyroll/HIDIVE identity unverified",
+            ),
+            "missing_english_audio_locale": (
+                {"audio_locales": ["ja-JP"]},
+                "English audio-locales missing/unverified",
+            ),
+            "missing_verified_timestamp": (
+                {"last_verified_at": None},
+                "current provider verification stale or missing",
+            ),
+            "expired_verified_timestamp": (
+                {"expires_at": "2000-01-01T00:00:00Z", "last_verified_at": "2000-01-01T00:00:00Z", "fresh": False, "expired": True},
+                "current provider verification stale or missing",
+            ),
+            "review_not_verified": (
+                {"review_status": "review-needed"},
+                "provider identity review unverified",
+            ),
+            "catalog_not_present": (
+                {"catalog_status": "unknown"},
+                "current provider catalog presence unverified",
+            ),
+            "dub_not_present": (
+                {"english_dub_status": "unknown"},
+                "English-dub evidence unknown",
+            ),
+        }
+        for label, (overrides, expected_reason) in failure_cases.items():
+            with self.subTest(label=label):
+                evidence = _verified_provider_evidence()
+                evidence.update(overrides)
+                row = {"kind": "discovery_candidate", "context": {"provider_eligibility_evidence": [evidence]}}
+                self.assertFalse(_is_displayable_discovery(row))
+                self.assertIn(expected_reason, _strict_actionability_failure_reasons(row))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            for index, (identity_kind, audio_locales) in enumerate(accepted_cases, start=1):
+                upsert_recommendation_provider_eligibility_evidence(
+                    db_path,
+                    mal_anime_id=1000 + index,
+                    provider="crunchyroll" if index % 2 else "hidive",
+                    provider_series_id=f"strict-{index}",
+                    provider_title=f"Strict {index}",
+                    identity_match_kind=identity_kind,
+                    review_status="verified",
+                    catalog_status="present",
+                    english_dub_status="present",
+                    audio_locales=audio_locales,
+                    fetched_at="2026-07-18T00:00:00Z",
+                    expires_at="2099-01-01T00:00:00Z",
+                    last_verified_at="2026-07-18T00:00:00Z",
+                )
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=2000,
+                provider="crunchyroll",
+                provider_series_id="ja-only",
+                provider_title="Japanese Audio Only",
+                identity_match_kind="approved_mapping",
+                review_status="verified",
+                catalog_status="present",
+                english_dub_status="present",
+                audio_locales=["ja-JP"],
+                fetched_at="2026-07-18T00:00:00Z",
+                expires_at="2099-01-01T00:00:00Z",
+                last_verified_at="2026-07-18T00:00:00Z",
+            )
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=2001,
+                provider="hidive",
+                provider_series_id="review-needed",
+                provider_title="Review Needed",
+                identity_match_kind="manual_verified",
+                review_status="review-needed",
+                catalog_status="unknown",
+                english_dub_status="unknown",
+                audio_locales=[],
+                fetched_at="2026-07-18T00:00:00Z",
+                expires_at="2099-01-01T00:00:00Z",
+                last_verified_at=None,
+            )
+            counts = _eligibility_coverage_counts(db_path)
+            self.assertEqual(len(accepted_cases), counts["strict_current"])
+            self.assertEqual(1, counts["pending_review"])
+            self.assertEqual(0, counts["stale"])
+
     def test_render_includes_sortable_requested_columns_and_escapes_content(self) -> None:
         item = Recommendation(
             kind="discovery_candidate",
@@ -219,6 +386,71 @@ class RecommendationDashboardTests(unittest.TestCase):
         with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
             parser.parse_args(["sync"])
 
+    def test_build_dashboard_payload_never_bootstraps_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+
+            with patch("mal_updater.recommendation_dashboard.bootstrap_database", side_effect=AssertionError("payload must not bootstrap")):
+                payload = build_dashboard_payload(db_path)
+
+            self.assertEqual(
+                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                set(payload),
+            )
+            self.assertTrue(any("No persisted recommendation snapshot" in item["message"] for item in payload["indicators"]))
+
+    def test_build_dashboard_payload_missing_database_is_read_only_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / ".MAL-Updater" / "data" / "state.db"
+
+            payload = build_dashboard_payload(db_path)
+
+            self.assertFalse(db_path.parent.exists())
+            self.assertFalse(db_path.exists())
+            self.assertEqual(
+                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                set(payload),
+            )
+            self.assertEqual(
+                {
+                    "mode",
+                    "strict_default",
+                    "items",
+                    "sections",
+                    "section_totals",
+                    "section_metadata",
+                    "coverage_state",
+                    "diagnostic_source_snapshot",
+                    "limit",
+                    "limit_scope",
+                },
+                set(payload["recommendations"]),
+            )
+            self.assertEqual([], payload["recommendations"]["items"])
+            self.assertIn("Dashboard data unavailable", payload["recommendations"]["coverage_state"]["message"])
+            self.assertTrue(any("payload reads do not bootstrap schema" in item["message"] for item in payload["indicators"]))
+
+    def test_build_dashboard_payload_uninitialized_schema_is_explicit_without_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            db_path.touch()
+
+            payload = build_dashboard_payload(db_path)
+
+            self.assertTrue(db_path.exists())
+            self.assertEqual(b"", db_path.read_bytes())
+            self.assertEqual([], payload["recommendations"]["items"])
+            self.assertTrue(any("schema is not initialized" in item["message"] for item in payload["indicators"]))
+
+    def test_build_dashboard_payload_corrupt_database_error_is_not_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            db_path.write_bytes(b"not a sqlite database")
+
+            with self.assertRaises(sqlite3.DatabaseError):
+                build_dashboard_payload(db_path)
+
     def test_live_dashboard_payload_reads_current_database_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
@@ -263,22 +495,107 @@ class RecommendationDashboardTests(unittest.TestCase):
 
             payload = build_dashboard_payload(db_path)
 
+            self.assertEqual(
+                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                set(payload),
+            )
+            self.assertEqual(
+                {
+                    "mode",
+                    "strict_default",
+                    "items",
+                    "sections",
+                    "section_totals",
+                    "section_metadata",
+                    "coverage_state",
+                    "diagnostic_source_snapshot",
+                    "limit",
+                    "limit_scope",
+                },
+                set(payload["recommendations"]),
+            )
+            self.assertEqual("per_section", payload["recommendations"]["limit_scope"])
+            self.assertEqual("strict_actionable", payload["recommendations"]["mode"])
             self.assertEqual(payload["snapshot"]["run_id"], "run-1")
             self.assertEqual(payload["snapshot"]["item_count"], 2)
-            self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["english_title"], "Fresh English Show")
-            self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["genres"], ["Drama", "Sci-Fi"])
-            self.assertEqual(payload["recommendations"]["sections"]["discovery_available_now"][0]["reasons"], [])
+            row = payload["recommendations"]["sections"]["discovery_available_now"][0]
+            self.assertTrue(
+                {
+                    "id",
+                    "run_id",
+                    "generated_at",
+                    "kind",
+                    "provider",
+                    "title",
+                    "display_title",
+                    "provider_series_id",
+                    "mal_anime_id",
+                    "score",
+                    "priority",
+                    "reasons",
+                    "context",
+                    "evidence",
+                    "availability",
+                    "actionable",
+                    "diagnostic_only",
+                    "visibility_label",
+                    "strict_actionability",
+                }.issubset(row)
+            )
+            self.assertEqual("Fresh English Show", row["english_title"])
+            self.assertEqual(["Drama", "Sci-Fi"], row["genres"])
+            self.assertEqual([], row["reasons"])
+            self.assertEqual(
+                {
+                    "providers",
+                    "match_kinds",
+                    "match_sources",
+                    "match_confidences",
+                    "confidence",
+                    "confidence_label",
+                    "dub_status",
+                    "review_needed",
+                    "provider_badges",
+                    "verification",
+                    "freshness",
+                },
+                set(row["availability"]),
+            )
             self.assertEqual(payload["recommendations"]["section_metadata"]["discovery_available_now"]["label"], "Watchable now")
             self.assertEqual(payload["recommendations"]["section_metadata"]["discovery_available_now"]["title_label"], "English title")
             self.assertIn("English dub evidence", payload["recommendations"]["section_metadata"]["discovery_available_now"]["description"])
             self.assertEqual(payload["recommendations"]["section_metadata"]["resume_backlog"]["label"], "Resume backlog")
-            evidence = payload["recommendations"]["sections"]["discovery_available_now"][0]["evidence"]
+            evidence = row["evidence"]
+            self.assertTrue(
+                {
+                    "mal_recommendation_votes",
+                    "seed_count",
+                    "seed_ids",
+                    "seed_titles",
+                    "compact_seeds",
+                    "availability_providers",
+                    "availability_match_kinds",
+                    "availability_match_sources",
+                    "availability_match_confidences",
+                    "availability_confidence",
+                    "availability_confidence_label",
+                    "provider_eligibility_evidence",
+                    "verification_label",
+                    "evidence_freshness_label",
+                    "dub_status",
+                    "english_dub_present",
+                    "review_needed",
+                    "mal_watch_status",
+                    "why_recommended",
+                }.issubset(evidence)
+            )
             self.assertEqual(evidence["mal_recommendation_votes"], 12)
             self.assertEqual(evidence["seed_count"], 2)
             self.assertEqual(evidence["compact_seeds"], "Seed A, Seed B")
             self.assertEqual(evidence["availability_provider_label"], "crunchyroll")
             self.assertEqual(evidence["dub_signal"], "present")
             self.assertEqual(evidence["mal_watch_status"], "plan_to_watch")
+            self.assertEqual(row, payload["recommendations"]["items"][0])
             self.assertEqual(payload["operational"]["provider_counts_by_provider"]["crunchyroll"]["series"], 1)
             self.assertEqual(payload["operational"]["mappings"]["approved"], 1)
             self.assertEqual(payload["recent_sync_runs"][0]["status"], "completed")
@@ -310,6 +627,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "catalog_status": "present",
                         "english_dub_status": "present",
                         "explicit_dub_evidence_source": "provider_audio_locale",
+                        "audio_locales": ["en-US", "ja-JP"],
                         "fetched_at": "2026-07-18T00:00:00Z",
                         "last_verified_at": "2026-07-18T00:00:00Z",
                         "expires_at": "2027-01-01T00:00:00Z",
@@ -356,6 +674,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "catalog_status": "present",
                         "english_dub_status": "present",
                         "explicit_dub_evidence_source": "provider_audio_locale",
+                        "audio_locales": ["en-US", "ja-JP"],
                         "fetched_at": "2026-07-19T00:00:00Z",
                         "expires_at": "2026-07-26T00:00:00Z",
                         "fresh": True,
@@ -372,6 +691,111 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn("present (unverified)", html)
         self.assertIn("review review-needed", html)
         self.assertIn("catalog present", html)
+
+    def test_dashboard_strict_actionability_matches_shared_identity_locale_and_freshness_semantics(self) -> None:
+        accepted = [
+            ("approved_mapping", ["en-US"]),
+            ("manual_verified", ["EN_gb"]),
+            ("user_exact", ["en"]),
+            ("auto_exact", ["ja-JP", "en_CA"]),
+            ("provider_title_search_exact", ["en-AU"]),
+            ("provider_franchise_shell_child_match", ["en-GB", "ja-JP"]),
+        ]
+        for identity_kind, audio_locales in accepted:
+            row = {
+                "kind": "discovery_candidate",
+                "context": {"provider_eligibility_evidence": [_verified_provider_evidence(identity_match_kind=identity_kind, audio_locales=audio_locales)]},
+            }
+            self.assertTrue(_is_displayable_discovery(row), identity_kind)
+            self.assertEqual([], _strict_actionability_failure_reasons(row))
+
+        failure_cases = [
+            ("missing last verification", _verified_provider_evidence(last_verified_at=None), "current provider verification stale or missing"),
+            ("expired verification", _verified_provider_evidence(expires_at="2000-01-01T00:00:00Z"), "current provider verification stale or missing"),
+            ("review not verified", {**_verified_provider_evidence(), "review_status": "review-needed"}, "provider identity review unverified"),
+            ("catalog absent", {**_verified_provider_evidence(), "catalog_status": "absent"}, "current provider catalog presence unverified"),
+            ("dub absent", {**_verified_provider_evidence(), "english_dub_status": "absent"}, "English-dub evidence unknown"),
+            ("non-English audio", _verified_provider_evidence(audio_locales=["ja-JP"]), "English audio-locales missing/unverified"),
+        ]
+        for label, evidence, expected_reason in failure_cases:
+            row = {"kind": "discovery_candidate", "context": {"provider_eligibility_evidence": [evidence]}}
+            self.assertFalse(_is_displayable_discovery(row), label)
+            self.assertIn(expected_reason, _strict_actionability_failure_reasons(row), label)
+
+    def test_live_dashboard_coverage_counts_use_same_strict_display_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+
+            def store_evidence(mal_id: int, provider_series_id: str, title: str, *, identity_match_kind: str, audio_locales: list[str], review_status: str = "verified", catalog_status: str = "present", english_dub_status: str = "present", expires_at: str = "2027-01-01T00:00:00Z", last_verified_at: str | None = "2026-07-18T00:00:00Z") -> dict[str, object]:
+                upsert_recommendation_provider_eligibility_evidence(
+                    db_path,
+                    mal_anime_id=mal_id,
+                    provider="crunchyroll",
+                    provider_series_id=provider_series_id,
+                    provider_title=title,
+                    provider_url=f"https://example.test/{provider_series_id}",
+                    identity_match_kind=identity_match_kind,
+                    match_confidence=0.99,
+                    review_status=review_status,
+                    catalog_status=catalog_status,
+                    english_dub_status=english_dub_status,
+                    explicit_dub_evidence_source="provider_audio_locale" if audio_locales else None,
+                    audio_locales=audio_locales,
+                    source_evidence={"test": "dashboard_strict_parity"},
+                    fetched_at="2026-07-18T00:00:00Z",
+                    expires_at=expires_at,
+                    last_verified_at=last_verified_at,
+                )
+                fresh = expires_at > "2026-07-24T00:00:00Z"
+                return {
+                    "provider": "crunchyroll",
+                    "provider_series_id": provider_series_id,
+                    "provider_title": title,
+                    "provider_url": f"https://example.test/{provider_series_id}",
+                    "identity_match_kind": identity_match_kind,
+                    "match_confidence": 0.99,
+                    "review_status": review_status,
+                    "catalog_status": catalog_status,
+                    "english_dub_status": english_dub_status,
+                    "explicit_dub_evidence_source": "provider_audio_locale" if audio_locales else None,
+                    "audio_locales": audio_locales,
+                    "fetched_at": "2026-07-18T00:00:00Z",
+                    "last_verified_at": last_verified_at,
+                    "expires_at": expires_at,
+                    "fresh": fresh,
+                    "expired": not fresh,
+                }
+
+            title_search = store_evidence(901, "cr-title", "Title Exact", identity_match_kind="provider_title_search_exact", audio_locales=["EN_gb"])
+            shell = store_evidence(902, "cr-shell", "Shell Child", identity_match_kind="provider_franchise_shell_child_match", audio_locales=["en-CA"])
+            no_audio = store_evidence(903, "cr-no-audio", "No Audio", identity_match_kind="provider_title_search_exact", audio_locales=[])
+            store_evidence(904, "cr-review", "Review Needed", identity_match_kind="provider_title_search_exact", audio_locales=["en-US"], review_status="review-needed", catalog_status="unknown", english_dub_status="unknown", last_verified_at=None)
+            store_evidence(905, "cr-stale", "Stale", identity_match_kind="provider_title_search_exact", audio_locales=["en-US"], expires_at="2000-01-01T00:00:00Z")
+
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {"kind": "discovery_candidate", "provider": "crunchyroll", "title": "Title Exact", "provider_series_id": "cr-title", "priority": 99, "context": {"mal_anime_id": 901, "english_dub_signal": "present", "provider_eligibility_evidence": [title_search]}},
+                    {"kind": "discovery_candidate", "provider": "crunchyroll", "title": "Shell Child", "provider_series_id": "cr-shell", "priority": 98, "context": {"mal_anime_id": 902, "english_dub_signal": "present", "provider_eligibility_evidence": [shell]}},
+                    {"kind": "discovery_candidate", "provider": "crunchyroll", "title": "No Audio", "provider_series_id": "cr-no-audio", "priority": 97, "context": {"mal_anime_id": 903, "english_dub_signal": "present", "provider_eligibility_evidence": [no_audio]}},
+                ],
+                run_id="run-strict-parity",
+                generated_at="2026-07-18T03:00:00Z",
+            )
+
+            counts = _eligibility_coverage_counts(db_path)
+            payload = build_dashboard_payload(db_path)
+
+            self.assertEqual(5, counts["total"])
+            self.assertEqual(2, counts["strict_current"])
+            self.assertEqual(1, counts["pending_review"])
+            self.assertEqual(1, counts["stale"])
+            self.assertEqual(2, payload["recommendations"]["section_totals"]["discovery_available_now"])
+            self.assertEqual(1, payload["recommendations"]["section_totals"]["discovery_high_confidence"])
+            dormant = payload["recommendations"]["sections"]["discovery_high_confidence"][0]
+            self.assertEqual("No Audio", dormant["title"])
+            self.assertIn("English audio-locales missing/unverified", dormant["strict_actionability"]["missing"])
 
     def test_live_dashboard_payload_exposes_multi_provider_url_seed_and_scorecard_details(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -406,6 +830,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                                     "review_status": "verified",
                                     "catalog_status": "present",
                                     "english_dub_status": "present",
+                                    "audio_locales": ["en-US", "ja-JP"],
                                     "fetched_at": "2026-07-18T00:00:00Z",
                                     "last_verified_at": "2026-07-18T00:00:00Z",
                                     "expires_at": "2027-01-01T00:00:00Z",
@@ -420,6 +845,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                                     "review_status": "verified",
                                     "catalog_status": "present",
                                     "english_dub_status": "present",
+                                    "audio_locales": ["en-US", "ja-JP"],
                                     "fetched_at": "2026-07-18T00:00:00Z",
                                     "last_verified_at": "2026-07-18T00:00:00Z",
                                     "expires_at": "2027-01-01T00:00:00Z",
@@ -557,6 +983,94 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertIn("unverified", row["provider_evidence"])
             self.assertEqual("run-diagnostic-discovery", payload["recommendations"]["diagnostic_source_snapshot"]["run_id"])
 
+    def test_dashboard_current_fallback_uses_read_only_scoring_without_cache_merge_or_sql_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            db_path = project_root / ".MAL-Updater" / "data" / "mal_updater.sqlite3"
+            db_path.parent.mkdir(parents=True)
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
+                    VALUES ('crunchyroll', 'seed-series', 'Read Only Seed', 'Read Only Seed (English Dub)', '{}')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO provider_watchlist (provider, provider_series_id, status, raw_json)
+                    VALUES ('crunchyroll', 'seed-series', 'fully_watched', '{}')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO mal_series_mapping (provider, provider_series_id, mal_anime_id, mapping_source, approved_by_user)
+                    VALUES ('crunchyroll', 'seed-series', 100, 'user_exact', 1)
+                    """
+                )
+                conn.commit()
+            upsert_mal_anime_metadata(
+                db_path,
+                mal_anime_id=100,
+                title="Read Only Seed",
+                title_english=None,
+                title_japanese=None,
+                alternative_titles=[],
+                media_type="tv",
+                status="finished_airing",
+                num_episodes=12,
+                mean=8.5,
+                popularity=500,
+                start_season=None,
+                raw={"id": 100, "title": "Read Only Seed", "my_list_status": {"status": "completed", "score": 9}},
+            )
+            upsert_mal_anime_metadata(
+                db_path,
+                mal_anime_id=200,
+                title="Read Only Pick",
+                title_english=None,
+                title_japanese=None,
+                alternative_titles=[],
+                media_type="tv",
+                status="finished_airing",
+                num_episodes=12,
+                mean=8.2,
+                popularity=600,
+                start_season=None,
+                raw={"id": 200, "title": "Read Only Pick"},
+            )
+            replace_mal_recommendation_edges(
+                db_path,
+                source_mal_anime_id=100,
+                hop_distance=1,
+                edges=[{"target_mal_anime_id": 200, "target_title": "Read Only Pick", "num_recommendations": 18, "raw": {}}],
+            )
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [{"kind": "resume_backlog", "provider": "crunchyroll", "title": "Strict Resume", "provider_series_id": "cr-resume", "priority": 80}],
+                run_id="run-strict-resume",
+                generated_at="2026-07-19T05:00:00Z",
+            )
+
+            write_actions: list[tuple[int, str | None, str | None]] = []
+            trapped_connect = _query_only_connect_trap(write_actions)
+            with (
+                patch("mal_updater.db.connect", side_effect=trapped_connect),
+                patch("mal_updater.sync_planner.connect", side_effect=trapped_connect),
+                patch("mal_updater.recommendation_dashboard.connect", side_effect=trapped_connect),
+                patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata", side_effect=AssertionError("dashboard fallback must not merge caches")),
+                patch("mal_updater.recommendation_dashboard.build_recommendations", wraps=build_recommendations) as build_spy,
+            ):
+                payload = build_dashboard_payload(db_path, limit=120)
+
+            self.assertEqual([], write_actions)
+            self.assertTrue(build_spy.called)
+            self.assertTrue(build_spy.call_args.kwargs["read_only"])
+            row = payload["recommendations"]["sections"]["discovery_high_confidence"][0]
+            self.assertEqual("Read Only Pick", row["title"])
+            self.assertTrue(row["diagnostic_only"])
+            self.assertEqual("local-diagnostic-current", payload["recommendations"]["diagnostic_source_snapshot"]["run_id"])
+
     def test_current_diagnostic_discovery_rows_keep_genres_as_api_array(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / ".MAL-Updater" / "data" / "state.db"
@@ -580,6 +1094,20 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual("local-diagnostic-current", source["run_id"])
             self.assertEqual(["Action", "Comedy"], rows[0]["genres"])
             self.assertEqual("unknown/unverified", rows[0]["english_dub_evidence"])
+
+    def test_current_diagnostic_discovery_rows_do_not_merge_metadata_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            config = load_config(project_root)
+            config.db_path.parent.mkdir(parents=True, exist_ok=True)
+            bootstrap_database(config.db_path)
+
+            with patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata") as merge_mock:
+                rows, source = _current_ranked_discovery_rows_from_local_state(config.db_path, limit=120)
+
+            self.assertEqual([], rows)
+            self.assertIsNone(source)
+            merge_mock.assert_not_called()
 
     def test_live_dashboard_indicator_labels_local_current_diagnostics_without_persisted_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -872,6 +1400,50 @@ class RecommendationDashboardTests(unittest.TestCase):
     def test_dashboard_serve_cli_default_limit_is_polished_dashboard_default(self) -> None:
         args = build_parser().parse_args(["dashboard-serve"])
         self.assertEqual(args.limit, DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT)
+        parser = build_parser()
+        provider_action = next(action for action in parser._actions if getattr(action, "choices", None))
+        help_text = provider_action.choices["dashboard-serve"].format_help()
+        self.assertIn(f"{DASHBOARD_MIN_RECOMMENDATION_LIMIT}-{DASHBOARD_MAX_RECOMMENDATION_LIMIT}", help_text)
+        self.assertIn("invalid query values", help_text)
+        self.assertIn("use the default", help_text)
+
+    def test_dashboard_api_handler_get_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            config = load_config(project_root)
+            config.db_path.parent.mkdir(parents=True, exist_ok=True)
+            bootstrap_database(config.db_path)
+            insert_recommendation_snapshot_rows(
+                config.db_path,
+                [{"kind": "resume_backlog", "provider": "crunchyroll", "title": "Read Only Resume", "provider_series_id": "cr-readonly", "priority": 80}],
+                run_id="run-read-only-api",
+                generated_at="2026-07-24T07:00:00Z",
+            )
+            before_bytes = config.db_path.read_bytes()
+            write_actions: list[tuple[int, str | None, str | None]] = []
+            trapped_connect = _query_only_connect_trap(write_actions)
+
+            with (
+                patch("mal_updater.recommendation_dashboard.bootstrap_database", side_effect=AssertionError("GET must not bootstrap")),
+                patch("mal_updater.db.connect", side_effect=trapped_connect),
+                patch("mal_updater.sync_planner.connect", side_effect=trapped_connect),
+                patch("mal_updater.recommendation_dashboard.connect", side_effect=trapped_connect),
+                patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata") as merge_mock,
+            ):
+                server = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(config.db_path))
+                thread = Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    api = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard", timeout=5).read().decode("utf-8"))
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
+
+            self.assertIn("recommendations", api)
+            self.assertEqual([], write_actions)
+            merge_mock.assert_not_called()
+            self.assertEqual(before_bytes, config.db_path.read_bytes())
 
     def test_live_dashboard_html_and_json_handler(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -893,14 +1465,27 @@ class RecommendationDashboardTests(unittest.TestCase):
                 root = urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=5).read().decode("utf-8")
                 api = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard", timeout=5).read().decode("utf-8"))
                 override = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=3", timeout=5).read().decode("utf-8"))
+                invalid = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=not-an-int", timeout=5).read().decode("utf-8"))
+                negative = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=-99", timeout=5).read().decode("utf-8"))
+                excessive = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=999999", timeout=5).read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
             self.assertIn("MAL-Updater live dashboard", root)
             self.assertIn("snapshot", api)
+            self.assertEqual(
+                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                set(api),
+            )
+            self.assertIn("sections", api["recommendations"])
+            self.assertIn("section_metadata", api["recommendations"])
+            self.assertIn("coverage_state", api["recommendations"])
             self.assertEqual(api["recommendations"]["limit"], DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT)
             self.assertEqual(override["recommendations"]["limit"], 3)
+            self.assertEqual(invalid["recommendations"]["limit"], DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT)
+            self.assertEqual(negative["recommendations"]["limit"], DASHBOARD_MIN_RECOMMENDATION_LIMIT)
+            self.assertEqual(excessive["recommendations"]["limit"], DASHBOARD_MAX_RECOMMENDATION_LIMIT)
             self.assertTrue(any("No persisted recommendation snapshot" in item["message"] for item in api["indicators"]))
 
 

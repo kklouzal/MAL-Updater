@@ -48,15 +48,21 @@ PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
 ```
 
-## Crunchyroll auth / fetch
+## Provider auth / fetch
 
 ```bash
 cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --full-refresh
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --full-refresh
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --full-refresh
 ```
+
+`provider-auth-login` is live/provider-auth-mutating for the named provider because it logs in and writes local token/session state. `provider-fetch-snapshot` is live/provider-read and may write local cache/state; adding `--ingest` also mutates the local SQLite provider cache. HIDIVE snapshots cover account history, continue-watching, and favourites-as-watchlist surfaces; Crunchyroll additionally supports the page chunk/resume flags documented in CLI help.
 
 ## Review / sync
 
@@ -68,19 +74,20 @@ PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-map
 PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute
 ```
 
+`dry-run-sync`, queue listing/worklist commands, and mapping review generation are local planning/diagnostic surfaces. `apply-sync --execute` is the live MAL-mutating path; keep it exact-approved and bounded unless an operator explicitly approves broader catch-up.
+
 ## User-systemd daemon
 
 ```bash
 cd <repo-root>
 scripts/install_user_systemd_units.sh
-PYTHONPATH=src python3 -m mal_updater.cli install-service
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
 
-The installer renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/`.
+Use one install path, not both, for routine setup. Prefer `scripts/install_user_systemd_units.sh` for production bootstrap because it renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/` and preserves/installs the service env file. The CLI `install-service` path is a compatibility/direct service-manager path for targeted repair or tests.
 
 ## MAL redirect configuration
 

@@ -60,6 +60,8 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
         self.assertEqual("hot", sync_result["fetch_mode"])
         sync_args = run_subprocess.call_args_list[0].args[1]
+        self.assertIn("provider-fetch-snapshot", sync_args)
+        self.assertEqual(sync_args[sync_args.index("--provider") + 1], "crunchyroll")
         self.assertNotIn("--full-refresh", sync_args)
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
@@ -83,7 +85,8 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         self.assertEqual("ok", result["status"])
         self.assertEqual("running", observed_state["execution_state"])
         self.assertIn("running_started_at", observed_state)
-        self.assertIn("crunchyroll-fetch-snapshot", str(observed_state["running_command"]))
+        self.assertIn("provider-fetch-snapshot", str(observed_state["running_command"]))
+        self.assertIn("--provider crunchyroll", str(observed_state["running_command"]))
         self.assertNotIn("secret", str(observed_state["running_command"]))
         self.assertEqual(self.config.service.task_timeout_seconds, observed_state["running_timeout_seconds"])
 

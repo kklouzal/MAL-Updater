@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig
 from .db import (
+    MalAnimeMetadata,
     PersistedSeriesMapping,
     RecommendationProviderEligibilityEvidence,
     get_mal_anime_metadata_map,
@@ -19,6 +20,7 @@ from .db import (
     merge_mal_user_anime_list_cache_into_metadata,
 )
 from .mapping import normalize_title
+from .recommendation_actionability import is_strict_provider_eligibility_actionable, provider_audio_locales_have_english
 from .sync_planner import ProviderSeriesState, load_provider_series_states
 
 _ENGLISH_DUB_RE = re.compile(r"\benglish dub\b|\(dub\)", re.IGNORECASE)
@@ -418,7 +420,15 @@ def build_recommendations(
     *,
     require_provider_availability: bool = True,
     include_discovery_candidates_without_actionable_provider_evidence: bool = False,
+    read_only: bool = False,
 ) -> list[Recommendation]:
+    """Build ranked recommendations from local state.
+
+    The default path preserves existing maintenance behavior by merging cached MAL
+    list rows into metadata before scoring.  ``read_only=True`` is for request
+    surfaces that must not mutate local state; it skips that merge and applies the
+    same cached MAL list payloads to the in-memory metadata map instead.
+    """
     states = load_provider_series_states(config, limit=None)
     state_by_id = {(state.provider, state.provider_series_id): state for state in states}
     persisted_mappings = list_series_mappings(config.db_path, approved_only=False)
@@ -430,8 +440,14 @@ def build_recommendations(
         (mapping.provider, mapping.provider_series_id): mapping
         for mapping in persisted_mappings
     }
-    merge_mal_user_anime_list_cache_into_metadata(config.db_path)
-    metadata_by_id = get_mal_anime_metadata_map(config.db_path)
+    if read_only:
+        metadata_by_id = _metadata_map_with_mal_user_list_cache_overlay(
+            config.db_path,
+            get_mal_anime_metadata_map(config.db_path),
+        )
+    else:
+        merge_mal_user_anime_list_cache_into_metadata(config.db_path)
+        metadata_by_id = get_mal_anime_metadata_map(config.db_path)
     relations_by_id = get_mal_anime_relations_map(config.db_path)
     recommendation_edges_by_id = get_mal_recommendation_edges_map(config.db_path)
 
@@ -584,27 +600,11 @@ def _utc_iso_now() -> str:
 
 
 def _provider_audio_locales_have_english(locales: list[Any]) -> bool:
-    normalized = {str(value).strip().lower().replace("_", "-") for value in locales if value is not None}
-    return bool(normalized & {"en", "en-us", "en-gb"})
+    return provider_audio_locales_have_english(locales)
 
 
 def _eligibility_is_actionable(evidence: RecommendationProviderEligibilityEvidence, *, now: str) -> bool:
-    return (
-        evidence.provider in {"crunchyroll", "hidive"}
-        and evidence.identity_match_kind in {
-            "approved_mapping",
-            "manual_verified",
-            "user_exact",
-            "auto_exact",
-            "provider_title_search_exact",
-            "provider_franchise_shell_child_match",
-        }
-        and evidence.review_status == "verified"
-        and evidence.catalog_status == "present"
-        and evidence.english_dub_status == "present"
-        and evidence.expires_at > now
-        and _provider_audio_locales_have_english(evidence.audio_locales)
-    )
+    return is_strict_provider_eligibility_actionable(evidence, now=now)
 
 
 def _provider_eligibility_evidence_by_mal_id(
@@ -1000,6 +1000,82 @@ def _metadata_my_list_status(meta: Any) -> dict[str, Any] | None:
     return my_list_status if isinstance(my_list_status, dict) else None
 
 
+def _my_list_status_from_cache_entry(entry: Any) -> dict[str, Any]:
+    payload = dict(entry.list_status_raw) if isinstance(getattr(entry, "list_status_raw", None), dict) else {}
+    if entry.list_status:
+        payload["status"] = entry.list_status
+    if entry.user_score is not None:
+        payload["score"] = entry.user_score
+    if entry.num_episodes_watched is not None:
+        payload["num_episodes_watched"] = entry.num_episodes_watched
+    if entry.start_date:
+        payload["start_date"] = entry.start_date
+    if entry.finish_date:
+        payload["finish_date"] = entry.finish_date
+    if entry.list_updated_at:
+        payload["updated_at"] = entry.list_updated_at
+    return payload
+
+
+def _metadata_with_cache_entry_overlay(meta: MalAnimeMetadata, entry: Any) -> MalAnimeMetadata:
+    raw = dict(meta.raw) if isinstance(meta.raw, dict) else {}
+    raw["my_list_status"] = _my_list_status_from_cache_entry(entry)
+    raw["mal_user_anime_list_cache"] = {
+        "refresh_run_id": entry.refresh_run_id,
+        "refresh_generation": entry.refresh_generation,
+    }
+    return replace(meta, raw=raw)
+
+
+def _metadata_from_cache_entry(entry: Any) -> MalAnimeMetadata:
+    raw = {
+        "id": int(entry.mal_anime_id),
+        "title": entry.title,
+        "my_list_status": _my_list_status_from_cache_entry(entry),
+        "mal_user_anime_list_cache": {
+            "refresh_run_id": entry.refresh_run_id,
+            "refresh_generation": entry.refresh_generation,
+        },
+    }
+    return MalAnimeMetadata(
+        mal_anime_id=int(entry.mal_anime_id),
+        title=str(entry.title),
+        title_english=None,
+        title_japanese=None,
+        alternative_titles=[],
+        media_type=None,
+        status=None,
+        num_episodes=None,
+        mean=None,
+        popularity=None,
+        start_season=None,
+        raw=raw,
+        fetched_at="1970-01-01 00:00:00",
+        updated_at=str(getattr(entry, "updated_at", None) or entry.fetched_at),
+    )
+
+
+def _metadata_map_with_mal_user_list_cache_overlay(db_path: Any, metadata_by_id: dict[int, MalAnimeMetadata]) -> dict[int, MalAnimeMetadata]:
+    """Return metadata with MAL list cache status overlaid without DB writes.
+
+    This mirrors the scoring-relevant part of
+    ``merge_mal_user_anime_list_cache_into_metadata`` in memory only, including
+    synthetic cache-only metadata rows, so read-only request paths keep scoring
+    semantics without persisting maintenance updates.
+    """
+    entries = list_mal_user_anime_list_cache(db_path)
+    if not entries:
+        return metadata_by_id
+    overlaid = dict(metadata_by_id)
+    for entry in entries:
+        meta = overlaid.get(int(entry.mal_anime_id))
+        if meta is None:
+            overlaid[int(entry.mal_anime_id)] = _metadata_from_cache_entry(entry)
+            continue
+        overlaid[int(entry.mal_anime_id)] = _metadata_with_cache_entry_overlay(meta, entry)
+    return overlaid
+
+
 def _metadata_mal_watch_context(meta: Any) -> dict[str, Any]:
     my_list_status = _metadata_my_list_status(meta)
     status = None
@@ -1056,13 +1132,6 @@ def _supporting_seed_details(
         )
     details.sort(key=lambda item: (-int(item.get("num_recommendation_votes") or 0), str(item.get("title") or ""), int(item["mal_anime_id"])))
     return details[:5]
-
-
-def _provider_has_unwatched_tail(state: ProviderSeriesState) -> bool:
-    total = getattr(state, "available_episode_count", None) or getattr(state, "latest_episode_number", None) or state.max_episode_number
-    if total is None or total <= 0:
-        return False
-    return state.completed_episode_count < int(total)
 
 
 def _mapped_mal_watch_context(

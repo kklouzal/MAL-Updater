@@ -8,7 +8,7 @@ The rest of the Python application owns validation, persistence, mapping, sync p
 Current producer shape:
 
 ```bash
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out path/to/snapshot.json
+PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out path/to/snapshot.json
 ```
 
 - output JSON matches `references/contracts/crunchyroll_snapshot.schema.json`

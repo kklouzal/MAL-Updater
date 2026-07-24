@@ -408,7 +408,10 @@ def deliver_recommendations_via_openclaw(
             response_text = response.read().decode("utf-8", errors="replace")
             status_code = getattr(response, "status", None) or response.getcode()
     except HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace") if exc.fp is not None else str(exc)
+        try:
+            error_text = exc.read().decode("utf-8", errors="replace") if exc.fp is not None else str(exc)
+        finally:
+            exc.close()
         return OpenClawRecommendationDeliveryResult(
             status="http_error",
             request_url=request_url,

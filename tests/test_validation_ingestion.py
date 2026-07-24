@@ -182,11 +182,11 @@ class IngestionTests(unittest.TestCase):
 
             import sqlite3
 
-            conn = sqlite3.connect(config.db_path)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_series").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_episode_progress").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_watchlist").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sync_runs WHERE status = 'completed'").fetchone()[0], 1)
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_series").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_episode_progress").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_watchlist").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM sync_runs WHERE status = 'completed'").fetchone()[0], 1)
 
     def test_ingest_snapshot_payload_preserves_explicit_sync_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -198,9 +198,8 @@ class IngestionTests(unittest.TestCase):
 
             import sqlite3
 
-            conn = sqlite3.connect(config.db_path)
-            self.assertEqual(conn.execute("SELECT mode FROM sync_runs").fetchone()[0], "full_refresh")
-            conn.close()
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                self.assertEqual(conn.execute("SELECT mode FROM sync_runs").fetchone()[0], "full_refresh")
 
     def test_provider_fetch_snapshot_ingest_records_full_refresh_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -224,9 +223,8 @@ class IngestionTests(unittest.TestCase):
             import sqlite3
 
             config = load_config(root)
-            conn = sqlite3.connect(config.db_path)
-            self.assertEqual(conn.execute("SELECT mode FROM sync_runs").fetchone()[0], "full_refresh")
-            conn.close()
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                self.assertEqual(conn.execute("SELECT mode FROM sync_runs").fetchone()[0], "full_refresh")
 
 
 if __name__ == "__main__":

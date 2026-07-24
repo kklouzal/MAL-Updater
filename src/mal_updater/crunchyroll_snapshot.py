@@ -322,8 +322,6 @@ def refresh_access_token(
     response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds)
     if response.status_code >= 400:
         message = f"Crunchyroll refresh-token login failed: HTTP {response.status_code}"
-        if response.status_code == 403 and curl_requests is None:
-            message += " (likely blocked by Cloudflare; install or refresh required curl_cffi browser-TLS transport support)"
         try:
             payload = response.json()
         except ValueError:

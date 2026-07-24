@@ -52,6 +52,8 @@ class RecommendMaintainTests(unittest.TestCase):
             ],
         )
         provider_args = plan[0]["args"]
+        self.assertIn("provider-fetch-snapshot", provider_args)
+        self.assertEqual(provider_args[provider_args.index("--provider") + 1], "crunchyroll")
         self.assertIn("--ingest", provider_args)
         self.assertNotIn("--full-refresh", provider_args)
         self.assertEqual(provider_args[provider_args.index("--max-history-pages") + 1], "2")
@@ -66,6 +68,8 @@ class RecommendMaintainTests(unittest.TestCase):
             config = self._config(Path(tmp))
             args = _provider_fetch_command(config, "crunchyroll")
 
+        self.assertIn("provider-fetch-snapshot", args)
+        self.assertEqual(args[args.index("--provider") + 1], "crunchyroll")
         self.assertEqual(args[args.index("--max-history-pages") + 1], "10")
         self.assertEqual(args[args.index("--max-watchlist-pages") + 1], "2")
 

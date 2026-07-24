@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Iterator, TextIO
 
 from .config import AppConfig, ensure_directories
+from .health_report import build_health_report, health_report_exit_code, render_health_report, render_health_report_json
 
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -73,42 +73,6 @@ def _print_prefixed(message: str) -> None:
     print(f"[{_now_iso()}] {message}")
 
 
-def _health_check_command(
-    config: AppConfig,
-    *,
-    stale_hours: float,
-    strict: bool,
-    output_format: str,
-    review_issue_type: str | None,
-    review_worklist_limit: int,
-    mapping_coverage_threshold: float,
-    maintenance_review_limit: int,
-) -> list[str]:
-    command = [
-        "python3",
-        "-m",
-        "mal_updater.cli",
-        "--project-root",
-        str(config.project_root),
-        "health-check",
-        "--stale-hours",
-        str(stale_hours),
-        "--format",
-        output_format,
-        "--review-worklist-limit",
-        str(review_worklist_limit),
-        "--mapping-coverage-threshold",
-        str(mapping_coverage_threshold),
-        "--maintenance-review-limit",
-        str(maintenance_review_limit),
-    ]
-    if review_issue_type:
-        command.extend(["--review-issue-type", review_issue_type])
-    if strict:
-        command.append("--strict")
-    return command
-
-
 def _run_health_check_json(
     config: AppConfig,
     *,
@@ -119,29 +83,17 @@ def _run_health_check_json(
     mapping_coverage_threshold: float,
     maintenance_review_limit: int,
 ) -> tuple[int, dict[str, object]]:
-    result = subprocess.run(
-        _health_check_command(
-            config,
-            stale_hours=stale_hours,
-            strict=False,
-            output_format="json",
-            review_issue_type=review_issue_type,
-            review_worklist_limit=review_worklist_limit,
-            mapping_coverage_threshold=mapping_coverage_threshold,
-            maintenance_review_limit=maintenance_review_limit,
-        ),
-        check=False,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PYTHONPATH": str(_SOURCE_ROOT)},
-        cwd=config.project_root,
+    payload = build_health_report(
+        config,
+        stale_hours=stale_hours,
+        review_issue_type=review_issue_type,
+        review_worklist_limit=review_worklist_limit,
+        mapping_coverage_threshold=mapping_coverage_threshold,
+        maintenance_review_limit=maintenance_review_limit,
     )
-    json_path.write_text(result.stdout, encoding="utf-8")
-    payload = json.loads(result.stdout)
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Expected top-level object in {json_path}")
-    config.health_latest_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return result.returncode, payload
+    json_path.write_text(render_health_report_json(payload), encoding="utf-8")
+    config.health_latest_json_path.write_text(render_health_report_json(payload, trailing_newline=False), encoding="utf-8")
+    return health_report_exit_code(payload, strict=False), payload
 
 
 def _select_auto_command(payload: dict[str, object], *, allow_reason_codes: set[str]) -> dict[str, object] | None:
@@ -275,29 +227,19 @@ def run_health_check_cycle(
                         maintenance_review_limit=maintenance_review_limit,
                     )
 
-                summary = subprocess.run(
-                    _health_check_command(
-                        config,
-                        stale_hours=stale_hours,
-                        strict=strict,
-                        output_format="summary",
-                        review_issue_type=review_issue_type,
-                        review_worklist_limit=review_worklist_limit,
-                        mapping_coverage_threshold=mapping_coverage_threshold,
-                        maintenance_review_limit=maintenance_review_limit,
-                    ),
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    env={**os.environ, "PYTHONPATH": str(_SOURCE_ROOT)},
-                    cwd=config.project_root,
+                summary_payload = build_health_report(
+                    config,
+                    stale_hours=stale_hours,
+                    review_issue_type=review_issue_type,
+                    review_worklist_limit=review_worklist_limit,
+                    mapping_coverage_threshold=mapping_coverage_threshold,
+                    maintenance_review_limit=maintenance_review_limit,
                 )
-                if summary.stdout:
-                    print(summary.stdout, end="")
-                if summary.stderr:
-                    print(summary.stderr, end="", file=__import__("sys").stderr)
+                summary_output = render_health_report(summary_payload, output_format="summary")
+                if summary_output:
+                    print(summary_output, end="")
                 _print_prefixed("MAL-Updater health-check cycle completed")
-                return summary.returncode
+                return health_report_exit_code(summary_payload, strict=strict)
     except HealthCycleLockBusyError:
         _print_prefixed("health-check already running; skipping overlap")
         return 0

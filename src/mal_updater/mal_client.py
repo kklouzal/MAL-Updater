@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import random
 import re
@@ -83,6 +82,16 @@ def _sanitize_anime_search_query(query: str) -> str:
     cleaned = re.sub(r"\(\s*\)", " ", cleaned)
     cleaned = re.sub(r"\s*[-:|–—]\s*(?=$|\))", " ", cleaned)
     return " ".join(cleaned.split()).strip()
+
+
+def _read_http_error_detail(exc: HTTPError) -> str:
+    """Read and close urllib HTTPError bodies so failing calls do not leak files."""
+    try:
+        if exc.fp is None:
+            return str(exc)
+        return exc.read().decode("utf-8", errors="replace")
+    finally:
+        exc.close()
 
 
 class MalClient:
@@ -325,7 +334,7 @@ class MalClient:
 
             return self._request_with_timeout_retry(error_context, _send)
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            detail = _read_http_error_detail(exc)
             record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
@@ -344,7 +353,7 @@ class MalClient:
 
             return self._request_with_timeout_retry(error_context, _send)
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            detail = _read_http_error_detail(exc)
             record_api_request_event("mal", "get_json", url=url, method="GET", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
@@ -372,7 +381,7 @@ class MalClient:
 
             raw = self._request_with_timeout_retry("MAL token request failed", _send)
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            detail = _read_http_error_detail(exc)
             record_api_request_event("mal", "token_request", url=url, method="POST", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"MAL token request failed: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:

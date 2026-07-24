@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from mal_updater.auth import OAuthCallbackError, persist_token_response, wait_for_oauth_callback, write_secret_file
@@ -44,8 +45,9 @@ class AuthHelpersTests(unittest.TestCase):
         thread = threading.Thread(target=runner)
         thread.start()
         time.sleep(0.2)
-        with self.assertRaises(Exception):
+        with self.assertRaises(HTTPError) as raised:
             urlopen("http://127.0.0.1:8877/callback?code=hello&state=bad")
+        raised.exception.close()
         thread.join(timeout=2.0)
 
         self.assertIsInstance(results.get("error"), OAuthCallbackError)

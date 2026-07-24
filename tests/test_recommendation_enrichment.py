@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import closing
+
 import json
 import sqlite3
 import tempfile
@@ -90,7 +92,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         ]
 
     def _cache_row(self):
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute("SELECT * FROM provider_title_search_cache").fetchone()
 
@@ -101,7 +103,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             sql += " AND provider = ?"
             params = (provider,)
         sql += " ORDER BY id"
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             return [json.loads(row[0]) for row in conn.execute(sql, params).fetchall()]
 
     def _provider_match(self, *, audio_locales=None, **overrides):
@@ -224,7 +226,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(0, summary.strong_matches)
         self.assertEqual(0, summary.ambiguous_matches)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             review = conn.execute("SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review'").fetchone()[0]
         self.assertEqual(0, review)
 
@@ -362,7 +364,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(1, summary.as_dict()["exact_verified_identities_no_review"])
         self.assertEqual(0, summary.review_entries_written)
         self.assertEqual(0, summary.dry_run_review_entries)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             mapped = conn.execute("SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'crunchyroll'").fetchone()[0]
             review = conn.execute("SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND provider = 'crunchyroll'").fetchone()[0]
         self.assertEqual(mapped, 0)
@@ -451,7 +453,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(summary.strong_matches, 1)
         self.assertEqual(0, summary.review_entries_written)
         self.assertEqual(1, summary.exact_verified_identities_no_review)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             info_rows = conn.execute(
                 "SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND severity = 'info'"
             ).fetchone()[0]
@@ -660,7 +662,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual(summary.strong_matches, 1)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             mapped = conn.execute("SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'fake'").fetchone()[0]
             review = conn.execute("SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND provider = 'fake'").fetchone()[0]
         self.assertEqual(mapped, 0)
@@ -683,7 +685,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual(summary.ambiguous_matches, 1)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             mapped = conn.execute("SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'crunchyroll'").fetchone()[0]
             review = conn.execute("SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review'").fetchone()[0]
         self.assertEqual(mapped, 0)
@@ -1317,7 +1319,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual(summary.strong_matches, 1)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             provider_row = conn.execute("SELECT provider, provider_series_id, title FROM provider_series WHERE provider = 'hidive'").fetchone()
             mapped = conn.execute("SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'hidive'").fetchone()[0]
             review = conn.execute("SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND provider = 'hidive'").fetchone()[0]
@@ -1409,6 +1411,49 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("2026-07-26T01:00:00Z", evidence.expires_at)
 
+    def test_enrichment_title_only_english_dub_without_audio_locales_is_not_strict_actionable(self):
+        self._insert_meta(708, english="Title Only Dub")
+        self._recommendations(708)
+
+        class TitleOnlyDubProvider(FakeProvider):
+            slug = "crunchyroll"
+
+            def search_title(self, config, query: str, *, limit: int = 10):
+                self.calls.append((query, limit))
+                return [
+                    ProviderSearchResult(
+                        provider_series_id="708",
+                        title="Title Only Dub",
+                        season_title="Title Only Dub (English Dub)",
+                        url="https://example.test/title-only-dub",
+                        audio_locales=[],
+                    )
+                ]
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[TitleOnlyDubProvider([])],
+            candidate_limit=1,
+            now=datetime(2026, 7, 19, tzinfo=timezone.utc),
+        )
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=708,
+            provider="crunchyroll",
+            provider_series_id="708",
+        )
+
+        self.assertEqual(1, summary.eligibility_evidence_upserted)
+        self.assertEqual(0, summary.verified_eligibility_evidence_upserted)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
+        self.assertEqual("present", evidence.catalog_status)
+        self.assertEqual("unknown", evidence.english_dub_status)
+        self.assertEqual([], evidence.audio_locales)
+        self.assertIsNone(evidence.last_verified_at)
+
     def test_provider_search_result_raw_catalog_evidence_survives_normalization(self):
         match = enrichment._match_to_dict(
             ProviderSearchResult(
@@ -1456,7 +1501,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual([call[0] for call in provider.calls], [alias for _mal_id, _romaji, alias, _provider_id in fixtures])
         self.assertEqual(summary.strong_matches, 4)
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             mapped = conn.execute("SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'hidive'").fetchone()[0]
             review = conn.execute("SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND provider = 'hidive'").fetchone()[0]
         self.assertEqual(mapped, 0)
@@ -1497,7 +1542,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual([call[0] for call in provider.calls], titles)
         self.assertEqual(summary.strong_matches, len(titles))
-        with sqlite3.connect(self.config.db_path) as conn:
+        with closing(sqlite3.connect(self.config.db_path)) as conn:
             mapped = conn.execute("SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'crunchyroll'").fetchone()[0]
         self.assertEqual(mapped, 0)
 

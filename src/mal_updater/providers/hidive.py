@@ -25,6 +25,26 @@ HIDIVE_ALGOLIA_ENDPOINT = f"https://{HIDIVE_ALGOLIA_APP_ID}-dsn.algolia.net/1/in
 HIDIVE_ALGOLIA_SERIES_FILTER = "type:VOD_SERIES"
 
 
+def _reject_unsupported_snapshot_page_controls(
+    *,
+    max_history_pages: int | None,
+    max_watchlist_pages: int | None,
+    history_start_page: int,
+    watchlist_start: int,
+) -> None:
+    requested: list[str] = []
+    if max_history_pages is not None:
+        requested.append("max_history_pages")
+    if max_watchlist_pages is not None:
+        requested.append("max_watchlist_pages")
+    if history_start_page != 1:
+        requested.append("history_start_page")
+    if watchlist_start != 0:
+        requested.append("watchlist_start")
+    if requested:
+        raise ValueError("HIDIVE snapshot fetch does not support page chunk controls: " + ", ".join(requested))
+
+
 class HidiveProvider:
     slug = "hidive"
     display_name = "HIDIVE"
@@ -44,7 +64,17 @@ class HidiveProvider:
         *,
         profile: str = "default",
         full_refresh: bool = False,
+        max_history_pages: int | None = None,
+        max_watchlist_pages: int | None = None,
+        history_start_page: int = 1,
+        watchlist_start: int = 0,
     ) -> ProviderFetchResult:
+        _reject_unsupported_snapshot_page_controls(
+            max_history_pages=max_history_pages,
+            max_watchlist_pages=max_watchlist_pages,
+            history_start_page=history_start_page,
+            watchlist_start=watchlist_start,
+        )
         result = fetch_hidive_snapshot(
             config,
             profile=profile,

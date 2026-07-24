@@ -13,7 +13,7 @@
 
 - Python worker/application exists
 - SQLite bootstrap + migrations exist
-- Crunchyroll auth bootstrap and live snapshot fetch exist
+- Crunchyroll and HIDIVE auth bootstraps and live account-scoped snapshot fetches exist
 - MAL OAuth and guarded MAL apply exist
 - mapping review / queue triage workflows exist
 - exact-title split-bundle auto-resolution now covers conservative same-title TV suffix companions (for example `Title` + `Title (2009)`) when provider episode evidence cleanly fits the combined entry count and no stronger non-bundle rival remains
@@ -31,6 +31,7 @@
 - whole-season later-season provider titles now penalize split-part/cour candidates when the provider's observed episode evidence already fits a non-segmented season entry, so plain `Season 2` / `II` labels no longer tie with `Part 2` candidates unless the provider data itself looks like an aggregated split-cour shell
 - generic stage-style sequel labels such as `Second Stage` / `2nd Stage` and generic beat-style sequel labels such as `Second Beat` / `2nd Beat` now also count as later-season evidence and are emitted as search variants for explicit provider `Season N` titles, so the mapper can recover more franchise-agnostic MAL sequel naming drift without requiring a bespoke franchise alias first
 - MAL anime-search requests sanitize provider language/audio suffixes such as `(English Dub)`, `[German Dub]`, `(Latin American Spanish Dub)`, and `(English Sub)` before hitting MAL, reducing avoidable `invalid q` telemetry from review/mapping refreshes without widening auto-approval behavior
+- HIDIVE is no longer a provider placeholder: `provider-auth-login --provider hidive` stages HIDIVE authorisation/refresh tokens, `provider-fetch-snapshot --provider hidive` normalizes account history, continue-watching, and favourites-as-watchlist surfaces, and provider title search uses bounded read-only Algolia `VOD_SERIES` hits for specific recommendation/mapping candidates
 - long-lived daemon runtime + service manager exist
 - service-status now exposes recent daemon loop/task state, API-usage snapshots, health snapshot parsing, and log-tail context for unattended debugging, plus a terse `--format summary` operator view for quick checks
 - service-status now also computes each provider fetch lane's current planned fetch mode plus any active full-refresh reason (for example periodic cadence or health-driven refresh pressure), now records when a cadence-driven full refresh first became due plus its current overdue age, explicitly flags when that still-due resweep was recently budget-deferred and fell back to incremental, preserves condensed per-task last-result outcome context in `service-status --format summary` (status/returncode/reason/fetch-mode plus output snippets when present), and now derives a compact per-task execution-state view (`waiting_until_due`, `due_now`, `cooling_down_for_budget`, `cooling_down_after_failure`, `awaiting_schedule`) with reason/detail/countdown metadata, so operators can see both that a canonical resweep is presently due and whether the lane is actually waiting, due, or intentionally cooling down without inferring it from raw state

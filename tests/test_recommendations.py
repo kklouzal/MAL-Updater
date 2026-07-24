@@ -39,6 +39,15 @@ class RecommendationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_build_recommendations_read_only_skips_metadata_cache_merge_but_default_preserves_it(self) -> None:
+        with patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata", return_value=0) as merge_mock:
+            build_recommendations(self.config, limit=0)
+        merge_mock.assert_called_once_with(self.config.db_path)
+
+        with patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata", side_effect=AssertionError("read-only scoring must not merge caches")) as merge_mock:
+            build_recommendations(self.config, limit=0, read_only=True)
+        merge_mock.assert_not_called()
+
     def test_recommendation_snapshot_helper_round_trip(self) -> None:
         inserted = insert_recommendation_snapshot_rows(
             self.config.db_path,
@@ -343,6 +352,7 @@ class RecommendationTests(unittest.TestCase):
         english_dub_status: str = "present",
         audio_locales: list[str] | None = None,
         expires_at: str = "2099-01-01T00:00:00Z",
+        last_verified_at: str | None = "2026-07-19T00:00:00Z",
     ) -> None:
         upsert_recommendation_provider_eligibility_evidence(
             self.config.db_path,
@@ -361,7 +371,7 @@ class RecommendationTests(unittest.TestCase):
             source_evidence={"test": "provider_eligibility"},
             fetched_at="2026-07-19T00:00:00Z",
             expires_at=expires_at,
-            last_verified_at="2026-07-19T00:00:00Z" if review_status == "verified" else None,
+            last_verified_at=last_verified_at if review_status == "verified" else None,
         )
 
     def _cache_mal_list_status(self, mal_anime_id: int, title: str, status: str, *, score: int = 0) -> None:
@@ -711,6 +721,79 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("provider_audio_locale", item.context["provider_eligibility_evidence"][0]["explicit_dub_evidence_source"])
         self.assertEqual("Seed Actionable", item.context["supporting_seed_details"][0]["title"])
         self.assertEqual(9, item.context["supporting_seed_details"][0]["user_score"])
+
+    def test_provider_required_discovery_matches_shared_strict_identity_locale_and_freshness_semantics(self) -> None:
+        self._insert_series("seed-strict-parity", title="Seed Strict Parity", season_title="Seed Strict Parity (English Dub)", watchlist_status="fully_watched")
+        self._insert_progress("seed-strict-parity", "seed-strict-parity-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-strict-parity", 100)
+        self._cache_metadata(100, title="Seed Strict Parity", my_list_status={"status": "completed", "score": 9, "num_episodes_watched": 12})
+        accepted = {
+            901: ("Approved Mapping", "approved_mapping", ["en-US"]),
+            902: ("Manual Verified", "manual_verified", ["EN_gb"]),
+            903: ("User Exact", "user_exact", ["en"]),
+            904: ("Auto Exact", "auto_exact", ["en-CA"]),
+            905: ("Title Search Exact", "provider_title_search_exact", ["en_AU"]),
+            906: ("Franchise Shell Child", "provider_franchise_shell_child_match", ["ja-JP", "en_US"]),
+        }
+        rejected = {
+            920: ("Missing Verification Time", {"last_verified_at": None}),
+            921: ("Title Only English Dub", {"provider_title": "Title Only English Dub (English Dub)", "audio_locales": []}),
+            922: ("Review Needed", {"review_status": "review-needed", "catalog_status": "present", "english_dub_status": "present"}),
+            923: ("Catalog Absent", {"catalog_status": "absent"}),
+            924: ("Dub Absent", {"english_dub_status": "absent"}),
+            925: ("Expired", {"expires_at": "2000-01-01T00:00:00Z"}),
+            926: ("Legacy Identity", {"identity_match_kind": "provider_franchise_shell_metadata_match"}),
+        }
+        for mal_id, (title, _identity, _locales) in accepted.items():
+            self._cache_metadata(mal_id, title=title, mean=8.0, popularity=300)
+        for mal_id, (title, _overrides) in rejected.items():
+            self._cache_metadata(mal_id, title=title, mean=8.0, popularity=300)
+        self._cache_recommendations(
+            100,
+            [
+                {"target_mal_anime_id": mal_id, "target_title": title, "num_recommendations": 20, "raw": {}}
+                for mal_id, (title, *_rest) in {**accepted, **rejected}.items()
+            ],
+            make_targets_available=False,
+        )
+        for mal_id, (title, identity_kind, audio_locales) in accepted.items():
+            self._cache_provider_eligibility(
+                mal_id,
+                provider_series_id=f"strict-{mal_id}",
+                provider_title=title,
+                identity_match_kind=identity_kind,
+                audio_locales=audio_locales,
+            )
+        for mal_id, (title, overrides) in rejected.items():
+            payload = {
+                "provider_series_id": f"strict-{mal_id}",
+                "provider_title": title,
+                "identity_match_kind": "provider_title_search_exact",
+                "audio_locales": ["en-US"],
+            }
+            payload.update(overrides)
+            self._cache_provider_eligibility(mal_id, **payload)
+
+        strict = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+        diagnostic = [
+            item
+            for item in build_recommendations(
+                self.config,
+                limit=0,
+                require_provider_availability=False,
+                include_discovery_candidates_without_actionable_provider_evidence=True,
+            )
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual(sorted(accepted), sorted(item.context["mal_anime_id"] for item in strict))
+        self.assertEqual(sorted([*accepted, *rejected]), sorted(item.context["mal_anime_id"] for item in diagnostic))
+        identities = {item.context["mal_anime_id"]: item.context["provider_eligibility_evidence"][0]["identity_match_kind"] for item in strict}
+        self.assertEqual({mal_id: data[1] for mal_id, data in accepted.items()}, identities)
 
     def test_diagnostic_discovery_carries_review_needed_provider_catalog_and_dub_evidence(self) -> None:
         self._insert_series("seed-review-evidence", title="Seed Review Evidence", season_title="Seed Review Evidence (English Dub)", watchlist_status="fully_watched")
@@ -1230,6 +1313,23 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(["available-target-200"], [item.provider_series_id for item in results])
         self.assertEqual([100], results[0].context["supporting_mal_anime_ids"])
         self.assertEqual(9, results[0].context["supporting_seed_details"][0]["user_score"])
+
+    def test_read_only_recommendations_match_prepared_default_path_on_initialized_db(self) -> None:
+        self._cache_metadata(100, title="Read Only Seed", genres=["Adventure"], my_list_status={"status": "completed", "score": 9})
+        self._cache_mal_list_status(100, "Read Only Seed", "completed", score=9)
+        self._cache_metadata(200, title="Read Only Pick", genres=["Adventure"], mean=8.2, popularity=300)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 200, "target_title": "Read Only Pick", "num_recommendations": 12, "raw": {}}],
+        )
+
+        prepared = [item.as_dict() for item in build_recommendations(self.config, limit=0)]
+        with patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata") as merge_mock:
+            read_only = [item.as_dict() for item in build_recommendations(self.config, limit=0, read_only=True)]
+
+        self.assertTrue(prepared)
+        merge_mock.assert_not_called()
+        self.assertEqual(prepared, read_only)
 
     def test_discovery_candidate_does_not_positive_seed_plan_or_dropped_list_cache_rows(self) -> None:
         for status in ("plan_to_watch", "dropped"):

@@ -15,6 +15,7 @@ from mal_updater.config import ensure_directories, load_config
 from mal_updater.sync_planner import MAPPING_REVIEW_HEURISTICS_REVISION
 from mal_updater.db import bootstrap_database, connect, replace_review_queue_entries
 from mal_updater.health_cycle import _run_auto_command
+from mal_updater.health_report import build_health_report, health_report_exit_code, render_health_report
 
 
 class HealthCheckCliTests(unittest.TestCase):
@@ -117,6 +118,31 @@ class HealthCheckCliTests(unittest.TestCase):
                 self.assertIn("Deprecated compatibility option", normalized_help)
                 self.assertIn("ignored", normalized_help)
                 self.assertIn("--limit 0", normalized_help)
+
+    def test_health_report_api_matches_cli_json_and_summary_contract(self) -> None:
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.project_root / ".config")}, clear=False):
+            payload = build_health_report(
+                self.config,
+                stale_hours=72.0,
+                review_issue_type=None,
+                review_worklist_limit=3,
+                mapping_coverage_threshold=0.8,
+                maintenance_review_limit=25,
+            )
+            expected_json = render_health_report(payload, output_format="json")
+            expected_summary = render_health_report(payload, output_format="summary")
+
+        exit_code, stdout = self._run_health_check_raw()
+        self.assertEqual(health_report_exit_code(payload, strict=False), exit_code)
+        self.assertEqual(expected_json, stdout)
+
+        summary_exit_code, summary_stdout = self._run_health_check_raw("--format", "summary")
+        self.assertEqual(health_report_exit_code(payload, strict=False), summary_exit_code)
+        self.assertEqual(expected_summary, summary_stdout)
+
+        strict_exit_code, strict_stdout = self._run_health_check_raw("--strict")
+        self.assertEqual(health_report_exit_code(payload, strict=True), strict_exit_code)
+        self.assertEqual(expected_json, strict_stdout)
 
     def test_health_check_flags_missing_auth_and_missing_completed_snapshot(self) -> None:
         exit_code, payload = self._run_health_check()
@@ -391,7 +417,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("crunchyroll_auth_failures_repeated", warning_codes)
         maintenance_commands = payload["maintenance"]["recommended_commands"]
         self.assertEqual("rebootstrap_crunchyroll_auth_after_http_auth", maintenance_commands[0]["reason_code"])
-        self.assertEqual(["crunchyroll-auth-login"], maintenance_commands[0]["command_args"])
+        self.assertEqual(["provider-auth-login", "--provider", "crunchyroll"], maintenance_commands[0]["command_args"])
         self.assertEqual("http_auth", maintenance_commands[0]["auth_failure_kind"])
         self.assertEqual("http-auth-rejected", maintenance_commands[0]["auth_remediation_kind"])
         self.assertFalse(maintenance_commands[0]["automation_safe"])
@@ -537,7 +563,7 @@ class HealthCheckCliTests(unittest.TestCase):
             command for command in maintenance_commands
             if command["reason_code"] == "rebootstrap_crunchyroll_auth_after_missing_refresh_material"
         )
-        self.assertEqual(["crunchyroll-auth-login"], auth_command["command_args"])
+        self.assertEqual(["provider-auth-login", "--provider", "crunchyroll"], auth_command["command_args"])
         self.assertEqual("missing_refresh_material", auth_command["auth_failure_kind"])
         self.assertEqual("refresh-material-missing", auth_command["auth_remediation_kind"])
 
@@ -703,7 +729,7 @@ class HealthCheckCliTests(unittest.TestCase):
         def fake_systemctl_run(command: list[str], **kwargs):
             return unittest.mock.Mock(returncode=0, stdout="ActiveState=active\nSubState=running\nUnitFileState=disabled\nResult=success\n", stderr="")
 
-        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+        with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, payload = self._run_health_check()
 
         self.assertEqual(0, exit_code)
@@ -719,7 +745,7 @@ class HealthCheckCliTests(unittest.TestCase):
         def fake_systemctl_run(command: list[str], **kwargs):
             return unittest.mock.Mock(returncode=0, stdout="ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\nResult=success\n", stderr="")
 
-        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+        with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, payload = self._run_health_check()
 
         self.assertEqual(0, exit_code)
@@ -735,7 +761,7 @@ class HealthCheckCliTests(unittest.TestCase):
         def fake_systemctl_run(command: list[str], **kwargs):
             return unittest.mock.Mock(returncode=0, stdout="Result=success\nUnitFileState=enabled\nSubState=running\nActiveState=active\n", stderr="")
 
-        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+        with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, payload = self._run_health_check()
 
         self.assertEqual(0, exit_code)
@@ -928,11 +954,11 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(maintenance_commands[0]["automation_safe"])
         self.assertFalse(maintenance_commands[0]["requires_auth_interaction"])
         self.assertEqual(
-            ["crunchyroll-fetch-snapshot", "--out", ".MAL-Updater/cache/live-crunchyroll-snapshot.json", "--ingest"],
+            ["provider-fetch-snapshot", "--provider", "crunchyroll", "--out", ".MAL-Updater/cache/live-crunchyroll-snapshot.json", "--ingest"],
             maintenance_commands[0]["command_args"],
         )
         self.assertEqual(
-            "PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
+            "PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             maintenance_commands[0]["command"],
         )
         self.assertEqual(maintenance_commands[0], payload["maintenance"]["recommended_command"])
@@ -2263,7 +2289,7 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIn("maintenance_recommended_automation_safe=False", stdout)
         self.assertIn("maintenance_recommended_requires_auth_interaction=True", stdout)
         self.assertIn(
-            "maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
+            "maintenance_recommended_auto_command=PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest",
             stdout,
         )
         self.assertIn("maintenance_recommended_auto_reason_code=refresh_ingested_snapshot", stdout)
@@ -2307,7 +2333,7 @@ class HealthCheckCliTests(unittest.TestCase):
         def fake_systemctl_run(command: list[str], **kwargs):
             return unittest.mock.Mock(returncode=0, stdout="ActiveState=active\nSubState=running\nUnitFileState=disabled\nResult=success\n", stderr="")
 
-        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+        with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
@@ -2336,7 +2362,7 @@ class HealthCheckCliTests(unittest.TestCase):
             "result": "success",
         }
 
-        with patch("mal_updater.cli._read_systemd_user_unit_runtime", return_value=runtime_state):
+        with patch("mal_updater.service_systemd_status.read_systemd_user_unit_runtime", return_value=runtime_state):
             exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)
@@ -2355,7 +2381,7 @@ class HealthCheckCliTests(unittest.TestCase):
         def fake_systemctl_run(command: list[str], **kwargs):
             return unittest.mock.Mock(returncode=0, stdout="ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\nResult=success\n", stderr="")
 
-        with patch("mal_updater.cli.subprocess.run", side_effect=fake_systemctl_run):
+        with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=fake_systemctl_run):
             exit_code, stdout = self._run_health_check_raw("--format", "summary")
 
         self.assertEqual(0, exit_code)

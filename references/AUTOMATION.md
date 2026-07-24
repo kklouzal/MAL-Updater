@@ -45,12 +45,13 @@ scripts/install_user_systemd_units.sh --start-service
 
 ```bash
 cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli install-service
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
+
+Do not run both service install paths as routine setup. Prefer `scripts/install_user_systemd_units.sh` for normal host bootstrap; use `PYTHONPATH=src python3 -m mal_updater.cli install-service` only as the lower-level service-manager compatibility path when you intentionally want that behavior.
 
 `service-status` is now the main structured observability surface for unattended debugging. In addition to user-systemd enabled/active state, it reports:
 
@@ -62,7 +63,7 @@ PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 - the slow recommendation metadata hydration lane (`recommend_metadata_refresh`), including its independent cadence, bounded seed/discovery batch posture, and the most recent hydrated seed/discovery counts when the task's JSON stdout is available
 - the optional recommendation webhook delivery lane (`push_recommendations_webhook`), including its independent cadence, bounded digest size, configured delivery mode (`fresh` / `digest` / `all`), and item-aware dedupe behavior so unchanged recommendation payloads do not keep re-posting into OpenClaw even when the request id changes
 - persisted failure-backoff details for task errors, including retry countdown, last failure reason, and consecutive-failure streaks for auth-fragile provider lanes
-- health-check-driven auth recovery hints: repeated auth-style provider fetch failures recorded in daemon state now surface as explicit re-bootstrap recommendations (`crunchyroll-auth-login` / `provider-auth-login --provider hidive`) instead of only opaque backoff residue
+- health-check-driven auth recovery hints: repeated auth-style provider fetch failures recorded in daemon state now surface as explicit re-bootstrap recommendations (`provider-auth-login --provider crunchyroll` / `provider-auth-login --provider hidive`) instead of only opaque backoff residue
 - health-driven full-refresh escalation is disabled by default with `service.full_refresh_every_seconds = 0`; if an operator explicitly enables full-refresh cadence, health recommendations can still upgrade the next unattended provider fetch to `--full-refresh`, while lighter `refresh_ingested_snapshot` health recommendations can now trigger an early incremental fetch even before the normal cadence is due
 - current API-usage snapshot when available
 - recent `service.log` tail lines
@@ -87,7 +88,7 @@ Those commands still write runtime artifacts under `.MAL-Updater/state/` and `.M
 
 1. `bootstrap-audit`
 2. `init`
-3. MAL / Crunchyroll auth setup
+3. MAL / provider auth setup (`provider-auth-login --provider crunchyroll` and/or `provider-auth-login --provider hidive`)
 4. `scripts/install_user_systemd_units.sh`
 5. `service-status`
 6. `service-run-once`

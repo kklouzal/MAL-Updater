@@ -29,6 +29,10 @@ locale = "en-US"
 request_spacing_seconds = 22.5
 request_spacing_jitter_seconds = 7.5
 
+# Crunchyroll currently has provider-specific locale/pacing settings here.
+# HIDIVE does not have a [hidive] settings table; its unattended pacing comes from
+# the service budget tables below plus built-in provider/service defaults.
+
 [openclaw]
 recommendations_webhook_enabled = false
 recommendations_webhook_url = "http://127.0.0.1:18789/hooks/agent"
@@ -95,6 +99,7 @@ sync_apply = 3  # built-in default shown explicitly here
 
 [service.provider_projected_request_percentiles]
 crunchyroll = 0.9  # built-in default shown explicitly here; override only when this host needs a different provider-wide conservative projection
+hidive = 0.9  # built-in default shown explicitly here; override only when this host needs different HIDIVE learned-budget posture
 
 [service.task_projected_request_percentiles]
 sync_fetch_crunchyroll = 0.9  # optional conservative learned projection; when unset the daemon falls back to provider defaults, then smoothed/auto-bursty behavior
@@ -127,4 +132,6 @@ mal_access_token = "mal_access_token.txt"
 mal_refresh_token = "mal_refresh_token.txt"
 crunchyroll_username = "crunchyroll_username.txt"
 crunchyroll_password = "crunchyroll_password.txt"
+hidive_username = "hidive_username.txt"
+hidive_password = "hidive_password.txt"
 openclaw_hook_token = "openclaw_hook_token.txt"

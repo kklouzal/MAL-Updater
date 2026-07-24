@@ -59,6 +59,42 @@ copy_file() {
   install -D -m "$mode" "$source_path" "$target_path"
 }
 
+render_unit_python() {
+  local mode="$1"
+  local source_path="$2"
+  local target_path="${3:-}"
+  PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 - "$mode" "$source_path" "$target_path" "$ROOT_DIR" "$SERVICE_ENV_TARGET" "$SERVICE_PYTHON_BIN" <<'PY'
+from pathlib import Path
+import sys
+
+mode = sys.argv[1]
+source_path = Path(sys.argv[2])
+target_path = Path(sys.argv[3]) if sys.argv[3] else None
+repo_root = Path(sys.argv[4]).resolve()
+src_dir = str(repo_root / "src")
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+from mal_updater.service_units import render_systemd_unit_template_file
+
+rendered = render_systemd_unit_template_file(source_path, repo_root, sys.argv[5], sys.argv[6])
+if mode == "stdout":
+    print(rendered, end="")
+elif mode == "write":
+    if target_path is None:
+        raise SystemExit("write mode requires a target path")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(rendered, encoding="utf-8")
+else:
+    raise SystemExit(f"unknown render mode: {mode}")
+PY
+}
+
+render_unit_content() {
+  local source_path="$1"
+  render_unit_python stdout "$source_path"
+}
+
 render_unit() {
   local source_path="$1"
   local target_path="$2"
@@ -66,21 +102,7 @@ render_unit() {
     printf '[dry-run] render %q -> %q\n' "$source_path" "$target_path"
     return 0
   fi
-  python3 - "$source_path" "$target_path" "$ROOT_DIR" "$SERVICE_ENV_TARGET" "$SERVICE_PYTHON_BIN" <<'PY'
-from pathlib import Path
-import sys
-source_path = Path(sys.argv[1])
-target_path = Path(sys.argv[2])
-repo_root = Path(sys.argv[3]).resolve()
-service_env_target = sys.argv[4]
-service_python_bin = sys.argv[5]
-text = source_path.read_text(encoding='utf-8')
-text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
-text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
-text = text.replace('__MAL_UPDATER_PYTHON_BIN__', service_python_bin)
-target_path.parent.mkdir(parents=True, exist_ok=True)
-target_path.write_text(text, encoding='utf-8')
-PY
+  render_unit_python write "$source_path" "$target_path"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -147,20 +169,7 @@ log "target_dir=$TARGET_DIR"
 log "service_env_target=$SERVICE_ENV_TARGET"
 log "service_python_bin=$SERVICE_PYTHON_BIN"
 
-rendered_content="$(python3 - "$SOURCE_PATH" "$ROOT_DIR" "$SERVICE_ENV_TARGET" "$SERVICE_PYTHON_BIN" <<'PY'
-from pathlib import Path
-import sys
-source_path = Path(sys.argv[1])
-repo_root = Path(sys.argv[2]).resolve()
-service_env_target = sys.argv[3]
-service_python_bin = sys.argv[4]
-text = source_path.read_text(encoding='utf-8')
-text = text.replace('__MAL_UPDATER_REPO_ROOT__', str(repo_root))
-text = text.replace('__MAL_UPDATER_SERVICE_ENV_FILE__', service_env_target)
-text = text.replace('__MAL_UPDATER_PYTHON_BIN__', service_python_bin)
-print(text, end='')
-PY
-)"
+rendered_content="$(render_unit_content "$SOURCE_PATH")"
 
 if [[ ! -e "$TARGET_PATH" ]]; then
   log "installed_units=$UNIT_NAME"

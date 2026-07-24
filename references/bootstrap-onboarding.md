@@ -101,7 +101,7 @@ Compatibility wrapper still exists:
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
+PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
 ```
 
 This creates the staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.

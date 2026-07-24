@@ -130,7 +130,7 @@ Treat repeated Crunchyroll fetches as incremental by default.
 - Store only lightweight leading-page markers for watch-history and watchlist, not a second shadow database.
 - On the next fetch, stop paging once a previously seen marker appears in the current page; keep the current page, but do not keep walking older pages.
 - If the stored boundary belongs to a different Crunchyroll account, ignore it.
-- Provide an explicit operator escape hatch (`crunchyroll-fetch-snapshot --full-refresh`) for full pagination when needed.
+- Provide an explicit operator escape hatch (`provider-fetch-snapshot --provider crunchyroll --full-refresh`) for full pagination when needed.
 - Prefer explainable overlap-based stopping over more aggressive heuristics about dates/count deltas/order stability.
 
 ### Why
