@@ -11,6 +11,17 @@ from mal_updater.config import _load_toml_parser, _read_toml_file, load_config, 
 
 
 class ConfigLoadingTests(unittest.TestCase):
+    def test_zero_sync_apply_execute_limit_is_preserved_as_scheduler_disable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
+                "[service.task_execute_limits]\nsync_apply = 0\n",
+                encoding="utf-8",
+            )
+            config = load_config(root)
+        self.assertEqual(0, config.service.execute_limit_for("sync_apply"))
+
     def test_defaults_resolve_under_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -36,18 +47,28 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(5, config.openclaw.recommendations_webhook_section_limits["continue_next"])
             self.assertEqual(2, config.openclaw.recommendations_webhook_section_limits["resume_backlog"])
             self.assertEqual(60 * 60, config.service.sync_every_seconds)
-            self.assertEqual(0, config.service.full_refresh_every_seconds)
+            self.assertEqual(7 * 24 * 60 * 60, config.service.full_refresh_every_seconds)
             self.assertEqual(60 * 60, config.service.health_every_seconds)
             self.assertEqual(60 * 60, config.service.mal_refresh_every_seconds)
-            self.assertEqual(60 * 60, config.service.recommendation_metadata_refresh_every_seconds)
+            self.assertEqual(8 * 60 * 60, config.service.mal_list_refresh_every_seconds)
+            self.assertEqual(12 * 60 * 60, config.service.recommendation_metadata_refresh_every_seconds)
+            self.assertEqual(24 * 60 * 60, config.service.provider_eligibility_refresh_every_seconds)
             self.assertEqual(60 * 60, config.service.recommend_maintain_every_seconds)
+            self.assertEqual(30, config.service.startup_grace_seconds)
+            self.assertEqual(30 * 60, config.service.lease_stale_after_seconds)
             self.assertEqual(10, config.service.crunchyroll_provider_max_history_pages)
             self.assertEqual(2, config.service.crunchyroll_provider_max_watchlist_pages)
             self.assertEqual(900, config.service.task_timeout_seconds)
             self.assertEqual(72, config.service.provider_hourly_limits["hidive"])
+            self.assertEqual(6, config.service.task_hourly_limits["mal_list_refresh"])
             self.assertEqual(48, config.service.task_hourly_limits["sync_apply"])
+            self.assertEqual(18, config.service.task_hourly_limits["recommend_provider_eligibility_crunchyroll"])
             self.assertEqual(1, config.service.task_projected_request_counts["mal_refresh"])
+            self.assertEqual(3, config.service.task_projected_request_counts["mal_list_refresh"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
+            self.assertEqual(7, config.service.task_projected_request_counts["recommend_provider_eligibility_crunchyroll"])
+            self.assertEqual(2, config.service.task_execute_limits["recommend_provider_eligibility_candidates"])
+            self.assertEqual(1, config.service.task_execute_limits["recommend_provider_eligibility_queries_per_candidate"])
             self.assertEqual(8, config.service.task_execute_limits["sync_apply"])
             self.assertEqual(4, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["incremental"])
             self.assertEqual(55, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["full_refresh"])
@@ -305,12 +326,12 @@ class ConfigLoadingTests(unittest.TestCase):
             parsed = _read_toml_file(config.settings_path)
 
             self.assertEqual("fresh", parsed["openclaw"]["recommendations_webhook_delivery_mode"])
-            self.assertEqual(0, parsed["service"]["full_refresh_every_seconds"])
+            self.assertEqual(604800, parsed["service"]["full_refresh_every_seconds"])
             self.assertEqual(180, parsed["service"]["crunchyroll_hourly_limit"])
             self.assertEqual("all", config.openclaw.recommendations_webhook_delivery_mode)
             self.assertEqual(9876, config.mal.redirect_port)
             self.assertEqual(1800, config.service.sync_every_seconds)
-            self.assertEqual(0, config.service.full_refresh_every_seconds)
+            self.assertEqual(604800, config.service.full_refresh_every_seconds)
             self.assertEqual(20, config.service.task_execute_limits["push_recommendations_webhook"])
             self.assertEqual(55, config.service.task_projected_request_counts_by_mode["sync_fetch_crunchyroll"]["full_refresh"])
 

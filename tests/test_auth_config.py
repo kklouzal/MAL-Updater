@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.auth import format_auth_flow_prompt, persist_token_response, write_secret_file
-from mal_updater.cli import _cmd_approve_mapping, _cmd_dry_run_sync, _cmd_list_mappings, _cmd_review_mappings
+from mal_updater.cli import _cmd_approve_mapping, _cmd_dry_run_sync, _cmd_list_mappings, _cmd_review_mappings, _cmd_status
 from mal_updater.config import load_config, load_mal_secrets
 from mal_updater.db import bootstrap_database, connect, get_series_mapping, upsert_series_mapping
 from mal_updater.ingestion import ingest_snapshot_payload
@@ -19,6 +19,17 @@ from mal_updater.mal_client import MalApiError, MalClient, TokenResponse
 
 
 class ConfigTests(unittest.TestCase):
+    def test_status_surfaces_provider_niceness_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, _cmd_status(Path(td)))
+            status = output.getvalue()
+            self.assertIn("mal.retry_max_attempts=2", status)
+            self.assertIn("crunchyroll.request_spacing_seconds=22.5", status)
+            self.assertIn("hidive.request_spacing_seconds=5.0", status)
+            self.assertIn("hidive.retry_after_cap_seconds=60.0", status)
+
     def test_load_config_reads_bind_host_and_redirect_host_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -120,6 +131,28 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.crunchyroll.request_spacing_seconds, 12.5)
             self.assertEqual(config.crunchyroll.request_spacing_jitter_seconds, 2.25)
+
+    def test_load_config_reads_hidive_niceness_and_retry_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
+                textwrap.dedent(
+                    """
+                    [hidive]
+                    request_spacing_seconds = 7.0
+                    request_spacing_jitter_seconds = 1.5
+                    retry_max_attempts = 4
+                    retry_after_cap_seconds = 45.0
+                    """
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(root)
+            self.assertEqual(7.0, config.hidive.request_spacing_seconds)
+            self.assertEqual(1.5, config.hidive.request_spacing_jitter_seconds)
+            self.assertEqual(4, config.hidive.retry_max_attempts)
+            self.assertEqual(45.0, config.hidive.retry_after_cap_seconds)
 
 class AuthHelperTests(unittest.TestCase):
     def test_format_auth_flow_prompt_includes_bind_host_and_redirect_uri(self) -> None:
@@ -231,7 +264,7 @@ class AuthHelperTests(unittest.TestCase):
 
             with patch("mal_updater.mal_client.urlopen", return_value=_Response()), patch(
                 "mal_updater.mal_client.time.monotonic",
-                side_effect=[100.0, 100.0, 100.4, 100.4],
+                side_effect=[100.0, 100.4, 100.4],
             ), patch("mal_updater.mal_client.time.sleep") as sleep_mock:
                 client.search_anime("Example")
                 client.search_anime("Example Again")
@@ -239,8 +272,9 @@ class AuthHelperTests(unittest.TestCase):
             sleep_mock.assert_called_once()
             self.assertAlmostEqual(sleep_mock.call_args.args[0], 0.6, places=6)
             event_log = config.api_request_events_path.read_text(encoding="utf-8")
-            self.assertIn("Example", event_log)
-            self.assertIn("Example+Again", event_log)
+            self.assertNotIn("Example", event_log)
+            self.assertIn("q=%3Credacted%3E", event_log)
+            self.assertNotIn("Example+Again", event_log)
 
     def test_mal_client_retries_timeout_once_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as td:

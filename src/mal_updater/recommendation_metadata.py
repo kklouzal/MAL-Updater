@@ -53,8 +53,11 @@ DETAIL_FIELD_NAMES = (
 )
 DETAIL_FIELDS = ",".join(DETAIL_FIELD_NAMES)
 DISCOVERY_DETAIL_FIELDS = ",".join(field for field in DETAIL_FIELD_NAMES if field not in {"related_anime", "recommendations"})
-DEFAULT_HARVEST_STALE_AFTER_DAYS = 14
+DEFAULT_HARVEST_STALE_AFTER_DAYS = 30
 DEFAULT_METADATA_STALE_AFTER_DAYS = 14
+DEFAULT_HOT_METADATA_STALE_AFTER_DAYS = 3
+DEFAULT_WARM_METADATA_STALE_AFTER_DAYS = 14
+DEFAULT_COLD_METADATA_STALE_AFTER_DAYS = 90
 MAL_USER_LIST_POSITIVE_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
 MAL_USER_LIST_SUPPRESSION_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 MAL_USER_LIST_FIELDS = "list_status,num_episodes,media_type,status"
@@ -121,6 +124,8 @@ class MetadataRefreshSummary:
     harvest_failed: int = 0
     harvested_edge_count: int = 0
     target_hydration_skip_reasons: dict[str, int] = field(default_factory=dict)
+    fresh_skipped: int = 0
+    refresh_tiers: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         failures = self.failures or []
@@ -135,6 +140,8 @@ class MetadataRefreshSummary:
             "discovery_considered": self.discovery_considered,
             "discovery_refreshed": self.discovery_refreshed,
             "target_hydration_skip_reasons": dict(self.target_hydration_skip_reasons),
+            "fresh_skipped": self.fresh_skipped,
+            "refresh_tiers": dict(self.refresh_tiers),
             "failed": len(failures),
             "failures": [failure.as_dict() for failure in failures],
         }
@@ -526,6 +533,10 @@ def refresh_recommendation_metadata(
     discovery_target_limit: int | None = None,
     harvest_stale_after_days: int = DEFAULT_HARVEST_STALE_AFTER_DAYS,
     metadata_stale_after_days: int = DEFAULT_METADATA_STALE_AFTER_DAYS,
+    hot_stale_after_days: int = DEFAULT_HOT_METADATA_STALE_AFTER_DAYS,
+    warm_stale_after_days: int = DEFAULT_WARM_METADATA_STALE_AFTER_DAYS,
+    cold_stale_after_days: int = DEFAULT_COLD_METADATA_STALE_AFTER_DAYS,
+    force_refresh: bool = False,
 ) -> MetadataRefreshSummary:
     mappings = list_series_mappings(config.db_path, approved_only=False)
     merge_mal_user_anime_list_cache_into_metadata(config.db_path)
@@ -550,11 +561,33 @@ def refresh_recommendation_metadata(
     harvest_unharvested = sum(1 for state in seed_states.values() if state.eligible and state.harvest_status == "unharvested")
     harvest_stale = sum(1 for state in seed_states.values() if state.eligible and state.harvest_status == "stale")
     harvest_failed = sum(1 for state in seed_states.values() if state.eligible and state.harvest_status == "failed")
-    anime_ids = _rank_refresh_ids(sorted(seed_anime_ids), metadata_by_id, seed_states)
+    ranked_ids = _rank_refresh_ids(sorted(seed_anime_ids), metadata_by_id, seed_states)
+    refresh_tiers: dict[str, int] = {"hot": 0, "warm": 0, "cold": 0, "retry": 0}
+    anime_ids: list[int] = []
+    for anime_id in ranked_ids:
+        state = seed_states.get(anime_id)
+        metadata = metadata_by_id.get(anime_id)
+        list_status = _my_list_status_value(metadata)
+        if list_status == "watching":
+            tier, horizon = "hot", hot_stale_after_days
+        elif list_status in {"plan_to_watch", "on_hold"} or anime_id in mapped_anime_ids:
+            tier, horizon = "warm", warm_stale_after_days
+        else:
+            tier, horizon = "cold", cold_stale_after_days
+        needs_retry = metadata is None or state is None or state.harvest_status in HARVEST_RETRY_STATUSES
+        if force_refresh or needs_retry or _is_stale(metadata.fetched_at if metadata else None, stale_after_days=horizon):
+            anime_ids.append(anime_id)
+            refresh_tiers["retry" if needs_retry else tier] += 1
+    fresh_skipped = len(ranked_ids) - len(anime_ids)
     if limit is not None and limit > 0:
         anime_ids = anime_ids[:limit]
 
     client = MalClient(config, load_mal_secrets(config))
+    if force_refresh:
+        original_get_anime_details = client.get_anime_details
+        def _forced_get_anime_details(anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:
+            return original_get_anime_details(anime_id, fields=fields, force_refresh=True)
+        client.get_anime_details = _forced_get_anime_details  # type: ignore[method-assign]
     refreshed = 0
     harvested_edge_count = 0
     failures: list[MetadataRefreshFailure] = []
@@ -670,4 +703,6 @@ def refresh_recommendation_metadata(
         harvest_failed=harvest_failed,
         harvested_edge_count=harvested_edge_count,
         target_hydration_skip_reasons=target_hydration_skip_reasons,
+        fresh_skipped=fresh_skipped,
+        refresh_tiers=refresh_tiers,
     )

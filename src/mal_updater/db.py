@@ -16,6 +16,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "005_recommendation_score_snapshots.sql",
     "006_recommendation_eligibility_evidence.sql",
     "007_mal_user_anime_list_cache.sql",
+    "008_niceness_caches.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -235,6 +236,19 @@ class ProviderTitleSearchCacheEntry:
     status: str
     fetched_at: str
     expires_at: str
+    logic_version: str = "legacy-v1"
+    search_limit: int = 10
+    identity_key: str = ""
+
+
+@dataclass(slots=True)
+class JsonResponseCacheEntry:
+    status: str
+    response: dict[str, Any]
+    fetched_at: str
+    expires_at: str
+    failure_count: int = 0
+    next_retry_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -299,6 +313,10 @@ class RecommendationProviderEligibilityEvidence:
     fetched_at: str
     expires_at: str
     last_verified_at: str | None
+    refresh_status: str
+    failure_count: int
+    next_retry_at: str | None
+    logic_version: str
     created_at: str
     updated_at: str
 
@@ -320,6 +338,27 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _migration_statements(sql: str) -> list[str]:
+    """Split a simple migration script without executescript transaction side effects."""
+    statements: list[str] = []
+    pending = ""
+    for line in sql.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                statements.append(statement)
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("migration contains an incomplete SQL statement")
+    return statements
+
+
+def _execute_migration_statement(conn: sqlite3.Connection, statement: str) -> None:
+    """Narrow injection seam used to prove rollback/retry behavior in tests."""
+    conn.execute(statement)
+
+
 def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -329,6 +368,8 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Persist the catalog table before starting per-migration transactions.
+    conn.commit()
     for migration in MIGRATIONS:
         version = migration.name
         already_applied = conn.execute(
@@ -336,9 +377,16 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if already_applied:
             continue
-        conn.executescript(migration.read_text(encoding="utf-8"))
-        conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
-    conn.commit()
+        statements = _migration_statements(migration.read_text(encoding="utf-8"))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for statement in statements:
+                _execute_migration_statement(conn, statement)
+            conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
 
 def bootstrap_database(db_path: Path) -> None:
@@ -2231,6 +2279,10 @@ def _recommendation_provider_eligibility_from_db(row: sqlite3.Row) -> Recommenda
         fetched_at=str(row["fetched_at"]),
         expires_at=str(row["expires_at"]),
         last_verified_at=row["last_verified_at"],
+        refresh_status=str(row["refresh_status"]),
+        failure_count=int(row["failure_count"]),
+        next_retry_at=row["next_retry_at"],
+        logic_version=str(row["logic_version"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -2255,6 +2307,10 @@ def upsert_recommendation_provider_eligibility_evidence(
     audio_locales: list[Any] | None = None,
     source_evidence: dict[str, Any] | None = None,
     last_verified_at: str | None = None,
+    refresh_status: str = "ok",
+    failure_count: int = 0,
+    next_retry_at: str | None = None,
+    logic_version: str = "legacy-v1",
 ) -> RecommendationProviderEligibilityEvidence:
     normalized_provider = _validate_recommendation_eligibility_provider(provider)
     normalized_review_status = _validate_recommendation_eligibility_value("review_status", review_status, _REVIEW_STATUSES)
@@ -2269,8 +2325,9 @@ def upsert_recommendation_provider_eligibility_evidence(
                 mal_anime_id, provider, provider_series_id, provider_title, provider_url,
                 identity_match_kind, match_confidence, review_status, catalog_status, english_dub_status,
                 explicit_dub_evidence_source, audio_locales_json, source_evidence_json,
-                fetched_at, expires_at, last_verified_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fetched_at, expires_at, last_verified_at, refresh_status,
+                failure_count, next_retry_at, logic_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mal_anime_id, provider, provider_series_id) DO UPDATE SET
                 provider_title = excluded.provider_title,
                 provider_url = excluded.provider_url,
@@ -2285,6 +2342,10 @@ def upsert_recommendation_provider_eligibility_evidence(
                 fetched_at = excluded.fetched_at,
                 expires_at = excluded.expires_at,
                 last_verified_at = excluded.last_verified_at,
+                refresh_status = excluded.refresh_status,
+                failure_count = excluded.failure_count,
+                next_retry_at = excluded.next_retry_at,
+                logic_version = excluded.logic_version,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -2294,7 +2355,8 @@ def upsert_recommendation_provider_eligibility_evidence(
                 explicit_dub_evidence_source,
                 json.dumps(audio_locales or [], ensure_ascii=False, sort_keys=True),
                 json.dumps(source_evidence or {}, ensure_ascii=False, sort_keys=True),
-                fetched_at, expires_at, last_verified_at,
+                fetched_at, expires_at, last_verified_at, str(refresh_status),
+                max(0, int(failure_count)), next_retry_at, str(logic_version),
             ),
         )
         conn.commit()
@@ -2425,6 +2487,9 @@ def get_provider_title_search_cache(
     provider: str,
     normalized_query: str,
     now: str | None = None,
+    logic_version: str | None = None,
+    search_limit: int | None = None,
+    identity_key: str | None = None,
 ) -> ProviderTitleSearchCacheEntry | None:
     with connect(db_path) as conn:
         clause = "provider = ? AND normalized_query = ?"
@@ -2432,10 +2497,19 @@ def get_provider_title_search_cache(
         if now is not None:
             clause += " AND expires_at > ?"
             params.append(now)
+        if logic_version is not None:
+            clause += " AND logic_version = ?"
+            params.append(logic_version)
+        if search_limit is not None:
+            clause += " AND search_limit = ?"
+            params.append(int(search_limit))
+        if identity_key is not None:
+            clause += " AND identity_key = ?"
+            params.append(identity_key)
         row = conn.execute(
             f"""
             SELECT provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
-                   matches_json, status, fetched_at, expires_at
+                   matches_json, status, fetched_at, expires_at, logic_version, search_limit, identity_key
             FROM provider_title_search_cache
             WHERE {clause}
             """,
@@ -2449,11 +2523,14 @@ def get_provider_title_search_cache(
         query=str(row["query"]),
         candidate_mal_anime_id=None if row["candidate_mal_anime_id"] is None else int(row["candidate_mal_anime_id"]),
         candidate_title=row["candidate_title"],
-        matches=json.loads(row["matches_json"] or "[]"),
+        matches=_load_json_value(row["matches_json"], None),
         status=str(row["status"]),
         fetched_at=str(row["fetched_at"]),
         expires_at=str(row["expires_at"]),
-    )
+        logic_version=str(row["logic_version"]),
+        search_limit=int(row["search_limit"]),
+        identity_key=str(row["identity_key"]),
+    ) if isinstance(_load_json_value(row["matches_json"], None), list) else None
 
 
 def upsert_provider_title_search_cache(
@@ -2468,14 +2545,17 @@ def upsert_provider_title_search_cache(
     status: str,
     fetched_at: str,
     expires_at: str,
+    logic_version: str = "legacy-v1",
+    search_limit: int = 10,
+    identity_key: str = "",
 ) -> ProviderTitleSearchCacheEntry:
     with connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO provider_title_search_cache (
                 provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
-                matches_json, status, fetched_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                matches_json, status, fetched_at, expires_at, logic_version, search_limit, identity_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider, normalized_query) DO UPDATE SET
                 query = excluded.query,
                 candidate_mal_anime_id = excluded.candidate_mal_anime_id,
@@ -2484,12 +2564,140 @@ def upsert_provider_title_search_cache(
                 status = excluded.status,
                 fetched_at = excluded.fetched_at,
                 expires_at = excluded.expires_at
+                , logic_version = excluded.logic_version
+                , search_limit = excluded.search_limit
+                , identity_key = excluded.identity_key
             """,
             (provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
-             json.dumps(matches, ensure_ascii=False, sort_keys=True), status, fetched_at, expires_at),
+             json.dumps(matches, ensure_ascii=False, sort_keys=True), status, fetched_at, expires_at,
+             logic_version, int(search_limit), identity_key),
         )
         conn.commit()
     entry = get_provider_title_search_cache(db_path, provider=provider, normalized_query=normalized_query)
     if entry is None:
         raise RuntimeError("Provider title search cache disappeared after upsert")
     return entry
+
+
+def get_mal_anime_search_cache(db_path: Path, *, cache_key: str, now: str | None = None) -> JsonResponseCacheEntry | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status, response_json, fetched_at, expires_at FROM mal_anime_search_cache WHERE cache_key = ?"
+            + (" AND expires_at > ?" if now is not None else ""),
+            (cache_key, now) if now is not None else (cache_key,),
+        ).fetchone()
+    if row is None:
+        return None
+    response = _load_json_value(row["response_json"], None)
+    if not isinstance(response, dict):
+        return None
+    return JsonResponseCacheEntry(str(row["status"]), response, str(row["fetched_at"]), str(row["expires_at"]))
+
+
+def upsert_mal_anime_search_cache(db_path: Path, *, cache_key: str, normalized_query: str, result_limit: int,
+                                  fields: str, logic_version: str, status: str, response: dict[str, Any],
+                                  fetched_at: str, expires_at: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO mal_anime_search_cache(cache_key, normalized_query, result_limit, fields, logic_version,
+                status, response_json, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET status=excluded.status, response_json=excluded.response_json,
+                fetched_at=excluded.fetched_at, expires_at=excluded.expires_at
+        """, (cache_key, normalized_query, int(result_limit), fields, logic_version, status,
+              json.dumps(response, ensure_ascii=False, sort_keys=True), fetched_at, expires_at))
+        conn.commit()
+
+
+def get_mal_anime_detail_cache(db_path: Path, *, mal_anime_id: int, fields_key: str, logic_version: str,
+                               now: str | None = None) -> JsonResponseCacheEntry | None:
+    with connect(db_path) as conn:
+        row = conn.execute("""
+            SELECT status, response_json, fetched_at, expires_at, failure_count, next_retry_at
+            FROM mal_anime_detail_cache WHERE mal_anime_id=? AND fields_key=? AND logic_version=?
+        """, (int(mal_anime_id), fields_key, logic_version)).fetchone()
+    if row is None or (now is not None and str(row["expires_at"]) <= now):
+        return None
+    response = _load_json_value(row["response_json"], None)
+    if not isinstance(response, dict):
+        return None
+    return JsonResponseCacheEntry(str(row["status"]), response, str(row["fetched_at"]), str(row["expires_at"]),
+                                  int(row["failure_count"]), row["next_retry_at"])
+
+
+def find_covering_mal_anime_detail_cache(db_path: Path, *, mal_anime_id: int, required_fields: set[str],
+                                         logic_version: str, now: str) -> JsonResponseCacheEntry | None:
+    with connect(db_path) as conn:
+        rows = conn.execute("""
+            SELECT status, response_json, fetched_at, expires_at, failure_count, next_retry_at
+            FROM mal_anime_detail_cache
+            WHERE mal_anime_id=? AND logic_version=? AND status='ok' AND expires_at>?
+            ORDER BY fetched_at DESC
+        """, (int(mal_anime_id), logic_version, now)).fetchall()
+    for row in rows:
+        response = _load_json_value(row["response_json"], None)
+        if isinstance(response, dict) and required_fields.issubset(response):
+            return JsonResponseCacheEntry(str(row["status"]), response, str(row["fetched_at"]), str(row["expires_at"]),
+                                          int(row["failure_count"]), row["next_retry_at"])
+    return None
+
+
+def upsert_mal_anime_detail_cache(db_path: Path, *, mal_anime_id: int, fields_key: str, logic_version: str,
+                                  response: dict[str, Any], fetched_at: str, expires_at: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO mal_anime_detail_cache(mal_anime_id, fields_key, logic_version, status, response_json,
+                fetched_at, expires_at, failure_count, next_retry_at) VALUES (?, ?, ?, 'ok', ?, ?, ?, 0, NULL)
+            ON CONFLICT(mal_anime_id, fields_key, logic_version) DO UPDATE SET status='ok',
+                response_json=excluded.response_json, fetched_at=excluded.fetched_at, expires_at=excluded.expires_at,
+                failure_count=0, next_retry_at=NULL
+        """, (int(mal_anime_id), fields_key, logic_version,
+              json.dumps(response, ensure_ascii=False, sort_keys=True), fetched_at, expires_at))
+        conn.commit()
+
+
+def get_provider_enriched_detail_cache(db_path: Path, *, provider: str, provider_series_id: str,
+                                       logic_version: str, now: str | None = None) -> JsonResponseCacheEntry | None:
+    with connect(db_path) as conn:
+        row = conn.execute("""
+            SELECT status, detail_json, fetched_at, expires_at, failure_count, next_retry_at
+            FROM provider_enriched_detail_cache WHERE provider=? AND provider_series_id=? AND logic_version=?
+        """, (provider, provider_series_id, logic_version)).fetchone()
+    if row is None or (now is not None and str(row["expires_at"]) <= now):
+        return None
+    detail = _load_json_value(row["detail_json"], None)
+    if not isinstance(detail, dict):
+        return None
+    return JsonResponseCacheEntry(str(row["status"]), detail, str(row["fetched_at"]), str(row["expires_at"]),
+                                  int(row["failure_count"]), row["next_retry_at"])
+
+
+def upsert_provider_enriched_detail_cache(db_path: Path, *, provider: str, provider_series_id: str,
+                                          logic_version: str, detail: dict[str, Any], fetched_at: str,
+                                          expires_at: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO provider_enriched_detail_cache(provider, provider_series_id, logic_version, status,
+                detail_json, fetched_at, expires_at, failure_count, next_retry_at)
+            VALUES (?, ?, ?, 'ok', ?, ?, ?, 0, NULL)
+            ON CONFLICT(provider, provider_series_id, logic_version) DO UPDATE SET status='ok',
+                detail_json=excluded.detail_json, fetched_at=excluded.fetched_at, expires_at=excluded.expires_at,
+                failure_count=0, next_retry_at=NULL
+        """, (provider, provider_series_id, logic_version, json.dumps(detail, ensure_ascii=False, sort_keys=True),
+              fetched_at, expires_at))
+        conn.commit()
+
+
+def record_provider_enriched_detail_failure(db_path: Path, *, provider: str, provider_series_id: str,
+                                            logic_version: str, fetched_at: str, next_retry_at: str,
+                                            expires_at: str, error: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO provider_enriched_detail_cache(provider, provider_series_id, logic_version, status,
+                detail_json, fetched_at, expires_at, failure_count, next_retry_at)
+            VALUES (?, ?, ?, 'failed', ?, ?, ?, 1, ?)
+            ON CONFLICT(provider, provider_series_id, logic_version) DO UPDATE SET status='failed',
+                detail_json=excluded.detail_json, fetched_at=excluded.fetched_at, expires_at=excluded.expires_at,
+                failure_count=MIN(provider_enriched_detail_cache.failure_count + 1, 8),
+                next_retry_at=excluded.next_retry_at
+        """, (provider, provider_series_id, logic_version, json.dumps({"error": error}), fetched_at, expires_at, next_retry_at))
+        conn.commit()

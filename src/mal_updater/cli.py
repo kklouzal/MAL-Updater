@@ -28,6 +28,7 @@ from .hidive_auth import HidiveAuthError, load_hidive_credentials, resolve_hidiv
 from .hidive_snapshot import HidiveSnapshotError
 from . import provider_snapshot
 from .provider_registry import get_provider, list_provider_slugs
+from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
 from . import providers as _providers  # noqa: F401
 from .db import (
     bootstrap_database,
@@ -122,9 +123,13 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.redirect_uri={config.mal.redirect_uri}")
     print(f"mal.request_spacing_seconds={config.mal.request_spacing_seconds}")
     print(f"mal.request_spacing_jitter_seconds={config.mal.request_spacing_jitter_seconds}")
+    print(f"mal.retry_max_attempts={config.mal.retry_max_attempts}")
+    print(f"mal.retry_after_cap_seconds={config.mal.retry_after_cap_seconds}")
     print(f"crunchyroll.locale={config.crunchyroll.locale}")
     print(f"crunchyroll.request_spacing_seconds={config.crunchyroll.request_spacing_seconds}")
     print(f"crunchyroll.request_spacing_jitter_seconds={config.crunchyroll.request_spacing_jitter_seconds}")
+    print(f"crunchyroll.retry_max_attempts={config.crunchyroll.retry_max_attempts}")
+    print(f"crunchyroll.retry_after_cap_seconds={config.crunchyroll.retry_after_cap_seconds}")
     print(f"crunchyroll.username_present={bool(crunchyroll_credentials.username)}")
     print(f"crunchyroll.password_present={bool(crunchyroll_credentials.password)}")
     print(f"crunchyroll.username_path={crunchyroll_credentials.username_path}")
@@ -138,6 +143,10 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"crunchyroll.device_id_present={crunchyroll_state.device_id_path.exists()}")
     print(f"crunchyroll.sync_boundary_present={crunchyroll_state.sync_boundary_path.exists()}")
     print(f"hidive.username_present={bool(hidive_credentials.username)}")
+    print(f"hidive.request_spacing_seconds={config.hidive.request_spacing_seconds}")
+    print(f"hidive.request_spacing_jitter_seconds={config.hidive.request_spacing_jitter_seconds}")
+    print(f"hidive.retry_max_attempts={config.hidive.retry_max_attempts}")
+    print(f"hidive.retry_after_cap_seconds={config.hidive.retry_after_cap_seconds}")
     print(f"hidive.password_present={bool(hidive_credentials.password)}")
     print(f"hidive.username_path={hidive_credentials.username_path}")
     print(f"hidive.password_path={hidive_credentials.password_path}")
@@ -226,6 +235,7 @@ def _cmd_recommend_maintain(
     provider_max_history_pages: int | None,
     provider_max_watchlist_pages: int | None,
     skip_provider_refresh: bool,
+    local_only: bool,
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -240,9 +250,10 @@ def _cmd_recommend_maintain(
         provider_max_history_pages=provider_max_history_pages,
         provider_max_watchlist_pages=provider_max_watchlist_pages,
         include_provider_refresh=not skip_provider_refresh,
+        local_only=local_only,
     )
     print(json.dumps(result, indent=2))
-    return 0 if result.get("status") in {"ok", "dry_run"} else 1
+    return 0 if result.get("status") in {"ok", "dry_run", "skipped"} else 1
 
 
 _runtime_initialization_status = _bootstrap_guidance._runtime_initialization_status
@@ -288,6 +299,21 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
     print(f"service_state_exists={bool(payload.get('service_state_exists'))}")
     print(f"service_log_exists={bool(payload.get('service_log_exists'))}")
     print(f"health_latest_exists={bool(payload.get('health_latest_exists'))}")
+
+    niceness_policy = payload.get("niceness_policy")
+    if isinstance(niceness_policy, dict):
+        cadences = niceness_policy.get("cadences")
+        if isinstance(cadences, dict):
+            for name in sorted(cadences):
+                value = cadences.get(name)
+                if isinstance(value, (int, float, str)):
+                    print(f"niceness_{name}={value}")
+        cache_horizons = niceness_policy.get("cache_horizons_days")
+        if isinstance(cache_horizons, dict):
+            for name in sorted(cache_horizons):
+                value = cache_horizons.get(name)
+                if isinstance(value, (int, float)):
+                    print(f"cache_{name}_days={value}")
 
     if isinstance(payload.get("last_loop_at"), str):
         print(f"last_loop_at={payload['last_loop_at']}")
@@ -2809,6 +2835,7 @@ def _cmd_recommend_refresh_metadata(
     limit: int,
     include_discovery_targets: bool,
     discovery_target_limit: int,
+    force_refresh: bool = False,
 ) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -2818,12 +2845,20 @@ def _cmd_recommend_refresh_metadata(
         limit=_normalize_limit(limit),
         include_discovery_targets=include_discovery_targets,
         discovery_target_limit=_normalize_limit(discovery_target_limit),
+        force_refresh=force_refresh,
     )
     print(json.dumps(summary.as_dict(), indent=2))
     return 0
 
 
-def _cmd_recommend_enrich_provider_availability(project_root: Path | None, limit: int, provider: str | None, search_limit: int, dry_run: bool) -> int:
+def _cmd_recommend_enrich_provider_availability(
+    project_root: Path | None,
+    limit: int,
+    provider: str | None,
+    search_limit: int,
+    queries_per_candidate: int,
+    dry_run: bool,
+) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
@@ -2834,6 +2869,7 @@ def _cmd_recommend_enrich_provider_availability(project_root: Path | None, limit
         providers=providers,
         candidate_limit=_normalize_limit(limit) or 25,
         search_limit=_normalize_limit(search_limit) or 10,
+        queries_per_candidate=_normalize_limit(queries_per_candidate) or 0,
         persist_review_queue=not dry_run,
     )
     print(json.dumps(summary.as_dict(), indent=2))
@@ -2874,9 +2910,7 @@ def _cmd_push_recommendations_webhook(
     return 0 if result.status in {"dry_run", "delivered", "no_recommendations"} else 1
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def _dispatch(parser, args) -> int:
     if args.command == "init":
         return _cmd_init(args.project_root)
     if args.command == "status":
@@ -3142,6 +3176,7 @@ def main() -> int:
             provider_max_history_pages=args.provider_max_history_pages,
             provider_max_watchlist_pages=args.provider_max_watchlist_pages,
             skip_provider_refresh=args.skip_provider_refresh,
+            local_only=args.local_only,
         )
     if args.command == "recommend-dashboard":
         return _cmd_recommend_dashboard(args.project_root, args.output, args.limit, args.include_dormant)
@@ -3155,9 +3190,17 @@ def main() -> int:
             args.limit,
             args.include_discovery_targets,
             args.discovery_target_limit,
+            args.force_refresh,
         )
     if args.command == "recommend-enrich-provider-availability":
-        return _cmd_recommend_enrich_provider_availability(args.project_root, args.limit, args.provider, args.search_limit, args.dry_run)
+        return _cmd_recommend_enrich_provider_availability(
+            args.project_root,
+            args.limit,
+            args.provider,
+            args.search_limit,
+            args.queries_per_candidate,
+            args.dry_run,
+        )
     if args.command == "recommend-coverage":
         return _cmd_recommend_coverage(args.project_root, args.stale_after_days)
     if args.command == "push-recommendations-webhook":
@@ -3170,6 +3213,20 @@ def main() -> int:
         )
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    inherited = current_api_request_context()
+    token = None
+    if inherited.run_id is None:
+        token = begin_api_request_context(task=f"cli:{args.command}", run_id=str(uuid.uuid4()))
+    try:
+        return _dispatch(parser, args)
+    finally:
+        if token is not None:
+            end_api_request_context(token)
 
 if __name__ == "__main__":
     raise SystemExit(main())

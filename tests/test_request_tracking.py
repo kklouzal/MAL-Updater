@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import json
+import multiprocessing
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from mal_updater.config import ensure_directories, load_config
+from mal_updater.request_tracking import (
+    begin_api_request_context,
+    capture_api_event_boundary,
+    count_api_events_since,
+    end_api_request_context,
+    record_api_request_event,
+    prune_api_request_events,
+    sanitize_telemetry_url,
+    summarize_recent_api_usage,
+)
+
+
+class RequestTrackingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        (self.root / ".MAL-Updater" / "config").mkdir(parents=True)
+        self.config = load_config(self.root)
+        ensure_directories(self.config)
+
+    def _events(self) -> list[dict]:
+        return [json.loads(line) for line in self.config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+
+    def test_v2_event_has_run_sequence_and_redacts_url_error_values(self) -> None:
+        token = begin_api_request_context(task="sync_fetch_hidive", run_id="run-123")
+        try:
+            record_api_request_event(
+                "hidive",
+                "algolia_search",
+                url="https://user:pass@example.invalid/search?q=Private+Title&api_key=public-key&limit=3#fragment",
+                method="post",
+                outcome="request_error",
+                error="Bearer token-value password=hunter2 https://example.invalid/?query=PrivateTitle",
+                config=self.config,
+            )
+            record_api_request_event("hidive", "retry", url="https://example.invalid/retry", method="GET", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        first, second = self._events()
+        self.assertEqual(2, first["schema_version"])
+        self.assertTrue(first["event_id"])
+        self.assertEqual("sync_fetch_hidive", first["task"])
+        self.assertEqual("run-123", first["run_id"])
+        self.assertEqual(1, first["attempt_sequence"])
+        self.assertEqual(2, second["attempt_sequence"])
+        serialized = json.dumps(first)
+        for secret in ("Private Title", "PrivateTitle", "public-key", "token-value", "hunter2", "user:pass"):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("q=%3Credacted%3E", first["url"])
+
+    def test_run_boundary_counts_only_matching_attributed_attempts_during_overlap(self) -> None:
+        boundary = capture_api_event_boundary(config=self.config)
+        token_a = begin_api_request_context(task="sync_apply", run_id="run-a")
+        try:
+            record_api_request_event("mal", "put", url="https://example.invalid/a", method="PUT", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token_a)
+        token_b = begin_api_request_context(task="mal_refresh", run_id="run-b")
+        try:
+            record_api_request_event("mal", "post", url="https://example.invalid/b", method="POST", outcome="timeout", config=self.config)
+        finally:
+            end_api_request_context(token_b)
+
+        self.assertEqual(1, count_api_events_since(boundary, provider="mal", task="sync_apply", run_id="run-a", config=self.config))
+        self.assertEqual(1, count_api_events_since(boundary, provider="mal", task="mal_refresh", run_id="run-b", config=self.config))
+        self.assertEqual(2, count_api_events_since(boundary, provider="mal", config=self.config))
+
+    def test_concurrent_contexts_append_valid_unique_events_without_cross_attribution(self) -> None:
+        def write_run(run_number: int) -> None:
+            task = f"task-{run_number % 2}"
+            token = begin_api_request_context(task=task, run_id=f"run-{run_number}")
+            try:
+                for attempt in range(5):
+                    record_api_request_event(
+                        "crunchyroll", "get", url=f"https://example.invalid/{run_number}/{attempt}",
+                        method="GET", outcome="ok", config=self.config,
+                    )
+            finally:
+                end_api_request_context(token)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(write_run, range(8)))
+
+        events = self._events()
+        self.assertEqual(40, len(events))
+        self.assertEqual(40, len({event["event_id"] for event in events}))
+        self.assertEqual(20, summarize_recent_api_usage(provider="crunchyroll", task="task-0", config=self.config).request_count)
+        self.assertEqual(20, summarize_recent_api_usage(provider="crunchyroll", task="task-1", config=self.config).request_count)
+
+    def test_legacy_events_remain_global_and_are_conservative_for_task_scope(self) -> None:
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        legacy = {"at": now, "provider": "mal", "operation": "legacy", "url": "https://example.invalid", "method": "GET", "outcome": "ok"}
+        self.config.api_request_events_path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+        token = begin_api_request_context(task="sync_apply", run_id="new-run")
+        try:
+            record_api_request_event("mal", "new", url="https://example.invalid", method="PUT", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        self.assertEqual(2, summarize_recent_api_usage(provider="mal", config=self.config).request_count)
+        self.assertEqual(1, summarize_recent_api_usage(provider="mal", task="sync_apply", config=self.config).request_count)
+        self.assertEqual(2, summarize_recent_api_usage(provider="mal", task="sync_apply", include_legacy_in_task=True, config=self.config).request_count)
+
+    def test_rolling_expiry_does_not_change_monotonic_boundary_delta(self) -> None:
+        expired_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        old = {"schema_version": 2, "event_id": "old", "at": expired_at, "provider": "mal", "operation": "old", "url": "https://example.invalid", "method": "GET", "outcome": "ok", "task": "sync_apply", "run_id": "old-run"}
+        self.config.api_request_events_path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+        boundary = capture_api_event_boundary(config=self.config)
+        token = begin_api_request_context(task="sync_apply", run_id="current-run")
+        try:
+            record_api_request_event("mal", "current", url="https://example.invalid", method="PUT", outcome="request_error", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        self.assertEqual(1, summarize_recent_api_usage(provider="mal", window_seconds=3600, config=self.config).request_count)
+        self.assertEqual(1, count_api_events_since(boundary, provider="mal", task="sync_apply", run_id="current-run", config=self.config))
+
+    def test_malformed_port_is_sanitized_without_masking_caller_errors(self) -> None:
+        self.assertEqual("<invalid-url>", sanitize_telemetry_url("https://example.invalid:not-a-port/path?q=secret"))
+
+    def test_naive_and_malformed_timestamps_do_not_break_usage_budget_or_pruning(self) -> None:
+        naive = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        rows = [
+            {"at": naive, "provider": "mal", "operation": "legacy", "outcome": "ok"},
+            {"at": "not-a-date", "provider": "mal", "operation": "bad", "outcome": "ok"},
+            {"at": "9999-12-31T23:59:59-23:59", "provider": "mal", "operation": "overflow", "outcome": "ok"},
+        ]
+        self.config.api_request_events_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        self.assertEqual(1, summarize_recent_api_usage(provider="mal", config=self.config).request_count)
+        self.assertEqual(2, prune_api_request_events(config=self.config))
+        self.assertEqual(1, len(self._events()))
+
+    def test_multiprocess_append_and_prune_preserve_jsonl_integrity(self) -> None:
+        # fork is the production Linux execution model and avoids serializing AppConfig.
+        if "fork" not in multiprocessing.get_all_start_methods():
+            self.skipTest("requires Linux fork")
+        ctx = multiprocessing.get_context("fork")
+
+        def append_many() -> None:
+            for index in range(40):
+                record_api_request_event("mal", "child", url=f"https://example.invalid/{index}", method="GET", outcome="ok", config=self.config)
+
+        def prune_many() -> None:
+            for _ in range(20):
+                prune_api_request_events(config=self.config)
+
+        writers = [ctx.Process(target=append_many) for _ in range(3)]
+        pruner = ctx.Process(target=prune_many)
+        for process in [*writers, pruner]:
+            process.start()
+        for process in [*writers, pruner]:
+            process.join(10)
+            self.assertEqual(0, process.exitcode)
+        events = self._events()
+        self.assertEqual(120, len(events))
+        self.assertEqual(120, len({event["event_id"] for event in events}))
+
+
+if __name__ == "__main__":
+    unittest.main()

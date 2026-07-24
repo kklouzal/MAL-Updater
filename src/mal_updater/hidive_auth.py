@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .auth_utils import (
 )
 from .config import AppConfig, _read_secret_file, _resolve_secret_path
 from .request_tracking import record_api_request_event
+from .provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
 
 HIDIVE_API_BASE_URL = "https://dce-frontoffice.imggaming.com/api/v2"
 HIDIVE_REALM = "dce.hidive"
@@ -25,6 +27,7 @@ HIDIVE_API_KEY = "857a1e5d-e35e-4fdf-805b-a87b6f8364bf"
 DEFAULT_HIDIVE_USERNAME_FILE = "hidive_username.txt"
 DEFAULT_HIDIVE_PASSWORD_FILE = "hidive_password.txt"
 HIDIVE_REFRESH_WINDOW_SECONDS = 90
+_RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class HidiveAuthError(RuntimeError):
@@ -156,7 +159,7 @@ class HidiveSession:
             )
             return
         except HidiveAuthError as refresh_exc:
-            if self.credential_rebootstrap_attempted:
+            if self.credential_rebootstrap_attempted or not _auth_failure_allows_credential_rebootstrap(refresh_exc):
                 raise
             bootstrap = hidive_login_with_credentials(
                 self.config,
@@ -169,6 +172,12 @@ class HidiveSession:
             self.token.account_id = bootstrap.account_id
             self.token.account_name = bootstrap.account_name
             self.credential_rebootstrap_attempted = True
+
+
+def _auth_failure_allows_credential_rebootstrap(exc: HidiveAuthError) -> bool:
+    """Do not follow an ambiguous refresh failure with another credential POST."""
+    message = str(exc).casefold()
+    return any(marker in message for marker in ("http 400", "http 401", "http 403", "invalid refresh", "invalid token"))
 
 
 def _now_string() -> str:
@@ -251,8 +260,38 @@ def _hidive_json_request(
 ) -> Any:
     url = f"{HIDIVE_API_BASE_URL}{path}"
     timeout = timeout_seconds or config.request_timeout_seconds
-    try:
-        response = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
+    gate = ProviderRequestGate(
+        provider="hidive",
+        state_dir=config.state_dir,
+        spacing_seconds=config.hidive.request_spacing_seconds,
+        jitter_seconds=config.hidive.request_spacing_jitter_seconds,
+    )
+    normalized_method = method.upper()
+    # Login and refresh POSTs can consume or rotate credential state despite an
+    # ambiguous response, so retries are restricted to read-only GETs.
+    safe_to_retry = normalized_method == "GET"
+    attempts = max(1, int(config.hidive.retry_max_attempts)) if safe_to_retry else 1
+    response = None
+    for attempt in range(1, attempts + 1):
+        gate.wait_turn()
+        try:
+            response = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
+        except requests.RequestException as exc:
+            record_api_request_event(
+                "hidive", f"http_{method.lower()}", url=url, method=method,
+                outcome="request_error", error=type(exc).__name__, config=config,
+            )
+            if attempt < attempts and isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+                delay = retry_delay_seconds(
+                    attempt,
+                    base_seconds=config.hidive.retry_backoff_base_seconds,
+                    jitter_seconds=config.hidive.retry_backoff_jitter_seconds,
+                    cap_seconds=config.hidive.retry_after_cap_seconds,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            raise HidiveAuthError(f"HIDIVE {method} {path} request failed: {exc}") from exc
         record_api_request_event(
             "hidive",
             f"http_{method.lower()}",
@@ -262,18 +301,20 @@ def _hidive_json_request(
             status_code=response.status_code,
             config=config,
         )
-    except requests.RequestException as exc:
-        record_api_request_event(
-            "hidive",
-            f"http_{method.lower()}",
-            url=url,
-            method=method,
-            outcome="request_error",
-            error=str(exc),
-            config=config,
-        )
-        raise HidiveAuthError(f"HIDIVE {method} {path} request failed: {exc}") from exc
+        if response.status_code in _RETRYABLE_HTTP_STATUSES and attempt < attempts:
+            delay = retry_delay_seconds(
+                attempt,
+                retry_after=response_retry_after(response),
+                base_seconds=config.hidive.retry_backoff_base_seconds,
+                jitter_seconds=config.hidive.retry_backoff_jitter_seconds,
+                cap_seconds=config.hidive.retry_after_cap_seconds,
+            )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        break
 
+    assert response is not None
     if response.status_code >= 400:
         detail = response.text.strip()[:800]
         raise HidiveAuthError(f"HIDIVE {method} {path} failed: HTTP {response.status_code}: {detail}")

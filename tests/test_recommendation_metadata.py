@@ -279,7 +279,8 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details) as get_details:
             summary = refresh_recommendation_metadata(self.config, limit=5)
 
-        self.assertEqual([100, 400, 500, 200, 300], [call.args[0] for call in get_details.call_args_list])
+        self.assertEqual([100, 400, 500, 200], [call.args[0] for call in get_details.call_args_list])
+        self.assertEqual(1, summary.fresh_skipped)
         self.assertEqual(5, summary.eligible_seed_count)
         self.assertEqual(1, summary.harvest_unharvested)
         self.assertEqual(1, summary.harvest_failed)

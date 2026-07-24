@@ -27,6 +27,34 @@ from mal_updater.crunchyroll_snapshot import (
 
 
 class CrunchyrollAuthRecoveryTests(unittest.TestCase):
+    def test_refresh_token_post_timeout_and_503_are_single_attempt(self) -> None:
+        class Response:
+            status_code = 503
+
+            def json(self):
+                return {"error": "busy"}
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            paths = resolve_crunchyroll_state_paths(config)
+            paths.refresh_token_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.refresh_token_path.write_text("refresh-token\n", encoding="utf-8")
+            for effect in (TimeoutError("ambiguous"), Response()):
+                with self.subTest(effect=type(effect).__name__), patch.object(
+                    crunchyroll_snapshot, "_http_post", side_effect=effect if isinstance(effect, BaseException) else None,
+                    return_value=None if isinstance(effect, BaseException) else effect,
+                ) as post:
+                    with self.assertRaises((TimeoutError, CrunchyrollAuthError)):
+                        crunchyroll_snapshot.refresh_access_token(
+                            config,
+                            pacer=_CrunchyrollRequestPacer(
+                                0.0, 0.0, retry_max_attempts=3,
+                                retry_backoff_base_seconds=0.0,
+                                retry_backoff_jitter_seconds=0.0,
+                            ),
+                        )
+                    post.assert_called_once()
+
     def test_crunchyroll_snapshot_http_requires_curl_cffi_transport(self) -> None:
         with patch.object(crunchyroll_snapshot, "curl_requests", None):
             with self.assertRaisesRegex(CrunchyrollSnapshotError, "requires curl_cffi"):
@@ -35,6 +63,27 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
                     headers={},
                     timeout_seconds=1.0,
                 )
+
+    def test_snapshot_http_helpers_record_success_and_failure_attempts(self) -> None:
+        class Response:
+            status_code = 200
+
+        class Transport:
+            def get(self, *args, **kwargs):
+                return Response()
+
+            def post(self, *args, **kwargs):
+                raise TimeoutError("simulated")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            with patch.object(crunchyroll_snapshot, "curl_requests", Transport()):
+                crunchyroll_snapshot._http_get("https://example.invalid/history", headers={}, timeout_seconds=1.0, config=config)
+                with self.assertRaises(TimeoutError):
+                    crunchyroll_snapshot._http_post("https://example.invalid/token", data={}, headers={}, timeout_seconds=1.0, config=config)
+
+            events = [json.loads(line) for line in config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["ok", "request_error"], [event["outcome"] for event in events])
 
     def _build_session(self, root: Path) -> _CrunchyrollAuthSession:
         config = load_config(root)
@@ -160,7 +209,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
 
             with patch("mal_updater.crunchyroll_snapshot._authorized_json_get", side_effect=fake_authorized_get), patch(
                 "mal_updater.crunchyroll_snapshot.refresh_access_token",
-                side_effect=CrunchyrollAuthError("refresh failed"),
+                side_effect=CrunchyrollAuthError("refresh failed: HTTP 401 invalid_grant"),
             ) as mock_refresh, patch(
                 "mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials"
             ) as mock_login:
@@ -188,6 +237,20 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             self.assertTrue(session.credential_rebootstrap_attempted)
             mock_refresh.assert_called_once()
             mock_login.assert_called_once()
+
+    def test_ambiguous_refresh_failure_does_not_rebootstrap_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            with patch("mal_updater.crunchyroll_snapshot._authorized_json_get", side_effect=CrunchyrollUnauthorizedError("https://example.invalid", 401)), patch(
+                "mal_updater.crunchyroll_snapshot.refresh_access_token",
+                side_effect=CrunchyrollAuthError("Crunchyroll refresh-token login failed: HTTP 503"),
+            ), patch("mal_updater.crunchyroll_snapshot.crunchyroll_login_with_credentials") as login:
+                with self.assertRaisesRegex(CrunchyrollAuthError, "HTTP 503"):
+                    session.authorized_json_get("https://example.invalid")
+            login.assert_not_called()
+            self.assertEqual("refresh-token", session.token.refresh_token)
 
     def test_authorized_json_get_stops_cleanly_after_refresh_and_credential_retry_are_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -245,6 +308,8 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(session.auth_source, "credential_rebootstrap")
             self.assertTrue(session.credential_rebootstrap_attempted)
+            self.assertIsNone(session.token.account_id)
+            self.assertIsNone(session.account_email)
             mock_refresh.assert_called_once()
             mock_login.assert_called_once()
 
@@ -507,15 +572,18 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                 raise TimeoutError("simulated timeout")
 
         fake_transport = FakeTransport()
-        with patch("mal_updater.crunchyroll_snapshot.curl_requests", fake_transport):
-            with self.assertRaises(CrunchyrollSnapshotError) as ctx:
-                _authorized_json_get(
-                    "https://www.crunchyroll.com/content/v2/acct-123/watch-history",
-                    access_token="access-token",
-                    timeout_seconds=7.0,
-                    params={"page": 3},
-                    phase="watch-history page 3",
-                )
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            with patch("mal_updater.crunchyroll_snapshot.curl_requests", fake_transport):
+                with self.assertRaises(CrunchyrollSnapshotError) as ctx:
+                    _authorized_json_get(
+                        "https://www.crunchyroll.com/content/v2/acct-123/watch-history",
+                        access_token="access-token",
+                        timeout_seconds=7.0,
+                        params={"page": 3},
+                        phase="watch-history page 3",
+                        config=config,
+                    )
 
         self.assertIn("watch-history page 3", str(ctx.exception))
         self.assertIn("/watch-history", str(ctx.exception))

@@ -340,6 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_maintain.add_argument("--provider-max-history-pages", type=int, default=None, help="Crunchyroll chunk budget for history pages; partial chunks stay incremental")
     recommend_maintain.add_argument("--provider-max-watchlist-pages", type=int, default=None, help="Crunchyroll chunk budget for watchlist pages; partial chunks stay incremental")
     recommend_maintain.add_argument("--skip-provider-refresh", action="store_true", help="Skip provider snapshot refresh for this cycle")
+    recommend_maintain.add_argument("--local-only", action="store_true", help="Run only DB/local snapshot and health work (daemon-safe; no MAL/provider calls)")
     recommend_dashboard = subparsers.add_parser(
         "recommend-dashboard",
         help="Write a dependency-free sortable local HTML recommendation dashboard",
@@ -398,6 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also hydrate minimal metadata for top recommended target anime so discovery suppression/ranking can use MAL list state and metadata",
     )
+    recommend_refresh.add_argument("--force-refresh", action="store_true", help="Bypass fresh MAL metadata/detail caches for an operator-forced refresh")
     recommend_refresh.add_argument(
         "--discovery-target-limit",
         type=int,
@@ -411,6 +413,12 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_enrich.add_argument("--limit", type=int, default=25, help="Maximum recommendation candidates to inspect")
     recommend_enrich.add_argument("--provider", choices=list(list_provider_slugs()), help="Provider slug to query; defaults to all registered providers")
     recommend_enrich.add_argument("--search-limit", type=int, default=10, help="Maximum provider search results per query")
+    recommend_enrich.add_argument(
+        "--queries-per-candidate",
+        type=int,
+        default=0,
+        help="Maximum title aliases queried per recommendation candidate (0 keeps the manual all-alias behavior)",
+    )
     recommend_enrich.add_argument("--dry-run", action="store_true", help="Report/cache provider search candidates without replacing the review queue")
     recommend_coverage = subparsers.add_parser(
         "recommend-coverage",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -16,6 +17,8 @@ from ..hidive_snapshot import fetch_snapshot as fetch_hidive_snapshot
 from ..hidive_snapshot import write_snapshot_file as write_hidive_snapshot_file
 from ..provider_registry import register_provider
 from ..provider_types import ProviderCapabilities, ProviderFetchResult, ProviderSearchResult
+from ..request_tracking import record_api_request_event
+from ..provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
 
 HIDIVE_ALGOLIA_APP_ID = "H99XLDR8MJ"
 HIDIVE_ALGOLIA_API_KEY = "e55ccb3db0399eabe2bfc37a0314c346"  # public frontend search-only key; never log
@@ -204,19 +207,63 @@ def _search_title(config, query: str, *, limit: int = 10):
     timeout = float(getattr(config, "request_timeout_seconds", 30.0) or 30.0)
     params = urlencode({"query": q, "hitsPerPage": normalized_limit, "filters": HIDIVE_ALGOLIA_SERIES_FILTER})
     body = {"params": params}
-    response = curl_requests.post(
-        HIDIVE_ALGOLIA_ENDPOINT,
-        data=json.dumps(body),
-        headers={
-            "x-algolia-application-id": HIDIVE_ALGOLIA_APP_ID,
-            "x-algolia-api-key": HIDIVE_ALGOLIA_API_KEY,
-            "content-type": "application/json",
-            "accept": "application/json",
-            "user-agent": "MAL-Updater/1.0 HIDIVE title search",
-        },
-        timeout=(timeout, timeout),
-        impersonate="chrome124",
+    niceness = getattr(config, "hidive", None)
+    state_dir = Path(getattr(config, "state_dir", Path(getattr(config, "api_request_events_path", Path.cwd())).parent))
+    gate = ProviderRequestGate(
+        provider="hidive",
+        state_dir=state_dir,
+        spacing_seconds=float(getattr(niceness, "request_spacing_seconds", 0.0) or 0.0),
+        jitter_seconds=float(getattr(niceness, "request_spacing_jitter_seconds", 0.0) or 0.0),
     )
-    response.raise_for_status()
+    attempts = max(1, int(getattr(niceness, "retry_max_attempts", 2) or 2))
+    response = None
+    for attempt in range(1, attempts + 1):
+        gate.wait_turn()
+        try:
+            response = curl_requests.post(
+                HIDIVE_ALGOLIA_ENDPOINT,
+                data=json.dumps(body),
+                headers={
+                    "x-algolia-application-id": HIDIVE_ALGOLIA_APP_ID,
+                    "x-algolia-api-key": HIDIVE_ALGOLIA_API_KEY,
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                    "user-agent": "MAL-Updater/1.0 HIDIVE title search",
+                },
+                timeout=(timeout, timeout),
+                impersonate="chrome124",
+            )
+        except Exception as exc:
+            record_api_request_event("hidive", "algolia_search", url=HIDIVE_ALGOLIA_ENDPOINT, method="POST", outcome="request_error", error=type(exc).__name__, config=config)
+            if attempt < attempts and ("timeout" in type(exc).__name__.lower() or "connection" in type(exc).__name__.lower()):
+                delay = retry_delay_seconds(
+                    attempt,
+                    base_seconds=float(getattr(niceness, "retry_backoff_base_seconds", 1.0) or 0.0),
+                    jitter_seconds=float(getattr(niceness, "retry_backoff_jitter_seconds", 0.25) or 0.0),
+                    cap_seconds=float(getattr(niceness, "retry_after_cap_seconds", 60.0) or 0.0),
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            raise
+        status_code = int(getattr(response, "status_code", 200))
+        record_api_request_event(
+            "hidive", "algolia_search", url=HIDIVE_ALGOLIA_ENDPOINT, method="POST",
+            outcome="ok" if status_code < 400 else "http_error", status_code=status_code, config=config,
+        )
+        if status_code in {429, 500, 502, 503, 504} and attempt < attempts:
+            delay = retry_delay_seconds(
+                attempt,
+                retry_after=response_retry_after(response),
+                base_seconds=float(getattr(niceness, "retry_backoff_base_seconds", 1.0) or 0.0),
+                jitter_seconds=float(getattr(niceness, "retry_backoff_jitter_seconds", 0.25) or 0.0),
+                cap_seconds=float(getattr(niceness, "retry_after_cap_seconds", 60.0) or 0.0),
+            )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        response.raise_for_status()
+        break
+    assert response is not None
     payload = response.json()
     return _normalize_algolia_hits(payload, limit=normalized_limit)

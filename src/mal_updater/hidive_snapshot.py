@@ -496,6 +496,11 @@ def fetch_snapshot(
             "hot_surface_only": hot_mode,
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
             "sync_boundary_path": str(session.state_paths.sync_boundary_path),
+            "request_spacing_seconds": config.hidive.request_spacing_seconds,
+            "request_spacing_jitter_seconds": config.hidive.request_spacing_jitter_seconds,
+            "retry_max_attempts": config.hidive.retry_max_attempts,
+            "retry_after_cap_seconds": config.hidive.retry_after_cap_seconds,
+            "niceness_policy": "local_host_process_gate",
             "supports": {
                 "history": True,
                 "continue_watching": not hot_mode,

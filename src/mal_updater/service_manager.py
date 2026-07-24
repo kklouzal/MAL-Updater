@@ -8,7 +8,7 @@ import subprocess
 from typing import Any
 
 from .config import AppConfig, ensure_directories, load_config
-from .service_runtime import TaskSpec, _planned_fetch_mode
+from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
 from .service_systemd_status import build_service_status_payload
 from .service_units import SERVICE_UNIT_NAME, render_repo_systemd_unit_template
 
@@ -251,6 +251,8 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
         summary["last_run_epoch"] = value["last_run_epoch"]
     if isinstance(value.get("every_seconds"), int):
         summary["every_seconds"] = value["every_seconds"]
+    if isinstance(value.get("initial_delay_seconds"), int):
+        summary["initial_delay_seconds"] = value["initial_delay_seconds"]
     if isinstance(value.get("next_due_epoch"), (int, float)):
         summary["next_due_epoch"] = value["next_due_epoch"]
     if isinstance(value.get("last_duration_seconds"), (int, float)):
@@ -405,6 +407,7 @@ def doctor_service(config: AppConfig | None = None) -> dict[str, Any]:
         "health_latest_exists": config.health_latest_json_path.exists(),
         "health_latest_parse_error": recent_health_error,
         "health_latest_summary": recent_health,
+        "niceness_policy": effective_niceness_policy(config),
     }
     if isinstance(service_state, dict) and isinstance(service_state.get("api_usage"), dict):
         payload["api_usage"] = service_state["api_usage"]

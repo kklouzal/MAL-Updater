@@ -30,9 +30,19 @@ DEFAULT_MAL_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_MAL_REDIRECT_PORT = 8765
 DEFAULT_MAL_REQUEST_SPACING_SECONDS = 1.0
 DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS = 0.2
+DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS = 14
+DEFAULT_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS = 3
+DEFAULT_MAL_DETAIL_CACHE_TTL_DAYS = 14
+DEFAULT_PROVIDER_DETAIL_CACHE_TTL_DAYS = 30
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 22.5
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 7.5
+DEFAULT_HIDIVE_REQUEST_SPACING_SECONDS = 5.0
+DEFAULT_HIDIVE_REQUEST_SPACING_JITTER_SECONDS = 1.0
+DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS = 2
+DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS = 1.0
+DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS = 0.25
+DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS = 60.0
 DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS = 20.0
 DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE = "fresh"
 DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_SECTION_LIMITS = {
@@ -49,13 +59,16 @@ DEFAULT_MAL_REFRESH_TOKEN_FILE = "mal_refresh_token.txt"
 DEFAULT_DB_FILE = "mal_updater.sqlite3"
 DEFAULT_RUNTIME_DIR_NAME = ".MAL-Updater"
 DEFAULT_SERVICE_SYNC_EVERY_SECONDS = 60 * 60
-DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS = 0
+DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 60 * 60
-DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 60 * 60
+DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS = 8 * 60 * 60
+DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
+DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS = 24 * 60 * 60
 DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
+DEFAULT_SERVICE_STARTUP_GRACE_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
 DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
 DEFAULT_SERVICE_MAL_HOURLY_LIMIT = 120
@@ -65,6 +78,7 @@ DEFAULT_SERVICE_SOURCE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOOR_SECONDS = 0
 DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_HISTORY_PAGES = 10
 DEFAULT_SERVICE_CRUNCHYROLL_PROVIDER_MAX_WATCHLIST_PAGES = 2
 DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_SERVICE_LEASE_STALE_AFTER_SECONDS = 30 * 60
 DEFAULT_SERVICE_WARN_RATIO = 0.8
 DEFAULT_SERVICE_CRITICAL_RATIO = 0.95
 DEFAULT_SERVICE_PROJECTED_REQUEST_HISTORY_WINDOW = 5
@@ -73,18 +87,28 @@ DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS = {
     "hidive": 72,
 }
 DEFAULT_SERVICE_TASK_HOURLY_LIMITS = {
+    "mal_list_refresh": 6,
     "sync_apply": 48,
-    "recommend_metadata_refresh": 24,
+    "recommend_metadata_refresh": 12,
+    "recommend_provider_eligibility_crunchyroll": 18,
+    "recommend_provider_eligibility_hidive": 8,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
     "mal_refresh": 1,
+    "mal_list_refresh": 3,
     "sync_apply": 8,
     "recommend_metadata_refresh": 8,
+    "recommend_provider_eligibility_crunchyroll": 7,
+    "recommend_provider_eligibility_hidive": 2,
 }
 DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
+    "mal_list_refresh_pages": 3,
     "sync_apply": 8,
     "recommend_metadata_refresh": 3,
     "recommend_metadata_discovery_targets": 5,
+    "recommend_provider_eligibility_candidates": 2,
+    "recommend_provider_eligibility_search_results": 5,
+    "recommend_provider_eligibility_queries_per_candidate": 1,
     "recommendation_snapshot": 100,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS_BY_MODE = {
@@ -105,12 +129,18 @@ DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_HISTORY_WINDOWS = {
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS = {
     "mal_refresh": 3,
+    "mal_list_refresh": 5,
     "sync_apply": 3,
     "recommend_metadata_refresh": 5,
+    "recommend_provider_eligibility_crunchyroll": 7,
+    "recommend_provider_eligibility_hidive": 7,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_PERCENTILES = {
+    "mal_list_refresh": 0.9,
     "sync_apply": 0.9,
     "recommend_metadata_refresh": 0.9,
+    "recommend_provider_eligibility_crunchyroll": 0.9,
+    "recommend_provider_eligibility_hidive": 0.9,
 }
 DEFAULT_SERVICE_PROVIDER_PROJECTED_REQUEST_PERCENTILES = {
     "crunchyroll": 0.9,
@@ -121,21 +151,33 @@ DEFAULT_SERVICE_PROVIDER_WARN_BACKOFF_FLOORS = {
     "hidive": 300,
 }
 DEFAULT_SERVICE_TASK_WARN_BACKOFF_FLOORS = {
+    "mal_list_refresh": 1800,
     "sync_apply": 900,
+    "recommend_metadata_refresh": 1800,
+    "recommend_provider_eligibility_crunchyroll": 3600,
+    "recommend_provider_eligibility_hidive": 3600,
 }
 DEFAULT_SERVICE_PROVIDER_CRITICAL_BACKOFF_FLOORS = {
     "crunchyroll": 1800,
     "hidive": 1200,
 }
 DEFAULT_SERVICE_TASK_CRITICAL_BACKOFF_FLOORS = {
+    "mal_list_refresh": 3600,
     "sync_apply": 1800,
+    "recommend_metadata_refresh": 3600,
+    "recommend_provider_eligibility_crunchyroll": 7200,
+    "recommend_provider_eligibility_hidive": 7200,
 }
 DEFAULT_SERVICE_PROVIDER_AUTH_FAILURE_BACKOFF_FLOORS = {
     "crunchyroll": 7200,
     "hidive": 3600,
 }
 DEFAULT_SERVICE_TASK_AUTH_FAILURE_BACKOFF_FLOORS = {
+    "mal_list_refresh": 6 * 60 * 60,
     "sync_apply": 2400,
+    "recommend_metadata_refresh": 6 * 60 * 60,
+    "recommend_provider_eligibility_crunchyroll": 12 * 60 * 60,
+    "recommend_provider_eligibility_hidive": 12 * 60 * 60,
 }
 WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 
@@ -150,6 +192,14 @@ class MalSettings:
     redirect_port: int = DEFAULT_MAL_REDIRECT_PORT
     request_spacing_seconds: float = DEFAULT_MAL_REQUEST_SPACING_SECONDS
     request_spacing_jitter_seconds: float = DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS
+    search_cache_ttl_days: int = DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS
+    search_negative_cache_ttl_days: int = DEFAULT_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS
+    detail_cache_ttl_days: int = DEFAULT_MAL_DETAIL_CACHE_TTL_DAYS
+    provider_detail_cache_ttl_days: int = DEFAULT_PROVIDER_DETAIL_CACHE_TTL_DAYS
+    retry_max_attempts: int = DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS
+    retry_backoff_base_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS
+    retry_backoff_jitter_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS
+    retry_after_cap_seconds: float = DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS
 
     @property
     def redirect_uri(self) -> str:
@@ -161,6 +211,20 @@ class CrunchyrollSettings:
     locale: str = DEFAULT_CRUNCHYROLL_LOCALE
     request_spacing_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS
     request_spacing_jitter_seconds: float = DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS
+    retry_max_attempts: int = DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS
+    retry_backoff_base_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS
+    retry_backoff_jitter_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS
+    retry_after_cap_seconds: float = DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS
+
+
+@dataclass(slots=True)
+class HidiveSettings:
+    request_spacing_seconds: float = DEFAULT_HIDIVE_REQUEST_SPACING_SECONDS
+    request_spacing_jitter_seconds: float = DEFAULT_HIDIVE_REQUEST_SPACING_JITTER_SECONDS
+    retry_max_attempts: int = DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS
+    retry_backoff_base_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS
+    retry_backoff_jitter_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS
+    retry_after_cap_seconds: float = DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS
 
 
 @dataclass(slots=True)
@@ -180,11 +244,15 @@ class ServiceSettings:
     full_refresh_every_seconds: int = DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS
     health_every_seconds: int = DEFAULT_SERVICE_HEALTH_EVERY_SECONDS
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
+    mal_list_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS
     recommendation_metadata_refresh_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS
+    provider_eligibility_refresh_every_seconds: int = DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS
     recommend_maintain_every_seconds: int = DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS
     recommendations_webhook_push_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
+    startup_grace_seconds: int = DEFAULT_SERVICE_STARTUP_GRACE_SECONDS
     task_timeout_seconds: int = DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS
+    lease_stale_after_seconds: int = DEFAULT_SERVICE_LEASE_STALE_AFTER_SECONDS
     crunchyroll_hourly_limit: int = DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT
     source_provider_hourly_limit: int = DEFAULT_SERVICE_SOURCE_PROVIDER_HOURLY_LIMIT
     mal_hourly_limit: int = DEFAULT_SERVICE_MAL_HOURLY_LIMIT
@@ -345,6 +413,7 @@ class AppConfig:
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     mal: MalSettings = field(default_factory=MalSettings)
     crunchyroll: CrunchyrollSettings = field(default_factory=CrunchyrollSettings)
+    hidive: HidiveSettings = field(default_factory=HidiveSettings)
     openclaw: OpenClawSettings = field(default_factory=OpenClawSettings)
     service: ServiceSettings = field(default_factory=ServiceSettings)
 
@@ -355,6 +424,10 @@ class AppConfig:
     @property
     def service_state_path(self) -> Path:
         return self.state_dir / "service-state.json"
+
+    @property
+    def service_leases_dir(self) -> Path:
+        return self.state_dir / "leases"
 
     @property
     def api_request_events_path(self) -> Path:
@@ -514,6 +587,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     paths_section = _get_table(settings, "paths")
     mal_section = _get_table(settings, "mal")
     crunchyroll_section = _get_table(settings, "crunchyroll")
+    hidive_section = _get_table(settings, "hidive")
     openclaw_section = _get_table(settings, "openclaw")
     openclaw_section_limits_section = _get_nested_table(settings, "openclaw", "recommendations_webhook_section_limits")
     service_section = _get_table(settings, "service")
@@ -619,6 +693,14 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                     _get_float(mal_section, "request_spacing_jitter_seconds", DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS),
                 )
             ),
+            search_cache_ttl_days=max(0, int(os.getenv("MAL_UPDATER_MAL_SEARCH_CACHE_TTL_DAYS", _get_int(mal_section, "search_cache_ttl_days", DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS)))),
+            search_negative_cache_ttl_days=max(0, int(os.getenv("MAL_UPDATER_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS", _get_int(mal_section, "search_negative_cache_ttl_days", DEFAULT_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS)))),
+            detail_cache_ttl_days=max(0, int(os.getenv("MAL_UPDATER_MAL_DETAIL_CACHE_TTL_DAYS", _get_int(mal_section, "detail_cache_ttl_days", DEFAULT_MAL_DETAIL_CACHE_TTL_DAYS)))),
+            provider_detail_cache_ttl_days=max(0, int(os.getenv("MAL_UPDATER_PROVIDER_DETAIL_CACHE_TTL_DAYS", _get_int(mal_section, "provider_detail_cache_ttl_days", DEFAULT_PROVIDER_DETAIL_CACHE_TTL_DAYS)))),
+            retry_max_attempts=max(1, int(os.getenv("MAL_UPDATER_MAL_RETRY_MAX_ATTEMPTS", _get_int(mal_section, "retry_max_attempts", DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS)))),
+            retry_backoff_base_seconds=max(0.0, float(os.getenv("MAL_UPDATER_MAL_RETRY_BACKOFF_BASE_SECONDS", _get_float(mal_section, "retry_backoff_base_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS)))),
+            retry_backoff_jitter_seconds=max(0.0, float(os.getenv("MAL_UPDATER_MAL_RETRY_BACKOFF_JITTER_SECONDS", _get_float(mal_section, "retry_backoff_jitter_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS)))),
+            retry_after_cap_seconds=max(0.0, float(os.getenv("MAL_UPDATER_MAL_RETRY_AFTER_CAP_SECONDS", _get_float(mal_section, "retry_after_cap_seconds", DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS)))),
         ),
         crunchyroll=CrunchyrollSettings(
             locale=os.getenv("MAL_UPDATER_CRUNCHYROLL_LOCALE", _get_str(crunchyroll_section, "locale", DEFAULT_CRUNCHYROLL_LOCALE)),
@@ -638,6 +720,18 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                     ),
                 )
             ),
+            retry_max_attempts=max(1, int(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_MAX_ATTEMPTS", _get_int(crunchyroll_section, "retry_max_attempts", DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS)))),
+            retry_backoff_base_seconds=max(0.0, float(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_BACKOFF_BASE_SECONDS", _get_float(crunchyroll_section, "retry_backoff_base_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS)))),
+            retry_backoff_jitter_seconds=max(0.0, float(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_BACKOFF_JITTER_SECONDS", _get_float(crunchyroll_section, "retry_backoff_jitter_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS)))),
+            retry_after_cap_seconds=max(0.0, float(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_AFTER_CAP_SECONDS", _get_float(crunchyroll_section, "retry_after_cap_seconds", DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS)))),
+        ),
+        hidive=HidiveSettings(
+            request_spacing_seconds=max(0.0, float(os.getenv("MAL_UPDATER_HIDIVE_REQUEST_SPACING_SECONDS", _get_float(hidive_section, "request_spacing_seconds", DEFAULT_HIDIVE_REQUEST_SPACING_SECONDS)))),
+            request_spacing_jitter_seconds=max(0.0, float(os.getenv("MAL_UPDATER_HIDIVE_REQUEST_SPACING_JITTER_SECONDS", _get_float(hidive_section, "request_spacing_jitter_seconds", DEFAULT_HIDIVE_REQUEST_SPACING_JITTER_SECONDS)))),
+            retry_max_attempts=max(1, int(os.getenv("MAL_UPDATER_HIDIVE_RETRY_MAX_ATTEMPTS", _get_int(hidive_section, "retry_max_attempts", DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS)))),
+            retry_backoff_base_seconds=max(0.0, float(os.getenv("MAL_UPDATER_HIDIVE_RETRY_BACKOFF_BASE_SECONDS", _get_float(hidive_section, "retry_backoff_base_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS)))),
+            retry_backoff_jitter_seconds=max(0.0, float(os.getenv("MAL_UPDATER_HIDIVE_RETRY_BACKOFF_JITTER_SECONDS", _get_float(hidive_section, "retry_backoff_jitter_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS)))),
+            retry_after_cap_seconds=max(0.0, float(os.getenv("MAL_UPDATER_HIDIVE_RETRY_AFTER_CAP_SECONDS", _get_float(hidive_section, "retry_after_cap_seconds", DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS)))),
         ),
         openclaw=OpenClawSettings(
             recommendations_webhook_enabled=(
@@ -691,6 +785,12 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             full_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_FULL_REFRESH_EVERY_SECONDS", _get_int(service_section, "full_refresh_every_seconds", DEFAULT_SERVICE_FULL_REFRESH_EVERY_SECONDS))),
             health_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_EVERY_SECONDS", _get_int(service_section, "health_every_seconds", DEFAULT_SERVICE_HEALTH_EVERY_SECONDS))),
             mal_refresh_every_seconds=int(os.getenv("MAL_UPDATER_SERVICE_MAL_REFRESH_EVERY_SECONDS", _get_int(service_section, "mal_refresh_every_seconds", DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS))),
+            mal_list_refresh_every_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS",
+                    _get_int(service_section, "mal_list_refresh_every_seconds", DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS),
+                )
+            ),
             recommendation_metadata_refresh_every_seconds=int(
                 os.getenv(
                     "MAL_UPDATER_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS",
@@ -698,6 +798,16 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                         service_section,
                         "recommendation_metadata_refresh_every_seconds",
                         DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS,
+                    ),
+                )
+            ),
+            provider_eligibility_refresh_every_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS",
+                    _get_int(
+                        service_section,
+                        "provider_eligibility_refresh_every_seconds",
+                        DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS,
                     ),
                 )
             ),
@@ -722,7 +832,25 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                 )
             ),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
+            startup_grace_seconds=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_STARTUP_GRACE_SECONDS",
+                        _get_int(service_section, "startup_grace_seconds", DEFAULT_SERVICE_STARTUP_GRACE_SECONDS),
+                    )
+                ),
+            ),
             task_timeout_seconds=max(1, int(os.getenv("MAL_UPDATER_SERVICE_TASK_TIMEOUT_SECONDS", _get_int(service_section, "task_timeout_seconds", DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS)))),
+            lease_stale_after_seconds=max(
+                1,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_LEASE_STALE_AFTER_SECONDS",
+                        _get_int(service_section, "lease_stale_after_seconds", DEFAULT_SERVICE_LEASE_STALE_AFTER_SECONDS),
+                    )
+                ),
+            ),
             crunchyroll_hourly_limit=int(os.getenv("MAL_UPDATER_SERVICE_CRUNCHYROLL_HOURLY_LIMIT", _get_int(service_section, "crunchyroll_hourly_limit", DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT))),
             source_provider_hourly_limit=int(
                 os.getenv(
@@ -977,6 +1105,7 @@ def ensure_directories(config: AppConfig) -> None:
         config.state_dir,
         config.cache_dir,
         config.service_log_path.parent,
+        config.service_leases_dir,
         config.health_latest_json_path.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)

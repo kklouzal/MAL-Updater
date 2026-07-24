@@ -342,6 +342,95 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(third.provider_searches, 1)
         self.assertEqual(len(provider.calls), 2)
 
+    def test_fresh_actionable_eligibility_is_zero_request_and_expiry_rechecks(self):
+        self._insert_meta(102, english="Frieren")
+        self._recommendations(102)
+        provider = FakeProvider([
+            {
+                "provider_series_id": "cr-frieren",
+                "title": "Frieren",
+                "audio_locales": ["en-US"],
+                "catalog_status": "present",
+            }
+        ])
+        provider.slug = "crunchyroll"
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        first = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now,
+        )
+        self.assertEqual(1, first.provider_searches)
+        self.assertEqual(1, len(provider.calls))
+
+        fresh = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now + timedelta(days=1),
+        )
+        self.assertEqual(1, fresh.cache_hits)
+        self.assertEqual(1, fresh.eligibility_fresh_skips)
+        self.assertEqual(0, fresh.provider_searches)
+        self.assertEqual(0, fresh.provider_detail_probes)
+        self.assertEqual(1, len(provider.calls), "fresh actionable evidence must make zero provider calls")
+
+        expired = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now + timedelta(days=8),
+        )
+        self.assertEqual(1, expired.eligibility_expired_retries)
+        self.assertEqual(1, expired.provider_searches)
+        self.assertEqual(2, len(provider.calls))
+
+    def test_expired_eligibility_failure_backs_off_then_success_resets_lifecycle(self):
+        self._insert_meta(103, english="Retry Show")
+        self._recommendations(103)
+
+        class RetryProvider(FakeProvider):
+            slug = "crunchyroll"
+
+            def __init__(self):
+                super().__init__([{"provider_series_id": "cr-retry", "title": "Retry Show", "audio_locales": ["en-US"], "catalog_status": "present"}])
+                self.fail = False
+
+            def search_title(self, config, query: str, *, limit: int = 10):
+                self.calls.append((query, limit))
+                if self.fail:
+                    raise RuntimeError("temporary provider failure")
+                return list(self.matches)
+
+        provider = RetryProvider()
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now)
+        provider.fail = True
+        failed = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=8))
+        self.assertEqual(1, failed.provider_search_failures)
+        evidence = get_recommendation_provider_eligibility_evidence(self.config.db_path, mal_anime_id=103, provider="crunchyroll", provider_series_id="cr-retry")
+        self.assertEqual("failed", evidence.refresh_status)
+        self.assertEqual(1, evidence.failure_count)
+        self.assertIsNotNone(evidence.next_retry_at)
+
+        backed_off = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=8, minutes=30))
+        self.assertEqual(1, backed_off.eligibility_retry_backoff_skips)
+        self.assertEqual(2, len(provider.calls))
+
+        provider.fail = False
+        recovered = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=8, hours=2))
+        self.assertEqual(1, recovered.eligibility_expired_retries)
+        evidence = get_recommendation_provider_eligibility_evidence(self.config.db_path, mal_anime_id=103, provider="crunchyroll", provider_series_id="cr-retry")
+        self.assertEqual("ok", evidence.refresh_status)
+        self.assertEqual(0, evidence.failure_count)
+        self.assertIsNone(evidence.next_retry_at)
+        self.assertEqual(enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION, evidence.logic_version)
+
     def test_strong_exact_match_with_english_audio_coalesces_discovery_review_evidence(self):
         self._insert_meta(202, english="Delicious in Dungeon")
         self._recommendations(202)
@@ -646,6 +735,34 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
         self.assertEqual("crunchyroll_cms_series", evidence.source_evidence["catalog_evidence_source"])
+
+    def test_fresh_crunchyroll_detail_cache_does_not_construct_session(self):
+        now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+        match = {"provider_series_id": "cr-cached", "title": "Cached", "audio_locales": []}
+        enrichment.upsert_provider_enriched_detail_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            provider_series_id="cr-cached",
+            logic_version=enrichment.PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+            detail={**match, "audio_locales": ["en-US"]},
+            fetched_at=enrichment._iso(now),
+            expires_at=enrichment._iso(now + timedelta(days=30)),
+        )
+
+        class Provider:
+            slug = "crunchyroll"
+
+            def fetch_search_result_detail(self, config, candidate, *, session=None):
+                raise AssertionError("fresh cache must not call provider")
+
+        factory_calls = []
+        enriched, attempted = enrichment._fetch_provider_detail_if_available(
+            Provider(), self.config, match, now=now,
+            provider_session_factory=lambda: factory_calls.append(True),
+        )
+        self.assertFalse(attempted)
+        self.assertEqual(["en-US"], enriched["audio_locales"])
+        self.assertEqual([], factory_calls)
 
     def test_single_near_exact_match_auto_enriches_series_mapping(self):
         self._insert_meta(303, english="The Apothecary Diaries")

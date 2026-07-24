@@ -325,7 +325,7 @@ class HidiveSnapshotTests(unittest.TestCase):
                 HidiveSession,
                 "json_get",
                 side_effect=[history_payload, history_backfill_payload, home_payload, favourites_payload, favourites_backfill_payload],
-            ):
+            ) as mock_get:
                 result = fetch_snapshot(load_config(root))
 
         self.assertFalse(result.snapshot.raw["history_stopped_early"])
@@ -337,6 +337,7 @@ class HidiveSnapshotTests(unittest.TestCase):
         self.assertEqual({"history": True, "continue_watching": False, "watchlists": False}, result.snapshot.raw["supports"])
         self.assertEqual(1, result.snapshot.raw["history_pages_fetched"])
         self.assertEqual(0, result.snapshot.raw["favourite_pages_fetched"])
+        self.assertEqual(1, mock_get.call_count)
 
 
 if __name__ == "__main__":

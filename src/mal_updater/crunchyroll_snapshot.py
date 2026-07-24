@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover - dependency/install health chec
 from .auth import write_secret_file
 from .config import AppConfig, _read_secret_file
 from .request_tracking import record_api_request_event
+from .provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
 from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
@@ -92,6 +93,11 @@ class _CrunchyrollRequestPacer:
     spacing_seconds: float
     jitter_seconds: float = 0.0
     last_request_started_at: float | None = None
+    gate: ProviderRequestGate | None = None
+    retry_max_attempts: int = 1
+    retry_backoff_base_seconds: float = 1.0
+    retry_backoff_jitter_seconds: float = 0.25
+    retry_after_cap_seconds: float = 60.0
 
     def _target_spacing_seconds(self) -> float:
         if self.spacing_seconds <= 0:
@@ -103,6 +109,9 @@ class _CrunchyrollRequestPacer:
         return random.uniform(lower, upper)
 
     def wait_turn(self) -> None:
+        if self.gate is not None:
+            self.gate.wait_turn()
+            return
         target_spacing_seconds = self._target_spacing_seconds()
         if target_spacing_seconds <= 0:
             self.last_request_started_at = time.monotonic()
@@ -114,6 +123,24 @@ class _CrunchyrollRequestPacer:
                 time.sleep(remaining)
                 now = time.monotonic()
         self.last_request_started_at = now
+
+
+def _build_request_pacer(config: AppConfig) -> _CrunchyrollRequestPacer:
+    spacing = max(0.0, float(config.crunchyroll.request_spacing_seconds))
+    jitter = max(0.0, float(config.crunchyroll.request_spacing_jitter_seconds))
+    state_dir = getattr(config, "state_dir", None)
+    return _CrunchyrollRequestPacer(
+        spacing_seconds=spacing,
+        jitter_seconds=jitter,
+        gate=(ProviderRequestGate(
+            provider="crunchyroll", state_dir=state_dir,
+            spacing_seconds=spacing, jitter_seconds=jitter,
+        ) if state_dir is not None else None),
+        retry_max_attempts=max(1, int(getattr(config.crunchyroll, "retry_max_attempts", 1))),
+        retry_backoff_base_seconds=float(getattr(config.crunchyroll, "retry_backoff_base_seconds", 1.0)),
+        retry_backoff_jitter_seconds=float(getattr(config.crunchyroll, "retry_backoff_jitter_seconds", 0.25)),
+        retry_after_cap_seconds=float(getattr(config.crunchyroll, "retry_after_cap_seconds", 60.0)),
+    )
 
 
 @dataclass(slots=True)
@@ -149,6 +176,8 @@ class _CrunchyrollAuthSession:
                         continue
                     except CrunchyrollAuthError as refresh_exc:
                         refresh_error = refresh_exc
+                        if not _auth_failure_allows_credential_rebootstrap(refresh_exc):
+                            raise
                 if not self.credential_rebootstrap_attempted:
                     self._rebootstrap_with_credentials(exc, refresh_error=refresh_error)
                     continue
@@ -166,10 +195,14 @@ class _CrunchyrollAuthSession:
                     success=False,
                     phase="auth_failed",
                 )
+                self.token.account_id = None
+                self.account_email = None
                 raise
         raise last_unauthorized or CrunchyrollSnapshotError(f"Crunchyroll authorization failed for {url}")
 
     def _refresh_with_refresh_token(self, exc: CrunchyrollUnauthorizedError) -> None:
+        prior_account_id = self.token.account_id
+        prior_account_email = self.account_email
         _write_session_state(
             state_paths=self.state_paths,
             profile=self.profile,
@@ -187,6 +220,10 @@ class _CrunchyrollAuthSession:
             pacer=self.pacer,
         )
         self.token = token
+        if prior_account_id and token.account_id == prior_account_id:
+            self.account_email = prior_account_email
+        elif prior_account_id != token.account_id:
+            self.account_email = None
         self.state_paths = state_paths
         self.auth_source = "refresh_token_recovery"
 
@@ -214,6 +251,7 @@ class _CrunchyrollAuthSession:
             profile=self.profile,
             timeout_seconds=self.timeout_seconds,
             verify_account=True,
+            pacer=self.pacer,
         )
         self.token = _token_from_bootstrap(bootstrap)
         self.state_paths = resolve_crunchyroll_state_paths(self.config, profile=self.profile)
@@ -235,27 +273,27 @@ def _log_fetch_progress(message: str) -> None:
     print(f"[crunchyroll-fetch] {message}", file=sys.stderr, flush=True)
 
 
-def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float):
+def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float, config: AppConfig | None = None):
     transport = _require_curl_requests()
     request_exception = getattr(getattr(transport, "exceptions", None), "RequestException", Exception)
     try:
         response = transport.post(url, data=data, headers=headers, timeout=_request_timeout(timeout_seconds), impersonate="chrome124")
-        record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code)
+        record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code, config=config)
         return response
     except request_exception as exc:
-        record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="request_error", error=str(exc))
+        record_api_request_event("crunchyroll", "http_post", url=url, method="POST", outcome="request_error", error=type(exc).__name__, config=config)
         raise
 
 
-def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, params: dict[str, Any] | None = None):
+def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, params: dict[str, Any] | None = None, config: AppConfig | None = None):
     transport = _require_curl_requests()
     request_exception = getattr(getattr(transport, "exceptions", None), "RequestException", Exception)
     try:
         response = transport.get(url, headers=headers, timeout=_request_timeout(timeout_seconds), params=params, impersonate="chrome124")
-        record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code)
+        record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="ok" if response.status_code < 400 else "http_error", status_code=response.status_code, config=config)
         return response
     except request_exception as exc:
-        record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="request_error", error=str(exc))
+        record_api_request_event("crunchyroll", "http_get", url=url, method="GET", outcome="request_error", error=type(exc).__name__, config=config)
         raise
 
 
@@ -298,6 +336,7 @@ def refresh_access_token(
     timeout_seconds: float = 30.0,
     pacer: _CrunchyrollRequestPacer | None = None,
 ) -> tuple[CrunchyrollAccessToken, CrunchyrollStatePaths]:
+    pacer = pacer or _build_request_pacer(config)
     state_paths = resolve_crunchyroll_state_paths(config, profile=profile)
     refresh_token = _read_secret_file(state_paths.refresh_token_path)
     if not refresh_token:
@@ -317,9 +356,40 @@ def refresh_access_token(
         "Content-Type": "application/x-www-form-urlencoded",
         "ETP-Anonymous-ID": device_id,
     }
-    if pacer is not None:
-        pacer.wait_turn()
-    response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds)
+    # Refresh tokens may be rotated even when the response is lost or transient;
+    # never replay this credential POST automatically.
+    attempts = 1
+    response = None
+    for attempt in range(1, attempts + 1):
+        if pacer is not None:
+            pacer.wait_turn()
+        try:
+            response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds, config=config)
+        except Exception as exc:
+            if attempt < attempts and ("timeout" in type(exc).__name__.lower() or "connection" in type(exc).__name__.lower()):
+                delay = retry_delay_seconds(
+                    attempt,
+                    base_seconds=getattr(pacer, "retry_backoff_base_seconds", 1.0),
+                    jitter_seconds=getattr(pacer, "retry_backoff_jitter_seconds", 0.25),
+                    cap_seconds=getattr(pacer, "retry_after_cap_seconds", 60.0),
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            raise
+        if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
+            delay = retry_delay_seconds(
+                attempt,
+                retry_after=response_retry_after(response),
+                base_seconds=getattr(pacer, "retry_backoff_base_seconds", 1.0),
+                jitter_seconds=getattr(pacer, "retry_backoff_jitter_seconds", 0.25),
+                cap_seconds=getattr(pacer, "retry_after_cap_seconds", 60.0),
+            )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        break
+    assert response is not None
     if response.status_code >= 400:
         message = f"Crunchyroll refresh-token login failed: HTTP {response.status_code}"
         try:
@@ -383,19 +453,47 @@ def _authorized_json_get(
     params: dict[str, Any] | None = None,
     pacer: _CrunchyrollRequestPacer | None = None,
     phase: str | None = None,
+    config: AppConfig | None = None,
 ) -> Any:
-    if pacer is not None:
-        pacer.wait_turn()
     phase_label = phase or "GET"
-    try:
-        response = _http_get(
-            url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout_seconds=timeout_seconds,
-            params=params,
-        )
-    except Exception as exc:
-        raise CrunchyrollSnapshotError(f"Crunchyroll {phase_label} request failed for {url}: {exc}") from exc
+    attempts = max(1, int(getattr(pacer, "retry_max_attempts", 1)))
+    response = None
+    for attempt in range(1, attempts + 1):
+        if pacer is not None:
+            pacer.wait_turn()
+        try:
+            response = _http_get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout_seconds=timeout_seconds,
+                params=params,
+                config=config,
+            )
+        except Exception as exc:
+            if attempt < attempts and ("timeout" in type(exc).__name__.lower() or "connection" in type(exc).__name__.lower()):
+                delay = retry_delay_seconds(
+                    attempt,
+                    base_seconds=getattr(pacer, "retry_backoff_base_seconds", 1.0),
+                    jitter_seconds=getattr(pacer, "retry_backoff_jitter_seconds", 0.25),
+                    cap_seconds=getattr(pacer, "retry_after_cap_seconds", 60.0),
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            raise CrunchyrollSnapshotError(f"Crunchyroll {phase_label} request failed for {url}: {exc}") from exc
+        if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
+            delay = retry_delay_seconds(
+                attempt,
+                retry_after=response_retry_after(response),
+                base_seconds=getattr(pacer, "retry_backoff_base_seconds", 1.0),
+                jitter_seconds=getattr(pacer, "retry_backoff_jitter_seconds", 0.25),
+                cap_seconds=getattr(pacer, "retry_after_cap_seconds", 60.0),
+            )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        break
+    assert response is not None
     if response.status_code == 401:
         raise CrunchyrollUnauthorizedError(url, response.status_code)
     if response.status_code >= 400:
@@ -699,12 +797,15 @@ def _start_auth_session(
             token=token,
             auth_source="refresh_token",
         )
-    except CrunchyrollAuthError:
+    except CrunchyrollAuthError as exc:
+        if not _auth_failure_allows_credential_rebootstrap(exc):
+            raise
         bootstrap = crunchyroll_login_with_credentials(
             config,
             profile=profile,
             timeout_seconds=timeout_seconds,
             verify_account=True,
+            pacer=pacer,
         )
         return _CrunchyrollAuthSession(
             config=config,
@@ -717,6 +818,12 @@ def _start_auth_session(
             account_email=bootstrap.account_email,
             credential_rebootstrap_attempted=True,
         )
+
+
+def _auth_failure_allows_credential_rebootstrap(exc: CrunchyrollAuthError) -> bool:
+    """Only definitive credential rejection permits a second credential POST."""
+    message = str(exc).casefold()
+    return any(marker in message for marker in ("http 400", "http 401", "http 403", "invalid_grant", "invalid refresh", "missing crunchyroll refresh token"))
 
 
 def _fetch_snapshot_once(
@@ -932,6 +1039,9 @@ def _fetch_snapshot_once(
             "transport": "curl_cffi:chrome124" if curl_requests is not None else "requests",
             "request_spacing_seconds": config.crunchyroll.request_spacing_seconds,
             "request_spacing_jitter_seconds": config.crunchyroll.request_spacing_jitter_seconds,
+            "retry_max_attempts": config.crunchyroll.retry_max_attempts,
+            "retry_after_cap_seconds": config.crunchyroll.retry_after_cap_seconds,
+            "niceness_policy": "local_host_process_gate",
             "auth_source": session.auth_source,
         },
     )
@@ -974,10 +1084,7 @@ def fetch_snapshot(
     history_start_page: int = 1,
     watchlist_start: int = 0,
 ) -> CrunchyrollFetchResult:
-    pacer = _CrunchyrollRequestPacer(
-        config.crunchyroll.request_spacing_seconds,
-        jitter_seconds=config.crunchyroll.request_spacing_jitter_seconds,
-    )
+    pacer = _build_request_pacer(config)
     session = _start_auth_session(
         config,
         profile=profile,

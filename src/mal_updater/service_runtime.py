@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import fcntl
 import json
 import math
+import os
 import shlex
 import subprocess
 import sys
 import time
 from typing import Any
+import uuid
 
 from .auth import persist_token_response
 from .auth_failure_signals import looks_auth_style_failure
@@ -26,9 +29,15 @@ from .hidive_auth import load_hidive_credentials
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .request_tracking import (
+    begin_api_request_context,
+    capture_api_event_boundary,
+    count_api_events_since,
+    current_api_request_context,
+    end_api_request_context,
     estimate_budget_recovery_seconds,
     estimate_budget_recovery_seconds_for_ratio,
     prune_api_request_events,
+    request_context_environment,
     summarize_recent_api_usage,
 )
 
@@ -38,6 +47,7 @@ class TaskSpec:
     name: str
     every_seconds: int
     budget_provider: str | None = None
+    initial_delay_seconds: int = 0
 
 
 _RECOMMENDATIONS_WEBHOOK_REPEAT_COOLDOWN_SECONDS = 90 * 24 * 60 * 60
@@ -47,8 +57,12 @@ _AUTO_PROJECTED_REQUEST_PERCENTILE = 0.9
 _AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY = 4
 _AUTO_PROJECTED_REQUEST_BURST_RATIO = 2.0
 _MAL_USER_LIST_REFRESH_MAX_PAGES = 3
+_MAL_USER_LIST_INITIAL_DELAY_SECONDS = 15 * 60
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_INITIAL_DELAY_SECONDS = 45 * 60
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS = 15 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 20
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT = 5
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE = 1
 
 
 def _now_iso() -> str:
@@ -66,7 +80,106 @@ def _load_state(config: AppConfig) -> dict[str, Any]:
 
 
 def _save_state(config: AppConfig, state: dict[str, Any]) -> None:
-    config.service_state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path = config.service_state_path.with_suffix(f"{config.service_state_path.suffix}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temp_path, config.service_state_path)
+
+
+def _read_json_dict(path: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+class _ProcessLease:
+    """A kernel-backed singleton lease with atomic operator-visible identity metadata."""
+
+    def __init__(self, config: AppConfig, name: str) -> None:
+        self.config = config
+        self.name = name
+        self.lock_path = config.service_leases_dir / f"{name}.lock"
+        self.status_path = config.service_leases_dir / f"{name}.json"
+        self.run_id = uuid.uuid4().hex
+        self._handle: Any = None
+        self.status: dict[str, Any] = {}
+
+    def _write_status(self, payload: dict[str, Any]) -> None:
+        temp_path = self.status_path.with_suffix(f".json.{os.getpid()}.{self.run_id}.tmp")
+        temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temp_path, self.status_path)
+        self.status = payload
+
+    def try_acquire(self, *, phase: str) -> bool:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            holder = _read_json_dict(self.status_path)
+            started_epoch = holder.get("started_epoch")
+            age_seconds = max(0, int(time.time() - float(started_epoch))) if isinstance(started_epoch, (int, float)) else None
+            self.status = {
+                "status": "busy",
+                "lease": self.name,
+                "holder": holder,
+                "holder_age_seconds": age_seconds,
+                "holder_is_stale": age_seconds is not None and age_seconds >= int(self.config.service.lease_stale_after_seconds),
+                "status_file": str(self.status_path),
+            }
+            return False
+
+        self._handle = handle
+        previous = _read_json_dict(self.status_path)
+        now = time.time()
+        previous_started = previous.get("started_epoch")
+        previous_age = max(0, int(now - float(previous_started))) if isinstance(previous_started, (int, float)) else None
+        recovered = bool(previous and previous.get("status") == "running")
+        payload: dict[str, Any] = {
+            "status": "running",
+            "lease": self.name,
+            "phase": phase,
+            "pid": os.getpid(),
+            "run_id": self.run_id,
+            "started_epoch": now,
+            "started_at": _now_iso(),
+            "stale_after_seconds": int(self.config.service.lease_stale_after_seconds),
+            "lock_file": str(self.lock_path),
+        }
+        if recovered:
+            payload["recovered_previous_lease"] = True
+            payload["previous_run_id"] = previous.get("run_id")
+            payload["previous_pid"] = previous.get("pid")
+            payload["previous_age_seconds"] = previous_age
+            payload["previous_was_stale"] = previous_age is not None and previous_age >= int(self.config.service.lease_stale_after_seconds)
+        self._write_status(payload)
+        return True
+
+    def update_phase(self, phase: str) -> None:
+        if self._handle is None:
+            return
+        payload = dict(self.status)
+        payload["phase"] = phase
+        payload["updated_at"] = _now_iso()
+        self._write_status(payload)
+
+    @property
+    def fileno(self) -> int:
+        if self._handle is None:
+            raise RuntimeError("lease is not acquired")
+        return int(self._handle.fileno())
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        payload = dict(self.status)
+        payload.update({"status": "released", "released_at": _now_iso(), "released_epoch": time.time()})
+        self._write_status(payload)
+        fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None
 
 
 def _set_task_next_due(task_state: dict[str, Any], *, base_epoch: float, every_seconds: int) -> None:
@@ -197,6 +310,44 @@ def _record_observed_request_delta(
     task_state["last_request_delta_history_by_mode"] = history_by_mode
 
 
+def _finalize_run_request_delta(
+    config: AppConfig,
+    spec: TaskSpec,
+    task_state: dict[str, Any],
+    *,
+    boundary: Any,
+    run_id: str,
+    fetch_mode: str | None,
+    finished_at: str,
+) -> dict[str, Any]:
+    if spec.budget_provider is None:
+        return {}
+    observed_request_delta = count_api_events_since(
+        boundary, provider=spec.budget_provider, task=spec.name, run_id=run_id, config=config
+    )
+    history_mode = fetch_mode if spec.name.startswith("sync_fetch_") else None
+    _record_observed_request_delta(
+        task_state,
+        observed_request_delta=observed_request_delta,
+        fetch_mode=history_mode,
+        finished_at=finished_at,
+        history_limit=config.service.projected_request_history_window_for(spec.name, provider=spec.budget_provider),
+    )
+    projected_request_count, projected_request_source = _refresh_projected_request_state(
+        config, spec, task_state, fetch_mode=history_mode
+    )
+    payload: dict[str, Any] = {
+        "request_delta": observed_request_delta,
+        "request_run_id": run_id,
+        "next_projected_request_count": projected_request_count,
+    }
+    if projected_request_source is not None:
+        payload["next_projected_request_source"] = projected_request_source
+    if history_mode is not None:
+        payload["request_delta_by_mode"] = {history_mode: observed_request_delta}
+    return payload
+
+
 _SENSITIVE_ARG_NAMES = {"--token", "--access-token", "--refresh-token", "--client-secret", "--password", "--secret"}
 _SENSITIVE_ARG_PREFIXES = ("token=", "access_token=", "refresh_token=", "client_secret=", "password=", "secret=")
 
@@ -224,43 +375,63 @@ def _redacted_command(args: list[str]) -> str:
     return shlex.join(redacted)
 
 
-def _run_subprocess(config: AppConfig, args: list[str], *, label: str) -> dict[str, Any]:
+def _run_subprocess(config: AppConfig, args: list[str], *, label: str, run_id: str | None = None) -> dict[str, Any]:
+    inherited_context = current_api_request_context()
+    effective_run_id = run_id or inherited_context.run_id or str(uuid.uuid4())
+    effective_task = inherited_context.task or label
     env = {
         **__import__("os").environ,
         "PYTHONPATH": str(config.project_root / "src"),
+        **request_context_environment(task=effective_task, run_id=effective_run_id),
     }
     timeout_seconds = max(1, int(config.service.task_timeout_seconds))
     command = _redacted_command(args)
+    lease = _ProcessLease(config, f"task-{label}")
+    if not lease.try_acquire(phase="subprocess"):
+        _append_log(config, f"task={label} status=skipped reason=lease_busy command={command}")
+        return {
+            "status": "skipped",
+            "label": label,
+            "reason": "lease_busy",
+            "command": command,
+            "lease": lease.status,
+        }
     started = time.monotonic()
     _append_log(config, f"task={label} status=started timeout_seconds={timeout_seconds} command={command}")
     try:
-        result = subprocess.run(
-            args,
-            cwd=config.project_root,
-            text=True,
-            capture_output=True,
-            check=False,
-            env=env,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration_seconds = round(time.monotonic() - started, 3)
-        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        payload = {
-            "status": "error",
-            "label": label,
-            "returncode": None,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timed_out": True,
-            "timeout_seconds": timeout_seconds,
-            "duration_seconds": duration_seconds,
-            "command": command,
-            "reason": "subprocess_timeout",
-        }
-        _append_log(config, f"task={label} status=error reason=subprocess_timeout timeout_seconds={timeout_seconds} duration_seconds={duration_seconds} command={command}")
-        return payload
+        try:
+            result = subprocess.run(
+                args,
+                cwd=config.project_root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+                timeout=timeout_seconds,
+                # If the scheduler is killed mid-task, the child retains the lock
+                # until it exits, preventing a restarted daemon from duplicating it.
+                pass_fds=(lease.fileno,),
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration_seconds = round(time.monotonic() - started, 3)
+            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            payload = {
+                "status": "error",
+                "label": label,
+                "returncode": None,
+                "stdout": stdout,
+                "stderr": stderr,
+                "timed_out": True,
+                "timeout_seconds": timeout_seconds,
+                "duration_seconds": duration_seconds,
+                "command": command,
+                "reason": "subprocess_timeout",
+            }
+            _append_log(config, f"task={label} status=error reason=subprocess_timeout timeout_seconds={timeout_seconds} duration_seconds={duration_seconds} command={command}")
+            return payload
+    finally:
+        lease.release()
     duration_seconds = round(time.monotonic() - started, 3)
     status = "ok" if result.returncode == 0 else "error"
     payload = {
@@ -350,17 +521,164 @@ def _available_source_providers(config: AppConfig) -> list[str]:
 
 def _task_specs(config: AppConfig) -> list[TaskSpec]:
     specs = [TaskSpec("mal_refresh", config.service.mal_refresh_every_seconds, budget_provider="mal")]
-    for provider in _available_source_providers(config):
+    providers = _available_source_providers(config)
+    for provider in providers:
         specs.append(TaskSpec(f"sync_fetch_{provider}", config.service.sync_every_seconds, budget_provider=provider))
     specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
+    mal_secrets = load_mal_secrets(config)
+    if int(config.service.mal_list_refresh_every_seconds) > 0 and bool(mal_secrets.access_token):
+        specs.append(
+            TaskSpec(
+                "mal_list_refresh",
+                config.service.mal_list_refresh_every_seconds,
+                budget_provider="mal",
+                initial_delay_seconds=_MAL_USER_LIST_INITIAL_DELAY_SECONDS,
+            )
+        )
     if int(config.service.recommendation_metadata_refresh_every_seconds) > 0:
         specs.append(TaskSpec("recommend_metadata_refresh", config.service.recommendation_metadata_refresh_every_seconds, budget_provider="mal"))
+    if int(config.service.provider_eligibility_refresh_every_seconds) > 0:
+        for index, provider in enumerate(providers):
+            specs.append(
+                TaskSpec(
+                    f"recommend_provider_eligibility_{provider}",
+                    config.service.provider_eligibility_refresh_every_seconds,
+                    budget_provider=provider,
+                    initial_delay_seconds=(
+                        _RECOMMENDATION_PROVIDER_ELIGIBILITY_INITIAL_DELAY_SECONDS
+                        + index * _RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS
+                    ),
+                )
+            )
     if int(config.service.recommend_maintain_every_seconds) > 0:
         specs.append(TaskSpec("recommend_maintain", config.service.recommend_maintain_every_seconds, budget_provider=None))
     if int(config.service.recommendations_webhook_push_every_seconds) > 0 and config.openclaw.recommendations_webhook_enabled:
         specs.append(TaskSpec("push_recommendations_webhook", config.service.recommendations_webhook_push_every_seconds, budget_provider=None))
     specs.append(TaskSpec("health", config.service.health_every_seconds, budget_provider=None))
     return specs
+
+
+def effective_niceness_policy(config: AppConfig) -> dict[str, Any]:
+    """Return the effective operator-facing cadence, cache, and budget contract."""
+    from .recommendation_enrichment import (
+        PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+        PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
+        PROVIDER_SEARCH_CACHE_TTL_DAYS,
+    )
+    from .recommendation_metadata import (
+        DEFAULT_COLD_METADATA_STALE_AFTER_DAYS,
+        DEFAULT_HARVEST_STALE_AFTER_DAYS,
+        DEFAULT_HOT_METADATA_STALE_AFTER_DAYS,
+        DEFAULT_WARM_METADATA_STALE_AFTER_DAYS,
+    )
+
+    task_policies: dict[str, Any] = {}
+    for spec in _task_specs(config):
+        projected, projected_source = config.service.projected_request_count_for(spec.name)
+        task_policy = {
+            "every_seconds": int(spec.every_seconds),
+            "initial_delay_seconds": int(spec.initial_delay_seconds),
+            "budget_provider": spec.budget_provider,
+            "budget_scope": config.service.budget_scope_for(spec.budget_provider, task_name=spec.name),
+            "task_hourly_limit": (
+                config.service.hourly_limit_for(spec.budget_provider, task_name=spec.name)
+                if spec.budget_provider and spec.name in config.service.task_hourly_limits
+                else None
+            ),
+            "provider_hourly_limit": (
+                config.service.hourly_limit_for(spec.budget_provider) if spec.budget_provider else None
+            ),
+            "projected_requests": projected,
+            "projected_request_source": projected_source,
+            "projected_history_window": config.service.projected_request_history_window_for(
+                spec.name, provider=spec.budget_provider
+            ),
+            "projected_percentile": config.service.projected_request_percentile_for(
+                spec.name, provider=spec.budget_provider
+            ),
+        }
+        if spec.budget_provider:
+            task_policy.update(
+                {
+                    "warn_backoff_floor_seconds": config.service.backoff_floor_seconds_for(
+                        spec.budget_provider, level="warn", task_name=spec.name
+                    ),
+                    "critical_backoff_floor_seconds": config.service.backoff_floor_seconds_for(
+                        spec.budget_provider, level="critical", task_name=spec.name
+                    ),
+                    "auth_failure_backoff_floor_seconds": config.service.auth_failure_backoff_floor_seconds_for(
+                        spec.budget_provider, task_name=spec.name
+                    ),
+                }
+            )
+        mode_projections = config.service.task_projected_request_counts_by_mode.get(spec.name)
+        if isinstance(mode_projections, dict):
+            task_policy["projected_requests_by_mode"] = dict(sorted(mode_projections.items()))
+        task_policies[spec.name] = task_policy
+    return {
+        "policy_kind": "local_niceness_controls_not_external_provider_limits",
+        "cadences": {
+            "provider_hot_incremental_seconds": int(config.service.sync_every_seconds),
+            "provider_cold_full_seconds": int(config.service.full_refresh_every_seconds),
+            "provider_cold_full_policy": "weekly_page_bounded_crunchyroll_manual_only_hidive",
+            "mal_token_refresh_seconds": int(config.service.mal_refresh_every_seconds),
+            "mal_user_list_refresh_seconds": int(config.service.mal_list_refresh_every_seconds),
+            "recommendation_metadata_refresh_seconds": int(config.service.recommendation_metadata_refresh_every_seconds),
+            "provider_eligibility_refresh_seconds": int(config.service.provider_eligibility_refresh_every_seconds),
+            "recommendation_snapshot_health_seconds": int(config.service.recommend_maintain_every_seconds),
+            "health_seconds": int(config.service.health_every_seconds),
+        },
+        "thresholds": {
+            "warn_ratio": float(config.service.warn_ratio),
+            "critical_ratio": float(config.service.critical_ratio),
+            "task_and_provider_global_budgets_enforced": True,
+        },
+        "provider_hourly_budgets": {
+            "mal": config.service.hourly_limit_for("mal"),
+            "crunchyroll": config.service.hourly_limit_for("crunchyroll"),
+            "hidive": config.service.hourly_limit_for("hidive"),
+        },
+        "request_start_spacing_seconds": {
+            "mal": {
+                "base": float(config.mal.request_spacing_seconds),
+                "jitter": float(config.mal.request_spacing_jitter_seconds),
+            },
+            "crunchyroll": {
+                "base": float(config.crunchyroll.request_spacing_seconds),
+                "jitter": float(config.crunchyroll.request_spacing_jitter_seconds),
+            },
+            "hidive": {
+                "base": float(config.hidive.request_spacing_seconds),
+                "jitter": float(config.hidive.request_spacing_jitter_seconds),
+            },
+        },
+        "retry_policy": {
+            "mal_max_attempts": int(config.mal.retry_max_attempts),
+            "crunchyroll_max_attempts": int(config.crunchyroll.retry_max_attempts),
+            "hidive_max_attempts": int(config.hidive.retry_max_attempts),
+            "mal_writes_retried": False,
+        },
+        "execute_limits": dict(sorted(config.service.task_execute_limits.items())),
+        "task_policies": task_policies,
+        "cold_refresh_bounds": {
+            "crunchyroll_max_history_pages": int(config.service.crunchyroll_provider_max_history_pages),
+            "crunchyroll_max_watchlist_pages": int(config.service.crunchyroll_provider_max_watchlist_pages),
+            "hidive_unattended_full_refresh": False,
+        },
+        "cache_horizons_days": {
+            "mal_search_positive": int(config.mal.search_cache_ttl_days),
+            "mal_search_negative": int(config.mal.search_negative_cache_ttl_days),
+            "mal_detail": int(config.mal.detail_cache_ttl_days),
+            "provider_detail": int(config.mal.provider_detail_cache_ttl_days),
+            "provider_search": PROVIDER_SEARCH_CACHE_TTL_DAYS,
+            "provider_eligibility_evidence": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
+            "recommendation_harvest": DEFAULT_HARVEST_STALE_AFTER_DAYS,
+            "recommendation_metadata_hot": DEFAULT_HOT_METADATA_STALE_AFTER_DAYS,
+            "recommendation_metadata_warm": DEFAULT_WARM_METADATA_STALE_AFTER_DAYS,
+            "recommendation_metadata_cold": DEFAULT_COLD_METADATA_STALE_AFTER_DAYS,
+        },
+        "provider_detail_logic_version": PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+    }
 
 
 def _provider_fetch_command(config: AppConfig, provider: str, *, full_refresh: bool = False) -> list[str]:
@@ -423,6 +741,7 @@ def maintenance_cycle_plan(
     provider_max_history_pages: int | None = None,
     provider_max_watchlist_pages: int | None = None,
     include_provider_refresh: bool = True,
+    local_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the unattended, write-conservative maintenance command sequence.
 
@@ -433,7 +752,7 @@ def maintenance_cycle_plan(
     """
 
     commands: list[dict[str, Any]] = []
-    if include_provider_refresh:
+    if include_provider_refresh and not local_only:
         for provider in _available_source_providers(config):
             command = _provider_fetch_command(config, provider, full_refresh=False)
             if provider == "crunchyroll":
@@ -445,8 +764,9 @@ def maintenance_cycle_plan(
                     _append_positive_int_arg(command, "--max-watchlist-pages", provider_max_watchlist_pages)
             commands.append({"label": f"maintain_provider_refresh_{provider}", "args": command})
 
-    commands.extend(
-        [
+    if not local_only:
+        commands.extend(
+            [
             {
                 "label": "maintain_safe_mapping_review",
                 "args": [
@@ -471,20 +791,6 @@ def maintenance_cycle_plan(
                 ],
             },
             {
-                "label": "maintain_recommend_metadata",
-                "args": [
-                    sys.executable,
-                    "-m",
-                    "mal_updater.cli",
-                    "recommend-refresh-metadata",
-                    "--limit",
-                    str(max(0, int(metadata_limit))),
-                    "--include-discovery-targets",
-                    "--discovery-target-limit",
-                    str(max(0, int(discovery_target_limit))),
-                ],
-            },
-            {
                 "label": "maintain_recommend_provider_eligibility",
                 "args": [
                     sys.executable,
@@ -495,8 +801,14 @@ def maintenance_cycle_plan(
                     str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT),
                     "--search-limit",
                     str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT),
+                    "--queries-per-candidate",
+                    str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE),
                 ],
             },
+            ]
+        )
+    commands.extend(
+        [
             {
                 "label": "maintain_recommend_snapshot",
                 "args": [
@@ -518,7 +830,7 @@ def maintenance_cycle_plan(
     return commands
 
 
-def run_maintenance_cycle(
+def _run_maintenance_cycle_unlocked(
     config: AppConfig,
     *,
     dry_run: bool = False,
@@ -530,6 +842,7 @@ def run_maintenance_cycle(
     provider_max_history_pages: int | None = None,
     provider_max_watchlist_pages: int | None = None,
     include_provider_refresh: bool = True,
+    local_only: bool = False,
 ) -> dict[str, Any]:
     plan = maintenance_cycle_plan(
         config,
@@ -541,6 +854,7 @@ def run_maintenance_cycle(
         provider_max_history_pages=provider_max_history_pages,
         provider_max_watchlist_pages=provider_max_watchlist_pages,
         include_provider_refresh=include_provider_refresh,
+        local_only=local_only,
     )
     state = _load_state(config)
     task_state = state.setdefault("tasks", {}).setdefault("recommend_maintain", {})
@@ -578,6 +892,20 @@ def run_maintenance_cycle(
     state["last_maintenance_cycle_at"] = finished_at
     _save_state(config, state)
     return {"status": status, "results": results, "failures": failures, "state_file": str(config.service_state_path)}
+
+
+def run_maintenance_cycle(config: AppConfig, **kwargs: Any) -> dict[str, Any]:
+    ensure_directories(config)
+    lease = _ProcessLease(config, "recommend-maintain")
+    if not lease.try_acquire(phase="maintenance"):
+        _append_log(config, "task=recommend_maintain status=skipped reason=lease_busy")
+        return {"status": "skipped", "reason": "lease_busy", "lease": lease.status}
+    try:
+        result = _run_maintenance_cycle_unlocked(config, **kwargs)
+        result["lease"] = {"run_id": lease.run_id, "status_file": str(lease.status_path)}
+        return result
+    finally:
+        lease.release()
 
 
 
@@ -689,13 +1017,54 @@ def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
     ]
 
 
+def _mal_list_refresh_command(config: AppConfig) -> list[str]:
+    max_pages = config.service.execute_limit_for("mal_list_refresh_pages")
+    if max_pages is None:
+        max_pages = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("mal_list_refresh_pages", _MAL_USER_LIST_REFRESH_MAX_PAGES)
+    return [
+        sys.executable,
+        "-m",
+        "mal_updater.cli",
+        "mal-list-refresh",
+        "--max-pages",
+        str(max(1, int(max_pages))),
+    ]
+
+
+def _provider_eligibility_command(config: AppConfig, provider: str) -> list[str]:
+    candidate_limit = config.service.execute_limit_for("recommend_provider_eligibility_candidates")
+    if candidate_limit is None:
+        candidate_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get(
+            "recommend_provider_eligibility_candidates", _RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT
+        )
+    search_limit = config.service.execute_limit_for("recommend_provider_eligibility_search_results")
+    if search_limit is None:
+        search_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get(
+            "recommend_provider_eligibility_search_results", _RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT
+        )
+    query_limit = config.service.execute_limit_for("recommend_provider_eligibility_queries_per_candidate")
+    if query_limit is None:
+        query_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get(
+            "recommend_provider_eligibility_queries_per_candidate",
+            _RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE,
+        )
+    return [
+        sys.executable,
+        "-m",
+        "mal_updater.cli",
+        "recommend-enrich-provider-availability",
+        "--provider",
+        provider,
+        "--limit",
+        str(max(0, int(candidate_limit))),
+        "--search-limit",
+        str(max(1, int(search_limit))),
+        "--queries-per-candidate",
+        str(max(1, int(query_limit))),
+    ]
+
+
 def _recommend_maintain_command(config: AppConfig) -> list[str]:
-    metadata_limit = config.service.execute_limit_for("recommend_metadata_refresh")
-    if metadata_limit is None:
-        metadata_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_refresh", 0)
-    discovery_target_limit = config.service.execute_limit_for("recommend_metadata_discovery_targets")
-    if discovery_target_limit is None:
-        discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
     recommendation_limit = config.service.execute_limit_for("recommendation_snapshot")
     if recommendation_limit is None:
         recommendation_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommendation_snapshot", 100)
@@ -707,19 +1076,13 @@ def _recommend_maintain_command(config: AppConfig) -> list[str]:
         "-m",
         "mal_updater.cli",
         "recommend-maintain",
-        "--metadata-limit",
-        str(max(0, int(metadata_limit))),
-        "--discovery-target-limit",
-        str(max(0, int(discovery_target_limit))),
         "--recommendation-limit",
         str(max(0, int(recommendation_limit))),
         "--mapping-limit",
         str(max(0, int(mapping_limit))),
-        "--mal-list-max-pages",
-        str(_MAL_USER_LIST_REFRESH_MAX_PAGES),
-        # The daemon's provider fetch tasks own provider backoff/auth state; the
-        # recurring maintenance task only advances recommendation maintenance.
-        "--skip-provider-refresh",
+        # Network work belongs to the individually budgeted MAL/provider lanes.
+        # This frequent maintenance pass materializes DB-local snapshot/health only.
+        "--local-only",
     ]
 
 
@@ -855,6 +1218,9 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
 
 
 def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: str | None = None) -> str | None:
+    if spec.name == "mal_list_refresh":
+        max_pages = config.service.execute_limit_for("mal_list_refresh_pages")
+        return f"mal_list_refresh:max_pages={max_pages}"
     if spec.name == "sync_apply":
         apply_limit = config.service.execute_limit_for("sync_apply")
         if apply_limit is None:
@@ -868,6 +1234,9 @@ def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: 
         if discovery_target_limit is None:
             discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
         return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
+    if spec.name.startswith("recommend_provider_eligibility_"):
+        provider = spec.name.removeprefix("recommend_provider_eligibility_")
+        return f"{spec.name}:provider={provider}:command={' '.join(_provider_eligibility_command(config, provider)[4:])}"
     if spec.name == "push_recommendations_webhook":
         return f"push_recommendations_webhook:limit={_recommendations_webhook_push_limit(config)}:mode={config.openclaw.recommendations_webhook_delivery_mode}"
     if spec.name.startswith("sync_fetch_"):
@@ -889,6 +1258,10 @@ def _maybe_reset_task_projection_state_for_signature(
     if previous == signature:
         return
     task_state["execution_signature"] = signature
+    # Adopt legacy state without discarding useful learned deltas. Only a known
+    # signature change proves that the execution shape became incomparable.
+    if previous is None:
+        return
     for key in (
         "last_request_delta",
         "last_request_delta_at",
@@ -919,10 +1292,16 @@ def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str,
     provider = spec.name.removeprefix("sync_fetch_")
     full_refresh_reasons: list[str] = []
     health_request = _provider_fetch_health_request(config, provider, task_state)
-    if _provider_fetch_requires_full_refresh(config, task_state, now=now):
+    # Crunchyroll cold work is page-bounded by the daemon command. HIDIVE does
+    # not expose chunk controls, so its full refresh remains an explicit manual
+    # operation rather than an accidental unattended crawl.
+    unattended_full_refresh_supported = provider == "crunchyroll"
+    if unattended_full_refresh_supported and _provider_fetch_requires_full_refresh(config, task_state, now=now):
         full_refresh_reasons.append("periodic_cadence")
-    if isinstance(health_request, dict) and health_request.get("mode") == "full_refresh":
+    if unattended_full_refresh_supported and isinstance(health_request, dict) and health_request.get("mode") == "full_refresh":
         full_refresh_reasons.append("health_recommended")
+    if not unattended_full_refresh_supported and isinstance(health_request, dict) and health_request.get("mode") == "full_refresh":
+        return "hot", [], health_request
     if isinstance(health_request, dict) and health_request.get("mode") in {"hot", "incremental"}:
         return "hot", ["health_recommended_hot"], health_request
     return ("full_refresh" if full_refresh_reasons else "hot"), full_refresh_reasons, health_request
@@ -1072,18 +1451,29 @@ def _budget_gate(
     provider = spec.budget_provider
     if provider is None:
         return True, None, None
-    usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
-    limit = config.service.hourly_limit_for(provider, task_name=spec.name)
+    global_usage = summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
+    task_usage = summarize_recent_api_usage(
+        provider=provider, task=spec.name, include_legacy_in_task=True,
+        window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config,
+    ).as_dict()
+    global_limit = config.service.hourly_limit_for(provider)
+    task_limit = config.service.hourly_limit_for(provider, task_name=spec.name)
+    task_override = spec.name in config.service.task_hourly_limits
+    usage = task_usage if task_override else global_usage
+    limit = task_limit if task_override else global_limit
     ratio = 0.0 if limit <= 0 else float(usage.get("request_count", 0)) / float(limit)
     projected_request_count, projected_request_source = _projected_request_count(config, spec, task_state, fetch_mode=fetch_mode)
     projected_request_total = int(usage.get("request_count", 0)) + projected_request_count
     projected_ratio = 0.0 if limit <= 0 else float(projected_request_total) / float(limit)
+    recovery_task = spec.name if task_override else None
     warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
         provider=provider,
         limit=limit,
         target_ratio=config.service.warn_ratio,
         projected_requests=0,
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        task=recovery_task,
+        include_legacy_in_task=task_override,
         config=config,
     )
     projected_warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
@@ -1092,6 +1482,8 @@ def _budget_gate(
         target_ratio=config.service.warn_ratio,
         projected_requests=projected_request_count,
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        task=recovery_task,
+        include_legacy_in_task=task_override,
         config=config,
     )
     recovery_seconds = estimate_budget_recovery_seconds(
@@ -1100,6 +1492,8 @@ def _budget_gate(
         critical_ratio=config.service.critical_ratio,
         projected_requests=0,
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        task=recovery_task,
+        include_legacy_in_task=task_override,
         config=config,
     )
     projected_recovery_seconds = estimate_budget_recovery_seconds(
@@ -1108,6 +1502,8 @@ def _budget_gate(
         critical_ratio=config.service.critical_ratio,
         projected_requests=projected_request_count,
         window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+        task=recovery_task,
+        include_legacy_in_task=task_override,
         config=config,
     )
     budget_scope = config.service.budget_scope_for(provider, task_name=spec.name)
@@ -1118,6 +1514,10 @@ def _budget_gate(
     projected_warn_cooldown_seconds = max(projected_warn_recovery_seconds, warn_floor_seconds)
     projected_critical_cooldown_seconds = max(projected_recovery_seconds, critical_floor_seconds)
     usage["limit"] = limit
+    usage["global_request_count"] = int(global_usage.get("request_count", 0))
+    usage["global_limit"] = global_limit
+    usage["task_request_count"] = int(task_usage.get("request_count", 0))
+    usage["task_limit"] = task_limit
     usage["ratio"] = ratio
     usage["warn_ratio"] = config.service.warn_ratio
     usage["critical_ratio"] = config.service.critical_ratio
@@ -1138,6 +1538,45 @@ def _budget_gate(
     if projected_request_source is not None:
         usage["projected_request_source"] = projected_request_source
     usage.update(_projected_request_policy_details(config, spec, task_state, fetch_mode=fetch_mode))
+    global_ratio = 0.0 if global_limit <= 0 else float(global_usage.get("request_count", 0)) / float(global_limit)
+    global_projected_ratio = 0.0 if global_limit <= 0 else float(int(global_usage.get("request_count", 0)) + projected_request_count) / float(global_limit)
+    global_warn_recovery_seconds = estimate_budget_recovery_seconds_for_ratio(
+        provider=provider, limit=global_limit, target_ratio=config.service.warn_ratio,
+        projected_requests=projected_request_count, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config,
+    )
+    global_critical_recovery_seconds = estimate_budget_recovery_seconds(
+        provider=provider, limit=global_limit, critical_ratio=config.service.critical_ratio,
+        projected_requests=projected_request_count, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config,
+    )
+    global_warn_cooldown_seconds = max(
+        global_warn_recovery_seconds,
+        config.service.backoff_floor_seconds_for(provider, level="warn"),
+    )
+    global_critical_cooldown_seconds = max(
+        global_critical_recovery_seconds,
+        config.service.backoff_floor_seconds_for(provider, level="critical"),
+    )
+    usage["global_ratio"] = global_ratio
+    usage["global_projected_ratio"] = global_projected_ratio
+    usage["global_warn_recovery_seconds"] = global_warn_recovery_seconds
+    usage["global_recovery_seconds"] = global_critical_recovery_seconds
+    # A task override narrows the lane but never exempts it from the provider-global cap.
+    if task_override and (global_ratio >= config.service.critical_ratio or (projected_request_count > 0 and global_projected_ratio >= config.service.critical_ratio)):
+        usage["backoff_level"] = "critical"
+        usage["cooldown_seconds"] = global_critical_cooldown_seconds
+        global_floor = config.service.backoff_floor_seconds_for(provider, level="critical")
+        usage["critical_backoff_floor_seconds"] = global_floor
+        if global_floor > global_critical_recovery_seconds:
+            usage["cooldown_source"] = "provider_global_floor"
+        return False, f"{provider}_global_budget_critical ratio={global_ratio:.3f} projected_ratio={global_projected_ratio:.3f} cooldown={global_critical_cooldown_seconds}s", usage
+    if task_override and (global_ratio >= config.service.warn_ratio or (projected_request_count > 0 and global_projected_ratio >= config.service.warn_ratio)) and global_warn_cooldown_seconds > 0:
+        usage["backoff_level"] = "warn"
+        usage["cooldown_seconds"] = global_warn_cooldown_seconds
+        global_floor = config.service.backoff_floor_seconds_for(provider, level="warn")
+        usage["warn_backoff_floor_seconds"] = global_floor
+        if global_floor > global_warn_recovery_seconds:
+            usage["cooldown_source"] = "provider_global_floor"
+        return False, f"{provider}_global_budget_warn ratio={global_ratio:.3f} projected_ratio={global_projected_ratio:.3f} cooldown={global_warn_cooldown_seconds}s", usage
     if ratio >= config.service.critical_ratio:
         usage["backoff_level"] = "critical"
         usage["cooldown_seconds"] = critical_cooldown_seconds
@@ -1238,7 +1677,7 @@ def _summarize_task_failure(result: dict[str, Any]) -> str | None:
     return None
 
 
-def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
+def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
     config = config or load_config()
     ensure_directories(config)
     state = _load_state(config)
@@ -1254,6 +1693,19 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
         task_state["budget_provider"] = spec.budget_provider
         task_state["budget_scope"] = config.service.budget_scope_for(spec.budget_provider, task_name=spec.name)
         task_state["every_seconds"] = int(spec.every_seconds)
+        task_state["initial_delay_seconds"] = int(spec.initial_delay_seconds)
+        if spec.initial_delay_seconds > 0 and "last_run_epoch" not in task_state and not task_state.get("last_status"):
+            task_state["last_status"] = "scheduled"
+            task_state["execution_state"] = "idle"
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.initial_delay_seconds)
+            continue
+        if (
+            spec.initial_delay_seconds > 0
+            and "last_run_epoch" not in task_state
+            and task_state.get("last_status") == "scheduled"
+            and float(task_state.get("next_due_epoch", 0)) > now
+        ):
+            continue
         if spec.name == "recommend_maintain" and "last_run_epoch" not in task_state:
             if task_state.get("last_status") == "scheduled" and float(task_state.get("next_due_epoch", 0)) > now:
                 continue
@@ -1262,9 +1714,31 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 task_state["execution_state"] = "idle"
                 _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
                 continue
+        if task_state.get("last_status") in {"skipped", "disabled"} and task_state.get("last_skip_reason") in {
+            "lease_busy",
+            "execute_limit_zero",
+        } and float(task_state.get("next_due_epoch", 0)) > now:
+            # A busy child keeps its due intent but must not spin every daemon
+            # loop; disabled lanes are likewise quiet until their next config
+            # observation cadence.
+            continue
         last_run = float(task_state.get("last_run_epoch", 0))
         planned_fetch_mode, planned_full_refresh_reasons, health_request = _planned_fetch_mode(config, spec, task_state, now=now)
         health_requested_run = isinstance(health_request, dict)
+        if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) <= 0:
+            # Manual `apply-sync --limit 0` retains its explicit full-scan
+            # meaning. In unattended service config, zero is a hard disable so
+            # it can never normalize into unbounded writes.
+            task_state.update(
+                {
+                    "last_status": "disabled",
+                    "execution_state": "idle",
+                    "last_skip_reason": "execute_limit_zero",
+                }
+            )
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
+            continue
         if now - last_run < spec.every_seconds and not health_requested_run:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
@@ -1397,10 +1871,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             continue
         started_epoch = time.time()
         started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        request_run_id = str(uuid.uuid4())
+        request_boundary = capture_api_event_boundary(config=config)
+        request_context_token = begin_api_request_context(task=spec.name, run_id=request_run_id)
         try:
             full_refresh_requested = planned_fetch_mode == "full_refresh"
             if spec.name == "mal_refresh":
                 result = _refresh_mal_tokens(config)
+            elif spec.name == "mal_list_refresh":
+                command_args = _mal_list_refresh_command(config)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label=spec.name)
+                result["max_pages"] = int(command_args[-1])
             elif spec.name.startswith("sync_fetch_"):
                 provider = spec.name.removeprefix("sync_fetch_")
                 full_refresh_reasons = list(planned_full_refresh_reasons)
@@ -1440,6 +1922,27 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
                             result[key] = max(0, int(value))
+            elif spec.name.startswith("recommend_provider_eligibility_"):
+                provider = spec.name.removeprefix("recommend_provider_eligibility_")
+                command_args = _provider_eligibility_command(config, provider)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label=spec.name)
+                result["provider"] = provider
+                parsed_stdout = _parse_json_stdout(result)
+                if parsed_stdout is not None:
+                    for key in (
+                        "candidates_considered",
+                        "queries_selected",
+                        "cache_hits",
+                        "cache_misses",
+                        "provider_searches",
+                        "provider_detail_probes",
+                        "eligibility_fresh_skips",
+                        "eligibility_expired_retries",
+                    ):
+                        value = parsed_stdout.get(key)
+                        if isinstance(value, int):
+                            result[key] = max(0, int(value))
             elif spec.name == "recommend_maintain":
                 command_args = _recommend_maintain_command(config)
                 started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
@@ -1462,37 +1965,29 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 result = {"status": "skipped", "reason": "unknown_task"}
             finished_epoch = time.time()
             finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            if spec.budget_provider is not None and isinstance(usage, dict):
-                before_request_count = int(usage.get("request_count", 0))
-                after_usage = summarize_recent_api_usage(provider=spec.budget_provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
-                observed_request_delta = max(0, int(after_usage.get("request_count", 0)) - before_request_count)
-                fetch_mode_for_history = planned_fetch_mode if spec.name.startswith("sync_fetch_") else None
-                _record_observed_request_delta(
-                    task_state,
-                    observed_request_delta=observed_request_delta,
-                    fetch_mode=fetch_mode_for_history,
-                    finished_at=finished_at,
-                    history_limit=config.service.projected_request_history_window_for(spec.name, provider=spec.budget_provider),
-                )
-                projected_request_count, projected_request_source = _refresh_projected_request_state(
-                    config,
-                    spec,
-                    task_state,
-                    fetch_mode=fetch_mode_for_history,
-                )
-                result["request_delta"] = observed_request_delta
-                result["next_projected_request_count"] = projected_request_count
-                if projected_request_source is not None:
-                    result["next_projected_request_source"] = projected_request_source
-                if fetch_mode_for_history is not None:
-                    result["request_delta_by_mode"] = {fetch_mode_for_history: observed_request_delta}
             task_status = result.get("status", "ok")
-            task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": task_status, "last_result": result})
+            task_succeeded = task_status == "ok"
+            if task_succeeded and spec.budget_provider is not None and isinstance(usage, dict):
+                result.update(
+                    _finalize_run_request_delta(
+                        config, spec, task_state, boundary=request_boundary, run_id=request_run_id,
+                        fetch_mode=planned_fetch_mode, finished_at=finished_at,
+                    )
+                )
+            task_state.update({"last_status": task_status, "last_result": result})
+            if task_succeeded or task_status == "error":
+                task_state.update({"last_run_epoch": now, "last_run_at": finished_at})
             task_state["execution_state"] = "idle"
             _clear_task_running(task_state)
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
-            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
-            fetch_succeeded = task_status != "error"
+            if task_succeeded:
+                _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            elif task_status != "error":
+                retry_seconds = min(60, max(5, int(spec.every_seconds)))
+                _set_task_next_due(task_state, base_epoch=now, every_seconds=retry_seconds)
+                task_state["last_skipped_at"] = finished_at
+                task_state["last_skip_reason"] = str(result.get("reason") or task_status)
+            fetch_succeeded = task_succeeded
             if spec.name.startswith("sync_fetch_") and fetch_succeeded:
                 task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "hot"
                 task_state["last_fetch_mode_at"] = finished_at
@@ -1511,8 +2006,9 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                     if not isinstance(task_state.get("full_refresh_anchor_epoch"), (int, float)):
                         task_state["full_refresh_anchor_epoch"] = finished_epoch
                         task_state["full_refresh_anchor_at"] = finished_at
-            task_state.pop("last_skip_reason", None)
-            task_state.pop("last_skipped_at", None)
+            if task_succeeded or task_status == "error":
+                task_state.pop("last_skip_reason", None)
+                task_state.pop("last_skipped_at", None)
             task_state.pop("budget_backoff_level", None)
             task_state.pop("budget_backoff_until_epoch", None)
             task_state.pop("budget_backoff_until", None)
@@ -1523,22 +2019,30 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
                 failure_reason = _summarize_task_failure(result) or "subprocess_error"
                 task_state["last_error"] = failure_reason
                 failure_backoff = _set_failure_backoff(config, spec, task_state, now=now, reason=failure_reason)
+                _set_task_next_due(
+                    task_state,
+                    base_epoch=now,
+                    every_seconds=int(failure_backoff["failure_backoff_remaining_seconds"]),
+                )
                 results.append({"task": spec.name, **result, **failure_backoff})
                 _append_log(
                     config,
                     f"task={spec.name} status=error failure_backoff={failure_backoff['failure_backoff_remaining_seconds']}s reason={failure_reason}",
                 )
                 continue
-            task_state.pop("last_error", None)
-            _clear_failure_backoff(task_state)
+            if task_succeeded:
+                task_state.pop("last_error", None)
+                _clear_failure_backoff(task_state)
             results.append({"task": spec.name, **result})
         except (MalApiError, OSError, subprocess.SubprocessError) as exc:
             finished_epoch = time.time()
             finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            # Failed/ambiguous attempts are still present in telemetry, but do
+            # not teach the scheduler a new success projection.
+            failed_request_delta: dict[str, Any] = {}
             task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
             _clear_task_running(task_state)
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
-            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             task_state.pop("last_skip_reason", None)
             task_state.pop("last_skipped_at", None)
             task_state.pop("budget_backoff_level", None)
@@ -1548,11 +2052,18 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
             task_state.pop("budget_backoff_floor_seconds", None)
             task_state.pop("budget_backoff_cooldown_source", None)
             failure_backoff = _set_failure_backoff(config, spec, task_state, now=now, reason=f"{type(exc).__name__}: {exc}")
-            results.append({"task": spec.name, "status": "error", "error": f"{type(exc).__name__}: {exc}", **failure_backoff})
+            _set_task_next_due(
+                task_state,
+                base_epoch=now,
+                every_seconds=int(failure_backoff["failure_backoff_remaining_seconds"]),
+            )
+            results.append({"task": spec.name, "status": "error", "error": f"{type(exc).__name__}: {exc}", **failed_request_delta, **failure_backoff})
             _append_log(
                 config,
                 f"task={spec.name} status=error error={type(exc).__name__}: {exc} failure_backoff={failure_backoff['failure_backoff_remaining_seconds']}s",
             )
+        finally:
+            end_api_request_context(request_context_token)
 
     state["last_loop_at"] = _now_iso()
     tracked_providers = {"mal", "crunchyroll", *config.service.provider_hourly_limits.keys(), *_available_source_providers(config)}
@@ -1563,10 +2074,37 @@ def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
     _save_state(config, state)
     return {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}
 
+
+def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
+    config = config or load_config()
+    ensure_directories(config)
+    lease = _ProcessLease(config, "scheduler")
+    if not lease.try_acquire(phase="task-pass"):
+        _append_log(config, "scheduler status=skipped reason=lease_busy")
+        return {"status": "skipped", "reason": "lease_busy", "results": [], "lease": lease.status}
+    try:
+        result = _run_pending_tasks_unlocked(config)
+        result["lease"] = {"run_id": lease.run_id, "status_file": str(lease.status_path)}
+        return result
+    finally:
+        lease.release()
+
 def run_service_loop(config: AppConfig | None = None) -> int:
     config = config or load_config()
     ensure_directories(config)
-    _append_log(config, "service loop starting")
-    while True:
-        run_pending_tasks(config)
-        time.sleep(max(5, int(config.service.loop_sleep_seconds)))
+    lease = _ProcessLease(config, "daemon")
+    if not lease.try_acquire(phase="startup"):
+        _append_log(config, "service loop not started reason=lease_busy")
+        return 0
+    try:
+        grace_seconds = max(0, int(config.service.startup_grace_seconds))
+        _append_log(config, f"service loop starting run_id={lease.run_id} startup_grace_seconds={grace_seconds}")
+        if grace_seconds:
+            lease.update_phase("startup_grace")
+            time.sleep(grace_seconds)
+        lease.update_phase("running")
+        while True:
+            run_pending_tasks(config)
+            time.sleep(max(5, int(config.service.loop_sleep_seconds)))
+    finally:
+        lease.release()

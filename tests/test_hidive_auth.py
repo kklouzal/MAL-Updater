@@ -34,6 +34,29 @@ class _FakeResponse:
 
 
 class HidiveAuthTests(unittest.TestCase):
+    def test_login_and_refresh_post_failures_are_single_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            config.hidive.retry_max_attempts = 5
+            config.hidive.request_spacing_seconds = 0
+            for path, effect in (("/login", _FakeResponse(503, {"error": "busy"})), ("/token/refresh", hidive_auth.requests.Timeout("ambiguous"))):
+                with patch("mal_updater.hidive_auth.requests.request", side_effect=effect if isinstance(effect, BaseException) else None, return_value=None if isinstance(effect, BaseException) else effect) as send:
+                    with self.assertRaises(HidiveAuthError):
+                        hidive_auth._hidive_json_request(config, "POST", path, headers={}, json_body={})
+                self.assertEqual(1, send.call_count)
+
+    def test_ambiguous_refresh_failure_preserves_tokens_without_credential_rebootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            session = self._build_session(Path(td))
+            with patch("mal_updater.hidive_auth._hidive_json_request", side_effect=HidiveAuthError("HIDIVE POST /token/refresh failed: HTTP 503")), patch(
+                "mal_updater.hidive_auth.hidive_login_with_credentials"
+            ) as login:
+                with self.assertRaisesRegex(HidiveAuthError, "HTTP 503"):
+                    session.refresh_tokens()
+            login.assert_not_called()
+            self.assertEqual("access-token", session.token.authorisation_token)
+            self.assertEqual("refresh-token", session.token.refresh_token)
+
     def _build_session(self, root: Path) -> HidiveSession:
         config = load_config(root)
         state_paths = HidiveStatePaths(
@@ -50,6 +73,24 @@ class HidiveAuthTests(unittest.TestCase):
             state_paths=state_paths,
             token=HidiveTokenSet(authorisation_token="access-token", refresh_token="refresh-token", account_id="acct-123"),
         )
+
+    def test_json_request_records_http_and_transport_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            config.hidive.request_spacing_seconds = 0.0
+            config.hidive.request_spacing_jitter_seconds = 0.0
+            config.hidive.retry_backoff_base_seconds = 0.0
+            config.hidive.retry_backoff_jitter_seconds = 0.0
+            with patch("mal_updater.hidive_auth.requests.request", return_value=_FakeResponse(500, {"error": "failed"})):
+                with self.assertRaisesRegex(HidiveAuthError, "HTTP 500"):
+                    hidive_auth._hidive_json_request(config, "GET", "/test", headers={})
+            with patch("mal_updater.hidive_auth.requests.request", side_effect=hidive_auth.requests.Timeout("token=do-not-log")):
+                with self.assertRaisesRegex(HidiveAuthError, "request failed"):
+                    hidive_auth._hidive_json_request(config, "GET", "/test", headers={})
+
+            events = [json.loads(line) for line in config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["http_error", "http_error", "request_error", "request_error"], [event["outcome"] for event in events])
+            self.assertNotIn("do-not-log", json.dumps(events))
 
     def test_load_hidive_credentials_reads_secret_file_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -248,7 +289,7 @@ class HidiveAuthTests(unittest.TestCase):
                 if path == "/content/home" and len(calls) == 1:
                     raise HidiveAuthError("HIDIVE GET /content/home failed: HTTP 401: expired")
                 if path == "/token/refresh":
-                    raise HidiveAuthError("refresh blocked")
+                    raise HidiveAuthError("refresh blocked: HTTP 401 invalid token")
                 return {"ok": True}
 
             with patch("mal_updater.hidive_auth._hidive_json_request", side_effect=fake_request), patch(

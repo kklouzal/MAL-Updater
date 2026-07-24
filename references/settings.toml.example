@@ -15,6 +15,10 @@ cache_dir = "../cache"
 db_path = "../data/mal_updater.sqlite3"
 
 [mal]
+search_cache_ttl_days = 14  # normalized-query positive cache; key includes limit, fields, and logic version
+search_negative_cache_ttl_days = 3  # bounded no-result cache; force refresh bypasses it
+detail_cache_ttl_days = 14  # only complete field-covering rows may satisfy a detail read
+provider_detail_cache_ttl_days = 30  # Crunchyroll enriched series/audio/season evidence; HIDIVE stays search-only
 base_url = "https://api.myanimelist.net/v2"
 auth_url = "https://myanimelist.net/v1/oauth2/authorize"
 token_url = "https://myanimelist.net/v1/oauth2/token"
@@ -23,15 +27,30 @@ redirect_host = "127.0.0.1"
 redirect_port = 8765
 request_spacing_seconds = 1.0
 request_spacing_jitter_seconds = 0.2
+retry_max_attempts = 2  # safe GET/read attempts only; OAuth token POSTs and MAL PUT writes are always single-attempt
+retry_backoff_base_seconds = 1.0
+retry_backoff_jitter_seconds = 0.25
+retry_after_cap_seconds = 60.0
 
 [crunchyroll]
 locale = "en-US"
 request_spacing_seconds = 22.5
 request_spacing_jitter_seconds = 7.5
+retry_max_attempts = 2  # safe GET/read attempts only; login and token-refresh POSTs are always single-attempt
+retry_backoff_base_seconds = 1.0
+retry_backoff_jitter_seconds = 0.25
+retry_after_cap_seconds = 60.0
 
-# Crunchyroll currently has provider-specific locale/pacing settings here.
-# HIDIVE does not have a [hidive] settings table; its unattended pacing comes from
-# the service budget tables below plus built-in provider/service defaults.
+# These are local niceness controls, not undocumented provider rate-limit claims.
+# Request-start gates are shared by provider across clients/processes on this host.
+
+[hidive]
+request_spacing_seconds = 5.0
+request_spacing_jitter_seconds = 1.0
+retry_max_attempts = 2  # safe GET/read attempts only; login and token-refresh POSTs are always single-attempt
+retry_backoff_base_seconds = 1.0
+retry_backoff_jitter_seconds = 0.25
+retry_after_cap_seconds = 60.0
 
 [openclaw]
 recommendations_webhook_enabled = false
@@ -50,12 +69,17 @@ other = 2
 
 [service]
 sync_every_seconds = 3600
-full_refresh_every_seconds = 0  # disabled by default; reserve full refresh for initial bootstrap or explicit recovery
+full_refresh_every_seconds = 604800  # weekly only for page-bounded Crunchyroll; HIDIVE unattended full refresh remains disabled
 health_every_seconds = 3600
-recommendation_metadata_refresh_every_seconds = 3600
-mal_refresh_every_seconds = 3600
+mal_refresh_every_seconds = 3600  # lightweight token-refresh lane; distinct from the user-list network refresh
+mal_list_refresh_every_seconds = 28800  # 8h, within the conservative 6-12h user-list window; max pages is configured below
+recommendation_metadata_refresh_every_seconds = 43200  # 12h bounded seed/discovery hydration
+provider_eligibility_refresh_every_seconds = 86400  # one separately budgeted provider-specific lane per credentialed provider
+recommend_maintain_every_seconds = 3600  # DB/local-only recommendation snapshot + health materialization
 recommendations_webhook_push_every_seconds = 0  # disabled by default; set >0 to let the daemon push changed recommendation digests into OpenClaw using delivery_mode + item-aware dedupe
 loop_sleep_seconds = 30
+startup_grace_seconds = 30  # applies only to long-lived service-run; manual service-run-once remains immediate
+lease_stale_after_seconds = 1800  # operator evidence threshold; kernel locks safely recover immediately when an owning process dies
 crunchyroll_hourly_limit = 180  # legacy Crunchyroll-specific override
 source_provider_hourly_limit = 180
 source_provider_warn_backoff_floor_seconds = 0
@@ -69,15 +93,30 @@ critical_ratio = 0.95
 hidive = 72  # built-in default shown explicitly here; override only when this host needs a different HIDIVE budget
 
 [service.task_hourly_limits]
-sync_apply = 48  # built-in default shown explicitly here; override only when this host needs a different aggregate-apply MAL budget
+mal_list_refresh = 6  # task cap and MAL provider-global cap are both enforced
+sync_apply = 48  # additional task-scoped cap; provider-global MAL cap is still enforced, and legacy unattributed events are conservatively included
+recommend_metadata_refresh = 12
+recommend_provider_eligibility_crunchyroll = 18  # local safety budget, not an external provider-limit claim
+recommend_provider_eligibility_hidive = 8
 
 [service.task_execute_limits]
-sync_apply = 8  # built-in default shown explicitly here; unattended apply runs should advance MAL in bounded batches instead of trying a full aggregate pass
+mal_list_refresh_pages = 3
+sync_apply = 8  # built-in default shown explicitly here; positive values bound unattended writes, while 0 disables this scheduler lane (manual CLI --limit 0 keeps its explicit full-scan meaning)
+recommend_metadata_refresh = 3
+recommend_metadata_discovery_targets = 5
+recommend_provider_eligibility_candidates = 2
+recommend_provider_eligibility_search_results = 5
+recommend_provider_eligibility_queries_per_candidate = 1
+recommendation_snapshot = 100
 push_recommendations_webhook = 20  # optional daemon push batch size for recommendation delivery into OpenClaw; actual sections are still trimmed by openclaw.recommendations_webhook_delivery_mode + section_limits
 
 [service.task_projected_request_counts]
 mal_refresh = 1  # built-in default shown explicitly here; fresh installs now seed unattended MAL token refresh with a small non-zero request-cost estimate, but learned history can replace the seed once real runs exist
+mal_list_refresh = 3
 sync_apply = 8  # built-in default shown explicitly here; keep this aligned with the unattended apply batch posture unless this host has strong evidence for a different per-run MAL request cost
+recommend_metadata_refresh = 8
+recommend_provider_eligibility_crunchyroll = 7
+recommend_provider_eligibility_hidive = 2
 sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds
 
 [service.task_projected_request_counts_by_mode.sync_fetch_crunchyroll]

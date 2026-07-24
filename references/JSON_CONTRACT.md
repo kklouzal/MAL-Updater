@@ -34,6 +34,31 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider cru
 - MAL mutations must only be inferred from normalized persisted state, never directly from raw passthrough blobs.
 - `playback_position_ms`, `duration_ms`, `episode_number`, and `last_watched_at` are part of the conservative completion policy; do not drop them if credits-skipped behavior still matters.
 
+## API request telemetry contract
+
+`.MAL-Updater/state/api-request-events.jsonl` is append-only request-attempt telemetry. New records use `schema_version: 2` and retain the legacy fields (`at`, `provider`, `operation`, `url`, `method`, `outcome`, `status_code`, `error`) while adding:
+
+- `event_id`: unique event identity used for monotonic run-boundary deltas
+- `task` / `run_id`: daemon or direct-CLI attribution when known
+- `attempt_sequence`: sequence within the propagated request context; retries/timeouts are separate events
+
+URLs retain scheme/host/path and query-key shape, but credentials, fragments, and every query value are redacted. Error text is bounded and redacts URLs, auth material, and sensitive key/value forms. Request headers/bodies are never written. Readers remain tolerant of legacy records without the v2 fields; those records count toward provider-global budgets and conservatively count in task gates where attribution is unavailable.
+
+## Service status niceness contract
+
+`service-status` and `health-check` JSON include `niceness_policy`, an effective loaded-policy object rather than a copy of example settings. Stable top-level children are:
+
+- `policy_kind`: explicitly identifies local niceness controls as non-provider-limit claims
+- `cadences`: effective hot/cold, MAL user-list, recommendation metadata, provider eligibility, snapshot, and health intervals in seconds
+- `thresholds`: warn/critical ratios and the task-plus-provider-global enforcement posture
+- `provider_hourly_budgets`, `request_start_spacing_seconds`, and `retry_policy`: effective local headroom/pacing/retry controls (including the non-retried MAL-write posture)
+- `execute_limits`: bounded per-task page/candidate/seed/snapshot limits
+- `task_policies`: credential-sensitive effective daemon lanes with cadence, initial stagger, provider/task budgets, and cold-start projection
+- `cold_refresh_bounds`: Crunchyroll page caps and HIDIVE unattended-full disabled posture
+- `cache_horizons_days`: effective MAL/provider/recommendation cache and freshness horizons
+
+Fields may be added compatibly. Consumers must tolerate task-lane absence when credentials are not configured and must not reinterpret the local budgets as external rate-limit declarations.
+
 ## Example payload
 
 ```json

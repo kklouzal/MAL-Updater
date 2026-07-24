@@ -29,6 +29,32 @@ class _FakeResponse:
 
 
 class CrunchyrollAuthTests(unittest.TestCase):
+    def test_auth_post_503_and_timeout_are_single_attempt(self) -> None:
+        class FakeTransport:
+            def __init__(self, effect):
+                self.effect = effect
+                self.calls = 0
+
+            def post(self, *args, **kwargs):
+                self.calls += 1
+                if isinstance(self.effect, BaseException):
+                    raise self.effect
+                return self.effect
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            config.crunchyroll.retry_max_attempts = 5
+            config.crunchyroll.request_spacing_seconds = 0
+            for effect in (_FakeResponse(503, {"error": "busy"}), TimeoutError("ambiguous")):
+                transport = FakeTransport(effect)
+                with patch.object(crunchyroll_auth, "curl_requests", transport):
+                    if isinstance(effect, BaseException):
+                        with self.assertRaises(TimeoutError):
+                            crunchyroll_auth._http_post("https://example.invalid/token", data={}, headers={}, timeout_seconds=1, config=config)
+                    else:
+                        self.assertEqual(503, crunchyroll_auth._http_post("https://example.invalid/token", data={}, headers={}, timeout_seconds=1, config=config).status_code)
+                self.assertEqual(1, transport.calls)
+
     def test_provider_timestamp_helper_preserves_utc_z_format(self) -> None:
         self.assertEqual(
             current_utc_timestamp_z(now=datetime(2026, 7, 23, 3, 1, 2, 345678, tzinfo=timezone.utc)),
@@ -44,6 +70,30 @@ class CrunchyrollAuthTests(unittest.TestCase):
                     headers={},
                     timeout_seconds=1.0,
                 )
+
+    def test_direct_auth_http_helper_records_success_and_failed_attempts(self) -> None:
+        class FakeTransport:
+            def post(self, *args, **kwargs):
+                return _FakeResponse(200, {"ok": True})
+
+            def get(self, *args, **kwargs):
+                raise TimeoutError("simulated timeout token=do-not-log")
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            config.crunchyroll.request_spacing_seconds = 0.0
+            config.crunchyroll.request_spacing_jitter_seconds = 0.0
+            config.crunchyroll.retry_backoff_base_seconds = 0.0
+            config.crunchyroll.retry_backoff_jitter_seconds = 0.0
+            with patch.object(crunchyroll_auth, "curl_requests", FakeTransport()):
+                crunchyroll_auth._http_post("https://example.invalid/token?code=secret-code", data={}, headers={}, timeout_seconds=1.0, config=config)
+                with self.assertRaises(TimeoutError):
+                    crunchyroll_auth._http_get("https://example.invalid/me", headers={}, timeout_seconds=1.0, config=config)
+
+            events = [json.loads(line) for line in config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["ok", "request_error", "request_error"], [event["outcome"] for event in events])
+            self.assertNotIn("secret-code", json.dumps(events))
+            self.assertNotIn("do-not-log", json.dumps(events))
 
     def test_load_crunchyroll_credentials_reads_secret_file_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as td:

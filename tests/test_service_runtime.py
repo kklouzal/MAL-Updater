@@ -12,8 +12,93 @@ from unittest.mock import patch
 
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
-from mal_updater.request_tracking import estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _apply_sync_command, _projected_request_count, _recommendation_metadata_refresh_command, _run_subprocess, run_pending_tasks
+from mal_updater.request_tracking import begin_api_request_context, end_api_request_context, estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
+from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_metadata_refresh_command, _run_subprocess, run_pending_tasks, run_service_loop
+
+
+class ServiceRuntimeLeaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.project_root = Path(self.temp_dir.name)
+        self.config = load_config(self.project_root)
+        ensure_directories(self.config)
+
+    def test_overlapping_scheduler_pass_is_suppressed_with_holder_evidence(self) -> None:
+        holder = _ProcessLease(self.config, "scheduler")
+        self.assertTrue(holder.try_acquire(phase="test-holder"))
+        self.addCleanup(holder.release)
+
+        with patch("mal_updater.service_runtime._run_pending_tasks_unlocked") as unlocked:
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual("skipped", result["status"])
+        self.assertEqual("lease_busy", result["reason"])
+        self.assertEqual(os.getpid(), result["lease"]["holder"]["pid"])
+        unlocked.assert_not_called()
+
+    def test_dead_stale_lease_metadata_is_recovered_under_new_kernel_lock(self) -> None:
+        self.config.service.lease_stale_after_seconds = 10
+        status_path = self.config.service_leases_dir / "scheduler.json"
+        status_path.write_text(
+            json.dumps({"status": "running", "pid": 999999, "run_id": "dead-run", "started_epoch": time.time() - 60}),
+            encoding="utf-8",
+        )
+
+        lease = _ProcessLease(self.config, "scheduler")
+        self.assertTrue(lease.try_acquire(phase="recovery"))
+        self.addCleanup(lease.release)
+
+        self.assertTrue(lease.status["recovered_previous_lease"])
+        self.assertTrue(lease.status["previous_was_stale"])
+        self.assertEqual("dead-run", lease.status["previous_run_id"])
+
+    def test_overlapping_task_subprocess_is_suppressed(self) -> None:
+        holder = _ProcessLease(self.config, "task-diagnostic")
+        self.assertTrue(holder.try_acquire(phase="test-task-holder"))
+        self.addCleanup(holder.release)
+
+        with patch("mal_updater.service_runtime.subprocess.run") as subprocess_run:
+            result = _run_subprocess(self.config, [sys.executable, "-c", "print('never')"], label="diagnostic")
+
+        self.assertEqual("skipped", result["status"])
+        self.assertEqual("lease_busy", result["reason"])
+        subprocess_run.assert_not_called()
+
+    def test_run_subprocess_propagates_request_task_and_run_context(self) -> None:
+        token = begin_api_request_context(task="sync_fetch_crunchyroll", run_id="run-context-123")
+        try:
+            result = _run_subprocess(
+                self.config,
+                [sys.executable, "-c", "import os; print(os.environ['MAL_UPDATER_REQUEST_TASK'] + ':' + os.environ['MAL_UPDATER_REQUEST_RUN_ID'])"],
+                label="sync_fetch_crunchyroll",
+            )
+        finally:
+            end_api_request_context(token)
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual("sync_fetch_crunchyroll:run-context-123", result["stdout"].strip())
+
+    def test_daemon_startup_grace_precedes_first_task_pass(self) -> None:
+        self.config.service.startup_grace_seconds = 17
+        with patch("mal_updater.service_runtime.time.sleep", side_effect=[None, KeyboardInterrupt]) as sleep, patch(
+            "mal_updater.service_runtime.run_pending_tasks", return_value={"status": "ok"}
+        ) as run_tasks:
+            with self.assertRaises(KeyboardInterrupt):
+                run_service_loop(self.config)
+
+        self.assertEqual(17, sleep.call_args_list[0].args[0])
+        run_tasks.assert_called_once_with(self.config)
+
+    def test_manual_one_shot_has_no_startup_grace(self) -> None:
+        self.config.service.startup_grace_seconds = 99
+        with patch("mal_updater.service_runtime.time.sleep") as sleep, patch(
+            "mal_updater.service_runtime._run_pending_tasks_unlocked", return_value={"status": "ok", "results": []}
+        ):
+            result = run_pending_tasks(self.config)
+
+        self.assertEqual("ok", result["status"])
+        sleep.assert_not_called()
 
 
 class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
@@ -225,6 +310,44 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         sync_state = saved["tasks"]["sync_fetch_crunchyroll"]
         self.assertEqual("health_recommended", sync_state["last_full_refresh_reason"])
+
+    def test_lease_busy_child_preserves_due_full_refresh_and_health_request(self) -> None:
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text(json.dumps({"maintenance": {"recommended_commands": [{
+            "reason_code": "refresh_full_snapshot",
+            "command_args": ["crunchyroll-fetch-snapshot", "--full-refresh"],
+        }]}}), encoding="utf-8")
+        health_mtime = self.config.health_latest_json_path.stat().st_mtime
+        stale_anchor = time.time() - 90000
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        state["tasks"]["sync_fetch_crunchyroll"] = {
+            "last_run_epoch": 0,
+            "full_refresh_anchor_epoch": stale_anchor,
+            "execution_signature": "sync_fetch_crunchyroll:mode=full_refresh",
+            "last_request_delta_by_mode": {"full_refresh": 44},
+        }
+        self.config.service_state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        with patch("mal_updater.service_runtime._budget_gate", side_effect=[(True, None, {"provider": "crunchyroll"}), (True, None, {"provider": "mal"}), (True, None, None)]), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "skipped", "reason": "lease_busy", "label": "sync_fetch_crunchyroll"},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "health", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ):
+            result = run_pending_tasks(self.config)
+
+        fetch = next(item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll")
+        self.assertEqual("skipped", fetch["status"])
+        saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_fetch_crunchyroll"]
+        self.assertEqual(stale_anchor, saved["full_refresh_anchor_epoch"])
+        self.assertEqual({"full_refresh": 44}, saved["last_request_delta_by_mode"])
+        self.assertNotIn("last_successful_full_refresh_epoch", saved)
+        self.assertNotIn("last_health_request_handled_mtime", saved)
+        self.assertLessEqual(saved["next_due_epoch"], time.time() + 61)
+        self.assertGreater(saved["next_due_epoch"], time.time())
+        self.assertGreater(health_mtime, 0)
 
     def test_run_pending_tasks_does_not_repeat_health_recommended_full_refresh_after_newer_success(self) -> None:
         self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -454,6 +577,28 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             ],
             _apply_sync_command(self.config),
         )
+
+    def test_zero_sync_apply_limit_disables_unattended_execution(self) -> None:
+        self.config.service.sync_every_seconds = 0
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.task_execute_limits["sync_apply"] = 0
+        now = time.time()
+        self.config.service_state_path.write_text(
+            json.dumps({"started_at": "2026-03-20T20:00:00Z", "tasks": {
+                "mal_refresh": {"last_run_epoch": now},
+                "health": {"last_run_epoch": now},
+                "sync_apply": {"last_run_epoch": 0},
+            }}), encoding="utf-8",
+        )
+        with patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "returncode": 0, "stdout": "", "stderr": ""},
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+        disabled = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual({"task": "sync_apply", "status": "skipped", "reason": "execute_limit_zero"}, disabled)
+        self.assertFalse(any(call.kwargs.get("label") == "sync_apply" for call in run_subprocess.call_args_list))
 
     def test_recommendation_metadata_refresh_command_uses_bounded_service_limits(self) -> None:
         self.config.service.task_execute_limits["recommend_metadata_refresh"] = 4
@@ -734,6 +879,29 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.assertNotIn("budget_backoff_until_epoch", apply_state)
         self.assertNotIn("last_skip_reason", apply_state)
 
+    def test_zero_unattended_sync_apply_limit_disables_lane_without_subprocess(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 0
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.task_execute_limits["sync_apply"] = 0
+        self.config.service_state_path.write_text(json.dumps({"tasks": {
+            "mal_refresh": {"last_run_epoch": now},
+            "health": {"last_run_epoch": now},
+        }}), encoding="utf-8")
+
+        with patch("mal_updater.service_runtime._task_specs", return_value=[TaskSpec("sync_apply", 60, "mal")]), patch(
+            "mal_updater.service_runtime._run_subprocess"
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual({"task": "sync_apply", "status": "skipped", "reason": "execute_limit_zero"}, apply_result)
+        run_subprocess.assert_not_called()
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_apply"]
+        self.assertEqual("disabled", state["last_status"])
+        self.assertNotIn("last_run_epoch", state)
+
 
 class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -781,6 +949,40 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         recovery = estimate_budget_recovery_seconds_for_ratio(provider="crunchyroll", limit=10, target_ratio=0.8, config=self.config)
         self.assertGreaterEqual(recovery, 2850)
         self.assertLessEqual(recovery, 2955)
+
+    def test_task_budget_and_provider_global_budget_are_both_enforced(self) -> None:
+        self.config.service.mal_hourly_limit = 5
+        self.config.service.task_hourly_limits["sync_apply"] = 10
+        self.config.service.task_projected_request_counts["sync_apply"] = 1
+        token = begin_api_request_context(task="mal_refresh", run_id="other-run")
+        try:
+            for index in range(4):
+                record_api_request_event("mal", "other", url=f"https://example.invalid/{index}", method="POST", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        allowed, reason, usage = _budget_gate(self.config, TaskSpec("sync_apply", 60, "mal"), {}, fetch_mode=None)
+        self.assertFalse(allowed)
+        self.assertIn("mal_global_budget_critical", reason or "")
+        self.assertEqual(4, usage["global_request_count"])
+        self.assertEqual(0, usage["task_request_count"])
+
+        self.config.api_request_events_path.unlink()
+        self.config.service.mal_hourly_limit = 100
+        self.config.service.task_hourly_limits["sync_apply"] = 2
+        self.config.service.task_projected_request_counts["sync_apply"] = 0
+        token = begin_api_request_context(task="sync_apply", run_id="task-run")
+        try:
+            for index in range(2):
+                record_api_request_event("mal", "apply", url=f"https://example.invalid/{index}", method="PUT", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        allowed, reason, usage = _budget_gate(self.config, TaskSpec("sync_apply", 60, "mal"), {}, fetch_mode=None)
+        self.assertFalse(allowed)
+        self.assertIn("mal_budget_critical", reason or "")
+        self.assertEqual(2, usage["task_request_count"])
+        self.assertEqual(2, usage["global_request_count"])
 
     def test_run_pending_tasks_records_budget_backoff_and_skips_rechecks_until_expiry(self) -> None:
         self._write_request_events("crunchyroll", [50, 100, 200])
@@ -929,7 +1131,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertAlmostEqual(0.8, sync_state["projected_ratio"])
         self.assertEqual("configured", sync_state["projected_request_source"])
 
-    def test_run_pending_tasks_prefers_mode_specific_configured_projection_for_full_refresh(self) -> None:
+    def test_hidive_periodic_full_refresh_stays_manual_and_uses_hot_projection(self) -> None:
         self._write_request_events("hidive", [50, 100])
         (self.project_root / ".MAL-Updater" / "secrets" / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.project_root / ".MAL-Updater" / "secrets" / "hidive_password.txt").write_text("secret\n", encoding="utf-8")
@@ -980,7 +1182,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         sync_result = next(item for item in result["results"] if item["task"] == "sync_fetch_hidive")
         self.assertEqual("ok", sync_result["status"])
         self.assertEqual("hot", sync_result["fetch_mode"])
-        self.assertEqual("periodic_cadence", sync_result["deferred_full_refresh_reason"])
+        self.assertNotIn("deferred_full_refresh_reason", sync_result)
         self.assertEqual(5, sync_result["next_projected_request_count"])
         self.assertEqual("configured_hot", sync_result["next_projected_request_source"])
 
@@ -1556,7 +1758,9 @@ class ServiceRuntimeRecommendMaintainTaskTests(unittest.TestCase):
         self.assertEqual(["recommend_maintain"], [item["task"] for item in result["results"]])
         command = run_subprocess.call_args.args[1]
         self.assertIn("recommend-maintain", command)
-        self.assertIn("--skip-provider-refresh", command)
+        self.assertIn("--local-only", command)
+        self.assertNotIn("--metadata-limit", command)
+        self.assertNotIn("--discovery-target-limit", command)
         self.assertNotIn("--dry-run", command)
 
         saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))

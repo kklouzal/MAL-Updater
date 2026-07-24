@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
-import random
 import re
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from socket import timeout as SocketTimeout
 from typing import Any, Callable, TypeVar
 from urllib.error import HTTPError, URLError
@@ -15,6 +16,8 @@ from urllib.request import Request, urlopen
 
 from .config import AppConfig, MalSecrets
 from .request_tracking import record_api_request_event
+from .provider_niceness import ProviderRequestGate, retry_delay_seconds
+from .db import bootstrap_database, find_covering_mal_anime_detail_cache, get_mal_anime_detail_cache, get_mal_anime_search_cache, upsert_mal_anime_detail_cache, upsert_mal_anime_search_cache
 
 
 @dataclass(slots=True)
@@ -39,6 +42,9 @@ class MalApiError(RuntimeError):
 
 _T = TypeVar("_T")
 _TIMEOUT_RETRY_ATTEMPTS = 2
+_RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+MAL_SEARCH_CACHE_LOGIC_VERSION = "mal-search-v1"
+MAL_DETAIL_CACHE_LOGIC_VERSION = "mal-detail-v1"
 
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 
@@ -98,7 +104,14 @@ class MalClient:
     def __init__(self, config: AppConfig, secrets: MalSecrets):
         self.config = config
         self.secrets = secrets
-        self._last_request_started_at: float | None = None
+        self._request_gate = ProviderRequestGate(
+            provider="mal",
+            state_dir=config.state_dir,
+            spacing_seconds=config.mal.request_spacing_seconds,
+            jitter_seconds=config.mal.request_spacing_jitter_seconds,
+            clock=lambda: time.monotonic(),
+            sleep=lambda seconds: time.sleep(seconds),
+        )
 
     def _build_auth_headers(self, require_user: bool = False) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -113,19 +126,7 @@ class MalClient:
         return headers
 
     def _pace_request(self) -> None:
-        spacing = max(0.0, float(self.config.mal.request_spacing_seconds))
-        jitter = max(0.0, float(self.config.mal.request_spacing_jitter_seconds))
-        if spacing <= 0 and jitter <= 0:
-            self._last_request_started_at = time.monotonic()
-            return
-        requested_gap = spacing + (random.uniform(-jitter, jitter) if jitter > 0 else 0.0)
-        target_gap = max(0.0, requested_gap)
-        now = time.monotonic()
-        if self._last_request_started_at is not None:
-            elapsed = now - self._last_request_started_at
-            if elapsed < target_gap:
-                time.sleep(target_gap - elapsed)
-        self._last_request_started_at = time.monotonic()
+        self._request_gate.wait_turn()
 
     def _is_timeout_error(self, exc: BaseException) -> bool:
         if isinstance(exc, (TimeoutError, SocketTimeout)):
@@ -138,27 +139,63 @@ class MalClient:
             return "timed out" in reason_text or "timeout" in reason_text
         return False
 
-    def _format_timeout_message(self, error_context: str, exc: BaseException) -> str:
-        return f"{error_context}: timeout after {_TIMEOUT_RETRY_ATTEMPTS} attempts: {exc}"
+    def _format_timeout_message(self, error_context: str, exc: BaseException, *, attempts: int = _TIMEOUT_RETRY_ATTEMPTS) -> str:
+        return f"{error_context}: timeout after {attempts} attempts: {exc}"
 
-    def _request_with_timeout_retry(self, error_context: str, func: Callable[[], _T]) -> _T:
-        attempts = _TIMEOUT_RETRY_ATTEMPTS
+    def _request_with_timeout_retry(
+        self,
+        error_context: str,
+        func: Callable[[], _T],
+        *,
+        operation: str,
+        url: str,
+        method: str,
+    ) -> _T:
+        # Only read-only requests are retryable. OAuth authorization codes and
+        # rotating refresh tokens may have been consumed even when a POST times
+        # out or returns a transient upstream error.
+        safe_to_retry = method.upper() == "GET"
+        attempts = max(1, int(self.config.mal.retry_max_attempts)) if safe_to_retry else 1
         last_exc: BaseException | None = None
         for attempt in range(1, attempts + 1):
             self._pace_request()
             try:
                 return func()
-            except HTTPError:
+            except HTTPError as exc:
+                record_api_request_event("mal", operation, url=url, method=method, outcome="http_error", status_code=exc.code, error=f"HTTP {exc.code}", config=self.config)
+                if safe_to_retry and exc.code in _RETRYABLE_HTTP_STATUSES and attempt < attempts:
+                    retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+                    delay = retry_delay_seconds(
+                        attempt,
+                        retry_after=retry_after,
+                        base_seconds=self.config.mal.retry_backoff_base_seconds,
+                        jitter_seconds=self.config.mal.retry_backoff_jitter_seconds,
+                        cap_seconds=self.config.mal.retry_after_cap_seconds,
+                    )
+                    exc.close()
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
                 raise
             except (URLError, TimeoutError, SocketTimeout) as exc:
+                outcome = "timeout" if self._is_timeout_error(exc) else "url_error"
+                record_api_request_event("mal", operation, url=url, method=method, outcome=outcome, error=type(exc).__name__, config=self.config)
                 if self._is_timeout_error(exc):
                     last_exc = exc
                     if attempt < attempts:
+                        delay = retry_delay_seconds(
+                            attempt,
+                            base_seconds=self.config.mal.retry_backoff_base_seconds,
+                            jitter_seconds=self.config.mal.retry_backoff_jitter_seconds,
+                            cap_seconds=self.config.mal.retry_after_cap_seconds,
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
                         continue
-                    raise MalApiError(self._format_timeout_message(error_context, exc)) from exc
+                    raise MalApiError(self._format_timeout_message(error_context, exc, attempts=attempts)) from exc
                 raise
         if last_exc is not None:
-            raise MalApiError(self._format_timeout_message(error_context, last_exc)) from last_exc
+            raise MalApiError(self._format_timeout_message(error_context, last_exc, attempts=attempts)) from last_exc
         raise MalApiError(f"{error_context}: request failed without a captured exception")
 
     def generate_state(self) -> str:
@@ -226,21 +263,61 @@ class MalClient:
             error_context="MAL API GET /users/@me failed",
         )
 
-    def search_anime(self, query: str, *, limit: int = 5, fields: str = "id,title,alternative_titles,media_type,status,num_episodes") -> dict[str, Any]:
+    def search_anime(self, query: str, *, limit: int = 5, fields: str = "id,title,alternative_titles,media_type,status,num_episodes", force_refresh: bool = False) -> dict[str, Any]:
         sanitized_query = _sanitize_anime_search_query(query) or " ".join(str(query).split()).strip()
+        normalized_query = " ".join(sanitized_query.casefold().split())
+        fields_key = ",".join(sorted({part.strip() for part in fields.split(",") if part.strip()}))
+        cache_key = hashlib.sha256(json.dumps([MAL_SEARCH_CACHE_LOGIC_VERSION, normalized_query, int(limit), fields_key], separators=(",", ":")).encode()).hexdigest()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        now_iso = now.isoformat().replace("+00:00", "Z")
+        cache_available = self.config.db_path.parent.exists()
+        if cache_available:
+            bootstrap_database(self.config.db_path)
+        if cache_available and not force_refresh:
+            cached = get_mal_anime_search_cache(self.config.db_path, cache_key=cache_key, now=now_iso)
+            if cached is not None:
+                return cached.response
         encoded_query = urlencode({"q": sanitized_query, "limit": limit, "fields": fields})
-        return self._get_json(
+        response = self._get_json(
             f"/anime?{encoded_query}",
             headers=self._build_auth_headers(require_user=False),
             error_context=f"MAL API anime search failed for query={sanitized_query!r}",
         )
+        negative = not bool(response.get("data"))
+        ttl_days = self.config.mal.search_negative_cache_ttl_days if negative else self.config.mal.search_cache_ttl_days
+        if cache_available:
+            upsert_mal_anime_search_cache(self.config.db_path, cache_key=cache_key, normalized_query=normalized_query,
+                result_limit=int(limit), fields=fields_key, logic_version=MAL_SEARCH_CACHE_LOGIC_VERSION,
+                status="negative" if negative else "ok", response=response, fetched_at=now_iso,
+                expires_at=(now + timedelta(days=max(0, ttl_days))).isoformat().replace("+00:00", "Z"))
+        return response
 
-    def get_anime_details(self, anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:
-        return self._get_json(
+    def get_anime_details(self, anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status", force_refresh: bool = False, cache_ttl_days: int | None = None) -> dict[str, Any]:
+        fields_key = ",".join(sorted({part.strip() for part in fields.split(",") if part.strip()}))
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        now_iso = now.isoformat().replace("+00:00", "Z")
+        cache_available = self.config.db_path.parent.exists()
+        if cache_available:
+            bootstrap_database(self.config.db_path)
+        if cache_available and not force_refresh:
+            cached = get_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
+                                                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now=now_iso)
+            if cached is None:
+                cached = find_covering_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id),
+                    required_fields=set(fields_key.split(",")), logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now=now_iso)
+            if cached is not None and cached.status == "ok" and all(field in cached.response for field in fields_key.split(",")):
+                return cached.response
+        response = self._get_json(
             f"/anime/{anime_id}?{urlencode({'fields': fields})}",
             headers=self._build_auth_headers(require_user=False),
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
+        ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
+        if cache_available:
+            upsert_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
+                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, response=response, fetched_at=now_iso,
+                expires_at=(now + timedelta(days=ttl)).isoformat().replace("+00:00", "Z"))
+        return response
 
 
     def iter_my_anime_list_pages(
@@ -332,13 +409,11 @@ class MalClient:
                     record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
                     return json.loads(body) if body else {"status": status, "num_episodes_watched": num_watched_episodes}
 
-            return self._request_with_timeout_retry(error_context, _send)
+            return self._request_with_timeout_retry(error_context, _send, operation="update_my_list_status", url=request.full_url, method="PUT")
         except HTTPError as exc:
             detail = _read_http_error_detail(exc)
-            record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="url_error", error=str(exc.reason), config=self.config)
             raise MalApiError(f"{error_context}: {exc.reason}") from exc
 
     def _get_json(self, path_or_url: str, *, headers: dict[str, str], error_context: str) -> dict[str, Any]:
@@ -347,17 +422,14 @@ class MalClient:
         try:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
                     record_api_request_event("mal", "get_json", url=url, method="GET", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
-                    return payload
+                    return json.loads(response.read().decode("utf-8"))
 
-            return self._request_with_timeout_retry(error_context, _send)
+            return self._request_with_timeout_retry(error_context, _send, operation="get_json", url=url, method="GET")
         except HTTPError as exc:
             detail = _read_http_error_detail(exc)
-            record_api_request_event("mal", "get_json", url=url, method="GET", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            record_api_request_event("mal", "get_json", url=url, method="GET", outcome="url_error", error=str(exc.reason), config=self.config)
             raise MalApiError(f"{error_context}: {exc.reason}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
@@ -375,17 +447,14 @@ class MalClient:
         try:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
                     record_api_request_event("mal", "token_request", url=url, method="POST", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
-                    return payload
+                    return json.loads(response.read().decode("utf-8"))
 
-            raw = self._request_with_timeout_retry("MAL token request failed", _send)
+            raw = self._request_with_timeout_retry("MAL token request failed", _send, operation="token_request", url=url, method="POST")
         except HTTPError as exc:
             detail = _read_http_error_detail(exc)
-            record_api_request_event("mal", "token_request", url=url, method="POST", outcome="http_error", status_code=exc.code, error=detail, config=self.config)
             raise MalApiError(f"MAL token request failed: HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
-            record_api_request_event("mal", "token_request", url=url, method="POST", outcome="url_error", error=str(exc.reason), config=self.config)
             raise MalApiError(f"MAL token request failed: {exc.reason}") from exc
         return TokenResponse(
             access_token=raw["access_token"],

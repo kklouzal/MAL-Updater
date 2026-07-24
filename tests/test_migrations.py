@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import venv
 from contextlib import closing
 from pathlib import Path
@@ -26,6 +27,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "005_recommendation_score_snapshots.sql",
                 "006_recommendation_eligibility_evidence.sql",
                 "007_mal_user_anime_list_cache.sql",
+                "008_niceness_caches.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -41,8 +43,8 @@ class MigrationCatalogTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "duplicate numeric prefix"):
             validate_migration_catalog(
-                db.MIGRATION_FILENAMES + ("007_future_duplicate.sql",),
-                packaged_filenames=db.MIGRATION_FILENAMES + ("007_future_duplicate.sql",),
+                db.MIGRATION_FILENAMES + ("008_future_duplicate.sql",),
+                packaged_filenames=db.MIGRATION_FILENAMES + ("008_future_duplicate.sql",),
             )
         with self.assertRaisesRegex(RuntimeError, "historical duplicate migration order changed"):
             validate_migration_catalog(
@@ -55,6 +57,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "005_recommendation_score_snapshots.sql",
                     "006_recommendation_eligibility_evidence.sql",
                     "007_mal_user_anime_list_cache.sql",
+                    "008_niceness_caches.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -69,6 +72,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "005_recommendation_score_snapshots.sql",
                     "006_recommendation_eligibility_evidence.sql",
                     "007_mal_user_anime_list_cache.sql",
+                    "008_niceness_caches.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -94,6 +98,53 @@ class MigrationCatalogTests(unittest.TestCase):
                 root_file.read_text(encoding="utf-8"),
                 migration.read_text(encoding="utf-8"),
             )
+
+    def test_v7_to_v8_failure_rolls_back_and_retry_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "v7.sqlite3"
+            original = db.MIGRATIONS
+            try:
+                db.MIGRATIONS = original[:-1]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            real_execute = db._execute_migration_statement
+            calls = 0
+
+            def fail_midway(conn: sqlite3.Connection, statement: str) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 9:
+                    raise RuntimeError("injected migration failure")
+                real_execute(conn, statement)
+
+            with connect(db_path) as conn:
+                with mock.patch.object(db, "_execute_migration_statement", side_effect=fail_midway):
+                    with self.assertRaisesRegex(RuntimeError, "injected migration failure"):
+                        db.apply_migrations(conn)
+            with connect(db_path) as conn:
+                self.assertIsNone(conn.execute("SELECT 1 FROM schema_migrations WHERE version = '008_niceness_caches.sql'").fetchone())
+                self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mal_anime_search_cache'").fetchone())
+                provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_title_search_cache)")}
+                self.assertTrue({"logic_version", "search_limit", "identity_key"}.isdisjoint(provider_columns))
+
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM schema_migrations WHERE version = '008_niceness_caches.sql'").fetchone())
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mal_anime_search_cache'").fetchone())
+                eligibility_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_eligibility_evidence)")}
+                self.assertTrue({"fetched_at", "expires_at", "last_verified_at"} <= eligibility_columns)
+                self.assertTrue({"refresh_status", "failure_count", "next_retry_at", "logic_version"} <= eligibility_columns)
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                marker_count = conn.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = '008_niceness_caches.sql'"
+                ).fetchone()[0]
+                self.assertEqual(1, marker_count)
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
 
 class WheelMigrationPackagingTests(unittest.TestCase):

@@ -61,18 +61,31 @@ class CrunchyrollProvider:
     def write_snapshot_file(self, path: Path, snapshot: ProviderSnapshot) -> Path:
         return write_crunchyroll_snapshot_file(path, snapshot)
 
-    def search_title(self, config: AppConfig, query: str, *, limit: int = 10):
-        return _search_title(config, query, limit=limit)
+    def create_request_session(self, config: AppConfig):
+        from ..crunchyroll_snapshot import _build_request_pacer, _start_auth_session
+        return _start_auth_session(
+            config,
+            profile="default",
+            timeout_seconds=_request_timeout_seconds(config),
+            pacer=_build_request_pacer(config),
+        )
 
-    def fetch_search_result_detail(self, config: AppConfig, match):
-        return _fetch_search_result_detail(config, match)
+    def search_title(self, config: AppConfig, query: str, *, limit: int = 10, session=None):
+        return _search_title(config, query, limit=limit, session=session) if session is not None else _search_title(config, query, limit=limit)
 
-    def fetch_search_result_children(self, config: AppConfig, match):
-        return _fetch_search_result_children(config, match)
+    def fetch_search_result_detail(self, config: AppConfig, match, *, session=None):
+        return _fetch_search_result_detail(config, match, session=session) if session is not None else _fetch_search_result_detail(config, match)
+
+    def fetch_search_result_children(self, config: AppConfig, match, *, session=None):
+        return _fetch_search_result_children(config, match, session=session) if session is not None else _fetch_search_result_children(config, match)
 
 
 provider = CrunchyrollProvider()
 register_provider(provider)
+
+
+def _request_timeout_seconds(config: AppConfig) -> float:
+    return float(getattr(config.crunchyroll, "request_timeout_seconds", getattr(config, "request_timeout_seconds", 30.0)) or 30.0)
 
 
 def _normalize_audio_locales(value: Any) -> list[str]:
@@ -161,29 +174,26 @@ def _series_from_crunchyroll_item(item):
     }
 
 
-def _search_title(config, query: str, *, limit: int = 10):
+def _search_title(config, query: str, *, limit: int = 10, session=None):
     """Bounded read-only Crunchyroll title search.
 
     Uses Crunchyroll's authenticated content discover search endpoint and returns only
     normalized summary rows for series-like items. This is intentionally a single
     limited query, not a catalog crawl.
     """
-    from ..crunchyroll_snapshot import CrunchyrollSnapshotError, _CrunchyrollRequestPacer, _start_auth_session
+    from ..crunchyroll_snapshot import CrunchyrollSnapshotError, _build_request_pacer, _start_auth_session
 
     normalized_limit = max(1, min(int(limit or 10), 10))
     q = str(query or "").strip()
     if not q:
         return []
-    pacer = _CrunchyrollRequestPacer(
-        spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
-        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_jitter_seconds", 0.0) or 0.0)),
-    )
-    session = _start_auth_session(
-        config,
-        profile="default",
-        timeout_seconds=float(getattr(config.crunchyroll, "request_timeout_seconds", 30.0) or 30.0),
-        pacer=pacer,
-    )
+    if session is None:
+        session = _start_auth_session(
+            config,
+            profile="default",
+            timeout_seconds=_request_timeout_seconds(config),
+            pacer=_build_request_pacer(config),
+        )
     endpoint = "https://www.crunchyroll.com/content/v2/discover/search"
     payload = session.authorized_json_get(
         endpoint,
@@ -323,23 +333,15 @@ def _seasons_from_crunchyroll_payload(payload: Any) -> list[dict[str, Any]]:
     return seasons
 
 
-def _fetch_search_result_children(config: AppConfig, match: Any) -> list[dict[str, Any]]:
+def _fetch_search_result_children(config: AppConfig, match: Any, *, session=None) -> list[dict[str, Any]]:
     """Fetch bounded Crunchyroll CMS child season metadata for an aggregate search hit."""
-    from ..crunchyroll_snapshot import _CrunchyrollRequestPacer, _start_auth_session
+    from ..crunchyroll_snapshot import _build_request_pacer, _start_auth_session
 
     provider_series_id = _provider_series_id_from_match(match)
     if not provider_series_id:
         return []
-    pacer = _CrunchyrollRequestPacer(
-        spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
-        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_jitter_seconds", 0.0) or 0.0)),
-    )
-    session = _start_auth_session(
-        config,
-        profile="default",
-        timeout_seconds=float(getattr(config.crunchyroll, "request_timeout_seconds", 30.0) or 30.0),
-        pacer=pacer,
-    )
+    if session is None:
+        session = _start_auth_session(config, profile="default", timeout_seconds=_request_timeout_seconds(config), pacer=_build_request_pacer(config))
     payload = session.authorized_json_get(
         f"https://www.crunchyroll.com/content/v2/cms/series/{provider_series_id}/seasons",
         params={"locale": getattr(config.crunchyroll, "locale", "en-US") or "en-US"},
@@ -348,28 +350,20 @@ def _fetch_search_result_children(config: AppConfig, match: Any) -> list[dict[st
     return _seasons_from_crunchyroll_payload(payload)
 
 
-def _fetch_search_result_detail(config: AppConfig, match: Any):
+def _fetch_search_result_detail(config: AppConfig, match: Any, *, session=None):
     """Fetch a bounded authenticated Crunchyroll CMS series detail payload.
 
     Crunchyroll discover search sometimes omits audio locales from grouped search
     hits. The CMS series object is still read-only/account-authenticated and
     exposes the explicit ``audio_locales`` field needed for English-dub evidence.
     """
-    from ..crunchyroll_snapshot import _CrunchyrollRequestPacer, _start_auth_session
+    from ..crunchyroll_snapshot import _build_request_pacer, _start_auth_session
 
     provider_series_id = _provider_series_id_from_match(match)
     if not provider_series_id:
         return match
-    pacer = _CrunchyrollRequestPacer(
-        spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
-        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_jitter_seconds", 0.0) or 0.0)),
-    )
-    session = _start_auth_session(
-        config,
-        profile="default",
-        timeout_seconds=float(getattr(config.crunchyroll, "request_timeout_seconds", 30.0) or 30.0),
-        pacer=pacer,
-    )
+    if session is None:
+        session = _start_auth_session(config, profile="default", timeout_seconds=_request_timeout_seconds(config), pacer=_build_request_pacer(config))
     payload = session.authorized_json_get(
         f"https://www.crunchyroll.com/content/v2/cms/series/{provider_series_id}",
         params={"locale": getattr(config.crunchyroll, "locale", "en-US") or "en-US"},

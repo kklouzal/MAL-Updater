@@ -3,17 +3,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .config import AppConfig
 from .db import (
     connect,
     get_mal_anime_metadata_map,
     get_provider_title_search_cache,
+    get_provider_enriched_detail_cache,
+    record_provider_enriched_detail_failure,
     get_recommendation_provider_eligibility_evidence,
     list_series_mappings,
     replace_review_queue_entries,
     upsert_provider_title_search_cache,
+    upsert_provider_enriched_detail_cache,
     upsert_recommendation_provider_eligibility_evidence,
 )
 from .mapping import normalize_title
@@ -28,6 +31,9 @@ from .recommendation_actionability import (
 from .recommendations import Recommendation, build_recommendations
 
 PROVIDER_SEARCH_CACHE_TTL_DAYS = 365
+PROVIDER_SEARCH_CACHE_LOGIC_VERSION = "provider-title-v2"
+PROVIDER_DETAIL_CACHE_LOGIC_VERSION = "crunchyroll-detail-v1"
+PROVIDER_ELIGIBILITY_LOGIC_VERSION = "provider-eligibility-v1"
 PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS = 7
 DISCOVERY_PROVIDER_SEARCH_REVIEW_ISSUE = "discovery_provider_search_match_review"
 DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS = STRICT_PROVIDER_ELIGIBILITY_PROVIDERS
@@ -61,6 +67,9 @@ class EnrichmentSummary:
     provider_search_failures: int = 0
     provider_detail_probes: int = 0
     provider_detail_failures: int = 0
+    eligibility_fresh_skips: int = 0
+    eligibility_expired_retries: int = 0
+    eligibility_retry_backoff_skips: int = 0
     failure_details: list[dict[str, str]] = field(default_factory=list)
     eligibility_evidence_upserted: int = 0
     verified_eligibility_evidence_upserted: int = 0
@@ -85,6 +94,9 @@ class EnrichmentSummary:
             "provider_search_failures": self.provider_search_failures,
             "provider_detail_probes": self.provider_detail_probes,
             "provider_detail_failures": self.provider_detail_failures,
+            "eligibility_fresh_skips": self.eligibility_fresh_skips,
+            "eligibility_expired_retries": self.eligibility_expired_retries,
+            "eligibility_retry_backoff_skips": self.eligibility_retry_backoff_skips,
             "failure_details": self.failure_details,
             "eligibility_evidence_upserted": self.eligibility_evidence_upserted,
             "verified_eligibility_evidence_upserted": self.verified_eligibility_evidence_upserted,
@@ -557,15 +569,37 @@ def _fetch_provider_children_if_available(
     provider: ProviderTitleSearchClient,
     config: AppConfig,
     match: dict[str, Any],
+    *,
+    provider_session: Any | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     cached_children = _provider_child_items_from_match(match)
     if cached_children:
         return cached_children, False
+    provider_slug = str(getattr(provider, "slug", ""))
+    provider_series_id = str(match.get("provider_series_id") or "")
+    current = _utc_now()
+    current_iso = _iso(current)
+    if provider_slug == "crunchyroll" and provider_series_id:
+        cached = get_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
+            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION, now=current_iso)
+        if cached is not None:
+            if cached.status == "failed" and cached.next_retry_at and cached.next_retry_at > current_iso:
+                return [], False
+            children = _provider_child_items_from_match(cached.response)
+            if children:
+                return children, False
     children_func = getattr(provider, "fetch_search_result_children", None)
     if not callable(children_func):
         return [], False
-    fetched = children_func(config, match)
-    return _coerce_provider_child_items(fetched), True
+    fetched = children_func(config, match, session=provider_session) if provider_session is not None else children_func(config, match)
+    children = _coerce_provider_child_items(fetched)
+    if provider_slug == "crunchyroll" and provider_series_id and children:
+        ttl = max(0, int(getattr(config.mal, "provider_detail_cache_ttl_days", 30)))
+        upsert_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
+            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+            detail={**match, "children": children}, fetched_at=current_iso,
+            expires_at=_iso(current + timedelta(days=ttl)))
+    return children, True
 
 
 def _aggregate_shell_parent_metadata_reasons(
@@ -922,14 +956,50 @@ def _fetch_provider_detail_if_available(
     provider: ProviderTitleSearchClient,
     config: AppConfig,
     match: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    force_refresh: bool = False,
+    provider_session: Any | None = None,
+    provider_session_factory: Callable[[], Any | None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     detail_func = getattr(provider, "fetch_search_result_detail", None)
     if not callable(detail_func) or not _provider_detail_needed(provider, match):
         return match, False
-    enriched = detail_func(config, match)
+    provider_slug = str(getattr(provider, "slug", ""))
+    provider_series_id = str(match.get("provider_series_id") or "")
+    current = now or _utc_now()
+    current_iso = _iso(current)
+    if provider_slug == "crunchyroll" and provider_series_id and not force_refresh:
+        cached = get_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
+            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION, now=current_iso)
+        if cached is not None and cached.status == "ok":
+            return _match_to_dict(cached.response), False
+        if cached is not None and cached.status == "failed" and cached.next_retry_at and cached.next_retry_at > current_iso:
+            return match, False
+    if provider_session is None and provider_session_factory is not None:
+        provider_session = provider_session_factory()
+    try:
+        enriched = detail_func(config, match, session=provider_session) if provider_session is not None else detail_func(config, match)
+    except Exception as exc:
+        if provider_slug == "crunchyroll" and provider_series_id:
+            prior = get_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
+                provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION)
+            failure_count = (prior.failure_count if prior else 0) + 1
+            delay_hours = min(24, 2 ** min(failure_count - 1, 5))
+            record_provider_enriched_detail_failure(config.db_path, provider=provider_slug,
+                provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+                fetched_at=current_iso, next_retry_at=_iso(current + timedelta(hours=delay_hours)),
+                expires_at=_iso(current + timedelta(days=7)), error=str(exc))
+        raise
     if enriched is None:
         return match, True
-    return _match_to_dict(enriched), True
+    normalized = _match_to_dict(enriched)
+    if provider_slug == "crunchyroll" and provider_series_id:
+        ttl = max(0, int(getattr(config.mal, "provider_detail_cache_ttl_days", 30)))
+        upsert_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
+            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+            detail=normalized, fetched_at=current_iso, expires_at=_iso(current + timedelta(days=ttl)))
+    return normalized, True
 
 
 def _upsert_search_eligibility_evidence(
@@ -1032,8 +1102,45 @@ def _upsert_search_eligibility_evidence(
         fetched_at=fetched_at,
         expires_at=expires_at,
         last_verified_at=last_verified_at,
+        refresh_status="ok",
+        failure_count=0,
+        next_retry_at=None,
+        logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
     )
     return True, verified_identity, verified_actionable
+
+
+def _record_eligibility_refresh_failure(
+    config: AppConfig,
+    evidence: Any,
+    *,
+    now: datetime,
+) -> None:
+    failure_count = max(0, int(evidence.failure_count)) + 1
+    delay_hours = min(24, 2 ** min(failure_count - 1, 5))
+    upsert_recommendation_provider_eligibility_evidence(
+        config.db_path,
+        mal_anime_id=evidence.mal_anime_id,
+        provider=evidence.provider,
+        provider_series_id=evidence.provider_series_id,
+        provider_title=evidence.provider_title,
+        provider_url=evidence.provider_url,
+        identity_match_kind=evidence.identity_match_kind,
+        match_confidence=evidence.match_confidence,
+        review_status=evidence.review_status,
+        catalog_status=evidence.catalog_status,
+        english_dub_status=evidence.english_dub_status,
+        explicit_dub_evidence_source=evidence.explicit_dub_evidence_source,
+        audio_locales=evidence.audio_locales,
+        source_evidence=evidence.source_evidence,
+        fetched_at=evidence.fetched_at,
+        expires_at=evidence.expires_at,
+        last_verified_at=evidence.last_verified_at,
+        refresh_status="failed",
+        failure_count=failure_count,
+        next_retry_at=_iso(now + timedelta(hours=delay_hours)),
+        logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+    )
 
 
 def _provider_title_norms(match: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1357,6 +1464,7 @@ def _verified_aggregate_shell_candidates(
     title_family: list[TargetTitleAlias],
     child_probe_cache: dict[tuple[str, str], list[dict[str, Any]]],
     child_probe_failures: set[tuple[str, str]],
+    provider_session: Any | None = None,
 ) -> list[AggregateShellVerification]:
     if "franchise_shell_overlap" not in decision.reasons:
         return []
@@ -1377,7 +1485,7 @@ def _verified_aggregate_shell_candidates(
             elif probe_key is not None and probe_key in child_probe_failures:
                 children = []
             else:
-                children, children_attempted = _fetch_provider_children_if_available(provider, config, match)
+                children, children_attempted = _fetch_provider_children_if_available(provider, config, match, provider_session=provider_session)
                 if probe_key is not None and children_attempted:
                     child_probe_cache[probe_key] = children
             if children_attempted:
@@ -1435,8 +1543,10 @@ def enrich_discovery_provider_availability(
     providers: list[ProviderTitleSearchClient],
     candidate_limit: int = 25,
     search_limit: int = 10,
+    queries_per_candidate: int = 0,
     now: datetime | None = None,
     persist_review_queue: bool = True,
+    force_refresh: bool = False,
 ) -> EnrichmentSummary:
     current = now or _utc_now()
     fetched_at = _iso(current)
@@ -1461,6 +1571,16 @@ def enrich_discovery_provider_availability(
     review_entries: list[dict[str, Any]] = []
     child_probe_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     child_probe_failures: set[tuple[str, str]] = set()
+    provider_sessions: dict[str, Any] = {}
+
+    def request_session(provider: ProviderTitleSearchClient) -> Any | None:
+        slug = str(getattr(provider, "slug", ""))
+        if slug in provider_sessions:
+            return provider_sessions[slug]
+        factory = getattr(provider, "create_request_session", None)
+        session = factory(config) if callable(factory) else None
+        provider_sessions[slug] = session
+        return session
     for item in candidates[:candidate_limit]:
         summary.candidates_considered += 1
         mal_id = _candidate_mal_id(item)
@@ -1469,6 +1589,8 @@ def enrich_discovery_provider_availability(
             continue
         title_family = build_target_title_family(meta)
         queries = select_english_provider_search_queries(meta)
+        if queries_per_candidate > 0:
+            queries = queries[:queries_per_candidate]
         if not queries:
             continue
         summary.queries_selected += len(queries)
@@ -1478,14 +1600,20 @@ def enrich_discovery_provider_availability(
                 continue
             for query in queries:
                 normalized_query = normalize_title(query)
-                cached = get_provider_title_search_cache(config.db_path, provider=provider.slug, normalized_query=normalized_query, now=fetched_at)
+                identity_key = f"mal:{mal_id or ''}"
+                cached = None if force_refresh else get_provider_title_search_cache(
+                    config.db_path, provider=provider.slug, normalized_query=normalized_query, now=fetched_at,
+                    logic_version=PROVIDER_SEARCH_CACHE_LOGIC_VERSION, search_limit=search_limit,
+                    identity_key=identity_key,
+                )
                 if cached is not None:
                     summary.cache_hits += 1
                     matches = _dedupe_provider_matches(cached.matches)
                 else:
                     summary.cache_misses += 1
                     try:
-                        raw_matches = provider.search_title(config, query, limit=search_limit)
+                        session = request_session(provider)
+                        raw_matches = provider.search_title(config, query, limit=search_limit, session=session) if session is not None else provider.search_title(config, query, limit=search_limit)
                     except Exception as exc:  # provider/auth/network errors must not stale-out good evidence
                         summary.provider_search_failures += 1
                         if len(summary.failure_details) < 10:
@@ -1504,14 +1632,67 @@ def enrich_discovery_provider_availability(
                         status="ok",
                         fetched_at=fetched_at,
                         expires_at=expires_at,
+                        logic_version=PROVIDER_SEARCH_CACHE_LOGIC_VERSION,
+                        search_limit=search_limit,
+                        identity_key=identity_key,
                     )
                 decision = classify_provider_matches(query, matches, title_family)
                 if decision.kind == "strong" and decision.selected:
                     match = decision.selected[0]
                     provider_series_id = match.get("provider_series_id")
                     if provider_series_id:
+                        existing_evidence = None
+                        if provider.slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS:
+                            existing_evidence = get_recommendation_provider_eligibility_evidence(
+                                config.db_path, mal_anime_id=int(mal_id), provider=provider.slug,
+                                provider_series_id=str(provider_series_id),
+                            )
+                        if (not force_refresh and cached is not None and existing_evidence is not None
+                                and existing_evidence.fetched_at != fetched_at
+                                and existing_evidence.refresh_status == "ok"
+                                and existing_evidence.logic_version == PROVIDER_ELIGIBILITY_LOGIC_VERSION
+                                and is_strict_provider_eligibility_actionable(existing_evidence, now=fetched_at)
+                                and not bool(mappings_by_series.get((provider.slug, str(provider_series_id))))):
+                            summary.eligibility_fresh_skips += 1
+                            continue
+                        if cached is not None and existing_evidence is not None and existing_evidence.expires_at <= fetched_at:
+                            # Search-cache identity is reusable for 365d, but availability is not.
+                            # Re-query this bounded title before issuing a new current eligibility claim.
+                            if (
+                                not force_refresh
+                                and existing_evidence.refresh_status == "failed"
+                                and existing_evidence.logic_version == PROVIDER_ELIGIBILITY_LOGIC_VERSION
+                                and existing_evidence.next_retry_at is not None
+                                and existing_evidence.next_retry_at > fetched_at
+                            ):
+                                summary.eligibility_retry_backoff_skips += 1
+                                continue
+                            summary.eligibility_expired_retries += 1
+                            try:
+                                session = request_session(provider)
+                                raw_matches = provider.search_title(config, query, limit=search_limit, session=session) if session is not None else provider.search_title(config, query, limit=search_limit)
+                            except Exception as exc:
+                                _record_eligibility_refresh_failure(config, existing_evidence, now=current)
+                                summary.provider_search_failures += 1
+                                if len(summary.failure_details) < 10:
+                                    summary.failure_details.append({"provider": str(provider.slug), "query": query, "error": str(exc)})
+                                continue
+                            summary.provider_searches += 1
+                            matches = _dedupe_provider_matches([_match_to_dict(value) for value in raw_matches])
+                            decision = classify_provider_matches(query, matches, title_family)
+                            if decision.kind != "strong" or not decision.selected:
+                                continue
+                            match = decision.selected[0]
+                            provider_series_id = match.get("provider_series_id")
+                            if not provider_series_id:
+                                continue
                         try:
-                            match, detail_attempted = _fetch_provider_detail_if_available(provider, config, match)
+                            match, detail_attempted = _fetch_provider_detail_if_available(
+                                provider, config, match, now=current, force_refresh=force_refresh,
+                                provider_session=provider_sessions.get(str(provider.slug)),
+                                provider_session_factory=(lambda provider=provider: request_session(provider))
+                                if _provider_detail_needed(provider, match) else None,
+                            )
                             if detail_attempted:
                                 summary.provider_detail_probes += 1
                         except Exception as exc:  # detail enrichment is optional; keep the search hit evidence
@@ -1548,6 +1729,7 @@ def enrich_discovery_provider_availability(
                         title_family=title_family,
                         child_probe_cache=child_probe_cache,
                         child_probe_failures=child_probe_failures,
+                        provider_session=request_session(provider),
                     )
                     if len(verified_shells) == 1:
                         verification = verified_shells[0]

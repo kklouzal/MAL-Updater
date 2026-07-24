@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from socket import timeout as SocketTimeout
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from mal_updater.config import AppConfig, MalSecrets, MalSettings, DEFAULT_MAL_BASE_URL
@@ -44,6 +47,25 @@ class MalClientTests(unittest.TestCase):
             mal=MalSettings(request_spacing_seconds=0.0, request_spacing_jitter_seconds=0.0),
         )
 
+    def test_token_exchange_and_refresh_failures_are_single_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            config.mal.retry_max_attempts = 5
+            client = MalClient(config, MalSecrets(
+                client_id="client-id", client_secret=None, access_token=None, refresh_token="refresh-token",
+                client_id_path=config.secrets_dir / "mal_client_id.txt", client_secret_path=config.secrets_dir / "mal_client_secret.txt",
+                access_token_path=config.secrets_dir / "mal_access_token.txt", refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
+            ))
+            effects = [
+                HTTPError(config.mal.token_url, 503, "busy", {}, io.BytesIO(b"busy")),
+                SocketTimeout("ambiguous"),
+            ]
+            for effect, call in ((effects[0], lambda: client.exchange_code("one-shot-code", "verifier")), (effects[1], client.refresh_access_token)):
+                with patch("mal_updater.mal_client.urlopen", side_effect=effect) as send:
+                    with self.assertRaises(MalApiError):
+                        call()
+                self.assertEqual(1, send.call_count)
+
     def test_search_anime_strips_dub_noise_before_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
@@ -72,6 +94,62 @@ class MalClientTests(unittest.TestCase):
             query = parse_qs(urlparse(requested_urls[0]).query)["q"][0]
             self.assertEqual(query, "Sword Art Online the Movie -Progressive- Scherzo of Deep Night")
             self.assertNotIn("Dub", query)
+
+    def test_timeout_retry_records_each_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=config.secrets_dir / "mal_client_id.txt",
+                    client_secret_path=config.secrets_dir / "mal_client_secret.txt",
+                    access_token_path=config.secrets_dir / "mal_access_token.txt",
+                    refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
+                ),
+            )
+            with patch("mal_updater.mal_client.urlopen", side_effect=SocketTimeout("simulated timeout")):
+                with self.assertRaisesRegex(MalApiError, "timeout after 2 attempts"):
+                    client.get_my_user()
+
+            events = [json.loads(line) for line in config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(2, len(events))
+            self.assertEqual(["timeout", "timeout"], [event["outcome"] for event in events])
+            self.assertEqual(events[0]["attempt_sequence"] + 1, events[1]["attempt_sequence"])
+
+    def test_get_retries_selected_5xx_and_honors_capped_retry_after(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            config.mal.retry_backoff_base_seconds = 0.0
+            config.mal.retry_backoff_jitter_seconds = 0.0
+            config.mal.retry_after_cap_seconds = 0.5
+            client = MalClient(config, MalSecrets(
+                client_id="client-id", client_secret=None, access_token="access-token", refresh_token=None,
+                client_id_path=config.secrets_dir / "mal_client_id.txt", client_secret_path=config.secrets_dir / "mal_client_secret.txt",
+                access_token_path=config.secrets_dir / "mal_access_token.txt", refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
+            ))
+            error = HTTPError("https://example.invalid", 503, "busy", {"Retry-After": "10"}, io.BytesIO(b"busy"))
+            with patch("mal_updater.mal_client.urlopen", side_effect=[error, _JsonResponse({"id": 1})]) as send, patch("mal_updater.mal_client.time.sleep") as sleep:
+                payload = client.get_my_user()
+            self.assertEqual({"id": 1}, payload)
+            self.assertEqual(2, send.call_count)
+            sleep.assert_called_once_with(0.5)
+
+    def test_put_timeout_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, MalSecrets(
+                client_id="client-id", client_secret=None, access_token="access-token", refresh_token=None,
+                client_id_path=config.secrets_dir / "mal_client_id.txt", client_secret_path=config.secrets_dir / "mal_client_secret.txt",
+                access_token_path=config.secrets_dir / "mal_access_token.txt", refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
+            ))
+            with patch("mal_updater.mal_client.urlopen", side_effect=SocketTimeout("ambiguous write")) as send:
+                with self.assertRaises(MalApiError):
+                    client.update_my_list_status(1, status="watching", num_watched_episodes=1)
+            self.assertEqual(1, send.call_count)
 
     def test_search_anime_strips_broader_provider_audio_noise(self) -> None:
         cases = {

@@ -84,6 +84,15 @@ class HealthCheckCliTests(unittest.TestCase):
             exit_code = cli_main()
         return exit_code, stdout.getvalue()
 
+    def test_health_json_exposes_effective_niceness_policy(self) -> None:
+        _exit_code, payload = self._run_health_check()
+
+        policy = payload["niceness_policy"]
+        self.assertEqual(3600, policy["cadences"]["provider_hot_incremental_seconds"])
+        self.assertEqual(604800, policy["cadences"]["provider_cold_full_seconds"])
+        self.assertEqual(28800, policy["cadences"]["mal_user_list_refresh_seconds"])
+        self.assertEqual(7, policy["cache_horizons_days"]["provider_eligibility_evidence"])
+
     def _provision_repo_owned_automation_assets(self) -> None:
         source_dir = self.project_root / "ops" / "systemd-user"
         source_dir.mkdir(parents=True, exist_ok=True)

@@ -769,3 +769,16 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("active=False", stdout)
         self.assertIn("service_state_parse_error=JSONDecodeError", stdout)
         self.assertIn(f"health_latest_parse_error=Expected top-level object in {self.config.health_latest_json_path.name}", stdout)
+
+    def test_service_status_exposes_effective_niceness_policy_and_cache_horizons(self) -> None:
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr="not-found\n")):
+            payload = doctor_service(self.config)
+
+        policy = payload["niceness_policy"]
+        self.assertEqual(86400, policy["cadences"]["provider_cold_full_seconds"])
+        self.assertEqual(28800, policy["cadences"]["mal_user_list_refresh_seconds"])
+        self.assertEqual(43200, policy["cadences"]["recommendation_metadata_refresh_seconds"])
+        self.assertEqual(86400, policy["cadences"]["provider_eligibility_refresh_seconds"])
+        self.assertEqual(14, policy["cache_horizons_days"]["mal_search_positive"])
+        self.assertEqual(7, policy["cache_horizons_days"]["provider_eligibility_evidence"])
+        self.assertTrue(policy["thresholds"]["task_and_provider_global_budgets_enforced"])

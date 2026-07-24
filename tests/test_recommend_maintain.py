@@ -25,7 +25,7 @@ class RecommendMaintainTests(unittest.TestCase):
             db_path=runtime_root / "data" / "mal_updater.sqlite3",
         )
 
-    def test_plan_orders_provider_mapping_metadata_snapshot_health_and_chunks_crunchyroll(self) -> None:
+    def test_explicit_plan_orders_provider_mapping_eligibility_snapshot_health_without_metadata_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
             with patch("mal_updater.service_runtime._available_source_providers", return_value=["crunchyroll"]):
@@ -45,7 +45,6 @@ class RecommendMaintainTests(unittest.TestCase):
                 "maintain_provider_refresh_crunchyroll",
                 "maintain_safe_mapping_review",
                 "maintain_mal_list_refresh",
-                "maintain_recommend_metadata",
                 "maintain_recommend_provider_eligibility",
                 "maintain_recommend_snapshot",
                 "maintain_health",
@@ -60,8 +59,12 @@ class RecommendMaintainTests(unittest.TestCase):
         self.assertEqual(provider_args[provider_args.index("--max-watchlist-pages") + 1], "3")
         self.assertEqual(plan[1]["args"][-3:], ["--limit", "10", "--exact-approved-only"])
         self.assertEqual(plan[2]["args"][-2:], ["--max-pages", "3"])
-        self.assertEqual(plan[4]["args"][-4:], ["--limit", "20", "--search-limit", "5"])
-        self.assertIn("--persist-snapshot", plan[5]["args"])
+        self.assertEqual(
+            plan[3]["args"][-6:],
+            ["--limit", "20", "--search-limit", "5", "--queries-per-candidate", "1"],
+        )
+        self.assertIn("--persist-snapshot", plan[4]["args"])
+        self.assertNotIn("recommend-refresh-metadata", [arg for step in plan for arg in step["args"]])
 
     def test_provider_fetch_command_caps_crunchyroll_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,7 +126,7 @@ class RecommendMaintainTests(unittest.TestCase):
 
             def fake_run(_config: AppConfig, _args: list[str], *, label: str) -> dict[str, object]:
                 calls.append(label)
-                if label == "maintain_recommend_metadata":
+                if label == "maintain_recommend_provider_eligibility":
                     return {"status": "error", "label": label, "returncode": 4, "stderr": "boom", "stdout": ""}
                 return {"status": "ok", "label": label, "returncode": 0, "stderr": "", "stdout": "{}"}
 
@@ -137,7 +140,6 @@ class RecommendMaintainTests(unittest.TestCase):
             [
                 "maintain_safe_mapping_review",
                 "maintain_mal_list_refresh",
-                "maintain_recommend_metadata",
                 "maintain_recommend_provider_eligibility",
                 "maintain_recommend_snapshot",
                 "maintain_health",
@@ -145,7 +147,20 @@ class RecommendMaintainTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "partial_error")
         self.assertEqual(len(result["failures"]), 1)
-        self.assertEqual(result["failures"][0]["label"], "maintain_recommend_metadata")
+        self.assertEqual(result["failures"][0]["label"], "maintain_recommend_provider_eligibility")
+
+    def test_daemon_local_only_plan_has_no_network_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            with patch("mal_updater.service_runtime._available_source_providers", return_value=["crunchyroll"]):
+                plan = maintenance_cycle_plan(config, local_only=True)
+
+        self.assertEqual(["maintain_recommend_snapshot", "maintain_health"], [step["label"] for step in plan])
+        command_text = " ".join(arg for step in plan for arg in step["args"])
+        self.assertNotIn("provider-fetch-snapshot", command_text)
+        self.assertNotIn("mal-list-refresh", command_text)
+        self.assertNotIn("recommend-refresh-metadata", command_text)
+        self.assertNotIn("recommend-enrich-provider-availability", command_text)
 
     def test_daemon_task_specs_keep_snapshot_materialization_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

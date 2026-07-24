@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -114,11 +116,12 @@ class HidiveProviderSearchTests(unittest.TestCase):
             ]
         }
         response = _FakeCurlResponse(payload)
-        config = SimpleNamespace(request_timeout_seconds=12)
-
-        with patch.object(hidive, "curl_requests", SimpleNamespace(post=lambda *args, **kwargs: response)) as fake_curl:
-            with patch.object(fake_curl, "post", return_value=response) as mock_post:
-                results = hidive._search_title(config, "Test Show", limit=3)
+        with tempfile.TemporaryDirectory() as td:
+            config = SimpleNamespace(request_timeout_seconds=12, api_request_events_path=Path(td) / "events.jsonl")
+            with patch.object(hidive, "curl_requests", SimpleNamespace(post=lambda *args, **kwargs: response)) as fake_curl:
+                with patch.object(fake_curl, "post", return_value=response) as mock_post:
+                    results = hidive._search_title(config, "Test Show", limit=3)
+            events = [json.loads(line) for line in config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
 
         self.assertEqual(["42"], [r.provider_series_id for r in results])
         self.assertEqual([["en-US"]], [r.audio_locales for r in results])
@@ -133,6 +136,7 @@ class HidiveProviderSearchTests(unittest.TestCase):
         self.assertIn("query=Test+Show", body["params"])
         self.assertIn("hitsPerPage=3", body["params"])
         self.assertIn("filters=type%3AVOD_SERIES", body["params"])
+        self.assertEqual(["algolia_search"], [event["operation"] for event in events])
 
 
 if __name__ == "__main__":

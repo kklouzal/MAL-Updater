@@ -645,6 +645,19 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
 
     print(f"healthy={bool(payload.get('healthy'))}")
     print(f"warning_count={len(warnings)}")
+    niceness_policy = payload.get("niceness_policy") if isinstance(payload.get("niceness_policy"), dict) else {}
+    cadences = niceness_policy.get("cadences") if isinstance(niceness_policy.get("cadences"), dict) else {}
+    for name in (
+        "provider_hot_incremental_seconds",
+        "provider_cold_full_seconds",
+        "mal_user_list_refresh_seconds",
+        "recommendation_metadata_refresh_seconds",
+        "provider_eligibility_refresh_seconds",
+        "recommendation_snapshot_health_seconds",
+    ):
+        value = cadences.get(name)
+        if isinstance(value, int):
+            print(f"niceness_{name}={value}")
     if isinstance(mapping_coverage, dict):
         approved_count = mapping_coverage.get("approved_mapping_count")
         provider_series_count = mapping_coverage.get("provider_series_count")
@@ -742,6 +755,8 @@ def build_health_report(
     mapping_coverage_threshold: float,
     maintenance_review_limit: int,
 ) -> dict[str, object]:
+    from .service_runtime import effective_niceness_policy
+
     ensure_directories(config)
     bootstrap_database(config.db_path)
     secrets = load_mal_secrets(config)
@@ -1127,6 +1142,7 @@ def build_health_report(
     payload = {
         "healthy": not health_blocking_warnings,
         "stale_hours_threshold": stale_hours,
+        "niceness_policy": effective_niceness_policy(config),
         "warnings": warnings,
         "maintenance": {
             "recommended_commands": maintenance_commands,
