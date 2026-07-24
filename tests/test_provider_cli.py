@@ -146,12 +146,20 @@ class ProviderCliTests(unittest.TestCase):
         self.assertIn("MAL refreshes are paced by client throttling", help_text)
         self.assertIn("spread over time", help_text)
 
-    def test_reserved_sync_command_stays_parseable_for_cli_compatibility(self) -> None:
+    def test_dead_sync_placeholder_is_absent_but_real_sync_commands_remain(self) -> None:
         parser = build_parser()
         provider_action = next(action for action in parser._actions if getattr(action, "choices", None))
+        commands = set(provider_action.choices)
 
-        self.assertIn("sync", provider_action.choices)
-        self.assertIn("Reserved for future sync orchestration", provider_action.choices["sync"].format_help())
+        self.assertNotIn("sync", provider_action.choices)
+        self.assertNotIn("sync", commands)
+        for command in ("dry-run-sync", "apply-sync", "exact-approved-sync-cycle"):
+            with self.subTest(command=command):
+                self.assertIn(command, commands)
+                self.assertEqual(command, parser.parse_args([command]).command)
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["sync"])
+        self.assertEqual(2, raised.exception.code)
 
 
 if __name__ == "__main__":

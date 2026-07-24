@@ -67,6 +67,7 @@ from .service_manager import doctor_service, install_service, restart_service, s
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
 from .sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
+    MAPPING_REVIEW_NO_QUEUE_DECISIONS,
     build_dry_run_sync_plan,
     build_mapping_review,
     execute_approved_sync,
@@ -75,7 +76,6 @@ from .sync_planner import (
     persist_sync_review_queue,
 )
 from .validation import SnapshotValidationError, validate_snapshot_payload
-
 
 
 def _cmd_init(project_root: Path | None) -> int:
@@ -4295,7 +4295,7 @@ def _refresh_mapping_review_queue_for_provider_series_ids(
     )
     queue_entries = []
     for item in items:
-        if item.decision in {"preserved", "auto_approved", "ready_for_approval"}:
+        if item.decision in MAPPING_REVIEW_NO_QUEUE_DECISIONS:
             continue
         severity = "error" if item.decision == "needs_manual_match" else "warning"
         queue_entries.append(
@@ -6551,12 +6551,6 @@ def _cmd_push_recommendations_webhook(
     return 0 if result.status in {"dry_run", "delivered", "no_recommendations"} else 1
 
 
-def _cmd_sync(_: Path | None) -> int:
-    raise SystemExit(
-        "Sync pipeline not implemented yet. Use 'dry-run-sync' for guarded read-only proposals or 'apply-sync' for the approved-mapping-only executor."
-    )
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mal-updater")
     parser.add_argument("--project-root", type=Path, default=None, help="Override project root")
@@ -6984,11 +6978,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Build the outbound payload without performing the webhook POST",
     )
-    subparsers.add_parser(
-        "sync",
-        help="Reserved for future sync orchestration",
-        description="Reserved for future sync orchestration",
-    )
     return parser
 
 
@@ -7286,8 +7275,6 @@ def main() -> int:
             args.delivery_mode,
             args.dry_run,
         )
-    if args.command == "sync":
-        return _cmd_sync(args.project_root)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

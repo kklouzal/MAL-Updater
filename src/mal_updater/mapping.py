@@ -55,6 +55,9 @@ _BUNDLE_DISQUALIFYING_REASON_PREFIXES = (
     "installment_hint_conflict=",
     "base_installment_penalty_for_explicit_later_season",
 )
+_MULTI_ENTRY_BUNDLE_REASON_PREFIX = "multi_entry_bundle_suspected="
+_DETERMINISTIC_BUNDLE_MIN_SCORE = 0.99
+_DETERMINISTIC_BUNDLE_CLOSE_COMPETITOR_GAP = 0.12
 
 from .mal_client import MalApiError, MalClient
 
@@ -108,6 +111,7 @@ _COUR_NUMBER_RE = re.compile(r"\bcour\s*(\d+)\b", re.IGNORECASE)
 _FINAL_SEASON_RE = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
 _PLUS_INSTALLMENT_RE = re.compile(r"[+＋](?:!+)?(?:\s*[)\]]\s*)?$")
 _SEASON_RANGE_RE = re.compile(r"\bseasons?\s+\d+\s*[-/]\s*\d+\b", re.IGNORECASE)
+_TITLE_DOMAIN_NUMERAL_MARKERS = frozenset({"level", "lvl", "lv", "rank", "class", "grade"})
 _STANDALONE_SEASON_RE = re.compile(r"^season\s+\d+$", re.IGNORECASE)
 _STANDALONE_PART_RE = re.compile(r"^part\s+\d+$", re.IGNORECASE)
 _STANDALONE_COUR_RE = re.compile(
@@ -267,6 +271,9 @@ class MappingResult:
     rationale: list[str]
     bundle_companion_candidate: MappingCandidate | None = None
     bundle_companion_candidates: list[MappingCandidate] | None = None
+
+    def is_deterministic_multi_entry_bundle(self) -> bool:
+        return _is_deterministic_multi_entry_bundle(self)
 
 
 
@@ -549,6 +556,8 @@ def _extract_roman_installment_number(value: str | None) -> int | None:
     if not value:
         return None
     for match in _ROMAN_TOKEN_RE.finditer(value):
+        if _terminal_installment_is_title_domain_numeral(value, match.start()):
+            continue
         token = match.group(1).lower()
         if len(token) == 1:
             continue
@@ -618,16 +627,28 @@ def _extract_terminal_installment_number(value: str | None) -> int | None:
         return None
     numeric_match = re.search(r"\b(\d+)$", cleaned)
     if numeric_match:
+        if _terminal_installment_is_title_domain_numeral(cleaned, numeric_match.start()):
+            return None
         number = int(numeric_match.group(1))
         if 2 <= number <= _MAX_PLAUSIBLE_INSTALLMENT_NUMBER:
             return number
         return None
     roman_match = re.search(r"\b([ivx]+)$", cleaned, re.IGNORECASE)
     if roman_match:
+        if _terminal_installment_is_title_domain_numeral(cleaned, roman_match.start()):
+            return None
         number = _ROMAN_TO_NUMBER.get(roman_match.group(1).lower())
         if number is not None and number >= 2:
             return number
     return None
+
+
+def _terminal_installment_is_title_domain_numeral(cleaned: str, numeral_start: int) -> bool:
+    prefix = cleaned[:numeral_start].strip()
+    if not prefix:
+        return False
+    prefix_tokens = normalize_title_strict(prefix).split()
+    return bool(prefix_tokens and prefix_tokens[-1] in _TITLE_DOMAIN_NUMERAL_MARKERS)
 
 
 def _extract_title_hints(value: str | None) -> set[str]:
@@ -1524,6 +1545,90 @@ def _candidate_is_safe_exact_bundle_pair_member(top: MappingCandidate, companion
     return False
 
 
+def _candidate_has_positive_installment_alignment(candidate: MappingCandidate) -> bool:
+    if (
+        "exact_later_installment_alignment" in candidate.match_reasons
+        or "final_season_hint_match" in candidate.match_reasons
+    ):
+        return True
+    return any(
+        reason.startswith(
+            (
+                "season_number_match=",
+                "part_hint_match=",
+                "split_installment_match=",
+                "season_to_split_match=",
+                "roman_installment_match=",
+                "installment_hint_match=",
+            )
+        )
+        for reason in candidate.match_reasons
+    )
+
+
+def _is_deterministic_multi_entry_bundle(result: MappingResult) -> bool:
+    top = result.chosen_candidate
+    companions = list(result.bundle_companion_candidates or [])
+    if top is None or not companions:
+        return False
+    if result.confidence < _DETERMINISTIC_BUNDLE_MIN_SCORE or top.score < _DETERMINISTIC_BUNDLE_MIN_SCORE:
+        return False
+    if top.media_type != "tv" or any(companion.media_type != "tv" for companion in companions):
+        return False
+    if "supplemental_title_candidate" in top.match_reasons:
+        return False
+    if not any(reason.startswith(_MULTI_ENTRY_BUNDLE_REASON_PREFIX) for reason in result.rationale):
+        return False
+    candidate_ids = [top.mal_anime_id, *(companion.mal_anime_id for companion in companions)]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        return False
+
+    provider_episode_evidence = _provider_episode_evidence(result.series)
+    if provider_episode_evidence <= 0 or top.num_episodes is None or top.num_episodes <= 0:
+        return False
+    if provider_episode_evidence <= top.num_episodes:
+        return False
+    companion_episode_counts: list[int] = []
+    for companion in companions:
+        if companion.num_episodes is None or companion.num_episodes <= 0:
+            return False
+        companion_episode_counts.append(companion.num_episodes)
+    if provider_episode_evidence > top.num_episodes + sum(companion_episode_counts):
+        return False
+
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
+    if not _candidate_has_positive_installment_alignment(top):
+        return False
+
+    for companion in companions:
+        if companion.score < _DETERMINISTIC_BUNDLE_MIN_SCORE:
+            return False
+        shares_bundle_family = _candidate_shares_bundle_title_family(
+            top,
+            companion,
+        ) or _candidate_shares_bundle_alias_family(top, companion)
+        if not shares_bundle_family:
+            return False
+        if not _candidate_has_explicit_followup_installment_hint(companion):
+            return False
+        if not _candidate_is_safe_exact_bundle_pair_member(top, companion):
+            return False
+        if _has_reason_with_prefix(companion.match_reasons, _BUNDLE_DISQUALIFYING_REASON_PREFIXES):
+            return False
+
+    companion_ids = set(candidate_ids)
+    for candidate in result.candidates:
+        if candidate.mal_anime_id in companion_ids:
+            continue
+        if candidate.score < top.score - _DETERMINISTIC_BUNDLE_CLOSE_COMPETITOR_GAP:
+            continue
+        if _candidate_is_explainably_weaker(result.series, candidate):
+            continue
+        return False
+    return True
+
+
 
 def _candidate_installment_indexes(candidate: MappingCandidate) -> set[int]:
     indexes: set[int] = set()
@@ -1835,6 +1940,8 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
 
 def should_auto_approve_mapping(result: MappingResult) -> bool:
     if result.status != "exact" or result.chosen_candidate is None:
+        return False
+    if result.is_deterministic_multi_entry_bundle():
         return False
     reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
     provider_auxiliary_markers = _provider_auxiliary_markers(result.series)

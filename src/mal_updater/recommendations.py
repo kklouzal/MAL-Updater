@@ -591,7 +591,14 @@ def _provider_audio_locales_have_english(locales: list[Any]) -> bool:
 def _eligibility_is_actionable(evidence: RecommendationProviderEligibilityEvidence, *, now: str) -> bool:
     return (
         evidence.provider in {"crunchyroll", "hidive"}
-        and evidence.identity_match_kind in {"approved_mapping", "manual_verified", "user_exact", "auto_exact", "provider_title_search_exact"}
+        and evidence.identity_match_kind in {
+            "approved_mapping",
+            "manual_verified",
+            "user_exact",
+            "auto_exact",
+            "provider_title_search_exact",
+            "provider_franchise_shell_child_match",
+        }
         and evidence.review_status == "verified"
         and evidence.catalog_status == "present"
         and evidence.english_dub_status == "present"

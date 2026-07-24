@@ -10,7 +10,10 @@ from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
 
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
-MAPPING_REVIEW_HEURISTICS_REVISION = "2026-03-22a"
+MAPPING_REVIEW_HEURISTICS_REVISION = "2026-07-23a"
+MAPPING_REVIEW_NO_QUEUE_DECISIONS = frozenset(
+    {"preserved", "auto_approved", "ready_for_approval", "auto_classified_bundle"}
+)
 
 
 def _is_approved_mapping_eligible(persisted: PersistedSeriesMapping | None, *, exact_approved_only: bool = False) -> bool:
@@ -424,7 +427,10 @@ def build_mapping_review(
         effective_mapping = existing
         effective_status = mapping.status
         decision = "needs_review"
-        if should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
+        if mapping.is_deterministic_multi_entry_bundle():
+            decision = "auto_classified_bundle"
+            reasons.append("auto_classified_multi_entry_bundle_non_actionable")
+        elif should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
             effective_mapping = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)
             effective_status = "approved"
             decision = "auto_approved"
@@ -489,7 +495,7 @@ def build_mapping_review(
 def persist_mapping_review_queue(config: AppConfig, items: list[MappingReviewItem]) -> dict[str, int]:
     queue_entries = []
     for item in items:
-        if item.decision in {"preserved", "auto_approved", "ready_for_approval"}:
+        if item.decision in MAPPING_REVIEW_NO_QUEUE_DECISIONS:
             continue
         severity = "error" if item.decision == "needs_manual_match" else "warning"
         queue_entries.append(
@@ -773,6 +779,9 @@ def _resolve_mapping_for_sync(
         mapping_reasons.append(
             f"existing_mapping={persisted.mal_anime_id}:{persisted.mapping_source}:approved={int(persisted.approved_by_user)}"
         )
+    if mapping.is_deterministic_multi_entry_bundle():
+        mapping_reasons.append("auto_classified_multi_entry_bundle_non_actionable")
+        return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
     if should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
         persisted = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)
         mapping_reasons.append("auto_approved_exact_unique_match")

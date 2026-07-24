@@ -67,6 +67,9 @@ class CrunchyrollProvider:
     def fetch_search_result_detail(self, config: AppConfig, match):
         return _fetch_search_result_detail(config, match)
 
+    def fetch_search_result_children(self, config: AppConfig, match):
+        return _fetch_search_result_children(config, match)
+
 
 provider = CrunchyrollProvider()
 register_provider(provider)
@@ -101,6 +104,11 @@ def _audio_locales_from_crunchyroll_item(item: dict[str, Any]) -> list[str]:
     top_level = _normalize_audio_locales(item.get("audio_locales"))
     if top_level:
         return top_level
+    season_metadata = item.get("season_metadata")
+    if isinstance(season_metadata, dict):
+        season_locales = _normalize_audio_locales(season_metadata.get("audio_locales"))
+        if season_locales:
+            return season_locales
     series_metadata = item.get("series_metadata")
     if isinstance(series_metadata, dict):
         return _normalize_audio_locales(series_metadata.get("audio_locales"))
@@ -238,7 +246,8 @@ def _merge_search_result_with_detail(match: Any, detail: dict[str, Any]) -> Prov
     raw = base.get("raw") if isinstance(base.get("raw"), dict) else {}
     original_title = base.get("title")
     original_season_title = base.get("season_title")
-    return {
+    children = _seasons_from_crunchyroll_payload({"data": detail.get("seasons")}) if isinstance(detail.get("seasons"), list) else []
+    merged = {
         **base,
         "provider_series_id": summary.get("provider_series_id") or base.get("provider_series_id"),
         "title": original_title or summary.get("title"),
@@ -249,6 +258,94 @@ def _merge_search_result_with_detail(match: Any, detail: dict[str, Any]) -> Prov
         "raw": {**raw, "detail": detail},
         "detail_evidence_source": "crunchyroll_cms_series",
     }
+    if children:
+        merged["children"] = children
+    return merged
+
+
+def _int_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _season_from_crunchyroll_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    metadata = item.get("season_metadata") if isinstance(item.get("season_metadata"), dict) else {}
+    title = item.get("title") or item.get("season_title") or item.get("name") or metadata.get("title") or metadata.get("season_title")
+    if not title:
+        return None
+    season_id = item.get("id") or item.get("season_id") or metadata.get("id") or metadata.get("season_id")
+    series_id = item.get("series_id") or metadata.get("series_id")
+    episode_count = None
+    for source in (item, metadata):
+        episode_count = _int_value(source.get("episode_count") or source.get("number_of_episodes") or source.get("num_episodes") or source.get("episodes_count"))
+        if episode_count is not None:
+            break
+    return {
+        "id": str(season_id) if season_id else None,
+        "series_id": str(series_id) if series_id else None,
+        "title": str(title),
+        "season_title": str(item.get("season_title") or metadata.get("season_title") or title),
+        "season_number": _int_value(item.get("season_number") or metadata.get("season_number")),
+        "episode_count": episode_count,
+        "audio_locales": _audio_locales_from_crunchyroll_item(item),
+        "raw": item,
+    }
+
+
+def _seasons_from_crunchyroll_payload(payload: Any) -> list[dict[str, Any]]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        raw_items = data.get("items") if isinstance(data.get("items"), list) else [data]
+    elif isinstance(data, list):
+        raw_items = data
+    else:
+        raw_items = []
+    seasons: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_items:
+        season = _season_from_crunchyroll_item(item)
+        if season is None:
+            continue
+        key = (str(season.get("id") or ""), str(season.get("title") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        seasons.append(season)
+    return seasons
+
+
+def _fetch_search_result_children(config: AppConfig, match: Any) -> list[dict[str, Any]]:
+    """Fetch bounded Crunchyroll CMS child season metadata for an aggregate search hit."""
+    from ..crunchyroll_snapshot import _CrunchyrollRequestPacer, _start_auth_session
+
+    provider_series_id = _provider_series_id_from_match(match)
+    if not provider_series_id:
+        return []
+    pacer = _CrunchyrollRequestPacer(
+        spacing_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_seconds", 0.0) or 0.0)),
+        jitter_seconds=max(0.0, float(getattr(config.crunchyroll, "request_spacing_jitter_seconds", 0.0) or 0.0)),
+    )
+    session = _start_auth_session(
+        config,
+        profile="default",
+        timeout_seconds=float(getattr(config.crunchyroll, "request_timeout_seconds", 30.0) or 30.0),
+        pacer=pacer,
+    )
+    payload = session.authorized_json_get(
+        f"https://www.crunchyroll.com/content/v2/cms/series/{provider_series_id}/seasons",
+        params={"locale": getattr(config.crunchyroll, "locale", "en-US") or "en-US"},
+        phase="title-detail-seasons",
+    )
+    return _seasons_from_crunchyroll_payload(payload)
 
 
 def _fetch_search_result_detail(config: AppConfig, match: Any):

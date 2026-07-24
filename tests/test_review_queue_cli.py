@@ -1990,6 +1990,12 @@ class ReviewQueueCliTests(unittest.TestCase):
                     "severity": "warning",
                     "payload": {"decision": "needs_review", "reasons": ["keep_reason"]},
                 },
+                {
+                    "provider": "crunchyroll",
+                    "provider_series_id": "series-bundle",
+                    "severity": "warning",
+                    "payload": {"decision": "needs_review", "reasons": ["stale_bundle_reason"]},
+                },
             ],
         )
 
@@ -2015,6 +2021,17 @@ class ReviewQueueCliTests(unittest.TestCase):
                 "reasons": ["auto_approved_exact_unique_match"],
             },
         )
+        auto_classified_bundle_item = SimpleNamespace(
+            provider="crunchyroll",
+            provider_series_id="series-bundle",
+            decision="auto_classified_bundle",
+            as_dict=lambda: {
+                "provider": "crunchyroll",
+                "provider_series_id": "series-bundle",
+                "decision": "auto_classified_bundle",
+                "reasons": ["auto_classified_multi_entry_bundle_non_actionable"],
+            },
+        )
 
         argv = [
             "mal-updater",
@@ -2025,22 +2042,26 @@ class ReviewQueueCliTests(unittest.TestCase):
             "series-target",
             "--provider-series-id",
             "series-cleared",
+            "--provider-series-id",
+            "series-bundle",
         ]
-        with patch("mal_updater.cli.build_mapping_review", return_value=[refreshed_item, auto_approved_item]), patch(
-            "sys.argv", argv
-        ), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+        with patch(
+            "mal_updater.cli.build_mapping_review",
+            return_value=[refreshed_item, auto_approved_item, auto_classified_bundle_item],
+        ), patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
             exit_code = cli_main()
 
         self.assertEqual(0, exit_code)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(["series-cleared", "series-target"], payload["provider_series_ids"])
-        self.assertEqual({"resolved": 1, "inserted": 1}, payload["review_queue"])
+        self.assertEqual(["series-bundle", "series-cleared", "series-target"], payload["provider_series_ids"])
+        self.assertEqual({"resolved": 2, "inserted": 1}, payload["review_queue"])
 
         open_rows = list_review_queue_entries(self.config.db_path, status="open", issue_type="mapping_review")
         self.assertEqual(["series-target", "series-other"], [item.provider_series_id for item in open_rows])
         target_row = next(item for item in open_rows if item.provider_series_id == "series-target")
         self.assertEqual(["fresh_reason"], target_row.payload["reasons"])
         self.assertEqual([], [item.provider_series_id for item in open_rows if item.provider_series_id == "series-cleared"])
+        self.assertEqual([], [item.provider_series_id for item in open_rows if item.provider_series_id == "series-bundle"])
 
     def test_refresh_mapping_review_queue_can_target_all_open_rows(self) -> None:
         replace_review_queue_entries(

@@ -2449,6 +2449,79 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("present", visible[0].context["english_dub_signal"])
         self.assertEqual("provider_title_search_exact", visible[0].context["provider_eligibility_evidence"][0]["identity_match_kind"])
 
+    def test_provider_required_discovery_accepts_verified_franchise_shell_eligibility_evidence(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(303, title="Shell Target")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 303, "target_title": "Shell Target", "num_recommendations": 20, "raw": {}},
+        ], make_targets_available=False)
+        self._cache_provider_eligibility(
+            303,
+            provider_series_id="aggregate-shell",
+            provider_title="Shell Franchise",
+            identity_match_kind="provider_franchise_shell_child_match",
+        )
+
+        visible = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual(1, len(visible))
+        self.assertEqual("aggregate-shell", visible[0].provider_series_id)
+        self.assertEqual("provider_franchise_shell_child_match", visible[0].context["provider_eligibility_evidence"][0]["identity_match_kind"])
+
+    def test_provider_required_discovery_rejects_legacy_franchise_shell_metadata_evidence(self) -> None:
+        self._insert_series(
+            "seed-a",
+            title="Seed A",
+            season_title="Seed A (English Dub)",
+            watchlist_status="fully_watched",
+        )
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._map_series("seed-a", 100)
+        self._cache_metadata(100, title="Seed A")
+        self._cache_metadata(37450, title="Legacy Shell Target")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 37450, "target_title": "Legacy Shell Target", "num_recommendations": 20, "raw": {}},
+        ], make_targets_available=False)
+        self._cache_provider_eligibility(
+            37450,
+            provider_series_id="legacy-aggregate-shell",
+            provider_title="Legacy Shell Franchise",
+            identity_match_kind="provider_franchise_shell_metadata_match",
+        )
+
+        visible = [
+            item
+            for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
+            if item.kind == "discovery_candidate"
+        ]
+        diagnostic = [
+            item
+            for item in build_recommendations(
+                self.config,
+                limit=0,
+                require_provider_availability=False,
+                include_discovery_candidates_without_actionable_provider_evidence=True,
+            )
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual([], visible)
+        self.assertEqual(1, len(diagnostic))
+        self.assertEqual("mal", diagnostic[0].provider)
+        self.assertEqual("provider_franchise_shell_metadata_match", diagnostic[0].context["provider_eligibility_evidence"][0]["identity_match_kind"])
+
     def test_discovery_target_metadata_refresh_considers_hidive_mappings(self) -> None:
         self._insert_series(
             "hidive-seed",

@@ -16,6 +16,7 @@ from mal_updater.mapping import (
     map_series,
     normalize_title,
     should_auto_approve_mapping,
+    _extract_title_hints,
 )
 from mal_updater.sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
@@ -27,6 +28,61 @@ from mal_updater.sync_planner import (
     persist_sync_review_queue,
 )
 from tests.test_validation_ingestion import sample_snapshot
+
+
+def _write_test_mal_secret_files(root: Path) -> None:
+    (root / ".MAL-Updater" / "secrets").mkdir(parents=True, exist_ok=True)
+    (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+    (root / ".MAL-Updater" / "secrets" / "mal_access_token.txt").write_text("access-token\n", encoding="utf-8")
+
+
+def _replace_progress_with_completed_episodes(payload: dict, provider_series_id: str, episode_count: int) -> None:
+    progress_template = dict(payload["progress"][0])
+    payload["progress"] = []
+    for episode_number in range(1, episode_count + 1):
+        item = dict(progress_template)
+        item["provider_series_id"] = provider_series_id
+        item["provider_episode_id"] = f"ep-{episode_number}"
+        item["episode_number"] = episode_number
+        item["completion_ratio"] = 1.0
+        payload["progress"].append(item)
+
+
+def _misfit_split_part_search_response() -> dict:
+    return {
+        "data": [
+            {
+                "node": {
+                    "id": 48417,
+                    "title": "Maou Gakuin no Futekigousha II: Shijou Saikyou no Maou no Shiso, Tensei shite Shison-tachi no Gakkou e Kayou",
+                    "alternative_titles": {"en": "The Misfit of Demon King Academy II"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                }
+            },
+            {
+                "node": {
+                    "id": 48418,
+                    "title": "Maou Gakuin no Futekigousha II: Shijou Saikyou no Maou no Shiso, Tensei shite Shison-tachi no Gakkou e Kayou Part 2",
+                    "alternative_titles": {"en": "The Misfit of Demon King Academy II Part 2"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                }
+            },
+            {
+                "node": {
+                    "id": 40496,
+                    "title": "Maou Gakuin no Futekigousha: Shijou Saikyou no Maou no Shiso, Tensei shite Shison-tachi no Gakkou e Kayou",
+                    "alternative_titles": {"en": "The Misfit of Demon King Academy"},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 13,
+                }
+            },
+        ]
+    }
 
 
 class MappingTests(unittest.TestCase):
@@ -298,6 +354,92 @@ class MappingTests(unittest.TestCase):
         self.assertTrue(should_auto_approve_mapping(result))
         self.assertEqual(result.chosen_candidate.mal_anime_id, 56009)
         self.assertNotIn("season_number_mismatch=provider:1;candidate:9004", result.rationale)
+
+    def test_map_series_does_not_treat_level_or_lv_title_numeral_as_installment(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="GEXH3W2PK",
+                title="Chillin’ in Another World with Level 2 Super Cheat Powers",
+                season_title="Chillin’ in Another World with Level 2 Super Cheat Powers",
+                season_number=1,
+                max_episode_number=12,
+                completed_episode_count=12,
+            ),
+            [
+                {
+                    "id": 56923,
+                    "title": "Lv2 kara Cheat datta Motoyuusha Kouho no Mattari Isekai Life",
+                    "alternative_titles": {"en": "Chillin’ in Another World with Level 2 Super Cheat Powers", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                },
+                {
+                    "id": 64553,
+                    "title": "Lv2 kara Cheat datta Motoyuusha Kouho no Mattari Isekai Life 2nd Season",
+                    "alternative_titles": {"en": "Chillin’ in Another World with Level 2 Super Cheat Powers Season 2", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "not_yet_aired",
+                    "num_episodes": 0,
+                },
+                {
+                    "id": 40960,
+                    "title": "Cheat Kusushi no Slow Life: Isekai ni Tsukurou Drugstore",
+                    "alternative_titles": {"en": "Drug Store in Another World - The Slow Life of a Cheat Pharmacist", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                },
+                {
+                    "id": 35203,
+                    "title": "Isekai wa Smartphone to Tomo ni.",
+                    "alternative_titles": {"en": "In Another World With My Smartphone", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                },
+                {
+                    "id": 15315,
+                    "title": "Mondaiji-tachi ga Isekai kara Kuru Sou desu yo?",
+                    "alternative_titles": {"en": "Problem Children Are Coming from Another World, Aren't They?", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 10,
+                },
+            ],
+        )
+
+        self.assertEqual(result.status, "exact")
+        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.chosen_candidate.mal_anime_id, 56923)
+        self.assertIn("exact_normalized_title", result.rationale)
+        self.assertFalse(any(reason.startswith("season_number_mismatch=provider:1;candidate:2") for reason in result.rationale))
+        self.assertNotIn("candidate_extra_installment_hint", result.rationale)
+        self.assertFalse(any(reason.startswith("season_number_mismatch=provider:1;candidate:2") for reason in result.chosen_candidate.match_reasons))
+        self.assertNotIn("candidate_extra_installment_hint", result.chosen_candidate.match_reasons)
+
+    def test_title_domain_level_lv_rank_class_grade_numerals_are_not_installment_hints(self) -> None:
+        for title in (
+            "Chillin’ in Another World with Level 2 Super Cheat Powers",
+            "Lv2 kara Cheat datta Motoyuusha Kouho no Mattari Isekai Life",
+            "Example Level 2",
+            "Example Lv2",
+            "Example Rank 2",
+            "Example Class 2",
+            "Example Grade 2",
+        ):
+            with self.subTest(title=title):
+                self.assertFalse(_extract_title_hints(title) & {"season:2", "roman:2"})
+
+    def test_true_installment_hints_remain_recognized(self) -> None:
+        self.assertIn("season:2", _extract_title_hints("Example Show Season 2"))
+        self.assertIn("season:2", _extract_title_hints("Example Show 2nd Season"))
+        self.assertIn("part:2", _extract_title_hints("Example Show Part 2"))
+        self.assertIn("split:2", _extract_title_hints("Example Show Part 2"))
+        self.assertIn("roman:2", _extract_title_hints("Example Show II"))
+        self.assertIn("season:2", _extract_title_hints("Example Show Second Stage"))
+        self.assertIn("season:2", _extract_title_hints("Example Show Second Beat"))
 
     def test_high_confidence_english_alias_match_can_auto_approve_when_episode_evidence_fits(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -4459,7 +4601,43 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result.chosen_candidate.mal_anime_id, 48417)
         self.assertIn("multi_entry_bundle_suspected=24<=12+12", result.rationale)
         self.assertEqual({48418}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertTrue(result.is_deterministic_multi_entry_bundle())
         self.assertFalse(should_auto_approve_mapping(result))
+
+    def test_deterministic_bundle_predicate_rejects_alias_only_bundle_without_installment_evidence(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="series-alias-only-bundle",
+                title="The Melancholy of Haruhi Suzumiya",
+                season_title="The Melancholy of Haruhi Suzumiya (English Dub)",
+                season_number=1,
+                max_episode_number=28,
+                completed_episode_count=28,
+            ),
+            [
+                {
+                    "id": 849,
+                    "title": "Suzumiya Haruhi no Yuuutsu",
+                    "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 14,
+                },
+                {
+                    "id": 4382,
+                    "title": "Suzumiya Haruhi no Yuuutsu (2009)",
+                    "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 14,
+                },
+            ],
+        )
+
+        self.assertIn("multi_entry_bundle_suspected=28<=14+14", result.rationale)
+        self.assertEqual({4382}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
+        self.assertFalse(result.is_deterministic_multi_entry_bundle())
 
     def test_map_series_prefers_split_specific_candidate_over_broader_same_season_tie(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -5461,6 +5639,151 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(persisted[0].mal_anime_id, 222)
         self.assertEqual(persisted[0].mapping_source, "auto_exact")
 
+    def test_build_mapping_review_keeps_level_two_title_as_auto_approved_one_to_one(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["title"] = "Chillin’ in Another World with Level 2 Super Cheat Powers"
+            payload["series"][0]["season_title"] = "Chillin’ in Another World with Level 2 Super Cheat Powers"
+            payload["series"][0]["season_number"] = 1
+            _replace_progress_with_completed_episodes(payload, "series-123", 12)
+            ingest_snapshot_payload(payload, config)
+            _write_test_mal_secret_files(root)
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 56923,
+                                "title": "Lv2 kara Cheat datta Motoyuusha Kouho no Mattari Isekai Life",
+                                "alternative_titles": {"en": "Chillin’ in Another World with Level 2 Super Cheat Powers", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 12,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 64553,
+                                "title": "Lv2 kara Cheat datta Motoyuusha Kouho no Mattari Isekai Life 2nd Season",
+                                "alternative_titles": {"en": "Chillin’ in Another World with Level 2 Super Cheat Powers Season 2", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "not_yet_aired",
+                                "num_episodes": 0,
+                            }
+                        },
+                    ]
+                },
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=3)
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll", approved_only=True)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].decision, "auto_approved")
+        self.assertEqual(items[0].mapping_status, "approved")
+        self.assertEqual(items[0].suggested_mal_anime_id, 56923)
+        self.assertEqual([56923], [item.mal_anime_id for item in persisted])
+
+    def test_build_mapping_review_auto_classifies_deterministic_split_bundle_without_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["provider_series_id"] = "GY243NN0R"
+            payload["series"][0]["title"] = "The Misfit of Demon King Academy"
+            payload["series"][0]["season_title"] = "The Misfit of Demon King Academy II(English Dub)"
+            payload["series"][0]["season_number"] = 2
+            payload["watchlist"][0]["provider_series_id"] = "GY243NN0R"
+            _replace_progress_with_completed_episodes(payload, "GY243NN0R", 24)
+            ingest_snapshot_payload(payload, config)
+            _write_test_mal_secret_files(root)
+
+            with patch.object(MalClient, "search_anime", return_value=_misfit_split_part_search_response()):
+                items = build_mapping_review(config, limit=5, mapping_limit=5)
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item.decision, "auto_classified_bundle")
+        self.assertIsNone(item.existing_mapping)
+        self.assertEqual(item.suggested_mal_anime_id, 48417)
+        self.assertEqual({48418}, {candidate["mal_anime_id"] for candidate in item.bundle_companion_candidates})
+        self.assertIn("multi_entry_bundle_suspected=24<=12+12", item.reasons)
+        self.assertIn("auto_classified_multi_entry_bundle_non_actionable", item.reasons)
+        self.assertEqual([], persisted)
+        self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
+        self.assertEqual([], open_rows)
+
+    def test_build_mapping_review_keeps_uncertain_alias_only_bundle_in_review_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["title"] = "The Melancholy of Haruhi Suzumiya"
+            payload["series"][0]["season_title"] = "The Melancholy of Haruhi Suzumiya (English Dub)"
+            payload["series"][0]["season_number"] = 1
+            _replace_progress_with_completed_episodes(payload, "series-123", 28)
+            ingest_snapshot_payload(payload, config)
+            _write_test_mal_secret_files(root)
+
+            with patch.object(
+                MalClient,
+                "search_anime",
+                return_value={
+                    "data": [
+                        {
+                            "node": {
+                                "id": 849,
+                                "title": "Suzumiya Haruhi no Yuuutsu",
+                                "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 4382,
+                                "title": "Suzumiya Haruhi no Yuuutsu (2009)",
+                                "alternative_titles": {"en": "The Melancholy of Haruhi Suzumiya", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 14,
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": 9000,
+                                "title": "The Melancholy of Haruhi",
+                                "alternative_titles": {"synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 28,
+                            }
+                        },
+                    ]
+                },
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=5)
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].decision, "needs_review")
+        self.assertIn("multi_entry_bundle_suspected=28<=14+14", items[0].reasons)
+        self.assertNotIn("auto_classified_multi_entry_bundle_non_actionable", items[0].reasons)
+        self.assertEqual({"resolved": 0, "inserted": 1}, queue_result)
+        self.assertEqual(["series-123"], [row.provider_series_id for row in open_rows])
+
     def test_build_mapping_review_surfaces_bundle_companion_for_multi_entry_residue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -5692,6 +6015,45 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertTrue(any(reason == "auto_approved_exact_unique_match" for reason in proposals[0].reasons))
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0].mal_anime_id, 333)
+
+    def test_build_dry_run_sync_plan_keeps_deterministic_split_bundle_unmapped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["provider_series_id"] = "GY243NN0R"
+            payload["series"][0]["title"] = "The Misfit of Demon King Academy"
+            payload["series"][0]["season_title"] = "The Misfit of Demon King Academy II(English Dub)"
+            payload["series"][0]["season_number"] = 2
+            payload["watchlist"][0]["provider_series_id"] = "GY243NN0R"
+            _replace_progress_with_completed_episodes(payload, "GY243NN0R", 24)
+            ingest_snapshot_payload(payload, config)
+            _write_test_mal_secret_files(root)
+
+            search_response = _misfit_split_part_search_response()
+            detail_by_id = {entry["node"]["id"]: {**entry["node"], "related_anime": []} for entry in search_response["data"]}
+
+            def fake_get_anime_details(anime_id: int, fields: str | None = None) -> dict:
+                if fields and "my_list_status" in fields:
+                    raise AssertionError("deterministic bundle must not resolve to one MAL status details lookup")
+                return detail_by_id[anime_id]
+
+            with patch.object(MalClient, "search_anime", return_value=search_response), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_get_anime_details,
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=5)
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+
+        self.assertEqual(len(proposals), 1)
+        proposal = proposals[0]
+        self.assertEqual(proposal.decision, "review")
+        self.assertIsNone(proposal.mal_anime_id)
+        self.assertFalse(proposal.persisted_mapping_approved)
+        self.assertIn("auto_classified_multi_entry_bundle_non_actionable", proposal.reasons)
+        self.assertEqual([], persisted)
 
     def test_build_dry_run_sync_plan_can_require_approved_mappings_only(self) -> None:
         with tempfile.TemporaryDirectory() as td:

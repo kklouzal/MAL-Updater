@@ -52,6 +52,28 @@ class CrunchyrollProviderSearchTests(unittest.TestCase):
         self.assertEqual(result["raw"]["series_metadata"]["is_dubbed"], True)
         self.assertEqual(result["raw"]["series_metadata"]["availability_status"], "available")
 
+    def test_season_child_normalization_uses_season_metadata_audio_and_number_of_episodes(self) -> None:
+        seasons = crunchyroll._seasons_from_crunchyroll_payload(
+            {
+                "data": [
+                    {
+                        "id": "GRZXCM4XJ",
+                        "series_id": "GYW4MG9G6",
+                        "title": "Rascal Does Not Dream of Bunny Girl Senpai",
+                        "season_metadata": {"audio_locales": ["en_US", "ja-JP"], "number_of_episodes": 13, "season_number": 1},
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(1, len(seasons))
+        self.assertEqual("GRZXCM4XJ", seasons[0]["id"])
+        self.assertEqual("GYW4MG9G6", seasons[0]["series_id"])
+        self.assertEqual("Rascal Does Not Dream of Bunny Girl Senpai", seasons[0]["title"])
+        self.assertEqual(1, seasons[0]["season_number"])
+        self.assertEqual(13, seasons[0]["episode_count"])
+        self.assertEqual(["en-US", "ja-JP"], seasons[0]["audio_locales"])
+
     def test_discover_item_does_not_infer_english_from_dub_flag_or_title(self) -> None:
         result = crunchyroll._series_from_crunchyroll_item(
             {
@@ -99,6 +121,37 @@ class CrunchyrollProviderSearchTests(unittest.TestCase):
         self.assertEqual(result["catalog_status"], "present")
         self.assertEqual(result["detail_evidence_source"], "crunchyroll_cms_series")
         self.assertIn("detail", result["raw"])
+
+    def test_cms_series_detail_merge_exposes_child_season_identity_metadata(self) -> None:
+        match = {
+            "provider_series_id": "GYW4MG9G6",
+            "title": "Rascal Does Not Dream Series",
+            "season_title": "Rascal Does Not Dream Series",
+            "audio_locales": [],
+            "raw": {"source": "search"},
+        }
+        detail = {
+            "id": "GYW4MG9G6",
+            "title": "Rascal Does Not Dream Series",
+            "audio_locales": ["ja-JP"],
+            "seasons": [
+                {
+                    "id": "GRZXCM4XJ",
+                    "series_id": "GYW4MG9G6",
+                    "title": "Rascal Does Not Dream of Bunny Girl Senpai",
+                    "season_metadata": {"season_number": 1, "episode_count": 13, "audio_locales": ["ja-JP"]},
+                }
+            ],
+        }
+
+        result = crunchyroll._merge_search_result_with_detail(match, detail)
+
+        self.assertEqual("Rascal Does Not Dream of Bunny Girl Senpai", result["children"][0]["title"])
+        self.assertEqual("GRZXCM4XJ", result["children"][0]["id"])
+        self.assertEqual("GYW4MG9G6", result["children"][0]["series_id"])
+        self.assertEqual(1, result["children"][0]["season_number"])
+        self.assertEqual(13, result["children"][0]["episode_count"])
+        self.assertEqual(["ja-JP"], result["children"][0]["audio_locales"])
 
     def test_search_normalization_dedupes_and_limits_grouped_results(self) -> None:
         payload = {
@@ -209,6 +262,45 @@ class CrunchyrollProviderSearchTests(unittest.TestCase):
         self.assertEqual(1.5, captured["pacer"].jitter_seconds)
         self.assertEqual(8.0, captured["timeout_seconds"])
         self.assertEqual("title-detail", captured["phase"])
+
+    def test_fetch_search_result_children_passes_configured_spacing_jitter_without_network(self) -> None:
+        config = SimpleNamespace(
+            crunchyroll=SimpleNamespace(
+                request_spacing_seconds=3.0,
+                request_spacing_jitter_seconds=1.0,
+                request_timeout_seconds=7.0,
+                locale="en-US",
+            )
+        )
+        match = {"provider_series_id": "GYW4MG9G6", "title": "Rascal Does Not Dream Series"}
+        captured = {}
+
+        class FakeSession:
+            def authorized_json_get(self, endpoint, *, params=None, phase=None):
+                captured["endpoint"] = endpoint
+                captured["params"] = params
+                captured["phase"] = phase
+                return {"data": [{"id": "GRZXCM4XJ", "series_id": "GYW4MG9G6", "title": "Rascal Does Not Dream of Bunny Girl Senpai", "season_number": 1, "episode_count": 13}]}
+
+        def fake_start_auth_session(config_arg, *, profile, timeout_seconds, pacer):
+            captured["config"] = config_arg
+            captured["profile"] = profile
+            captured["timeout_seconds"] = timeout_seconds
+            captured["pacer"] = pacer
+            return FakeSession()
+
+        with patch("mal_updater.crunchyroll_snapshot._start_auth_session", side_effect=fake_start_auth_session):
+            result = crunchyroll._fetch_search_result_children(config, match)
+
+        self.assertEqual("title-detail-seasons", captured["phase"])
+        self.assertTrue(captured["endpoint"].endswith("/content/v2/cms/series/GYW4MG9G6/seasons"))
+        self.assertEqual(3.0, captured["pacer"].spacing_seconds)
+        self.assertEqual(1.0, captured["pacer"].jitter_seconds)
+        self.assertEqual(7.0, captured["timeout_seconds"])
+        self.assertEqual("Rascal Does Not Dream of Bunny Girl Senpai", result[0]["title"])
+        self.assertEqual("GRZXCM4XJ", result[0]["id"])
+        self.assertEqual("GYW4MG9G6", result[0]["series_id"])
+        self.assertEqual(1, result[0]["season_number"])
 
 
 if __name__ == "__main__":
