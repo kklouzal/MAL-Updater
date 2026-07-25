@@ -7,6 +7,8 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Iterable
 
+BROADCAST_COMPATIBILITY_MIGRATION = "013_mal_anime_metadata_broadcast_compatibility.sql"
+
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
     "002_mal_metadata_cache.sql",
@@ -21,6 +23,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "010_mal_anime_metadata_official_detail_fields.sql",
     "011_mal_user_anime_list_preference_fields.sql",
     "012_watch_confirmation_provenance.sql",
+    BROADCAST_COMPATIBILITY_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -464,6 +467,63 @@ def _execute_migration_statement(conn: sqlite3.Connection, statement: str) -> No
     conn.execute(statement)
 
 
+def _repair_mal_anime_metadata_broadcast_columns(conn: sqlite3.Connection) -> None:
+    """Repair historical dirty 010 schemas that used legacy broadcast aliases."""
+    table_exists = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'mal_anime_metadata'
+        """
+    ).fetchone()
+    if table_exists is None:
+        return
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(mal_anime_metadata)")}
+    if "broadcast_day" not in columns:
+        conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN broadcast_day TEXT")
+        columns.add("broadcast_day")
+    if "broadcast_time" not in columns:
+        conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN broadcast_time TEXT")
+        columns.add("broadcast_time")
+
+    if "broadcast_day_of_the_week" in columns:
+        conn.execute(
+            """
+            UPDATE mal_anime_metadata
+            SET broadcast_day = LOWER(TRIM(CAST(broadcast_day_of_the_week AS TEXT)))
+            WHERE (broadcast_day IS NULL OR TRIM(CAST(broadcast_day AS TEXT)) = '')
+              AND broadcast_day_of_the_week IS NOT NULL
+              AND TRIM(CAST(broadcast_day_of_the_week AS TEXT)) <> ''
+            """
+        )
+    if "broadcast_start_time" in columns:
+        conn.execute(
+            """
+            UPDATE mal_anime_metadata
+            SET broadcast_time = TRIM(CAST(broadcast_start_time AS TEXT))
+            WHERE (broadcast_time IS NULL OR TRIM(CAST(broadcast_time AS TEXT)) = '')
+              AND broadcast_start_time IS NOT NULL
+              AND TRIM(CAST(broadcast_start_time AS TEXT)) <> ''
+            """
+        )
+
+
+def _repair_recorded_broadcast_compatibility_migration(conn: sqlite3.Connection) -> None:
+    if conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE version = ?",
+        (BROADCAST_COMPATIBILITY_MIGRATION,),
+    ).fetchone() is None:
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _repair_mal_anime_metadata_broadcast_columns(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -487,11 +547,14 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("BEGIN IMMEDIATE")
             for statement in statements:
                 _execute_migration_statement(conn, statement)
+            if version == BROADCAST_COMPATIBILITY_MIGRATION:
+                _repair_mal_anime_metadata_broadcast_columns(conn)
             conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
+    _repair_recorded_broadcast_compatibility_migration(conn)
 
 
 def bootstrap_database(db_path: Path) -> None:

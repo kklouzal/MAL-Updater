@@ -33,6 +33,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "010_mal_anime_metadata_official_detail_fields.sql",
                 "011_mal_user_anime_list_preference_fields.sql",
                 "012_watch_confirmation_provenance.sql",
+                "013_mal_anime_metadata_broadcast_compatibility.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -46,10 +47,15 @@ class MigrationCatalogTests(unittest.TestCase):
             db.MIGRATION_FILENAMES,
             packaged_filenames=db.MIGRATION_FILENAMES,
         )
+        invalid_filenames = (
+            db.MIGRATION_FILENAMES[:-1]
+            + ("012_future_duplicate.sql",)
+            + db.MIGRATION_FILENAMES[-1:]
+        )
         with self.assertRaisesRegex(RuntimeError, "duplicate numeric prefix"):
             validate_migration_catalog(
-                db.MIGRATION_FILENAMES + ("012_future_duplicate.sql",),
-                packaged_filenames=db.MIGRATION_FILENAMES + ("012_future_duplicate.sql",),
+                invalid_filenames,
+                packaged_filenames=invalid_filenames,
             )
         with self.assertRaisesRegex(RuntimeError, "historical duplicate migration order changed"):
             validate_migration_catalog(
@@ -67,6 +73,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "010_mal_anime_metadata_official_detail_fields.sql",
                     "011_mal_user_anime_list_preference_fields.sql",
                     "012_watch_confirmation_provenance.sql",
+                    "013_mal_anime_metadata_broadcast_compatibility.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -86,6 +93,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "010_mal_anime_metadata_official_detail_fields.sql",
                     "011_mal_user_anime_list_preference_fields.sql",
                     "012_watch_confirmation_provenance.sql",
+                    "013_mal_anime_metadata_broadcast_compatibility.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -216,12 +224,15 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertEqual(1, marker_count)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
-    def test_v9_to_v12_recommendation_data_upgrades_backfill_privacy_and_current_tables(self) -> None:
+    def test_v9_to_current_recommendation_data_upgrades_backfill_privacy_and_current_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "v9.sqlite3"
             original = db.MIGRATIONS
+            first_upgrade = db.MIGRATION_FILENAMES.index(
+                "010_mal_anime_metadata_official_detail_fields.sql"
+            )
             try:
-                db.MIGRATIONS = original[:-3]
+                db.MIGRATIONS = original[:first_upgrade]
                 bootstrap_database(db_path)
             finally:
                 db.MIGRATIONS = original
@@ -298,9 +309,91 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertNotIn("comments", columns)
                 self.assertNotIn("tags_json", columns)
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watch_confirmation_provenance'").fetchone())
-                for version in db.MIGRATION_FILENAMES[-3:]:
+                for version in db.MIGRATION_FILENAMES[first_upgrade:]:
                     marker_count = conn.execute("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?", (version,)).fetchone()["n"]
                     self.assertEqual(1, marker_count)
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+    def test_recorded_legacy_010_schema_gets_canonical_broadcast_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "legacy-010.sqlite3"
+            original = db.MIGRATIONS
+            try:
+                db.MIGRATIONS = original[: db.MIGRATION_FILENAMES.index("010_mal_anime_metadata_official_detail_fields.sql")]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            with connect(db_path) as conn:
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN rank INTEGER")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN num_list_users INTEGER")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN num_scoring_users INTEGER")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN rating TEXT")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN average_episode_duration INTEGER")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN start_date TEXT")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN end_date TEXT")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN broadcast_day_of_the_week TEXT")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN broadcast_start_time TEXT")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN broadcast_timezone TEXT")
+                conn.execute("ALTER TABLE mal_anime_metadata ADD COLUMN nsfw TEXT")
+                conn.execute(
+                    """
+                    INSERT INTO mal_anime_metadata (
+                        mal_anime_id, title, alternative_titles_json, raw_json,
+                        broadcast_day_of_the_week, broadcast_start_time, broadcast_timezone,
+                        fetched_at, updated_at
+                    ) VALUES (30, 'Legacy Broadcast', '[]', ?, 'Saturday', '01:05', 'Asia/Tokyo',
+                              '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                    """,
+                    (json.dumps({"broadcast": {"day_of_the_week": "Tuesday", "start_time": "09:30"}}),),
+                )
+                conn.execute("INSERT INTO schema_migrations(version) VALUES ('010_mal_anime_metadata_official_detail_fields.sql')")
+                conn.execute("INSERT INTO schema_migrations(version) VALUES ('011_mal_user_anime_list_preference_fields.sql')")
+                conn.execute("INSERT INTO schema_migrations(version) VALUES ('012_watch_confirmation_provenance.sql')")
+                conn.commit()
+
+            bootstrap_database(db_path)
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_anime_metadata)")}
+                self.assertTrue({"broadcast_day", "broadcast_time"} <= columns)
+                self.assertTrue({"broadcast_day_of_the_week", "broadcast_start_time"} <= columns)
+                row = conn.execute(
+                    """
+                    SELECT broadcast_day, broadcast_time, broadcast_day_of_the_week, broadcast_start_time
+                    FROM mal_anime_metadata
+                    WHERE mal_anime_id = 30
+                    """
+                ).fetchone()
+                self.assertEqual("saturday", row["broadcast_day"])
+                self.assertEqual("01:05", row["broadcast_time"])
+                self.assertEqual("Saturday", row["broadcast_day_of_the_week"])
+                self.assertEqual("01:05", row["broadcast_start_time"])
+                marker_count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?",
+                    (db.BROADCAST_COMPATIBILITY_MIGRATION,),
+                ).fetchone()["n"]
+                self.assertEqual(1, marker_count)
+                metadata = db.get_mal_anime_metadata_map(db_path)[30]
+                self.assertEqual("saturday", metadata.broadcast_day)
+                self.assertEqual("01:05", metadata.broadcast_time)
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+    def test_fresh_schema_keeps_current_broadcast_columns_after_compatibility_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "fresh.sqlite3"
+            bootstrap_database(db_path)
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_anime_metadata)")}
+                self.assertTrue({"broadcast_day", "broadcast_time", "broadcast_timezone"} <= columns)
+                self.assertFalse({"broadcast_day_of_the_week", "broadcast_start_time"} & columns)
+                marker_count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?",
+                    (db.BROADCAST_COMPATIBILITY_MIGRATION,),
+                ).fetchone()["n"]
+                self.assertEqual(1, marker_count)
+                self.assertEqual(db.MIGRATION_FILENAMES, tuple(row["version"] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY rowid")))
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
 
