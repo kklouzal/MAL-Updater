@@ -17,6 +17,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "006_recommendation_eligibility_evidence.sql",
     "007_mal_user_anime_list_cache.sql",
     "008_niceness_caches.sql",
+    "009_recommendation_full_harvest_provenance.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -1440,19 +1441,48 @@ def get_mal_anime_relations_map(db_path: Path) -> dict[int, list[MalAnimeRelatio
     return result
 
 
+MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL = "official_detail"
+MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS = "public_userrecs"
+
+
 def replace_mal_recommendation_edges(
     db_path: Path,
     *,
     source_mal_anime_id: int,
     hop_distance: int,
     edges: list[dict[str, Any]],
-) -> None:
+    source_type: str = MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
+    complete: bool = False,
+    pages_fetched: int | None = None,
+    source_url: str | None = None,
+    allow_complete_downgrade: bool = False,
+) -> bool:
+    normalized_source_type = str(source_type or MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL).strip() or MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL
+    normalized_complete = bool(complete)
     with connect(db_path) as conn:
+        existing_status = conn.execute(
+            """
+            SELECT source_type, is_complete, status
+            FROM mal_recommendation_harvest_status
+            WHERE source_mal_anime_id = ?
+            """,
+            (int(source_mal_anime_id),),
+        ).fetchone()
+        if (
+            not normalized_complete
+            and not allow_complete_downgrade
+            and existing_status is not None
+            and int(existing_status["is_complete"] or 0) == 1
+            and str(existing_status["source_type"] or "") == MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS
+        ):
+            return False
         conn.execute(
             "DELETE FROM mal_anime_recommendations WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'",
             (int(source_mal_anime_id),),
         )
         for edge in edges:
+            raw = edge.get("raw") if isinstance(edge.get("raw"), dict) else {}
+            provenance = edge.get("provenance") if isinstance(edge.get("provenance"), dict) else {}
             conn.execute(
                 """
                 INSERT INTO mal_anime_recommendations (
@@ -1462,8 +1492,11 @@ def replace_mal_recommendation_edges(
                     num_recommendations,
                     hop_distance,
                     source_kind,
-                    raw_json
-                ) VALUES (?, ?, ?, ?, ?, 'mal_recommendation', ?)
+                    raw_json,
+                    harvest_source,
+                    complete_harvest,
+                    provenance_json
+                ) VALUES (?, ?, ?, ?, ?, 'mal_recommendation', ?, ?, ?, ?)
                 """,
                 (
                     int(source_mal_anime_id),
@@ -1471,21 +1504,156 @@ def replace_mal_recommendation_edges(
                     edge.get("target_title"),
                     edge.get("num_recommendations"),
                     int(hop_distance),
-                    json.dumps(edge["raw"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(raw, ensure_ascii=False, sort_keys=True),
+                    normalized_source_type,
+                    1 if normalized_complete else 0,
+                    json.dumps(provenance, ensure_ascii=False, sort_keys=True),
                 ),
             )
         conn.execute(
             """
-            INSERT INTO mal_recommendation_harvest_status (source_mal_anime_id, status, num_edges, fetched_at)
-            VALUES (?, 'fetched', ?, CURRENT_TIMESTAMP)
+            INSERT INTO mal_recommendation_harvest_status (
+                source_mal_anime_id,
+                status,
+                num_edges,
+                fetched_at,
+                source_type,
+                is_complete,
+                pages_fetched,
+                source_url,
+                last_attempted_at,
+                last_error,
+                failure_count,
+                updated_at
+            )
+            VALUES (?, 'fetched', ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL, 0, CURRENT_TIMESTAMP)
             ON CONFLICT(source_mal_anime_id) DO UPDATE SET
                 status = excluded.status,
                 num_edges = excluded.num_edges,
-                fetched_at = excluded.fetched_at
+                fetched_at = excluded.fetched_at,
+                source_type = excluded.source_type,
+                is_complete = excluded.is_complete,
+                pages_fetched = excluded.pages_fetched,
+                source_url = excluded.source_url,
+                last_attempted_at = excluded.last_attempted_at,
+                last_error = NULL,
+                failure_count = 0,
+                updated_at = CURRENT_TIMESTAMP
             """,
-            (int(source_mal_anime_id), len(edges)),
+            (
+                int(source_mal_anime_id),
+                len(edges),
+                normalized_source_type,
+                1 if normalized_complete else 0,
+                max(0, int(pages_fetched or 0)),
+                source_url,
+            ),
         )
         conn.commit()
+    return True
+
+
+def record_mal_recommendation_harvest_failure(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    source_type: str = MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
+    error: str | None = None,
+    pages_fetched: int | None = None,
+    source_url: str | None = None,
+) -> None:
+    normalized_source_type = str(source_type or MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL).strip() or MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL
+    normalized_error = None
+    if error is not None:
+        normalized_error = str(error).strip()[:1000] or None
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO mal_recommendation_harvest_status (
+                source_mal_anime_id,
+                status,
+                num_edges,
+                fetched_at,
+                source_type,
+                is_complete,
+                pages_fetched,
+                source_url,
+                last_attempted_at,
+                last_error,
+                failure_count,
+                updated_at
+            )
+            VALUES (
+                ?,
+                'failed',
+                COALESCE((SELECT COUNT(*) FROM mal_anime_recommendations WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'), 0),
+                CURRENT_TIMESTAMP,
+                ?,
+                0,
+                ?,
+                ?,
+                CURRENT_TIMESTAMP,
+                ?,
+                1,
+                CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(source_mal_anime_id) DO UPDATE SET
+                status = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.status
+                    ELSE 'failed'
+                END,
+                num_edges = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.num_edges
+                    ELSE COALESCE((SELECT COUNT(*) FROM mal_anime_recommendations WHERE source_mal_anime_id = excluded.source_mal_anime_id AND source_kind = 'mal_recommendation'), mal_recommendation_harvest_status.num_edges)
+                END,
+                source_type = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.source_type
+                    ELSE excluded.source_type
+                END,
+                is_complete = mal_recommendation_harvest_status.is_complete,
+                pages_fetched = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.pages_fetched
+                    ELSE excluded.pages_fetched
+                END,
+                source_url = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.source_url
+                    ELSE COALESCE(excluded.source_url, mal_recommendation_harvest_status.source_url)
+                END,
+                last_attempted_at = CURRENT_TIMESTAMP,
+                last_error = excluded.last_error,
+                failure_count = mal_recommendation_harvest_status.failure_count + 1,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                int(source_mal_anime_id),
+                int(source_mal_anime_id),
+                normalized_source_type,
+                max(0, int(pages_fetched or 0)),
+                source_url,
+                normalized_error,
+            ),
+        )
+        conn.commit()
+
+
+def replace_mal_public_userrecs_recommendation_edges(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    edges: list[dict[str, Any]],
+    pages_fetched: int,
+    source_url: str | None = None,
+) -> bool:
+    return replace_mal_recommendation_edges(
+        db_path,
+        source_mal_anime_id=source_mal_anime_id,
+        hop_distance=1,
+        edges=edges,
+        source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+        complete=True,
+        pages_fetched=pages_fetched,
+        source_url=source_url,
+    )
 
 
 def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: int = 14) -> dict[str, Any]:
@@ -1504,31 +1672,81 @@ def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: 
                 LEFT JOIN provider_episode_progress p
                     ON p.provider = m.provider AND p.provider_series_id = m.provider_series_id
                 GROUP BY m.mal_anime_id
+            ), positive_list AS (
+                SELECT mal_anime_id, list_status
+                FROM mal_user_anime_list_cache
+                WHERE list_status IN ('completed', 'watching', 'on_hold')
+            ), seeds AS (
+                SELECT
+                    mapped.mal_anime_id AS mal_anime_id,
+                    mapped.mapped_series_count AS mapped_series_count,
+                    mapped.watched AS watched,
+                    positive_list.list_status AS list_status,
+                    CASE WHEN positive_list.mal_anime_id IS NOT NULL THEN 1 ELSE 0 END AS positive_list_seed
+                FROM mapped
+                LEFT JOIN positive_list ON positive_list.mal_anime_id = mapped.mal_anime_id
+                UNION ALL
+                SELECT
+                    positive_list.mal_anime_id AS mal_anime_id,
+                    0 AS mapped_series_count,
+                    0 AS watched,
+                    positive_list.list_status AS list_status,
+                    1 AS positive_list_seed
+                FROM positive_list
+                WHERE NOT EXISTS (SELECT 1 FROM mapped WHERE mapped.mal_anime_id = positive_list.mal_anime_id)
             ), edge_counts AS (
-                SELECT source_mal_anime_id, COUNT(*) AS edge_count, MAX(fetched_at) AS edge_fetched_at
+                SELECT
+                    source_mal_anime_id,
+                    COUNT(*) AS edge_count,
+                    MAX(fetched_at) AS edge_fetched_at,
+                    MAX(CASE WHEN complete_harvest THEN 1 ELSE 0 END) AS has_complete_edges,
+                    MAX(harvest_source) AS edge_harvest_source
                 FROM mal_anime_recommendations
                 WHERE source_kind = 'mal_recommendation'
                 GROUP BY source_mal_anime_id
             )
             SELECT
-                mapped.mal_anime_id,
-                mapped.mapped_series_count,
-                mapped.watched,
+                seeds.mal_anime_id,
+                seeds.mapped_series_count,
+                seeds.watched,
+                seeds.list_status,
+                seeds.positive_list_seed,
                 COALESCE(status.num_edges, edge_counts.edge_count, 0) AS edge_count,
                 COALESCE(status.fetched_at, edge_counts.edge_fetched_at) AS fetched_at,
-                status.status AS harvest_status
-            FROM mapped
-            LEFT JOIN edge_counts ON edge_counts.source_mal_anime_id = mapped.mal_anime_id
-            LEFT JOIN mal_recommendation_harvest_status status ON status.source_mal_anime_id = mapped.mal_anime_id
-            ORDER BY mapped.mal_anime_id ASC
+                status.status AS harvest_status,
+                COALESCE(status.source_type, edge_counts.edge_harvest_source) AS source_type,
+                COALESCE(status.is_complete, edge_counts.has_complete_edges, 0) AS is_complete,
+                COALESCE(status.pages_fetched, 0) AS pages_fetched,
+                status.source_url,
+                status.last_attempted_at,
+                status.last_error,
+                COALESCE(status.failure_count, 0) AS failure_count
+            FROM seeds
+            LEFT JOIN edge_counts ON edge_counts.source_mal_anime_id = seeds.mal_anime_id
+            LEFT JOIN mal_recommendation_harvest_status status ON status.source_mal_anime_id = seeds.mal_anime_id
+            ORDER BY seeds.mal_anime_id ASC
             """
         ).fetchall()
     items: list[dict[str, Any]] = []
-    summary = {"mapped_sources": 0, "watched_sources": 0, "fresh": 0, "stale": 0, "unharvested": 0, "total_edges": 0}
+    summary = {
+        "mapped_sources": 0,
+        "watched_sources": 0,
+        "positive_list_sources": 0,
+        "confirmed_positive_sources": 0,
+        "fresh": 0,
+        "stale": 0,
+        "failed": 0,
+        "unharvested": 0,
+        "complete_full_harvest_sources": 0,
+        "official_detail_sources": 0,
+        "total_edges": 0,
+    }
     for row in rows:
         fetched_at = row["fetched_at"]
-        status = "unharvested"
-        if fetched_at:
+        stored_status = str(row["harvest_status"] or "")
+        if stored_status == "failed":
+            status = "failed"
+        elif fetched_at:
             status = "fresh"
             if stale_after_days > 0:
                 with connect(db_path) as conn:
@@ -1537,23 +1755,44 @@ def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: 
                         (fetched_at, f"-{stale_after_days} days"),
                     ).fetchone()[0]
                 status = "stale" if is_stale else "fresh"
+        else:
+            status = "unharvested"
         edge_count = int(row["edge_count"] or 0)
         watched = bool(row["watched"])
-        summary["mapped_sources"] += 1
+        mapped = int(row["mapped_series_count"] or 0) > 0
+        positive_list_seed = bool(row["positive_list_seed"])
+        if mapped:
+            summary["mapped_sources"] += 1
         summary["watched_sources"] += 1 if watched else 0
+        summary["positive_list_sources"] += 1 if positive_list_seed else 0
+        summary["confirmed_positive_sources"] += 1 if positive_list_seed or watched else 0
         summary[status] += 1
+        if int(row["is_complete"] or 0):
+            summary["complete_full_harvest_sources"] += 1
+        if (fetched_at or edge_count > 0) and str(row["source_type"] or "") == MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL:
+            summary["official_detail_sources"] += 1
         summary["total_edges"] += edge_count
         items.append(
             {
                 "mal_anime_id": int(row["mal_anime_id"]),
                 "mapped_series_count": int(row["mapped_series_count"] or 0),
                 "watched": watched,
+                "positive_list_seed": positive_list_seed,
+                "list_status": row["list_status"],
                 "edge_count": edge_count,
                 "fetched_at": fetched_at,
                 "status": status,
+                "source_type": str(row["source_type"]) if row["source_type"] else None,
+                "is_complete": bool(row["is_complete"]),
+                "pages_fetched": int(row["pages_fetched"] or 0),
+                "source_url": row["source_url"],
+                "last_attempted_at": row["last_attempted_at"],
+                "last_error": row["last_error"],
+                "failure_count": int(row["failure_count"] or 0),
             }
         )
-    coverage = None if summary["mapped_sources"] == 0 else (summary["fresh"] / summary["mapped_sources"])
+    coverage_denominator = int(summary["confirmed_positive_sources"] or summary["mapped_sources"])
+    coverage = None if coverage_denominator == 0 else (summary["fresh"] / coverage_denominator)
     summary["fresh_coverage_ratio"] = coverage
     return {"summary": summary, "sources": items}
 
@@ -2387,6 +2626,38 @@ def get_recommendation_provider_eligibility_evidence(
     if row is None:
         return None
     return _recommendation_provider_eligibility_from_db(row)
+
+
+def list_recommendation_provider_eligibility_evidence_for_provider_series_keys(
+    db_path: Path,
+    provider_series_keys: Iterable[tuple[str, str]],
+) -> list[RecommendationProviderEligibilityEvidence]:
+    normalized_keys = sorted(
+        {
+            (provider.strip().lower(), provider_series_id.strip())
+            for provider, provider_series_id in provider_series_keys
+            if isinstance(provider, str)
+            and provider.strip()
+            and isinstance(provider_series_id, str)
+            and provider_series_id.strip()
+        }
+    )
+    if not normalized_keys:
+        return []
+    conditions = " OR ".join("(provider = ? AND provider_series_id = ?)" for _ in normalized_keys)
+    params: list[str] = []
+    for provider, provider_series_id in normalized_keys:
+        params.extend([provider, provider_series_id])
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM recommendation_provider_eligibility_evidence
+            WHERE {conditions}
+            ORDER BY provider ASC, provider_series_id ASC, mal_anime_id ASC
+            """,
+            params,
+        ).fetchall()
+    return [_recommendation_provider_eligibility_from_db(row) for row in rows]
 
 
 def list_recommendation_provider_eligibility_evidence_for_mal_ids(

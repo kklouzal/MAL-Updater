@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
 from itertools import combinations
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .db import MalAnimeMetadata
 
 _AUTO_APPROVAL_BLOCKERS = (
     "season_number_mismatch=",
@@ -15,6 +18,10 @@ _AUTO_APPROVAL_BLOCKERS = (
     "installment_hint_conflict=",
     "episode_evidence_exceeds_candidate_count=",
     "completed_evidence_exceeds_candidate_count=",
+    "provider_episode_count_mismatch=",
+    "provider_start_year_mismatch=",
+    "provider_aggregate_shell_suspected=",
+    "provider_franchise_shell_child_match_non_actionable=",
 )
 
 _MAX_PLAUSIBLE_INSTALLMENT_NUMBER = 30
@@ -40,12 +47,21 @@ _INSTALLMENT_ALIGNMENT_REASON_PREFIXES = (
     "season_to_split_match=",
     "roman_installment_match=",
 )
-_POSITIVE_SIGNAL_REASON_PREFIXES = (*_INSTALLMENT_ALIGNMENT_REASON_PREFIXES, "installment_hint_match=")
+_POSITIVE_SIGNAL_REASON_PREFIXES = (
+    *_INSTALLMENT_ALIGNMENT_REASON_PREFIXES,
+    "installment_hint_match=",
+    "provider_episode_count_match=",
+    "provider_start_year_match=",
+)
 _CANDIDATE_WEAKNESS_REASON_PREFIXES = (
     "season_number_mismatch=",
     "installment_hint_conflict=",
     "candidate_missing_installment_hint",
     "candidate_extra_installment_hint",
+    "provider_episode_count_mismatch=",
+    "provider_start_year_mismatch=",
+    "provider_aggregate_shell_suspected=",
+    "provider_franchise_shell_child_match_non_actionable=",
     "base_installment_penalty_for_explicit_later_season",
     "candidate_auxiliary_content=",
     *_EPISODE_OVERFLOW_REASON_PREFIXES,
@@ -58,8 +74,12 @@ _BUNDLE_DISQUALIFYING_REASON_PREFIXES = (
 _MULTI_ENTRY_BUNDLE_REASON_PREFIX = "multi_entry_bundle_suspected="
 _DETERMINISTIC_BUNDLE_MIN_SCORE = 0.99
 _DETERMINISTIC_BUNDLE_CLOSE_COMPETITOR_GAP = 0.12
+_MAPPING_SEARCH_FIELDS = "id,title,alternative_titles,media_type,status,num_episodes,start_season"
+_PROVIDER_EPISODE_COUNT_FIELDS = ("episode_count", "number_of_episodes", "num_episodes", "episodes_count", "total_episodes")
+_PROVIDER_TRUSTWORTHY_YEAR_FIELDS = ("broadcast_year", "release_year", "start_year", "air_year")
+_PROVIDER_CONDITIONAL_LAUNCH_YEAR_FIELDS = ("series_launch_year", "launch_year")
 
-from .mal_client import MalApiError, MalClient
+from .mal_client import MAL_ANIME_SEARCH_QUERY_MAX_CHARS, MalApiError, MalClient
 
 _TITLE_CLEANUPS = [
     re.compile(r"\(english dub\)", re.IGNORECASE),
@@ -234,6 +254,8 @@ _SUPPLEMENTAL_TITLE_CANDIDATE_IDS = {
     "heaven s lost property": [5958],
 }
 
+_NON_ACTIONABLE_PROVIDER_SHELL_IDENTITY_KINDS = frozenset({"provider_franchise_shell_child_match"})
+
 
 @dataclass(slots=True)
 class SeriesMappingInput:
@@ -245,6 +267,25 @@ class SeriesMappingInput:
     max_episode_number: int | None = None
     completed_episode_count: int | None = None
     max_completed_episode_number: int | None = None
+    provider_episode_count: int | None = None
+    provider_season_count: int | None = None
+    provider_start_year: int | None = None
+    provider_start_year_is_trustworthy: bool = False
+    verified_mal_anime_id: int | None = None
+    verified_identity_kind: str | None = None
+    verified_identity_evidence: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderMappingEvidence:
+    episode_count: int | None = None
+    episode_count_source: str | None = None
+    season_count: int | None = None
+    season_count_source: str | None = None
+    start_year: int | None = None
+    start_year_source: str | None = None
+    start_year_is_trustworthy: bool = False
+    identity_evidence: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -274,6 +315,161 @@ class MappingResult:
 
     def is_deterministic_multi_entry_bundle(self) -> bool:
         return _is_deterministic_multi_entry_bundle(self)
+
+    def has_provider_aggregate_shell_protection(self) -> bool:
+        reasons = [*self.rationale]
+        if self.chosen_candidate is not None:
+            reasons.extend(self.chosen_candidate.match_reasons)
+        return any(
+            reason.startswith(("provider_aggregate_shell_suspected=", "provider_franchise_shell_child_match_non_actionable="))
+            for reason in reasons
+        )
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        coerced = value
+    elif isinstance(value, float) and value.is_integer():
+        coerced = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        coerced = int(value.strip())
+    else:
+        return None
+    return coerced if coerced > 0 else None
+
+
+def _provider_evidence_layers(value: Any, *, max_depth: int = 6) -> list[tuple[str, dict[str, Any]]]:
+    """Return provider raw dictionaries in stable outer-to-inner priority order.
+
+    Provider-series rows have several historical shapes: a normalized match can
+    wrap the native provider payload under one or more ``raw`` keys, and native
+    catalog payloads commonly tuck stable fields under ``series_metadata``.  Keep
+    this intentionally bounded and dict-only so child season lists do not turn a
+    parent series total into per-child evidence.
+    """
+    layers: list[tuple[str, dict[str, Any]]] = []
+    queue: deque[tuple[str, Any, int]] = deque([("raw", value, 0)])
+    seen_ids: set[int] = set()
+    while queue:
+        path, current, depth = queue.popleft()
+        if not isinstance(current, dict):
+            continue
+        identity = id(current)
+        if identity in seen_ids:
+            continue
+        seen_ids.add(identity)
+        layers.append((path, current))
+        if depth >= max_depth:
+            continue
+        for key in ("raw", "series_metadata", "metadata", "detail"):
+            nested = current.get(key)
+            if isinstance(nested, dict):
+                queue.append((f"{path}.{key}", nested, depth + 1))
+    return layers
+
+
+def _first_evidence_int(
+    layers: list[tuple[str, dict[str, Any]]],
+    field_names: tuple[str, ...],
+) -> tuple[int | None, str | None]:
+    for path, layer in layers:
+        for field_name in field_names:
+            value = _coerce_positive_int(layer.get(field_name))
+            if value is not None:
+                return value, f"{path}.{field_name}"
+    return None, None
+
+
+def _first_identity_evidence_payload(layers: list[tuple[str, dict[str, Any]]]) -> tuple[dict[str, Any] | None, str | None]:
+    for path, layer in layers:
+        identity_evidence = layer.get("identity_evidence")
+        if isinstance(identity_evidence, dict):
+            return identity_evidence, f"{path}.identity_evidence"
+        source_evidence = layer.get("source_evidence")
+        if isinstance(source_evidence, dict) and isinstance(source_evidence.get("identity_evidence"), dict):
+            return source_evidence["identity_evidence"], f"{path}.source_evidence.identity_evidence"
+    return None, None
+
+
+def extract_provider_mapping_evidence(raw: Any) -> ProviderMappingEvidence:
+    """Extract conservative provider-side mapping evidence from stored raw JSON.
+
+    Episode totals are useful as identity evidence when they agree with a MAL
+    candidate.  Provider launch years are more delicate: Crunchyroll-style
+    ``series_launch_year`` can be a catalog/availability year for aggregate
+    series shells, so it is only promoted to trustworthy broadcast-year evidence
+    when the provider row looks like a single-season/single-installment entry.
+    """
+    layers = _provider_evidence_layers(raw)
+    episode_count, episode_source = _first_evidence_int(layers, _PROVIDER_EPISODE_COUNT_FIELDS)
+    season_count, season_source = _first_evidence_int(layers, ("season_count", "seasons_count", "total_seasons"))
+    identity_evidence, identity_evidence_source = _first_identity_evidence_payload(layers)
+    if isinstance(identity_evidence, dict):
+        parent_episode_count = _coerce_positive_int(identity_evidence.get("parent_episode_count"))
+        if episode_count is None and parent_episode_count is not None:
+            episode_count = parent_episode_count
+            episode_source = f"{identity_evidence_source}.parent_episode_count" if identity_evidence_source else "identity_evidence.parent_episode_count"
+        parent_season_count = _coerce_positive_int(identity_evidence.get("parent_season_count"))
+        if season_count is None and parent_season_count is not None:
+            season_count = parent_season_count
+            season_source = f"{identity_evidence_source}.parent_season_count" if identity_evidence_source else "identity_evidence.parent_season_count"
+    start_year, start_source = _first_evidence_int(layers, _PROVIDER_TRUSTWORTHY_YEAR_FIELDS)
+    start_year_is_trustworthy = start_year is not None
+
+    if start_year is None:
+        conditional_year, conditional_source = _first_evidence_int(layers, _PROVIDER_CONDITIONAL_LAUNCH_YEAR_FIELDS)
+        if conditional_year is not None:
+            if season_count is None or season_count <= 1:
+                start_year = conditional_year
+                start_source = conditional_source
+                start_year_is_trustworthy = True
+
+    return ProviderMappingEvidence(
+        episode_count=episode_count,
+        episode_count_source=episode_source,
+        season_count=season_count,
+        season_count_source=season_source,
+        start_year=start_year,
+        start_year_source=start_source,
+        start_year_is_trustworthy=start_year_is_trustworthy,
+        identity_evidence=identity_evidence,
+    )
+
+
+def merge_provider_mapping_evidence(*items: ProviderMappingEvidence) -> ProviderMappingEvidence:
+    episode_count: int | None = None
+    episode_count_source: str | None = None
+    season_count: int | None = None
+    season_count_source: str | None = None
+    start_year: int | None = None
+    start_year_source: str | None = None
+    start_year_is_trustworthy = False
+    identity_evidence: dict[str, Any] | None = None
+    for item in items:
+        if episode_count is None and item.episode_count is not None:
+            episode_count = item.episode_count
+            episode_count_source = item.episode_count_source
+        if season_count is None and item.season_count is not None:
+            season_count = item.season_count
+            season_count_source = item.season_count_source
+        if start_year is None and item.start_year is not None:
+            start_year = item.start_year
+            start_year_source = item.start_year_source
+            start_year_is_trustworthy = item.start_year_is_trustworthy
+        if identity_evidence is None and isinstance(item.identity_evidence, dict):
+            identity_evidence = item.identity_evidence
+    return ProviderMappingEvidence(
+        episode_count=episode_count,
+        episode_count_source=episode_count_source,
+        season_count=season_count,
+        season_count_source=season_count_source,
+        start_year=start_year,
+        start_year_source=start_year_source,
+        start_year_is_trustworthy=start_year_is_trustworthy,
+        identity_evidence=identity_evidence,
+    )
 
 
 
@@ -413,6 +609,77 @@ def _fallback_queries(query: str) -> list[str]:
         shortened = " ".join(words[:8]).strip()
         if shortened and shortened not in variants:
             variants.append(shortened)
+    return variants
+
+
+_TRAILING_SEARCH_FRAGMENT_WORDS = frozenset({"a", "an", "and", "as", "for", "from", "in", "of", "or", "the", "to", "with"})
+_SEARCH_FRAGMENT_STOPWORDS = frozenset({"a", "an", "and", "as", "for", "from", "in", "of", "or", "the", "to", "with"})
+
+
+def _add_unique_search_variant(variants: list[str], value: str | None) -> None:
+    if not value:
+        return
+    cleaned = " ".join(str(value).split()).strip()
+    if not cleaned or len(cleaned) > MAL_ANIME_SEARCH_QUERY_MAX_CHARS:
+        return
+    if cleaned not in variants:
+        variants.append(cleaned)
+
+
+def _trim_trailing_search_fragment_words(words: list[str]) -> list[str]:
+    trimmed = list(words)
+    while len(trimmed) > 1 and normalize_title_strict(trimmed[-1]) in _TRAILING_SEARCH_FRAGMENT_WORDS:
+        trimmed.pop()
+    return trimmed
+
+
+def _bounded_word_prefix(value: str) -> str:
+    words: list[str] = []
+    for word in " ".join(value.split()).split():
+        candidate_words = [*words, word]
+        candidate = " ".join(candidate_words)
+        if len(candidate) > MAL_ANIME_SEARCH_QUERY_MAX_CHARS:
+            break
+        words = candidate_words
+    return " ".join(words).strip()
+
+
+def _keyword_search_fragment(value: str) -> str:
+    keywords: list[str] = []
+    for word in " ".join(value.split()).split():
+        key = normalize_title_strict(word)
+        if not key or key in _SEARCH_FRAGMENT_STOPWORDS:
+            continue
+        candidate = " ".join([*keywords, word])
+        if len(candidate) > MAL_ANIME_SEARCH_QUERY_MAX_CHARS:
+            break
+        keywords.append(word)
+    return " ".join(keywords).strip()
+
+
+def _bounded_search_query_variants(query: str) -> list[str]:
+    """Return MAL-searchable q variants while preserving full-title scoring.
+
+    MAL rejects anime search queries over 64 characters.  The mapper scores all
+    returned nodes against the original logical query, so bounded fragments are
+    used only for discovery; an exact match to a fragment is not treated as an
+    exact match to the provider title.
+    """
+    raw = " ".join(str(query).split()).strip()
+    variants: list[str] = []
+    for candidate in (raw, _search_query_cleanup(raw), *_fallback_queries(raw)):
+        cleaned = " ".join(str(candidate).split()).strip() if candidate else ""
+        if not cleaned:
+            continue
+        if len(cleaned) <= MAL_ANIME_SEARCH_QUERY_MAX_CHARS:
+            _add_unique_search_variant(variants, cleaned)
+            continue
+        prefix = _bounded_word_prefix(cleaned)
+        _add_unique_search_variant(variants, prefix)
+        trimmed_prefix_words = _trim_trailing_search_fragment_words(prefix.split())
+        if trimmed_prefix_words != prefix.split():
+            _add_unique_search_variant(variants, " ".join(trimmed_prefix_words))
+        _add_unique_search_variant(variants, _keyword_search_fragment(cleaned))
     return variants
 
 
@@ -958,6 +1225,19 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score = max(score, 0.91)
         reasons.append("exact_base_title_after_subtitle_trim")
 
+    if (
+        query_strict_norm
+        and best_strict_norm
+        and query_strict_norm.startswith(f"{best_strict_norm} ")
+        and best_strict_norm != query_strict_norm
+        and "exact_normalized_title" not in reasons
+        and "exact_base_title_after_subtitle_trim" not in reasons
+    ):
+        suffix = query_strict_norm[len(best_strict_norm) :].strip()
+        if suffix:
+            score -= 0.06
+            reasons.append(f"candidate_missing_provider_title_suffix={suffix.replace(' ', '_')}")
+
     provider_season_number, provider_season_conflict_reason = _provider_season_number(series)
     if provider_season_conflict_reason:
         reasons.append(provider_season_conflict_reason)
@@ -1259,6 +1539,189 @@ def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, i
         candidate.title.lower(),
         -candidate.mal_anime_id,
     )
+
+
+def _candidate_has_verified_provider_identity(candidate: MappingCandidate) -> bool:
+    return any(
+        reason.startswith("verified_provider_identity=")
+        for reason in candidate.match_reasons
+    )
+
+
+def _apply_verified_provider_identity_evidence(series: SeriesMappingInput, candidates: list[MappingCandidate]) -> None:
+    anime_id = series.verified_mal_anime_id
+    identity_kind = series.verified_identity_kind
+    if anime_id is None or not identity_kind:
+        return
+    verified = next((candidate for candidate in candidates if candidate.mal_anime_id == anime_id), None)
+    if verified is None:
+        return
+    # The evidence lane already required a unique exact MAL title-family match
+    # (or an exact child-season match for a provider shell).  Make it decisive
+    # for ranking without manufacturing a lexical exact-title reason.
+    verified.score = 1.0
+    for candidate in candidates:
+        if candidate is verified or candidate.score < 0.70:
+            continue
+        candidate.score = max(0.0, candidate.score - 0.08)
+
+
+def _candidate_start_year(candidate: MappingCandidate) -> int | None:
+    start_season = candidate.raw.get("start_season") if isinstance(candidate.raw, dict) else None
+    if isinstance(start_season, dict):
+        return _coerce_positive_int(start_season.get("year"))
+    return None
+
+
+def _candidate_can_receive_provider_evidence(candidate: MappingCandidate) -> bool:
+    if candidate.media_type in _REVIEW_GATED_MEDIA_TYPES:
+        return False
+    return candidate.score >= 0.70
+
+
+def _provider_verified_identity_child_titles(series: SeriesMappingInput) -> list[Any]:
+    identity_evidence = series.verified_identity_evidence if isinstance(series.verified_identity_evidence, dict) else None
+    if identity_evidence is None:
+        return []
+    child_titles = identity_evidence.get("child_titles")
+    return child_titles if isinstance(child_titles, list) else []
+
+
+def _provider_verified_identity_child_count(series: SeriesMappingInput) -> int:
+    child_titles = _provider_verified_identity_child_titles(series)
+    return len(child_titles)
+
+
+def _provider_verified_identity_child_episode_total(series: SeriesMappingInput) -> int | None:
+    child_titles = _provider_verified_identity_child_titles(series)
+    if not child_titles:
+        return None
+    total = 0
+    for child in child_titles:
+        episode_count = _coerce_positive_int(child.get("episode_count") if isinstance(child, dict) else None)
+        if episode_count is None:
+            return None
+        total += episode_count
+    return total if total > 0 else None
+
+
+def _provider_aggregate_shell_reason(series: SeriesMappingInput, candidate: MappingCandidate) -> str | None:
+    provider_episode_count = _coerce_positive_int(series.provider_episode_count)
+    candidate_episode_count = _coerce_positive_int(candidate.num_episodes)
+    provider_season_count = _coerce_positive_int(series.provider_season_count)
+    child_count = _provider_verified_identity_child_count(series)
+    child_episode_total = _provider_verified_identity_child_episode_total(series)
+
+    if (
+        series.verified_identity_kind in _NON_ACTIONABLE_PROVIDER_SHELL_IDENTITY_KINDS
+        and child_count > 1
+    ):
+        parts = [f"children:{child_count}"]
+        if provider_episode_count is not None:
+            parts.append(f"provider_episodes:{provider_episode_count}")
+        if candidate_episode_count is not None:
+            parts.append(f"candidate_episodes:{candidate_episode_count}")
+        if child_episode_total is not None:
+            parts.append(f"child_episodes:{child_episode_total}")
+        if provider_season_count is not None:
+            parts.append(f"provider_seasons:{provider_season_count}")
+        return "provider_franchise_shell_child_match_non_actionable=" + ";".join(parts)
+
+    if (
+        provider_episode_count is not None
+        and candidate_episode_count is not None
+        and provider_episode_count > candidate_episode_count
+        and provider_season_count is not None
+        and provider_season_count >= 3
+    ):
+        return (
+            "provider_aggregate_shell_suspected="
+            f"provider_episodes:{provider_episode_count};candidate_episodes:{candidate_episode_count};"
+            f"provider_seasons:{provider_season_count}"
+        )
+    return None
+
+
+def _apply_provider_aggregate_shell_evidence(series: SeriesMappingInput, candidates: list[MappingCandidate]) -> None:
+    for candidate in candidates:
+        reason = _provider_aggregate_shell_reason(series, candidate)
+        if reason is None:
+            continue
+        if not any(existing.startswith(("provider_aggregate_shell_suspected=", "provider_franchise_shell_child_match_non_actionable=")) for existing in candidate.match_reasons):
+            candidate.match_reasons.append(reason)
+        candidate.score = min(candidate.score, 0.89)
+
+
+def _apply_provider_episode_count_evidence(series: SeriesMappingInput, candidates: list[MappingCandidate]) -> None:
+    provider_episode_count = _coerce_positive_int(series.provider_episode_count)
+    if provider_episode_count is None:
+        return
+
+    matching_candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_can_receive_provider_evidence(candidate)
+        and candidate.num_episodes == provider_episode_count
+    ]
+    if not matching_candidates:
+        return
+
+    for candidate in candidates:
+        if not _candidate_can_receive_provider_evidence(candidate):
+            continue
+        candidate_episode_count = candidate.num_episodes
+        if not isinstance(candidate_episode_count, int) or candidate_episode_count <= 0:
+            continue
+        if candidate_episode_count == provider_episode_count:
+            if not any(reason.startswith("provider_episode_count_match=") for reason in candidate.match_reasons):
+                candidate.match_reasons.append(f"provider_episode_count_match={provider_episode_count}")
+            candidate.score = min(1.0, candidate.score + 0.06)
+        else:
+            if not any(reason.startswith("provider_episode_count_mismatch=") for reason in candidate.match_reasons):
+                candidate.match_reasons.append(
+                    f"provider_episode_count_mismatch=provider:{provider_episode_count};candidate:{candidate_episode_count}"
+                )
+            candidate.score = max(0.0, candidate.score - 0.10)
+
+
+def _apply_provider_start_year_evidence(series: SeriesMappingInput, candidates: list[MappingCandidate]) -> None:
+    provider_start_year = _coerce_positive_int(series.provider_start_year)
+    if provider_start_year is None or not series.provider_start_year_is_trustworthy:
+        return
+
+    matching_candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_can_receive_provider_evidence(candidate)
+        and _candidate_start_year(candidate) == provider_start_year
+    ]
+    if not matching_candidates:
+        return
+
+    for candidate in candidates:
+        if not _candidate_can_receive_provider_evidence(candidate):
+            continue
+        candidate_start_year = _candidate_start_year(candidate)
+        if candidate_start_year is None:
+            continue
+        if candidate_start_year == provider_start_year:
+            if not any(reason.startswith("provider_start_year_match=") for reason in candidate.match_reasons):
+                candidate.match_reasons.append(f"provider_start_year_match={provider_start_year}")
+            candidate.score = min(1.0, candidate.score + 0.04)
+        else:
+            if not any(reason.startswith("provider_start_year_mismatch=") for reason in candidate.match_reasons):
+                candidate.match_reasons.append(
+                    f"provider_start_year_mismatch=provider:{provider_start_year};candidate:{candidate_start_year}"
+                )
+            candidate.score = max(0.0, candidate.score - 0.06)
+
+
+def _apply_provider_mapping_evidence(series: SeriesMappingInput, by_id: dict[int, MappingCandidate]) -> None:
+    candidates = list(by_id.values())
+    _apply_verified_provider_identity_evidence(series, candidates)
+    _apply_provider_episode_count_evidence(series, candidates)
+    _apply_provider_start_year_evidence(series, candidates)
+    _apply_provider_aggregate_shell_evidence(series, candidates)
 
 
 def _candidate_is_explainably_weaker(series: SeriesMappingInput, candidate: MappingCandidate) -> bool:
@@ -1816,6 +2279,14 @@ def _supports_high_confidence_lexical_auto_resolution(
 def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
     provider_episode_evidence = _provider_episode_evidence(series)
     top_has_blockers = _candidate_has_auto_approval_blockers(top)
+    if (
+        "exact_normalized_title" in top.match_reasons
+        and any(reason.startswith("provider_episode_count_match=") for reason in top.match_reasons)
+        and top.media_type not in _REVIEW_GATED_MEDIA_TYPES
+        and top.score >= 0.98
+        and (second is None or _candidate_is_explainably_weaker(series, second))
+    ):
+        return True
     if second is None:
         return top.score >= 0.99 and not top_has_blockers
     if (
@@ -1941,6 +2412,9 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
 def should_auto_approve_mapping(result: MappingResult) -> bool:
     if result.status != "exact" or result.chosen_candidate is None:
         return False
+    if _candidate_has_verified_provider_identity(result.chosen_candidate):
+        reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
+        return not any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons)
     if result.is_deterministic_multi_entry_bundle():
         return False
     reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
@@ -2135,6 +2609,65 @@ def _inject_supplemental_candidates(
             by_id[candidate.mal_anime_id] = candidate
 
 
+def _mal_metadata_candidate_node(metadata: MalAnimeMetadata) -> dict[str, Any]:
+    alternative_titles = dict(metadata.raw.get("alternative_titles") or {})
+    if not alternative_titles:
+        alternative_titles = {
+            "en": metadata.title_english,
+            "ja": metadata.title_japanese,
+            "synonyms": metadata.alternative_titles,
+        }
+    return {
+        "id": metadata.mal_anime_id,
+        "title": metadata.title,
+        "alternative_titles": alternative_titles,
+        "media_type": metadata.media_type,
+        "status": metadata.status,
+        "num_episodes": metadata.num_episodes,
+        "start_season": metadata.start_season,
+    }
+
+
+def _inject_verified_identity_candidate(
+    client: MalClient,
+    series: SeriesMappingInput,
+    queries: list[str],
+    by_id: dict[int, MappingCandidate],
+) -> None:
+    anime_id = series.verified_mal_anime_id
+    identity_kind = series.verified_identity_kind
+    if anime_id is None or not identity_kind:
+        return
+    detail = None
+    if client.config.db_path.exists():
+        from .db import get_mal_anime_metadata_map
+
+        metadata = get_mal_anime_metadata_map(client.config.db_path).get(anime_id)
+        if metadata is not None:
+            detail = _mal_metadata_candidate_node(metadata)
+    if detail is None:
+        try:
+            detail = client.get_anime_details(
+                anime_id,
+                fields="id,title,alternative_titles,media_type,status,num_episodes,start_season",
+            )
+        except MalApiError:
+            return
+    if not isinstance(detail, dict):
+        return
+    candidate = _best_candidate_from_node(
+        series,
+        queries,
+        detail,
+        discovery_reason=f"verified_provider_identity={identity_kind}",
+    )
+    if candidate is None:
+        return
+    previous = by_id.get(candidate.mal_anime_id)
+    if previous is None or candidate.score >= previous.score:
+        by_id[candidate.mal_anime_id] = candidate
+
+
 
 def _expand_candidates_via_relations(
     client: MalClient,
@@ -2199,18 +2732,30 @@ def _expand_candidates_via_relations(
             queue.appendleft((normalized_id, depth + 1))
 
 
+def _search_anime_for_mapping(client: MalClient, query: str, *, limit: int) -> dict[str, Any]:
+    try:
+        return client.search_anime(query, limit=limit, fields=_MAPPING_SEARCH_FIELDS)
+    except TypeError as exc:
+        # Several unit-test doubles predate the explicit fields argument.  The
+        # production client supports it; fall back only for legacy compatible
+        # callables so focused mapper tests can keep tiny fake signatures.
+        if "fields" not in str(exc):
+            raise
+        return client.search_anime(query, limit=limit)
+
+
 def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) -> MappingResult:
     queries = build_search_queries(series)
     by_id: dict[int, MappingCandidate] = {}
     attempted_queries: list[str] = []
     for query in queries:
-        query_variants = [query, *_fallback_queries(query)]
+        query_variants = _bounded_search_query_variants(query)
         for variant in query_variants:
             if not variant or variant in attempted_queries:
                 continue
             attempted_queries.append(variant)
             try:
-                response = client.search_anime(variant, limit=limit)
+                response = _search_anime_for_mapping(client, variant, limit=limit)
             except MalApiError:
                 continue
             for entry in response.get("data", []):
@@ -2235,8 +2780,10 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
                 previous = by_id.get(candidate.mal_anime_id)
                 if previous is None or candidate.score > previous.score:
                     by_id[candidate.mal_anime_id] = candidate
+    _inject_verified_identity_candidate(client, series, queries, by_id)
     _inject_supplemental_candidates(client, series, queries, by_id)
     _expand_candidates_via_relations(client, series, queries, by_id)
+    _apply_provider_mapping_evidence(series, by_id)
     candidates = sorted(by_id.values(), key=_candidate_sort_key, reverse=True)
     top = candidates[0] if candidates else None
     second = candidates[1] if len(candidates) > 1 else None
@@ -2254,7 +2801,13 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
         multi_entry_bundle_reason, bundle_companion_candidates = multi_entry_bundle
         rationale.append(multi_entry_bundle_reason)
         bundle_companion_candidate = bundle_companion_candidates[0] if bundle_companion_candidates else None
-    if _supports_exact_classification(series, top, second) or _supports_exact_bundle_auto_resolution(
+    provider_aggregate_shell_protected = any(
+        reason.startswith(("provider_aggregate_shell_suspected=", "provider_franchise_shell_child_match_non_actionable="))
+        for reason in top.match_reasons
+    )
+    if provider_aggregate_shell_protected:
+        status = "ambiguous"
+    elif _supports_exact_classification(series, top, second) or _supports_exact_bundle_auto_resolution(
         series,
         top,
         second,

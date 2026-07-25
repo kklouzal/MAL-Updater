@@ -187,6 +187,30 @@ class MalClientTests(unittest.TestCase):
             sanitized_queries = [parse_qs(urlparse(url).query)["q"][0] for url in requested_urls]
             self.assertEqual(sanitized_queries, list(cases.values()))
 
+    def test_search_anime_skips_queries_over_mal_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token=None,
+                    refresh_token=None,
+                    client_id_path=config.secrets_dir / "mal_client_id.txt",
+                    client_secret_path=config.secrets_dir / "mal_client_secret.txt",
+                    access_token_path=config.secrets_dir / "mal_access_token.txt",
+                    refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch("mal_updater.mal_client.urlopen", side_effect=AssertionError("invalid long query should not be sent")):
+                result = client.search_anime(
+                    "The Magical Revolution of the Reincarnated Princess and the Genius Young Lady"
+                )
+
+            self.assertEqual({"data": []}, result)
+
     def test_my_anime_list_paginates_with_user_auth_and_clamps_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))

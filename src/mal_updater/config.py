@@ -23,6 +23,7 @@ DEFAULT_CREDITS_SKIP_WINDOW_SECONDS = 120
 DEFAULT_CONTRACT_VERSION = "1.0"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAL_BASE_URL = "https://api.myanimelist.net/v2"
+DEFAULT_MAL_PUBLIC_BASE_URL = "https://myanimelist.net"
 DEFAULT_MAL_AUTH_URL = "https://myanimelist.net/v1/oauth2/authorize"
 DEFAULT_MAL_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
 DEFAULT_MAL_BIND_HOST = "0.0.0.0"
@@ -64,6 +65,8 @@ DEFAULT_SERVICE_HEALTH_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS = 8 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
+DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS = 6 * 60 * 60
+DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS = 45
 DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS = 24 * 60 * 60
 DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
@@ -90,6 +93,7 @@ DEFAULT_SERVICE_TASK_HOURLY_LIMITS = {
     "mal_list_refresh": 6,
     "sync_apply": 48,
     "recommend_metadata_refresh": 12,
+    "recommend_full_harvest": 8,
     "recommend_provider_eligibility_crunchyroll": 18,
     "recommend_provider_eligibility_hidive": 8,
 }
@@ -98,6 +102,7 @@ DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
     "mal_list_refresh": 3,
     "sync_apply": 8,
     "recommend_metadata_refresh": 8,
+    "recommend_full_harvest": 6,
     "recommend_provider_eligibility_crunchyroll": 7,
     "recommend_provider_eligibility_hidive": 2,
 }
@@ -106,6 +111,8 @@ DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
     "sync_apply": 8,
     "recommend_metadata_refresh": 3,
     "recommend_metadata_discovery_targets": 5,
+    "recommend_full_harvest": 2,
+    "recommend_full_harvest_pages": 3,
     "recommend_provider_eligibility_candidates": 2,
     "recommend_provider_eligibility_search_results": 5,
     "recommend_provider_eligibility_queries_per_candidate": 1,
@@ -132,6 +139,7 @@ DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_HISTORY_WINDOWS = {
     "mal_list_refresh": 5,
     "sync_apply": 3,
     "recommend_metadata_refresh": 5,
+    "recommend_full_harvest": 5,
     "recommend_provider_eligibility_crunchyroll": 7,
     "recommend_provider_eligibility_hidive": 7,
 }
@@ -139,6 +147,7 @@ DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_PERCENTILES = {
     "mal_list_refresh": 0.9,
     "sync_apply": 0.9,
     "recommend_metadata_refresh": 0.9,
+    "recommend_full_harvest": 0.9,
     "recommend_provider_eligibility_crunchyroll": 0.9,
     "recommend_provider_eligibility_hidive": 0.9,
 }
@@ -154,6 +163,7 @@ DEFAULT_SERVICE_TASK_WARN_BACKOFF_FLOORS = {
     "mal_list_refresh": 1800,
     "sync_apply": 900,
     "recommend_metadata_refresh": 1800,
+    "recommend_full_harvest": 1800,
     "recommend_provider_eligibility_crunchyroll": 3600,
     "recommend_provider_eligibility_hidive": 3600,
 }
@@ -165,6 +175,7 @@ DEFAULT_SERVICE_TASK_CRITICAL_BACKOFF_FLOORS = {
     "mal_list_refresh": 3600,
     "sync_apply": 1800,
     "recommend_metadata_refresh": 3600,
+    "recommend_full_harvest": 3600,
     "recommend_provider_eligibility_crunchyroll": 7200,
     "recommend_provider_eligibility_hidive": 7200,
 }
@@ -176,6 +187,7 @@ DEFAULT_SERVICE_TASK_AUTH_FAILURE_BACKOFF_FLOORS = {
     "mal_list_refresh": 6 * 60 * 60,
     "sync_apply": 2400,
     "recommend_metadata_refresh": 6 * 60 * 60,
+    "recommend_full_harvest": 6 * 60 * 60,
     "recommend_provider_eligibility_crunchyroll": 12 * 60 * 60,
     "recommend_provider_eligibility_hidive": 12 * 60 * 60,
 }
@@ -185,6 +197,7 @@ WORKSPACE_MARKER_FILES = ("AGENTS.md", "SOUL.md", "USER.md")
 @dataclass(slots=True)
 class MalSettings:
     base_url: str = DEFAULT_MAL_BASE_URL
+    public_base_url: str = DEFAULT_MAL_PUBLIC_BASE_URL
     auth_url: str = DEFAULT_MAL_AUTH_URL
     token_url: str = DEFAULT_MAL_TOKEN_URL
     bind_host: str = DEFAULT_MAL_BIND_HOST
@@ -246,6 +259,8 @@ class ServiceSettings:
     mal_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS
     mal_list_refresh_every_seconds: int = DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS
     recommendation_metadata_refresh_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS
+    recommendation_full_harvest_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS
+    recommendation_full_harvest_stale_after_days: int = DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS
     provider_eligibility_refresh_every_seconds: int = DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS
     recommend_maintain_every_seconds: int = DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS
     recommendations_webhook_push_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS
@@ -676,6 +691,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         ),
         mal=MalSettings(
             base_url=os.getenv("MAL_UPDATER_MAL_BASE_URL", _get_str(mal_section, "base_url", DEFAULT_MAL_BASE_URL)),
+            public_base_url=os.getenv("MAL_UPDATER_MAL_PUBLIC_BASE_URL", _get_str(mal_section, "public_base_url", DEFAULT_MAL_PUBLIC_BASE_URL)),
             auth_url=os.getenv("MAL_UPDATER_MAL_AUTH_URL", _get_str(mal_section, "auth_url", DEFAULT_MAL_AUTH_URL)),
             token_url=os.getenv("MAL_UPDATER_MAL_TOKEN_URL", _get_str(mal_section, "token_url", DEFAULT_MAL_TOKEN_URL)),
             bind_host=os.getenv("MAL_UPDATER_MAL_BIND_HOST", _get_str(mal_section, "bind_host", DEFAULT_MAL_BIND_HOST)),
@@ -800,6 +816,29 @@ def load_config(project_root: Path | None = None) -> AppConfig:
                         DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS,
                     ),
                 )
+            ),
+            recommendation_full_harvest_every_seconds=int(
+                os.getenv(
+                    "MAL_UPDATER_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS",
+                    _get_int(
+                        service_section,
+                        "recommendation_full_harvest_every_seconds",
+                        DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS,
+                    ),
+                )
+            ),
+            recommendation_full_harvest_stale_after_days=max(
+                1,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS",
+                        _get_int(
+                            service_section,
+                            "recommendation_full_harvest_stale_after_days",
+                            DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS,
+                        ),
+                    )
+                ),
             ),
             provider_eligibility_refresh_every_seconds=int(
                 os.getenv(

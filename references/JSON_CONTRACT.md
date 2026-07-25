@@ -49,15 +49,19 @@ URLs retain scheme/host/path and query-key shape, but credentials, fragments, an
 `service-status` and `health-check` JSON include `niceness_policy`, an effective loaded-policy object rather than a copy of example settings. Stable top-level children are:
 
 - `policy_kind`: explicitly identifies local niceness controls as non-provider-limit claims
-- `cadences`: effective hot/cold, MAL user-list, recommendation metadata, provider eligibility, snapshot, and health intervals in seconds
+- `cadences`: effective hot/cold, MAL user-list, recommendation metadata, complete public MAL userrecs harvest, provider eligibility, snapshot, and health intervals in seconds
 - `thresholds`: warn/critical ratios and the task-plus-provider-global enforcement posture
 - `provider_hourly_budgets`, `request_start_spacing_seconds`, and `retry_policy`: effective local headroom/pacing/retry controls (including the non-retried MAL-write posture)
 - `execute_limits`: bounded per-task page/candidate/seed/snapshot limits
 - `task_policies`: credential-sensitive effective daemon lanes with cadence, initial stagger, provider/task budgets, and cold-start projection
 - `cold_refresh_bounds`: Crunchyroll page caps and HIDIVE unattended-full disabled posture
-- `cache_horizons_days`: effective MAL/provider/recommendation cache and freshness horizons
+- `cache_horizons_days`: effective MAL/provider/recommendation cache and freshness horizons, including the public userrecs full-harvest stale horizon
 
 Fields may be added compatibly. Consumers must tolerate task-lane absence when credentials are not configured and must not reinterpret the local budgets as external rate-limit declarations.
+
+## Public MAL full-userrecs harvest summary
+
+`recommend-refresh-full-userrecs` emits a JSON object with stable counters: `status` (`ok`, `partial`, or `failed`), `seed_count`, `considered`, `harvested`, `failed`, `skipped_fresh`, `total_edges`, `forced`, `stale_after_days`, `max_pages`, `failures`, `harvested_sources`, and `semantics`. `partial` means at least one source was preserved because completeness was not proven; existing edges for failed/partial sources are not replaced. Persisted recommendation edges from this path retain only `target_mal_anime_id`, `target_title`, and `num_recommendations`; recommendation prose and usernames are not part of the durable contract.
 
 ## Example payload
 

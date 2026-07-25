@@ -635,9 +635,14 @@ def _empty_mal_recommendation_harvest_coverage() -> dict[str, Any]:
         "summary": {
             "mapped_sources": 0,
             "watched_sources": 0,
+            "positive_list_sources": 0,
+            "confirmed_positive_sources": 0,
             "fresh": 0,
             "stale": 0,
+            "failed": 0,
             "unharvested": 0,
+            "complete_full_harvest_sources": 0,
+            "official_detail_sources": 0,
             "total_edges": 0,
             "fresh_coverage_ratio": None,
         },
@@ -1216,8 +1221,8 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     if latest_run and latest_run.get("status") not in (None, "completed"):
         indicators.append({"level": "error", "message": f"Latest provider sync run is {latest_run.get('status')}."})
     cov_summary = coverage.get("summary") or {}
-    if cov_summary.get("unharvested") or cov_summary.get("stale"):
-        indicators.append({"level": "warning", "message": "Recommendation harvest coverage is stale or incomplete."})
+    if cov_summary.get("unharvested") or cov_summary.get("stale") or cov_summary.get("failed"):
+        indicators.append({"level": "warning", "message": "Recommendation harvest coverage is stale, failed, or incomplete."})
     if strict_actionable_count == 0:
         indicators.append({"level": "warning", "message": coverage_state["message"]})
     if dormant_count:

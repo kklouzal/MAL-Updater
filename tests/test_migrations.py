@@ -28,6 +28,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "006_recommendation_eligibility_evidence.sql",
                 "007_mal_user_anime_list_cache.sql",
                 "008_niceness_caches.sql",
+                "009_recommendation_full_harvest_provenance.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -43,8 +44,8 @@ class MigrationCatalogTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "duplicate numeric prefix"):
             validate_migration_catalog(
-                db.MIGRATION_FILENAMES + ("008_future_duplicate.sql",),
-                packaged_filenames=db.MIGRATION_FILENAMES + ("008_future_duplicate.sql",),
+                db.MIGRATION_FILENAMES + ("009_future_duplicate.sql",),
+                packaged_filenames=db.MIGRATION_FILENAMES + ("009_future_duplicate.sql",),
             )
         with self.assertRaisesRegex(RuntimeError, "historical duplicate migration order changed"):
             validate_migration_catalog(
@@ -58,6 +59,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "006_recommendation_eligibility_evidence.sql",
                     "007_mal_user_anime_list_cache.sql",
                     "008_niceness_caches.sql",
+                    "009_recommendation_full_harvest_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -73,6 +75,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "006_recommendation_eligibility_evidence.sql",
                     "007_mal_user_anime_list_cache.sql",
                     "008_niceness_caches.sql",
+                    "009_recommendation_full_harvest_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -104,7 +107,7 @@ class MigrationCatalogTests(unittest.TestCase):
             db_path = Path(temp_dir) / "v7.sqlite3"
             original = db.MIGRATIONS
             try:
-                db.MIGRATIONS = original[:-1]
+                db.MIGRATIONS = original[:-2]
                 bootstrap_database(db_path)
             finally:
                 db.MIGRATIONS = original
@@ -132,16 +135,73 @@ class MigrationCatalogTests(unittest.TestCase):
             bootstrap_database(db_path)
             with connect(db_path) as conn:
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM schema_migrations WHERE version = '008_niceness_caches.sql'").fetchone())
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM schema_migrations WHERE version = '009_recommendation_full_harvest_provenance.sql'").fetchone())
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mal_anime_search_cache'").fetchone())
                 eligibility_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_eligibility_evidence)")}
                 self.assertTrue({"fetched_at", "expires_at", "last_verified_at"} <= eligibility_columns)
                 self.assertTrue({"refresh_status", "failure_count", "next_retry_at", "logic_version"} <= eligibility_columns)
+                rec_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_anime_recommendations)")}
+                self.assertTrue({"harvest_source", "complete_harvest", "provenance_json"} <= rec_columns)
+                status_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_recommendation_harvest_status)")}
+                self.assertTrue({"source_type", "is_complete", "pages_fetched", "source_url", "last_attempted_at", "last_error", "failure_count", "updated_at"} <= status_columns)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
             bootstrap_database(db_path)
             with connect(db_path) as conn:
                 marker_count = conn.execute(
-                    "SELECT COUNT(*) FROM schema_migrations WHERE version = '008_niceness_caches.sql'"
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = '009_recommendation_full_harvest_provenance.sql'"
+                ).fetchone()[0]
+                self.assertEqual(1, marker_count)
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+    def test_v8_to_v9_provenance_upgrade_backfills_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "v8.sqlite3"
+            original = db.MIGRATIONS
+            try:
+                db.MIGRATIONS = original[:-1]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            with connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO mal_anime_recommendations (
+                        source_mal_anime_id,
+                        target_mal_anime_id,
+                        target_title,
+                        num_recommendations,
+                        hop_distance,
+                        source_kind,
+                        raw_json,
+                        fetched_at
+                    ) VALUES (1, 2, 'Two', 3, 1, 'mal_recommendation', '{}', '2026-01-01 00:00:00')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO mal_recommendation_harvest_status (source_mal_anime_id, status, num_edges, fetched_at)
+                    VALUES (1, 'fetched', 1, '2026-01-01 00:00:00')
+                    """
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                edge = conn.execute("SELECT harvest_source, complete_harvest, provenance_json FROM mal_anime_recommendations WHERE source_mal_anime_id = 1").fetchone()
+                self.assertEqual("official_detail", edge["harvest_source"])
+                self.assertEqual(0, edge["complete_harvest"])
+                self.assertEqual("{}", edge["provenance_json"])
+                status = conn.execute("SELECT source_type, is_complete, pages_fetched, last_attempted_at, failure_count FROM mal_recommendation_harvest_status WHERE source_mal_anime_id = 1").fetchone()
+                self.assertEqual("official_detail", status["source_type"])
+                self.assertEqual(0, status["is_complete"])
+                self.assertEqual(0, status["pages_fetched"])
+                self.assertEqual("2026-01-01 00:00:00", status["last_attempted_at"])
+                self.assertEqual(0, status["failure_count"])
+                marker_count = conn.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = '009_recommendation_full_harvest_provenance.sql'"
                 ).fetchone()[0]
                 self.assertEqual(1, marker_count)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])

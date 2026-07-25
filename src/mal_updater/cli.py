@@ -60,7 +60,7 @@ from .recommendation_dashboard import (
     write_recommendation_dashboard,
 )
 from .recommendation_enrichment import enrich_discovery_provider_availability
-from .recommendation_metadata import refresh_mal_user_anime_list_cache, refresh_recommendation_metadata
+from .recommendation_metadata import refresh_full_user_recommendation_harvest, refresh_mal_user_anime_list_cache, refresh_recommendation_metadata
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
@@ -117,6 +117,7 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"completion_threshold={config.completion_threshold}")
     print(f"credits_skip_window_seconds={config.credits_skip_window_seconds}")
     print(f"mal.base_url={config.mal.base_url}")
+    print(f"mal.public_base_url={config.mal.public_base_url}")
     print(f"mal.auth_url={config.mal.auth_url}")
     print(f"mal.token_url={config.mal.token_url}")
     print(f"mal.bind_host={config.mal.bind_host}")
@@ -1592,6 +1593,13 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
                     max_episode_number=state.max_episode_number,
                     completed_episode_count=state.completed_episode_count,
                     max_completed_episode_number=state.max_completed_episode_number,
+                    verified_mal_anime_id=state.verified_mal_anime_id,
+                    verified_identity_kind=state.verified_identity_kind,
+                    provider_episode_count=state.provider_episode_count,
+                    provider_season_count=state.provider_season_count,
+                    provider_start_year=state.provider_start_year,
+                    provider_start_year_is_trustworthy=state.provider_start_year_is_trustworthy,
+                    verified_identity_evidence=state.verified_identity_evidence,
                 ),
                 limit=mapping_limit,
             )
@@ -2851,6 +2859,62 @@ def _cmd_recommend_refresh_metadata(
     return 0
 
 
+def _cmd_recommend_refresh_full_userrecs(
+    project_root: Path | None,
+    limit: int,
+    force_refresh: bool,
+    stale_after_days: int,
+    max_pages: int,
+    max_body_mb: float,
+    output_format: str,
+) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    max_body_bytes = max(1024, int(float(max_body_mb) * 1024 * 1024))
+    summary = refresh_full_user_recommendation_harvest(
+        config,
+        limit=_normalize_limit(limit),
+        force_refresh=force_refresh,
+        stale_after_days=max(1, int(stale_after_days)),
+        max_pages=max(1, int(max_pages)),
+        max_body_bytes=max_body_bytes,
+    )
+    payload = summary.as_dict()
+    if output_format == "summary":
+        print(
+            " ".join(
+                [
+                    f"status={payload['status']}",
+                    f"seed_count={payload['seed_count']}",
+                    f"considered={payload['considered']}",
+                    f"harvested={payload['harvested']}",
+                    f"failed={payload['failed']}",
+                    f"skipped_fresh={payload['skipped_fresh']}",
+                    f"total_edges={payload['total_edges']}",
+                    f"max_pages={payload['max_pages']}",
+                    "partial_preserves_existing_edges=true",
+                ]
+            )
+        )
+        for failure in payload.get("failures", []):
+            if isinstance(failure, dict):
+                print(
+                    "failure="
+                    + json.dumps(
+                        {
+                            "mal_anime_id": failure.get("mal_anime_id"),
+                            "pages_fetched": failure.get("pages_fetched"),
+                            "error": failure.get("error"),
+                        },
+                        sort_keys=True,
+                    )
+                )
+    else:
+        print(json.dumps(payload, indent=2))
+    return 0 if summary.status in {"ok", "partial"} else 1
+
+
 def _cmd_recommend_enrich_provider_availability(
     project_root: Path | None,
     limit: int,
@@ -3191,6 +3255,16 @@ def _dispatch(parser, args) -> int:
             args.include_discovery_targets,
             args.discovery_target_limit,
             args.force_refresh,
+        )
+    if args.command == "recommend-refresh-full-userrecs":
+        return _cmd_recommend_refresh_full_userrecs(
+            args.project_root,
+            args.limit,
+            args.force_refresh,
+            args.stale_after_days,
+            args.max_pages,
+            args.max_body_mb,
+            args.format,
         )
     if args.command == "recommend-enrich-provider-availability":
         return _cmd_recommend_enrich_provider_availability(

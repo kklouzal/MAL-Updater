@@ -58,6 +58,7 @@ _AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY = 4
 _AUTO_PROJECTED_REQUEST_BURST_RATIO = 2.0
 _MAL_USER_LIST_REFRESH_MAX_PAGES = 3
 _MAL_USER_LIST_INITIAL_DELAY_SECONDS = 15 * 60
+_RECOMMENDATION_FULL_HARVEST_INITIAL_DELAY_SECONDS = 75 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_INITIAL_DELAY_SECONDS = 45 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS = 15 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 20
@@ -537,6 +538,15 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
         )
     if int(config.service.recommendation_metadata_refresh_every_seconds) > 0:
         specs.append(TaskSpec("recommend_metadata_refresh", config.service.recommendation_metadata_refresh_every_seconds, budget_provider="mal"))
+    if int(config.service.recommendation_full_harvest_every_seconds) > 0:
+        specs.append(
+            TaskSpec(
+                "recommend_full_harvest",
+                config.service.recommendation_full_harvest_every_seconds,
+                budget_provider="mal",
+                initial_delay_seconds=_RECOMMENDATION_FULL_HARVEST_INITIAL_DELAY_SECONDS,
+            )
+        )
     if int(config.service.provider_eligibility_refresh_every_seconds) > 0:
         for index, provider in enumerate(providers):
             specs.append(
@@ -568,6 +578,7 @@ def effective_niceness_policy(config: AppConfig) -> dict[str, Any]:
     from .recommendation_metadata import (
         DEFAULT_COLD_METADATA_STALE_AFTER_DAYS,
         DEFAULT_HARVEST_STALE_AFTER_DAYS,
+        DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS,
         DEFAULT_HOT_METADATA_STALE_AFTER_DAYS,
         DEFAULT_WARM_METADATA_STALE_AFTER_DAYS,
     )
@@ -624,6 +635,7 @@ def effective_niceness_policy(config: AppConfig) -> dict[str, Any]:
             "mal_token_refresh_seconds": int(config.service.mal_refresh_every_seconds),
             "mal_user_list_refresh_seconds": int(config.service.mal_list_refresh_every_seconds),
             "recommendation_metadata_refresh_seconds": int(config.service.recommendation_metadata_refresh_every_seconds),
+            "recommendation_full_harvest_seconds": int(config.service.recommendation_full_harvest_every_seconds),
             "provider_eligibility_refresh_seconds": int(config.service.provider_eligibility_refresh_every_seconds),
             "recommendation_snapshot_health_seconds": int(config.service.recommend_maintain_every_seconds),
             "health_seconds": int(config.service.health_every_seconds),
@@ -673,6 +685,7 @@ def effective_niceness_policy(config: AppConfig) -> dict[str, Any]:
             "provider_search": PROVIDER_SEARCH_CACHE_TTL_DAYS,
             "provider_eligibility_evidence": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
             "recommendation_harvest": DEFAULT_HARVEST_STALE_AFTER_DAYS,
+            "recommendation_full_userrecs_harvest": int(getattr(config.service, "recommendation_full_harvest_stale_after_days", DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS)),
             "recommendation_metadata_hot": DEFAULT_HOT_METADATA_STALE_AFTER_DAYS,
             "recommendation_metadata_warm": DEFAULT_WARM_METADATA_STALE_AFTER_DAYS,
             "recommendation_metadata_cold": DEFAULT_COLD_METADATA_STALE_AFTER_DAYS,
@@ -1017,6 +1030,27 @@ def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
     ]
 
 
+def _recommendation_full_harvest_command(config: AppConfig) -> list[str]:
+    source_limit = config.service.execute_limit_for("recommend_full_harvest")
+    if source_limit is None:
+        source_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 0)
+    max_pages = config.service.execute_limit_for("recommend_full_harvest_pages")
+    if max_pages is None:
+        max_pages = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 1)
+    return [
+        sys.executable,
+        "-m",
+        "mal_updater.cli",
+        "recommend-refresh-full-userrecs",
+        "--limit",
+        str(max(0, int(source_limit))),
+        "--stale-after-days",
+        str(max(1, int(config.service.recommendation_full_harvest_stale_after_days))),
+        "--max-pages",
+        str(max(1, int(max_pages))),
+    ]
+
+
 def _mal_list_refresh_command(config: AppConfig) -> list[str]:
     max_pages = config.service.execute_limit_for("mal_list_refresh_pages")
     if max_pages is None:
@@ -1234,6 +1268,18 @@ def _task_execution_signature(config: AppConfig, spec: TaskSpec, *, fetch_mode: 
         if discovery_target_limit is None:
             discovery_target_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_metadata_discovery_targets", 0)
         return f"recommend_metadata_refresh:limit={max(0, int(seed_limit))}:discovery_target_limit={max(0, int(discovery_target_limit))}"
+    if spec.name == "recommend_full_harvest":
+        source_limit = config.service.execute_limit_for("recommend_full_harvest")
+        if source_limit is None:
+            source_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 0)
+        max_pages = config.service.execute_limit_for("recommend_full_harvest_pages")
+        if max_pages is None:
+            max_pages = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 1)
+        return (
+            f"recommend_full_harvest:limit={max(0, int(source_limit))}"
+            f":stale_after_days={max(1, int(config.service.recommendation_full_harvest_stale_after_days))}"
+            f":max_pages={max(1, int(max_pages))}"
+        )
     if spec.name.startswith("recommend_provider_eligibility_"):
         provider = spec.name.removeprefix("recommend_provider_eligibility_")
         return f"{spec.name}:provider={provider}:command={' '.join(_provider_eligibility_command(config, provider)[4:])}"
@@ -1739,6 +1785,20 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
             continue
+        if spec.name == "recommend_full_harvest" and (config.service.execute_limit_for("recommend_full_harvest") or 0) <= 0:
+            # Manual CLI --limit 0 means "all due". In the daemon's cold public
+            # MAL userrecs lane, zero is a hard disable so a config typo cannot
+            # turn into one giant unattended crawl.
+            task_state.update(
+                {
+                    "last_status": "disabled",
+                    "execution_state": "idle",
+                    "last_skip_reason": "execute_limit_zero",
+                }
+            )
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
+            continue
         if now - last_run < spec.every_seconds and not health_requested_run:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
@@ -1919,6 +1979,24 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 parsed_stdout = _parse_json_stdout(result)
                 if parsed_stdout is not None:
                     for key in ("considered", "refreshed", "discovery_considered", "discovery_refreshed"):
+                        value = parsed_stdout.get(key)
+                        if isinstance(value, int):
+                            result[key] = max(0, int(value))
+            elif spec.name == "recommend_full_harvest":
+                command_args = _recommendation_full_harvest_command(config)
+                started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
+                result = _run_subprocess(config, command_args, label="recommend_full_harvest")
+                source_limit = config.service.execute_limit_for("recommend_full_harvest")
+                if source_limit is None:
+                    source_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 0)
+                max_pages = config.service.execute_limit_for("recommend_full_harvest_pages")
+                if max_pages is None:
+                    max_pages = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 1)
+                result["refresh_limit"] = max(0, int(source_limit))
+                result["max_pages"] = max(1, int(max_pages))
+                parsed_stdout = _parse_json_stdout(result)
+                if parsed_stdout is not None:
+                    for key in ("seed_count", "considered", "harvested", "failed", "skipped_fresh", "total_edges"):
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
                             result[key] = max(0, int(value))

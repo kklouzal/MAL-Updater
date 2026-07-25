@@ -1,8 +1,8 @@
 # Operations
 
-Cache operations: normal maintenance skips fresh complete MAL/provider evidence. Use `recommend-refresh-metadata --force-refresh` only for explicit repair/upstream verification. Invalidation is TTL plus logic-version based; malformed JSON is ignored and refetched. A 365-day provider title-search hit never extends provider eligibility: expired eligibility evidence is not a current availability claim.
+Cache operations: normal maintenance skips fresh complete MAL/provider evidence. Use `recommend-refresh-metadata --force-refresh` only for explicit repair/upstream verification of official MAL metadata/detail rows; that official anime-detail surface exposes only a practical top-10 `recommendations` set and must not overwrite a complete public userrecs harvest. Use `recommend-refresh-full-userrecs` for the bounded complete aggregate public MAL `/userrecs` cold path. Invalidation is TTL plus logic-version based; malformed JSON is ignored and refetched. A 365-day provider title-search hit never extends provider eligibility: expired eligibility evidence is not a current availability claim.
 
-Effective daemon ownership defaults are intentionally separated: provider hot/incremental fetch hourly; MAL token refresh hourly; bounded MAL user-list refresh every 8 hours (3 pages); recommendation metadata every 12 hours (3 seed rows plus 5 discovery targets); provider eligibility daily in one credentialed-provider-specific lane (2 candidates, 1 alias each, 5 returned matches); and DB/local recommendation snapshot/health hourly. Eligibility lanes use both their task budget and the provider-global budget. Fresh actionable 7-day eligibility evidence plus the 365-day identity cache yields a successful zero-network-request run. Crunchyroll cold/full refresh is weekly and capped at 10 history + 2 watchlist pages; HIDIVE full refresh remains manual because it has no chunk controls.
+Effective daemon ownership defaults are intentionally separated: provider hot/incremental fetch hourly; MAL token refresh hourly; bounded MAL user-list refresh every 8 hours (3 pages); recommendation metadata every 12 hours (3 seed rows plus 5 discovery targets); complete public MAL userrecs cold harvest every 6 hours (2 source titles, 3 advertised same-origin pages each, 45-day complete-refresh horizon); provider eligibility daily in one credentialed-provider-specific lane (2 candidates, 1 alias each, 5 returned matches); and DB/local recommendation snapshot/health hourly. Eligibility lanes and the full-userrecs lane use both their task budget and the provider-global MAL/provider budget. Fresh actionable 7-day eligibility evidence plus the 365-day identity cache yields a successful zero-network-request run. Crunchyroll cold/full refresh is weekly and capped at 10 history + 2 watchlist pages; HIDIVE full refresh remains manual because it has no chunk controls.
 
 Inspect the exact loaded policy and cache horizons with `service-status` (`niceness_policy` in JSON, `niceness_*` / `cache_*` in summary). These budgets and request-spacing values are local safety controls, not claims about provider limits.
 
@@ -93,6 +93,20 @@ PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-
 ```
 
 `dry-run-sync`, queue listing/worklist commands, and mapping review generation are local planning/diagnostic surfaces. `apply-sync --execute` is the live MAL-mutating path; keep it exact-approved and bounded unless an operator explicitly approves broader catch-up.
+
+## Recommendation full userrecs harvest
+
+```bash
+cd <repo-root>
+PYTHONPATH=src python3 -m mal_updater.cli mal-list-refresh --max-pages 3
+PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 5 --max-pages 3
+PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 5 --force-refresh --format summary
+PYTHONPATH=src python3 -m mal_updater.cli recommend-coverage
+```
+
+`recommend-refresh-full-userrecs` seeds only from the cached official MAL `@me` anime list statuses that count as watched-positive for recommendation semantics: `completed`, `watching`, and `on_hold`. It intentionally excludes `dropped` and `plan_to_watch` and does not use provider-only mappings as full-harvest seeds. The client reads public MAL HTML from the configured `mal.public_base_url`, validates same HTTPS origin plus the source anime `/userrecs` path, follows only advertised same-origin next links, dedupes target MAL IDs deterministically, and stores only target MAL ID/title plus aggregate recommender count. Recommendation prose and usernames are not retained.
+
+Atomicity guarantee: a source's existing recommendation graph is replaced only after the full public surface reaches a terminal page inside the configured bounds. Malformed HTML, out-of-origin next links, loops, oversize bodies, max-page exhaustion, and transient HTTP failures record failed attempt provenance but preserve the previous edges. Once a complete public userrecs harvest exists for a source, the normal 12h official-detail metadata refresh will not clobber it with the official top-10 subset.
 
 ## User-systemd daemon
 

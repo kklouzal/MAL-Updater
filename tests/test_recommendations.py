@@ -3936,10 +3936,18 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(
-            {"mapped_sources": 3, "watched_sources": 3, "fresh": 1, "stale": 1, "unharvested": 1, "total_edges": 2, "fresh_coverage_ratio": 1 / 3},
-            payload["summary"],
-        )
+        self.assertEqual(3, payload["summary"]["mapped_sources"])
+        self.assertEqual(3, payload["summary"]["watched_sources"])
+        self.assertEqual(0, payload["summary"]["positive_list_sources"])
+        self.assertEqual(3, payload["summary"]["confirmed_positive_sources"])
+        self.assertEqual(1, payload["summary"]["fresh"])
+        self.assertEqual(1, payload["summary"]["stale"])
+        self.assertEqual(1, payload["summary"]["unharvested"])
+        self.assertEqual(0, payload["summary"]["failed"])
+        self.assertEqual(0, payload["summary"]["complete_full_harvest_sources"])
+        self.assertEqual(2, payload["summary"]["official_detail_sources"])
+        self.assertEqual(2, payload["summary"]["total_edges"])
+        self.assertEqual(1 / 3, payload["summary"]["fresh_coverage_ratio"])
         statuses = {source["mal_anime_id"]: source["status"] for source in payload["sources"]}
         self.assertEqual({100: "fresh", 200: "stale", 300: "unharvested"}, statuses)
 

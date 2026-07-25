@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from .config import AppConfig, load_mal_secrets
-from .db import PersistedSeriesMapping, connect, get_series_mapping, replace_review_queue_entries, upsert_series_mapping
+from .db import (
+    PersistedSeriesMapping,
+    connect,
+    get_series_mapping,
+    list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
+    replace_review_queue_entries,
+    upsert_series_mapping,
+)
 from .mal_client import MalApiError, MalClient
-from .mapping import SeriesMappingInput, map_series, should_auto_approve_mapping
+from .mapping import SeriesMappingInput, extract_provider_mapping_evidence, map_series, merge_provider_mapping_evidence, should_auto_approve_mapping
 
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
-MAPPING_REVIEW_HEURISTICS_REVISION = "2026-07-23a"
+MAPPING_REVIEW_HEURISTICS_REVISION = "2026-07-24b"
 MAPPING_REVIEW_NO_QUEUE_DECISIONS = frozenset(
     {"preserved", "auto_approved", "ready_for_approval", "auto_classified_bundle"}
 )
@@ -38,6 +46,13 @@ class ProviderSeriesState:
     watchlist_status: str | None
     last_watched_at: str | None
     completion_audit: dict[str, Any] = field(default_factory=dict)
+    verified_mal_anime_id: int | None = None
+    verified_identity_kind: str | None = None
+    provider_episode_count: int | None = None
+    provider_season_count: int | None = None
+    provider_start_year: int | None = None
+    provider_start_year_is_trustworthy: bool = False
+    verified_identity_evidence: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -179,6 +194,7 @@ def load_provider_series_states(
             s.title,
             s.season_title,
             s.season_number,
+            s.raw_json,
             s.last_seen_at,
             w.status AS watchlist_status
         FROM provider_series s
@@ -218,6 +234,27 @@ def load_provider_series_states(
         series_rows = conn.execute(series_query, series_params).fetchall()
         progress_rows = conn.execute(progress_query, progress_params).fetchall()
 
+    verified_identity_by_series: dict[tuple[str, str], Any] = {}
+    conflicting_verified_identity_keys: set[tuple[str, str]] = set()
+    for evidence in list_recommendation_provider_eligibility_evidence_for_provider_series_keys(
+        config.db_path,
+        ((row["provider"], row["provider_series_id"]) for row in series_rows),
+    ):
+        if evidence.review_status != "verified" or evidence.identity_match_kind not in {
+            "provider_title_search_exact",
+            "provider_franchise_shell_child_match",
+        }:
+            continue
+        key = (evidence.provider, evidence.provider_series_id)
+        candidate = (evidence.mal_anime_id, evidence.identity_match_kind)
+        previous = verified_identity_by_series.get(key)
+        previous_candidate = (previous.mal_anime_id, previous.identity_match_kind) if previous is not None else None
+        if previous is None and key not in conflicting_verified_identity_keys:
+            verified_identity_by_series[key] = evidence
+        elif previous_candidate != candidate:
+            verified_identity_by_series.pop(key, None)
+            conflicting_verified_identity_keys.add(key)
+
     progress_by_series: dict[tuple[str, str], list[EpisodeProgressState]] = {}
     for row in progress_rows:
         progress_by_series.setdefault((row["provider"], row["provider_series_id"]), []).append(
@@ -235,6 +272,17 @@ def load_provider_series_states(
     for row in series_rows:
         series_progress = progress_by_series.get((row["provider"], row["provider_series_id"]), [])
         summary = _summarize_episode_progress(series_progress, config)
+        verified_identity = verified_identity_by_series.get((row["provider"], row["provider_series_id"]))
+        provider_evidence = extract_provider_mapping_evidence(_load_series_raw_json(row["raw_json"]))
+        verified_identity_evidence = provider_evidence.identity_evidence if isinstance(provider_evidence.identity_evidence, dict) else None
+        if verified_identity is not None and isinstance(verified_identity.source_evidence, dict):
+            raw_identity_evidence = verified_identity.source_evidence.get("identity_evidence")
+            if isinstance(raw_identity_evidence, dict):
+                verified_identity_evidence = raw_identity_evidence
+                provider_evidence = merge_provider_mapping_evidence(
+                    provider_evidence,
+                    extract_provider_mapping_evidence({"identity_evidence": raw_identity_evidence}),
+                )
         sort_key = summary["last_watched_at"] or row["last_seen_at"]
         states.append(
             (
@@ -253,6 +301,13 @@ def load_provider_series_states(
                     watchlist_status=row["watchlist_status"],
                     last_watched_at=summary["last_watched_at"],
                     completion_audit=summary["completion_audit"],
+                    verified_mal_anime_id=verified_identity.mal_anime_id if verified_identity else None,
+                    verified_identity_kind=verified_identity.identity_match_kind if verified_identity else None,
+                    verified_identity_evidence=verified_identity_evidence,
+                    provider_episode_count=provider_evidence.episode_count,
+                    provider_season_count=provider_evidence.season_count,
+                    provider_start_year=provider_evidence.start_year,
+                    provider_start_year_is_trustworthy=provider_evidence.start_year_is_trustworthy,
                 ),
             )
         )
@@ -262,6 +317,18 @@ def load_provider_series_states(
     if limit is not None:
         return ordered[:limit]
     return ordered
+
+
+def _load_series_raw_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppConfig) -> dict[str, Any]:
@@ -384,6 +451,13 @@ def _build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInpu
         max_episode_number=state.max_episode_number,
         completed_episode_count=state.completed_episode_count,
         max_completed_episode_number=state.max_completed_episode_number,
+        provider_episode_count=state.provider_episode_count,
+        provider_season_count=state.provider_season_count,
+        provider_start_year=state.provider_start_year,
+        provider_start_year_is_trustworthy=state.provider_start_year_is_trustworthy,
+        verified_mal_anime_id=state.verified_mal_anime_id,
+        verified_identity_kind=state.verified_identity_kind,
+        verified_identity_evidence=state.verified_identity_evidence,
     )
 
 
@@ -430,6 +504,8 @@ def build_mapping_review(
         if mapping.is_deterministic_multi_entry_bundle():
             decision = "auto_classified_bundle"
             reasons.append("auto_classified_multi_entry_bundle_non_actionable")
+        elif mapping.has_provider_aggregate_shell_protection():
+            reasons.append("provider_aggregate_shell_non_actionable")
         elif should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
             effective_mapping = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)
             effective_status = "approved"
@@ -781,6 +857,9 @@ def _resolve_mapping_for_sync(
         )
     if mapping.is_deterministic_multi_entry_bundle():
         mapping_reasons.append("auto_classified_multi_entry_bundle_non_actionable")
+        return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
+    if mapping.has_provider_aggregate_shell_protection():
+        mapping_reasons.append("provider_aggregate_shell_non_actionable")
         return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
     if should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
         persisted = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)

@@ -13,7 +13,7 @@ from unittest.mock import patch
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
 from mal_updater.request_tracking import begin_api_request_context, end_api_request_context, estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_metadata_refresh_command, _run_subprocess, run_pending_tasks, run_service_loop
+from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, effective_niceness_policy, run_pending_tasks, run_service_loop
 
 
 class ServiceRuntimeLeaseTests(unittest.TestCase):
@@ -618,6 +618,82 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             _recommendation_metadata_refresh_command(self.config),
         )
 
+    def test_recommendation_full_harvest_command_and_policy_are_bounded(self) -> None:
+        self.config.service.task_execute_limits["recommend_full_harvest"] = 3
+        self.config.service.task_execute_limits["recommend_full_harvest_pages"] = 4
+        self.config.service.recommendation_full_harvest_stale_after_days = 60
+
+        self.assertEqual(
+            [
+                sys.executable,
+                "-m",
+                "mal_updater.cli",
+                "recommend-refresh-full-userrecs",
+                "--limit",
+                "3",
+                "--stale-after-days",
+                "60",
+                "--max-pages",
+                "4",
+            ],
+            _recommendation_full_harvest_command(self.config),
+        )
+        policy = effective_niceness_policy(self.config)
+        self.assertEqual(self.config.service.recommendation_full_harvest_every_seconds, policy["cadences"]["recommendation_full_harvest_seconds"])
+        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertIn("recommend_full_harvest", policy["task_policies"])
+
+    def test_run_pending_tasks_executes_recommendation_full_harvest_slow_lane(self) -> None:
+        now = time.time()
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendation_full_harvest_every_seconds = 1
+        self.config.service.task_execute_limits["recommend_full_harvest"] = 3
+        self.config.service.task_execute_limits["recommend_full_harvest_pages"] = 4
+        self.config.service.recommendation_full_harvest_stale_after_days = 60
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "sync_apply": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                        "recommend_full_harvest": {"last_run_epoch": 0, "last_run_at": "2026-03-19T20:00:00Z"},
+                        "health": {"last_run_epoch": now, "last_run_at": "2026-03-20T20:00:00Z"},
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_runtime._budget_gate", return_value=(True, None, {"provider": "mal", "request_count": 0})), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={
+                "status": "ok",
+                "label": "recommend_full_harvest",
+                "returncode": 0,
+                "stdout": json.dumps({"seed_count": 10, "considered": 3, "harvested": 2, "failed": 1, "skipped_fresh": 7, "total_edges": 80}),
+                "stderr": "",
+            },
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        harvest_result = next(item for item in result["results"] if item["task"] == "recommend_full_harvest")
+        self.assertEqual("ok", harvest_result["status"])
+        self.assertEqual(3, harvest_result["refresh_limit"])
+        self.assertEqual(4, harvest_result["max_pages"])
+        self.assertEqual(10, harvest_result["seed_count"])
+        self.assertEqual(2, harvest_result["harvested"])
+        self.assertEqual(1, harvest_result["failed"])
+        self.assertEqual(_recommendation_full_harvest_command(self.config), run_subprocess.call_args.args[1])
+
+        state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        harvest_state = state["tasks"]["recommend_full_harvest"]
+        self.assertEqual("recommend_full_harvest:limit=3:stale_after_days=60:max_pages=4", harvest_state["execution_signature"])
+
     def test_run_pending_tasks_executes_recommendation_metadata_refresh_slow_lane(self) -> None:
         now = time.time()
         self.config.service.sync_every_seconds = 3600
@@ -983,6 +1059,49 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertIn("mal_budget_critical", reason or "")
         self.assertEqual(2, usage["task_request_count"])
         self.assertEqual(2, usage["global_request_count"])
+
+    def test_recommend_full_harvest_cold_start_projection_fits_default_task_budget(self) -> None:
+        spec = TaskSpec("recommend_full_harvest", self.config.service.recommendation_full_harvest_every_seconds, budget_provider="mal")
+
+        allowed, reason, usage = _budget_gate(self.config, spec, {}, fetch_mode=None)
+
+        self.assertTrue(allowed, reason)
+        self.assertIsNone(reason)
+        self.assertEqual(8, usage["task_limit"])
+        self.assertEqual(0.95, usage["critical_ratio"])
+        self.assertEqual(6, usage["projected_request_count"])
+        self.assertEqual(6, usage["projected_request_total"])
+        self.assertAlmostEqual(0.75, usage["projected_ratio"])
+        self.assertEqual("configured", usage["projected_request_source"])
+        self.assertEqual(0, usage["task_request_count"])
+        self.assertEqual(0, usage["global_request_count"])
+
+        token = begin_api_request_context(task="recommend_full_harvest", run_id="harvest-critical")
+        try:
+            for index in range(2):
+                record_api_request_event(
+                    "mal",
+                    "recommend-full-harvest",
+                    url=f"https://example.invalid/userrecs/{index}",
+                    method="GET",
+                    outcome="ok",
+                    status_code=200,
+                    config=self.config,
+                )
+        finally:
+            end_api_request_context(token)
+
+        allowed, reason, usage = _budget_gate(self.config, spec, {}, fetch_mode=None)
+
+        self.assertFalse(allowed)
+        self.assertIn("mal_budget_projected_critical", reason or "")
+        self.assertEqual(8, usage["task_limit"])
+        self.assertEqual(2, usage["task_request_count"])
+        self.assertEqual(2, usage["global_request_count"])
+        self.assertEqual(6, usage["projected_request_count"])
+        self.assertEqual(8, usage["projected_request_total"])
+        self.assertAlmostEqual(1.0, usage["projected_ratio"])
+        self.assertEqual("critical", usage["backoff_level"])
 
     def test_run_pending_tasks_records_budget_backoff_and_skips_rechecks_until_expiry(self) -> None:
         self._write_request_events("crunchyroll", [50, 100, 200])

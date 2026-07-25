@@ -43,8 +43,9 @@ class MalApiError(RuntimeError):
 _T = TypeVar("_T")
 _TIMEOUT_RETRY_ATTEMPTS = 2
 _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
-MAL_SEARCH_CACHE_LOGIC_VERSION = "mal-search-v1"
+MAL_SEARCH_CACHE_LOGIC_VERSION = "mal-search-v2"
 MAL_DETAIL_CACHE_LOGIC_VERSION = "mal-detail-v1"
+MAL_ANIME_SEARCH_QUERY_MAX_CHARS = 64
 
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 
@@ -265,6 +266,11 @@ class MalClient:
 
     def search_anime(self, query: str, *, limit: int = 5, fields: str = "id,title,alternative_titles,media_type,status,num_episodes", force_refresh: bool = False) -> dict[str, Any]:
         sanitized_query = _sanitize_anime_search_query(query) or " ".join(str(query).split()).strip()
+        # MAL rejects q values longer than 64 characters. Mapping already tries
+        # bounded title fallbacks, so skip an invalid network request and let
+        # those variants (or verified identity evidence) supply candidates.
+        if len(sanitized_query) > MAL_ANIME_SEARCH_QUERY_MAX_CHARS:
+            return {"data": []}
         normalized_query = " ".join(sanitized_query.casefold().split())
         fields_key = ",".join(sorted({part.strip() for part in fields.split(",") if part.strip()}))
         cache_key = hashlib.sha256(json.dumps([MAL_SEARCH_CACHE_LOGIC_VERSION, normalized_query, int(limit), fields_key], separators=(",", ":")).encode()).hexdigest()

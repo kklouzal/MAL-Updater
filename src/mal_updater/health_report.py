@@ -652,6 +652,7 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
         "provider_cold_full_seconds",
         "mal_user_list_refresh_seconds",
         "recommendation_metadata_refresh_seconds",
+        "recommendation_full_harvest_seconds",
         "provider_eligibility_refresh_seconds",
         "recommendation_snapshot_health_seconds",
     ):

@@ -406,6 +406,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="How many discovered target anime to hydrate when --include-discovery-targets is used (use 0 for all discovered targets)",
     )
+    recommend_full_userrecs = subparsers.add_parser(
+        "recommend-refresh-full-userrecs",
+        help="Bounded cold-path harvest of complete public MAL /userrecs aggregates for cached completed/watching/on_hold MAL list titles",
+    )
+    recommend_full_userrecs.add_argument("--limit", type=int, default=0, help="How many positive MAL list source titles to harvest this run (use 0 for all due sources)")
+    recommend_full_userrecs.add_argument("--force-refresh", action="store_true", help="Refresh due and fresh complete public userrecs rows without letting official-detail top-10 data overwrite them")
+    recommend_full_userrecs.add_argument("--stale-after-days", type=int, default=45, help="Refresh complete public userrecs rows older than this many days (default: 45)")
+    recommend_full_userrecs.add_argument("--max-pages", type=int, default=3, help="Maximum advertised same-origin userrecs pages to follow per title before preserving existing edges as partial/failed")
+    recommend_full_userrecs.add_argument("--max-body-mb", type=float, default=4.0, help="Maximum HTML body size per public MAL userrecs page before preserving existing edges as failed")
+    recommend_full_userrecs.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     recommend_enrich = subparsers.add_parser(
         "recommend-enrich-provider-availability",
         help="Use bounded provider title search to enrich recommendation availability cache",

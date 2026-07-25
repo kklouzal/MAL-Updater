@@ -20,6 +20,7 @@ search_negative_cache_ttl_days = 3  # bounded no-result cache; force refresh byp
 detail_cache_ttl_days = 14  # only complete field-covering rows may satisfy a detail read
 provider_detail_cache_ttl_days = 30  # Crunchyroll enriched series/audio/season evidence; HIDIVE stays search-only
 base_url = "https://api.myanimelist.net/v2"
+public_base_url = "https://myanimelist.net"  # public read-only /anime/<id>/<slug>/userrecs aggregate surface; prose/usernames are not retained
 auth_url = "https://myanimelist.net/v1/oauth2/authorize"
 token_url = "https://myanimelist.net/v1/oauth2/token"
 bind_host = "0.0.0.0"
@@ -74,6 +75,8 @@ health_every_seconds = 3600
 mal_refresh_every_seconds = 3600  # lightweight token-refresh lane; distinct from the user-list network refresh
 mal_list_refresh_every_seconds = 28800  # 8h, within the conservative 6-12h user-list window; max pages is configured below
 recommendation_metadata_refresh_every_seconds = 43200  # 12h bounded seed/discovery hydration
+recommendation_full_harvest_every_seconds = 21600  # 6h tiny cold-path batches over public MAL userrecs aggregates
+recommendation_full_harvest_stale_after_days = 45  # long refresh horizon for newly added public MAL user recommendations
 provider_eligibility_refresh_every_seconds = 86400  # one separately budgeted provider-specific lane per credentialed provider
 recommend_maintain_every_seconds = 3600  # DB/local-only recommendation snapshot + health materialization
 recommendations_webhook_push_every_seconds = 0  # disabled by default; set >0 to let the daemon push changed recommendation digests into OpenClaw using delivery_mode + item-aware dedupe
@@ -96,6 +99,7 @@ hidive = 72  # built-in default shown explicitly here; override only when this h
 mal_list_refresh = 6  # task cap and MAL provider-global cap are both enforced
 sync_apply = 48  # additional task-scoped cap; provider-global MAL cap is still enforced, and legacy unattributed events are conservatively included
 recommend_metadata_refresh = 12
+recommend_full_harvest = 8  # task cap and MAL provider-global cap are both enforced
 recommend_provider_eligibility_crunchyroll = 18  # local safety budget, not an external provider-limit claim
 recommend_provider_eligibility_hidive = 8
 
@@ -104,6 +108,8 @@ mal_list_refresh_pages = 3
 sync_apply = 8  # built-in default shown explicitly here; positive values bound unattended writes, while 0 disables this scheduler lane (manual CLI --limit 0 keeps its explicit full-scan meaning)
 recommend_metadata_refresh = 3
 recommend_metadata_discovery_targets = 5
+recommend_full_harvest = 2  # positive source-title batch size; 0 disables daemon lane rather than becoming unbounded
+recommend_full_harvest_pages = 3  # advertised same-origin public userrecs pages per source before preserving existing edges as failed/partial
 recommend_provider_eligibility_candidates = 2
 recommend_provider_eligibility_search_results = 5
 recommend_provider_eligibility_queries_per_candidate = 1
@@ -115,6 +121,7 @@ mal_refresh = 1  # built-in default shown explicitly here; fresh installs now se
 mal_list_refresh = 3
 sync_apply = 8  # built-in default shown explicitly here; keep this aligned with the unattended apply batch posture unless this host has strong evidence for a different per-run MAL request cost
 recommend_metadata_refresh = 8
+recommend_full_harvest = 6
 recommend_provider_eligibility_crunchyroll = 7
 recommend_provider_eligibility_hidive = 2
 sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds
@@ -135,6 +142,7 @@ hidive = 9  # built-in default shown explicitly here
 mal_refresh = 3  # built-in default shown explicitly here; keep MAL token refresh learning shallow because the lane is normally tiny and steady
 sync_fetch_crunchyroll = 7  # optional lane-specific override; task settings win over provider defaults when both exist
 sync_apply = 3  # built-in default shown explicitly here
+recommend_full_harvest = 5  # learned-history depth for the complete public MAL userrecs lane
 
 [service.provider_projected_request_percentiles]
 crunchyroll = 0.9  # built-in default shown explicitly here; override only when this host needs a different provider-wide conservative projection
@@ -142,6 +150,7 @@ hidive = 0.9  # built-in default shown explicitly here; override only when this 
 
 [service.task_projected_request_percentiles]
 sync_fetch_crunchyroll = 0.9  # optional conservative learned projection; when unset the daemon falls back to provider defaults, then smoothed/auto-bursty behavior
+recommend_full_harvest = 0.9
 
 [service.provider_warn_backoff_floor_seconds]
 crunchyroll = 900  # built-in default shown explicitly here
@@ -153,9 +162,11 @@ hidive = 1200  # built-in default shown explicitly here
 
 [service.task_warn_backoff_floor_seconds]
 sync_apply = 900  # built-in default shown explicitly here
+recommend_full_harvest = 1800
 
 [service.task_critical_backoff_floor_seconds]
 sync_apply = 1800  # built-in default shown explicitly here
+recommend_full_harvest = 3600
 
 [service.provider_auth_failure_backoff_floor_seconds]
 crunchyroll = 7200  # built-in default shown explicitly here
@@ -163,6 +174,7 @@ hidive = 3600  # built-in default shown explicitly here
 
 [service.task_auth_failure_backoff_floor_seconds]
 sync_apply = 2400  # built-in default shown explicitly here
+recommend_full_harvest = 21600
 
 [secret_files]
 mal_client_id = "mal_client_id.txt"

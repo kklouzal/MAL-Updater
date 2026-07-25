@@ -9,6 +9,8 @@ from typing import Any
 
 from .config import AppConfig, load_mal_secrets
 from .db import (
+    MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
+    MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     MalAnimeMetadata,
     MalUserAnimeListRefreshSummary,
     abort_mal_user_anime_list_cache_refresh,
@@ -19,12 +21,19 @@ from .db import (
     list_mal_user_anime_list_cache,
     merge_mal_user_anime_list_cache_into_metadata,
     list_series_mappings,
+    record_mal_recommendation_harvest_failure,
     replace_mal_anime_relations,
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
     upsert_mal_user_anime_list_cache_generation,
 )
 from .mal_client import MalApiError, MalClient
+from .mal_user_recommendations import (
+    DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
+    DEFAULT_PUBLIC_USER_RECS_MAX_PAGES,
+    PublicMalUserRecommendationsClient,
+    PublicMalUserRecommendationsError,
+)
 
 DETAIL_FIELD_NAMES = (
     "id",
@@ -58,6 +67,7 @@ DEFAULT_METADATA_STALE_AFTER_DAYS = 14
 DEFAULT_HOT_METADATA_STALE_AFTER_DAYS = 3
 DEFAULT_WARM_METADATA_STALE_AFTER_DAYS = 14
 DEFAULT_COLD_METADATA_STALE_AFTER_DAYS = 90
+DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS = 45
 MAL_USER_LIST_POSITIVE_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
 MAL_USER_LIST_SUPPRESSION_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 MAL_USER_LIST_FIELDS = "list_status,num_episodes,media_type,status"
@@ -144,6 +154,63 @@ class MetadataRefreshSummary:
             "refresh_tiers": dict(self.refresh_tiers),
             "failed": len(failures),
             "failures": [failure.as_dict() for failure in failures],
+        }
+
+
+@dataclass(slots=True)
+class FullUserRecommendationHarvestFailure:
+    mal_anime_id: int
+    title: str | None
+    error: str
+    pages_fetched: int = 0
+    source_url: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mal_anime_id": self.mal_anime_id,
+            "title": self.title,
+            "error": self.error,
+            "pages_fetched": self.pages_fetched,
+            "source_url": self.source_url,
+        }
+
+
+@dataclass(slots=True)
+class FullUserRecommendationHarvestSummary:
+    status: str
+    seed_count: int
+    considered: int
+    harvested: int
+    failed: int
+    skipped_fresh: int
+    total_edges: int
+    forced: bool
+    stale_after_days: int
+    max_pages: int
+    failures: list[FullUserRecommendationHarvestFailure] = field(default_factory=list)
+    harvested_sources: list[dict[str, Any]] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "seed_count": self.seed_count,
+            "considered": self.considered,
+            "harvested": self.harvested,
+            "failed": self.failed,
+            "skipped_fresh": self.skipped_fresh,
+            "total_edges": self.total_edges,
+            "forced": self.forced,
+            "stale_after_days": self.stale_after_days,
+            "max_pages": self.max_pages,
+            "failures": [failure.as_dict() for failure in self.failures],
+            "harvested_sources": list(self.harvested_sources),
+            "semantics": {
+                "source": "public_mal_userrecs_html",
+                "complete_when_no_next_link": True,
+                "partial_failure_preserves_existing_edges": True,
+                "retained_fields": ["target_mal_anime_id", "target_title", "num_recommendations"],
+                "privacy": "recommendation prose and usernames are not persisted",
+            },
         }
 
 
@@ -247,7 +314,7 @@ def _load_mapped_seed_states(
         ).fetchall()
         status_rows = conn.execute(
             f"""
-            SELECT source_mal_anime_id, status, num_edges, fetched_at
+            SELECT source_mal_anime_id, status, num_edges, fetched_at, source_type, is_complete
             FROM mal_recommendation_harvest_status
             WHERE source_mal_anime_id IN ({placeholders})
             """,
@@ -280,7 +347,18 @@ def _load_mapped_seed_states(
         elif edge_row is not None:
             edge_count = int(edge_row["edge_count"] or 0)
 
-        if status_row is None and edge_row is None:
+        has_complete_public_harvest = (
+            status_row is not None
+            and int(status_row["is_complete"] or 0) == 1
+            and str(status_row["source_type"] or "") == MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS
+        )
+        if has_complete_public_harvest:
+            # The separate public-MAL cold path owns complete-harvest freshness.
+            # The ordinary 12h official-detail metadata lane must never chase a
+            # stale/failed full-harvest attempt by overwriting complete edges with
+            # the official API detail surface's practical top-10 subset.
+            harvest_status = "fresh"
+        elif status_row is None and edge_row is None:
             harvest_status = "unharvested"
         else:
             stored_status = str(status_row["status"] or "fetched") if status_row is not None else "fetched"
@@ -320,25 +398,13 @@ def _rank_refresh_ids(anime_ids: list[int], metadata_by_id: dict[int, Any], seed
     return sorted(anime_ids, key=_priority)
 
 
-def _record_harvest_failure(db_path: Path, *, source_mal_anime_id: int) -> None:
-    with connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO mal_recommendation_harvest_status (source_mal_anime_id, status, num_edges, fetched_at)
-            VALUES (
-                ?,
-                'failed',
-                COALESCE((SELECT COUNT(*) FROM mal_anime_recommendations WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'), 0),
-                CURRENT_TIMESTAMP
-            )
-            ON CONFLICT(source_mal_anime_id) DO UPDATE SET
-                status = 'failed',
-                num_edges = COALESCE((SELECT COUNT(*) FROM mal_anime_recommendations WHERE source_mal_anime_id = excluded.source_mal_anime_id AND source_kind = 'mal_recommendation'), mal_recommendation_harvest_status.num_edges),
-                fetched_at = CURRENT_TIMESTAMP
-            """,
-            (int(source_mal_anime_id), int(source_mal_anime_id)),
-        )
-        conn.commit()
+def _record_harvest_failure(db_path: Path, *, source_mal_anime_id: int, error: str | None = None) -> None:
+    record_mal_recommendation_harvest_failure(
+        db_path,
+        source_mal_anime_id=source_mal_anime_id,
+        source_type=MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
+        error=error,
+    )
 
 
 def _metadata_payload_from_details(db_path: Path, *, mal_anime_id: int, details: dict[str, Any]) -> None:
@@ -525,6 +591,191 @@ def refresh_mal_user_anime_list_cache(
     summary.by_status = dict(by_status)
     return summary
 
+
+def _full_harvest_status_rows(db_path: Path, source_ids: set[int]) -> dict[int, dict[str, Any]]:
+    if not source_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in source_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                source_mal_anime_id,
+                status,
+                num_edges,
+                fetched_at,
+                source_type,
+                is_complete,
+                pages_fetched,
+                source_url,
+                last_attempted_at,
+                last_error,
+                failure_count
+            FROM mal_recommendation_harvest_status
+            WHERE source_mal_anime_id IN ({placeholders})
+            """,
+            [int(source_id) for source_id in sorted(source_ids)],
+        ).fetchall()
+    return {int(row["source_mal_anime_id"]): {key: row[key] for key in row.keys()} for row in rows}
+
+
+def _full_harvest_candidate_status(row: dict[str, Any] | None, *, stale_after_days: int) -> str:
+    if row is None:
+        return "unharvested"
+    if str(row.get("status") or "") == "failed":
+        return "failed"
+    if not bool(row.get("is_complete")) or str(row.get("source_type") or "") != MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS:
+        return "unharvested"
+    return "stale" if _is_stale(row.get("fetched_at"), stale_after_days=stale_after_days) else "fresh"
+
+
+def _full_harvest_rank_key(entry: Any, status_row: dict[str, Any] | None, *, stale_after_days: int) -> tuple[int, tuple[int, str], int]:
+    status = _full_harvest_candidate_status(status_row, stale_after_days=stale_after_days)
+    status_order = {"unharvested": 0, "failed": 1, "stale": 2, "fresh": 3}.get(status, 4)
+    if status == "failed":
+        age = _metadata_age_sort_value(status_row.get("last_attempted_at") if status_row else None)
+    else:
+        age = _metadata_age_sort_value(status_row.get("fetched_at") if status_row else None)
+    return (status_order, age, int(entry.mal_anime_id))
+
+
+def refresh_full_user_recommendation_harvest(
+    config: AppConfig,
+    *,
+    limit: int | None = None,
+    force_refresh: bool = False,
+    stale_after_days: int = DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS,
+    max_pages: int = DEFAULT_PUBLIC_USER_RECS_MAX_PAGES,
+    max_body_bytes: int = DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
+    client: Any | None = None,
+) -> FullUserRecommendationHarvestSummary:
+    """Bounded cold path for complete public MAL user-recommendation aggregates.
+
+    Seeds come only from the cached official MAL @me anime-list positive states
+    (completed/watching/on_hold). Provider-only mappings are intentionally not a
+    full-harvest source of truth. Each source is atomically replaced only after
+    public MAL pagination reaches a terminal page; malformed/looped/truncated
+    pages are recorded as failed attempts and preserve existing graph data.
+    """
+    stale_after_days = max(1, int(stale_after_days))
+    normalized_max_pages = max(1, int(max_pages))
+    normalized_max_body_bytes = max(1024, int(max_body_bytes))
+    merge_mal_user_anime_list_cache_into_metadata(config.db_path)
+    positive_entries = list_mal_user_anime_list_cache(config.db_path, statuses=MAL_USER_LIST_POSITIVE_SEED_STATUSES)
+    source_ids = {int(entry.mal_anime_id) for entry in positive_entries}
+    status_rows = _full_harvest_status_rows(config.db_path, source_ids)
+    ranked_entries = sorted(
+        positive_entries,
+        key=lambda entry: _full_harvest_rank_key(entry, status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days),
+    )
+    stale_or_missing_entries = [
+        entry
+        for entry in ranked_entries
+        if force_refresh
+        or _full_harvest_candidate_status(status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days)
+        != "fresh"
+    ]
+    skipped_fresh = len(ranked_entries) - len(stale_or_missing_entries)
+    selected_entries = stale_or_missing_entries
+    if limit is not None and limit > 0:
+        selected_entries = selected_entries[: int(limit)]
+
+    harvest_client = client or PublicMalUserRecommendationsClient(config)
+    failures: list[FullUserRecommendationHarvestFailure] = []
+    harvested_sources: list[dict[str, Any]] = []
+    harvested = 0
+    total_edges = 0
+    for entry in selected_entries:
+        try:
+            result = harvest_client.harvest(
+                int(entry.mal_anime_id),
+                source_title=entry.title,
+                max_pages=normalized_max_pages,
+                max_body_bytes=normalized_max_body_bytes,
+            )
+        except PublicMalUserRecommendationsError as exc:
+            record_mal_recommendation_harvest_failure(
+                config.db_path,
+                source_mal_anime_id=int(entry.mal_anime_id),
+                source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                error=str(exc),
+            )
+            failures.append(
+                FullUserRecommendationHarvestFailure(
+                    mal_anime_id=int(entry.mal_anime_id),
+                    title=entry.title,
+                    error=str(exc),
+                )
+            )
+            continue
+        if not result.complete or result.partial or result.status != "ok":
+            error = result.error or "public MAL userrecs harvest did not prove completeness"
+            record_mal_recommendation_harvest_failure(
+                config.db_path,
+                source_mal_anime_id=int(entry.mal_anime_id),
+                source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                error=error,
+                pages_fetched=result.pages_fetched,
+                source_url=result.source_url,
+            )
+            failures.append(
+                FullUserRecommendationHarvestFailure(
+                    mal_anime_id=int(entry.mal_anime_id),
+                    title=entry.title,
+                    error=error,
+                    pages_fetched=result.pages_fetched,
+                    source_url=result.source_url,
+                )
+            )
+            continue
+        edge_payloads = [
+            edge.as_edge_payload(source_url=result.source_url or "", page_count=result.pages_fetched)
+            for edge in result.edges
+        ]
+        replaced = replace_mal_recommendation_edges(
+            config.db_path,
+            source_mal_anime_id=int(entry.mal_anime_id),
+            hop_distance=1,
+            edges=edge_payloads,
+            source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+            complete=True,
+            pages_fetched=result.pages_fetched,
+            source_url=result.source_url,
+        )
+        if replaced:
+            harvested += 1
+            total_edges += len(edge_payloads)
+            harvested_sources.append(
+                {
+                    "mal_anime_id": int(entry.mal_anime_id),
+                    "title": entry.title,
+                    "edge_count": len(edge_payloads),
+                    "pages_fetched": result.pages_fetched,
+                    "source_url": result.source_url,
+                }
+            )
+
+    if failures and harvested:
+        status = "partial"
+    elif failures:
+        status = "failed"
+    else:
+        status = "ok"
+    return FullUserRecommendationHarvestSummary(
+        status=status,
+        seed_count=len(positive_entries),
+        considered=len(selected_entries),
+        harvested=harvested,
+        failed=len(failures),
+        skipped_fresh=skipped_fresh,
+        total_edges=total_edges,
+        forced=bool(force_refresh),
+        stale_after_days=stale_after_days,
+        max_pages=normalized_max_pages,
+        failures=failures,
+        harvested_sources=harvested_sources,
+    )
+
 def refresh_recommendation_metadata(
     config: AppConfig,
     *,
@@ -596,7 +847,7 @@ def refresh_recommendation_metadata(
         try:
             details = client.get_anime_details(anime_id, fields=DETAIL_FIELDS)
         except (MalApiError, TimeoutError) as exc:
-            _record_harvest_failure(config.db_path, source_mal_anime_id=anime_id)
+            _record_harvest_failure(config.db_path, source_mal_anime_id=anime_id, error=str(exc))
             failures.append(MetadataRefreshFailure(mal_anime_id=anime_id, stage="mapped_metadata", error=str(exc)))
             continue
         _metadata_payload_from_details(config.db_path, mal_anime_id=anime_id, details=details)
@@ -643,13 +894,16 @@ def refresh_recommendation_metadata(
                 title=target_title,
                 num_recommendations=num_recs,
             )
-        replace_mal_recommendation_edges(
+        replaced_edges = replace_mal_recommendation_edges(
             config.db_path,
             source_mal_anime_id=anime_id,
             hop_distance=1,
             edges=recommendation_edges,
+            source_type=MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
+            complete=False,
         )
-        harvested_edge_count += len(recommendation_edges)
+        if replaced_edges:
+            harvested_edge_count += len(recommendation_edges)
         refreshed += 1
 
     discovery_considered = 0

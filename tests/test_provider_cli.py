@@ -99,6 +99,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "recommend-dashboard",
     "recommend-enrich-provider-availability",
     "recommend-maintain",
+    "recommend-refresh-full-userrecs",
     "recommend-refresh-metadata",
     "recommend-snapshots",
     "refresh-mapping-review-queue",
@@ -335,7 +336,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(49, len(actual_commands))
+        self.assertEqual(50, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",
