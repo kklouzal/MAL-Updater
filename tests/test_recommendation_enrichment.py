@@ -11,7 +11,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mal_updater.config import load_config
-from mal_updater.db import bootstrap_database, get_recommendation_provider_eligibility_evidence, get_series_mapping, upsert_mal_anime_metadata, upsert_series_mapping
+from mal_updater.db import (
+    bootstrap_database,
+    get_recommendation_provider_enrichment_cursor,
+    get_recommendation_provider_eligibility_evidence,
+    get_series_mapping,
+    list_recommendation_provider_enrichment_attempts,
+    upsert_mal_anime_metadata,
+    upsert_recommendation_provider_eligibility_evidence,
+    upsert_series_mapping,
+)
 from mal_updater.provider_registry import get_provider
 from mal_updater.provider_types import ProviderSearchResult
 from mal_updater import providers as _providers  # noqa: F401 - register provider instances
@@ -177,6 +186,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config,
             providers=[provider],
             candidate_limit=1,
+            queries_per_candidate=0,
             now=datetime(2026, 1, 1, tzinfo=timezone.utc),
             persist_review_queue=False,
         )
@@ -373,10 +383,11 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             queries_per_candidate=1,
             now=now + timedelta(days=1),
         )
-        self.assertEqual(1, fresh.cache_hits)
+        self.assertEqual(0, fresh.cache_hits)
         self.assertEqual(1, fresh.eligibility_fresh_skips)
         self.assertEqual(0, fresh.provider_searches)
         self.assertEqual(0, fresh.provider_detail_probes)
+        self.assertEqual([], fresh.selected_candidates)
         self.assertEqual(1, len(provider.calls), "fresh actionable evidence must make zero provider calls")
 
         expired = enrichment.enrich_discovery_provider_availability(
@@ -389,6 +400,213 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(1, expired.eligibility_expired_retries)
         self.assertEqual(1, expired.provider_searches)
         self.assertEqual(2, len(provider.calls))
+
+    def test_provider_cursor_selects_uncovered_then_advances_and_persists_across_reload(self):
+        self._insert_meta(901, english="First Cursor Show")
+        self._insert_meta(902, english="Second Cursor Show")
+        self._recommendations(901, 902)
+
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+        now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+
+        first = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now,
+        )
+        self.assertEqual([901], [item["mal_anime_id"] for item in first.selected_candidates])
+        self.assertEqual("uncovered", first.selected_candidates[0]["selection_class"])
+        self.assertEqual("searched_no_match", first.selected_candidates[0]["outcome"])
+        cursor = get_recommendation_provider_enrichment_cursor(self.config.db_path, provider="crunchyroll")
+        self.assertIsNotNone(cursor)
+        assert cursor is not None
+        self.assertEqual(901, cursor.cursor_mal_anime_id)
+
+        reloaded_config = load_config(self.root)
+        second = enrichment.enrich_discovery_provider_availability(
+            reloaded_config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now + timedelta(hours=1),
+        )
+        self.assertEqual([902], [item["mal_anime_id"] for item in second.selected_candidates])
+        self.assertEqual(["First Cursor Show", "Second Cursor Show"], [call[0] for call in provider.calls])
+        attempts = list_recommendation_provider_enrichment_attempts(
+            self.config.db_path,
+            provider="crunchyroll",
+            mal_anime_ids=[901, 902],
+        )
+        self.assertEqual({901: 1, 902: 1}, {attempt.mal_anime_id: attempt.attempt_count for attempt in attempts})
+
+    def test_fresh_covered_candidate_is_skipped_for_next_uncovered_provider_candidate(self):
+        self._insert_meta(913, english="Already Covered")
+        self._insert_meta(914, english="Needs Coverage")
+        self._recommendations(913, 914)
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=913,
+            provider="crunchyroll",
+            provider_series_id="cr-covered",
+            provider_title="Already Covered",
+            identity_match_kind="provider_title_search_exact",
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            audio_locales=["en-US"],
+            fetched_at="2026-02-01T00:00:00Z",
+            expires_at="2026-02-08T00:00:00Z",
+            last_verified_at="2026-02-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=datetime(2026, 2, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual([914], [item["mal_anime_id"] for item in summary.selected_candidates])
+        self.assertEqual(1, summary.eligibility_fresh_skips)
+        self.assertEqual({"fresh_covered": 1}, summary.selection_skip_counts)
+        self.assertEqual(["Needs Coverage"], [call[0] for call in provider.calls])
+
+    def test_provider_cursor_wraps_and_cache_hit_no_match_still_advances(self):
+        self._insert_meta(903, english="Wrapped One")
+        self._insert_meta(904, english="Wrapped Two")
+        self._recommendations(903, 904)
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+        now = datetime(2026, 2, 2, tzinfo=timezone.utc)
+
+        enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now)
+        enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=1))
+        wrapped = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=2))
+
+        self.assertEqual([903], [item["mal_anime_id"] for item in wrapped.selected_candidates])
+        self.assertEqual(1, wrapped.cache_hits)
+        self.assertEqual(0, wrapped.provider_searches)
+        self.assertEqual("cache_hit_no_match", wrapped.selected_candidates[0]["outcome"])
+        self.assertTrue(wrapped.provider_cursor_states["crunchyroll"]["wrapped"])
+        self.assertEqual(["Wrapped One", "Wrapped Two"], [call[0] for call in provider.calls])
+
+    def test_provider_cursor_membership_change_uses_unattempted_ranked_candidate(self):
+        self._insert_meta(905, english="Departing Cursor")
+        self._insert_meta(906, english="Remaining Cursor")
+        self._insert_meta(907, english="New Cursor")
+        self._recommendations(905, 906)
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+        now = datetime(2026, 2, 3, tzinfo=timezone.utc)
+
+        enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now)
+        self._recommendations(907, 906)
+        changed = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=1))
+
+        self.assertEqual([907], [item["mal_anime_id"] for item in changed.selected_candidates])
+        self.assertTrue(changed.provider_cursor_states["crunchyroll"]["cursor_missing"])
+
+    def test_crunchyroll_and_hidive_cursors_are_independent(self):
+        self._insert_meta(908, english="Shared First")
+        self._insert_meta(909, english="Shared Second")
+        self._recommendations(908, 909)
+        crunchyroll = FakeProvider([])
+        crunchyroll.slug = "crunchyroll"
+        hidive = FakeProvider([])
+        hidive.slug = "hidive"
+        now = datetime(2026, 2, 4, tzinfo=timezone.utc)
+
+        enrichment.enrich_discovery_provider_availability(self.config, providers=[crunchyroll], candidate_limit=1, queries_per_candidate=1, now=now)
+        enrichment.enrich_discovery_provider_availability(self.config, providers=[hidive], candidate_limit=1, queries_per_candidate=1, now=now)
+        advanced_cr = enrichment.enrich_discovery_provider_availability(self.config, providers=[crunchyroll], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=1))
+
+        cr_cursor = get_recommendation_provider_enrichment_cursor(self.config.db_path, provider="crunchyroll")
+        hi_cursor = get_recommendation_provider_enrichment_cursor(self.config.db_path, provider="hidive")
+        self.assertIsNotNone(cr_cursor)
+        self.assertIsNotNone(hi_cursor)
+        assert cr_cursor is not None and hi_cursor is not None
+        self.assertEqual([909], [item["mal_anime_id"] for item in advanced_cr.selected_candidates])
+        self.assertEqual(909, cr_cursor.cursor_mal_anime_id)
+        self.assertEqual(908, hi_cursor.cursor_mal_anime_id)
+
+    def test_due_retry_selection_refreshes_failed_eligibility_evidence(self):
+        self._insert_meta(910, english="Retry Due Show")
+        self._recommendations(910)
+        provider = FakeProvider([
+            {"provider_series_id": "cr-due", "title": "Retry Due Show", "audio_locales": ["en-US"], "catalog_status": "present"}
+        ])
+        provider.slug = "crunchyroll"
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=910,
+            provider="crunchyroll",
+            provider_series_id="cr-due",
+            provider_title="Retry Due Show",
+            identity_match_kind="provider_title_search_exact",
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            audio_locales=["en-US"],
+            fetched_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-08T00:00:00Z",
+            last_verified_at="2026-01-01T00:00:00Z",
+            refresh_status="failed",
+            failure_count=1,
+            next_retry_at="2026-01-08T02:00:00Z",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=datetime(2026, 1, 8, 3, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual("failed_retry_due", summary.selected_candidates[0]["selection_class"])
+        self.assertEqual(1, summary.eligibility_expired_retries)
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=910,
+            provider="crunchyroll",
+            provider_series_id="cr-due",
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("ok", evidence.refresh_status)
+        self.assertEqual(0, evidence.failure_count)
+        self.assertIsNone(evidence.next_retry_at)
+
+    def test_provider_search_failure_still_advances_cursor(self):
+        self._insert_meta(911, english="Failure Cursor")
+        self._insert_meta(912, english="After Failure Cursor")
+        self._recommendations(911, 912)
+
+        class FailingFirstProvider(FakeProvider):
+            slug = "crunchyroll"
+
+            def search_title(self, config, query: str, *, limit: int = 10):
+                self.calls.append((query, limit))
+                if query == "Failure Cursor":
+                    raise RuntimeError("temporary search failure")
+                return []
+
+        provider = FailingFirstProvider([])
+        now = datetime(2026, 2, 5, tzinfo=timezone.utc)
+        failed = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now)
+        advanced = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=1))
+
+        self.assertEqual(1, failed.provider_search_failures)
+        self.assertEqual("provider_search_failure", failed.selected_candidates[0]["outcome"])
+        self.assertEqual([912], [item["mal_anime_id"] for item in advanced.selected_candidates])
 
     def test_expired_eligibility_failure_backs_off_then_success_resets_lifecycle(self):
         self._insert_meta(103, english="Retry Show")
@@ -836,6 +1054,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config,
             providers=[provider],
             candidate_limit=1,
+            queries_per_candidate=0,
             now=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
@@ -882,6 +1101,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config,
             providers=[provider],
             candidate_limit=1,
+            queries_per_candidate=0,
             now=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
@@ -954,6 +1174,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config,
             providers=[provider],
             candidate_limit=1,
+            queries_per_candidate=0,
             now=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
@@ -1284,6 +1505,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config,
             providers=[provider],
             candidate_limit=1,
+            queries_per_candidate=0,
             now=datetime(2026, 7, 23, tzinfo=timezone.utc),
         )
 

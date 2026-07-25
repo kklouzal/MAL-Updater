@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 BROADCAST_COMPATIBILITY_MIGRATION = "013_mal_anime_metadata_broadcast_compatibility.sql"
+PROVIDER_ENRICHMENT_CURSOR_MIGRATION = "014_recommendation_provider_enrichment_cursor.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -24,6 +25,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "011_mal_user_anime_list_preference_fields.sql",
     "012_watch_confirmation_provenance.sql",
     BROADCAST_COMPATIBILITY_MIGRATION,
+    PROVIDER_ENRICHMENT_CURSOR_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -345,6 +347,54 @@ class RecommendationProviderEligibilityEvidence:
     logic_version: str
     created_at: str
     updated_at: str
+
+
+@dataclass(slots=True)
+class RecommendationProviderEnrichmentCursor:
+    provider: str
+    cursor_mal_anime_id: int | None
+    cursor_rank_key_json: str | None
+    cursor_generation: int
+    wrapped_at: str | None
+    last_attempted_mal_anime_id: int | None
+    last_attempted_rank_key_json: str | None
+    last_attempted_at: str | None
+    last_selection_class: str | None
+    last_outcome: str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def cursor_rank_key(self) -> dict[str, Any] | None:
+        return _decode_json_object_or_none(self.cursor_rank_key_json)
+
+    @property
+    def last_attempted_rank_key(self) -> dict[str, Any] | None:
+        return _decode_json_object_or_none(self.last_attempted_rank_key_json)
+
+
+@dataclass(slots=True)
+class RecommendationProviderEnrichmentAttempt:
+    provider: str
+    mal_anime_id: int
+    rank_key_json: str
+    selection_class: str
+    attempted_at: str
+    attempt_count: int
+    last_outcome: str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def rank_key(self) -> dict[str, Any]:
+        return _decode_json_object_or_none(self.rank_key_json) or {}
+
+
+@dataclass(slots=True)
+class RecommendationProviderEnrichmentProgress:
+    provider: str
+    cursor: RecommendationProviderEnrichmentCursor | None
+    attempts_by_mal_anime_id: dict[int, RecommendationProviderEnrichmentAttempt]
 
 
 @dataclass(slots=True)
@@ -3504,6 +3554,240 @@ def delete_recommendation_provider_eligibility_evidence(
         cursor = conn.execute(f"DELETE FROM recommendation_provider_eligibility_evidence WHERE {' AND '.join(conditions)}", params)
         conn.commit()
         return int(cursor.rowcount or 0)
+
+
+def _normalize_provider_progress_slug(provider: str) -> str:
+    normalized = str(provider).strip().lower()
+    if not normalized:
+        raise ValueError("provider must be a non-empty slug")
+    return normalized
+
+
+def _normalize_non_empty_progress_text(name: str, value: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"{name} must be non-empty")
+    return normalized
+
+
+def _stable_json_object(value: dict[str, Any]) -> str:
+    if not isinstance(value, dict):
+        raise TypeError("rank_key must be a dictionary")
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _decode_json_object_or_none(raw_json: str | None) -> dict[str, Any] | None:
+    if raw_json is None:
+        return None
+    decoded = json.loads(raw_json)
+    if not isinstance(decoded, dict):
+        raise ValueError("stored rank key JSON is not an object")
+    return decoded
+
+
+def _provider_enrichment_cursor_from_db(row: sqlite3.Row) -> RecommendationProviderEnrichmentCursor:
+    return RecommendationProviderEnrichmentCursor(
+        provider=str(row["provider"]),
+        cursor_mal_anime_id=None if row["cursor_mal_anime_id"] is None else int(row["cursor_mal_anime_id"]),
+        cursor_rank_key_json=row["cursor_rank_key_json"],
+        cursor_generation=int(row["cursor_generation"]),
+        wrapped_at=row["wrapped_at"],
+        last_attempted_mal_anime_id=(
+            None if row["last_attempted_mal_anime_id"] is None else int(row["last_attempted_mal_anime_id"])
+        ),
+        last_attempted_rank_key_json=row["last_attempted_rank_key_json"],
+        last_attempted_at=row["last_attempted_at"],
+        last_selection_class=row["last_selection_class"],
+        last_outcome=row["last_outcome"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def get_recommendation_provider_enrichment_cursor(
+    db_path: Path,
+    *,
+    provider: str,
+) -> RecommendationProviderEnrichmentCursor | None:
+    normalized_provider = _normalize_provider_progress_slug(provider)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM recommendation_provider_enrichment_cursor WHERE provider = ?",
+            (normalized_provider,),
+        ).fetchone()
+    if row is None:
+        return None
+    return _provider_enrichment_cursor_from_db(row)
+
+
+def record_recommendation_provider_enrichment_attempt(
+    db_path: Path,
+    *,
+    provider: str,
+    mal_anime_id: int,
+    rank_key: dict[str, Any],
+    selection_class: str,
+    attempted_at: str,
+    wrapped: bool = False,
+    outcome: str = "selected",
+) -> RecommendationProviderEnrichmentCursor:
+    """Advance the durable provider enrichment cursor and record one candidate attempt."""
+    normalized_provider = _normalize_provider_progress_slug(provider)
+    normalized_selection_class = _normalize_non_empty_progress_text("selection_class", selection_class)
+    normalized_attempted_at = _normalize_non_empty_progress_text("attempted_at", attempted_at)
+    normalized_outcome = _normalize_non_empty_progress_text("outcome", outcome)
+    rank_key_json = _stable_json_object(rank_key)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO recommendation_provider_enrichment_cursor (
+                provider, cursor_mal_anime_id, cursor_rank_key_json, cursor_generation,
+                wrapped_at, last_attempted_mal_anime_id, last_attempted_rank_key_json,
+                last_attempted_at, last_selection_class, last_outcome
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                cursor_mal_anime_id = excluded.cursor_mal_anime_id,
+                cursor_rank_key_json = excluded.cursor_rank_key_json,
+                cursor_generation = recommendation_provider_enrichment_cursor.cursor_generation + 1,
+                wrapped_at = COALESCE(excluded.wrapped_at, recommendation_provider_enrichment_cursor.wrapped_at),
+                last_attempted_mal_anime_id = excluded.last_attempted_mal_anime_id,
+                last_attempted_rank_key_json = excluded.last_attempted_rank_key_json,
+                last_attempted_at = excluded.last_attempted_at,
+                last_selection_class = excluded.last_selection_class,
+                last_outcome = excluded.last_outcome,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                normalized_provider,
+                int(mal_anime_id),
+                rank_key_json,
+                normalized_attempted_at if wrapped else None,
+                int(mal_anime_id),
+                rank_key_json,
+                normalized_attempted_at,
+                normalized_selection_class,
+                normalized_outcome,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO recommendation_provider_enrichment_attempts (
+                provider, mal_anime_id, rank_key_json, selection_class,
+                attempted_at, attempt_count, last_outcome
+            ) VALUES (?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(provider, mal_anime_id) DO UPDATE SET
+                rank_key_json = excluded.rank_key_json,
+                selection_class = excluded.selection_class,
+                attempted_at = excluded.attempted_at,
+                attempt_count = recommendation_provider_enrichment_attempts.attempt_count + 1,
+                last_outcome = excluded.last_outcome,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                normalized_provider,
+                int(mal_anime_id),
+                rank_key_json,
+                normalized_selection_class,
+                normalized_attempted_at,
+                normalized_outcome,
+            ),
+        )
+        conn.commit()
+    cursor = get_recommendation_provider_enrichment_cursor(db_path, provider=normalized_provider)
+    if cursor is None:
+        raise RuntimeError("Recommendation provider enrichment cursor disappeared after upsert")
+    return cursor
+
+
+def update_recommendation_provider_enrichment_attempt_outcome(
+    db_path: Path,
+    *,
+    provider: str,
+    mal_anime_id: int,
+    outcome: str,
+) -> int:
+    normalized_provider = _normalize_provider_progress_slug(provider)
+    normalized_outcome = _normalize_non_empty_progress_text("outcome", outcome)
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE recommendation_provider_enrichment_attempts
+            SET last_outcome = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE provider = ? AND mal_anime_id = ?
+            """,
+            (normalized_outcome, normalized_provider, int(mal_anime_id)),
+        )
+        rowcount = int(cursor.rowcount or 0)
+        conn.execute(
+            """
+            UPDATE recommendation_provider_enrichment_cursor
+            SET last_outcome = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE provider = ? AND last_attempted_mal_anime_id = ?
+            """,
+            (normalized_outcome, normalized_provider, int(mal_anime_id)),
+        )
+        conn.commit()
+    return rowcount
+
+
+def _provider_enrichment_attempt_from_db(row: sqlite3.Row) -> RecommendationProviderEnrichmentAttempt:
+    return RecommendationProviderEnrichmentAttempt(
+        provider=str(row["provider"]),
+        mal_anime_id=int(row["mal_anime_id"]),
+        rank_key_json=str(row["rank_key_json"]),
+        selection_class=str(row["selection_class"]),
+        attempted_at=str(row["attempted_at"]),
+        attempt_count=int(row["attempt_count"]),
+        last_outcome=row["last_outcome"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def list_recommendation_provider_enrichment_attempts(
+    db_path: Path,
+    *,
+    provider: str,
+    mal_anime_ids: Iterable[int] | None = None,
+) -> list[RecommendationProviderEnrichmentAttempt]:
+    normalized_provider = _normalize_provider_progress_slug(provider)
+    conditions = ["provider = ?"]
+    params: list[object] = [normalized_provider]
+    if mal_anime_ids is not None:
+        ids = sorted({int(value) for value in mal_anime_ids})
+        if not ids:
+            return []
+        conditions.append(f"mal_anime_id IN ({', '.join('?' for _ in ids)})")
+        params.extend(ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM recommendation_provider_enrichment_attempts
+            WHERE {' AND '.join(conditions)}
+            ORDER BY provider ASC, mal_anime_id ASC
+            """,
+            params,
+        ).fetchall()
+    return [_provider_enrichment_attempt_from_db(row) for row in rows]
+
+
+def get_recommendation_provider_enrichment_progress(
+    db_path: Path,
+    *,
+    provider: str,
+    mal_anime_ids: Iterable[int] | None = None,
+) -> RecommendationProviderEnrichmentProgress:
+    normalized_provider = _normalize_provider_progress_slug(provider)
+    attempts = list_recommendation_provider_enrichment_attempts(
+        db_path,
+        provider=normalized_provider,
+        mal_anime_ids=mal_anime_ids,
+    )
+    return RecommendationProviderEnrichmentProgress(
+        provider=normalized_provider,
+        cursor=get_recommendation_provider_enrichment_cursor(db_path, provider=normalized_provider),
+        attempts_by_mal_anime_id={attempt.mal_anime_id: attempt for attempt in attempts},
+    )
 
 
 def get_provider_title_search_cache(

@@ -2932,9 +2932,9 @@ def _cmd_recommend_enrich_provider_availability(
     summary = enrich_discovery_provider_availability(
         config,
         providers=providers,
-        candidate_limit=_normalize_limit(limit) or 25,
-        search_limit=_normalize_limit(search_limit) or 10,
-        queries_per_candidate=_normalize_limit(queries_per_candidate) or 0,
+        candidate_limit=_normalize_limit(limit) or 1,
+        search_limit=_normalize_limit(search_limit) or 5,
+        queries_per_candidate=max(0, int(queries_per_candidate)),
         persist_review_queue=not dry_run,
     )
     print(json.dumps(summary.as_dict(), indent=2))

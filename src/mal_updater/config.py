@@ -67,7 +67,7 @@ DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS = 8 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS = 6 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS = 45
-DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS = 24 * 60 * 60
+DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
@@ -113,7 +113,7 @@ DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
     "recommend_metadata_discovery_targets": 5,
     "recommend_full_harvest": 2,
     "recommend_full_harvest_pages": 3,
-    "recommend_provider_eligibility_candidates": 2,
+    "recommend_provider_eligibility_candidates": 1,
     "recommend_provider_eligibility_search_results": 5,
     "recommend_provider_eligibility_queries_per_candidate": 1,
     "recommendation_snapshot": 100,

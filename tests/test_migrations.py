@@ -34,6 +34,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "011_mal_user_anime_list_preference_fields.sql",
                 "012_watch_confirmation_provenance.sql",
                 "013_mal_anime_metadata_broadcast_compatibility.sql",
+                "014_recommendation_provider_enrichment_cursor.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -47,10 +48,11 @@ class MigrationCatalogTests(unittest.TestCase):
             db.MIGRATION_FILENAMES,
             packaged_filenames=db.MIGRATION_FILENAMES,
         )
+        first_after_012 = db.MIGRATION_FILENAMES.index("013_mal_anime_metadata_broadcast_compatibility.sql")
         invalid_filenames = (
-            db.MIGRATION_FILENAMES[:-1]
+            db.MIGRATION_FILENAMES[:first_after_012]
             + ("012_future_duplicate.sql",)
-            + db.MIGRATION_FILENAMES[-1:]
+            + db.MIGRATION_FILENAMES[first_after_012:]
         )
         with self.assertRaisesRegex(RuntimeError, "duplicate numeric prefix"):
             validate_migration_catalog(
@@ -74,6 +76,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "011_mal_user_anime_list_preference_fields.sql",
                     "012_watch_confirmation_provenance.sql",
                     "013_mal_anime_metadata_broadcast_compatibility.sql",
+                    "014_recommendation_provider_enrichment_cursor.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -94,6 +97,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "011_mal_user_anime_list_preference_fields.sql",
                     "012_watch_confirmation_provenance.sql",
                     "013_mal_anime_metadata_broadcast_compatibility.sql",
+                    "014_recommendation_provider_enrichment_cursor.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -162,6 +166,10 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertTrue({"harvest_source", "complete_harvest", "provenance_json"} <= rec_columns)
                 status_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_recommendation_harvest_status)")}
                 self.assertTrue({"source_type", "is_complete", "pages_fetched", "source_url", "last_attempted_at", "last_error", "failure_count", "updated_at"} <= status_columns)
+                cursor_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_enrichment_cursor)")}
+                self.assertTrue({"provider", "cursor_mal_anime_id", "cursor_rank_key_json", "cursor_generation", "last_selection_class"} <= cursor_columns)
+                attempt_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_enrichment_attempts)")}
+                self.assertTrue({"provider", "mal_anime_id", "rank_key_json", "selection_class", "attempted_at", "attempt_count", "last_outcome"} <= attempt_columns)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
             bootstrap_database(db_path)

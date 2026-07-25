@@ -41,7 +41,7 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(900, specs["mal_list_refresh"].initial_delay_seconds)
         self.assertEqual(43200, specs["recommend_metadata_refresh"].every_seconds)
         eligibility = specs["recommend_provider_eligibility_crunchyroll"]
-        self.assertEqual(86400, eligibility.every_seconds)
+        self.assertEqual(3600, eligibility.every_seconds)
         self.assertEqual(2700, eligibility.initial_delay_seconds)
         self.assertEqual("crunchyroll", eligibility.budget_provider)
         self.assertEqual(3600, specs["recommend_maintain"].every_seconds)
@@ -49,7 +49,7 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
 
         command = _provider_eligibility_command(self.config, "crunchyroll")
         self.assertEqual("crunchyroll", command[command.index("--provider") + 1])
-        self.assertEqual("2", command[command.index("--limit") + 1])
+        self.assertEqual("1", command[command.index("--limit") + 1])
         self.assertEqual("5", command[command.index("--search-limit") + 1])
         self.assertEqual("1", command[command.index("--queries-per-candidate") + 1])
 
@@ -110,12 +110,12 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
             if label == "recommend_provider_eligibility_crunchyroll":
                 stdout = json.dumps(
                     {
-                        "candidates_considered": 2,
-                        "cache_hits": 2,
+                        "candidates_considered": 1,
+                        "cache_hits": 0,
                         "cache_misses": 0,
                         "provider_searches": 0,
                         "provider_detail_probes": 0,
-                        "eligibility_fresh_skips": 2,
+                        "eligibility_fresh_skips": 1,
                     }
                 )
             return {"status": "ok", "label": label, "returncode": 0, "stdout": stdout, "stderr": ""}
@@ -139,7 +139,7 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(73, counts["sync_apply"])
         self.assertEqual(9, counts["mal_list_refresh"])
         self.assertEqual(7, counts["recommend_metadata_refresh"])
-        self.assertEqual(3, counts["recommend_provider_eligibility_crunchyroll"])
+        self.assertEqual(72, counts["recommend_provider_eligibility_crunchyroll"])
         self.assertEqual(72, counts["recommend_maintain"])
         self.assertEqual(73, counts["health"])
 
@@ -156,12 +156,12 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertLessEqual(counts["sync_apply"] * 8, 584)
         self.assertLessEqual(counts["mal_list_refresh"] * 3, 27)
         self.assertLessEqual(counts["recommend_metadata_refresh"] * 8, 56)
-        self.assertLessEqual(counts["recommend_provider_eligibility_crunchyroll"] * 7, 21)
+        self.assertLessEqual(counts["recommend_provider_eligibility_crunchyroll"] * 7, 504)
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         eligibility = state["tasks"]["recommend_provider_eligibility_crunchyroll"]
         self.assertEqual(0, eligibility["last_request_delta"])
-        self.assertEqual(2, eligibility["last_result"]["eligibility_fresh_skips"])
+        self.assertEqual(1, eligibility["last_result"]["eligibility_fresh_skips"])
         self.assertEqual(0, eligibility["last_result"]["provider_searches"])
 
 

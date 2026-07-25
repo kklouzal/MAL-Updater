@@ -11,13 +11,18 @@ from .db import (
     get_mal_anime_metadata_map,
     get_provider_title_search_cache,
     get_provider_enriched_detail_cache,
+    get_recommendation_provider_enrichment_cursor,
     record_provider_enriched_detail_failure,
+    record_recommendation_provider_enrichment_attempt,
     get_recommendation_provider_eligibility_evidence,
+    list_recommendation_provider_enrichment_attempts,
     list_series_mappings,
+    list_recommendation_provider_eligibility_evidence_for_mal_ids,
     replace_review_queue_entries,
     upsert_provider_title_search_cache,
     upsert_provider_enriched_detail_cache,
     upsert_recommendation_provider_eligibility_evidence,
+    update_recommendation_provider_enrichment_attempt_outcome,
 )
 from .mapping import normalize_title
 from .recommendation_actionability import (
@@ -80,6 +85,10 @@ class EnrichmentSummary:
     review_entries_written: int = 0
     review_entries_resolved: int = 0
     dry_run_review_entries: int = 0
+    selected_candidates: list[dict[str, Any]] = field(default_factory=list)
+    provider_cursor_states: dict[str, dict[str, Any]] = field(default_factory=dict)
+    selection_class_counts: dict[str, int] = field(default_factory=dict)
+    selection_skip_counts: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +116,10 @@ class EnrichmentSummary:
             "review_entries_written": self.review_entries_written,
             "review_entries_resolved": self.review_entries_resolved,
             "dry_run_review_entries": self.dry_run_review_entries,
+            "selected_candidates": self.selected_candidates,
+            "provider_cursor_states": self.provider_cursor_states,
+            "selection_class_counts": dict(sorted(self.selection_class_counts.items())),
+            "selection_skip_counts": dict(sorted(self.selection_skip_counts.items())),
             "cache_ttl_days": PROVIDER_SEARCH_CACHE_TTL_DAYS,
             "eligibility_evidence_ttl_days": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
         }
@@ -1512,6 +1525,246 @@ def _candidate_mal_id(item: Recommendation) -> int | None:
     return value if isinstance(value, int) else None
 
 
+@dataclass(slots=True)
+class ProviderEnrichmentCandidate:
+    item: Recommendation
+    mal_id: int
+    rank: int
+    rank_key: dict[str, Any]
+    selection_class: str
+    cursor_wrapped: bool = False
+    previous_attempted_at: str | None = None
+    previous_attempt_count: int = 0
+    due_evidence: tuple[Any, ...] = ()
+
+
+_DUE_SELECTION_CLASSES = frozenset({
+    "failed_retry_due",
+    "expired_refresh_due",
+    "stale_refresh_due",
+    "logic_refresh_due",
+})
+
+
+def _candidate_rank_key(item: Recommendation, *, mal_id: int, rank: int) -> dict[str, Any]:
+    return {
+        "rank": int(rank),
+        "mal_anime_id": int(mal_id),
+        "priority": int(getattr(item, "priority", 0) or 0),
+        "kind": str(getattr(item, "kind", "") or ""),
+    }
+
+
+def _evidence_is_stale(evidence: Any) -> bool:
+    return any(
+        str(getattr(evidence, field_name, "")).strip().lower() == "stale"
+        for field_name in ("review_status", "catalog_status", "english_dub_status")
+    )
+
+
+def _provider_selection_class(
+    evidence_rows: list[Any],
+    *,
+    now: str,
+    force_refresh: bool,
+) -> tuple[str | None, str | None, tuple[Any, ...]]:
+    if force_refresh:
+        return "force_refresh", None, tuple(evidence_rows)
+    if not evidence_rows:
+        return "uncovered", None, ()
+    if any(is_strict_provider_eligibility_actionable(evidence, now=now) for evidence in evidence_rows):
+        return None, "fresh_covered", ()
+
+    failed_due: list[Any] = []
+    failed_backoff: list[Any] = []
+    stale_due: list[Any] = []
+    expired_due: list[Any] = []
+    logic_due: list[Any] = []
+    fresh_current: list[Any] = []
+    for evidence in evidence_rows:
+        refresh_status = str(getattr(evidence, "refresh_status", "")).strip().lower()
+        next_retry_at = getattr(evidence, "next_retry_at", None)
+        if refresh_status == "failed":
+            if next_retry_at is not None and str(next_retry_at) > now:
+                failed_backoff.append(evidence)
+                continue
+            failed_due.append(evidence)
+            continue
+        if str(getattr(evidence, "logic_version", "")) != PROVIDER_ELIGIBILITY_LOGIC_VERSION:
+            logic_due.append(evidence)
+            continue
+        if _evidence_is_stale(evidence):
+            stale_due.append(evidence)
+            continue
+        if str(getattr(evidence, "expires_at", "")) <= now:
+            expired_due.append(evidence)
+            continue
+        fresh_current.append(evidence)
+
+    if failed_due:
+        return "failed_retry_due", None, tuple(failed_due)
+    if stale_due:
+        return "stale_refresh_due", None, tuple(stale_due)
+    if expired_due:
+        return "expired_refresh_due", None, tuple(expired_due)
+    if logic_due:
+        return "logic_refresh_due", None, tuple(logic_due)
+    if failed_backoff and not fresh_current:
+        return None, "retry_backoff", ()
+    return None, "fresh_covered", ()
+
+
+def _append_summary_counter(target: dict[str, int], key: str) -> None:
+    target[key] = target.get(key, 0) + 1
+
+
+def _provider_candidate_title(item: Recommendation, meta: Any | None) -> str | None:
+    title = getattr(meta, "title", None) if meta is not None else None
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    item_title = getattr(item, "title", None)
+    if isinstance(item_title, str) and item_title.strip():
+        return item_title.strip()
+    return None
+
+
+def _select_provider_enrichment_candidates(
+    config: AppConfig,
+    *,
+    provider_slug: str,
+    candidates: list[Recommendation],
+    metadata: dict[int, Any],
+    mappings_by_series: dict[tuple[str, str], Any],
+    candidate_limit: int,
+    now: str,
+    force_refresh: bool,
+    summary: EnrichmentSummary,
+) -> list[ProviderEnrichmentCandidate]:
+    limit = max(0, int(candidate_limit))
+    cursor = get_recommendation_provider_enrichment_cursor(config.db_path, provider=provider_slug)
+    provider_state: dict[str, Any] = {
+        "cursor_before_mal_anime_id": cursor.cursor_mal_anime_id if cursor is not None else None,
+        "cursor_before_generation": cursor.cursor_generation if cursor is not None else 0,
+        "candidate_count": len(candidates),
+        "eligible_count": 0,
+        "selected_mal_anime_ids": [],
+        "selected_classes": [],
+        "wrapped": False,
+        "cursor_missing": False,
+    }
+    summary.provider_cursor_states[provider_slug] = provider_state
+    if limit <= 0 or not candidates:
+        provider_state["exhausted"] = True
+        return []
+
+    candidate_ids = [mal_id for item in candidates if (mal_id := _candidate_mal_id(item)) is not None]
+    evidence_by_mal_id: dict[int, list[Any]] = {}
+    if provider_slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS and candidate_ids:
+        for evidence in list_recommendation_provider_eligibility_evidence_for_mal_ids(
+            config.db_path,
+            candidate_ids,
+            provider=provider_slug,
+        ):
+            evidence_by_mal_id.setdefault(evidence.mal_anime_id, []).append(evidence)
+    attempts_by_mal_id = {
+        attempt.mal_anime_id: attempt
+        for attempt in list_recommendation_provider_enrichment_attempts(
+            config.db_path,
+            provider=provider_slug,
+            mal_anime_ids=candidate_ids,
+        )
+    }
+
+    ranked: list[ProviderEnrichmentCandidate] = []
+    cursor_rank: int | None = None
+    cursor_mal_id = cursor.cursor_mal_anime_id if cursor is not None else None
+    for rank, item in enumerate(candidates):
+        mal_id = _candidate_mal_id(item)
+        if mal_id is None:
+            _append_summary_counter(summary.selection_skip_counts, "missing_mal_id")
+            continue
+        if cursor_mal_id is not None and mal_id == cursor_mal_id:
+            cursor_rank = rank
+        if metadata.get(mal_id) is None:
+            _append_summary_counter(summary.selection_skip_counts, "missing_metadata")
+            continue
+        evidence_rows = evidence_by_mal_id.get(mal_id, [])
+        selection_class, skip_reason, due_evidence = _provider_selection_class(
+            evidence_rows,
+            now=now,
+            force_refresh=force_refresh,
+        )
+        if selection_class is None and skip_reason == "fresh_covered":
+            for evidence in evidence_rows:
+                mapping = mappings_by_series.get((provider_slug, str(evidence.provider_series_id)))
+                if (
+                    mapping is not None
+                    and bool(getattr(mapping, "approved_by_user", False))
+                    and int(getattr(mapping, "mal_anime_id", -1)) == int(mal_id)
+                    and str(getattr(evidence, "identity_match_kind", "")) != "approved_mapping"
+                ):
+                    selection_class = "mapping_refresh_due"
+                    skip_reason = None
+                    due_evidence = (evidence,)
+                    break
+        if selection_class is None:
+            _append_summary_counter(summary.selection_skip_counts, skip_reason or "not_due")
+            if skip_reason == "fresh_covered":
+                summary.eligibility_fresh_skips += 1
+            elif skip_reason == "retry_backoff":
+                summary.eligibility_retry_backoff_skips += 1
+            continue
+        attempt = attempts_by_mal_id.get(mal_id)
+        ranked.append(
+            ProviderEnrichmentCandidate(
+                item=item,
+                mal_id=mal_id,
+                rank=rank,
+                rank_key=_candidate_rank_key(item, mal_id=mal_id, rank=rank),
+                selection_class=selection_class,
+                previous_attempted_at=attempt.attempted_at if attempt is not None else None,
+                previous_attempt_count=attempt.attempt_count if attempt is not None else 0,
+                due_evidence=due_evidence,
+            )
+        )
+
+    provider_state["eligible_count"] = len(ranked)
+    if not ranked:
+        provider_state["exhausted"] = True
+        return []
+
+    if cursor_rank is not None:
+        after = [candidate for candidate in ranked if candidate.rank > cursor_rank]
+        before = [candidate for candidate in ranked if candidate.rank <= cursor_rank]
+        ordered = [*after, *before]
+        selected = ordered[:limit]
+        if any(candidate.rank <= cursor_rank for candidate in selected):
+            provider_state["wrapped"] = True
+            for candidate in selected:
+                if candidate.rank <= cursor_rank:
+                    candidate.cursor_wrapped = True
+    else:
+        if cursor_mal_id is not None:
+            provider_state["cursor_missing"] = True
+        # First run or cursor target aged out of the ranked set: prefer never-attempted
+        # candidates in current rank order, then the least-recently attempted rows.
+        selected = sorted(
+            ranked,
+            key=lambda candidate: (
+                1 if candidate.previous_attempted_at is not None else 0,
+                candidate.previous_attempted_at or "",
+                candidate.rank,
+                candidate.mal_id,
+            ),
+        )[:limit]
+
+    provider_state["selected_mal_anime_ids"] = [candidate.mal_id for candidate in selected]
+    provider_state["selected_classes"] = [candidate.selection_class for candidate in selected]
+    if selected:
+        provider_state["cursor_after_mal_anime_id"] = selected[-1].mal_id
+    return selected
+
+
 def _ensure_provider_series(config: AppConfig, *, provider: str, match: dict[str, Any]) -> None:
     provider_series_id = str(match["provider_series_id"])
     title = str(match.get("title") or provider_series_id)
@@ -1541,9 +1794,9 @@ def enrich_discovery_provider_availability(
     config: AppConfig,
     *,
     providers: list[ProviderTitleSearchClient],
-    candidate_limit: int = 25,
-    search_limit: int = 10,
-    queries_per_candidate: int = 0,
+    candidate_limit: int = 1,
+    search_limit: int = 5,
+    queries_per_candidate: int = 1,
     now: datetime | None = None,
     persist_review_queue: bool = True,
     force_refresh: bool = False,
@@ -1581,31 +1834,73 @@ def enrich_discovery_provider_availability(
         session = factory(config) if callable(factory) else None
         provider_sessions[slug] = session
         return session
-    for item in candidates[:candidate_limit]:
+
+    def process_selection(provider: ProviderTitleSearchClient, selection: ProviderEnrichmentCandidate) -> None:
+        provider_slug = str(getattr(provider, "slug", provider.__class__.__name__)).strip().lower()
+        meta = metadata.get(selection.mal_id)
+        candidate_title = _provider_candidate_title(selection.item, meta)
+        cursor = record_recommendation_provider_enrichment_attempt(
+            config.db_path,
+            provider=provider_slug,
+            mal_anime_id=selection.mal_id,
+            rank_key=selection.rank_key,
+            selection_class=selection.selection_class,
+            attempted_at=fetched_at,
+            wrapped=selection.cursor_wrapped,
+            outcome="selected",
+        )
+        provider_state = summary.provider_cursor_states.setdefault(provider_slug, {})
+        provider_state["cursor_after_generation"] = cursor.cursor_generation
+        provider_state["cursor_after_mal_anime_id"] = selection.mal_id
+        selected_payload: dict[str, Any] = {
+            "provider": provider_slug,
+            "mal_anime_id": selection.mal_id,
+            "candidate_title": candidate_title,
+            "rank": selection.rank,
+            "rank_key": selection.rank_key,
+            "selection_class": selection.selection_class,
+            "cursor_wrapped": selection.cursor_wrapped,
+            "previous_attempted_at": selection.previous_attempted_at,
+            "previous_attempt_count": selection.previous_attempt_count,
+        }
+        summary.selected_candidates.append(selected_payload)
         summary.candidates_considered += 1
-        mal_id = _candidate_mal_id(item)
-        meta = metadata.get(mal_id) if mal_id is not None else None
-        if meta is None:
-            continue
-        title_family = build_target_title_family(meta)
-        queries = select_english_provider_search_queries(meta)
-        if queries_per_candidate > 0:
-            queries = queries[:queries_per_candidate]
-        if not queries:
-            continue
-        summary.queries_selected += len(queries)
-        for provider in providers:
-            if not hasattr(provider, "search_title"):
-                summary.providers_skipped.append(getattr(provider, "slug", provider.__class__.__name__))
-                continue
+        _append_summary_counter(summary.selection_class_counts, selection.selection_class)
+        if selection.selection_class in _DUE_SELECTION_CLASSES:
+            summary.eligibility_expired_retries += 1
+        outcome = "selected"
+        due_failure_recorded = False
+
+        def record_due_failures_once() -> None:
+            nonlocal due_failure_recorded
+            if due_failure_recorded:
+                return
+            due_failure_recorded = True
+            for evidence in selection.due_evidence:
+                _record_eligibility_refresh_failure(config, evidence, now=current)
+
+        try:
+            if meta is None:
+                outcome = "missing_metadata"
+                return
+            title_family = build_target_title_family(meta)
+            queries = select_english_provider_search_queries(meta)
+            if queries_per_candidate > 0:
+                queries = queries[:queries_per_candidate]
+            if not queries:
+                outcome = "no_queries"
+                return
+            summary.queries_selected += len(queries)
             for query in queries:
                 normalized_query = normalize_title(query)
-                identity_key = f"mal:{mal_id or ''}"
-                cached = None if force_refresh else get_provider_title_search_cache(
-                    config.db_path, provider=provider.slug, normalized_query=normalized_query, now=fetched_at,
+                identity_key = f"mal:{selection.mal_id}"
+                bypass_cache = force_refresh or selection.selection_class in _DUE_SELECTION_CLASSES
+                cached = None if bypass_cache else get_provider_title_search_cache(
+                    config.db_path, provider=provider_slug, normalized_query=normalized_query, now=fetched_at,
                     logic_version=PROVIDER_SEARCH_CACHE_LOGIC_VERSION, search_limit=search_limit,
                     identity_key=identity_key,
                 )
+                searched_provider = False
                 if cached is not None:
                     summary.cache_hits += 1
                     matches = _dedupe_provider_matches(cached.matches)
@@ -1615,18 +1910,22 @@ def enrich_discovery_provider_availability(
                         session = request_session(provider)
                         raw_matches = provider.search_title(config, query, limit=search_limit, session=session) if session is not None else provider.search_title(config, query, limit=search_limit)
                     except Exception as exc:  # provider/auth/network errors must not stale-out good evidence
+                        if selection.selection_class in _DUE_SELECTION_CLASSES:
+                            record_due_failures_once()
                         summary.provider_search_failures += 1
+                        outcome = "provider_search_failure"
                         if len(summary.failure_details) < 10:
-                            summary.failure_details.append({"provider": str(provider.slug), "query": query, "error": str(exc)})
+                            summary.failure_details.append({"provider": provider_slug, "query": query, "error": str(exc)})
                         continue
+                    searched_provider = True
                     summary.provider_searches += 1
                     matches = _dedupe_provider_matches([_match_to_dict(match) for match in raw_matches])
                     upsert_provider_title_search_cache(
                         config.db_path,
-                        provider=provider.slug,
+                        provider=provider_slug,
                         normalized_query=normalized_query,
                         query=query,
-                        candidate_mal_anime_id=mal_id,
+                        candidate_mal_anime_id=selection.mal_id,
                         candidate_title=meta.title,
                         matches=matches,
                         status="ok",
@@ -1638,13 +1937,14 @@ def enrich_discovery_provider_availability(
                     )
                 decision = classify_provider_matches(query, matches, title_family)
                 if decision.kind == "strong" and decision.selected:
+                    outcome = "strong_match"
                     match = decision.selected[0]
                     provider_series_id = match.get("provider_series_id")
                     if provider_series_id:
                         existing_evidence = None
-                        if provider.slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS:
+                        if provider_slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS:
                             existing_evidence = get_recommendation_provider_eligibility_evidence(
-                                config.db_path, mal_anime_id=int(mal_id), provider=provider.slug,
+                                config.db_path, mal_anime_id=int(selection.mal_id), provider=provider_slug,
                                 provider_series_id=str(provider_series_id),
                             )
                         if (not force_refresh and cached is not None and existing_evidence is not None
@@ -1652,8 +1952,9 @@ def enrich_discovery_provider_availability(
                                 and existing_evidence.refresh_status == "ok"
                                 and existing_evidence.logic_version == PROVIDER_ELIGIBILITY_LOGIC_VERSION
                                 and is_strict_provider_eligibility_actionable(existing_evidence, now=fetched_at)
-                                and not bool(mappings_by_series.get((provider.slug, str(provider_series_id))))):
+                                and not bool(mappings_by_series.get((provider_slug, str(provider_series_id))))):
                             summary.eligibility_fresh_skips += 1
+                            outcome = "fresh_eligibility_skip"
                             continue
                         if cached is not None and existing_evidence is not None and existing_evidence.expires_at <= fetched_at:
                             # Search-cache identity is reusable for 365d, but availability is not.
@@ -1666,6 +1967,7 @@ def enrich_discovery_provider_availability(
                                 and existing_evidence.next_retry_at > fetched_at
                             ):
                                 summary.eligibility_retry_backoff_skips += 1
+                                outcome = "retry_backoff_skip"
                                 continue
                             summary.eligibility_expired_retries += 1
                             try:
@@ -1674,22 +1976,26 @@ def enrich_discovery_provider_availability(
                             except Exception as exc:
                                 _record_eligibility_refresh_failure(config, existing_evidence, now=current)
                                 summary.provider_search_failures += 1
+                                outcome = "provider_search_failure"
                                 if len(summary.failure_details) < 10:
-                                    summary.failure_details.append({"provider": str(provider.slug), "query": query, "error": str(exc)})
+                                    summary.failure_details.append({"provider": provider_slug, "query": query, "error": str(exc)})
                                 continue
+                            searched_provider = True
                             summary.provider_searches += 1
                             matches = _dedupe_provider_matches([_match_to_dict(value) for value in raw_matches])
                             decision = classify_provider_matches(query, matches, title_family)
                             if decision.kind != "strong" or not decision.selected:
+                                outcome = "searched_no_current_strong_match"
                                 continue
                             match = decision.selected[0]
                             provider_series_id = match.get("provider_series_id")
                             if not provider_series_id:
+                                outcome = "strong_match_missing_provider_series_id"
                                 continue
                         try:
                             match, detail_attempted = _fetch_provider_detail_if_available(
                                 provider, config, match, now=current, force_refresh=force_refresh,
-                                provider_session=provider_sessions.get(str(provider.slug)),
+                                provider_session=provider_sessions.get(str(getattr(provider, "slug", ""))),
                                 provider_session_factory=(lambda provider=provider: request_session(provider))
                                 if _provider_detail_needed(provider, match) else None,
                             )
@@ -1698,27 +2004,28 @@ def enrich_discovery_provider_availability(
                         except Exception as exc:  # detail enrichment is optional; keep the search hit evidence
                             summary.provider_detail_failures += 1
                             if len(summary.failure_details) < 10:
-                                summary.failure_details.append({"provider": str(provider.slug), "query": query, "detail_error": str(exc)})
+                                summary.failure_details.append({"provider": provider_slug, "query": query, "detail_error": str(exc)})
                         provider_series_id = match.get("provider_series_id") or provider_series_id
-                        _ensure_provider_series(config, provider=provider.slug, match=match)
+                        _ensure_provider_series(config, provider=provider_slug, match=match)
                         summary.strong_matches += 1
                         _upsert_exact_identity_or_append_review(
                             config,
                             summary,
                             review_entries,
-                            provider=provider.slug,
+                            provider=provider_slug,
                             provider_series_id=provider_series_id,
-                            mal_id=mal_id,
+                            mal_id=selection.mal_id,
                             candidate_title=meta.title,
                             query=query,
                             match=match,
-                            mapping=mappings_by_series.get((provider.slug, str(provider_series_id))),
+                            mapping=mappings_by_series.get((provider_slug, str(provider_series_id))),
                             decision=decision,
                             title_family=title_family,
                             fetched_at=fetched_at,
                             expires_at=eligibility_expires_at,
                         )
                 elif decision.kind == "ambiguous":
+                    outcome = "ambiguous_match"
                     verified_shells = _verified_aggregate_shell_candidates(
                         config,
                         summary,
@@ -1737,23 +2044,23 @@ def enrich_discovery_provider_availability(
                         if provider_series_id and _upsert_aggregate_shell_identity(
                             config,
                             summary,
-                            provider=provider.slug,
-                            mal_id=mal_id,
+                            provider=provider_slug,
+                            mal_id=selection.mal_id,
                             candidate_title=meta.title,
                             query=query,
                             verification=verification,
-                            mapping=mappings_by_series.get((provider.slug, provider_series_id)),
+                            mapping=mappings_by_series.get((provider_slug, provider_series_id)),
                             fetched_at=fetched_at,
                             expires_at=eligibility_expires_at,
                         ):
                             continue
                     summary.ambiguous_matches += 1
                     review_entries.append({
-                        "provider": provider.slug,
+                        "provider": provider_slug,
                         "provider_series_id": None,
                         "severity": "warning",
                         "payload": {
-                            "mal_anime_id": mal_id,
+                            "mal_anime_id": selection.mal_id,
                             "candidate_title": meta.title,
                             "query": query,
                             "matches": decision.selected,
@@ -1761,6 +2068,35 @@ def enrich_discovery_provider_availability(
                             "provider_search_match_reasons": list(decision.reasons),
                         },
                     })
+                elif outcome not in {"provider_search_failure", "strong_match", "ambiguous_match"}:
+                    outcome = "searched_no_match" if searched_provider else "cache_hit_no_match"
+        finally:
+            update_recommendation_provider_enrichment_attempt_outcome(
+                config.db_path,
+                provider=provider_slug,
+                mal_anime_id=selection.mal_id,
+                outcome=outcome,
+            )
+            selected_payload["outcome"] = outcome
+
+    for provider in providers:
+        provider_slug = str(getattr(provider, "slug", provider.__class__.__name__)).strip().lower()
+        if not callable(getattr(provider, "search_title", None)):
+            summary.providers_skipped.append(provider_slug)
+            continue
+        selected = _select_provider_enrichment_candidates(
+            config,
+            provider_slug=provider_slug,
+            candidates=candidates,
+            metadata=metadata,
+            mappings_by_series=mappings_by_series,
+            candidate_limit=candidate_limit,
+            now=fetched_at,
+            force_refresh=force_refresh,
+            summary=summary,
+        )
+        for selection in selected:
+            process_selection(provider, selection)
     review_entries = _dedupe_discovery_review_entries(_coalesce_discovery_review_entries(review_entries))
     should_refresh_review_queue = bool(
         review_entries
