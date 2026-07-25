@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -29,6 +30,9 @@ class MigrationCatalogTests(unittest.TestCase):
                 "007_mal_user_anime_list_cache.sql",
                 "008_niceness_caches.sql",
                 "009_recommendation_full_harvest_provenance.sql",
+                "010_mal_anime_metadata_official_detail_fields.sql",
+                "011_mal_user_anime_list_preference_fields.sql",
+                "012_watch_confirmation_provenance.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -44,8 +48,8 @@ class MigrationCatalogTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "duplicate numeric prefix"):
             validate_migration_catalog(
-                db.MIGRATION_FILENAMES + ("009_future_duplicate.sql",),
-                packaged_filenames=db.MIGRATION_FILENAMES + ("009_future_duplicate.sql",),
+                db.MIGRATION_FILENAMES + ("012_future_duplicate.sql",),
+                packaged_filenames=db.MIGRATION_FILENAMES + ("012_future_duplicate.sql",),
             )
         with self.assertRaisesRegex(RuntimeError, "historical duplicate migration order changed"):
             validate_migration_catalog(
@@ -60,6 +64,9 @@ class MigrationCatalogTests(unittest.TestCase):
                     "007_mal_user_anime_list_cache.sql",
                     "008_niceness_caches.sql",
                     "009_recommendation_full_harvest_provenance.sql",
+                    "010_mal_anime_metadata_official_detail_fields.sql",
+                    "011_mal_user_anime_list_preference_fields.sql",
+                    "012_watch_confirmation_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -76,6 +83,9 @@ class MigrationCatalogTests(unittest.TestCase):
                     "007_mal_user_anime_list_cache.sql",
                     "008_niceness_caches.sql",
                     "009_recommendation_full_harvest_provenance.sql",
+                    "010_mal_anime_metadata_official_detail_fields.sql",
+                    "011_mal_user_anime_list_preference_fields.sql",
+                    "012_watch_confirmation_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -107,7 +117,7 @@ class MigrationCatalogTests(unittest.TestCase):
             db_path = Path(temp_dir) / "v7.sqlite3"
             original = db.MIGRATIONS
             try:
-                db.MIGRATIONS = original[:-2]
+                db.MIGRATIONS = original[: db.MIGRATION_FILENAMES.index("008_niceness_caches.sql")]
                 bootstrap_database(db_path)
             finally:
                 db.MIGRATIONS = original
@@ -159,7 +169,7 @@ class MigrationCatalogTests(unittest.TestCase):
             db_path = Path(temp_dir) / "v8.sqlite3"
             original = db.MIGRATIONS
             try:
-                db.MIGRATIONS = original[:-1]
+                db.MIGRATIONS = original[: db.MIGRATION_FILENAMES.index("009_recommendation_full_harvest_provenance.sql")]
                 bootstrap_database(db_path)
             finally:
                 db.MIGRATIONS = original
@@ -204,6 +214,93 @@ class MigrationCatalogTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM schema_migrations WHERE version = '009_recommendation_full_harvest_provenance.sql'"
                 ).fetchone()[0]
                 self.assertEqual(1, marker_count)
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+    def test_v9_to_v12_recommendation_data_upgrades_backfill_privacy_and_current_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "v9.sqlite3"
+            original = db.MIGRATIONS
+            try:
+                db.MIGRATIONS = original[:-3]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            with connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO mal_anime_metadata (
+                        mal_anime_id, title, alternative_titles_json, raw_json, fetched_at, updated_at
+                    ) VALUES (?, ?, '[]', ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                    """,
+                    (
+                        10,
+                        "Backfill Detail",
+                        json.dumps(
+                            {
+                                "rank": "123",
+                                "num_list_users": 200000,
+                                "num_scoring_users": 50000,
+                                "rating": "PG_13",
+                                "average_episode_duration": "1440",
+                                "start_date": "2024-01-01",
+                                "broadcast": {"day_of_the_week": "Friday", "start_time": "23:30"},
+                                "nsfw": "white",
+                            }
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO mal_user_anime_list_cache (
+                        mal_anime_id, title, list_status, user_score, num_episodes_watched,
+                        node_json, list_status_json, raw_json, refresh_run_id, refresh_generation,
+                        fetched_at, last_seen_at
+                    ) VALUES (20, 'Preference Seed', 'completed', 9, 12, '{}', ?, ?, 'run', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "priority": 2,
+                                "is_rewatching": True,
+                                "num_times_rewatched": 1,
+                                "rewatch_value": 5,
+                                "tags": ["private tag"],
+                                "comments": "private comment",
+                            }
+                        ),
+                        json.dumps({"node": {"id": 20, "title": "Preference Seed"}}),
+                    ),
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                metadata = conn.execute("SELECT rank, num_list_users, num_scoring_users, rating, average_episode_duration, start_date, broadcast_day, broadcast_time, nsfw FROM mal_anime_metadata WHERE mal_anime_id = 10").fetchone()
+                self.assertEqual(123, metadata["rank"])
+                self.assertEqual(200000, metadata["num_list_users"])
+                self.assertEqual(50000, metadata["num_scoring_users"])
+                self.assertEqual("pg_13", metadata["rating"])
+                self.assertEqual(1440, metadata["average_episode_duration"])
+                self.assertEqual("2024-01-01", metadata["start_date"])
+                self.assertEqual("friday", metadata["broadcast_day"])
+                self.assertEqual("23:30", metadata["broadcast_time"])
+                self.assertEqual("white", metadata["nsfw"])
+                prefs = conn.execute("SELECT priority, is_rewatching, num_times_rewatched, rewatch_value, tag_count, has_comments FROM mal_user_anime_list_cache WHERE mal_anime_id = 20").fetchone()
+                self.assertEqual(2, prefs["priority"])
+                self.assertEqual(1, prefs["is_rewatching"])
+                self.assertEqual(1, prefs["num_times_rewatched"])
+                self.assertEqual(5, prefs["rewatch_value"])
+                self.assertEqual(1, prefs["tag_count"])
+                self.assertEqual(1, prefs["has_comments"])
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_cache)")}
+                self.assertNotIn("comments", columns)
+                self.assertNotIn("tags_json", columns)
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watch_confirmation_provenance'").fetchone())
+                for version in db.MIGRATION_FILENAMES[-3:]:
+                    marker_count = conn.execute("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?", (version,)).fetchone()["n"]
+                    self.assertEqual(1, marker_count)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
 

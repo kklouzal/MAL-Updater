@@ -1445,6 +1445,14 @@ class RecommendationDashboardTests(unittest.TestCase):
             merge_mock.assert_not_called()
             self.assertEqual(before_bytes, config.db_path.read_bytes())
 
+    def test_live_dashboard_nested_operational_counts_render_without_object_stringification(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn("const countValue = value =>", html)
+        self.assertIn("typeof value === 'object'", html)
+        self.assertIn("${countValue(v)}", html)
+        self.assertNotIn("${esc(v)}</div>", html)
+
     def test_live_dashboard_html_and_json_handler(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"

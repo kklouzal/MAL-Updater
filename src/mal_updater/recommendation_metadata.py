@@ -51,12 +51,19 @@ DETAIL_FIELD_NAMES = (
     "num_scoring_users",
     "rating",
     "average_episode_duration",
+    "start_date",
+    "end_date",
+    "broadcast",
+    "pictures",
+    "background",
+    "nsfw",
     "statistics",
     "start_season",
     "source",
     "genres",
     "studios",
     "related_anime",
+    "related_manga",
     "recommendations",
     "my_list_status",
 )
@@ -70,7 +77,22 @@ DEFAULT_COLD_METADATA_STALE_AFTER_DAYS = 90
 DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS = 45
 MAL_USER_LIST_POSITIVE_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
 MAL_USER_LIST_SUPPRESSION_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
-MAL_USER_LIST_FIELDS = "list_status,num_episodes,media_type,status"
+MAL_USER_LIST_STATUS_PREFERENCE_FIELDS = (
+    "priority",
+    "is_rewatching",
+    "num_times_rewatched",
+    "rewatch_value",
+    "tags",
+    "comments",
+)
+MAL_USER_LIST_FIELD_NAMES = (
+    "list_status",
+    *MAL_USER_LIST_STATUS_PREFERENCE_FIELDS,
+    "num_episodes",
+    "media_type",
+    "status",
+)
+MAL_USER_LIST_FIELDS = ",".join(MAL_USER_LIST_FIELD_NAMES)
 HARVEST_RETRY_STATUSES = frozenset({"unharvested", "stale", "failed"})
 HARVEST_RETRY_ORDER = {"unharvested": 0, "failed": 1, "stale": 2}
 
@@ -152,6 +174,20 @@ class MetadataRefreshSummary:
             "target_hydration_skip_reasons": dict(self.target_hydration_skip_reasons),
             "fresh_skipped": self.fresh_skipped,
             "refresh_tiers": dict(self.refresh_tiers),
+            "official_detail_fields": list(DETAIL_FIELD_NAMES),
+            "typed_detail_fields": [
+                "rank",
+                "num_list_users",
+                "num_scoring_users",
+                "rating",
+                "average_episode_duration",
+                "start_date",
+                "end_date",
+                "broadcast_day",
+                "broadcast_time",
+                "broadcast_timezone",
+                "nsfw",
+            ],
             "failed": len(failures),
             "failures": [failure.as_dict() for failure in failures],
         }

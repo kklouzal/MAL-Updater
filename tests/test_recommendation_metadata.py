@@ -21,6 +21,8 @@ from mal_updater.mal_client import MalApiError
 from mal_updater.recommendation_metadata import (
     CHARACTER_VOICE_ACTOR_CAPABILITY_NOTE,
     DETAIL_FIELDS,
+    MAL_USER_LIST_FIELDS,
+    MAL_USER_LIST_STATUS_PREFERENCE_FIELDS,
     refresh_mal_user_anime_list_cache,
     refresh_recommendation_metadata,
 )
@@ -141,12 +143,19 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
             "num_scoring_users": 6789,
             "rating": "pg_13",
             "average_episode_duration": 1420,
+            "start_date": "2020-01-10",
+            "end_date": "2020-03-27",
+            "broadcast": {"day_of_the_week": "friday", "start_time": "23:30", "timezone": "Asia/Tokyo"},
+            "pictures": [{"medium": "https://example.invalid/gallery.jpg"}],
+            "background": "Official background payload",
+            "nsfw": "white",
             "statistics": {"status": {"completed": "1000"}},
             "start_season": {"year": 2020, "season": "winter"},
             "source": "manga",
             "genres": [{"id": 1, "name": "Action"}],
             "studios": [{"id": 2, "name": "Bones"}],
             "related_anime": [],
+            "related_manga": [{"node": {"id": 50, "title": "Seed Manga"}, "relation_type": "adaptation"}],
             "recommendations": recommendations or [],
             "my_list_status": {"status": "completed", "score": 9, "num_episodes_watched": 12},
         }
@@ -156,6 +165,21 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
             "node": {"id": anime_id, "title": title},
             "list_status": {"status": status, "score": score, "num_episodes_watched": 12 if status == "completed" else 0},
         }
+
+    def test_mal_list_refresh_requests_official_preference_field_names(self) -> None:
+        seen_fields: list[str] = []
+
+        def fake_pages(**kwargs: object):
+            seen_fields.append(str(kwargs.get("fields") or ""))
+            yield {"data": [], "paging": {}}
+
+        with patch("mal_updater.recommendation_metadata.MalClient.iter_my_anime_list_pages", side_effect=fake_pages):
+            summary = refresh_mal_user_anime_list_cache(self.config, max_pages=1)
+
+        self.assertEqual("ok", summary.status)
+        self.assertEqual([MAL_USER_LIST_FIELDS], seen_fields)
+        for field in MAL_USER_LIST_STATUS_PREFERENCE_FIELDS:
+            self.assertIn(field, MAL_USER_LIST_FIELDS)
 
     def test_mal_list_refresh_terminal_complete_can_prune_absent_rows(self) -> None:
         replace_mal_user_anime_list_cache_generation(
@@ -243,14 +267,42 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
 
         self.assertEqual(1, summary.refreshed)
         self.assertEqual([DETAIL_FIELDS], seen_fields)
-        for field in ("rank", "num_list_users", "num_scoring_users", "rating", "average_episode_duration", "statistics"):
+        for field in (
+            "rank",
+            "num_list_users",
+            "num_scoring_users",
+            "rating",
+            "average_episode_duration",
+            "start_date",
+            "end_date",
+            "broadcast",
+            "pictures",
+            "background",
+            "nsfw",
+            "related_manga",
+            "statistics",
+        ):
             self.assertIn(field, DETAIL_FIELDS)
         metadata = get_mal_anime_metadata_map(self.config.db_path)[100]
+        self.assertEqual(100, metadata.rank)
+        self.assertEqual(12345, metadata.num_list_users)
+        self.assertEqual(6789, metadata.num_scoring_users)
+        self.assertEqual("pg_13", metadata.rating)
+        self.assertEqual(1420, metadata.average_episode_duration)
+        self.assertEqual("2020-01-10", metadata.start_date)
+        self.assertEqual("2020-03-27", metadata.end_date)
+        self.assertEqual("friday", metadata.broadcast_day)
+        self.assertEqual("23:30", metadata.broadcast_time)
+        self.assertEqual("Asia/Tokyo", metadata.broadcast_timezone)
+        self.assertEqual("white", metadata.nsfw)
         self.assertEqual(100, metadata.raw["rank"])
         self.assertEqual(12345, metadata.raw["num_list_users"])
         self.assertEqual(6789, metadata.raw["num_scoring_users"])
         self.assertEqual("pg_13", metadata.raw["rating"])
         self.assertEqual(1420, metadata.raw["average_episode_duration"])
+        self.assertEqual("friday", metadata.raw["broadcast"]["day_of_the_week"])
+        self.assertEqual("Official background payload", metadata.raw["background"])
+        self.assertEqual("Seed Manga", metadata.raw["related_manga"][0]["node"]["title"])
         self.assertEqual({"completed": "1000"}, metadata.raw["statistics"]["status"])
         self.assertEqual("manga", metadata.raw["source"])
         self.assertEqual("Bones", metadata.raw["studios"][0]["name"])
@@ -402,11 +454,18 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
                 "num_scoring_users": 1500,
                 "rating": "pg_13",
                 "average_episode_duration": 1440,
+                "start_date": "2023-10-01",
+                "end_date": "2023-12-24",
+                "broadcast": {"day_of_the_week": "sunday", "start_time": "00:00"},
+                "pictures": [],
+                "background": "Hydratable background",
+                "nsfw": "white",
                 "statistics": {"status": {"plan_to_watch": "100"}},
                 "start_season": {"year": 2023, "season": "fall"},
                 "source": "original",
                 "genres": [],
                 "studios": [],
+                "related_manga": [],
                 "my_list_status": {"status": "plan_to_watch", "num_episodes_watched": 0},
             }
 

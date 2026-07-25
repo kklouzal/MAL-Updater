@@ -1252,7 +1252,16 @@ def render_dynamic_dashboard_html(*, title: str = "MAL-Updater live dashboard") 
 body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#101418;color:#eef3f8}a{color:#8cc8ff}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}table{border-collapse:collapse;width:100%;background:#161d24;margin:.75rem 0 1.5rem}th,td{border:1px solid #2b3642;padding:.45rem .6rem;vertical-align:top}th{background:#243140;text-align:left}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.05rem .45rem;font-weight:700;margin:.05rem .2rem .05rem 0}.diagnostic-row{opacity:.82}.diagnostic-label{color:#ffd37a;font-weight:700}code{white-space:pre-wrap}
 </style></head><body><h1>__TITLE__</h1><p class=\"muted\">Live local strict dashboard. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
-const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${esc(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
+const countValue = value => {
+  if (value == null) return '';
+  if (Array.isArray(value)) return value.length ? value.map(countValue).join(', ') : '<span class=\"muted\">none</span>';
+  if (typeof value === 'object') {
+    const entries = Object.entries(value);
+    return entries.length ? entries.map(([key, nested]) => `<span class=\"muted\">${esc(key)}:</span> ${countValue(nested)}`).join(' · ') : '<span class=\"muted\">none</span>';
+  }
+  return esc(value);
+};
+const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${countValue(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
 const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const label = `<span class=\"provider-badge\">${esc(b.label || b.provider)}</span>`; const title = b.title ? ` <span class=\"muted\">${esc(b.title)}</span>` : ''; return `${b.url ? `<a href=\"${esc(b.url)}\" rel=\"noreferrer noopener\">${label}</a>` : label}${title}`; }).join('<br>'); };
 const seedDetails = e => (e?.top_supporting_seeds || []).map(s => { const bits = []; if (s.num_recommendation_votes != null) bits.push(`${s.num_recommendation_votes} MAL vote${s.num_recommendation_votes === 1 ? '' : 's'}`); if (s.user_score != null) bits.push(`score ${s.user_score}`); if (s.status) bits.push(s.status); return `${esc(s.title || s.mal_anime_id || 'MAL seed')}${bits.length ? ` <span class=\"muted\">(${esc(bits.join(', '))})</span>` : ''}`; }).join('<br>') || esc(e?.compact_seeds || '');
 const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary || '');

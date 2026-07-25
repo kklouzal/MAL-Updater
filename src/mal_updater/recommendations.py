@@ -909,6 +909,90 @@ def _discovery_catalog_quality_penalty(*, mean: float | None, popularity: int | 
     return min(penalty, 3), mean_band, popularity_band
 
 
+def _discovery_official_detail_calibration(meta: Any) -> tuple[int, int, list[str], dict[str, Any]]:
+    """Small, non-excluding calibration from typed official MAL detail fields."""
+    if meta is None:
+        return 0, 0, [], {}
+    bonus = 0
+    penalty = 0
+    positive_fragments: list[str] = []
+    tempered_fragments: list[str] = []
+    rank = getattr(meta, "rank", None)
+    if isinstance(rank, int):
+        if rank <= 100:
+            bonus += 2
+            positive_fragments.append("top-100 MAL rank")
+        elif rank <= 500:
+            bonus += 1
+            positive_fragments.append("top-500 MAL rank")
+    num_list_users = getattr(meta, "num_list_users", None)
+    if isinstance(num_list_users, int):
+        if num_list_users >= 500_000:
+            bonus += 2
+            positive_fragments.append("very broad MAL list adoption")
+        elif num_list_users >= 100_000:
+            bonus += 1
+            positive_fragments.append("broad MAL list adoption")
+    num_scoring_users = getattr(meta, "num_scoring_users", None)
+    if isinstance(num_scoring_users, int) and num_scoring_users >= 50_000:
+        bonus += 1
+        positive_fragments.append("broad MAL scoring base")
+    if any(
+        isinstance(getattr(meta, name, None), str) and getattr(meta, name).strip()
+        for name in ("start_date", "end_date", "broadcast_day", "broadcast_time", "broadcast_timezone")
+    ):
+        bonus += 1
+        positive_fragments.append("date/broadcast metadata present")
+
+    rating = getattr(meta, "rating", None)
+    rating_text = rating.strip().lower() if isinstance(rating, str) else None
+    if rating_text in {"rx", "rx_hentai", "r+"}:
+        penalty += 2
+        tempered_fragments.append("adult MAL rating")
+    elif rating_text in {"r", "r17"}:
+        penalty += 1
+        tempered_fragments.append("mature MAL rating")
+    nsfw = getattr(meta, "nsfw", None)
+    nsfw_text = nsfw.strip().lower() if isinstance(nsfw, str) else None
+    if nsfw_text in {"black", "gray"}:
+        penalty += 2 if nsfw_text == "black" else 1
+        tempered_fragments.append(f"MAL nsfw={nsfw_text}")
+    duration = getattr(meta, "average_episode_duration", None)
+    if isinstance(duration, int) and duration > 0 and (duration < 600 or duration > 3600):
+        penalty += 1
+        tempered_fragments.append("atypical episode duration")
+
+    capped_bonus = min(bonus, 6)
+    capped_penalty = min(penalty, 4)
+    reasons: list[str] = []
+    if capped_bonus > 0 and positive_fragments:
+        reasons.append(
+            "official MAL detail signals slightly favored this candidate ("
+            + ", ".join(positive_fragments[:4])
+            + ")"
+        )
+    if capped_penalty > 0 and tempered_fragments:
+        reasons.append(
+            "official MAL detail safety/fit signals gently tempered this candidate without excluding it ("
+            + ", ".join(tempered_fragments[:3])
+            + ")"
+        )
+    features = {
+        "rank": rank if isinstance(rank, int) else None,
+        "num_list_users": num_list_users if isinstance(num_list_users, int) else None,
+        "num_scoring_users": num_scoring_users if isinstance(num_scoring_users, int) else None,
+        "rating": rating_text,
+        "average_episode_duration": duration if isinstance(duration, int) else None,
+        "start_date": getattr(meta, "start_date", None),
+        "end_date": getattr(meta, "end_date", None),
+        "broadcast_day": getattr(meta, "broadcast_day", None),
+        "broadcast_time": getattr(meta, "broadcast_time", None),
+        "broadcast_timezone": getattr(meta, "broadcast_timezone", None),
+        "nsfw": nsfw_text,
+    }
+    return capped_bonus, capped_penalty, reasons, features
+
+
 def _metadata_start_season(meta: Any) -> dict[str, Any] | None:
     start_season = getattr(meta, "start_season", None) if meta is not None else None
     if not isinstance(start_season, dict):
@@ -1001,7 +1085,12 @@ def _metadata_my_list_status(meta: Any) -> dict[str, Any] | None:
 
 
 def _my_list_status_from_cache_entry(entry: Any) -> dict[str, Any]:
-    payload = dict(entry.list_status_raw) if isinstance(getattr(entry, "list_status_raw", None), dict) else {}
+    raw_status = getattr(entry, "list_status_raw", None)
+    payload = {
+        key: value
+        for key, value in (raw_status.items() if isinstance(raw_status, dict) else [])
+        if key not in {"tags", "comments"}
+    }
     if entry.list_status:
         payload["status"] = entry.list_status
     if entry.user_score is not None:
@@ -1014,6 +1103,18 @@ def _my_list_status_from_cache_entry(entry: Any) -> dict[str, Any]:
         payload["finish_date"] = entry.finish_date
     if entry.list_updated_at:
         payload["updated_at"] = entry.list_updated_at
+    if getattr(entry, "priority", None) is not None:
+        payload["priority"] = entry.priority
+    if getattr(entry, "is_rewatching", None) is not None:
+        payload["is_rewatching"] = entry.is_rewatching
+    if getattr(entry, "num_times_rewatched", None) is not None:
+        payload["num_times_rewatched"] = entry.num_times_rewatched
+    if getattr(entry, "rewatch_value", None) is not None:
+        payload["rewatch_value"] = entry.rewatch_value
+    if int(getattr(entry, "tag_count", 0) or 0) > 0:
+        payload["tag_count"] = int(entry.tag_count)
+    if bool(getattr(entry, "has_comments", False)):
+        payload["has_comments"] = True
     return payload
 
 
@@ -1214,6 +1315,37 @@ def _discovery_seed_score_is_neutral(meta: Any) -> tuple[bool, int | None]:
     if not isinstance(raw_score, int) or raw_score <= 0:
         return False, None
     return raw_score == 6, raw_score
+
+
+def _discovery_seed_preference_signal_bonus(meta: Any) -> tuple[int, dict[str, Any]]:
+    my_list_status = _metadata_my_list_status(meta)
+    if not isinstance(my_list_status, dict):
+        return 0, {}
+    bonus = 0
+    features: dict[str, Any] = {}
+    priority = my_list_status.get("priority")
+    if isinstance(priority, int) and 0 <= priority <= 2:
+        bonus += priority
+        features["priority"] = priority
+    if my_list_status.get("is_rewatching") is True:
+        bonus += 1
+        features["is_rewatching"] = True
+    times = my_list_status.get("num_times_rewatched")
+    if isinstance(times, int) and times > 0:
+        bonus += min(times, 2)
+        features["num_times_rewatched"] = times
+    rewatch_value = my_list_status.get("rewatch_value")
+    if isinstance(rewatch_value, int) and rewatch_value > 0:
+        bonus += 2 if rewatch_value >= 4 else 1 if rewatch_value >= 3 else 0
+        features["rewatch_value"] = rewatch_value
+    tag_count = my_list_status.get("tag_count")
+    if isinstance(tag_count, int) and tag_count > 0:
+        bonus += 1
+        features["tag_count"] = tag_count
+    if my_list_status.get("has_comments") is True:
+        bonus += 1
+        features["has_comments"] = True
+    return min(bonus, 6), features
 
 
 def _discovery_seed_completion_bonus(state: ProviderSeriesState) -> int:
@@ -1429,6 +1561,8 @@ def _build_discovery_recommendations(
     seed_penalty_scores: dict[int, int] = {}
     seed_quality_bonus: dict[int, int] = {}
     seed_quality_penalty: dict[int, int] = {}
+    seed_preference_bonus: dict[int, int] = {}
+    seed_preference_features: dict[int, dict[str, Any]] = {}
     dropped_seed_ids: set[int] = set()
     disliked_seed_ids: set[int] = set()
     positive_quality_seed_ids: set[int] = set()
@@ -1447,6 +1581,7 @@ def _build_discovery_recommendations(
         score_bonus, seed_score = _discovery_seed_score_bonus(meta)
         score_penalty, seed_penalty_score = _discovery_seed_score_penalty(meta)
         is_neutral_seed, neutral_seed_score = _discovery_seed_score_is_neutral(meta)
+        preference_bonus, preference_features = _discovery_seed_preference_signal_bonus(meta)
         seed_status = _discovery_seed_status_value(meta)
         if seed_status == "dropped":
             dropped_seed_ids.add(mal_anime_id)
@@ -1459,6 +1594,9 @@ def _build_discovery_recommendations(
             positive_quality_seed_ids.add(mal_anime_id)
         if score_penalty > seed_quality_penalty.get(mal_anime_id, 0):
             seed_quality_penalty[mal_anime_id] = score_penalty
+        if preference_bonus > seed_preference_bonus.get(mal_anime_id, 0):
+            seed_preference_bonus[mal_anime_id] = preference_bonus
+            seed_preference_features[mal_anime_id] = preference_features
         if is_neutral_seed:
             neutral_seed_ids.add(mal_anime_id)
             if neutral_seed_score is not None:
@@ -1550,6 +1688,7 @@ def _build_discovery_recommendations(
             seed_staleness_penalty.setdefault(source_id, 0)
             seed_quality_bonus.setdefault(source_id, 0)
             seed_quality_penalty.setdefault(source_id, 0)
+            seed_preference_bonus.setdefault(source_id, 0)
         for edge in recommendation_edges_by_id.get(source_id, [])[:_DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED]:
             target_id = edge.target_mal_anime_id
             if target_id in watched_ids or target_id in harvested_source_ids:
@@ -1572,6 +1711,8 @@ def _build_discovery_recommendations(
                     "stale_supporting_seed_ids": set(),
                     "seed_quality_bonus": 0,
                     "seed_quality_penalty": 0,
+                    "seed_preference_bonus": 0,
+                    "supporting_seed_preference_signals": {},
                     "supporting_seed_scores": {},
                     "penalized_seed_scores": {},
                     "dropped_supporting_seed_ids": set(),
@@ -1587,8 +1728,11 @@ def _build_discovery_recommendations(
             bucket["seed_staleness_penalty"] += seed_staleness_penalty.get(source_id, 0)
             bucket["seed_quality_bonus"] += seed_quality_bonus.get(source_id, 0)
             bucket["seed_quality_penalty"] += seed_quality_penalty.get(source_id, 0)
+            bucket["seed_preference_bonus"] += seed_preference_bonus.get(source_id, 0)
             if source_id in seed_recent_activity_days:
                 bucket["seed_recent_activity_days"][source_id] = seed_recent_activity_days[source_id]
+            if source_id in seed_preference_features:
+                bucket["supporting_seed_preference_signals"][source_id] = seed_preference_features[source_id]
             if source_id in seed_scores:
                 bucket["supporting_seed_scores"][source_id] = seed_scores[source_id]
             if source_id in seed_penalty_scores:
@@ -1745,12 +1889,19 @@ def _build_discovery_recommendations(
             popularity=popularity,
         )
         catalog_quality_adjustment = catalog_quality_bonus - catalog_quality_penalty
+        official_detail_bonus, official_detail_penalty, official_detail_reasons, official_detail_features = _discovery_official_detail_calibration(meta)
         start_season = _metadata_start_season(meta)
         start_season_label = _format_start_season(start_season)
         freshness_bonus, freshness_bucket, catalog_age_in_seasons, freshness_penalty = _discovery_candidate_freshness_profile(start_season)
         recent_seed_activity_bonus = min(int(bucket.get("seed_recent_activity_bonus", 0)), 6)
         seed_quality_bonus = min(int(bucket.get("seed_quality_bonus", 0)), 6)
         seed_quality_penalty = min(int(bucket.get("seed_quality_penalty", 0)), 6)
+        seed_preference_bonus_value = min(int(bucket.get("seed_preference_bonus", 0)), 6)
+        supporting_seed_preference_signals = {
+            int(source_id): dict(signal)
+            for source_id, signal in (bucket.get("supporting_seed_preference_signals") or {}).items()
+            if isinstance(source_id, int) and isinstance(signal, dict)
+        }
         recent_seed_activity_days = [
             int(value) for value in (bucket.get("seed_recent_activity_days") or {}).values() if isinstance(value, int)
         ]
@@ -1862,10 +2013,11 @@ def _build_discovery_recommendations(
         )
         support_balance_bonus = min(effective_cross_seed_support_votes // 5, 8)
         priority = int(min(bucket["raw_score"] / 8.0, 60)) + effective_supporting_seed_count * 12 + int(mean or 0)
-        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + metadata_affinity_bonus + metadata_quality_bonus + catalog_quality_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus + availability_confidence_bonus
+        priority += popularity_bonus + genre_bonus + studio_bonus + source_bonus + metadata_affinity_bonus + metadata_quality_bonus + catalog_quality_bonus + official_detail_bonus + support_balance_bonus + freshness_bonus + recent_seed_activity_bonus + seed_quality_bonus + seed_preference_bonus_value + availability_confidence_bonus
         priority -= freshness_penalty
         priority -= stale_support_penalty
         priority -= seed_quality_penalty
+        priority -= official_detail_penalty
         priority -= mixed_signal_penalty
         priority -= neutral_support_penalty
         priority -= catalog_quality_penalty
@@ -1932,6 +2084,7 @@ def _build_discovery_recommendations(
                     + ", ".join(catalog_penalty_fragments)
                     + ")"
                 )
+        reasons.extend(official_detail_reasons)
         if freshness_bonus > 0 and start_season_label is not None:
             reasons.append(f"recent MAL start season: {start_season_label}")
         if recent_seed_activity_bonus > 0 and freshest_supporting_seed_days is not None:
@@ -1951,6 +2104,10 @@ def _build_discovery_recommendations(
                 reasons.append(f"backed by higher-confidence seed taste signals (best supporting seed MAL score: {best_supporting_seed_score})")
             else:
                 reasons.append("backed by stronger seed engagement signals (completion depth across supporting seeds)")
+        if seed_preference_bonus_value > 0:
+            reasons.append(
+                "backed by privacy-safe MAL list preference signals from supporting seeds (priority/rewatch/tag-or-comment presence only)"
+            )
         if seed_quality_penalty > 0 and lowest_supporting_seed_score is not None:
             reasons.append(
                 f"tempered by low-confidence/disliked seed support (lowest supporting seed MAL score: {lowest_supporting_seed_score})"
@@ -2026,17 +2183,22 @@ def _build_discovery_recommendations(
             "provider_dub_verified": bool(actionable_provider_evidence),
             "provider_eligibility_evidence": provider_evidence_chain,
             "top_supporting_seed_titles": supporting_seed_details,
+            "seed_preference_bonus": seed_preference_bonus_value,
+            "supporting_seed_preference_signals": supporting_seed_preference_signals,
+            "official_detail_bonus": official_detail_bonus,
+            "official_detail_penalty": official_detail_penalty,
+            "official_detail_features": official_detail_features,
             "metadata_cached": meta is not None,
         }
         consensus_score = min(100.0, 35.0 + (effective_supporting_seed_count * 18.0) + min(float(bucket["votes"]), 60.0) * 0.45)
         affinity_score = min(100.0, (genre_overlap_score * 55.0) + (studio_overlap_score * 25.0) + (source_overlap_score * 20.0) + (metadata_affinity_bonus * 3.0))
         if not metadata_match_dimensions:
             affinity_score = 50.0 if meta is None else max(35.0, affinity_score)
-        seed_quality_score = max(0.0, min(100.0, 55.0 + (seed_quality_bonus * 4.0) - (seed_quality_penalty * 5.0) - (mixed_signal_penalty * 3.0) - (neutral_support_penalty * 3.0)))
+        seed_quality_score = max(0.0, min(100.0, 55.0 + (seed_quality_bonus * 4.0) + (seed_preference_bonus_value * 3.0) - (seed_quality_penalty * 5.0) - (mixed_signal_penalty * 3.0) - (neutral_support_penalty * 3.0)))
         if best_supporting_seed_score is not None:
             seed_quality_score = max(seed_quality_score, min(100.0, best_supporting_seed_score * 10.0))
         source_rating_score = 50.0 if mean is None else max(0.0, min(100.0, mean * 10.0))
-        quality_score = max(0.0, min(100.0, 55.0 + metadata_quality_bonus * 3.0 + catalog_quality_bonus * 3.0 - catalog_quality_penalty * 3.0 + freshness_bonus * 2.0 - freshness_penalty * 2.0))
+        quality_score = max(0.0, min(100.0, 55.0 + metadata_quality_bonus * 3.0 + catalog_quality_bonus * 3.0 + official_detail_bonus * 2.0 - catalog_quality_penalty * 3.0 - official_detail_penalty * 2.0 + freshness_bonus * 2.0 - freshness_penalty * 2.0))
         availability_score = 100.0 if availability_confidence in {"mapped", "verified_provider_eligibility"} else (78.0 if available_states else 25.0)
         dub_signal = scorecard_features["english_dub_signal"]
         dub_watchable_score = 100.0 if dub_signal == "present" else (55.0 if available_states else 35.0)
@@ -2170,6 +2332,9 @@ def _build_discovery_recommendations(
                     "catalog_low_mean_band": catalog_low_mean_band,
                     "catalog_niche_popularity_band": catalog_niche_popularity_band,
                     "catalog_quality_adjustment": catalog_quality_adjustment,
+                    "official_detail_bonus": official_detail_bonus,
+                    "official_detail_penalty": official_detail_penalty,
+                    "official_detail_features": official_detail_features,
                     "start_season": start_season,
                     "start_season_label": start_season_label,
                     "freshness_bucket": freshness_bucket,
@@ -2179,6 +2344,8 @@ def _build_discovery_recommendations(
                     "recent_seed_activity_bonus": recent_seed_activity_bonus,
                     "seed_quality_bonus": seed_quality_bonus,
                     "seed_quality_penalty": seed_quality_penalty,
+                    "seed_preference_bonus": seed_preference_bonus_value,
+                    "supporting_seed_preference_signals": supporting_seed_preference_signals,
                     "supporting_seed_scores": supporting_seed_scores,
                     "penalized_seed_scores": penalized_seed_scores,
                     "best_supporting_seed_score": best_supporting_seed_score,

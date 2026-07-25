@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import AppConfig, load_mal_secrets
@@ -12,6 +13,7 @@ from .db import (
     list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
     replace_review_queue_entries,
     upsert_series_mapping,
+    upsert_watch_confirmation_provenance,
 )
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, extract_provider_mapping_evidence, map_series, merge_provider_mapping_evidence, should_auto_approve_mapping
@@ -46,6 +48,8 @@ class ProviderSeriesState:
     watchlist_status: str | None
     last_watched_at: str | None
     completion_audit: dict[str, Any] = field(default_factory=dict)
+    last_progress_seen_at: str | None = None
+    last_series_seen_at: str | None = None
     verified_mal_anime_id: int | None = None
     verified_identity_kind: str | None = None
     provider_episode_count: int | None = None
@@ -63,6 +67,7 @@ class EpisodeProgressState:
     playback_position_ms: int | None
     duration_ms: int | None
     last_watched_at: str | None
+    last_seen_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -211,7 +216,8 @@ def load_provider_series_states(
             completion_ratio,
             playback_position_ms,
             duration_ms,
-            last_watched_at
+            last_watched_at,
+            last_seen_at
         FROM provider_episode_progress
         WHERE 1=1
     """
@@ -265,6 +271,7 @@ def load_provider_series_states(
                 playback_position_ms=row["playback_position_ms"],
                 duration_ms=row["duration_ms"],
                 last_watched_at=row["last_watched_at"],
+                last_seen_at=row["last_seen_at"],
             )
         )
 
@@ -301,6 +308,8 @@ def load_provider_series_states(
                     watchlist_status=row["watchlist_status"],
                     last_watched_at=summary["last_watched_at"],
                     completion_audit=summary["completion_audit"],
+                    last_progress_seen_at=summary["last_progress_seen_at"],
+                    last_series_seen_at=row["last_seen_at"],
                     verified_mal_anime_id=verified_identity.mal_anime_id if verified_identity else None,
                     verified_identity_kind=verified_identity.identity_match_kind if verified_identity else None,
                     verified_identity_evidence=verified_identity_evidence,
@@ -337,6 +346,7 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     max_episode_number: int | None = None
     max_completed_episode_number: int | None = None
     last_watched_at: str | None = None
+    last_progress_seen_at: str | None = None
     completion_reason_counts: dict[str, int] = {
         "ratio_threshold": 0,
         "credits_window": 0,
@@ -354,6 +364,8 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
             max_episode_number = row.episode_number if max_episode_number is None else max(max_episode_number, row.episode_number)
         if row.last_watched_at and (last_watched_at is None or row.last_watched_at > last_watched_at):
             last_watched_at = row.last_watched_at
+        if row.last_seen_at and (last_progress_seen_at is None or row.last_seen_at > last_progress_seen_at):
+            last_progress_seen_at = row.last_seen_at
         completion_reason = _completion_reason(row, rows, config)
         if completion_reason is None:
             if len(incomplete_examples) < 5:
@@ -377,6 +389,7 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
         "completed_episode_count": len(completed_episode_numbers) + len(completed_episode_ids_without_number),
         "max_completed_episode_number": max_completed_episode_number,
         "last_watched_at": last_watched_at,
+        "last_progress_seen_at": last_progress_seen_at,
         "completion_audit": {
             "completed_by": completion_reason_counts,
             "completed_examples": completion_reason_examples,
@@ -585,6 +598,150 @@ def persist_mapping_review_queue(config: AppConfig, items: list[MappingReviewIte
     return replace_review_queue_entries(config.db_path, issue_type="mapping_review", entries=queue_entries)
 
 
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _coerce_detail_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _completion_decision_for_provenance(
+    *,
+    provider_watched_episodes: int,
+    mal_num_episodes: int | None,
+    watchlist_status: str | None,
+    progress_rows: int,
+) -> tuple[bool, str, str]:
+    if mal_num_episodes is not None and mal_num_episodes > 0 and provider_watched_episodes >= mal_num_episodes:
+        return True, "provider_completed_known_mal_episode_count", "complete"
+    if provider_watched_episodes > 0:
+        return False, "provider_progress_without_known_mal_completion", "partial"
+    if progress_rows > 0:
+        return False, "provider_progress_without_completed_episode", "partial"
+    if watchlist_status:
+        return False, "provider_watchlist_without_progress", "watchlist_only"
+    return False, "no_provider_watch_evidence", "none"
+
+
+def _watch_identity_key(state: ProviderSeriesState, mal_anime_id: int | None) -> str:
+    if mal_anime_id is not None:
+        return f"mal:{mal_anime_id}"
+    identity = state.verified_identity_evidence if isinstance(state.verified_identity_evidence, dict) else None
+    if identity:
+        for key in ("series_guid", "series_id", "id", "slug"):
+            value = identity.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{state.provider}:{key}:{value.strip()}"
+    return f"{state.provider}:{state.provider_series_id}"
+
+
+def _persist_watch_confirmation_provenance_snapshot(
+    config: AppConfig,
+    state: ProviderSeriesState,
+    proposal: SyncProposal,
+    *,
+    detail: dict[str, Any] | None,
+    mapping_reasons: list[str] | None = None,
+) -> None:
+    mal_num_episodes = _coerce_detail_int((detail or {}).get("num_episodes"))
+    provider_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
+    confirmed_complete, completion_decision, completion_status = _completion_decision_for_provenance(
+        provider_watched_episodes=provider_watched_episodes,
+        mal_num_episodes=mal_num_episodes,
+        watchlist_status=state.watchlist_status,
+        progress_rows=state.progress_rows,
+    )
+    generated_at = _utc_iso_now()
+    last_evidence_at = max(
+        [value for value in (state.last_watched_at, state.last_progress_seen_at, state.last_series_seen_at) if isinstance(value, str)],
+        default=None,
+    )
+    completion_audit = state.completion_audit if isinstance(state.completion_audit, dict) else {}
+    completed_by = completion_audit.get("completed_by") if isinstance(completion_audit.get("completed_by"), dict) else {}
+    completed_examples = completion_audit.get("completed_examples") if isinstance(completion_audit.get("completed_examples"), dict) else {}
+    incomplete_examples = completion_audit.get("incomplete_examples") if isinstance(completion_audit.get("incomplete_examples"), list) else []
+    mapping_audit = {
+        "mapping_status": proposal.mapping_status,
+        "mapping_source": proposal.mapping_source,
+        "mapping_confidence": proposal.confidence,
+        "mapping_approved": proposal.persisted_mapping_approved,
+        "reasons": list(mapping_reasons or []),
+    }
+    decision_audit = {
+        "decision": proposal.decision,
+        "current_my_list_status": proposal.current_my_list_status,
+        "proposed_my_list_status": proposal.proposed_my_list_status,
+        "reasons": list(proposal.reasons),
+    }
+    progress_audit = {
+        "provider": state.provider,
+        "provider_series_id": state.provider_series_id,
+        "watchlist_status": state.watchlist_status,
+        "progress_rows": state.progress_rows,
+        "completed_episode_count": state.completed_episode_count,
+        "max_episode_number": state.max_episode_number,
+        "max_completed_episode_number": state.max_completed_episode_number,
+        "provider_watched_episodes": provider_watched_episodes,
+        "last_watched_at": state.last_watched_at,
+        "last_progress_seen_at": state.last_progress_seen_at,
+        "last_series_seen_at": state.last_series_seen_at,
+        "completion_audit": completion_audit,
+    }
+    upsert_watch_confirmation_provenance(
+        config.db_path,
+        provider=state.provider,
+        provider_series_id=state.provider_series_id,
+        identity_key=_watch_identity_key(state, proposal.mal_anime_id),
+        mal_anime_id=proposal.mal_anime_id,
+        source_title=state.title,
+        season_title=state.season_title,
+        mapped_mal_title=proposal.mal_title or ((detail or {}).get("title") if isinstance((detail or {}).get("title"), str) else None),
+        progress_rows=state.progress_rows,
+        completed_episode_count=state.completed_episode_count,
+        max_episode_number=state.max_episode_number,
+        max_completed_episode_number=state.max_completed_episode_number,
+        provider_watched_episodes=provider_watched_episodes,
+        mal_num_episodes=mal_num_episodes,
+        confirmed_complete=confirmed_complete,
+        completion_decision=completion_decision,
+        completion_status=completion_status,
+        completion_threshold=config.completion_threshold,
+        credits_skip_window_seconds=config.credits_skip_window_seconds,
+        last_watched_at=state.last_watched_at,
+        last_progress_seen_at=state.last_progress_seen_at,
+        last_series_seen_at=state.last_series_seen_at,
+        last_evidence_at=last_evidence_at,
+        mapping_source=proposal.mapping_source,
+        mapping_confidence=proposal.confidence,
+        mapping_approved=proposal.persisted_mapping_approved,
+        verified_identity_kind=state.verified_identity_kind,
+        verified_identity=state.verified_identity_evidence,
+        completed_by=completed_by,
+        completed_examples=completed_examples,
+        incomplete_examples=incomplete_examples,
+        thresholds={
+            "completion_threshold": config.completion_threshold,
+            "credits_skip_window_seconds": config.credits_skip_window_seconds,
+        },
+        progress_audit=progress_audit,
+        mapping_audit=mapping_audit,
+        decision_audit=decision_audit,
+        generated_at=generated_at,
+    )
+
+
 def build_dry_run_sync_plan(
     config: AppConfig,
     limit: int | None = 20,
@@ -606,23 +763,23 @@ def build_dry_run_sync_plan(
                 reasons.append("no_user_approved_mapping")
             else:
                 reasons.append(f"mapping_source_not_exact={persisted.mapping_source}")
-            proposals.append(
-                SyncProposal(
-                    provider_series_id=state.provider_series_id,
-                    provider_title=state.title,
-                    mapping_status="unapproved",
-                    confidence=0.0,
-                    mal_anime_id=persisted.mal_anime_id if persisted else None,
-                    mal_title=None,
-                    current_my_list_status=None,
-                    proposed_my_list_status=None,
-                    decision="review",
-                    mapping_source=persisted.mapping_source if persisted else None,
-                    persisted_mapping_approved=False,
-                    reasons=reasons,
-                    provider=state.provider,
-                )
+            proposal = SyncProposal(
+                provider_series_id=state.provider_series_id,
+                provider_title=state.title,
+                mapping_status="unapproved",
+                confidence=0.0,
+                mal_anime_id=persisted.mal_anime_id if persisted else None,
+                mal_title=None,
+                current_my_list_status=None,
+                proposed_my_list_status=None,
+                decision="review",
+                mapping_source=persisted.mapping_source if persisted else None,
+                persisted_mapping_approved=False,
+                reasons=reasons,
+                provider=state.provider,
             )
+            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=reasons)
+            proposals.append(proposal)
             continue
 
         mapping_status, confidence, chosen_anime_id, mapping_source, approved, mapping_reasons = _resolve_mapping_for_sync(
@@ -634,23 +791,23 @@ def build_dry_run_sync_plan(
             allow_live_search=not approved_mappings_only,
         )
         if chosen_anime_id is None:
-            proposals.append(
-                SyncProposal(
-                    provider_series_id=state.provider_series_id,
-                    provider_title=state.title,
-                    mapping_status=mapping_status,
-                    confidence=confidence,
-                    mal_anime_id=persisted.mal_anime_id if persisted else None,
-                    mal_title=None,
-                    current_my_list_status=None,
-                    proposed_my_list_status=None,
-                    decision="review",
-                    mapping_source=mapping_source,
-                    persisted_mapping_approved=approved,
-                    reasons=mapping_reasons,
-                    provider=state.provider,
-                )
+            proposal = SyncProposal(
+                provider_series_id=state.provider_series_id,
+                provider_title=state.title,
+                mapping_status=mapping_status,
+                confidence=confidence,
+                mal_anime_id=persisted.mal_anime_id if persisted else None,
+                mal_title=None,
+                current_my_list_status=None,
+                proposed_my_list_status=None,
+                decision="review",
+                mapping_source=mapping_source,
+                persisted_mapping_approved=approved,
+                reasons=mapping_reasons,
+                provider=state.provider,
             )
+            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=mapping_reasons)
+            proposals.append(proposal)
             continue
 
         try:
@@ -659,35 +816,35 @@ def build_dry_run_sync_plan(
                 fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
             )
         except MalApiError as exc:
-            proposals.append(
-                SyncProposal(
-                    provider_series_id=state.provider_series_id,
-                    provider_title=state.title,
-                    mapping_status=mapping_status,
-                    confidence=confidence,
-                    mal_anime_id=chosen_anime_id,
-                    mal_title=None,
-                    current_my_list_status=None,
-                    proposed_my_list_status=None,
-                    decision="review",
-                    mapping_source=mapping_source,
-                    persisted_mapping_approved=approved,
-                    reasons=mapping_reasons + [f"mal_details_lookup_failed:{exc}"],
-                    provider=state.provider,
-                )
-            )
-            continue
-        proposals.append(
-            _plan_status_update(
-                state,
-                detail,
-                mapping_status,
-                confidence,
+            proposal = SyncProposal(
+                provider_series_id=state.provider_series_id,
+                provider_title=state.title,
+                mapping_status=mapping_status,
+                confidence=confidence,
+                mal_anime_id=chosen_anime_id,
+                mal_title=None,
+                current_my_list_status=None,
+                proposed_my_list_status=None,
+                decision="review",
                 mapping_source=mapping_source,
                 persisted_mapping_approved=approved,
-                extra_reasons=mapping_reasons,
+                reasons=mapping_reasons + [f"mal_details_lookup_failed:{exc}"],
+                provider=state.provider,
             )
+            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=mapping_reasons)
+            proposals.append(proposal)
+            continue
+        proposal = _plan_status_update(
+            state,
+            detail,
+            mapping_status,
+            confidence,
+            mapping_source=mapping_source,
+            persisted_mapping_approved=approved,
+            extra_reasons=mapping_reasons,
         )
+        _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=mapping_reasons)
+        proposals.append(proposal)
     return proposals
 
 
@@ -730,6 +887,27 @@ def execute_approved_sync(
                 fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
             )
         except MalApiError as exc:
+            error_reasons = [
+                "using_user_approved_mapping",
+                *(["exact_approved_only_enabled"] if exact_approved_only else []),
+                f"mal_details_lookup_failed:{exc}",
+            ]
+            proposal = SyncProposal(
+                provider_series_id=state.provider_series_id,
+                provider_title=state.title,
+                mapping_status="approved",
+                confidence=float(persisted.confidence or 1.0),
+                mal_anime_id=persisted.mal_anime_id,
+                mal_title=None,
+                current_my_list_status=None,
+                proposed_my_list_status=None,
+                decision="review",
+                mapping_source=persisted.mapping_source,
+                persisted_mapping_approved=True,
+                reasons=error_reasons,
+                provider=state.provider,
+            )
+            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=error_reasons)
             results.append(
                 ApplyResult(
                     provider=state.provider,
@@ -740,11 +918,7 @@ def execute_approved_sync(
                     proposal_decision="error",
                     requested_status=None,
                     response_status=None,
-                    reasons=[
-                        "using_user_approved_mapping",
-                        *(["exact_approved_only_enabled"] if exact_approved_only else []),
-                        f"mal_details_lookup_failed:{exc}",
-                    ],
+                    reasons=error_reasons,
                 )
             )
             continue
@@ -761,6 +935,7 @@ def execute_approved_sync(
                 *(["exact_approved_only_enabled"] if exact_approved_only else []),
             ],
         )
+        _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=proposal.reasons)
         if proposal.decision != "propose_update":
             results.append(
                 ApplyResult(

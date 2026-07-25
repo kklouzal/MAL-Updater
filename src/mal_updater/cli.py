@@ -2827,6 +2827,7 @@ def _cmd_mal_list_refresh(
                     f"preserved_absent={payload['preserved_absent']}",
                     f"scored={payload['scored']}",
                     f"unscored={payload['unscored']}",
+                    f"preference_counts={json.dumps(payload.get('preference_counts', {}), sort_keys=True)}",
                     f"by_status={json.dumps(payload['by_status'], sort_keys=True)}",
                 ]
             )

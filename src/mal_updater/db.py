@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +18,9 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "007_mal_user_anime_list_cache.sql",
     "008_niceness_caches.sql",
     "009_recommendation_full_harvest_provenance.sql",
+    "010_mal_anime_metadata_official_detail_fields.sql",
+    "011_mal_user_anime_list_preference_fields.sql",
+    "012_watch_confirmation_provenance.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -166,6 +169,17 @@ class MalAnimeMetadata:
     raw: dict[str, Any]
     fetched_at: str
     updated_at: str
+    rank: int | None = None
+    num_list_users: int | None = None
+    num_scoring_users: int | None = None
+    rating: str | None = None
+    average_episode_duration: int | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    broadcast_day: str | None = None
+    broadcast_time: str | None = None
+    broadcast_timezone: str | None = None
+    nsfw: str | None = None
 
 
 @dataclass(slots=True)
@@ -178,6 +192,12 @@ class MalUserAnimeListCacheEntry:
     start_date: str | None
     finish_date: str | None
     list_updated_at: str | None
+    priority: int | None
+    is_rewatching: bool | None
+    num_times_rewatched: int | None
+    rewatch_value: int | None
+    tag_count: int
+    has_comments: bool
     node: dict[str, Any]
     list_status_raw: dict[str, Any]
     raw: dict[str, Any]
@@ -201,6 +221,7 @@ class MalUserAnimeListRefreshSummary:
     preserved_absent: int = 0
     scored: int = 0
     unscored: int = 0
+    preference_counts: dict[str, int] = field(default_factory=dict)
     metadata_rows_with_my_list_status: int = 0
     by_status: dict[str, int] | None = None
     partial: bool = False
@@ -218,6 +239,7 @@ class MalUserAnimeListRefreshSummary:
             "preserved_absent": self.preserved_absent,
             "scored": self.scored,
             "unscored": self.unscored,
+            "preference_counts": dict(self.preference_counts or {}),
             "metadata_rows_with_my_list_status": self.metadata_rows_with_my_list_status,
             "by_status": dict(self.by_status or {}),
             "partial": self.partial,
@@ -320,6 +342,88 @@ class RecommendationProviderEligibilityEvidence:
     logic_version: str
     created_at: str
     updated_at: str
+
+
+@dataclass(slots=True)
+class WatchConfirmationProvenance:
+    provider: str
+    provider_series_id: str
+    identity_key: str
+    mal_anime_id: int | None
+    source_title: str
+    season_title: str | None
+    mapped_mal_title: str | None
+    progress_rows: int
+    completed_episode_count: int
+    max_episode_number: int | None
+    max_completed_episode_number: int | None
+    provider_watched_episodes: int
+    mal_num_episodes: int | None
+    confirmed_complete: bool
+    completion_decision: str
+    completion_status: str
+    completion_threshold: float | None
+    credits_skip_window_seconds: int | None
+    last_watched_at: str | None
+    last_progress_seen_at: str | None
+    last_series_seen_at: str | None
+    last_evidence_at: str | None
+    mapping_source: str | None
+    mapping_confidence: float | None
+    mapping_approved: bool
+    verified_identity_kind: str | None
+    verified_identity: dict[str, Any] | None
+    completed_by: dict[str, Any]
+    completed_examples: dict[str, Any]
+    incomplete_examples: list[Any]
+    thresholds: dict[str, Any]
+    progress_audit: dict[str, Any]
+    mapping_audit: dict[str, Any]
+    decision_audit: dict[str, Any]
+    generated_at: str
+    created_at: str
+    updated_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "provider_series_id": self.provider_series_id,
+            "identity_key": self.identity_key,
+            "mal_anime_id": self.mal_anime_id,
+            "source_title": self.source_title,
+            "season_title": self.season_title,
+            "mapped_mal_title": self.mapped_mal_title,
+            "progress_rows": self.progress_rows,
+            "completed_episode_count": self.completed_episode_count,
+            "max_episode_number": self.max_episode_number,
+            "max_completed_episode_number": self.max_completed_episode_number,
+            "provider_watched_episodes": self.provider_watched_episodes,
+            "mal_num_episodes": self.mal_num_episodes,
+            "confirmed_complete": self.confirmed_complete,
+            "completion_decision": self.completion_decision,
+            "completion_status": self.completion_status,
+            "completion_threshold": self.completion_threshold,
+            "credits_skip_window_seconds": self.credits_skip_window_seconds,
+            "last_watched_at": self.last_watched_at,
+            "last_progress_seen_at": self.last_progress_seen_at,
+            "last_series_seen_at": self.last_series_seen_at,
+            "last_evidence_at": self.last_evidence_at,
+            "mapping_source": self.mapping_source,
+            "mapping_confidence": self.mapping_confidence,
+            "mapping_approved": self.mapping_approved,
+            "verified_identity_kind": self.verified_identity_kind,
+            "verified_identity": self.verified_identity,
+            "completed_by": self.completed_by,
+            "completed_examples": self.completed_examples,
+            "incomplete_examples": self.incomplete_examples,
+            "thresholds": self.thresholds,
+            "progress_audit": self.progress_audit,
+            "mapping_audit": self.mapping_audit,
+            "decision_audit": self.decision_audit,
+            "generated_at": self.generated_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
 
 
 class ManagedConnection(sqlite3.Connection):
@@ -514,6 +618,72 @@ def _non_numeric_label(value: Any) -> str | None:
     if isinstance(value, str) and value.strip() and _coerce_float(value) is None:
         return value.strip()
     return None
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    coerced = _coerce_int(value)
+    if coerced is None or coerced <= 0:
+        return None
+    return coerced
+
+
+def _coerce_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    coerced = _coerce_int(value)
+    if coerced is None or coerced < 0:
+        return None
+    return coerced
+
+
+def _coerce_non_empty_text(value: Any, *, lowercase: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return text.lower() if lowercase else text
+
+
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def _row_get(row: sqlite3.Row, name: str, default: Any = None) -> Any:
+    return row[name] if name in row.keys() else default
+
+
+def _privacy_safe_tag_count(value: Any) -> int:
+    if isinstance(value, list):
+        return sum(1 for item in value if isinstance(item, str) and item.strip())
+    if isinstance(value, str) and value.strip():
+        return 1
+    return 0
+
+
+def _privacy_safe_has_comments(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _raw_payload(raw: Any) -> dict[str, Any]:
+    return raw if isinstance(raw, dict) else {}
+
+
+def _broadcast_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    broadcast = raw.get("broadcast")
+    return broadcast if isinstance(broadcast, dict) else {}
 
 
 def _load_json_value(value: str | None, fallback: Any) -> Any:
@@ -776,7 +946,40 @@ def upsert_mal_anime_metadata(
     popularity: int | None,
     start_season: dict[str, Any] | None,
     raw: dict[str, Any],
+    rank: int | None = None,
+    num_list_users: int | None = None,
+    num_scoring_users: int | None = None,
+    rating: str | None = None,
+    average_episode_duration: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    broadcast_day: str | None = None,
+    broadcast_time: str | None = None,
+    broadcast_timezone: str | None = None,
+    nsfw: str | None = None,
 ) -> None:
+    raw_payload = _raw_payload(raw)
+    broadcast_payload = _broadcast_payload(raw_payload)
+    rank_value = _coerce_positive_int(rank if rank is not None else raw_payload.get("rank"))
+    num_list_users_value = _coerce_nonnegative_int(num_list_users if num_list_users is not None else raw_payload.get("num_list_users"))
+    num_scoring_users_value = _coerce_nonnegative_int(num_scoring_users if num_scoring_users is not None else raw_payload.get("num_scoring_users"))
+    rating_value = _coerce_non_empty_text(rating if rating is not None else raw_payload.get("rating"), lowercase=True)
+    average_episode_duration_value = _coerce_positive_int(
+        average_episode_duration if average_episode_duration is not None else raw_payload.get("average_episode_duration")
+    )
+    start_date_value = _coerce_non_empty_text(start_date if start_date is not None else raw_payload.get("start_date"))
+    end_date_value = _coerce_non_empty_text(end_date if end_date is not None else raw_payload.get("end_date"))
+    broadcast_day_value = _coerce_non_empty_text(
+        broadcast_day if broadcast_day is not None else broadcast_payload.get("day_of_the_week"),
+        lowercase=True,
+    )
+    broadcast_time_value = _coerce_non_empty_text(
+        broadcast_time if broadcast_time is not None else broadcast_payload.get("start_time")
+    )
+    broadcast_timezone_value = _coerce_non_empty_text(
+        broadcast_timezone if broadcast_timezone is not None else broadcast_payload.get("timezone")
+    )
+    nsfw_value = _coerce_non_empty_text(nsfw if nsfw is not None else raw_payload.get("nsfw"), lowercase=True)
     with connect(db_path) as conn:
         conn.execute(
             """
@@ -792,8 +995,19 @@ def upsert_mal_anime_metadata(
                 mean,
                 popularity,
                 start_season_json,
+                rank,
+                num_list_users,
+                num_scoring_users,
+                rating,
+                average_episode_duration,
+                start_date,
+                end_date,
+                broadcast_day,
+                broadcast_time,
+                broadcast_timezone,
+                nsfw,
                 raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mal_anime_id) DO UPDATE SET
                 title = excluded.title,
                 title_english = excluded.title_english,
@@ -805,6 +1019,17 @@ def upsert_mal_anime_metadata(
                 mean = excluded.mean,
                 popularity = excluded.popularity,
                 start_season_json = excluded.start_season_json,
+                rank = excluded.rank,
+                num_list_users = excluded.num_list_users,
+                num_scoring_users = excluded.num_scoring_users,
+                rating = excluded.rating,
+                average_episode_duration = excluded.average_episode_duration,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                broadcast_day = excluded.broadcast_day,
+                broadcast_time = excluded.broadcast_time,
+                broadcast_timezone = excluded.broadcast_timezone,
+                nsfw = excluded.nsfw,
                 raw_json = excluded.raw_json,
                 fetched_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
@@ -821,10 +1046,288 @@ def upsert_mal_anime_metadata(
                 mean,
                 popularity,
                 json.dumps(start_season, ensure_ascii=False, sort_keys=True) if start_season is not None else None,
+                rank_value,
+                num_list_users_value,
+                num_scoring_users_value,
+                rating_value,
+                average_episode_duration_value,
+                start_date_value,
+                end_date_value,
+                broadcast_day_value,
+                broadcast_time_value,
+                broadcast_timezone_value,
+                nsfw_value,
                 json.dumps(raw, ensure_ascii=False, sort_keys=True),
             ),
         )
         conn.commit()
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _watch_confirmation_provenance_from_row(row: sqlite3.Row) -> WatchConfirmationProvenance:
+    return WatchConfirmationProvenance(
+        provider=str(row["provider"]),
+        provider_series_id=str(row["provider_series_id"]),
+        identity_key=str(row["identity_key"] or ""),
+        mal_anime_id=None if row["mal_anime_id"] is None else int(row["mal_anime_id"]),
+        source_title=str(row["source_title"]),
+        season_title=row["season_title"],
+        mapped_mal_title=row["mapped_mal_title"],
+        progress_rows=int(row["progress_rows"] or 0),
+        completed_episode_count=int(row["completed_episode_count"] or 0),
+        max_episode_number=None if row["max_episode_number"] is None else int(row["max_episode_number"]),
+        max_completed_episode_number=None if row["max_completed_episode_number"] is None else int(row["max_completed_episode_number"]),
+        provider_watched_episodes=int(row["provider_watched_episodes"] or 0),
+        mal_num_episodes=None if row["mal_num_episodes"] is None else int(row["mal_num_episodes"]),
+        confirmed_complete=bool(row["confirmed_complete"]),
+        completion_decision=str(row["completion_decision"]),
+        completion_status=str(row["completion_status"]),
+        completion_threshold=None if row["completion_threshold"] is None else float(row["completion_threshold"]),
+        credits_skip_window_seconds=None if row["credits_skip_window_seconds"] is None else int(row["credits_skip_window_seconds"]),
+        last_watched_at=row["last_watched_at"],
+        last_progress_seen_at=row["last_progress_seen_at"],
+        last_series_seen_at=row["last_series_seen_at"],
+        last_evidence_at=row["last_evidence_at"],
+        mapping_source=row["mapping_source"],
+        mapping_confidence=None if row["mapping_confidence"] is None else float(row["mapping_confidence"]),
+        mapping_approved=bool(row["mapping_approved"]),
+        verified_identity_kind=row["verified_identity_kind"],
+        verified_identity=_json_dict(_load_json_value(row["verified_identity_json"], {})) if row["verified_identity_json"] else None,
+        completed_by=_json_dict(_load_json_value(row["completed_by_json"], {})),
+        completed_examples=_json_dict(_load_json_value(row["completed_examples_json"], {})),
+        incomplete_examples=_json_list(_load_json_value(row["incomplete_examples_json"], [])),
+        thresholds=_json_dict(_load_json_value(row["thresholds_json"], {})),
+        progress_audit=_json_dict(_load_json_value(row["progress_audit_json"], {})),
+        mapping_audit=_json_dict(_load_json_value(row["mapping_audit_json"], {})),
+        decision_audit=_json_dict(_load_json_value(row["decision_audit_json"], {})),
+        generated_at=str(row["generated_at"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def get_watch_confirmation_provenance(
+    db_path: Path,
+    *,
+    provider: str,
+    provider_series_id: str,
+) -> WatchConfirmationProvenance | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM watch_confirmation_provenance
+            WHERE provider = ? AND provider_series_id = ?
+            """,
+            (provider, provider_series_id),
+        ).fetchone()
+    return None if row is None else _watch_confirmation_provenance_from_row(row)
+
+
+def list_watch_confirmation_provenance(
+    db_path: Path,
+    *,
+    provider: str | None = None,
+    mal_anime_id: int | None = None,
+    identity_key: str | None = None,
+    confirmed_complete: bool | None = None,
+    limit: int | None = None,
+) -> list[WatchConfirmationProvenance]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if provider is not None:
+        conditions.append("provider = ?")
+        params.append(provider)
+    if mal_anime_id is not None:
+        conditions.append("mal_anime_id = ?")
+        params.append(int(mal_anime_id))
+    if identity_key is not None:
+        conditions.append("identity_key = ?")
+        params.append(identity_key)
+    if confirmed_complete is not None:
+        conditions.append("confirmed_complete = ?")
+        params.append(1 if confirmed_complete else 0)
+    query = "SELECT * FROM watch_confirmation_provenance"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY updated_at DESC, provider ASC, provider_series_id ASC"
+    if limit is not None and limit > 0:
+        query += " LIMIT ?"
+        params.append(int(limit))
+    with connect(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_watch_confirmation_provenance_from_row(row) for row in rows]
+
+
+def upsert_watch_confirmation_provenance(
+    db_path: Path,
+    *,
+    provider: str,
+    provider_series_id: str,
+    identity_key: str | None = None,
+    mal_anime_id: int | None = None,
+    source_title: str,
+    season_title: str | None = None,
+    mapped_mal_title: str | None = None,
+    progress_rows: int = 0,
+    completed_episode_count: int = 0,
+    max_episode_number: int | None = None,
+    max_completed_episode_number: int | None = None,
+    provider_watched_episodes: int = 0,
+    mal_num_episodes: int | None = None,
+    confirmed_complete: bool = False,
+    completion_decision: str = "unknown",
+    completion_status: str = "unknown",
+    completion_threshold: float | None = None,
+    credits_skip_window_seconds: int | None = None,
+    last_watched_at: str | None = None,
+    last_progress_seen_at: str | None = None,
+    last_series_seen_at: str | None = None,
+    last_evidence_at: str | None = None,
+    mapping_source: str | None = None,
+    mapping_confidence: float | None = None,
+    mapping_approved: bool = False,
+    verified_identity_kind: str | None = None,
+    verified_identity: dict[str, Any] | None = None,
+    completed_by: dict[str, Any] | None = None,
+    completed_examples: dict[str, Any] | None = None,
+    incomplete_examples: list[Any] | None = None,
+    thresholds: dict[str, Any] | None = None,
+    progress_audit: dict[str, Any] | None = None,
+    mapping_audit: dict[str, Any] | None = None,
+    decision_audit: dict[str, Any] | None = None,
+    generated_at: str,
+) -> WatchConfirmationProvenance:
+    normalized_identity_key = str(identity_key or f"{provider}:{provider_series_id}")
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO watch_confirmation_provenance (
+                provider,
+                provider_series_id,
+                identity_key,
+                mal_anime_id,
+                source_title,
+                season_title,
+                mapped_mal_title,
+                progress_rows,
+                completed_episode_count,
+                max_episode_number,
+                max_completed_episode_number,
+                provider_watched_episodes,
+                mal_num_episodes,
+                confirmed_complete,
+                completion_decision,
+                completion_status,
+                completion_threshold,
+                credits_skip_window_seconds,
+                last_watched_at,
+                last_progress_seen_at,
+                last_series_seen_at,
+                last_evidence_at,
+                mapping_source,
+                mapping_confidence,
+                mapping_approved,
+                verified_identity_kind,
+                verified_identity_json,
+                completed_by_json,
+                completed_examples_json,
+                incomplete_examples_json,
+                thresholds_json,
+                progress_audit_json,
+                mapping_audit_json,
+                decision_audit_json,
+                generated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, provider_series_id) DO UPDATE SET
+                identity_key = excluded.identity_key,
+                mal_anime_id = excluded.mal_anime_id,
+                source_title = excluded.source_title,
+                season_title = excluded.season_title,
+                mapped_mal_title = excluded.mapped_mal_title,
+                progress_rows = excluded.progress_rows,
+                completed_episode_count = excluded.completed_episode_count,
+                max_episode_number = excluded.max_episode_number,
+                max_completed_episode_number = excluded.max_completed_episode_number,
+                provider_watched_episodes = excluded.provider_watched_episodes,
+                mal_num_episodes = excluded.mal_num_episodes,
+                confirmed_complete = excluded.confirmed_complete,
+                completion_decision = excluded.completion_decision,
+                completion_status = excluded.completion_status,
+                completion_threshold = excluded.completion_threshold,
+                credits_skip_window_seconds = excluded.credits_skip_window_seconds,
+                last_watched_at = excluded.last_watched_at,
+                last_progress_seen_at = excluded.last_progress_seen_at,
+                last_series_seen_at = excluded.last_series_seen_at,
+                last_evidence_at = excluded.last_evidence_at,
+                mapping_source = excluded.mapping_source,
+                mapping_confidence = excluded.mapping_confidence,
+                mapping_approved = excluded.mapping_approved,
+                verified_identity_kind = excluded.verified_identity_kind,
+                verified_identity_json = excluded.verified_identity_json,
+                completed_by_json = excluded.completed_by_json,
+                completed_examples_json = excluded.completed_examples_json,
+                incomplete_examples_json = excluded.incomplete_examples_json,
+                thresholds_json = excluded.thresholds_json,
+                progress_audit_json = excluded.progress_audit_json,
+                mapping_audit_json = excluded.mapping_audit_json,
+                decision_audit_json = excluded.decision_audit_json,
+                generated_at = excluded.generated_at,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                provider,
+                provider_series_id,
+                normalized_identity_key,
+                None if mal_anime_id is None else int(mal_anime_id),
+                source_title,
+                season_title,
+                mapped_mal_title,
+                max(0, int(progress_rows)),
+                max(0, int(completed_episode_count)),
+                None if max_episode_number is None else int(max_episode_number),
+                None if max_completed_episode_number is None else int(max_completed_episode_number),
+                max(0, int(provider_watched_episodes)),
+                None if mal_num_episodes is None else int(mal_num_episodes),
+                1 if confirmed_complete else 0,
+                str(completion_decision or "unknown"),
+                str(completion_status or "unknown"),
+                None if completion_threshold is None else float(completion_threshold),
+                None if credits_skip_window_seconds is None else int(credits_skip_window_seconds),
+                last_watched_at,
+                last_progress_seen_at,
+                last_series_seen_at,
+                last_evidence_at,
+                mapping_source,
+                None if mapping_confidence is None else float(mapping_confidence),
+                1 if mapping_approved else 0,
+                verified_identity_kind,
+                _json_dumps(verified_identity) if verified_identity is not None else None,
+                _json_dumps(completed_by or {}),
+                _json_dumps(completed_examples or {}),
+                _json_dumps(incomplete_examples or []),
+                _json_dumps(thresholds or {}),
+                _json_dumps(progress_audit or {}),
+                _json_dumps(mapping_audit or {}),
+                _json_dumps(decision_audit or {}),
+                str(generated_at),
+            ),
+        )
+        conn.commit()
+    row = get_watch_confirmation_provenance(db_path, provider=provider, provider_series_id=provider_series_id)
+    if row is None:
+        raise RuntimeError("watch confirmation provenance disappeared after upsert")
+    return row
 
 
 _ALLOWED_MAL_USER_LIST_STATUSES = {"completed", "watching", "on_hold", "dropped", "plan_to_watch"}
@@ -905,6 +1408,8 @@ def begin_mal_user_anime_list_cache_refresh(
 
 
 def _mal_user_list_entry_from_row(row: sqlite3.Row) -> MalUserAnimeListCacheEntry:
+    tag_count = _row_get(row, "tag_count", 0)
+    has_comments = _row_get(row, "has_comments", 0)
     return MalUserAnimeListCacheEntry(
         mal_anime_id=int(row["mal_anime_id"]),
         title=str(row["title"]),
@@ -914,6 +1419,12 @@ def _mal_user_list_entry_from_row(row: sqlite3.Row) -> MalUserAnimeListCacheEntr
         start_date=row["start_date"],
         finish_date=row["finish_date"],
         list_updated_at=row["list_updated_at"],
+        priority=None if _row_get(row, "priority") is None else int(_row_get(row, "priority")),
+        is_rewatching=_coerce_optional_bool(_row_get(row, "is_rewatching")),
+        num_times_rewatched=None if _row_get(row, "num_times_rewatched") is None else int(_row_get(row, "num_times_rewatched")),
+        rewatch_value=None if _row_get(row, "rewatch_value") is None else int(_row_get(row, "rewatch_value")),
+        tag_count=max(int(tag_count or 0), 0),
+        has_comments=bool(has_comments),
         node=json.loads(row["node_json"] or "{}"),
         list_status_raw=json.loads(row["list_status_json"] or "{}"),
         raw=json.loads(row["raw_json"]),
@@ -940,6 +1451,12 @@ def _prepare_mal_user_list_cache_item(item: dict[str, Any], *, refresh_run_id: s
     start_date = list_status_raw.get("start_date") if isinstance(list_status_raw.get("start_date"), str) else None
     finish_date = list_status_raw.get("finish_date") if isinstance(list_status_raw.get("finish_date"), str) else None
     list_updated_at = list_status_raw.get("updated_at") if isinstance(list_status_raw.get("updated_at"), str) else None
+    priority = _clamp_optional_int(list_status_raw.get("priority"), minimum=0, maximum=2)
+    is_rewatching = _coerce_optional_bool(list_status_raw.get("is_rewatching"))
+    num_times_rewatched = _clamp_optional_int(list_status_raw.get("num_times_rewatched"), minimum=0)
+    rewatch_value = _clamp_optional_int(list_status_raw.get("rewatch_value"), minimum=0, maximum=5)
+    tag_count = _privacy_safe_tag_count(list_status_raw.get("tags"))
+    has_comments = _privacy_safe_has_comments(list_status_raw.get("comments"))
     return (
         mal_anime_id,
         title,
@@ -949,6 +1466,12 @@ def _prepare_mal_user_list_cache_item(item: dict[str, Any], *, refresh_run_id: s
         start_date,
         finish_date,
         list_updated_at,
+        priority,
+        None if is_rewatching is None else int(is_rewatching),
+        num_times_rewatched,
+        rewatch_value,
+        tag_count,
+        int(has_comments),
         json.dumps(node, ensure_ascii=False, sort_keys=True),
         json.dumps(list_status_raw, ensure_ascii=False, sort_keys=True),
         json.dumps(item, ensure_ascii=False, sort_keys=True),
@@ -959,10 +1482,22 @@ def _prepare_mal_user_list_cache_item(item: dict[str, Any], *, refresh_run_id: s
     )
 
 
-def _summarize_prepared_mal_user_list_rows(prepared: list[tuple[Any, ...]]) -> tuple[dict[str, int], int, int]:
+def _empty_preference_counts() -> dict[str, int]:
+    return {
+        "with_priority": 0,
+        "with_rewatching": 0,
+        "with_num_times_rewatched": 0,
+        "with_rewatch_value": 0,
+        "with_tags": 0,
+        "with_comments": 0,
+    }
+
+
+def _summarize_prepared_mal_user_list_rows(prepared: list[tuple[Any, ...]]) -> tuple[dict[str, int], int, int, dict[str, int]]:
     by_status: dict[str, int] = {}
     scored = 0
     unscored = 0
+    preference_counts = _empty_preference_counts()
     for row in prepared:
         status = row[2]
         score = row[3]
@@ -972,7 +1507,19 @@ def _summarize_prepared_mal_user_list_rows(prepared: list[tuple[Any, ...]]) -> t
             scored += 1
         else:
             unscored += 1
-    return by_status, scored, unscored
+        if row[8] is not None:
+            preference_counts["with_priority"] += 1
+        if row[9] is not None:
+            preference_counts["with_rewatching"] += 1
+        if row[10] is not None:
+            preference_counts["with_num_times_rewatched"] += 1
+        if row[11] is not None:
+            preference_counts["with_rewatch_value"] += 1
+        if int(row[12] or 0) > 0:
+            preference_counts["with_tags"] += 1
+        if int(row[13] or 0) > 0:
+            preference_counts["with_comments"] += 1
+    return by_status, scored, unscored, preference_counts
 
 
 def upsert_mal_user_anime_list_cache_generation(
@@ -1009,9 +1556,11 @@ def upsert_mal_user_anime_list_cache_generation(
                 """
                 INSERT INTO mal_user_anime_list_cache (
                     mal_anime_id, title, list_status, user_score, num_episodes_watched,
-                    start_date, finish_date, list_updated_at, node_json, list_status_json,
-                    raw_json, refresh_run_id, refresh_generation, fetched_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    start_date, finish_date, list_updated_at, priority, is_rewatching,
+                    num_times_rewatched, rewatch_value, tag_count, has_comments,
+                    node_json, list_status_json, raw_json, refresh_run_id,
+                    refresh_generation, fetched_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(mal_anime_id) DO UPDATE SET
                     title = excluded.title,
                     list_status = excluded.list_status,
@@ -1020,6 +1569,12 @@ def upsert_mal_user_anime_list_cache_generation(
                     start_date = excluded.start_date,
                     finish_date = excluded.finish_date,
                     list_updated_at = excluded.list_updated_at,
+                    priority = excluded.priority,
+                    is_rewatching = excluded.is_rewatching,
+                    num_times_rewatched = excluded.num_times_rewatched,
+                    rewatch_value = excluded.rewatch_value,
+                    tag_count = excluded.tag_count,
+                    has_comments = excluded.has_comments,
                     node_json = excluded.node_json,
                     list_status_json = excluded.list_status_json,
                     raw_json = excluded.raw_json,
@@ -1037,7 +1592,7 @@ def upsert_mal_user_anime_list_cache_generation(
             ).fetchone()["n"]
     finally:
         conn.close()
-    by_status, scored, unscored = _summarize_prepared_mal_user_list_rows(prepared)
+    by_status, scored, unscored, preference_counts = _summarize_prepared_mal_user_list_rows(prepared)
     return MalUserAnimeListRefreshSummary(
         status="upserted",
         refresh_run_id=str(refresh_run_id),
@@ -1047,6 +1602,7 @@ def upsert_mal_user_anime_list_cache_generation(
         preserved_absent=int(preserved_absent or 0),
         scored=scored,
         unscored=unscored,
+        preference_counts=preference_counts,
         by_status=by_status,
         partial=True,
     )
@@ -1068,7 +1624,15 @@ def finalize_mal_user_anime_list_cache_refresh(
         with conn:
             current = conn.execute(
                 """
-                SELECT list_status, user_score
+                SELECT
+                    list_status,
+                    user_score,
+                    priority,
+                    is_rewatching,
+                    num_times_rewatched,
+                    rewatch_value,
+                    tag_count,
+                    has_comments
                 FROM mal_user_anime_list_cache
                 WHERE refresh_generation = ? AND refresh_run_id = ?
                 """,
@@ -1089,6 +1653,7 @@ def finalize_mal_user_anime_list_cache_refresh(
     by_status: dict[str, int] = {}
     scored = 0
     unscored = 0
+    preference_counts = _empty_preference_counts()
     for row in current:
         status = row["list_status"]
         score = row["user_score"]
@@ -1098,6 +1663,18 @@ def finalize_mal_user_anime_list_cache_refresh(
             scored += 1
         else:
             unscored += 1
+        if row["priority"] is not None:
+            preference_counts["with_priority"] += 1
+        if row["is_rewatching"] is not None:
+            preference_counts["with_rewatching"] += 1
+        if row["num_times_rewatched"] is not None:
+            preference_counts["with_num_times_rewatched"] += 1
+        if row["rewatch_value"] is not None:
+            preference_counts["with_rewatch_value"] += 1
+        if int(row["tag_count"] or 0) > 0:
+            preference_counts["with_tags"] += 1
+        if int(row["has_comments"] or 0) > 0:
+            preference_counts["with_comments"] += 1
     return MalUserAnimeListRefreshSummary(
         status="ok" if proven_complete else "aborted",
         refresh_run_id=str(refresh_run_id),
@@ -1108,6 +1685,7 @@ def finalize_mal_user_anime_list_cache_refresh(
         preserved_absent=int(preserved_absent or 0),
         scored=scored,
         unscored=unscored,
+        preference_counts=preference_counts,
         by_status=by_status,
         partial=not proven_complete,
     )
@@ -1246,7 +1824,17 @@ def summarize_mal_user_anime_list_cache(db_path: Path) -> dict[str, Any]:
         ).fetchall()
         freshness = conn.execute(
             """
-            SELECT COUNT(*) AS total, MAX(refresh_generation) AS generation, MAX(last_seen_at) AS newest_seen_at, MIN(last_seen_at) AS oldest_seen_at
+            SELECT
+                COUNT(*) AS total,
+                MAX(refresh_generation) AS generation,
+                MAX(last_seen_at) AS newest_seen_at,
+                MIN(last_seen_at) AS oldest_seen_at,
+                SUM(CASE WHEN priority IS NOT NULL THEN 1 ELSE 0 END) AS with_priority,
+                SUM(CASE WHEN is_rewatching IS NOT NULL THEN 1 ELSE 0 END) AS with_rewatching,
+                SUM(CASE WHEN num_times_rewatched IS NOT NULL THEN 1 ELSE 0 END) AS with_num_times_rewatched,
+                SUM(CASE WHEN rewatch_value IS NOT NULL THEN 1 ELSE 0 END) AS with_rewatch_value,
+                SUM(CASE WHEN tag_count > 0 THEN 1 ELSE 0 END) AS with_tags,
+                SUM(CASE WHEN has_comments > 0 THEN 1 ELSE 0 END) AS with_comments
             FROM mal_user_anime_list_cache
             """
         ).fetchone()
@@ -1263,11 +1851,23 @@ def summarize_mal_user_anime_list_cache(db_path: Path) -> dict[str, Any]:
         "generation": None if freshness["generation"] is None else int(freshness["generation"]),
         "newest_seen_at": freshness["newest_seen_at"],
         "oldest_seen_at": freshness["oldest_seen_at"],
+        "preference_counts": {
+            "with_priority": int(freshness["with_priority"] or 0),
+            "with_rewatching": int(freshness["with_rewatching"] or 0),
+            "with_num_times_rewatched": int(freshness["with_num_times_rewatched"] or 0),
+            "with_rewatch_value": int(freshness["with_rewatch_value"] or 0),
+            "with_tags": int(freshness["with_tags"] or 0),
+            "with_comments": int(freshness["with_comments"] or 0),
+        },
     }
 
 
 def _my_list_status_from_cache_entry(entry: MalUserAnimeListCacheEntry) -> dict[str, Any]:
-    payload = dict(entry.list_status_raw)
+    payload = {
+        key: value
+        for key, value in entry.list_status_raw.items()
+        if key not in {"tags", "comments"}
+    }
     if entry.list_status:
         payload["status"] = entry.list_status
     if entry.user_score is not None:
@@ -1280,6 +1880,18 @@ def _my_list_status_from_cache_entry(entry: MalUserAnimeListCacheEntry) -> dict[
         payload["finish_date"] = entry.finish_date
     if entry.list_updated_at:
         payload["updated_at"] = entry.list_updated_at
+    if entry.priority is not None:
+        payload["priority"] = entry.priority
+    if entry.is_rewatching is not None:
+        payload["is_rewatching"] = entry.is_rewatching
+    if entry.num_times_rewatched is not None:
+        payload["num_times_rewatched"] = entry.num_times_rewatched
+    if entry.rewatch_value is not None:
+        payload["rewatch_value"] = entry.rewatch_value
+    if entry.tag_count > 0:
+        payload["tag_count"] = entry.tag_count
+    if entry.has_comments:
+        payload["has_comments"] = True
     return payload
 
 
@@ -1382,31 +1994,80 @@ def get_mal_anime_metadata_map(db_path: Path) -> dict[int, MalAnimeMetadata]:
                 mean,
                 popularity,
                 start_season_json,
+                rank,
+                num_list_users,
+                num_scoring_users,
+                rating,
+                average_episode_duration,
+                start_date,
+                end_date,
+                broadcast_day,
+                broadcast_time,
+                broadcast_timezone,
+                nsfw,
                 raw_json,
                 fetched_at,
                 updated_at
             FROM mal_anime_metadata
             """
         ).fetchall()
-    return {
-        int(row["mal_anime_id"]): MalAnimeMetadata(
+    result: dict[int, MalAnimeMetadata] = {}
+    for row in rows:
+        raw = _load_json_value(row["raw_json"], {})
+        raw = raw if isinstance(raw, dict) else {}
+        broadcast = _broadcast_payload(raw)
+        alternative_titles = _load_json_value(row["alternative_titles_json"], [])
+        if not isinstance(alternative_titles, list):
+            alternative_titles = []
+        result[int(row["mal_anime_id"])] = MalAnimeMetadata(
             mal_anime_id=int(row["mal_anime_id"]),
             title=str(row["title"]),
             title_english=row["title_english"],
             title_japanese=row["title_japanese"],
-            alternative_titles=json.loads(row["alternative_titles_json"]) if row["alternative_titles_json"] else [],
+            alternative_titles=alternative_titles,
             media_type=row["media_type"],
             status=row["status"],
             num_episodes=None if row["num_episodes"] is None else int(row["num_episodes"]),
             mean=None if row["mean"] is None else float(row["mean"]),
             popularity=None if row["popularity"] is None else int(row["popularity"]),
-            start_season=json.loads(row["start_season_json"]) if row["start_season_json"] else None,
-            raw=json.loads(row["raw_json"]),
+            start_season=_load_json_value(row["start_season_json"], None) if row["start_season_json"] else None,
+            raw=raw,
             fetched_at=str(row["fetched_at"]),
             updated_at=str(row["updated_at"]),
+            rank=_coerce_positive_int(row["rank"]) or _coerce_positive_int(raw.get("rank")),
+            num_list_users=(
+                _coerce_nonnegative_int(row["num_list_users"])
+                if row["num_list_users"] is not None
+                else _coerce_nonnegative_int(raw.get("num_list_users"))
+            ),
+            num_scoring_users=(
+                _coerce_nonnegative_int(row["num_scoring_users"])
+                if row["num_scoring_users"] is not None
+                else _coerce_nonnegative_int(raw.get("num_scoring_users"))
+            ),
+            rating=_coerce_non_empty_text(row["rating"], lowercase=True) or _coerce_non_empty_text(raw.get("rating"), lowercase=True),
+            average_episode_duration=(
+                _coerce_positive_int(row["average_episode_duration"])
+                if row["average_episode_duration"] is not None
+                else _coerce_positive_int(raw.get("average_episode_duration"))
+            ),
+            start_date=_coerce_non_empty_text(row["start_date"]) or _coerce_non_empty_text(raw.get("start_date")),
+            end_date=_coerce_non_empty_text(row["end_date"]) or _coerce_non_empty_text(raw.get("end_date")),
+            broadcast_day=(
+                _coerce_non_empty_text(row["broadcast_day"], lowercase=True)
+                or _coerce_non_empty_text(broadcast.get("day_of_the_week"), lowercase=True)
+            ),
+            broadcast_time=(
+                _coerce_non_empty_text(row["broadcast_time"])
+                or _coerce_non_empty_text(broadcast.get("start_time"))
+            ),
+            broadcast_timezone=(
+                _coerce_non_empty_text(row["broadcast_timezone"])
+                or _coerce_non_empty_text(broadcast.get("timezone"))
+            ),
+            nsfw=_coerce_non_empty_text(row["nsfw"], lowercase=True) or _coerce_non_empty_text(raw.get("nsfw"), lowercase=True),
         )
-        for row in rows
-    }
+    return result
 
 
 def get_mal_anime_relations_map(db_path: Path) -> dict[int, list[MalAnimeRelation]]:
@@ -2036,6 +2697,22 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
             ORDER BY provider ASC, approved_by_user DESC, mapping_source ASC
             """
         ).fetchall()
+        metadata_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN rank IS NOT NULL THEN 1 ELSE 0 END) AS with_rank,
+                SUM(CASE WHEN num_list_users IS NOT NULL THEN 1 ELSE 0 END) AS with_num_list_users,
+                SUM(CASE WHEN num_scoring_users IS NOT NULL THEN 1 ELSE 0 END) AS with_num_scoring_users,
+                SUM(CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END) AS with_rating,
+                SUM(CASE WHEN average_episode_duration IS NOT NULL THEN 1 ELSE 0 END) AS with_average_episode_duration,
+                SUM(CASE WHEN start_date IS NOT NULL THEN 1 ELSE 0 END) AS with_start_date,
+                SUM(CASE WHEN end_date IS NOT NULL THEN 1 ELSE 0 END) AS with_end_date,
+                SUM(CASE WHEN broadcast_day IS NOT NULL OR broadcast_time IS NOT NULL OR broadcast_timezone IS NOT NULL THEN 1 ELSE 0 END) AS with_broadcast,
+                SUM(CASE WHEN nsfw IS NOT NULL THEN 1 ELSE 0 END) AS with_nsfw
+            FROM mal_anime_metadata
+            """
+        ).fetchone()
 
     def _sync_run_row_to_dict(row: Any) -> dict[str, Any] | None:
         if row is None:
@@ -2137,6 +2814,20 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
         "provider_freshness_by_provider": provider_freshness_by_provider,
         "review_queue": review_counts,
         "mappings": mapping_counts,
+        "mal_metadata": {
+            "total": int(metadata_row["total"] or 0),
+            "typed_field_coverage": {
+                "rank": int(metadata_row["with_rank"] or 0),
+                "num_list_users": int(metadata_row["with_num_list_users"] or 0),
+                "num_scoring_users": int(metadata_row["with_num_scoring_users"] or 0),
+                "rating": int(metadata_row["with_rating"] or 0),
+                "average_episode_duration": int(metadata_row["with_average_episode_duration"] or 0),
+                "start_date": int(metadata_row["with_start_date"] or 0),
+                "end_date": int(metadata_row["with_end_date"] or 0),
+                "broadcast": int(metadata_row["with_broadcast"] or 0),
+                "nsfw": int(metadata_row["with_nsfw"] or 0),
+            },
+        },
     }
 
 

@@ -62,11 +62,22 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         self.assertIn("fetched_at", columns)
         self.assertIn("last_seen_at", columns)
         self.assertIn("refresh_generation", columns)
+        self.assertIn("priority", columns)
+        self.assertIn("is_rewatching", columns)
+        self.assertIn("num_times_rewatched", columns)
+        self.assertIn("rewatch_value", columns)
+        self.assertIn("tag_count", columns)
+        self.assertIn("has_comments", columns)
+        self.assertNotIn("tags_json", columns)
+        self.assertNotIn("comments", columns)
         self.assertIn("idx_mal_user_anime_list_cache_status", indexes)
         self.assertIn("idx_mal_user_anime_list_cache_score", indexes)
         self.assertIn("idx_mal_user_anime_list_cache_freshness", indexes)
         self.assertIn("idx_mal_user_anime_list_cache_generation", indexes)
+        self.assertIn("idx_mal_user_anime_list_cache_priority_pref", indexes)
+        self.assertIn("idx_mal_user_anime_list_cache_private_text_presence", indexes)
         self.assertIn("007_mal_user_anime_list_cache.sql", migrations)
+        self.assertIn("011_mal_user_anime_list_preference_fields.sql", migrations)
 
         db_path = Path(self.temp_dir.name) / "upgrade.sqlite3"
         with connect(db_path) as conn:
@@ -99,6 +110,51 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         self.assertEqual(1, migration_rows)
         self.assertIn("last_seen_at", columns)
         self.assertIn("list_status_json", columns)
+        self.assertIn("priority", columns)
+        self.assertIn("has_comments", columns)
+
+    def test_privacy_safe_preference_fields_are_typed_while_raw_json_is_retained(self) -> None:
+        item = _list_item(30, "Preference Seed", "completed", score=10, watched=12)
+        item["list_status"].update(
+            {
+                "priority": 2,
+                "is_rewatching": True,
+                "num_times_rewatched": 3,
+                "rewatch_value": 5,
+                "tags": ["private favorite", "private vibe"],
+                "comments": "private note that must not become a typed explanation field",
+            }
+        )
+        summary = replace_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[item],
+            refresh_run_id="pref-run",
+            fetched_at="2026-07-19T00:00:00Z",
+            prune_absent=True,
+        )
+
+        self.assertEqual(
+            {
+                "with_priority": 1,
+                "with_rewatching": 1,
+                "with_num_times_rewatched": 1,
+                "with_rewatch_value": 1,
+                "with_tags": 1,
+                "with_comments": 1,
+            },
+            summary.preference_counts,
+        )
+        entry = get_mal_user_anime_list_cache(self.db_path, 30)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(2, entry.priority)
+        self.assertIs(entry.is_rewatching, True)
+        self.assertEqual(3, entry.num_times_rewatched)
+        self.assertEqual(5, entry.rewatch_value)
+        self.assertEqual(2, entry.tag_count)
+        self.assertTrue(entry.has_comments)
+        self.assertEqual(["private favorite", "private vibe"], entry.list_status_raw["tags"])
+        self.assertIn("private note", entry.list_status_raw["comments"])
 
     def test_upsert_list_get_count_and_preserve_unknown_json_fields(self) -> None:
         summary = replace_mal_user_anime_list_cache_generation(

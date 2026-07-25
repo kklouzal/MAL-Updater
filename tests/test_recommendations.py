@@ -414,6 +414,114 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("series-1", item.provider_series_id)
         self.assertEqual(1, item.context["contiguous_tail_gap"])
 
+    def test_discovery_seed_uses_privacy_safe_preference_signals_without_leaking_text(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.config.db_path,
+            items=[
+                {
+                    "node": {"id": 5100, "title": "Preference Seed"},
+                    "list_status": {
+                        "status": "completed",
+                        "score": 8,
+                        "num_episodes_watched": 12,
+                        "priority": 2,
+                        "is_rewatching": True,
+                        "num_times_rewatched": 1,
+                        "rewatch_value": 5,
+                        "tags": ["private favorite tag"],
+                        "comments": "private comment text",
+                    },
+                }
+            ],
+            refresh_run_id="privacy-pref",
+            fetched_at="2026-07-19T00:00:00Z",
+            prune_absent=True,
+        )
+        self._cache_recommendations(
+            5100,
+            [{"target_mal_anime_id": 5200, "target_title": "Privacy Candidate", "num_recommendations": 10, "raw": {}}],
+        )
+        self._cache_metadata(5200, title="Privacy Candidate", mean=8.0, popularity=100, genres=["Action"])
+
+        items = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertGreater(item.context["seed_preference_bonus"], 0)
+        self.assertEqual({"priority": 2, "is_rewatching": True, "num_times_rewatched": 1, "rewatch_value": 5, "tag_count": 1, "has_comments": True}, item.context["supporting_seed_preference_signals"][5100])
+        payload = json.dumps(item.as_dict(), sort_keys=True)
+        self.assertIn("privacy-safe MAL list preference signals", payload)
+        self.assertNotIn("private favorite tag", payload)
+        self.assertNotIn("private comment text", payload)
+
+    def test_discovery_candidate_uses_typed_official_detail_quality_without_hard_excluding(self) -> None:
+        self._cache_mal_list_status(6100, "Detail Seed", "completed", score=8)
+        self._cache_recommendations(
+            6100,
+            [
+                {"target_mal_anime_id": 6200, "target_title": "Official Strong", "num_recommendations": 10, "raw": {}},
+                {"target_mal_anime_id": 6300, "target_title": "Official Tempered", "num_recommendations": 10, "raw": {}},
+            ],
+        )
+        upsert_mal_anime_metadata(
+            self.config.db_path,
+            mal_anime_id=6200,
+            title="Official Strong",
+            title_english=None,
+            title_japanese=None,
+            alternative_titles=[],
+            media_type="tv",
+            status="finished_airing",
+            num_episodes=12,
+            mean=8.0,
+            popularity=100,
+            start_season={"year": 2021, "season": "spring"},
+            raw={
+                "id": 6200,
+                "title": "Official Strong",
+                "rank": 50,
+                "num_list_users": 750000,
+                "num_scoring_users": 120000,
+                "rating": "pg_13",
+                "average_episode_duration": 1440,
+                "start_date": "2021-04-01",
+                "broadcast": {"day_of_the_week": "thursday", "start_time": "23:00"},
+                "nsfw": "white",
+            },
+        )
+        upsert_mal_anime_metadata(
+            self.config.db_path,
+            mal_anime_id=6300,
+            title="Official Tempered",
+            title_english=None,
+            title_japanese=None,
+            alternative_titles=[],
+            media_type="tv",
+            status="finished_airing",
+            num_episodes=12,
+            mean=8.0,
+            popularity=100,
+            start_season={"year": 2021, "season": "spring"},
+            raw={
+                "id": 6300,
+                "title": "Official Tempered",
+                "rank": 5000,
+                "num_list_users": 1000,
+                "rating": "rx",
+                "average_episode_duration": 540,
+                "nsfw": "gray",
+            },
+        )
+
+        items = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+        by_id = {item.context["mal_anime_id"]: item for item in items}
+
+        self.assertEqual(6200, items[0].context["mal_anime_id"])
+        self.assertGreater(by_id[6200].context["official_detail_bonus"], 0)
+        self.assertGreater(by_id[6300].context["official_detail_penalty"], 0)
+        self.assertIn("official MAL detail signals", " ".join(by_id[6200].reasons))
+        self.assertIn("without excluding it", " ".join(by_id[6300].reasons))
+
     def test_completed_mal_target_suppresses_continuation_noise(self) -> None:
         self._insert_series(
             "series-1",
