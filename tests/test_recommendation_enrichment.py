@@ -513,6 +513,47 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual([907], [item["mal_anime_id"] for item in changed.selected_candidates])
         self.assertTrue(changed.provider_cursor_states["crunchyroll"]["cursor_missing"])
 
+    def test_provider_cursor_uses_current_order_when_rankings_reorder_around_existing_cursor(self):
+        self._insert_meta(915, english="Original Cursor")
+        self._insert_meta(916, english="Reranked Before Cursor")
+        self._insert_meta(917, english="Reranked After Cursor")
+        self._recommendations(915, 916, 917)
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+        now = datetime(2026, 2, 5, tzinfo=timezone.utc)
+
+        first = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now,
+        )
+        self.assertEqual([915], [item["mal_anime_id"] for item in first.selected_candidates])
+
+        self._recommendations(916, 915, 917)
+        reordered = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now + timedelta(hours=1),
+        )
+        self.assertEqual([917], [item["mal_anime_id"] for item in reordered.selected_candidates])
+        self.assertFalse(reordered.provider_cursor_states["crunchyroll"]["cursor_missing"])
+        self.assertFalse(reordered.provider_cursor_states["crunchyroll"]["wrapped"])
+
+        wrapped = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=now + timedelta(hours=2),
+        )
+        self.assertEqual([916], [item["mal_anime_id"] for item in wrapped.selected_candidates])
+        self.assertTrue(wrapped.provider_cursor_states["crunchyroll"]["wrapped"])
+        self.assertEqual(["Original Cursor", "Reranked After Cursor", "Reranked Before Cursor"], [call[0] for call in provider.calls])
+
     def test_crunchyroll_and_hidive_cursors_are_independent(self):
         self._insert_meta(908, english="Shared First")
         self._insert_meta(909, english="Shared Second")
