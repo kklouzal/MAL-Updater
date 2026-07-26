@@ -8,6 +8,7 @@ from typing import Any, Callable, Protocol
 from .config import AppConfig
 from .db import (
     connect,
+    delete_recommendation_provider_eligibility_evidence,
     get_mal_anime_metadata_map,
     get_provider_title_search_cache,
     get_provider_enriched_detail_cache,
@@ -24,7 +25,7 @@ from .db import (
     upsert_recommendation_provider_eligibility_evidence,
     update_recommendation_provider_enrichment_attempt_outcome,
 )
-from .mapping import normalize_title
+from .mapping import extract_provider_mapping_evidence, merge_provider_mapping_evidence, normalize_title
 from .recommendation_actionability import (
     PROVIDER_FRANCHISE_SHELL_CHILD_IDENTITY_KIND,
     PROVIDER_TITLE_SEARCH_EXACT_IDENTITY_KIND,
@@ -50,6 +51,9 @@ PROVIDER_SEARCH_IDENTITY_CONFIDENCE = {
     PROVIDER_TITLE_SEARCH_EXACT_IDENTITY_KIND: 0.9,
     PROVIDER_FRANCHISE_SHELL_CHILD_IDENTITY_KIND: 0.88,
 }
+_EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
+_LEGACY_PROVIDER_ELIGIBILITY_LOGIC_VERSIONS = frozenset({"legacy-v1"})
+_PENDING_PROVIDER_ELIGIBILITY_REVIEW_STATUSES = frozenset({"unknown", "review-needed"})
 
 
 class ProviderTitleSearchClient(Protocol):
@@ -75,6 +79,8 @@ class EnrichmentSummary:
     eligibility_fresh_skips: int = 0
     eligibility_expired_retries: int = 0
     eligibility_retry_backoff_skips: int = 0
+    legacy_eligibility_rows_reconciled: int = 0
+    legacy_eligibility_rows_deleted: int = 0
     failure_details: list[dict[str, str]] = field(default_factory=list)
     eligibility_evidence_upserted: int = 0
     verified_eligibility_evidence_upserted: int = 0
@@ -106,6 +112,8 @@ class EnrichmentSummary:
             "eligibility_fresh_skips": self.eligibility_fresh_skips,
             "eligibility_expired_retries": self.eligibility_expired_retries,
             "eligibility_retry_backoff_skips": self.eligibility_retry_backoff_skips,
+            "legacy_eligibility_rows_reconciled": self.legacy_eligibility_rows_reconciled,
+            "legacy_eligibility_rows_deleted": self.legacy_eligibility_rows_deleted,
             "failure_details": self.failure_details,
             "eligibility_evidence_upserted": self.eligibility_evidence_upserted,
             "verified_eligibility_evidence_upserted": self.verified_eligibility_evidence_upserted,
@@ -1156,6 +1164,259 @@ def _record_eligibility_refresh_failure(
     )
 
 
+def _decode_json_object(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _decode_json_list(value: Any) -> list[Any]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def _current_provider_eligibility_rows_for_reconciliation(
+    config: AppConfig,
+    provider_series_keys: Any,
+) -> list[dict[str, Any]]:
+    normalized_keys = sorted(
+        {
+            (str(provider).strip().lower(), str(provider_series_id).strip())
+            for provider, provider_series_id in provider_series_keys
+            if str(provider).strip() and str(provider_series_id).strip()
+        }
+    )
+    if not normalized_keys:
+        return []
+    conditions = " OR ".join("(e.provider = ? AND e.provider_series_id = ?)" for _ in normalized_keys)
+    params: list[object] = []
+    for provider, provider_series_id in normalized_keys:
+        params.extend([provider, provider_series_id])
+    with connect(config.db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                e.*,
+                s.title AS current_provider_title,
+                s.season_title AS current_provider_season_title,
+                s.season_number AS current_provider_season_number,
+                s.raw_json AS current_provider_series_raw_json
+            FROM recommendation_provider_eligibility_evidence e
+            LEFT JOIN provider_series s
+                ON s.provider = e.provider
+               AND s.provider_series_id = e.provider_series_id
+            WHERE {conditions}
+            ORDER BY e.provider ASC, e.provider_series_id ASC, e.mal_anime_id ASC
+            """,
+            params,
+        ).fetchall()
+    prepared: list[dict[str, Any]] = []
+    for row in rows:
+        prepared.append(
+            {
+                "mal_anime_id": int(row["mal_anime_id"]),
+                "provider": str(row["provider"]),
+                "provider_series_id": str(row["provider_series_id"]),
+                "provider_title": row["provider_title"],
+                "provider_url": row["provider_url"],
+                "identity_match_kind": str(row["identity_match_kind"]),
+                "match_confidence": None if row["match_confidence"] is None else float(row["match_confidence"]),
+                "review_status": str(row["review_status"]),
+                "catalog_status": str(row["catalog_status"]),
+                "english_dub_status": str(row["english_dub_status"]),
+                "explicit_dub_evidence_source": row["explicit_dub_evidence_source"],
+                "audio_locales": _decode_json_list(row["audio_locales_json"]),
+                "source_evidence": _decode_json_object(row["source_evidence_json"]),
+                "fetched_at": str(row["fetched_at"]),
+                "expires_at": str(row["expires_at"]),
+                "last_verified_at": row["last_verified_at"],
+                "refresh_status": str(row["refresh_status"]),
+                "failure_count": int(row["failure_count"]),
+                "next_retry_at": row["next_retry_at"],
+                "logic_version": str(row["logic_version"]),
+                "current_provider_title": row["current_provider_title"],
+                "current_provider_season_title": row["current_provider_season_title"],
+                "current_provider_season_number": row["current_provider_season_number"],
+                "current_provider_series_raw": _decode_json_object(row["current_provider_series_raw_json"]),
+            }
+        )
+    return prepared
+
+
+def _approved_mappings_by_series(mappings_by_series: dict[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
+    return {
+        key: mapping
+        for key, mapping in mappings_by_series.items()
+        if bool(getattr(mapping, "approved_by_user", False))
+    }
+
+
+def _exact_approved_mappings_by_series(mappings_by_series: dict[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
+    return {
+        key: mapping
+        for key, mapping in _approved_mappings_by_series(mappings_by_series).items()
+        if str(getattr(mapping, "mapping_source", "")).strip() in _EXACT_APPROVED_MAPPING_SOURCES
+    }
+
+
+def _deterministic_child_identity_payload(source_evidence: dict[str, Any]) -> dict[str, Any] | None:
+    identity_evidence = source_evidence.get("identity_evidence")
+    if not isinstance(identity_evidence, dict):
+        match = source_evidence.get("match")
+        if isinstance(match, dict) and isinstance(match.get("identity_evidence"), dict):
+            identity_evidence = match["identity_evidence"]
+    if not isinstance(identity_evidence, dict):
+        return None
+    child_identity = identity_evidence.get("child_identity")
+    return child_identity if isinstance(child_identity, dict) and child_identity else None
+
+
+def _has_current_verified_child_identity(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("identity_match_kind") or "") == PROVIDER_FRANCHISE_SHELL_CHILD_IDENTITY_KIND
+        and str(row.get("review_status") or "").strip().lower() == "verified"
+        and _deterministic_child_identity_payload(row.get("source_evidence") if isinstance(row.get("source_evidence"), dict) else {}) is not None
+    )
+
+
+def _provider_mapping_evidence_for_eligibility_row(row: dict[str, Any]) -> Any:
+    evidence_items = []
+    provider_raw = row.get("current_provider_series_raw")
+    if isinstance(provider_raw, dict) and provider_raw:
+        evidence_items.append(extract_provider_mapping_evidence(provider_raw))
+    source_evidence = row.get("source_evidence") if isinstance(row.get("source_evidence"), dict) else {}
+    if source_evidence:
+        evidence_items.append(extract_provider_mapping_evidence(source_evidence))
+        match = source_evidence.get("match")
+        if isinstance(match, dict):
+            evidence_items.append(extract_provider_mapping_evidence(match))
+        identity_evidence = source_evidence.get("identity_evidence")
+        if isinstance(identity_evidence, dict):
+            evidence_items.append(extract_provider_mapping_evidence({"identity_evidence": identity_evidence}))
+    if not evidence_items:
+        return extract_provider_mapping_evidence({})
+    return merge_provider_mapping_evidence(*evidence_items)
+
+
+def _is_aggregate_provider_parent_row(row: dict[str, Any], meta: Any | None) -> bool:
+    provider_evidence = _provider_mapping_evidence_for_eligibility_row(row)
+    provider_episode_count = provider_evidence.episode_count
+    target_episode_count = _target_episode_count(meta) if meta is not None else None
+    if provider_episode_count is None or target_episode_count is None or target_episode_count <= 0:
+        return False
+    if provider_episode_count <= target_episode_count:
+        return False
+    season_count = provider_evidence.season_count
+    return season_count is not None and season_count >= 3
+
+
+def _eligibility_record_value(record: Any, key: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(key)
+    return getattr(record, key, None)
+
+
+def _is_legacy_or_pending_provider_eligibility_record(record: Any) -> bool:
+    review_status = str(_eligibility_record_value(record, "review_status") or "").strip().lower()
+    logic_version = str(_eligibility_record_value(record, "logic_version") or "").strip()
+    return (
+        review_status in _PENDING_PROVIDER_ELIGIBILITY_REVIEW_STATUSES
+        or logic_version in _LEGACY_PROVIDER_ELIGIBILITY_LOGIC_VERSIONS
+    )
+
+
+def _legacy_eligibility_row_needs_approved_mapping_rewrite(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("identity_match_kind") or "") != "approved_mapping"
+        or str(row.get("review_status") or "").strip().lower() != "verified"
+        or str(row.get("logic_version") or "") in _LEGACY_PROVIDER_ELIGIBILITY_LOGIC_VERSIONS
+    )
+
+
+def _delete_legacy_provider_eligibility_row(config: AppConfig, row: dict[str, Any]) -> int:
+    return delete_recommendation_provider_eligibility_evidence(
+        config.db_path,
+        mal_anime_id=int(row["mal_anime_id"]),
+        provider=str(row["provider"]),
+        provider_series_id=str(row["provider_series_id"]),
+    )
+
+
+def _rewrite_legacy_provider_eligibility_row_as_approved_mapping(
+    config: AppConfig,
+    row: dict[str, Any],
+    mapping: Any,
+) -> None:
+    upsert_recommendation_provider_eligibility_evidence(
+        config.db_path,
+        mal_anime_id=int(row["mal_anime_id"]),
+        provider=str(row["provider"]),
+        provider_series_id=str(row["provider_series_id"]),
+        provider_title=row.get("provider_title"),
+        provider_url=row.get("provider_url"),
+        identity_match_kind="approved_mapping",
+        match_confidence=getattr(mapping, "confidence", None) if getattr(mapping, "confidence", None) is not None else row.get("match_confidence"),
+        review_status="verified",
+        catalog_status=str(row.get("catalog_status") or "unknown"),
+        english_dub_status=str(row.get("english_dub_status") or "unknown"),
+        explicit_dub_evidence_source=row.get("explicit_dub_evidence_source"),
+        audio_locales=list(row.get("audio_locales") or []),
+        source_evidence=dict(row.get("source_evidence") or {}),
+        fetched_at=str(row["fetched_at"]),
+        expires_at=str(row["expires_at"]),
+        last_verified_at=row.get("last_verified_at"),
+        refresh_status=str(row.get("refresh_status") or "ok"),
+        failure_count=int(row.get("failure_count") or 0),
+        next_retry_at=row.get("next_retry_at"),
+        logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+    )
+
+
+def _reconcile_legacy_provider_eligibility_evidence(
+    config: AppConfig,
+    summary: EnrichmentSummary,
+    *,
+    metadata: dict[int, Any],
+    mappings_by_series: dict[tuple[str, str], Any],
+) -> None:
+    approved_mappings = _approved_mappings_by_series(mappings_by_series)
+    exact_approved_mappings = _exact_approved_mappings_by_series(mappings_by_series)
+    if not approved_mappings:
+        return
+    for row in _current_provider_eligibility_rows_for_reconciliation(config, approved_mappings.keys()):
+        key = (str(row["provider"]), str(row["provider_series_id"]))
+        approved_mapping = approved_mappings.get(key)
+        if approved_mapping is None:
+            continue
+        if int(getattr(approved_mapping, "mal_anime_id")) != int(row["mal_anime_id"]):
+            summary.legacy_eligibility_rows_deleted += _delete_legacy_provider_eligibility_row(config, row)
+            continue
+        if not _is_legacy_or_pending_provider_eligibility_record(row):
+            continue
+        child_identity = _has_current_verified_child_identity(row)
+        if _is_aggregate_provider_parent_row(row, metadata.get(int(row["mal_anime_id"]))) and not child_identity:
+            summary.legacy_eligibility_rows_deleted += _delete_legacy_provider_eligibility_row(config, row)
+            continue
+        if child_identity:
+            continue
+        exact_mapping = exact_approved_mappings.get(key)
+        if exact_mapping is None:
+            continue
+        if not _legacy_eligibility_row_needs_approved_mapping_rewrite(row):
+            continue
+        _rewrite_legacy_provider_eligibility_row_as_approved_mapping(config, row, exact_mapping)
+        summary.legacy_eligibility_rows_reconciled += 1
+
+
 def _provider_title_norms(match: dict[str, Any]) -> list[tuple[str, str]]:
     norms: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -1702,6 +1963,7 @@ def _select_provider_enrichment_candidates(
                     and bool(getattr(mapping, "approved_by_user", False))
                     and int(getattr(mapping, "mal_anime_id", -1)) == int(mal_id)
                     and str(getattr(evidence, "identity_match_kind", "")) != "approved_mapping"
+                    and _is_legacy_or_pending_provider_eligibility_record(evidence)
                 ):
                     selection_class = "mapping_refresh_due"
                     skip_reason = None
@@ -1811,6 +2073,12 @@ def enrich_discovery_provider_availability(
         (mapping.provider, mapping.provider_series_id): mapping
         for mapping in list_series_mappings(config.db_path, approved_only=False)
     }
+    _reconcile_legacy_provider_eligibility_evidence(
+        config,
+        summary,
+        metadata=metadata,
+        mappings_by_series=mappings_by_series,
+    )
     candidates = [
         r
         for r in build_recommendations(

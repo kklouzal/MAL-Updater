@@ -3950,6 +3950,65 @@ def find_covering_mal_anime_detail_cache(db_path: Path, *, mal_anime_id: int, re
     return None
 
 
+def list_covering_mal_anime_detail_cache_nodes(
+    db_path: Path,
+    *,
+    required_fields: set[str],
+    logic_version: str,
+    now: str,
+) -> list[dict[str, Any]]:
+    """List fresh, successful detail nodes that safely cover a field set.
+
+    A MAL anime can have multiple cache rows for different field sets. Keep the
+    newest usable response for each MAL ID, while ignoring failed, expired,
+    malformed, and incomplete rows.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT mal_anime_id, fields_key, response_json
+            FROM mal_anime_detail_cache
+            WHERE logic_version = ? AND status = 'ok' AND expires_at > ?
+            ORDER BY mal_anime_id ASC, fetched_at DESC, fields_key ASC
+            """,
+            (logic_version, now),
+        ).fetchall()
+
+    nodes: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for row in rows:
+        mal_anime_id = int(row["mal_anime_id"])
+        if mal_anime_id in seen_ids:
+            continue
+        row_fields = {part.strip() for part in str(row["fields_key"] or "").split(",") if part.strip()}
+        if not required_fields.issubset(row_fields):
+            continue
+        node = _load_json_value(row["response_json"], None)
+        if not isinstance(node, dict) or not required_fields.issubset(node):
+            continue
+        node_id = _coerce_positive_int(node.get("id"))
+        if node_id != mal_anime_id or not isinstance(node.get("title"), str) or not node["title"].strip():
+            continue
+        alternative_titles = node.get("alternative_titles")
+        if not isinstance(alternative_titles, dict):
+            continue
+        if node.get("media_type") is not None and not isinstance(node["media_type"], str):
+            continue
+        if node.get("status") is not None and not isinstance(node["status"], str):
+            continue
+        num_episodes = node.get("num_episodes")
+        if (
+            num_episodes is not None
+            and (isinstance(num_episodes, bool) or not isinstance(num_episodes, int) or num_episodes < 0)
+        ):
+            continue
+        if node.get("start_season") is not None and not isinstance(node["start_season"], dict):
+            continue
+        seen_ids.add(mal_anime_id)
+        nodes.append(node)
+    return nodes
+
+
 def upsert_mal_anime_detail_cache(db_path: Path, *, mal_anime_id: int, fields_key: str, logic_version: str,
                                   response: dict[str, Any], fetched_at: str, expires_at: str) -> None:
     with connect(db_path) as conn:

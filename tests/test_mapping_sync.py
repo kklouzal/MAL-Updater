@@ -14,12 +14,13 @@ from mal_updater.db import (
     get_series_mapping,
     list_review_queue_entries,
     list_series_mappings,
+    upsert_mal_anime_detail_cache,
     upsert_mal_anime_metadata,
     upsert_recommendation_provider_eligibility_evidence,
     upsert_series_mapping,
 )
 from mal_updater.ingestion import ingest_snapshot_payload
-from mal_updater.mal_client import MalClient
+from mal_updater.mal_client import MAL_DETAIL_CACHE_LOGIC_VERSION, MalApiError, MalClient
 from mal_updater.mapping import (
     SeriesMappingInput,
     build_search_queries,
@@ -117,6 +118,28 @@ class MappingTests(unittest.TestCase):
             )
             with patch.object(MalClient, "search_anime", return_value={"data": [{"node": node} for node in nodes]}):
                 return map_series(client, series)
+
+    def _dororo_search_nodes(self) -> list[dict]:
+        return [
+            {
+                "id": 5760,
+                "title": "Dororo to Hyakkimaru",
+                "alternative_titles": {"en": "Dororo", "synonyms": ["Dororo"]},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 26,
+                "start_season": {"season": "spring", "year": 1969},
+            },
+            {
+                "id": 37520,
+                "title": "Dororo",
+                "alternative_titles": {"en": "Dororo", "synonyms": ["Dororo to Hyakkimaru"]},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 24,
+                "start_season": {"season": "winter", "year": 2019},
+            },
+        ]
 
     def test_normalize_title_strips_dub_and_season_noise(self) -> None:
         self.assertEqual(
@@ -298,6 +321,107 @@ class MappingTests(unittest.TestCase):
         self.assertIn("exact_provider_season_title", result.chosen_candidate.match_reasons)
         self.assertFalse(should_auto_approve_mapping(result))
 
+    def test_exact_provider_season_title_beats_generic_primary_title_collision_for_flcl(self) -> None:
+        with patch.object(MalClient, "get_anime_details", side_effect=MalApiError("offline")):
+            result = self._map_with_search_results(
+                SeriesMappingInput(
+                    provider="crunchyroll",
+                    provider_series_id="flcl-alternative",
+                    title="FLCL",
+                    season_title="FLCL Alternative",
+                    season_number=1,
+                ),
+                [
+                    {
+                        "id": 227,
+                        "title": "FLCL",
+                        "alternative_titles": {"en": "FLCL", "synonyms": ["Fooly Cooly", "Furi Kuri"]},
+                        "media_type": "ova",
+                        "num_episodes": 6,
+                    },
+                    {
+                        "id": 35842,
+                        "title": "FLCL Alternative",
+                        "alternative_titles": {"en": "FLCL Alternative", "synonyms": ["FLCL 3", "Fooly Cooly Alternative"]},
+                        "media_type": "movie",
+                        "num_episodes": 1,
+                    },
+                ],
+            )
+
+        self.assertEqual("exact", result.status)
+        self.assertEqual(35842, result.chosen_candidate.mal_anime_id)
+        self.assertIn("exact_provider_season_title", result.chosen_candidate.match_reasons)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_multi_episode_ona_exact_english_title_can_auto_approve_when_episode_evidence_fits(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="last-summoner",
+                title="The Last Summoner",
+                season_title="The Last Summoner",
+                season_number=1,
+                max_episode_number=10,
+                completed_episode_count=8,
+            ),
+            [
+                {
+                    "id": 41915,
+                    "title": "Zuihou de Zhaohuan Shi",
+                    "alternative_titles": {"en": "The Last Summoner", "synonyms": ["Zui Hou De Zhao Huan Shi"]},
+                    "media_type": "ona",
+                    "num_episodes": 12,
+                },
+                {"id": 90001, "title": "The Last Spell", "alternative_titles": {}, "media_type": "tv", "num_episodes": 12},
+            ],
+        )
+
+        self.assertEqual("exact", result.status)
+        self.assertEqual(41915, result.chosen_candidate.mal_anime_id)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_exact_title_tie_without_provider_disambiguation_is_terminal_non_actionable(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="hidive",
+                provider_series_id="1181",
+                title="Dororo",
+                season_title="Dororo",
+            ),
+            self._dororo_search_nodes(),
+        )
+
+        self.assertEqual("ambiguous", result.status)
+        self.assertTrue(result.has_deterministic_ambiguous_exact_title_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
+
+    def test_aggregate_progress_overflow_is_terminal_non_actionable_without_bundle_companions(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="crunchyroll",
+                provider_series_id="blue-night-saga",
+                title="Blue Exorcist",
+                season_title="Blue Exorcist -The Blue Night Saga-",
+                season_number=5,
+                max_episode_number=25,
+                completed_episode_count=70,
+            ),
+            [
+                {
+                    "id": 59226,
+                    "title": "Ao no Exorcist: Yosuga-hen",
+                    "alternative_titles": {"en": "Blue Exorcist: The Blue Night Saga", "synonyms": ["Blue Exorcist Season 5"]},
+                    "media_type": "tv",
+                    "num_episodes": 12,
+                }
+            ],
+        )
+
+        self.assertEqual("exact", result.status)
+        self.assertTrue(result.has_deterministic_aggregate_progress_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
+
     def test_map_series_does_not_treat_large_terminal_unit_number_as_installment(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -442,6 +566,17 @@ class MappingTests(unittest.TestCase):
         ):
             with self.subTest(title=title):
                 self.assertFalse(_extract_title_hints(title) & {"season:2", "roman:2"})
+
+
+    def test_title_domain_sentence_terminal_ii_is_not_installment_hint(self) -> None:
+        self.assertFalse(
+            _extract_title_hints("Maou no Ore ga Dorei Elf wo Yome ni Shitanda ga, Dou Medereba Ii?")
+            & {"season:2", "roman:2"}
+        )
+        self.assertFalse(
+            _extract_title_hints("An Archdemon's Dilemma: How to Love Your Elf Bride")
+            & {"season:2", "roman:2"}
+        )
 
     def test_true_installment_hints_remain_recognized(self) -> None:
         self.assertIn("season:2", _extract_title_hints("Example Show Season 2"))
@@ -763,8 +898,9 @@ class MappingTests(unittest.TestCase):
                     ),
                 )
 
-        self.assertEqual(result.status, "exact")
-        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertEqual(result.status, "ambiguous")
+        self.assertTrue(result.has_deterministic_ambiguous_exact_title_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
         self.assertEqual(849, result.chosen_candidate.mal_anime_id)
         self.assertIn("exact_normalized_title", result.rationale)
         self.assertIn("episode_evidence_exceeds_candidate_count=28>14", result.rationale)
@@ -871,7 +1007,8 @@ class MappingTests(unittest.TestCase):
         self.assertIsNotNone(result.bundle_companion_candidate)
         self.assertEqual(23327, result.bundle_companion_candidate.mal_anime_id)
         self.assertEqual({23327}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
-        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertTrue(result.has_deterministic_aggregate_progress_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
 
     def test_map_series_flags_alias_only_bundle_companion_for_review_without_auto_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1026,7 +1163,8 @@ class MappingTests(unittest.TestCase):
         self.assertIsNotNone(result.bundle_companion_candidate)
         self.assertIn(result.bundle_companion_candidate.mal_anime_id, {1002, 1003})
         self.assertEqual({1002, 1003}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
-        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertTrue(result.has_deterministic_aggregate_progress_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
 
     def test_map_series_multi_entry_bundle_prefers_later_seasons_over_higher_scoring_sidecar_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1124,7 +1262,8 @@ class MappingTests(unittest.TestCase):
         self.assertIn("multi_entry_bundle_suspected=32<=14+10+12", result.rationale)
         self.assertEqual({42429, 40815}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
         self.assertNotIn(40841, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
-        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertTrue(result.has_deterministic_aggregate_progress_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
         self.assertGreater(
             next(candidate.score for candidate in result.candidates if candidate.mal_anime_id == 40841),
             next(candidate.score for candidate in result.candidates if candidate.mal_anime_id == 42429),
@@ -5201,7 +5340,8 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(22297, result.chosen_candidate.mal_anime_id)
         self.assertIn("multi_entry_bundle_suspected=24<=12+13", result.rationale)
         self.assertEqual({28701}, {candidate.mal_anime_id for candidate in (result.bundle_companion_candidates or [])})
-        self.assertTrue(should_auto_approve_mapping(result))
+        self.assertTrue(result.has_deterministic_aggregate_progress_classification())
+        self.assertFalse(should_auto_approve_mapping(result))
         movie_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 6922)
         prologue_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 27821)
         self.assertIn("single_episode_movie_penalty_for_multi_episode_series", movie_candidate.match_reasons)
@@ -5340,6 +5480,527 @@ class MappingTests(unittest.TestCase):
         self.assertEqual("exact", result.status)
         self.assertIn("verified_provider_identity=provider_title_search_exact", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_uses_local_metadata_exact_english_when_bounded_search_misses_long_title(self) -> None:
+        title = "The Magical Revolution of the Reincarnated Princess and the Genius Young Lady"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            upsert_mal_anime_metadata(
+                config.db_path,
+                mal_anime_id=52736,
+                title="Tensei Oujo to Tensai Reijou no Mahou Kakumei",
+                title_english=title,
+                title_japanese=None,
+                alternative_titles=[title],
+                media_type="tv",
+                status="finished_airing",
+                num_episodes=12,
+                mean=None,
+                popularity=None,
+                start_season={"year": 2023, "season": "winter"},
+                raw={
+                    "id": 52736,
+                    "title": "Tensei Oujo to Tensai Reijou no Mahou Kakumei",
+                    "alternative_titles": {"en": title, "synonyms": []},
+                },
+            )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+            attempted_queries: list[str] = []
+
+            def fake_search(query: str, limit: int = 5, fields: str | None = None) -> dict:
+                attempted_queries.append(query)
+                self.assertLessEqual(len(query), 64)
+                return {
+                    "data": [
+                        {
+                            "node": {
+                                "id": 37430,
+                                "title": "Tensei shitara Slime Datta Ken",
+                                "alternative_titles": {"en": "That Time I Got Reincarnated as a Slime", "synonyms": []},
+                                "media_type": "tv",
+                                "status": "finished_airing",
+                                "num_episodes": 24,
+                            }
+                        }
+                    ]
+                }
+
+            with patch.object(MalClient, "search_anime", side_effect=fake_search), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=AssertionError("local MAL metadata should cover generic exact-title injection"),
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="G5PHNM7J2",
+                        title=title,
+                        season_title=title,
+                        season_number=1,
+                    ),
+                )
+
+        self.assertTrue(attempted_queries)
+        self.assertTrue(all(len(query) <= 64 for query in attempted_queries))
+        self.assertNotIn(title, attempted_queries)
+        self.assertEqual("exact", result.status)
+        self.assertEqual(52736, result.chosen_candidate.mal_anime_id)
+        self.assertIn("local_mal_metadata_exact_title", result.rationale)
+        self.assertIn("exact_mal_english_title", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_does_not_inject_duplicate_local_metadata_exact_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            for anime_id, canonical_title, english_title in (
+                (900001, "Example Local Show", "Example Local Show"),
+                (900002, "Example Local Show: Side Story", "Example Local Show"),
+            ):
+                upsert_mal_anime_metadata(
+                    config.db_path,
+                    mal_anime_id=anime_id,
+                    title=canonical_title,
+                    title_english=english_title,
+                    title_japanese=None,
+                    alternative_titles=[english_title],
+                    media_type="tv",
+                    status="finished_airing",
+                    num_episodes=12,
+                    mean=None,
+                    popularity=None,
+                    start_season={"year": 2024, "season": "spring"},
+                    raw={"id": anime_id, "title": canonical_title, "alternative_titles": {"en": english_title, "synonyms": []}},
+                )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="duplicate-local-exact",
+                        title="Example Local Show",
+                        season_title="Example Local Show",
+                    ),
+                )
+
+        self.assertEqual("no_candidates", result.status)
+        self.assertIsNone(result.chosen_candidate)
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertNotIn("local_mal_metadata_exact_title", result.rationale)
+
+    def test_map_series_does_not_inject_local_metadata_exact_title_with_provider_evidence_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            upsert_mal_anime_metadata(
+                config.db_path,
+                mal_anime_id=900003,
+                title="Conflict Local Show",
+                title_english="Conflict Local Show",
+                title_japanese=None,
+                alternative_titles=["Conflict Local Show"],
+                media_type="tv",
+                status="finished_airing",
+                num_episodes=12,
+                mean=None,
+                popularity=None,
+                start_season={"year": 2023, "season": "winter"},
+                raw={"id": 900003, "title": "Conflict Local Show", "alternative_titles": {"en": "Conflict Local Show", "synonyms": []}},
+            )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="conflict-local-exact",
+                        title="Conflict Local Show",
+                        season_title="Conflict Local Show",
+                        provider_episode_count=24,
+                        provider_start_year=2024,
+                        provider_start_year_is_trustworthy=True,
+                    ),
+                )
+
+        self.assertEqual("no_candidates", result.status)
+        self.assertIsNone(result.chosen_candidate)
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertNotIn("local_mal_metadata_exact_title", result.rationale)
+
+    def test_map_series_uses_cache_only_local_exact_title_for_magical_revolution(self) -> None:
+        title = "The Magical Revolution of the Reincarnated Princess and the Genius Young Lady"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            upsert_mal_anime_detail_cache(
+                config.db_path,
+                mal_anime_id=52736,
+                fields_key="alternative_titles,id,media_type,num_episodes,start_season,status,title",
+                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+                response={
+                    "id": 52736,
+                    "title": "Tensei Oujo to Tensai Reijou no Mahou Kakumei",
+                    "alternative_titles": {"en": title, "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "start_season": {"year": 2023, "season": "winter"},
+                },
+                fetched_at="2026-07-26T17:00:00Z",
+                expires_at="2999-01-01T00:00:00Z",
+            )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            weak_node = {
+                "id": 37430,
+                "title": "Tensei shitara Slime Datta Ken",
+                "alternative_titles": {"en": "That Time I Got Reincarnated as a Slime", "synonyms": []},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 24,
+            }
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": weak_node}]}), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=AssertionError("fresh detail cache should cover local exact-title injection"),
+            ):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="G5PHNM7J2",
+                        title=title,
+                        season_title=title,
+                        provider_episode_count=12,
+                        provider_start_year=2023,
+                        provider_start_year_is_trustworthy=True,
+                    ),
+                )
+
+        self.assertEqual("exact", result.status)
+        self.assertEqual(52736, result.chosen_candidate.mal_anime_id)
+        self.assertIn("local_mal_metadata_exact_title", result.rationale)
+        self.assertIn("exact_mal_english_title", result.rationale)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_ignores_unusable_detail_cache_exact_title_rows(self) -> None:
+        title = "Unusable Cached Exact Show"
+        valid_node = {
+            "title": title,
+            "alternative_titles": {"en": title, "synonyms": []},
+            "media_type": "tv",
+            "status": "finished_airing",
+            "num_episodes": 12,
+            "start_season": {"year": 2024, "season": "spring"},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            fields_key = "alternative_titles,id,media_type,num_episodes,start_season,status,title"
+            rows = (
+                (900020, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {**valid_node, "id": 900020}, "2000-01-01T00:00:00Z"),
+                (900021, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "failed", {**valid_node, "id": 900021}, "2999-01-01T00:00:00Z"),
+                (900022, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", "not-json", "2999-01-01T00:00:00Z"),
+                (900023, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {"id": 900023, "title": title}, "2999-01-01T00:00:00Z"),
+            )
+            with connect(config.db_path) as conn:
+                for anime_id, fields_key, logic_version, status, response, expires_at in rows:
+                    response_json = response if isinstance(response, str) else json.dumps(response)
+                    conn.execute(
+                        """
+                        INSERT INTO mal_anime_detail_cache (
+                            mal_anime_id, fields_key, logic_version, status, response_json, fetched_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (anime_id, fields_key, logic_version, status, response_json, "2026-07-26T17:00:00Z", expires_at),
+                    )
+                conn.commit()
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="unusable-detail-cache-exact",
+                        title=title,
+                        season_title=title,
+                    ),
+                )
+
+        self.assertEqual("no_candidates", result.status)
+        self.assertIsNone(result.chosen_candidate)
+        self.assertFalse(should_auto_approve_mapping(result))
+
+    def test_map_series_dedupes_same_local_exact_id_across_metadata_and_detail_cache(self) -> None:
+        title = "Duplicate Local Exact Show"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            upsert_mal_anime_metadata(
+                config.db_path,
+                mal_anime_id=900010,
+                title="Duplicate Local Exact Show",
+                title_english=title,
+                title_japanese=None,
+                alternative_titles=[title],
+                media_type="tv",
+                status="finished_airing",
+                num_episodes=12,
+                mean=None,
+                popularity=None,
+                start_season={"year": 2024, "season": "spring"},
+                raw={"id": 900010, "title": title, "alternative_titles": {"en": title, "synonyms": []}},
+            )
+            upsert_mal_anime_detail_cache(
+                config.db_path,
+                mal_anime_id=900010,
+                fields_key="alternative_titles,id,media_type,num_episodes,start_season,status,title",
+                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+                response={
+                    "id": 900010,
+                    "title": title,
+                    "alternative_titles": {"en": title, "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "start_season": {"year": 2024, "season": "spring"},
+                },
+                fetched_at="2026-07-26T17:00:00Z",
+                expires_at="2999-01-01T00:00:00Z",
+            )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="same-id-local-exact",
+                        title=title,
+                        season_title=title,
+                    ),
+                )
+
+        self.assertEqual("exact", result.status)
+        self.assertEqual(900010, result.chosen_candidate.mal_anime_id)
+        self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_does_not_inject_multiple_distinct_detail_cache_exact_ids(self) -> None:
+        title = "Ambiguous Cached Exact Show"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            for anime_id, canonical_title in (
+                (900011, title),
+                (900012, f"{title}: Side Story"),
+            ):
+                upsert_mal_anime_detail_cache(
+                    config.db_path,
+                    mal_anime_id=anime_id,
+                    fields_key="alternative_titles,id,media_type,num_episodes,start_season,status,title",
+                    logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+                    response={
+                        "id": anime_id,
+                        "title": canonical_title,
+                        "alternative_titles": {"en": title, "synonyms": []},
+                        "media_type": "tv",
+                        "status": "finished_airing",
+                        "num_episodes": 12,
+                        "start_season": {"year": 2024, "season": "spring"},
+                    },
+                    fetched_at="2026-07-26T17:00:00Z",
+                    expires_at="2999-01-01T00:00:00Z",
+                )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            weak_node = {
+                "id": 37430,
+                "title": "Tensei shitara Slime Datta Ken",
+                "alternative_titles": {"en": "That Time I Got Reincarnated as a Slime", "synonyms": []},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 24,
+            }
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": weak_node}]}):
+                result = map_series(
+                    client,
+                    SeriesMappingInput(
+                        provider="crunchyroll",
+                        provider_series_id="multiple-cache-exacts",
+                        title=title,
+                        season_title=title,
+                    ),
+                )
+
+        self.assertEqual("weak", result.status)
+        self.assertEqual(37430, result.chosen_candidate.mal_anime_id)
+        self.assertFalse(should_auto_approve_mapping(result))
+
+    def test_map_series_blocks_detail_cache_exact_title_on_episode_or_year_conflict(self) -> None:
+        title = "Conflicting Cached Exact Show"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            upsert_mal_anime_detail_cache(
+                config.db_path,
+                mal_anime_id=900013,
+                fields_key="alternative_titles,id,media_type,num_episodes,start_season,status,title",
+                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+                response={
+                    "id": 900013,
+                    "title": title,
+                    "alternative_titles": {"en": title, "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "start_season": {"year": 2023, "season": "winter"},
+                },
+                fetched_at="2026-07-26T17:00:00Z",
+                expires_at="2999-01-01T00:00:00Z",
+            )
+            client = MalClient(
+                config,
+                MalSecrets(
+                    client_id="client-id",
+                    client_secret=None,
+                    access_token="access-token",
+                    refresh_token=None,
+                    client_id_path=root / ".MAL-Updater" / "secrets" / "mal_client_id.txt",
+                    client_secret_path=root / ".MAL-Updater" / "secrets" / "mal_client_secret.txt",
+                    access_token_path=root / ".MAL-Updater" / "secrets" / "mal_access_token.txt",
+                    refresh_token_path=root / ".MAL-Updater" / "secrets" / "mal_refresh_token.txt",
+                ),
+            )
+
+            conflicting_series = (
+                SeriesMappingInput(
+                    provider="crunchyroll",
+                    provider_series_id="cache-episode-conflict",
+                    title=title,
+                    season_title=title,
+                    provider_episode_count=24,
+                ),
+                SeriesMappingInput(
+                    provider="crunchyroll",
+                    provider_series_id="cache-year-conflict",
+                    title=title,
+                    season_title=title,
+                    provider_start_year=2024,
+                    provider_start_year_is_trustworthy=True,
+                ),
+            )
+            with patch.object(MalClient, "search_anime", return_value={"data": []}):
+                results = [map_series(client, series) for series in conflicting_series]
+
+        self.assertEqual(["no_candidates", "no_candidates"], [result.status for result in results])
+        self.assertTrue(all(result.chosen_candidate is None for result in results))
+        self.assertTrue(all(not should_auto_approve_mapping(result) for result in results))
 
     def test_map_series_discovers_overlong_exact_title_using_bounded_queries(self) -> None:
         title = "The Magical Revolution of the Reincarnated Princess and the Genius Young Lady"
@@ -5750,7 +6411,7 @@ class MappingTests(unittest.TestCase):
 
         self.assertEqual(result.status, "exact")
         self.assertEqual(result.chosen_candidate.mal_anime_id, 50664)
-        self.assertIn("exact_later_installment_alignment", result.rationale)
+        self.assertIn("exact_provider_season_title", result.rationale)
         self.assertTrue(should_auto_approve_mapping(result))
 
     def test_map_series_exact_specific_provider_title_beats_base_title_fragment(self) -> None:
@@ -5897,32 +6558,84 @@ class MappingTests(unittest.TestCase):
                 title="Dororo",
                 season_title="Dororo",
             ),
+            self._dororo_search_nodes(),
+        )
+
+        self.assertEqual("ambiguous", result.status)
+        self.assertFalse(should_auto_approve_mapping(result))
+        self.assertEqual(37520, result.chosen_candidate.mal_anime_id)
+        self.assertIn("exact_mal_primary_title", result.chosen_candidate.match_reasons)
+        alias_candidate = next(candidate for candidate in result.candidates if candidate.mal_anime_id == 5760)
+        self.assertIn("exact_mal_alternative_title", alias_candidate.match_reasons)
+        self.assertIn("exact_mal_english_title", alias_candidate.match_reasons)
+        self.assertEqual(1.0, result.candidates[0].score)
+        self.assertEqual(1.0, result.candidates[1].score)
+        self.assertIn("margin=0.000", result.rationale)
+
+    def test_map_series_uses_dororo_episode_or_year_evidence_for_remake_tie(self) -> None:
+        for label, provider_kwargs, expected_reason in (
+            ("episode", {"provider_episode_count": 24}, "provider_episode_count_match=24"),
+            (
+                "year",
+                {"provider_start_year": 2019, "provider_start_year_is_trustworthy": True},
+                "provider_start_year_match=2019",
+            ),
+            (
+                "episode_and_year",
+                {"provider_episode_count": 24, "provider_start_year": 2019, "provider_start_year_is_trustworthy": True},
+                "provider_start_year_match=2019",
+            ),
+        ):
+            with self.subTest(label=label):
+                result = self._map_with_search_results(
+                    SeriesMappingInput(
+                        provider="hidive",
+                        provider_series_id="1181",
+                        title="Dororo",
+                        season_title="Dororo",
+                        **provider_kwargs,
+                    ),
+                    copy.deepcopy(self._dororo_search_nodes()),
+                )
+
+            self.assertEqual("exact", result.status)
+            self.assertEqual(37520, result.chosen_candidate.mal_anime_id)
+            self.assertIn(expected_reason, result.rationale)
+            self.assertTrue(should_auto_approve_mapping(result))
+
+    def test_map_series_canonical_exact_tiebreak_does_not_create_score_margin(self) -> None:
+        result = self._map_with_search_results(
+            SeriesMappingInput(
+                provider="hidive",
+                provider_series_id="shared-title",
+                title="Shared Title",
+                season_title="Shared Title",
+            ),
             [
                 {
-                    "id": 5760,
-                    "title": "Dororo to Hyakkimaru",
-                    "alternative_titles": {"en": "Dororo", "synonyms": ["Dororo"]},
+                    "id": 900010,
+                    "title": "Shared Title Side Story",
+                    "alternative_titles": {"en": "Shared Title", "synonyms": []},
                     "media_type": "tv",
                     "status": "finished_airing",
-                    "num_episodes": 26,
-                    "start_season": {"season": "spring", "year": 1969},
+                    "num_episodes": 12,
                 },
                 {
-                    "id": 37520,
-                    "title": "Dororo",
-                    "alternative_titles": {"en": "Dororo", "synonyms": ["Dororo to Hyakkimaru"]},
+                    "id": 900011,
+                    "title": "Shared Title",
+                    "alternative_titles": {"en": "Shared Title", "synonyms": []},
                     "media_type": "tv",
                     "status": "finished_airing",
-                    "num_episodes": 24,
-                    "start_season": {"season": "winter", "year": 2019},
+                    "num_episodes": 12,
                 },
             ],
         )
 
         self.assertEqual("ambiguous", result.status)
         self.assertFalse(should_auto_approve_mapping(result))
-        self.assertEqual(1.0, result.candidates[0].score)
-        self.assertEqual(1.0, result.candidates[1].score)
+        self.assertEqual(900011, result.chosen_candidate.mal_anime_id)
+        self.assertEqual(result.candidates[0].score, result.candidates[1].score)
+        self.assertIn("margin=0.000", result.rationale)
 
     def test_build_mapping_review_replaces_unapproved_stale_mapping_for_exact_specific_title(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -6113,6 +6826,70 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(11061, items[0].suggested_mal_anime_id)
         self.assertIn("provider_episode_count_match=148", items[0].reasons)
         self.assertIn("provider_start_year_match=2011", items[0].reasons)
+
+    def test_build_mapping_review_uses_detail_cache_exact_title_when_metadata_absent(self) -> None:
+        title = "The Magical Revolution of the Reincarnated Princess and the Genius Young Lady"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            _write_test_mal_secret_files(root)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "G5PHNM7J2",
+                        title,
+                        title,
+                        1,
+                        json.dumps({"raw": {"series_metadata": {"episode_count": 12, "series_launch_year": 2023}}}),
+                    ),
+                )
+                conn.commit()
+            upsert_mal_anime_detail_cache(
+                config.db_path,
+                mal_anime_id=52736,
+                fields_key="alternative_titles,id,media_type,num_episodes,start_season,status,title",
+                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+                response={
+                    "id": 52736,
+                    "title": "Tensei Oujo to Tensai Reijou no Mahou Kakumei",
+                    "alternative_titles": {"en": title, "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 12,
+                    "start_season": {"year": 2023, "season": "winter"},
+                },
+                fetched_at="2026-07-26T17:00:00Z",
+                expires_at="2999-01-01T00:00:00Z",
+            )
+            weak_node = {
+                "id": 37430,
+                "title": "Tensei shitara Slime Datta Ken",
+                "alternative_titles": {"en": "That Time I Got Reincarnated as a Slime", "synonyms": []},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 24,
+            }
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": weak_node}]}), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=AssertionError("fresh detail cache should cover review exact-title injection"),
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=5, provider_series_ids=["G5PHNM7J2"])
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("auto_approved", items[0].decision)
+        self.assertEqual("approved", items[0].mapping_status)
+        self.assertEqual(52736, items[0].suggested_mal_anime_id)
+        self.assertIn("local_mal_metadata_exact_title", items[0].reasons)
+        self.assertIn("exact_mal_english_title", items[0].reasons)
 
     def test_map_series_auto_approves_exact_single_movie_feature(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -6461,6 +7238,329 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
         self.assertEqual([], open_rows)
 
+    def test_build_mapping_review_auto_classifies_verified_gintama_aggregate_shell_without_mapping_or_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            _write_test_mal_secret_files(root)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "GYQ4MKDZ6",
+                        "Gintama",
+                        "Gintama",
+                        None,
+                        json.dumps({"raw": {"series_metadata": {"episode_count": 382, "season_count": 8}}}),
+                    ),
+                )
+                conn.commit()
+            upsert_recommendation_provider_eligibility_evidence(
+                config.db_path,
+                mal_anime_id=918,
+                provider="crunchyroll",
+                provider_series_id="GYQ4MKDZ6",
+                provider_title="Gintama",
+                identity_match_kind="provider_title_search_exact",
+                match_confidence=0.9,
+                review_status="verified",
+                catalog_status="present",
+                english_dub_status="present",
+                fetched_at="2026-07-24T00:00:00Z",
+                expires_at="2026-07-31T00:00:00Z",
+                source_evidence={"identity_evidence": None},
+            )
+            gintama_918 = {
+                "id": 918,
+                "title": "Gintama",
+                "alternative_titles": {"en": "Gintama", "synonyms": []},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 201,
+            }
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": gintama_918}]}), patch.object(
+                MalClient,
+                "get_anime_details",
+                return_value=gintama_918,
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=5, provider_series_ids=["GYQ4MKDZ6"])
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual("auto_classified_provider_shell", item.decision)
+        self.assertEqual("ambiguous", item.mapping_status)
+        self.assertIsNone(item.existing_mapping)
+        self.assertEqual(918, item.suggested_mal_anime_id)
+        self.assertIn("auto_classified_provider_shell_non_actionable", item.reasons)
+        self.assertIn("provider_aggregate_shell_non_actionable", item.reasons)
+        self.assertTrue(any(reason.startswith("provider_aggregate_shell_suspected=provider_episodes:382;candidate_episodes:201;provider_seasons:8") for reason in item.reasons))
+        self.assertEqual([], persisted)
+        self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
+        self.assertEqual([], open_rows)
+
+    def test_build_mapping_review_auto_classifies_verified_rascal_multi_child_shell_without_child_mapping_or_queue(self) -> None:
+        identity_evidence = {
+            "child_titles": [
+                {"title": "Rascal Does Not Dream of Bunny Girl Senpai", "episode_count": 13},
+                {"title": "Rascal Does Not Dream of a Dreaming Girl", "episode_count": 1},
+                {"title": "Rascal Does Not Dream of a Sister Venturing Out", "episode_count": 1},
+                {"title": "Rascal Does Not Dream of a Knapsack Kid", "episode_count": 1},
+                {"title": "Rascal Does Not Dream of Santa Claus", "episode_count": 13},
+            ],
+            "parent_episode_count": 29,
+            "parent_season_count": 5,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            _write_test_mal_secret_files(root)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "GYW4MG9G6",
+                        "Rascal Does Not Dream Series",
+                        "Rascal Does Not Dream Series",
+                        None,
+                        json.dumps({"identity_evidence": identity_evidence, "raw": {"series_metadata": {"episode_count": 29, "season_count": 5}}}),
+                    ),
+                )
+                conn.commit()
+            upsert_recommendation_provider_eligibility_evidence(
+                config.db_path,
+                mal_anime_id=37450,
+                provider="crunchyroll",
+                provider_series_id="GYW4MG9G6",
+                provider_title="Rascal Does Not Dream Series",
+                identity_match_kind="provider_franchise_shell_child_match",
+                match_confidence=0.88,
+                review_status="verified",
+                catalog_status="present",
+                english_dub_status="present",
+                fetched_at="2026-07-24T00:00:00Z",
+                expires_at="2026-07-31T00:00:00Z",
+                source_evidence={"identity_evidence": identity_evidence},
+            )
+            child_nodes = [
+                {
+                    "id": 37450,
+                    "title": "Seishun Buta Yarou wa Bunny Girl Senpai no Yume wo Minai",
+                    "alternative_titles": {"en": "Rascal Does Not Dream of Bunny Girl Senpai", "synonyms": []},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 13,
+                    "related_anime": [
+                        {"node": {"id": 38329}},
+                        {"node": {"id": 53129}},
+                    ],
+                },
+                {
+                    "id": 38329,
+                    "title": "Seishun Buta Yarou wa Yumemiru Shoujo no Yume wo Minai",
+                    "alternative_titles": {"en": "Rascal Does Not Dream of a Dreaming Girl", "synonyms": []},
+                    "media_type": "movie",
+                    "status": "finished_airing",
+                    "num_episodes": 1,
+                    "related_anime": [],
+                },
+                {
+                    "id": 53129,
+                    "title": "Seishun Buta Yarou wa Odekake Sister no Yume wo Minai",
+                    "alternative_titles": {"en": "Rascal Does Not Dream of a Sister Venturing Out", "synonyms": []},
+                    "media_type": "movie",
+                    "status": "finished_airing",
+                    "num_episodes": 1,
+                    "related_anime": [],
+                },
+            ]
+            detail_by_id = {node["id"]: node for node in child_nodes}
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": child_nodes[0]}]}), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=lambda anime_id, fields=None: detail_by_id[anime_id],
+            ):
+                items = build_mapping_review(config, limit=5, mapping_limit=5, provider_series_ids=["GYW4MG9G6"])
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual("auto_classified_provider_shell", item.decision)
+        self.assertEqual("ambiguous", item.mapping_status)
+        self.assertIsNone(item.existing_mapping)
+        self.assertEqual(37450, item.suggested_mal_anime_id)
+        self.assertNotIn(38329, {candidate["mal_anime_id"] for candidate in item.candidates})
+        self.assertNotIn(53129, {candidate["mal_anime_id"] for candidate in item.candidates})
+        self.assertIn("auto_classified_provider_shell_non_actionable", item.reasons)
+        self.assertIn("provider_aggregate_shell_non_actionable", item.reasons)
+        self.assertTrue(any(reason.startswith("provider_franchise_shell_child_match_non_actionable=children:5") for reason in item.reasons))
+        self.assertEqual([], persisted)
+        self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
+        self.assertEqual([], open_rows)
+
+    def test_build_mapping_review_keeps_ambiguous_aggregate_shell_in_review_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            _write_test_mal_secret_files(root)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "ambiguous-aggregate",
+                        "Example Saga",
+                        "Example Saga",
+                        None,
+                        json.dumps({"raw": {"series_metadata": {"episode_count": 36, "season_count": 3}}}),
+                    ),
+                )
+                conn.commit()
+            candidate = {
+                "id": 70001,
+                "title": "Example Saga",
+                "alternative_titles": {"en": "Example Saga", "synonyms": []},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 12,
+            }
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": candidate}]}):
+                items = build_mapping_review(config, limit=5, mapping_limit=5, provider_series_ids=["ambiguous-aggregate"])
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual("needs_review", item.decision)
+        self.assertEqual("ambiguous", item.mapping_status)
+        self.assertIn("provider_aggregate_shell_non_actionable", item.reasons)
+        self.assertNotIn("auto_classified_provider_shell_non_actionable", item.reasons)
+        self.assertTrue(any(reason.startswith("provider_aggregate_shell_suspected=provider_episodes:36;candidate_episodes:12;provider_seasons:3") for reason in item.reasons))
+        self.assertEqual([], persisted)
+        self.assertEqual({"resolved": 0, "inserted": 1}, queue_result)
+        self.assertEqual(["ambiguous-aggregate"], [row.provider_series_id for row in open_rows])
+
+    def test_build_mapping_review_classifies_dororo_exact_title_tie_without_queue_or_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            _write_test_mal_secret_files(root)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("hidive", "1181", "Dororo", "Dororo", None, json.dumps({"title": "Dororo", "season_title": "Dororo"})),
+                )
+                conn.commit()
+
+            dororo_nodes = [
+                {
+                    "id": 5760,
+                    "title": "Dororo to Hyakkimaru",
+                    "alternative_titles": {"en": "Dororo", "synonyms": ["Dororo"]},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 26,
+                    "start_season": {"season": "spring", "year": 1969},
+                },
+                {
+                    "id": 37520,
+                    "title": "Dororo",
+                    "alternative_titles": {"en": "Dororo", "synonyms": ["Dororo to Hyakkimaru"]},
+                    "media_type": "tv",
+                    "status": "finished_airing",
+                    "num_episodes": 24,
+                    "start_season": {"season": "winter", "year": 2019},
+                },
+            ]
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": node} for node in dororo_nodes]}):
+                items = build_mapping_review(config, limit=5, mapping_limit=5, provider_series_ids=["1181"])
+                persisted = list_series_mappings(config.db_path, provider="hidive")
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("auto_classified_ambiguous_exact_title", items[0].decision)
+        self.assertIn("auto_classified_ambiguous_exact_title_non_actionable", items[0].reasons)
+        self.assertEqual([], persisted)
+        self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
+        self.assertEqual([], open_rows)
+
+    def test_build_mapping_review_classifies_provider_movie_collection_shell_without_queue_or_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["provider_series_id"] = "code-geass-movies"
+            payload["series"][0]["title"] = "Code Geass"
+            payload["series"][0]["season_title"] = "Code Geass: Lelouch of the Rebellion Movies"
+            payload["series"][0]["season_number"] = 13
+            payload["watchlist"][0]["provider_series_id"] = "code-geass-movies"
+            _replace_progress_with_completed_episodes(payload, "code-geass-movies", 25)
+            ingest_snapshot_payload(payload, config)
+            _write_test_mal_secret_files(root)
+            candidates = [
+                {
+                    "id": 1575,
+                    "title": "Code Geass: Hangyaku no Lelouch",
+                    "alternative_titles": {"en": "Code Geass: Lelouch of the Rebellion", "synonyms": []},
+                    "media_type": "tv",
+                    "num_episodes": 25,
+                },
+                {
+                    "id": 34438,
+                    "title": "Code Geass: Hangyaku no Lelouch I - Koudou",
+                    "alternative_titles": {"en": "Code Geass: Lelouch of the Rebellion I - Initiation", "synonyms": []},
+                    "media_type": "movie",
+                    "num_episodes": 1,
+                },
+            ]
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": node} for node in candidates]}):
+                items = build_mapping_review(config, limit=5, mapping_limit=5)
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+                queue_result = persist_mapping_review_queue(config, items)
+                open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("auto_classified_provider_shell", items[0].decision)
+        self.assertIn("auto_classified_provider_shell_non_actionable", items[0].reasons)
+        self.assertTrue(any(reason.startswith("provider_aggregate_title_shell_non_actionable=") for reason in items[0].reasons))
+        self.assertEqual([], persisted)
+        self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
+        self.assertEqual([], open_rows)
+
     def test_build_mapping_review_keeps_uncertain_alias_only_bundle_in_review_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -6517,11 +7617,11 @@ class DryRunPlannerTests(unittest.TestCase):
                 open_rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].decision, "needs_review")
+        self.assertEqual(items[0].decision, "auto_classified_ambiguous_exact_title")
         self.assertIn("multi_entry_bundle_suspected=28<=14+14", items[0].reasons)
-        self.assertNotIn("auto_classified_multi_entry_bundle_non_actionable", items[0].reasons)
-        self.assertEqual({"resolved": 0, "inserted": 1}, queue_result)
-        self.assertEqual(["series-123"], [row.provider_series_id for row in open_rows])
+        self.assertIn("auto_classified_ambiguous_exact_title_non_actionable", items[0].reasons)
+        self.assertEqual({"resolved": 0, "inserted": 0}, queue_result)
+        self.assertEqual([], [row.provider_series_id for row in open_rows])
 
     def test_build_mapping_review_surfaces_bundle_companion_for_multi_entry_residue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -6577,7 +7677,7 @@ class DryRunPlannerTests(unittest.TestCase):
                 items = build_mapping_review(config, limit=5, mapping_limit=5)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].decision, "auto_approved")
+        self.assertEqual(items[0].decision, "auto_classified_ambiguous_exact_title")
         self.assertEqual(MAPPING_REVIEW_HEURISTICS_REVISION, items[0].mapper_revision)
         self.assertEqual(MAPPING_REVIEW_HEURISTICS_REVISION, items[0].as_dict()["mapper_revision"])
         self.assertEqual(849, items[0].suggested_mal_anime_id)
@@ -6586,7 +7686,7 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(items[0].bundle_companion_candidate["num_episodes"], 14)
         self.assertEqual(1, len(items[0].bundle_companion_candidates))
         self.assertEqual({4382}, {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates})
-        self.assertIn("auto_approved_exact_unique_match", items[0].reasons)
+        self.assertIn("auto_classified_ambiguous_exact_title_non_actionable", items[0].reasons)
 
     def test_build_mapping_review_surfaces_all_bundle_companions_for_three_entry_residue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -6654,10 +7754,10 @@ class DryRunPlannerTests(unittest.TestCase):
                 items = build_mapping_review(config, limit=5, mapping_limit=5)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].decision, "auto_approved")
+        self.assertEqual(items[0].decision, "auto_classified_aggregate_progress")
         self.assertEqual({1002, 1003}, {candidate["mal_anime_id"] for candidate in items[0].bundle_companion_candidates})
         self.assertIn(items[0].bundle_companion_candidate["mal_anime_id"], {1002, 1003})
-        self.assertIn("auto_approved_exact_unique_match", items[0].reasons)
+        self.assertIn("auto_classified_aggregate_progress_non_actionable", items[0].reasons)
 
     def test_build_dry_run_sync_plan_uses_user_approved_mapping_without_search(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -6792,6 +7892,50 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertIsNone(proposal.mal_anime_id)
         self.assertFalse(proposal.persisted_mapping_approved)
         self.assertIn("auto_classified_multi_entry_bundle_non_actionable", proposal.reasons)
+        self.assertEqual([], persisted)
+
+    def test_build_dry_run_sync_plan_keeps_aggregate_progress_exact_installment_unmapped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["series"][0]["provider_series_id"] = "blue-night-saga"
+            payload["series"][0]["title"] = "Blue Exorcist"
+            payload["series"][0]["season_title"] = "Blue Exorcist -The Blue Night Saga-"
+            payload["series"][0]["season_number"] = 5
+            payload["watchlist"][0]["provider_series_id"] = "blue-night-saga"
+            _replace_progress_with_completed_episodes(payload, "blue-night-saga", 25)
+            ingest_snapshot_payload(payload, config)
+            _write_test_mal_secret_files(root)
+            candidate = {
+                "id": 59226,
+                "title": "Ao no Exorcist: Yosuga-hen",
+                "alternative_titles": {"en": "Blue Exorcist: The Blue Night Saga", "synonyms": ["Blue Exorcist Season 5"]},
+                "media_type": "tv",
+                "num_episodes": 12,
+            }
+
+            def fake_get_anime_details(anime_id: int, fields: str | None = None) -> dict:
+                if fields and "my_list_status" in fields:
+                    raise AssertionError("aggregate progress must not resolve to one MAL status details lookup")
+                raise MalApiError("offline")
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": candidate}]}), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_get_anime_details,
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=5)
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+
+        self.assertEqual(len(proposals), 1)
+        proposal = proposals[0]
+        self.assertEqual(proposal.decision, "review")
+        self.assertIsNone(proposal.mal_anime_id)
+        self.assertFalse(proposal.persisted_mapping_approved)
+        self.assertIn("auto_classified_aggregate_progress_non_actionable", proposal.reasons)
+        self.assertTrue(any(reason.startswith("aggregate_progress_non_actionable=") for reason in proposal.reasons))
         self.assertEqual([], persisted)
 
     def test_build_dry_run_sync_plan_keeps_verified_gintama_aggregate_unmapped(self) -> None:
@@ -6948,6 +8092,76 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertFalse(proposal.persisted_mapping_approved)
         self.assertIn("provider_aggregate_shell_non_actionable", proposal.reasons)
         self.assertTrue(any(reason.startswith("provider_franchise_shell_child_match_non_actionable=") for reason in proposal.reasons))
+        self.assertEqual([], persisted)
+
+    def test_build_dry_run_sync_plan_classified_provider_shell_creates_no_mapping_or_write_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            _write_test_mal_secret_files(root)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "GYQ4MKDZ6",
+                        "Gintama",
+                        "Gintama",
+                        None,
+                        json.dumps({"raw": {"series_metadata": {"episode_count": 382, "season_count": 8}}}),
+                    ),
+                )
+                conn.commit()
+            upsert_recommendation_provider_eligibility_evidence(
+                config.db_path,
+                mal_anime_id=918,
+                provider="crunchyroll",
+                provider_series_id="GYQ4MKDZ6",
+                provider_title="Gintama",
+                identity_match_kind="provider_title_search_exact",
+                match_confidence=0.9,
+                review_status="verified",
+                catalog_status="present",
+                english_dub_status="present",
+                fetched_at="2026-07-24T00:00:00Z",
+                expires_at="2026-07-31T00:00:00Z",
+                source_evidence={"identity_evidence": None},
+            )
+            gintama_918 = {
+                "id": 918,
+                "title": "Gintama",
+                "alternative_titles": {"en": "Gintama", "synonyms": []},
+                "media_type": "tv",
+                "status": "finished_airing",
+                "num_episodes": 201,
+            }
+
+            def fake_get_anime_details(anime_id: int, fields: str | None = None) -> dict:
+                if fields and "my_list_status" in fields:
+                    raise AssertionError("classified provider shell must not resolve to one MAL write details lookup")
+                return gintama_918
+
+            with patch.object(MalClient, "search_anime", return_value={"data": [{"node": gintama_918}]}), patch.object(
+                MalClient,
+                "get_anime_details",
+                side_effect=fake_get_anime_details,
+            ):
+                proposals = build_dry_run_sync_plan(config, limit=5, mapping_limit=5)
+                persisted = list_series_mappings(config.db_path, provider="crunchyroll")
+
+        self.assertEqual(1, len(proposals))
+        proposal = proposals[0]
+        self.assertEqual("review", proposal.decision)
+        self.assertEqual("ambiguous", proposal.mapping_status)
+        self.assertIsNone(proposal.mal_anime_id)
+        self.assertFalse(proposal.persisted_mapping_approved)
+        self.assertIn("auto_classified_provider_shell_non_actionable", proposal.reasons)
+        self.assertIn("provider_aggregate_shell_non_actionable", proposal.reasons)
         self.assertEqual([], persisted)
 
     def test_build_dry_run_sync_plan_can_require_approved_mappings_only(self) -> None:

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from mal_updater.config import load_config
 from mal_updater.db import (
     bootstrap_database,
+    connect,
     get_recommendation_provider_enrichment_cursor,
     get_recommendation_provider_eligibility_evidence,
     get_series_mapping,
@@ -21,8 +22,10 @@ from mal_updater.db import (
     upsert_recommendation_provider_eligibility_evidence,
     upsert_series_mapping,
 )
+from mal_updater.mapping import extract_provider_mapping_evidence
 from mal_updater.provider_registry import get_provider
 from mal_updater.provider_types import ProviderSearchResult
+from mal_updater.recommendation_actionability import is_strict_provider_eligibility_actionable
 from mal_updater import providers as _providers  # noqa: F401 - register provider instances
 from mal_updater import recommendation_enrichment as enrichment
 
@@ -128,6 +131,82 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         }
         match.update(overrides)
         return match
+
+    def _insert_provider_series(self, *, provider: str = "crunchyroll", provider_series_id: str, title: str, raw: dict | None = None) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(provider, provider_series_id) DO UPDATE SET
+                    title = excluded.title,
+                    season_title = excluded.season_title,
+                    raw_json = excluded.raw_json,
+                    last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (provider, provider_series_id, title, title, json.dumps(raw or {}, sort_keys=True)),
+            )
+            conn.commit()
+
+    def _prepare_approved_exact_provider_mapping(
+        self,
+        *,
+        mal_id: int,
+        provider_series_id: str,
+        title: str,
+        provider_raw: dict | None = None,
+        mapping_mal_id: int | None = None,
+        target_episode_count: int = 12,
+    ):
+        self._insert_meta(mal_id, title=title, english=title, num_episodes=target_episode_count)
+        if mapping_mal_id is not None and mapping_mal_id != mal_id:
+            self._insert_meta(mapping_mal_id, title=f"{title} Current Mapping", english=f"{title} Current Mapping", num_episodes=target_episode_count)
+        self._insert_provider_series(provider_series_id=provider_series_id, title=title, raw=provider_raw)
+        return upsert_series_mapping(
+            self.config.db_path,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            mal_anime_id=mapping_mal_id if mapping_mal_id is not None else mal_id,
+            confidence=0.99,
+            mapping_source="user_exact",
+            approved_by_user=True,
+            notes=None,
+        )
+
+    def _insert_legacy_provider_eligibility(
+        self,
+        *,
+        mal_id: int,
+        provider_series_id: str,
+        title: str,
+        english_dub_status: str,
+        audio_locales: list[str],
+        identity_match_kind: str = "provider_title_search",
+        review_status: str = "review-needed",
+        logic_version: str = "legacy-v1",
+        source_evidence: dict | None = None,
+        last_verified_at: str | None = None,
+    ):
+        return upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            provider_title=title,
+            provider_url=f"https://example.test/{provider_series_id}",
+            identity_match_kind=identity_match_kind,
+            match_confidence=0.42,
+            review_status=review_status,
+            catalog_status="present",
+            english_dub_status=english_dub_status,
+            explicit_dub_evidence_source="provider_audio_locale" if english_dub_status == "present" else None,
+            audio_locales=list(audio_locales),
+            source_evidence=source_evidence or {"source": "legacy_provider_eligibility_test"},
+            fetched_at="2026-07-01T00:00:00Z",
+            expires_at="2026-07-08T00:00:00Z",
+            last_verified_at=last_verified_at,
+            logic_version=logic_version,
+        )
 
     def _review_entry(self, *, decision="strong_provider_search_candidate_no_auto_link", query="Merge Show", audio_locales=None, **match_overrides):
         match = self._provider_match(audio_locales=audio_locales, **match_overrides)
@@ -689,6 +768,510 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(0, evidence.failure_count)
         self.assertIsNone(evidence.next_retry_at)
         self.assertEqual(enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION, evidence.logic_version)
+
+    def test_legacy_same_target_single_installment_present_dub_reconciles_to_verified_mapping(self):
+        mal_id = 930
+        provider_series_id = "cr-legacy-single-present"
+        title = "Legacy Single Present"
+        provider_raw = {"episode_count": 12, "season_count": 1}
+        self.assertEqual(12, extract_provider_mapping_evidence(provider_raw).episode_count)
+        mapping = self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw=provider_raw,
+            target_episode_count=12,
+        )
+        original = self._insert_legacy_provider_eligibility(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            english_dub_status="present",
+            audio_locales=["en-US", "ja-JP"],
+            source_evidence={
+                "source": "legacy_provider_eligibility_test",
+                "match": {"provider_series_id": provider_series_id, "title": title, "episode_count": 12, "audio_locales": ["en-US", "ja-JP"]},
+            },
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mapping.mal_anime_id,
+            provider=mapping.provider,
+            provider_series_id=mapping.provider_series_id,
+        )
+        self.assertEqual(1, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(0, summary.legacy_eligibility_rows_deleted)
+        self.assertEqual(1, summary.as_dict()["legacy_eligibility_rows_reconciled"])
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("approved_mapping", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual(mapping.confidence, evidence.match_confidence)
+        self.assertEqual("present", evidence.catalog_status)
+        self.assertEqual("present", evidence.english_dub_status)
+        self.assertEqual(["en-US", "ja-JP"], evidence.audio_locales)
+        self.assertEqual(original.source_evidence, evidence.source_evidence)
+        self.assertEqual(original.fetched_at, evidence.fetched_at)
+        self.assertEqual(original.expires_at, evidence.expires_at)
+        self.assertIsNone(evidence.last_verified_at)
+        self.assertEqual(enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION, evidence.logic_version)
+
+    def test_legacy_same_target_explicit_dub_absent_reconciles_verified_but_non_actionable(self):
+        mal_id = 931
+        provider_series_id = "cr-legacy-single-absent"
+        title = "Legacy Single Absent"
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw={"episode_count": 12, "season_count": 1},
+            target_episode_count=12,
+        )
+        self._insert_legacy_provider_eligibility(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            english_dub_status="absent",
+            audio_locales=["ja-JP"],
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        )
+        self.assertEqual(1, summary.legacy_eligibility_rows_reconciled)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("approved_mapping", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual("absent", evidence.english_dub_status)
+        self.assertEqual(["ja-JP"], evidence.audio_locales)
+        self.assertIsNone(evidence.last_verified_at)
+        self.assertFalse(is_strict_provider_eligibility_actionable(evidence, now="2026-07-02T00:00:00Z"))
+
+    def test_legacy_wrong_target_mapping_deletes_without_retargeting(self):
+        stale_mal_id = 932
+        current_mal_id = 933
+        provider_series_id = "cr-legacy-wrong-target"
+        title = "Legacy Wrong Target"
+        mapping = self._prepare_approved_exact_provider_mapping(
+            mal_id=stale_mal_id,
+            mapping_mal_id=current_mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw={"episode_count": 12, "season_count": 1},
+            target_episode_count=12,
+        )
+        self._insert_legacy_provider_eligibility(
+            mal_id=stale_mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            english_dub_status="present",
+            audio_locales=["en-US"],
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(1, summary.legacy_eligibility_rows_deleted)
+        self.assertIsNone(get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=stale_mal_id,
+            provider=mapping.provider,
+            provider_series_id=mapping.provider_series_id,
+        ))
+        self.assertIsNone(get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=current_mal_id,
+            provider=mapping.provider,
+            provider_series_id=mapping.provider_series_id,
+        ))
+
+    def test_legacy_same_target_aggregate_parent_deletes_generic_parent_evidence(self):
+        mal_id = 934
+        provider_series_id = "cr-legacy-aggregate-parent"
+        title = "Legacy Aggregate Parent"
+        provider_raw = {"series_metadata": {"season_count": 3, "episode_count": 36}}
+        provider_evidence = extract_provider_mapping_evidence(provider_raw)
+        self.assertEqual(3, provider_evidence.season_count)
+        self.assertEqual(36, provider_evidence.episode_count)
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw=provider_raw,
+            target_episode_count=12,
+        )
+        self._insert_legacy_provider_eligibility(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            english_dub_status="present",
+            audio_locales=["en-US"],
+            source_evidence={"source": "legacy_provider_eligibility_test", "match": {"provider_series_id": provider_series_id, "title": title, "raw": provider_raw}},
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(1, summary.legacy_eligibility_rows_deleted)
+        self.assertIsNone(get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        ))
+
+    def test_verified_franchise_shell_child_evidence_is_preserved_during_legacy_reconciliation(self):
+        mal_id = 935
+        provider_series_id = "cr-legacy-child-preserved"
+        title = "Legacy Child Preserved"
+        provider_raw = {"series_metadata": {"season_count": 3, "episode_count": 36}}
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw=provider_raw,
+            target_episode_count=12,
+        )
+        child_identity = {"id": "season-1", "title": title, "episode_count": 12}
+        source_evidence = {
+            "source": "bounded_provider_title_search",
+            "identity_evidence": {
+                "identity_match_kind": "provider_franchise_shell_child_match",
+                "child_title": title,
+                "child_identity": child_identity,
+                "parent_episode_count": 36,
+                "parent_season_count": 3,
+            },
+        }
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            provider_title=title,
+            identity_match_kind="provider_franchise_shell_child_match",
+            match_confidence=0.88,
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            explicit_dub_evidence_source="provider_audio_locale",
+            audio_locales=["en-US", "ja-JP"],
+            source_evidence=source_evidence,
+            fetched_at="2026-07-01T00:00:00Z",
+            expires_at="2026-07-08T00:00:00Z",
+            last_verified_at="2026-07-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        )
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(0, summary.legacy_eligibility_rows_deleted)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("provider_franchise_shell_child_match", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual(child_identity, evidence.source_evidence["identity_evidence"]["child_identity"])
+        self.assertEqual("2026-07-01T00:00:00Z", evidence.last_verified_at)
+        self.assertTrue(is_strict_provider_eligibility_actionable(evidence, now="2026-07-02T00:00:00Z"))
+
+    def test_current_verified_approved_mapping_survives_same_target_multi_season_provider_shell(self):
+        mal_id = 936
+        provider_series_id = "cr-current-long-title-split-seasons"
+        title = "Current Long Title Split Across Provider Seasons"
+        provider_raw = {"series_metadata": {"season_count": 3, "episode_count": 24}}
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw=provider_raw,
+            target_episode_count=24,
+        )
+        original = upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            provider_title=title,
+            provider_url=f"https://example.test/{provider_series_id}",
+            identity_match_kind="approved_mapping",
+            match_confidence=0.99,
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            explicit_dub_evidence_source="provider_audio_locale",
+            audio_locales=["en-US", "ja-JP"],
+            source_evidence={"source": "current_approved_mapping_regression", "raw": provider_raw},
+            fetched_at="2026-07-01T00:00:00Z",
+            expires_at="2026-07-08T00:00:00Z",
+            last_verified_at="2026-07-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        )
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(0, summary.legacy_eligibility_rows_deleted)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(original.identity_match_kind, evidence.identity_match_kind)
+        self.assertEqual(original.review_status, evidence.review_status)
+        self.assertEqual(original.logic_version, evidence.logic_version)
+        self.assertEqual(original.source_evidence, evidence.source_evidence)
+        self.assertEqual(original.fetched_at, evidence.fetched_at)
+        self.assertEqual(original.expires_at, evidence.expires_at)
+        self.assertEqual(original.last_verified_at, evidence.last_verified_at)
+
+    def test_current_verified_provider_detail_logic_is_not_legacy_rewritten_by_mapping_refresh(self):
+        mal_id = 937
+        provider_series_id = "cr-current-detail-logic"
+        title = "Current Detail Logic"
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw={"episode_count": 12, "season_count": 1},
+            target_episode_count=12,
+        )
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            provider_title=title,
+            identity_match_kind="provider_title_search_exact",
+            match_confidence=0.9,
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            explicit_dub_evidence_source="provider_audio_locale",
+            audio_locales=["en-US"],
+            source_evidence={"source": "current_detail_logic_regression"},
+            fetched_at="2026-07-01T00:00:00Z",
+            expires_at="2026-07-08T00:00:00Z",
+            last_verified_at="2026-07-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+        )
+        self._recommendations(mal_id)
+        provider = FakeProvider([
+            self._provider_match(
+                provider_series_id=provider_series_id,
+                title=title,
+                season_title=title,
+                audio_locales=["en-US"],
+            )
+        ])
+        provider.slug = "crunchyroll"
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            queries_per_candidate=1,
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        )
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual([], summary.selected_candidates)
+        self.assertEqual([], provider.calls)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual(enrichment.PROVIDER_DETAIL_CACHE_LOGIC_VERSION, evidence.logic_version)
+
+    def test_pending_current_logic_same_target_reconciles_to_verified_mapping(self):
+        mal_id = 938
+        provider_series_id = "cr-pending-current-logic"
+        title = "Pending Current Logic"
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw={"episode_count": 12, "season_count": 1},
+            target_episode_count=12,
+        )
+        self._insert_legacy_provider_eligibility(
+            mal_id=mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            english_dub_status="present",
+            audio_locales=["en-US"],
+            review_status="unknown",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        )
+        self.assertEqual(1, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(0, summary.legacy_eligibility_rows_deleted)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("approved_mapping", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
+        self.assertEqual(enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION, evidence.logic_version)
+
+    def test_wrong_target_current_verified_approved_mapping_still_deletes(self):
+        stale_mal_id = 939
+        current_mal_id = 940
+        provider_series_id = "cr-current-wrong-target"
+        title = "Current Wrong Target"
+        mapping = self._prepare_approved_exact_provider_mapping(
+            mal_id=stale_mal_id,
+            mapping_mal_id=current_mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw={"episode_count": 12, "season_count": 1},
+            target_episode_count=12,
+        )
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=stale_mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+            provider_title=title,
+            identity_match_kind="approved_mapping",
+            match_confidence=0.99,
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            explicit_dub_evidence_source="provider_audio_locale",
+            audio_locales=["en-US"],
+            source_evidence={"source": "wrong_target_current_verified_regression"},
+            fetched_at="2026-07-01T00:00:00Z",
+            expires_at="2026-07-08T00:00:00Z",
+            last_verified_at="2026-07-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        self._recommendations()
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[],
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual(1, summary.legacy_eligibility_rows_deleted)
+        self.assertIsNone(get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=stale_mal_id,
+            provider=mapping.provider,
+            provider_series_id=mapping.provider_series_id,
+        ))
+
+    def test_legacy_reconciliation_scans_rows_outside_recommendation_candidate_set(self):
+        outside_mal_id = 941
+        inside_mal_id = 942
+        provider_series_id = "cr-legacy-outside-candidate"
+        title = "Legacy Outside Candidate"
+        self._prepare_approved_exact_provider_mapping(
+            mal_id=outside_mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            provider_raw={"episode_count": 12, "season_count": 1},
+            target_episode_count=12,
+        )
+        self._insert_legacy_provider_eligibility(
+            mal_id=outside_mal_id,
+            provider_series_id=provider_series_id,
+            title=title,
+            english_dub_status="present",
+            audio_locales=["en-US"],
+        )
+        self._insert_meta(inside_mal_id, english="Only Ranked Candidate")
+        self._recommendations(inside_mal_id)
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=0,
+            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=outside_mal_id,
+            provider="crunchyroll",
+            provider_series_id=provider_series_id,
+        )
+        self.assertEqual(1, summary.legacy_eligibility_rows_reconciled)
+        self.assertEqual([], summary.selected_candidates)
+        self.assertEqual([], provider.calls)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual("approved_mapping", evidence.identity_match_kind)
+        self.assertEqual("verified", evidence.review_status)
 
     def test_strong_exact_match_with_english_audio_coalesces_discovery_review_evidence(self):
         self._insert_meta(202, english="Delicious in Dungeon")
@@ -1782,14 +2365,16 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             provider="hidive",
             provider_series_id="707",
         )
-        self.assertEqual(1, summary.verified_eligibility_evidence_upserted)
+        self.assertEqual(0, summary.verified_eligibility_evidence_upserted)
+        self.assertEqual(0, summary.legacy_eligibility_rows_reconciled)
         self.assertIsNotNone(evidence)
         assert evidence is not None
-        self.assertEqual("approved_mapping", evidence.identity_match_kind)
+        self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("present", evidence.catalog_status)
         self.assertEqual("present", evidence.english_dub_status)
-        self.assertEqual("2026-07-26T01:00:00Z", evidence.expires_at)
+        self.assertEqual("2026-07-26T00:00:00Z", evidence.expires_at)
+        self.assertEqual("2026-07-19T00:00:00Z", evidence.last_verified_at)
 
     def test_enrichment_title_only_english_dub_without_audio_locales_is_not_strict_actionable(self):
         self._insert_meta(708, english="Title Only Dub")

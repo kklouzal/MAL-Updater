@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -7,7 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import load_config
-from mal_updater.db import bootstrap_database, connect, upsert_mal_anime_detail_cache
+from mal_updater.db import (
+    bootstrap_database,
+    connect,
+    list_covering_mal_anime_detail_cache_nodes,
+    upsert_mal_anime_detail_cache,
+)
 from mal_updater.mal_client import MAL_DETAIL_CACHE_LOGIC_VERSION, MalClient
 
 
@@ -61,6 +67,56 @@ class NicenessCacheTests(unittest.TestCase):
             self.assertEqual("Cached", self.client.get_anime_details(7, fields="id,title")["title"])
             self.assertEqual("Network", self.client.get_anime_details(7, fields="id,title,status")["title"])
         self.assertEqual(1, get.call_count)
+
+    def test_covering_detail_cache_listing_dedupes_and_rejects_unusable_rows(self) -> None:
+        required_fields = {"id", "title", "alternative_titles", "media_type", "status", "num_episodes", "start_season"}
+        valid_node = {
+            "id": 52736,
+            "title": "Tensei Oujo to Tensai Reijou no Mahou Kakumei",
+            "alternative_titles": {
+                "en": "The Magical Revolution of the Reincarnated Princess and the Genius Young Lady",
+                "synonyms": [],
+            },
+            "media_type": "tv",
+            "status": "finished_airing",
+            "num_episodes": 12,
+            "start_season": {"year": 2023, "season": "winter"},
+        }
+        fields_key = ",".join(sorted(required_fields))
+        broader_fields_key = ",".join(sorted(required_fields | {"related_anime"}))
+        broadest_fields_key = ",".join(sorted(required_fields | {"related_anime", "synopsis"}))
+        rows = (
+            (52736, broadest_fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {**valid_node, "title": ""}, "2026-07-26T17:15:00Z", "2999-01-01T00:00:00Z"),
+            (52736, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", valid_node, "2026-07-26T17:00:00Z", "2999-01-01T00:00:00Z"),
+            (52736, f"{broader_fields_key},ranking", MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {**valid_node, "title": "Older duplicate"}, "2026-07-26T16:00:00Z", "2999-01-01T00:00:00Z"),
+            (1, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {**valid_node, "id": 1}, "2026-07-26T17:00:00Z", "2026-07-26T17:00:00Z"),
+            (2, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "failed", {**valid_node, "id": 2}, "2026-07-26T17:00:00Z", "2999-01-01T00:00:00Z"),
+            (3, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", "not-json", "2026-07-26T17:00:00Z", "2999-01-01T00:00:00Z"),
+            (4, "id,title", MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {**valid_node, "id": 4}, "2026-07-26T17:00:00Z", "2999-01-01T00:00:00Z"),
+            (5, fields_key, "old-logic", "ok", {**valid_node, "id": 5}, "2026-07-26T17:00:00Z", "2999-01-01T00:00:00Z"),
+            (6, fields_key, MAL_DETAIL_CACHE_LOGIC_VERSION, "ok", {**valid_node, "id": 60}, "2026-07-26T17:00:00Z", "2999-01-01T00:00:00Z"),
+        )
+        with connect(self.config.db_path) as conn:
+            for anime_id, fields_key, logic_version, status, response, fetched_at, expires_at in rows:
+                response_json = response if isinstance(response, str) else json.dumps(response)
+                conn.execute(
+                    """
+                    INSERT INTO mal_anime_detail_cache (
+                        mal_anime_id, fields_key, logic_version, status, response_json, fetched_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (anime_id, fields_key, logic_version, status, response_json, fetched_at, expires_at),
+                )
+            conn.commit()
+
+        nodes = list_covering_mal_anime_detail_cache_nodes(
+            self.config.db_path,
+            required_fields=required_fields,
+            logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+            now="2026-07-26T17:30:00Z",
+        )
+
+        self.assertEqual([valid_node], nodes)
 
 
 if __name__ == "__main__":

@@ -21,8 +21,19 @@ from .mapping import SeriesMappingInput, extract_provider_mapping_evidence, map_
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
 MAPPING_REVIEW_HEURISTICS_REVISION = "2026-07-24b"
+AUTO_CLASSIFIED_PROVIDER_SHELL_DECISION = "auto_classified_provider_shell"
+AUTO_CLASSIFIED_AGGREGATE_PROGRESS_DECISION = "auto_classified_aggregate_progress"
+AUTO_CLASSIFIED_AMBIGUOUS_EXACT_TITLE_DECISION = "auto_classified_ambiguous_exact_title"
 MAPPING_REVIEW_NO_QUEUE_DECISIONS = frozenset(
-    {"preserved", "auto_approved", "ready_for_approval", "auto_classified_bundle"}
+    {
+        "preserved",
+        "auto_approved",
+        "ready_for_approval",
+        "auto_classified_bundle",
+        AUTO_CLASSIFIED_PROVIDER_SHELL_DECISION,
+        AUTO_CLASSIFIED_AGGREGATE_PROGRESS_DECISION,
+        AUTO_CLASSIFIED_AMBIGUOUS_EXACT_TITLE_DECISION,
+    }
 )
 
 
@@ -517,7 +528,16 @@ def build_mapping_review(
         if mapping.is_deterministic_multi_entry_bundle():
             decision = "auto_classified_bundle"
             reasons.append("auto_classified_multi_entry_bundle_non_actionable")
+        elif mapping.has_deterministic_aggregate_progress_classification():
+            decision = AUTO_CLASSIFIED_AGGREGATE_PROGRESS_DECISION
+            reasons.append("auto_classified_aggregate_progress_non_actionable")
+        elif mapping.has_deterministic_ambiguous_exact_title_classification():
+            decision = AUTO_CLASSIFIED_AMBIGUOUS_EXACT_TITLE_DECISION
+            reasons.append("auto_classified_ambiguous_exact_title_non_actionable")
         elif mapping.has_provider_aggregate_shell_protection():
+            if mapping.has_deterministic_provider_shell_classification():
+                decision = AUTO_CLASSIFIED_PROVIDER_SHELL_DECISION
+                reasons.append("auto_classified_provider_shell_non_actionable")
             reasons.append("provider_aggregate_shell_non_actionable")
         elif should_auto_approve_mapping(mapping) and mapping.chosen_candidate:
             effective_mapping = _auto_approve_mapping(config, state, mapping.confidence, mapping.chosen_candidate.mal_anime_id)
@@ -1033,7 +1053,15 @@ def _resolve_mapping_for_sync(
     if mapping.is_deterministic_multi_entry_bundle():
         mapping_reasons.append("auto_classified_multi_entry_bundle_non_actionable")
         return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
+    if mapping.has_deterministic_aggregate_progress_classification():
+        mapping_reasons.append("auto_classified_aggregate_progress_non_actionable")
+        return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
+    if mapping.has_deterministic_ambiguous_exact_title_classification():
+        mapping_reasons.append("auto_classified_ambiguous_exact_title_non_actionable")
+        return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
     if mapping.has_provider_aggregate_shell_protection():
+        if mapping.has_deterministic_provider_shell_classification():
+            mapping_reasons.append("auto_classified_provider_shell_non_actionable")
         mapping_reasons.append("provider_aggregate_shell_non_actionable")
         return (mapping.status, mapping.confidence, None, mapping_source, False, mapping_reasons)
     if should_auto_approve_mapping(mapping) and mapping.chosen_candidate:

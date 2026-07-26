@@ -14,11 +14,14 @@ from mal_updater.db import (
     bootstrap_database,
     connect,
     list_review_queue_entries,
+    list_series_mappings,
     replace_review_queue_entries,
     update_review_queue_entry_statuses,
     insert_recommendation_snapshot_rows,
+    upsert_recommendation_provider_eligibility_evidence,
 )
 from mal_updater.ingestion import ingest_snapshot_payload
+from mal_updater.mal_client import MalClient
 from tests.test_validation_ingestion import sample_snapshot
 
 
@@ -888,6 +891,82 @@ class ReviewQueueCliTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(1, len(payload))
         self.assertEqual("series-60", payload[0]["provider_series_id"])
+
+    def test_refresh_mapping_review_queue_resolves_deterministic_provider_shell_without_new_open_row_or_mapping(self) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "crunchyroll",
+                    "GYQ4MKDZ6",
+                    "Gintama",
+                    "Gintama",
+                    None,
+                    json.dumps({"raw": {"series_metadata": {"episode_count": 382, "season_count": 8}}}),
+                ),
+            )
+            conn.commit()
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path,
+            mal_anime_id=918,
+            provider="crunchyroll",
+            provider_series_id="GYQ4MKDZ6",
+            provider_title="Gintama",
+            identity_match_kind="provider_title_search_exact",
+            match_confidence=0.9,
+            review_status="verified",
+            catalog_status="present",
+            english_dub_status="present",
+            fetched_at="2026-07-24T00:00:00Z",
+            expires_at="2026-07-31T00:00:00Z",
+            source_evidence={"identity_evidence": None},
+        )
+        replace_review_queue_entries(
+            self.config.db_path,
+            issue_type="mapping_review",
+            entries=[
+                {
+                    "provider": "crunchyroll",
+                    "provider_series_id": "GYQ4MKDZ6",
+                    "severity": "warning",
+                    "payload": {"decision": "needs_review", "crunchyroll_title": "Gintama", "reasons": ["stale"]},
+                }
+            ],
+        )
+        gintama_918 = {
+            "id": 918,
+            "title": "Gintama",
+            "alternative_titles": {"en": "Gintama", "synonyms": []},
+            "media_type": "tv",
+            "status": "finished_airing",
+            "num_episodes": 201,
+        }
+        argv = [
+            "mal-updater",
+            "--project-root",
+            str(self.project_root),
+            "refresh-mapping-review-queue",
+            "--provider-series-id",
+            "GYQ4MKDZ6",
+        ]
+
+        with patch.object(MalClient, "search_anime", return_value={"data": [{"node": gintama_918}]}), patch.object(
+            MalClient,
+            "get_anime_details",
+            return_value=gintama_918,
+        ), patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual({"resolved": 1, "inserted": 0}, payload["review_queue"])
+        self.assertEqual("auto_classified_provider_shell", payload["items"][0]["decision"])
+        self.assertIn("auto_classified_provider_shell_non_actionable", payload["items"][0]["reasons"])
+        self.assertEqual([], list_review_queue_entries(self.config.db_path, status="open", issue_type="mapping_review"))
+        self.assertEqual([], list_series_mappings(self.config.db_path, provider="crunchyroll"))
 
     def test_list_review_queue_decision_filter_returns_only_matching_rows(self) -> None:
         replace_review_queue_entries(

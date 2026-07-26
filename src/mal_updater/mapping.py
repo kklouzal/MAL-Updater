@@ -4,6 +4,7 @@ import re
 import unicodedata
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from functools import lru_cache
 from itertools import combinations
@@ -21,6 +22,7 @@ _AUTO_APPROVAL_BLOCKERS = (
     "provider_episode_count_mismatch=",
     "provider_start_year_mismatch=",
     "provider_aggregate_shell_suspected=",
+    "provider_aggregate_title_shell_non_actionable=",
     "provider_franchise_shell_child_match_non_actionable=",
 )
 
@@ -61,6 +63,7 @@ _CANDIDATE_WEAKNESS_REASON_PREFIXES = (
     "provider_episode_count_mismatch=",
     "provider_start_year_mismatch=",
     "provider_aggregate_shell_suspected=",
+    "provider_aggregate_title_shell_non_actionable=",
     "provider_franchise_shell_child_match_non_actionable=",
     "base_installment_penalty_for_explicit_later_season",
     "candidate_auxiliary_content=",
@@ -72,6 +75,14 @@ _BUNDLE_DISQUALIFYING_REASON_PREFIXES = (
     "base_installment_penalty_for_explicit_later_season",
 )
 _MULTI_ENTRY_BUNDLE_REASON_PREFIX = "multi_entry_bundle_suspected="
+_AGGREGATE_PROGRESS_REASON_PREFIX = "aggregate_progress_non_actionable="
+_AMBIGUOUS_EXACT_TITLE_REASON_PREFIX = "ambiguous_exact_title_non_actionable="
+_AGGREGATE_TITLE_SHELL_REASON_PREFIX = "provider_aggregate_title_shell_non_actionable="
+_NON_ACTIONABLE_SHELL_REASON_PREFIXES = (
+    "provider_aggregate_shell_suspected=",
+    _AGGREGATE_TITLE_SHELL_REASON_PREFIX,
+    "provider_franchise_shell_child_match_non_actionable=",
+)
 _DETERMINISTIC_BUNDLE_MIN_SCORE = 0.99
 _DETERMINISTIC_BUNDLE_CLOSE_COMPETITOR_GAP = 0.12
 _MAPPING_SEARCH_FIELDS = "id,title,alternative_titles,media_type,status,num_episodes,start_season"
@@ -79,7 +90,7 @@ _PROVIDER_EPISODE_COUNT_FIELDS = ("episode_count", "number_of_episodes", "num_ep
 _PROVIDER_TRUSTWORTHY_YEAR_FIELDS = ("broadcast_year", "release_year", "start_year", "air_year")
 _PROVIDER_CONDITIONAL_LAUNCH_YEAR_FIELDS = ("series_launch_year", "launch_year")
 
-from .mal_client import MAL_ANIME_SEARCH_QUERY_MAX_CHARS, MalApiError, MalClient
+from .mal_client import MAL_ANIME_SEARCH_QUERY_MAX_CHARS, MAL_DETAIL_CACHE_LOGIC_VERSION, MalApiError, MalClient
 
 _TITLE_CLEANUPS = [
     re.compile(r"\(english dub\)", re.IGNORECASE),
@@ -320,10 +331,44 @@ class MappingResult:
         reasons = [*self.rationale]
         if self.chosen_candidate is not None:
             reasons.extend(self.chosen_candidate.match_reasons)
-        return any(
-            reason.startswith(("provider_aggregate_shell_suspected=", "provider_franchise_shell_child_match_non_actionable="))
-            for reason in reasons
+        return any(reason.startswith(_NON_ACTIONABLE_SHELL_REASON_PREFIXES) for reason in reasons)
+
+    def has_deterministic_provider_shell_classification(self) -> bool:
+        reasons = [*self.rationale]
+        if self.chosen_candidate is not None:
+            reasons.extend(self.chosen_candidate.match_reasons)
+        if any(reason.startswith("provider_franchise_shell_child_match_non_actionable=") for reason in reasons):
+            return (
+                self.series.verified_mal_anime_id is not None
+                and self.series.verified_identity_kind in _NON_ACTIONABLE_PROVIDER_SHELL_IDENTITY_KINDS
+                and _provider_verified_identity_child_count(self.series) > 1
+            )
+        if any(reason.startswith("provider_aggregate_shell_suspected=") for reason in reasons):
+            return self.series.verified_mal_anime_id is not None and self.series.verified_identity_kind == "provider_title_search_exact"
+        if any(reason.startswith(_AGGREGATE_TITLE_SHELL_REASON_PREFIX) for reason in reasons):
+            return True
+        return False
+
+    def has_deterministic_ambiguous_exact_title_classification(self) -> bool:
+        return _has_reason_with_prefix(_mapping_result_reasons(self), (_AMBIGUOUS_EXACT_TITLE_REASON_PREFIX,))
+
+    def has_deterministic_aggregate_progress_classification(self) -> bool:
+        return _has_reason_with_prefix(_mapping_result_reasons(self), (_AGGREGATE_PROGRESS_REASON_PREFIX,))
+
+    def has_deterministic_non_actionable_classification(self) -> bool:
+        return (
+            self.is_deterministic_multi_entry_bundle()
+            or self.has_deterministic_provider_shell_classification()
+            or self.has_deterministic_ambiguous_exact_title_classification()
+            or self.has_deterministic_aggregate_progress_classification()
         )
+
+
+def _mapping_result_reasons(result: MappingResult) -> list[str]:
+    reasons = [*result.rationale]
+    if result.chosen_candidate is not None:
+        reasons.extend(result.chosen_candidate.match_reasons)
+    return reasons
 
 
 def _coerce_positive_int(value: Any) -> int | None:
@@ -822,10 +867,15 @@ def _extract_part_number(value: str | None) -> int | None:
 def _extract_roman_installment_number(value: str | None) -> int | None:
     if not value:
         return None
-    for match in _ROMAN_TOKEN_RE.finditer(value):
-        if _terminal_installment_is_title_domain_numeral(value, match.start()):
+    normalized = unicodedata.normalize("NFKC", value)
+    standalone_roman = bool(_STANDALONE_ROMAN_INSTALLMENT_RE.fullmatch(normalized.strip()))
+    for match in _ROMAN_TOKEN_RE.finditer(normalized):
+        token_text = match.group(1)
+        if token_text != token_text.upper() and not standalone_roman:
             continue
-        token = match.group(1).lower()
+        if _terminal_installment_is_title_domain_numeral(normalized, match.start()):
+            continue
+        token = token_text.lower()
         if len(token) == 1:
             continue
         number = _ROMAN_TO_NUMBER.get(token)
@@ -904,7 +954,13 @@ def _extract_terminal_installment_number(value: str | None) -> int | None:
     if roman_match:
         if _terminal_installment_is_title_domain_numeral(cleaned, roman_match.start()):
             return None
-        number = _ROMAN_TO_NUMBER.get(roman_match.group(1).lower())
+        token_text = roman_match.group(1)
+        # A single terminal X is often stylized title text (e.g. "the X" /
+        # "the Cross") rather than an installment number.  Multi-letter,
+        # intentionally uppercase Roman numerals still cover II/III/etc.
+        if len(token_text) == 1 or token_text != token_text.upper():
+            return None
+        number = _ROMAN_TO_NUMBER.get(token_text.lower())
         if number is not None and number >= 2:
             return number
     return None
@@ -1139,8 +1195,12 @@ def _candidate_exactly_matches_query_alias(node: dict[str, Any], query: str) -> 
 
 def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str | None]:
     title_season_number = _extract_season_number(series.season_title)
+    season_title_needs_base = False
+    season_title_is_installment_only = False
     if title_season_number is None and series.season_title:
-        if _season_title_is_installment_only_extension(series.title, series.season_title) or _season_title_needs_base_title(series.title, series.season_title):
+        season_title_is_installment_only = _season_title_is_installment_only_extension(series.title, series.season_title)
+        season_title_needs_base = _season_title_needs_base_title(series.title, series.season_title)
+        if season_title_is_installment_only or season_title_needs_base:
             title_season_number = _extract_ordinal_season_number(series.season_title)
             if title_season_number is None:
                 title_season_number = _extract_standalone_installment_number(series.season_title)
@@ -1160,36 +1220,66 @@ def _provider_season_number(series: SeriesMappingInput) -> tuple[int | None, str
         )
     if title_season_number is not None:
         return title_season_number, None
+    if metadata_season_number is None:
+        return None, None
+
+    # Provider catalog season ordinals are useful for generic rows such as
+    # "Season 2", but rows with a distinct arc/installment title often carry a
+    # provider-local ordinal that is not the MAL installment number.  Do not let
+    # that metadata turn an exact provider-season title (e.g. FLCL Alternative)
+    # into a false season mismatch against the MAL title family.
+    title_norm = normalize_title_strict(series.title)
+    season_title_norm = normalize_title_strict(series.season_title)
+    metadata_applies_to_title = (
+        not season_title_norm
+        or not title_norm
+        or season_title_norm == title_norm
+        or season_title_is_installment_only
+        or season_title_needs_base
+    )
+    if not metadata_applies_to_title:
+        return None, None
     return metadata_season_number, None
 
 
-def _extract_titles_from_node(node: dict[str, Any]) -> list[str]:
-    titles = [str(node.get("title") or "")]
+def _extract_title_entries_from_node(node: dict[str, Any]) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = [(str(node.get("title") or ""), "mal_primary_title")]
     alternative_titles = node.get("alternative_titles") or {}
     if isinstance(alternative_titles, dict):
+        source_by_key = {
+            "synonyms": "mal_synonym_title",
+            "en": "mal_english_title",
+            "ja": "mal_japanese_title",
+        }
         for key in ("synonyms", "en", "ja"):
             value = alternative_titles.get(key)
             if isinstance(value, list):
-                titles.extend(str(item) for item in value if item)
+                entries.extend((str(item), source_by_key[key]) for item in value if item)
             elif value:
-                titles.append(str(value))
-    return [title for title in titles if title]
+                entries.append((str(value), source_by_key[key]))
+    return [(title, source) for title, source in entries if title]
+
+
+def _extract_titles_from_node(node: dict[str, Any]) -> list[str]:
+    return [title for title, _source in _extract_title_entries_from_node(node)]
 
 
 def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any]) -> tuple[float, list[str]]:
-    titles = _extract_titles_from_node(node)
+    title_entries = _extract_title_entries_from_node(node)
     query_norm = normalize_title(query)
     query_strict_norm = normalize_title_strict(query)
     best_ratio = 0.0
     best_title = ""
-    for title in titles:
+    best_source = ""
+    for title, source in title_entries:
         title_norm = normalize_title(title)
         if not title_norm:
             continue
         ratio = SequenceMatcher(None, query_norm, title_norm).ratio()
-        if ratio > best_ratio:
+        if ratio > best_ratio or (ratio == best_ratio and source == "mal_primary_title" and best_source != "mal_primary_title"):
             best_ratio = ratio
             best_title = title
+            best_source = source
     reasons: list[str] = []
     score = best_ratio
     best_norm = normalize_title(best_title)
@@ -1200,6 +1290,18 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
     if best_strict_norm == query_strict_norm and best_strict_norm:
         score = max(score, 0.995)
         reasons.append("exact_normalized_title")
+        exact_sources = {
+            source
+            for title, source in title_entries
+            if normalize_title_strict(title) == query_strict_norm
+        }
+        if "mal_primary_title" in exact_sources:
+            reasons.append("exact_mal_primary_title")
+        elif exact_sources:
+            reasons.append("exact_mal_alternative_title")
+            for source in ("mal_english_title", "mal_synonym_title", "mal_japanese_title"):
+                if source in exact_sources:
+                    reasons.append(f"exact_{source}")
         season_title_strict_norm = normalize_title_strict(series.season_title)
         series_title_strict_norm = normalize_title_strict(series.title)
         if (
@@ -1245,6 +1347,11 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
 
     provider_hints = _provider_title_hints(series)
     candidate_hints = _candidate_title_hints(node)
+    exact_distinct_provider_season_title = (
+        "exact_provider_season_title" in reasons
+        and normalize_title_strict(series.season_title)
+        and normalize_title_strict(series.season_title) != normalize_title_strict(series.title)
+    )
     alias_installment_match = False
     if _query_matches_supplemental_installment_alias(series, query, provider_season_number) and _candidate_exactly_matches_query_alias(node, query):
         candidate_hints = set(candidate_hints)
@@ -1274,8 +1381,11 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         score -= 0.06
         reasons.append("candidate_missing_installment_hint")
     elif not provider_has_non_base_installment_hint and candidate_has_non_base_installment_hint:
-        score -= 0.06
-        reasons.append("candidate_extra_installment_hint")
+        if exact_distinct_provider_season_title:
+            reasons.append("candidate_installment_hint_covered_by_exact_provider_season_title")
+        else:
+            score -= 0.06
+            reasons.append("candidate_extra_installment_hint")
 
     exact_later_installment_alignment = False
 
@@ -1526,10 +1636,12 @@ def _candidate_media_type_priority(candidate: MappingCandidate) -> int:
     return 1
 
 
-def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, int, int, int, str, int]:
+def _candidate_sort_key(candidate: MappingCandidate) -> tuple[float, int, int, int, int, int, int, int, int, int, str, int]:
     return (
         candidate.score,
         int("exact_normalized_title" in candidate.match_reasons),
+        int("exact_provider_season_title" in candidate.match_reasons),
+        int("exact_mal_primary_title" in candidate.match_reasons),
         _candidate_positive_signal_count(candidate),
         -_candidate_penalty_count(candidate),
         int("candidate_extra_title_suffix" not in candidate.match_reasons),
@@ -2093,6 +2205,131 @@ def _is_deterministic_multi_entry_bundle(result: MappingResult) -> bool:
 
 
 
+def _candidate_has_non_base_positive_installment_alignment(candidate: MappingCandidate) -> bool:
+    if "exact_later_installment_alignment" in candidate.match_reasons or "final_season_hint_match" in candidate.match_reasons:
+        return True
+    for reason in candidate.match_reasons:
+        if reason.startswith("season_number_match="):
+            try:
+                if int(reason.split("=", 1)[1].split(",", 1)[0]) >= 2:
+                    return True
+            except ValueError:
+                continue
+        if reason.startswith(("part_hint_match=", "split_installment_match=", "season_to_split_match=", "roman_installment_match=", "installment_hint_match=")):
+            return True
+    return False
+
+
+def _has_non_actionable_aggregate_progress(result: MappingResult) -> bool:
+    top = result.chosen_candidate
+    companions = list(result.bundle_companion_candidates or [])
+    if top is None:
+        return False
+    if top.num_episodes is None or top.num_episodes <= 0:
+        return False
+    provider_episode_evidence = _provider_episode_evidence(result.series)
+    if provider_episode_evidence <= top.num_episodes:
+        return False
+    has_overflow_reason = any(reason.startswith(_EPISODE_OVERFLOW_REASON_PREFIXES) for reason in top.match_reasons)
+    if not companions:
+        return has_overflow_reason and (
+            provider_episode_evidence > top.num_episodes + 1
+            or (result.series.completed_episode_count or 0) > top.num_episodes + 1
+        ) and (
+            "exact_provider_season_title" in top.match_reasons
+            or _candidate_has_non_base_positive_installment_alignment(top)
+        )
+    if not any(reason.startswith(_MULTI_ENTRY_BUNDLE_REASON_PREFIX) for reason in result.rationale):
+        return False
+    if provider_episode_evidence > top.num_episodes + sum((candidate.num_episodes or 0) for candidate in companions):
+        return has_overflow_reason and (
+            "exact_provider_season_title" in top.match_reasons
+            or _candidate_has_non_base_positive_installment_alignment(top)
+        )
+    if _candidate_has_non_base_positive_installment_alignment(top):
+        return True
+    if any(_candidate_has_explicit_followup_installment_hint(candidate) for candidate in companions):
+        return True
+    provider_hints = _provider_title_hints(result.series)
+    return _has_non_base_installment_hint(provider_hints)
+
+
+def _has_ambiguous_exact_title_identity(result: MappingResult) -> bool:
+    top = result.chosen_candidate
+    if top is None or len(result.candidates) < 2:
+        return False
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
+    exact_competitors = [
+        candidate
+        for candidate in result.candidates[:5]
+        if candidate.mal_anime_id != top.mal_anime_id
+        and "exact_normalized_title" in candidate.match_reasons
+        and abs(candidate.score - top.score) <= 0.02
+    ]
+    if "exact_provider_season_title" in top.match_reasons:
+        exact_competitors = [
+            candidate for candidate in exact_competitors if "exact_provider_season_title" in candidate.match_reasons
+        ]
+    if not exact_competitors:
+        return False
+    provider_episode_evidence = _provider_episode_evidence(result.series)
+    if provider_episode_evidence > 0:
+        fitting = [
+            candidate
+            for candidate in [top, *exact_competitors]
+            if candidate.num_episodes is not None and provider_episode_evidence <= candidate.num_episodes
+        ]
+        if len(fitting) == 1 and fitting[0].mal_anime_id == top.mal_anime_id:
+            return False
+    provider_start_year = _coerce_positive_int(result.series.provider_start_year)
+    if provider_start_year is not None and result.series.provider_start_year_is_trustworthy:
+        matching_years = [
+            candidate
+            for candidate in [top, *exact_competitors]
+            if _candidate_start_year(candidate) == provider_start_year
+        ]
+        if len(matching_years) == 1 and matching_years[0].mal_anime_id == top.mal_anime_id:
+            return False
+    return True
+
+
+def _provider_collection_shell_marker(series: SeriesMappingInput) -> str | None:
+    values = [series.season_title or "", series.title or ""]
+    normalized = " ".join(normalize_title_strict(value) for value in values if value).strip()
+    if not normalized:
+        return None
+    marker_patterns = (
+        ("movies", r"\bmovies\b|\bfilms\b|\bmovie\s+collection\b|\bfilm\s+collection\b"),
+        ("specials", r"\bspecials\b|\bovas\b|\bonas\b"),
+        ("series", r"\bseries\b|\bcollection\b|\bfranchise\b"),
+    )
+    for marker, pattern in marker_patterns:
+        if re.search(pattern, normalized):
+            return marker
+    return None
+
+
+def _provider_aggregate_title_shell_reason(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    candidates: list[MappingCandidate],
+) -> str | None:
+    marker = _provider_collection_shell_marker(series)
+    if marker is None:
+        return None
+    if "exact_provider_season_title" in top.match_reasons:
+        return None
+    provider_episode_evidence = _provider_episode_evidence(series)
+    if provider_episode_evidence <= 1 and len(candidates) <= 1:
+        return None
+    missing_shell_suffix = any(reason.startswith("candidate_missing_provider_title_suffix=") for reason in top.match_reasons)
+    media_mismatch = marker == "movies" and top.media_type != "movie"
+    if not missing_shell_suffix and not media_mismatch:
+        return None
+    return _AGGREGATE_TITLE_SHELL_REASON_PREFIX + f"marker:{marker};candidate:{top.mal_anime_id};media:{top.media_type or 'unknown'}"
+
+
 def _candidate_installment_indexes(candidate: MappingCandidate) -> set[int]:
     indexes: set[int] = set()
     for hint in _candidate_title_hints(candidate.raw):
@@ -2149,7 +2386,7 @@ def _suspect_multi_entry_bundle(
     if not top_is_exact_base_match and not top_has_installment_alignment:
         return None
 
-    provider_episode_evidence = series.max_completed_episode_number or series.max_episode_number
+    provider_episode_evidence = _provider_episode_evidence(series)
     if provider_episode_evidence is None or top.num_episodes is None or provider_episode_evidence <= top.num_episodes:
         return None
     if not any(reason.startswith("episode_evidence_exceeds_candidate_count=") for reason in top.match_reasons):
@@ -2237,8 +2474,26 @@ def _candidate_episode_evidence_fits(series: SeriesMappingInput, candidate: Mapp
     return provider_episode_evidence <= candidate.num_episodes
 
 
+def _candidate_episode_evidence_has_safe_minor_overflow(series: SeriesMappingInput, candidate: MappingCandidate) -> bool:
+    if candidate.num_episodes is None or candidate.num_episodes <= 0:
+        return False
+    provider_episode_evidence = _provider_episode_evidence(series)
+    if provider_episode_evidence != candidate.num_episodes + 1:
+        return False
+    return (series.completed_episode_count or 0) <= candidate.num_episodes + 1
+
+
 def _candidate_has_auto_approval_blockers(candidate: MappingCandidate) -> bool:
     return any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in candidate.match_reasons)
+
+
+def _candidate_has_only_safe_minor_overflow_blockers(series: SeriesMappingInput, candidate: MappingCandidate) -> bool:
+    blockers = [reason for reason in candidate.match_reasons if reason.startswith(_AUTO_APPROVAL_BLOCKERS)]
+    if not blockers:
+        return True
+    if not _candidate_episode_evidence_has_safe_minor_overflow(series, candidate):
+        return False
+    return all(reason.startswith(_EPISODE_OVERFLOW_REASON_PREFIXES) for reason in blockers)
 
 
 def _supports_high_confidence_lexical_auto_resolution(
@@ -2262,7 +2517,7 @@ def _supports_high_confidence_lexical_auto_resolution(
             return False
         cleaned = _search_query_cleanup(value)
         before_parenthetical = cleaned.split("(", 1)[0]
-        return not re.search(r"[:|\u2013\u2014-]", before_parenthetical)
+        return not re.search(r"[:|\u2013\u2014]|\s-\s", before_parenthetical)
 
     if (
         top.score >= 0.91
@@ -2276,9 +2531,96 @@ def _supports_high_confidence_lexical_auto_resolution(
     return False
 
 
+def _candidate_has_exact_mal_title_source(candidate: MappingCandidate) -> bool:
+    return any(
+        reason in {
+            "exact_mal_primary_title",
+            "exact_mal_alternative_title",
+            "exact_mal_english_title",
+            "exact_mal_synonym_title",
+            "exact_mal_japanese_title",
+        }
+        for reason in candidate.match_reasons
+    )
+
+
+def _provider_episode_evidence_is_empty_or_single_unit(series: SeriesMappingInput) -> bool:
+    return _provider_episode_evidence(series) <= 1
+
+
+def _candidate_media_type_safe_for_unique_exact(series: SeriesMappingInput, candidate: MappingCandidate) -> bool:
+    media_type = candidate.media_type or ""
+    if media_type == "tv":
+        return True
+    if media_type in {"ona", "ova"}:
+        return (candidate.num_episodes or 0) > 1 and not _candidate_has_auxiliary_content_reason(candidate)
+    if media_type == "movie":
+        return "exact_provider_season_title" in candidate.match_reasons and _provider_episode_evidence_is_empty_or_single_unit(series)
+    return False
+
+
+def _supports_exact_provider_season_title_auto_resolution(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    second: MappingCandidate | None,
+) -> bool:
+    if "exact_provider_season_title" not in top.match_reasons or "exact_normalized_title" not in top.match_reasons:
+        return False
+    if not _candidate_has_only_safe_minor_overflow_blockers(series, top):
+        return False
+    if not _candidate_episode_evidence_fits(series, top) and not _candidate_episode_evidence_has_safe_minor_overflow(series, top):
+        return False
+    if not _candidate_media_type_safe_for_unique_exact(series, top):
+        return False
+    if second is None:
+        return True
+    top_query_norm = normalize_title_strict(top.matched_query)
+    second_query_norm = normalize_title_strict(second.matched_query)
+    if (
+        second_query_norm == top_query_norm
+        and "exact_normalized_title" in second.match_reasons
+        and second.score >= top.score - 0.05
+    ):
+        return False
+    if "exact_provider_season_title" in second.match_reasons and second.score >= top.score - 0.05:
+        return False
+    return True
+
+
+def _supports_unique_exact_title_auto_resolution(
+    series: SeriesMappingInput,
+    top: MappingCandidate,
+    second: MappingCandidate | None,
+) -> bool:
+    if "exact_normalized_title" not in top.match_reasons:
+        return False
+    if not _candidate_has_exact_mal_title_source(top):
+        return False
+    if _candidate_has_auto_approval_blockers(top):
+        return False
+    if not _candidate_episode_evidence_fits(series, top):
+        return False
+    if not _candidate_media_type_safe_for_unique_exact(series, top):
+        return False
+    if second is None:
+        return top.score >= 0.93
+    margin = top.score - second.score
+    if "exact_normalized_title" in second.match_reasons and not _candidate_is_explainably_weaker(series, second):
+        return margin >= 0.12
+    if margin >= 0.12:
+        return True
+    if any(reason.startswith(_POSITIVE_SIGNAL_REASON_PREFIXES) for reason in top.match_reasons) and margin >= 0.05:
+        return True
+    return _candidate_is_explainably_weaker(series, second) and margin >= 0.05
+
+
 def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
     provider_episode_evidence = _provider_episode_evidence(series)
     top_has_blockers = _candidate_has_auto_approval_blockers(top)
+    if _supports_exact_provider_season_title_auto_resolution(series, top, second):
+        return True
+    if _supports_unique_exact_title_auto_resolution(series, top, second):
+        return True
     if (
         "exact_normalized_title" in top.match_reasons
         and any(reason.startswith("provider_episode_count_match=") for reason in top.match_reasons)
@@ -2412,6 +2754,8 @@ def _supports_exact_classification(series: SeriesMappingInput, top: MappingCandi
 def should_auto_approve_mapping(result: MappingResult) -> bool:
     if result.status != "exact" or result.chosen_candidate is None:
         return False
+    if result.has_deterministic_aggregate_progress_classification():
+        return False
     if _candidate_has_verified_provider_identity(result.chosen_candidate):
         reasons = [*result.rationale, *result.chosen_candidate.match_reasons]
         return not any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons)
@@ -2477,20 +2821,28 @@ def should_auto_approve_mapping(result: MappingResult) -> bool:
         result.chosen_candidate,
         second_candidate,
     )
-    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match and not has_safe_bundle_resolution and not has_safe_later_installment_resolution and not has_safe_exact_title_overflow_resolution and not has_safe_high_confidence_lexical_resolution:
+    has_safe_exact_provider_season_title_resolution = _supports_exact_provider_season_title_auto_resolution(
+        result.series,
+        result.chosen_candidate,
+        second_candidate,
+    )
+    if not has_exact_title and not has_split_cour_match and not has_explainable_episode_drift_match and not has_safe_bundle_resolution and not has_safe_later_installment_resolution and not has_safe_exact_title_overflow_resolution and not has_safe_high_confidence_lexical_resolution and not has_safe_exact_provider_season_title_resolution:
         return False
 
     provider_season_number, _ = _provider_season_number(result.series)
     candidate_season_numbers = _candidate_season_numbers(result.chosen_candidate.raw)
-    if provider_season_number is not None and candidate_season_numbers and candidate_season_numbers != {provider_season_number}:
+    if provider_season_number is not None and candidate_season_numbers and provider_season_number not in candidate_season_numbers:
         return False
 
-    if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons) and not (has_safe_bundle_resolution or has_safe_later_installment_resolution or has_safe_exact_title_overflow_resolution):
+    if any(reason.startswith(_AUTO_APPROVAL_BLOCKERS) for reason in reasons) and not (has_safe_bundle_resolution or has_safe_later_installment_resolution or has_safe_exact_title_overflow_resolution or has_safe_exact_provider_season_title_resolution):
         return False
     return True
 
 
 def _should_expand_related_candidates(series: SeriesMappingInput, top: MappingCandidate, second: MappingCandidate | None) -> bool:
+    if series.verified_identity_kind in _NON_ACTIONABLE_PROVIDER_SHELL_IDENTITY_KINDS and _provider_verified_identity_child_count(series) > 1:
+        return False
+
     provider_hints = _provider_title_hints(series)
     provider_season_number, _ = _provider_season_number(series)
     has_non_base_installment_context = _has_non_base_installment_hint(provider_hints) or (
@@ -2610,13 +2962,19 @@ def _inject_supplemental_candidates(
 
 
 def _mal_metadata_candidate_node(metadata: MalAnimeMetadata) -> dict[str, Any]:
-    alternative_titles = dict(metadata.raw.get("alternative_titles") or {})
-    if not alternative_titles:
-        alternative_titles = {
-            "en": metadata.title_english,
-            "ja": metadata.title_japanese,
-            "synonyms": metadata.alternative_titles,
-        }
+    raw_alternative_titles = metadata.raw.get("alternative_titles") if isinstance(metadata.raw, dict) else None
+    alternative_titles = dict(raw_alternative_titles) if isinstance(raw_alternative_titles, dict) else {}
+    if metadata.title_english and not alternative_titles.get("en"):
+        alternative_titles["en"] = metadata.title_english
+    if metadata.title_japanese and not alternative_titles.get("ja"):
+        alternative_titles["ja"] = metadata.title_japanese
+    synonyms = alternative_titles.get("synonyms")
+    if not isinstance(synonyms, list):
+        synonyms = []
+    for title in metadata.alternative_titles:
+        if title and title not in synonyms:
+            synonyms.append(title)
+    alternative_titles["synonyms"] = synonyms
     return {
         "id": metadata.mal_anime_id,
         "title": metadata.title,
@@ -2626,6 +2984,96 @@ def _mal_metadata_candidate_node(metadata: MalAnimeMetadata) -> dict[str, Any]:
         "num_episodes": metadata.num_episodes,
         "start_season": metadata.start_season,
     }
+
+
+def _has_strong_mapping_candidate(by_id: dict[int, MappingCandidate]) -> bool:
+    return any(
+        "exact_normalized_title" in candidate.match_reasons or candidate.score >= 0.90
+        for candidate in by_id.values()
+    )
+
+
+def _local_metadata_exact_match_targets(series: SeriesMappingInput) -> dict[str, str]:
+    targets: dict[str, str] = {}
+    for value in (series.season_title, series.title):
+        normalized = normalize_title_strict(value)
+        if normalized and normalized not in targets:
+            targets[normalized] = str(value)
+    return targets
+
+
+def _node_exactly_matches_provider_title(node: dict[str, Any], targets: dict[str, str]) -> bool:
+    if not targets:
+        return False
+    return any(normalize_title_strict(title) in targets for title in _extract_titles_from_node(node))
+
+
+def _local_node_provider_evidence_conflicts(series: SeriesMappingInput, node: dict[str, Any]) -> bool:
+    candidate_episodes = _coerce_positive_int(node.get("num_episodes"))
+    provider_episode_count = _coerce_positive_int(series.provider_episode_count)
+    if provider_episode_count is not None and candidate_episodes is not None and provider_episode_count != candidate_episodes:
+        return True
+    provider_episode_evidence = _provider_episode_evidence(series)
+    if provider_episode_evidence > 0 and candidate_episodes is not None and provider_episode_evidence > candidate_episodes:
+        return True
+
+    provider_start_year = _coerce_positive_int(series.provider_start_year)
+    candidate_start_year = _coerce_positive_int(
+        (node.get("start_season") or {}).get("year") if isinstance(node.get("start_season"), dict) else None
+    )
+    if (
+        provider_start_year is not None
+        and series.provider_start_year_is_trustworthy
+        and candidate_start_year is not None
+        and provider_start_year != candidate_start_year
+    ):
+        return True
+    return False
+
+
+def _inject_local_metadata_exact_title_candidate(
+    client: MalClient,
+    series: SeriesMappingInput,
+    queries: list[str],
+    by_id: dict[int, MappingCandidate],
+) -> None:
+    if _has_strong_mapping_candidate(by_id):
+        return
+    if not client.config.db_path.exists():
+        return
+    from .db import get_mal_anime_metadata_map, list_covering_mal_anime_detail_cache_nodes
+
+    targets = _local_metadata_exact_match_targets(series)
+    exact_matches: dict[int, dict[str, Any]] = {}
+    for metadata in get_mal_anime_metadata_map(client.config.db_path).values():
+        node = _mal_metadata_candidate_node(metadata)
+        if _node_exactly_matches_provider_title(node, targets):
+            exact_matches[metadata.mal_anime_id] = node
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    for detail_node in list_covering_mal_anime_detail_cache_nodes(
+        client.config.db_path,
+        required_fields=set(_MAPPING_SEARCH_FIELDS.split(",")),
+        logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+        now=now,
+    ):
+        if _node_exactly_matches_provider_title(detail_node, targets):
+            exact_matches[int(detail_node["id"])] = detail_node
+    if len(exact_matches) != 1:
+        return
+    node = next(iter(exact_matches.values()))
+    if _local_node_provider_evidence_conflicts(series, node):
+        return
+    candidate = _best_candidate_from_node(
+        series,
+        list(targets.values()) or queries,
+        node,
+        discovery_reason="local_mal_metadata_exact_title",
+    )
+    if candidate is None:
+        return
+    previous = by_id.get(candidate.mal_anime_id)
+    if previous is None or candidate.score > previous.score:
+        by_id[candidate.mal_anime_id] = candidate
 
 
 def _inject_verified_identity_candidate(
@@ -2781,6 +3229,7 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
                 if previous is None or candidate.score > previous.score:
                     by_id[candidate.mal_anime_id] = candidate
     _inject_verified_identity_candidate(client, series, queries, by_id)
+    _inject_local_metadata_exact_title_candidate(client, series, queries, by_id)
     _inject_supplemental_candidates(client, series, queries, by_id)
     _expand_candidates_via_relations(client, series, queries, by_id)
     _apply_provider_mapping_evidence(series, by_id)
@@ -2801,11 +3250,37 @@ def map_series(client: MalClient, series: SeriesMappingInput, limit: int = 5) ->
         multi_entry_bundle_reason, bundle_companion_candidates = multi_entry_bundle
         rationale.append(multi_entry_bundle_reason)
         bundle_companion_candidate = bundle_companion_candidates[0] if bundle_companion_candidates else None
-    provider_aggregate_shell_protected = any(
-        reason.startswith(("provider_aggregate_shell_suspected=", "provider_franchise_shell_child_match_non_actionable="))
-        for reason in top.match_reasons
+    aggregate_title_shell_reason = _provider_aggregate_title_shell_reason(series, top, candidates)
+    if aggregate_title_shell_reason:
+        rationale.append(aggregate_title_shell_reason)
+    preclassified_result = MappingResult(
+        series=series,
+        status="ambiguous",
+        confidence=top.score,
+        chosen_candidate=top,
+        candidates=candidates[:limit],
+        rationale=rationale,
+        bundle_companion_candidate=bundle_companion_candidate,
+        bundle_companion_candidates=bundle_companion_candidates,
     )
-    if provider_aggregate_shell_protected:
+    if _has_non_actionable_aggregate_progress(preclassified_result):
+        rationale.append(
+            _AGGREGATE_PROGRESS_REASON_PREFIX
+            + f"provider_evidence:{_provider_episode_evidence(series)};candidate_episodes:{top.num_episodes}"
+        )
+    if _has_ambiguous_exact_title_identity(preclassified_result):
+        tied_ids = [
+            str(candidate.mal_anime_id)
+            for candidate in candidates[:5]
+            if "exact_normalized_title" in candidate.match_reasons and abs(candidate.score - top.score) <= 0.02
+        ]
+        rationale.append(_AMBIGUOUS_EXACT_TITLE_REASON_PREFIX + "candidate_ids:" + ",".join(tied_ids))
+    provider_aggregate_shell_protected = any(
+        reason.startswith(_NON_ACTIONABLE_SHELL_REASON_PREFIXES)
+        for reason in top.match_reasons
+    ) or any(reason.startswith(_NON_ACTIONABLE_SHELL_REASON_PREFIXES) for reason in rationale)
+    non_actionable_protected = any(reason.startswith(_AMBIGUOUS_EXACT_TITLE_REASON_PREFIX) for reason in rationale)
+    if provider_aggregate_shell_protected or non_actionable_protected:
         status = "ambiguous"
     elif _supports_exact_classification(series, top, second) or _supports_exact_bundle_auto_resolution(
         series,
