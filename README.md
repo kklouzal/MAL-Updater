@@ -95,8 +95,8 @@ PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --recommendation-li
 # Default unattended service cadence is conservative: hourly provider hot/incremental
 # fetch, exact-approved apply, MAL token refresh, health, and DB/local recommendation
 # snapshot work; MAL user-list refresh runs every 8h, recommendation metadata every 12h,
-# complete public MAL userrecs cold harvest runs every 6h with a tiny source-title
-# batch and 45-day horizon, and one independently budgeted provider-eligibility lane daily.
+# complete public MAL userrecs cold harvest runs hourly with one source-title
+# per batch and a 45-day horizon, and one independently budgeted provider-eligibility lane daily.
 # Crunchyroll cold/full work is weekly and page-bounded; HIDIVE full refresh stays manual
 # because its current fetch surface has no chunk controls. Long-lived daemon startup
 # has a deterministic grace, and kernel-backed leases suppress overlapping daemon/task

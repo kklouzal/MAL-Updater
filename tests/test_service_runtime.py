@@ -13,7 +13,7 @@ from unittest.mock import patch
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
 from mal_updater.request_tracking import begin_api_request_context, end_api_request_context, estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, effective_niceness_policy, run_pending_tasks, run_service_loop
+from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, _task_execution_signature, effective_niceness_policy, run_pending_tasks, run_service_loop
 
 
 class ServiceRuntimeLeaseTests(unittest.TestCase):
@@ -618,7 +618,43 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             _recommendation_metadata_refresh_command(self.config),
         )
 
-    def test_recommendation_full_harvest_command_and_policy_are_bounded(self) -> None:
+    def test_recommendation_full_harvest_default_cadence_command_and_policy_are_bounded(self) -> None:
+        self.assertEqual(3600, self.config.service.recommendation_full_harvest_every_seconds)
+
+        self.assertEqual(
+            [
+                sys.executable,
+                "-m",
+                "mal_updater.cli",
+                "recommend-refresh-full-userrecs",
+                "--limit",
+                "1",
+                "--stale-after-days",
+                "45",
+                "--max-pages",
+                "3",
+            ],
+            _recommendation_full_harvest_command(self.config),
+        )
+        policy = effective_niceness_policy(self.config)
+        self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
+        self.assertEqual(45, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
+        self.assertEqual(1, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
+        self.assertIn("recommend_full_harvest", policy["task_policies"])
+        self.assertEqual(
+            "recommend_full_harvest:limit=1:stale_after_days=45:max_pages=3",
+            _task_execution_signature(
+                self.config,
+                TaskSpec(
+                    "recommend_full_harvest",
+                    self.config.service.recommendation_full_harvest_every_seconds,
+                    budget_provider="mal",
+                ),
+            ),
+        )
+
+    def test_recommendation_full_harvest_command_honors_explicit_bounded_overrides(self) -> None:
         self.config.service.task_execute_limits["recommend_full_harvest"] = 3
         self.config.service.task_execute_limits["recommend_full_harvest_pages"] = 4
         self.config.service.recommendation_full_harvest_stale_after_days = 60
@@ -638,10 +674,6 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             ],
             _recommendation_full_harvest_command(self.config),
         )
-        policy = effective_niceness_policy(self.config)
-        self.assertEqual(self.config.service.recommendation_full_harvest_every_seconds, policy["cadences"]["recommendation_full_harvest_seconds"])
-        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest"])
-        self.assertIn("recommend_full_harvest", policy["task_policies"])
 
     def test_run_pending_tasks_executes_recommendation_full_harvest_slow_lane(self) -> None:
         now = time.time()

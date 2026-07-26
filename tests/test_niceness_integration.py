@@ -40,6 +40,9 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(28800, specs["mal_list_refresh"].every_seconds)
         self.assertEqual(900, specs["mal_list_refresh"].initial_delay_seconds)
         self.assertEqual(43200, specs["recommend_metadata_refresh"].every_seconds)
+        self.assertEqual(3600, specs["recommend_full_harvest"].every_seconds)
+        self.assertEqual(4500, specs["recommend_full_harvest"].initial_delay_seconds)
+        self.assertEqual("mal", specs["recommend_full_harvest"].budget_provider)
         eligibility = specs["recommend_provider_eligibility_crunchyroll"]
         self.assertEqual(3600, eligibility.every_seconds)
         self.assertEqual(2700, eligibility.initial_delay_seconds)
@@ -61,6 +64,13 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(18, eligibility["task_hourly_limit"])
         self.assertEqual(7, eligibility["projected_requests"])
         self.assertEqual(43200, eligibility["auth_failure_backoff_floor_seconds"])
+        harvest_policy = policy["task_policies"]["recommend_full_harvest"]
+        self.assertEqual(8, harvest_policy["task_hourly_limit"])
+        self.assertEqual(6, harvest_policy["projected_requests"])
+        self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
+        self.assertEqual(1, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
+        self.assertEqual(45, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
         self.assertEqual(10, policy["cold_refresh_bounds"]["crunchyroll_max_history_pages"])
         self.assertEqual(2, policy["cold_refresh_bounds"]["crunchyroll_max_watchlist_pages"])
         self.assertFalse(policy["cold_refresh_bounds"]["hidive_unattended_full_refresh"])
