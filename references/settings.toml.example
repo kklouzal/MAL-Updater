@@ -75,7 +75,7 @@ health_every_seconds = 3600
 mal_refresh_every_seconds = 3600  # lightweight token-refresh lane; distinct from the user-list network refresh
 mal_list_refresh_every_seconds = 28800  # 8h, within the conservative 6-12h user-list window; max pages is configured below
 recommendation_metadata_refresh_every_seconds = 43200  # 12h bounded seed/discovery hydration
-recommendation_full_harvest_every_seconds = 3600  # hourly one-source cold-path batches over public MAL userrecs aggregates
+recommendation_full_harvest_every_seconds = 3600  # hourly two-source cold-path batches over public MAL userrecs aggregates
 recommendation_full_harvest_stale_after_days = 45  # long refresh horizon for newly added public MAL user recommendations
 provider_eligibility_refresh_every_seconds = 3600  # one separately budgeted provider-specific lane per credentialed provider
 recommend_maintain_every_seconds = 3600  # DB/local-only recommendation snapshot + health materialization
@@ -99,18 +99,18 @@ hidive = 72  # built-in default shown explicitly here; override only when this h
 mal_list_refresh = 6  # task cap and MAL provider-global cap are both enforced
 sync_apply = 48  # additional task-scoped cap; provider-global MAL cap is still enforced, and legacy unattributed events are conservatively included
 recommend_metadata_refresh = 12
-recommend_full_harvest = 8  # task cap and MAL provider-global cap are both enforced
-recommend_provider_eligibility_crunchyroll = 18  # local safety budget, not an external provider-limit claim
-recommend_provider_eligibility_hidive = 8
+recommend_full_harvest = 16  # task cap and MAL provider-global cap are both enforced
+recommend_provider_eligibility_crunchyroll = 72  # local safety budget, not an external provider-limit claim
+recommend_provider_eligibility_hidive = 32
 
 [service.task_execute_limits]
 mal_list_refresh_pages = 3
 sync_apply = 8  # built-in default shown explicitly here; positive values bound unattended writes, while 0 disables this scheduler lane (manual CLI --limit 0 keeps its explicit full-scan meaning)
 recommend_metadata_refresh = 3
 recommend_metadata_discovery_targets = 5
-recommend_full_harvest = 1  # positive source-title batch size; 0 disables daemon lane rather than becoming unbounded
-recommend_full_harvest_pages = 3  # advertised same-origin public userrecs pages per source before preserving existing edges as failed/partial
-recommend_provider_eligibility_candidates = 1
+recommend_full_harvest = 2  # positive source-title batch size; 0 disables daemon lane rather than becoming unbounded
+recommend_full_harvest_pages = 3  # advertised same-origin public userrecs pages per source per run; unfinished coherent generations pause/resume before terminal atomic publish
+recommend_provider_eligibility_candidates = 4  # per credentialed provider lane; 0 disables the daemon lane rather than becoming unbounded
 recommend_provider_eligibility_search_results = 5
 recommend_provider_eligibility_queries_per_candidate = 1
 recommendation_snapshot = 100
@@ -121,9 +121,9 @@ mal_refresh = 1  # built-in default shown explicitly here; fresh installs now se
 mal_list_refresh = 3
 sync_apply = 8  # built-in default shown explicitly here; keep this aligned with the unattended apply batch posture unless this host has strong evidence for a different per-run MAL request cost
 recommend_metadata_refresh = 8
-recommend_full_harvest = 6
-recommend_provider_eligibility_crunchyroll = 7
-recommend_provider_eligibility_hidive = 2
+recommend_full_harvest = 12
+recommend_provider_eligibility_crunchyroll = 28
+recommend_provider_eligibility_hidive = 8
 sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds
 
 [service.task_projected_request_counts_by_mode.sync_fetch_crunchyroll]

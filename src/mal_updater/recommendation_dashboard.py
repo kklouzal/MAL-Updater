@@ -10,20 +10,25 @@ import sqlite3
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
-from .config import load_config
+from .config import DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS, load_config
+from .crunchyroll_auth import load_crunchyroll_credentials
 from .db import (
     bootstrap_database,
     connect,
     get_mal_recommendation_harvest_coverage,
     get_operational_snapshot,
+    get_public_userrecs_diagnostics,
     list_latest_recommendation_snapshot_rows,
+    unknown_public_userrecs_diagnostics,
 )
+from .hidive_auth import load_hidive_credentials
 
 from .recommendation_actionability import (
     is_strict_provider_eligibility_actionable,
     strict_provider_actionability_failure_reasons,
 )
 from .recommendations import Recommendation, build_recommendations
+from .recommendation_enrichment import build_provider_enrichment_diagnostics, unknown_provider_enrichment_diagnostics
 
 DASHBOARD_MIN_RECOMMENDATION_LIMIT = 1
 DASHBOARD_MAX_RECOMMENDATION_LIMIT = 500
@@ -627,6 +632,7 @@ def _empty_operational_snapshot() -> dict[str, Any]:
         "provider_freshness_by_provider": {},
         "review_queue": {},
         "mappings": {"total": 0, "approved": 0, "by_source": {}, "by_provider": {}},
+        "provider_enrichment": unknown_provider_enrichment_diagnostics(reason="dashboard_schema_unavailable"),
     }
 
 
@@ -647,10 +653,11 @@ def _empty_mal_recommendation_harvest_coverage() -> dict[str, Any]:
             "fresh_coverage_ratio": None,
         },
         "sources": [],
+        "public_userrecs": unknown_public_userrecs_diagnostics(reason="dashboard_schema_unavailable"),
     }
 
 
-def _unavailable_dashboard_payload(*, limit: int, reason: str) -> dict[str, Any]:
+def _unavailable_dashboard_payload(*, limit: int, reason: str, db_path: Path | None = None) -> dict[str, Any]:
     section_metadata = {kind: _section_metadata_for(kind) for kind in _STATIC_SECTION_ORDER}
     coverage_state = {
         "strict_actionable_count": 0,
@@ -661,6 +668,9 @@ def _unavailable_dashboard_payload(*, limit: int, reason: str) -> dict[str, Any]
         "message": f"Dashboard data unavailable: {reason}. Run an explicit initialization/startup command to apply migrations; payload reads do not bootstrap schema.",
         "next_diagnostic_command": STRICT_DISCOVERY_DIAGNOSTIC_COMMAND,
     }
+    coverage = _empty_mal_recommendation_harvest_coverage()
+    if db_path is not None:
+        coverage["public_userrecs"] = _public_userrecs_diagnostics_for_dashboard(db_path, reason="dashboard_schema_unavailable")
     return {
         "generated_at": _utc_now_z(),
         "snapshot": None,
@@ -676,7 +686,7 @@ def _unavailable_dashboard_payload(*, limit: int, reason: str) -> dict[str, Any]
             "limit": limit,
             "limit_scope": "per_section",
         },
-        "coverage": _empty_mal_recommendation_harvest_coverage(),
+        "coverage": coverage,
         "operational": _empty_operational_snapshot(),
         "recent_sync_runs": [],
         "indicators": [
@@ -1086,6 +1096,97 @@ def _project_root_from_db_path(db_path: Path) -> Path | None:
     return None
 
 
+def _dashboard_config_from_db_path(db_path: Path) -> Any | None:
+    project_root = _project_root_from_db_path(db_path)
+    if project_root is None:
+        return None
+    try:
+        config = load_config(project_root)
+        if config.db_path.resolve() != db_path.resolve():
+            return None
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+    return config
+
+
+def _public_userrecs_policy_kwargs_from_db_path(db_path: Path) -> dict[str, int]:
+    source_titles_per_hour = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 2))
+    max_pages_per_source_per_run = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 3))
+    stale_after_days = int(DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS)
+    config = _dashboard_config_from_db_path(db_path)
+    if config is not None and getattr(config, "service", None) is not None:
+        try:
+            source_limit = config.service.execute_limit_for("recommend_full_harvest")
+            pages_limit = config.service.execute_limit_for("recommend_full_harvest_pages")
+            if source_limit is not None:
+                source_titles_per_hour = max(0, int(source_limit))
+            if pages_limit is not None:
+                max_pages_per_source_per_run = max(1, int(pages_limit))
+            stale_after_days = max(1, int(config.service.recommendation_full_harvest_stale_after_days))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return {
+        "configured_source_titles_per_hour": source_titles_per_hour,
+        "max_pages_per_source_per_run": max_pages_per_source_per_run,
+        "stale_after_days": stale_after_days,
+    }
+
+
+def _public_userrecs_diagnostics_for_dashboard(db_path: Path, *, reason: str | None = None) -> dict[str, Any]:
+    policy_kwargs = _public_userrecs_policy_kwargs_from_db_path(db_path)
+    if reason is not None:
+        payload = unknown_public_userrecs_diagnostics(reason=reason)
+        payload["policy"].update(
+            {
+                "configured_source_titles_per_hour": policy_kwargs["configured_source_titles_per_hour"],
+                "configured_source_titles_per_hour_source": "task_execute_limit",
+                "max_pages_per_source_per_run": policy_kwargs["max_pages_per_source_per_run"],
+                "stale_horizon_days": policy_kwargs["stale_after_days"],
+                "stale_horizon_source": "configured_or_default",
+            }
+        )
+        payload["sustainability"].update(
+            {
+                "configured_source_titles_per_hour": policy_kwargs["configured_source_titles_per_hour"],
+                "configured_exceeds_authorized": policy_kwargs["configured_source_titles_per_hour"] > 2,
+            }
+        )
+        return payload
+    return get_public_userrecs_diagnostics(db_path, **policy_kwargs)
+
+
+def _dashboard_configured_provider_slugs(config: Any) -> list[str]:
+    providers: list[str] = []
+    try:
+        crunchyroll_credentials = load_crunchyroll_credentials(config)
+        if crunchyroll_credentials.username and crunchyroll_credentials.password:
+            providers.append("crunchyroll")
+    except (AttributeError, OSError, ValueError, TypeError):
+        pass
+    try:
+        hidive_credentials = load_hidive_credentials(config)
+        if hidive_credentials.username and hidive_credentials.password:
+            providers.append("hidive")
+    except (AttributeError, OSError, ValueError, TypeError):
+        pass
+    return providers
+
+
+def _provider_enrichment_diagnostics_for_dashboard(db_path: Path) -> dict[str, Any]:
+    config = _dashboard_config_from_db_path(db_path)
+    if config is None:
+        return unknown_provider_enrichment_diagnostics(reason="dashboard_config_unavailable")
+    try:
+        return build_provider_enrichment_diagnostics(
+            config,
+            provider_slugs=_dashboard_configured_provider_slugs(config),
+        )
+    except (AttributeError, OSError, ValueError, TypeError) as exc:
+        return unknown_provider_enrichment_diagnostics(
+            reason=f"provider_enrichment_diagnostic_unavailable:{type(exc).__name__}"
+        )
+
+
 def _local_diagnostic_unavailable_source(reason: str) -> dict[str, Any]:
     return {
         "run_id": "local-diagnostic-unavailable",
@@ -1146,7 +1247,7 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
     display_limit = normalize_dashboard_limit(limit)
     unavailable_reason = _dashboard_schema_unavailable_reason(db_path)
     if unavailable_reason is not None:
-        return _unavailable_dashboard_payload(limit=display_limit, reason=unavailable_reason)
+        return _unavailable_dashboard_payload(limit=display_limit, reason=unavailable_reason, db_path=db_path)
     try:
         return _build_dashboard_payload_from_initialized_schema(
             db_path,
@@ -1155,13 +1256,15 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
         )
     except sqlite3.OperationalError as exc:
         if _is_schema_unavailable_error(exc):
-            return _unavailable_dashboard_payload(limit=display_limit, reason=str(exc))
+            return _unavailable_dashboard_payload(limit=display_limit, reason=str(exc), db_path=db_path)
         raise
 
 
 def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_limit: int, stale_after_days: int) -> dict[str, Any]:
     operational = get_operational_snapshot(db_path)
+    operational["provider_enrichment"] = _provider_enrichment_diagnostics_for_dashboard(db_path)
     coverage = get_mal_recommendation_harvest_coverage(db_path, stale_after_days=stale_after_days)
+    coverage["public_userrecs"] = _public_userrecs_diagnostics_for_dashboard(db_path)
     latest_snapshot = _latest_snapshot_summary(db_path)
     latest_run_id = latest_snapshot.get("run_id") if latest_snapshot else None
     latest_raw_rows = list_latest_recommendation_snapshot_rows(db_path, limit=None)
@@ -1268,8 +1371,11 @@ const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary 
 const genreText = r => Array.isArray(r.genres) ? r.genres.join(', ') : (r.genres ?? '');
 function recTable(rows, meta = {}){ if(!rows?.length) return '<p class=\"muted\">No rows in latest snapshot.</p>'; const progress = r => { const c = r.context || {}; const done = c.completed_episode_count ?? c.max_completed_episode_number; const max = c.max_episode_number ?? c.available_episode_count; return done != null && max != null ? `${done}/${max}` : (done != null ? `${done}` : ''); }; const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; return `${diag}<table><thead><tr><th>Priority</th><th>${esc(titleLabel)}</th><th>Provider proof</th><th>English dub</th><th>Identity/review/catalog</th><th>Freshness/expiry</th><th>Why recommended</th><th>Scorecard</th><th>Top watched seeds</th><th>Genres</th><th>Provider progress</th><th>MAL watch status</th></tr></thead><tbody>${rows.map(r => { const e = r.evidence || {}; const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">discovery only · unverified</div>' : ''; return `<tr class=\"${diagnostic}\"><td>${esc(r.priority ?? r.score)}</td><td>${diagnosticLabel}${esc(r.display_title || r.english_title || r.title)}</td><td>${providerBadges(r)}</td><td>${esc(r.english_dub_evidence || e.dub_signal || '')}</td><td>${esc(r.verification || e.verification_label || r.unverified_evidence_label || '')}</td><td>${esc(r.evidence_freshness || e.evidence_freshness_label || '')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td><td>${esc(progress(r))}</td><td>${esc(e.mal_watch_status || '')}</td></tr>`; }).join('')}</tbody></table>`; }
 function syncTable(runs){ if(!runs?.length) return '<p class=\"muted\">No sync runs recorded.</p>'; return `<table><thead><tr><th>ID</th><th>Provider</th><th>Mode</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.provider)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td><td>${esc(r.started_at)}</td><td>${esc(r.completed_at)}</td></tr>`).join('')}</tbody></table>`; }
+const etaText = (hours, reasons = []) => hours == null ? `unknown${reasons.length ? ` (${esc(reasons.join(', '))})` : ''}` : (hours === 0 ? 'ready now' : `~${esc(hours)}h`);
+function publicUserrecsSection(p){ if(!p) return ''; const c = p.coverage || {}; const o = p.open_generations || {}; const h = p.hourly_throughput || {}; const b = p.backlog || {}; const s = p.sustainability || {}; return `<section><h2>Public MAL userrecs crawl</h2><div class=\"grid\"><section class=\"card\"><h3>Crawl coverage</h3>${count({status:p.status, positive_seeds:p.positive_seed_count, complete:c.complete, fresh:c.fresh, stale:c.stale, failed:c.failed, unharvested:c.unharvested, fresh_ratio:c.fresh_ratio})}</section><section class=\"card\"><h3>Backlog/open</h3>${count({due_sources:b.due_sources, active:o.active, paused:o.paused, ready:o.ready, open_total:o.total, staged_pages:o.staged_pages, staged_edges:o.staged_edges})}</section><section class=\"card\"><h3>Hourly throughput</h3>${count({pages_fetched_last_hour:h.pages_fetched_last_hour, last_page:h.last_page_fetched_at, sources_started:h.sources_started_last_hour, sources_published:h.sources_published_last_hour})}</section><section class=\"card\"><h3>Source-start ETA</h3>${count({eta:etaText(b.conservative_source_start_eta_hours), authorized_per_hour:s.authorized_source_titles_per_hour, configured_per_hour:s.configured_source_titles_per_hour, within_authorized_rate:s.within_authorized_rate})}</section><section class=\"card\"><h3>Completion ETA</h3>${count({eta:etaText(b.completion_eta_hours, b.completion_eta_reason_codes || ['unknown_pages_per_source'])})}</section></div></section>`; }
+function providerEnrichmentSection(e){ const providers = e?.providers || {}; const cards = Object.entries(providers).map(([slug,p]) => { const c = p.candidates || {}; const d = p.due || {}; const a = p.attempts || {}; const cur = p.cursor || {}; const eta = d.selection_eta || {}; const complete = p.availability_completion_eta || {}; return `<section class="card"><h3>${esc(slug)}</h3>${count({status:p.status, reasons:p.reason_codes, candidates:c.ranked_total, metadata_coverage:c.metadata_coverage_ratio, due:d.total, due_by_class:d.by_class, selected_now:d.current_limit_selection_count, selection_eta_seconds:eta.eta_seconds, selection_eta_reason:eta.reason_code, cursor_mal_id:cur.cursor_mal_anime_id, cursor_generation:cur.cursor_generation, attempted_last_hour:a.distinct_candidates_attempted_last_hour, recent_outcomes:a.recent_24h_outcome_counts, availability_completion_eta:complete.reason_code})}</section>`; }).join(''); if(!cards) return `<section><h2>Provider enrichment health</h2><p class="muted">${esc(e?.reason_codes?.join(', ') || 'No configured credentialed provider enrichment lanes detected.')}</p></section>`; return `<section><h2>Provider enrichment health</h2><div class="grid">${cards}</div></section>`; }
 function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
-async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown/unverified provider or dub evidence; only Watchable now is actionable.</section>' : '<section class=\"banner good\"><strong>Watchable now dashboard:</strong> actionable discovery rows require verified current Crunchyroll/HIDIVE identity/catalog presence plus explicit English-dub evidence.</section>'; document.getElementById('app').innerHTML = `${mode}<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({watchable_now: state.strict_actionable_count, ranked_unverified_discovery: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${emptyState(state)}<section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Recommendations</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
+async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown/unverified provider or dub evidence; only Watchable now is actionable.</section>' : '<section class=\"banner good\"><strong>Watchable now dashboard:</strong> actionable discovery rows require verified current Crunchyroll/HIDIVE identity/catalog presence plus explicit English-dub evidence.</section>'; document.getElementById('app').innerHTML = `${mode}<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({watchable_now: state.strict_actionable_count, ranked_unverified_discovery: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${publicUserrecsSection(data.coverage?.public_userrecs)}${providerEnrichmentSection(data.operational?.provider_enrichment)}${emptyState(state)}<section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Recommendations</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
 refresh().catch(err => document.getElementById('app').innerHTML = `<p class=\"bad\">${esc(err.message)}</p>`); setInterval(refresh, 60000);
 </script></body></html>"""
     return template.replace("__TITLE__", escape(title))

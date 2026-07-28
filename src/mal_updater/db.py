@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
+import math
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from importlib.resources import files
@@ -9,6 +12,7 @@ from typing import Any, Iterable
 
 BROADCAST_COMPATIBILITY_MIGRATION = "013_mal_anime_metadata_broadcast_compatibility.sql"
 PROVIDER_ENRICHMENT_CURSOR_MIGRATION = "014_recommendation_provider_enrichment_cursor.sql"
+PUBLIC_USERRECS_STAGING_MIGRATION = "015_public_userrecs_resumable_staging.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -26,6 +30,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "012_watch_confirmation_provenance.sql",
     BROADCAST_COMPATIBILITY_MIGRATION,
     PROVIDER_ENRICHMENT_CURSOR_MIGRATION,
+    PUBLIC_USERRECS_STAGING_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -300,6 +305,55 @@ class MalRecommendationEdge:
     source_kind: str
     raw: dict[str, Any]
     fetched_at: str
+
+
+@dataclass(slots=True)
+class MalPublicUserRecsCrawlGeneration:
+    generation_id: int
+    source_mal_anime_id: int
+    source_title: str | None
+    source_url: str | None
+    status: str
+    cursor_url: str | None
+    pages_fetched: int
+    staged_edge_count: int
+    last_page_url: str | None
+    last_page_fingerprint: str | None
+    last_error: str | None
+    started_at: str
+    completed_at: str | None
+    published_at: str | None
+    discarded_at: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class MalPublicUserRecsStagedPage:
+    generation_id: int
+    source_mal_anime_id: int
+    page_number: int
+    page_url: str
+    page_fingerprint: str
+    anchor_json: str
+    next_url: str | None
+    edge_count: int
+    fetched_at: str
+    created_at: str
+    updated_at: str
+
+    @property
+    def anchor(self) -> dict[str, Any]:
+        decoded = _load_json_value(self.anchor_json, {})
+        return decoded if isinstance(decoded, dict) else {}
+
+
+@dataclass(frozen=True, slots=True)
+class MalPublicUserRecsPublicationResult:
+    generation_id: int
+    source_mal_anime_id: int
+    published_edge_count: int
+    pages_fetched: int
 
 
 @dataclass(slots=True)
@@ -2410,6 +2464,94 @@ def record_mal_recommendation_harvest_failure(
         conn.commit()
 
 
+def record_mal_recommendation_harvest_attempt_error(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    source_type: str = MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
+    error: str | None = None,
+    pages_fetched: int | None = None,
+    source_url: str | None = None,
+) -> None:
+    """Record a transient harvest attempt error without demoting fetched rows.
+
+    Resumable public-userrecs fetch/parse failures keep an open staged
+    generation and should not increment the authoritative harvest failure_count
+    for a previously published complete graph. They still update last_attempted
+    metadata so operators can see the latest transient blocker.
+    """
+    normalized_source_type = str(source_type or MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL).strip() or MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL
+    normalized_error = None if error is None else str(error).strip()[:1000] or None
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO mal_recommendation_harvest_status (
+                source_mal_anime_id,
+                status,
+                num_edges,
+                fetched_at,
+                source_type,
+                is_complete,
+                pages_fetched,
+                source_url,
+                last_attempted_at,
+                last_error,
+                failure_count,
+                updated_at
+            )
+            VALUES (
+                ?,
+                'failed',
+                COALESCE((SELECT COUNT(*) FROM mal_anime_recommendations WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'), 0),
+                CURRENT_TIMESTAMP,
+                ?,
+                0,
+                ?,
+                ?,
+                CURRENT_TIMESTAMP,
+                ?,
+                0,
+                CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(source_mal_anime_id) DO UPDATE SET
+                status = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.status
+                    ELSE 'failed'
+                END,
+                num_edges = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.num_edges
+                    ELSE COALESCE((SELECT COUNT(*) FROM mal_anime_recommendations WHERE source_mal_anime_id = excluded.source_mal_anime_id AND source_kind = 'mal_recommendation'), mal_recommendation_harvest_status.num_edges)
+                END,
+                source_type = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.source_type
+                    ELSE excluded.source_type
+                END,
+                is_complete = mal_recommendation_harvest_status.is_complete,
+                pages_fetched = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.pages_fetched
+                    ELSE excluded.pages_fetched
+                END,
+                source_url = CASE
+                    WHEN mal_recommendation_harvest_status.is_complete = 1 THEN mal_recommendation_harvest_status.source_url
+                    ELSE COALESCE(excluded.source_url, mal_recommendation_harvest_status.source_url)
+                END,
+                last_attempted_at = CURRENT_TIMESTAMP,
+                last_error = excluded.last_error,
+                failure_count = mal_recommendation_harvest_status.failure_count,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                int(source_mal_anime_id),
+                int(source_mal_anime_id),
+                normalized_source_type,
+                max(0, int(pages_fetched or 0)),
+                source_url,
+                normalized_error,
+            ),
+        )
+        conn.commit()
+
+
 def replace_mal_public_userrecs_recommendation_edges(
     db_path: Path,
     *,
@@ -2428,6 +2570,1520 @@ def replace_mal_public_userrecs_recommendation_edges(
         pages_fetched=pages_fetched,
         source_url=source_url,
     )
+
+
+_PUBLIC_USERRECS_OPEN_GENERATION_STATUSES = frozenset({"active", "paused", "ready"})
+_PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES = frozenset({"active", "paused"})
+_PUBLIC_USERRECS_EVENT_LIMIT_PER_SOURCE = 200
+_PUBLIC_USERRECS_RETAINED_FIELDS = ["target_mal_anime_id", "target_title", "num_recommendations"]
+_UNSET = object()
+
+
+def _public_userrecs_safe_text(value: Any, *, max_length: int = 1000) -> str | None:
+    text = _coerce_non_empty_text(value)
+    return None if text is None else text[:max(1, int(max_length))]
+
+
+def _public_userrecs_sanitized_anchor(anchor: dict[str, Any] | None) -> dict[str, Any]:
+    """Persist only resumability/coherence anchor fields, never raw public prose."""
+    if not isinstance(anchor, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key in ("first_target_mal_anime_id", "last_target_mal_anime_id"):
+        target_id = _coerce_mal_anime_id(anchor.get(key))
+        if target_id is not None:
+            sanitized[key] = target_id
+    target_ids = anchor.get("target_mal_anime_ids")
+    if isinstance(target_ids, list):
+        sanitized_ids = [target_id for value in target_ids if (target_id := _coerce_mal_anime_id(value)) is not None]
+        if sanitized_ids:
+            sanitized["target_mal_anime_ids"] = sanitized_ids[:100]
+    for key in ("first_target_title", "last_target_title"):
+        text = _public_userrecs_safe_text(anchor.get(key), max_length=500)
+        if text is not None:
+            sanitized[key] = text
+    return sanitized
+
+
+def _public_userrecs_generation_from_row(row: sqlite3.Row) -> MalPublicUserRecsCrawlGeneration:
+    return MalPublicUserRecsCrawlGeneration(
+        generation_id=int(row["generation_id"]),
+        source_mal_anime_id=int(row["source_mal_anime_id"]),
+        source_title=row["source_title"],
+        source_url=row["source_url"],
+        status=str(row["status"]),
+        cursor_url=row["cursor_url"],
+        pages_fetched=int(row["pages_fetched"] or 0),
+        staged_edge_count=int(row["staged_edge_count"] or 0),
+        last_page_url=row["last_page_url"],
+        last_page_fingerprint=row["last_page_fingerprint"],
+        last_error=row["last_error"],
+        started_at=str(row["started_at"]),
+        completed_at=row["completed_at"],
+        published_at=row["published_at"],
+        discarded_at=row["discarded_at"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _public_userrecs_staged_page_from_row(row: sqlite3.Row) -> MalPublicUserRecsStagedPage:
+    return MalPublicUserRecsStagedPage(
+        generation_id=int(row["generation_id"]),
+        source_mal_anime_id=int(row["source_mal_anime_id"]),
+        page_number=int(row["page_number"]),
+        page_url=str(row["page_url"]),
+        page_fingerprint=str(row["page_fingerprint"]),
+        anchor_json=str(row["anchor_json"]),
+        next_url=row["next_url"],
+        edge_count=int(row["edge_count"] or 0),
+        fetched_at=str(row["fetched_at"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _get_public_userrecs_generation_row(conn: sqlite3.Connection, generation_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM mal_public_userrecs_crawl_generations WHERE generation_id = ?",
+        (int(generation_id),),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"public userrecs crawl generation not found: {generation_id}")
+    return row
+
+
+def _record_public_userrecs_event(
+    conn: sqlite3.Connection,
+    *,
+    generation_id: int | None,
+    source_mal_anime_id: int,
+    event_type: str,
+    page_number: int | None = None,
+    page_url: str | None = None,
+    error: str | None = None,
+    event_limit: int = _PUBLIC_USERRECS_EVENT_LIMIT_PER_SOURCE,
+) -> None:
+    normalized_error = None if error is None else str(error).strip()[:1000] or None
+    conn.execute(
+        """
+        INSERT INTO mal_public_userrecs_crawl_events (
+            generation_id, source_mal_anime_id, event_type, page_number, page_url, error
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            None if generation_id is None else int(generation_id),
+            int(source_mal_anime_id),
+            str(event_type),
+            None if page_number is None else int(page_number),
+            page_url,
+            normalized_error,
+        ),
+    )
+    limit = max(1, int(event_limit))
+    conn.execute(
+        """
+        DELETE FROM mal_public_userrecs_crawl_events
+        WHERE source_mal_anime_id = ?
+          AND id NOT IN (
+              SELECT id
+              FROM mal_public_userrecs_crawl_events
+              WHERE source_mal_anime_id = ?
+              ORDER BY id DESC
+              LIMIT ?
+          )
+        """,
+        (int(source_mal_anime_id), int(source_mal_anime_id), limit),
+    )
+
+
+def _require_public_userrecs_generation_status(row: sqlite3.Row, allowed: frozenset[str], *, action: str) -> None:
+    status = str(row["status"])
+    if status not in allowed:
+        raise ValueError(
+            f"cannot {action} public userrecs generation {row['generation_id']} "
+            f"while status is {status!r}"
+        )
+
+
+def get_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    generation_id: int,
+) -> MalPublicUserRecsCrawlGeneration | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM mal_public_userrecs_crawl_generations WHERE generation_id = ?",
+            (int(generation_id),),
+        ).fetchone()
+    return None if row is None else _public_userrecs_generation_from_row(row)
+
+
+def get_active_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+) -> MalPublicUserRecsCrawlGeneration | None:
+    source_id = _coerce_mal_anime_id(source_mal_anime_id)
+    if source_id is None:
+        raise ValueError("source_mal_anime_id must be a positive integer")
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM mal_public_userrecs_crawl_generations
+            WHERE source_mal_anime_id = ?
+              AND status IN ('active', 'paused', 'ready')
+            ORDER BY generation_id DESC
+            LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+    return None if row is None else _public_userrecs_generation_from_row(row)
+
+
+def list_active_mal_public_userrecs_generations(
+    db_path: Path,
+    *,
+    source_mal_anime_ids: Iterable[int] | None = None,
+) -> list[MalPublicUserRecsCrawlGeneration]:
+    """Return open public-userrecs generations, oldest-updated first.
+
+    Orchestration uses this to resume active/paused/ready generations before
+    starting new stale-source generations so interrupted long crawls do not
+    starve behind fresh candidate ranking.
+    """
+    source_ids: list[int] | None = None
+    if source_mal_anime_ids is not None:
+        source_ids = []
+        for value in source_mal_anime_ids:
+            source_id = _coerce_mal_anime_id(value)
+            if source_id is not None and source_id not in source_ids:
+                source_ids.append(source_id)
+        if not source_ids:
+            return []
+    clauses = ["status IN ('active', 'paused', 'ready')"]
+    params: list[Any] = []
+    if source_ids is not None:
+        placeholders = ", ".join("?" for _ in source_ids)
+        clauses.append(f"source_mal_anime_id IN ({placeholders})")
+        params.extend(source_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM mal_public_userrecs_crawl_generations
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at ASC, generation_id ASC
+            """,
+            params,
+        ).fetchall()
+    return [_public_userrecs_generation_from_row(row) for row in rows]
+
+
+def list_mal_public_userrecs_staged_pages(
+    db_path: Path,
+    *,
+    generation_id: int,
+) -> list[MalPublicUserRecsStagedPage]:
+    """Return staged pages for one public-userrecs generation in page order."""
+    with connect(db_path) as conn:
+        rows = _public_userrecs_staged_pages(conn, int(generation_id))
+    return [_public_userrecs_staged_page_from_row(row) for row in rows]
+
+
+def create_or_get_active_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    source_title: str | None = None,
+    source_url: str | None = None,
+    cursor_url: str | None = None,
+) -> MalPublicUserRecsCrawlGeneration:
+    """Return the one open public-userrecs crawl generation for a source, creating it if absent."""
+    source_id = _coerce_mal_anime_id(source_mal_anime_id)
+    if source_id is None:
+        raise ValueError("source_mal_anime_id must be a positive integer")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        initial_cursor_url = _coerce_non_empty_text(cursor_url) or _coerce_non_empty_text(source_url)
+        row = conn.execute(
+            """
+            SELECT *
+            FROM mal_public_userrecs_crawl_generations
+            WHERE source_mal_anime_id = ?
+              AND status IN ('active', 'paused', 'ready')
+            ORDER BY generation_id DESC
+            LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO mal_public_userrecs_crawl_generations (
+                    source_mal_anime_id, source_title, source_url, cursor_url
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (source_id, source_title, source_url, initial_cursor_url),
+            )
+            generation_id = int(cursor.lastrowid)
+            _record_public_userrecs_event(
+                conn,
+                generation_id=generation_id,
+                source_mal_anime_id=source_id,
+                event_type="begin",
+                page_url=initial_cursor_url,
+            )
+            row = _get_public_userrecs_generation_row(conn, generation_id)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def _prepared_public_userrecs_staged_edges(
+    edges: Iterable[dict[str, Any]],
+    *,
+    generation_id: int,
+    source_mal_anime_id: int,
+    page_number: int,
+    page_url: str,
+    fetched_at: str,
+) -> list[tuple[Any, ...]]:
+    by_target: dict[int, tuple[Any, ...]] = {}
+    sort_keys: dict[int, tuple[int, int]] = {}
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            continue
+        target_id = _coerce_mal_anime_id(edge.get("target_mal_anime_id"))
+        if target_id is None:
+            raise ValueError("staged public userrecs edge target_mal_anime_id must be a positive integer")
+        count = _coerce_nonnegative_int(edge.get("num_recommendations"))
+        target_title = _public_userrecs_safe_text(edge.get("target_title"), max_length=500)
+        raw_input = edge.get("raw") if isinstance(edge.get("raw"), dict) else {}
+        provenance_input = edge.get("provenance") if isinstance(edge.get("provenance"), dict) else {}
+        raw_page_url = _public_userrecs_safe_text(raw_input.get("page_url"), max_length=2000) or page_url
+        provenance_page_url = _public_userrecs_safe_text(provenance_input.get("page_url"), max_length=2000) or page_url
+        provenance_source_url = _public_userrecs_safe_text(provenance_input.get("source_url"), max_length=2000)
+        provenance_page_count = _coerce_nonnegative_int(provenance_input.get("page_count"))
+        raw = {
+            "source": "public_mal_userrecs",
+            "page_url": raw_page_url,
+            "target_mal_anime_id": target_id,
+            "target_title": target_title,
+            "num_recommendations": count,
+        }
+        provenance = {
+            "source": "public_mal_userrecs",
+            "page_url": provenance_page_url,
+            "retained_fields": list(_PUBLIC_USERRECS_RETAINED_FIELDS),
+            "privacy": "recommendation prose and usernames are not persisted",
+        }
+        if provenance_source_url is not None:
+            provenance["source_url"] = provenance_source_url
+        if provenance_page_count is not None:
+            provenance["page_count"] = provenance_page_count
+        prepared = (
+            int(generation_id),
+            int(source_mal_anime_id),
+            int(page_number),
+            target_id,
+            target_title,
+            count,
+            json.dumps(raw, ensure_ascii=False, sort_keys=True),
+            json.dumps(provenance, ensure_ascii=False, sort_keys=True),
+            fetched_at,
+        )
+        score = (count if count is not None else -1, -index)
+        existing_score = sort_keys.get(target_id)
+        if existing_score is None or score > existing_score:
+            by_target[target_id] = prepared
+            sort_keys[target_id] = score
+    return list(by_target.values())
+
+
+def replace_mal_public_userrecs_staged_page(
+    db_path: Path,
+    *,
+    generation_id: int,
+    page_number: int,
+    page_url: str,
+    page_fingerprint: str,
+    anchor: dict[str, Any] | None = None,
+    next_url: str | None = None,
+    edges: Iterable[dict[str, Any]] = (),
+    fetched_at: str | None = None,
+) -> MalPublicUserRecsStagedPage:
+    """Replace one staged page and its edges without touching published recommendations."""
+    if int(page_number) < 1:
+        raise ValueError("page_number must be >= 1")
+    normalized_page_url = str(page_url).strip()
+    if not normalized_page_url:
+        raise ValueError("page_url is required")
+    normalized_fingerprint = str(page_fingerprint).strip()
+    if not normalized_fingerprint:
+        raise ValueError("page_fingerprint is required")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            generation,
+            _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
+            action="stage page for",
+        )
+        source_id = int(generation["source_mal_anime_id"])
+        timestamp = fetched_at or str(conn.execute("SELECT CURRENT_TIMESTAMP AS now").fetchone()["now"])
+        prepared_edges = _prepared_public_userrecs_staged_edges(
+            edges,
+            generation_id=int(generation_id),
+            source_mal_anime_id=source_id,
+            page_number=int(page_number),
+            page_url=normalized_page_url,
+            fetched_at=timestamp,
+        )
+        conn.execute(
+            """
+            INSERT INTO mal_public_userrecs_staged_pages (
+                generation_id,
+                source_mal_anime_id,
+                page_number,
+                page_url,
+                page_fingerprint,
+                anchor_json,
+                next_url,
+                edge_count,
+                fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(generation_id, page_number) DO UPDATE SET
+                source_mal_anime_id = excluded.source_mal_anime_id,
+                page_url = excluded.page_url,
+                page_fingerprint = excluded.page_fingerprint,
+                anchor_json = excluded.anchor_json,
+                next_url = excluded.next_url,
+                edge_count = excluded.edge_count,
+                fetched_at = excluded.fetched_at,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                int(generation_id),
+                source_id,
+                int(page_number),
+                normalized_page_url,
+                normalized_fingerprint,
+                json.dumps(_public_userrecs_sanitized_anchor(anchor), ensure_ascii=False, sort_keys=True),
+                next_url,
+                len(prepared_edges),
+                timestamp,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM mal_public_userrecs_staged_edges WHERE generation_id = ? AND page_number = ?",
+            (int(generation_id), int(page_number)),
+        )
+        conn.executemany(
+            """
+            INSERT INTO mal_public_userrecs_staged_edges (
+                generation_id,
+                source_mal_anime_id,
+                page_number,
+                target_mal_anime_id,
+                target_title,
+                num_recommendations,
+                raw_json,
+                provenance_json,
+                fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            prepared_edges,
+        )
+        counts = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM mal_public_userrecs_staged_pages WHERE generation_id = ?) AS pages,
+                (SELECT COUNT(*) FROM mal_public_userrecs_staged_edges WHERE generation_id = ?) AS edges
+            """,
+            (int(generation_id), int(generation_id)),
+        ).fetchone()
+        final_page = conn.execute(
+            """
+            SELECT page_url, page_fingerprint, next_url
+            FROM mal_public_userrecs_staged_pages
+            WHERE generation_id = ?
+            ORDER BY page_number DESC
+            LIMIT 1
+            """,
+            (int(generation_id),),
+        ).fetchone()
+        if final_page is None:  # pragma: no cover - defensive; the upsert above guarantees a page row.
+            raise ValueError("public userrecs staged page replacement produced no staged pages")
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET cursor_url = ?,
+                pages_fetched = ?,
+                staged_edge_count = ?,
+                last_page_url = ?,
+                last_page_fingerprint = ?,
+                last_error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ?
+            """,
+            (
+                final_page["next_url"],
+                int(counts["pages"] or 0),
+                int(counts["edges"] or 0),
+                final_page["page_url"],
+                final_page["page_fingerprint"],
+                int(generation_id),
+            ),
+        )
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=source_id,
+            event_type="page_upsert",
+            page_number=int(page_number),
+            page_url=normalized_page_url,
+        )
+        row = conn.execute(
+            """
+            SELECT *
+            FROM mal_public_userrecs_staged_pages
+            WHERE generation_id = ? AND page_number = ?
+            """,
+            (int(generation_id), int(page_number)),
+        ).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_staged_page_from_row(row)
+
+
+def pause_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    generation_id: int,
+    cursor_url: str | None,
+    error: str | None = None,
+) -> MalPublicUserRecsCrawlGeneration:
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            generation,
+            _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
+            action="pause",
+        )
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET status = 'paused', cursor_url = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ?
+            """,
+            (cursor_url, None if error is None else str(error).strip()[:1000] or None, int(generation_id)),
+        )
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=int(generation["source_mal_anime_id"]),
+            event_type="pause",
+            page_url=cursor_url,
+            error=error,
+        )
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def resume_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    generation_id: int,
+    cursor_url: str | None | object = _UNSET,
+) -> MalPublicUserRecsCrawlGeneration:
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            generation,
+            _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
+            action="resume",
+        )
+        if cursor_url is _UNSET:
+            conn.execute(
+                """
+                UPDATE mal_public_userrecs_crawl_generations
+                SET status = 'active', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE generation_id = ?
+                """,
+                (int(generation_id),),
+            )
+            event_page_url = generation["cursor_url"]
+        else:
+            conn.execute(
+                """
+                UPDATE mal_public_userrecs_crawl_generations
+                SET status = 'active', cursor_url = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE generation_id = ?
+                """,
+                (cursor_url, int(generation_id)),
+            )
+            event_page_url = None if cursor_url is None else str(cursor_url)
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=int(generation["source_mal_anime_id"]),
+            event_type="resume",
+            page_url=event_page_url,
+        )
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def _public_userrecs_staged_pages(conn: sqlite3.Connection, generation_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM mal_public_userrecs_staged_pages
+        WHERE generation_id = ?
+        ORDER BY page_number ASC
+        """,
+        (int(generation_id),),
+    ).fetchall()
+
+
+def _public_userrecs_staged_edges(conn: sqlite3.Connection, generation_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM mal_public_userrecs_staged_edges
+        WHERE generation_id = ?
+        ORDER BY page_number ASC, target_mal_anime_id ASC
+        """,
+        (int(generation_id),),
+    ).fetchall()
+
+
+def _assert_public_userrecs_generation_coherent(
+    conn: sqlite3.Connection,
+    generation: sqlite3.Row,
+    *,
+    require_terminal: bool,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    generation_id = int(generation["generation_id"])
+    source_id = int(generation["source_mal_anime_id"])
+    pages = _public_userrecs_staged_pages(conn, generation_id)
+    edges = _public_userrecs_staged_edges(conn, generation_id)
+    if not pages:
+        raise ValueError("public userrecs generation has no staged pages")
+    expected_page_numbers = list(range(1, len(pages) + 1))
+    actual_page_numbers = [int(row["page_number"]) for row in pages]
+    if actual_page_numbers != expected_page_numbers:
+        raise ValueError(
+            "public userrecs staged pages are not contiguous from page 1: "
+            f"{actual_page_numbers!r}"
+        )
+    if int(generation["pages_fetched"] or 0) != len(pages):
+        raise ValueError("public userrecs generation pages_fetched does not match staged pages")
+    if int(generation["staged_edge_count"] or 0) != len(edges):
+        raise ValueError("public userrecs generation staged_edge_count does not match staged edges")
+    edge_counts_by_page: dict[int, int] = {}
+    for edge in edges:
+        if int(edge["source_mal_anime_id"]) != source_id:
+            raise ValueError("public userrecs staged edge source does not match generation source")
+        edge_counts_by_page[int(edge["page_number"])] = edge_counts_by_page.get(int(edge["page_number"]), 0) + 1
+    page_numbers = set(actual_page_numbers)
+    for edge_page in edge_counts_by_page:
+        if edge_page not in page_numbers:
+            raise ValueError("public userrecs staged edge references a missing page")
+    for page in pages:
+        if int(page["source_mal_anime_id"]) != source_id:
+            raise ValueError("public userrecs staged page source does not match generation source")
+        count = edge_counts_by_page.get(int(page["page_number"]), 0)
+        if int(page["edge_count"] or 0) != count:
+            raise ValueError("public userrecs staged page edge_count does not match staged edges")
+    last_page = pages[-1]
+    if generation["last_page_url"] != last_page["page_url"]:
+        raise ValueError("public userrecs generation last_page_url does not match final staged page")
+    if generation["last_page_fingerprint"] != last_page["page_fingerprint"]:
+        raise ValueError("public userrecs generation last_page_fingerprint does not match final staged page")
+    for previous, current in zip(pages, pages[1:]):
+        if previous["next_url"] != current["page_url"]:
+            raise ValueError("public userrecs staged next-link chain does not match page order")
+    if require_terminal:
+        if generation["cursor_url"] is not None:
+            raise ValueError("public userrecs generation still has a persisted next-page cursor")
+        if last_page["next_url"] is not None:
+            raise ValueError("public userrecs final staged page still has a next_url")
+    return pages, edges
+
+
+def mark_mal_public_userrecs_generation_ready(
+    db_path: Path,
+    *,
+    generation_id: int,
+) -> MalPublicUserRecsCrawlGeneration:
+    """Mark a terminal coherent staged crawl ready for guarded publication."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            generation,
+            _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
+            action="mark ready",
+        )
+        _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET status = 'ready', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ?
+            """,
+            (int(generation_id),),
+        )
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=int(generation["source_mal_anime_id"]),
+            event_type="ready",
+        )
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def discard_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    generation_id: int,
+    reason: str | None = None,
+) -> MalPublicUserRecsCrawlGeneration:
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            generation,
+            _PUBLIC_USERRECS_OPEN_GENERATION_STATUSES,
+            action="discard",
+        )
+        normalized_reason = None if reason is None else str(reason).strip()[:1000] or None
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET status = 'discarded', discarded_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ?
+            """,
+            (normalized_reason, int(generation_id)),
+        )
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=int(generation["source_mal_anime_id"]),
+            event_type="discard",
+            error=normalized_reason,
+        )
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def restart_mal_public_userrecs_generation_after_drift(
+    db_path: Path,
+    *,
+    generation_id: int,
+    reason: str | None = "public userrecs pagination drift detected",
+    cursor_url: str | None | object = _UNSET,
+) -> MalPublicUserRecsCrawlGeneration:
+    """Discard an open generation after drift and start a fresh one for the same source."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        old = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            old,
+            _PUBLIC_USERRECS_OPEN_GENERATION_STATUSES,
+            action="restart after drift",
+        )
+        source_id = int(old["source_mal_anime_id"])
+        normalized_reason = None if reason is None else str(reason).strip()[:1000] or None
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET status = 'discarded', discarded_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ?
+            """,
+            (normalized_reason, int(generation_id)),
+        )
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=source_id,
+            event_type="discard",
+            error=normalized_reason,
+        )
+        new_cursor_url = old["source_url"] if cursor_url is _UNSET else cursor_url
+        cursor = conn.execute(
+            """
+            INSERT INTO mal_public_userrecs_crawl_generations (
+                source_mal_anime_id, source_title, source_url, cursor_url
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (source_id, old["source_title"], old["source_url"], new_cursor_url),
+        )
+        new_generation_id = int(cursor.lastrowid)
+        _record_public_userrecs_event(
+            conn,
+            generation_id=new_generation_id,
+            source_mal_anime_id=source_id,
+            event_type="begin",
+            page_url=None if new_cursor_url is None else str(new_cursor_url),
+        )
+        row = _get_public_userrecs_generation_row(conn, new_generation_id)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def _aggregate_public_userrecs_publication_edges(
+    staged_edges: list[sqlite3.Row],
+    *,
+    source_url: str | None,
+    page_count: int,
+    generation_id: int,
+) -> list[dict[str, Any]]:
+    by_target: dict[int, dict[str, Any]] = {}
+    best_keys: dict[int, tuple[int, int]] = {}
+    for index, row in enumerate(staged_edges):
+        target_id = int(row["target_mal_anime_id"])
+        count = 0 if row["num_recommendations"] is None else max(0, int(row["num_recommendations"]))
+        sort_key = (count, -index)
+        if target_id in best_keys and sort_key <= best_keys[target_id]:
+            existing = by_target[target_id]
+            if not existing.get("target_title") and row["target_title"]:
+                existing["target_title"] = row["target_title"]
+            continue
+        raw_input = _load_json_value(row["raw_json"], {})
+        raw_input = raw_input if isinstance(raw_input, dict) else {}
+        provenance_input = _load_json_value(row["provenance_json"], {})
+        provenance_input = provenance_input if isinstance(provenance_input, dict) else {}
+        page_url = (
+            _public_userrecs_safe_text(provenance_input.get("page_url"), max_length=2000)
+            or _public_userrecs_safe_text(raw_input.get("page_url"), max_length=2000)
+        )
+        raw = {
+            "source": "public_mal_userrecs",
+            "target_mal_anime_id": target_id,
+            "target_title": row["target_title"],
+            "num_recommendations": count,
+        }
+        if page_url is not None:
+            raw["page_url"] = page_url
+        provenance = {
+            "source": "public_mal_userrecs",
+            "source_url": _public_userrecs_safe_text(provenance_input.get("source_url"), max_length=2000) or source_url,
+            "page_count": int(page_count),
+            "generation_id": int(generation_id),
+            "retained_fields": list(_PUBLIC_USERRECS_RETAINED_FIELDS),
+            "privacy": "recommendation prose and usernames are parsed only for aggregate counts and are not persisted",
+        }
+        if page_url is not None:
+            provenance["page_url"] = page_url
+        by_target[target_id] = {
+            "target_mal_anime_id": target_id,
+            "target_title": row["target_title"],
+            "num_recommendations": count,
+            "raw": raw,
+            "provenance": provenance,
+        }
+        best_keys[target_id] = sort_key
+    return sorted(
+        by_target.values(),
+        key=lambda edge: (-int(edge["num_recommendations"] or 0), int(edge["target_mal_anime_id"])),
+    )
+
+
+def _execute_public_userrecs_publication_statement(
+    conn: sqlite3.Connection,
+    statement: str,
+    params: tuple[Any, ...] = (),
+) -> sqlite3.Cursor:
+    """Narrow test seam proving public-userrecs publication rollback behavior."""
+    return conn.execute(statement, params)
+
+
+def publish_mal_public_userrecs_generation(
+    db_path: Path,
+    *,
+    generation_id: int,
+) -> MalPublicUserRecsPublicationResult:
+    """Atomically publish one terminal coherent staged public-userrecs generation."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_generation_status(
+            generation,
+            frozenset({"ready"}),
+            action="publish",
+        )
+        if generation["completed_at"] is None:
+            raise ValueError("public userrecs generation is ready but lacks completed_at")
+        pages, staged_edges = _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
+        source_id = int(generation["source_mal_anime_id"])
+        source_url = generation["source_url"] or pages[0]["page_url"]
+        edges = _aggregate_public_userrecs_publication_edges(
+            staged_edges,
+            source_url=source_url,
+            page_count=len(pages),
+            generation_id=int(generation_id),
+        )
+        _execute_public_userrecs_publication_statement(
+            conn,
+            "DELETE FROM mal_anime_recommendations WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'",
+            (source_id,),
+        )
+        for edge in edges:
+            _execute_public_userrecs_publication_statement(
+                conn,
+                """
+                INSERT INTO mal_anime_recommendations (
+                    source_mal_anime_id,
+                    target_mal_anime_id,
+                    target_title,
+                    num_recommendations,
+                    hop_distance,
+                    source_kind,
+                    raw_json,
+                    harvest_source,
+                    complete_harvest,
+                    provenance_json
+                ) VALUES (?, ?, ?, ?, 1, 'mal_recommendation', ?, ?, 1, ?)
+                """,
+                (
+                    source_id,
+                    int(edge["target_mal_anime_id"]),
+                    edge.get("target_title"),
+                    int(edge["num_recommendations"] or 0),
+                    json.dumps(edge.get("raw") if isinstance(edge.get("raw"), dict) else {}, ensure_ascii=False, sort_keys=True),
+                    MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                    json.dumps(edge.get("provenance") if isinstance(edge.get("provenance"), dict) else {}, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+        _execute_public_userrecs_publication_statement(
+            conn,
+            """
+            INSERT INTO mal_recommendation_harvest_status (
+                source_mal_anime_id,
+                status,
+                num_edges,
+                fetched_at,
+                source_type,
+                is_complete,
+                pages_fetched,
+                source_url,
+                last_attempted_at,
+                last_error,
+                failure_count,
+                updated_at
+            )
+            VALUES (?, 'fetched', ?, CURRENT_TIMESTAMP, ?, 1, ?, ?, CURRENT_TIMESTAMP, NULL, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT(source_mal_anime_id) DO UPDATE SET
+                status = excluded.status,
+                num_edges = excluded.num_edges,
+                fetched_at = excluded.fetched_at,
+                source_type = excluded.source_type,
+                is_complete = excluded.is_complete,
+                pages_fetched = excluded.pages_fetched,
+                source_url = excluded.source_url,
+                last_attempted_at = excluded.last_attempted_at,
+                last_error = NULL,
+                failure_count = 0,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                source_id,
+                len(edges),
+                MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                len(pages),
+                source_url,
+            ),
+        )
+        _execute_public_userrecs_publication_statement(
+            conn,
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET status = 'published', published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ? AND status = 'ready'
+            """,
+            (int(generation_id),),
+        )
+        _record_public_userrecs_event(
+            conn,
+            generation_id=int(generation_id),
+            source_mal_anime_id=source_id,
+            event_type="publish",
+        )
+        result = MalPublicUserRecsPublicationResult(
+            generation_id=int(generation_id),
+            source_mal_anime_id=source_id,
+            published_edge_count=len(edges),
+            pages_fetched=len(pages),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return result
+
+
+_PUBLIC_USERRECS_DIAGNOSTIC_TABLES: frozenset[str] = frozenset(
+    {
+        "mal_user_anime_list_cache",
+        "mal_recommendation_harvest_status",
+        "mal_public_userrecs_crawl_generations",
+        "mal_public_userrecs_staged_pages",
+        "mal_public_userrecs_staged_edges",
+        "mal_public_userrecs_crawl_events",
+    }
+)
+_PUBLIC_USERRECS_DIAGNOSTIC_STATUSES: frozenset[str] = frozenset({"ok", "degraded", "unknown"})
+
+
+def _safe_nonnegative_int(value: Any) -> int:
+    try:
+        if value is None or isinstance(value, bool):
+            return 0
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(max(0, int(numerator)) / denominator, 6)
+
+
+def _utc_iso_from_db_timestamp(value: Any) -> str | None:
+    text = _coerce_non_empty_text(value)
+    if text is None:
+        return None
+    candidate = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _diagnostic_error_code(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "unspecified"
+    if "rate" in text and "limit" in text:
+        return "rate_limited"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "parser" in text or "parse" in text:
+        return "parse_error"
+    if "fingerprint" in text or "drift" in text or "loop" in text or "cursor" in text:
+        return "pagination_drift"
+    if "validation" in text or "invalid" in text:
+        return "validation_error"
+    if "max_pages" in text or "max pages" in text:
+        return "page_budget_reached"
+    words = re.findall(r"[a-z0-9]+", text)
+    return "_".join(words[:4])[:80] or "error"
+
+
+def _public_userrecs_schema_diagnostic(conn: sqlite3.Connection) -> tuple[bool, list[str]]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    tables = {str(row["name"]) for row in rows}
+    missing = sorted(_PUBLIC_USERRECS_DIAGNOSTIC_TABLES - tables)
+    return not missing, missing
+
+
+def unknown_public_userrecs_diagnostics(*, reason: str, status: str = "unknown") -> dict[str, Any]:
+    """Return the stable read-only public-userrecs diagnostic shape when data is unavailable."""
+    normalized_status = status if status in _PUBLIC_USERRECS_DIAGNOSTIC_STATUSES else "unknown"
+    reason_codes = [str(reason or "unknown").strip() or "unknown"]
+    return {
+        "status": normalized_status,
+        "reason_codes": reason_codes,
+        "policy": {
+            "authorized_source_titles_per_hour": 2,
+            "configured_source_titles_per_hour": None,
+            "configured_source_titles_per_hour_source": "unknown",
+            "max_pages_per_source_per_run": None,
+            "stale_horizon_days": None,
+            "stale_horizon_source": "unknown",
+        },
+        "positive_seed_count": 0,
+        "coverage": {
+            "complete": 0,
+            "fresh": 0,
+            "stale": 0,
+            "failed": 0,
+            "unharvested": 0,
+            "fresh_ratio": None,
+            "total": 0,
+            "semantics": "complete public-userrecs harvest sources only",
+        },
+        "open_generations": {
+            "active": 0,
+            "paused": 0,
+            "ready": 0,
+            "total": 0,
+            "staged_pages": 0,
+            "staged_edges": 0,
+            "by_status": {
+                "active": {"count": 0, "staged_pages": 0, "staged_edges": 0},
+                "paused": {"count": 0, "staged_pages": 0, "staged_edges": 0},
+                "ready": {"count": 0, "staged_pages": 0, "staged_edges": 0},
+            },
+        },
+        "hourly_throughput": {
+            "pages_fetched_last_hour": 0,
+            "page_events_last_hour": 0,
+            "last_page_fetched_at": None,
+            "sources_started_last_hour": 0,
+            "sources_published_last_hour": 0,
+        },
+        "events": {
+            "recent_window_hours": 24,
+            "page_events_recent": 0,
+            "error_events_recent": 0,
+            "last_page_event_at": None,
+            "last_error_event_at": None,
+        },
+        "errors": {
+            "source_error_counts": {},
+            "recent_24h_error_events": 0,
+            "last_error": None,
+        },
+        "backlog": {
+            "due_sources": None,
+            "source_start_eta": {"eta_hours": None, "reason_code": "unknown"},
+            "conservative_source_start_eta": None,
+            "conservative_source_start_eta_hours": None,
+            "completion_eta": None,
+            "completion_eta_hours": None,
+            "completion_eta_reason_codes": ["unknown_pages_per_source"],
+            "completion_eta_detail": {"eta_hours": None, "reason_code": "unknown_pages_per_source"},
+        },
+        "sustainability": {
+            "authorized_source_titles_per_hour": 2,
+            "configured_source_titles_per_hour": None,
+            "sources_started_last_hour": 0,
+            "within_authorized_rate": None,
+            "over_authorized_by": 0,
+            "configured_exceeds_authorized": None,
+        },
+    }
+
+
+def get_public_userrecs_diagnostics(
+    db_path: Path,
+    *,
+    configured_source_titles_per_hour: int | None = None,
+    max_pages_per_source_per_run: int | None = None,
+    stale_after_days: int = 45,
+    authorized_source_titles_per_hour: int = 2,
+) -> dict[str, Any]:
+    """Return read-only public MAL userrecs crawl diagnostics for dashboards.
+
+    This intentionally avoids raw URLs, usernames, recommendation prose, and title
+    samples. Completion ETA remains unknown because MAL public userrecs exposes no
+    durable total-pages-per-source value until crawling reaches the terminal page.
+    """
+    stale_after_days = max(1, int(stale_after_days))
+    authorized = max(0, int(authorized_source_titles_per_hour))
+    configured = None if configured_source_titles_per_hour is None else max(0, int(configured_source_titles_per_hour))
+    max_pages = None if max_pages_per_source_per_run is None else max(1, int(max_pages_per_source_per_run))
+    try:
+        with connect(db_path) as conn:
+            schema_present, missing_tables = _public_userrecs_schema_diagnostic(conn)
+            if not schema_present:
+                payload = unknown_public_userrecs_diagnostics(
+                    reason="public_userrecs_staging_schema_absent",
+                    status="unknown",
+                )
+                payload["reason_codes"].append("missing_tables:" + ",".join(missing_tables))
+                payload["policy"].update(
+                    {
+                        "configured_source_titles_per_hour": configured,
+                        "configured_source_titles_per_hour_source": "task_execute_limit" if configured is not None else "unknown",
+                        "max_pages_per_source_per_run": max_pages,
+                        "stale_horizon_days": stale_after_days,
+                        "stale_horizon_source": "configured_or_default",
+                    }
+                )
+                payload["sustainability"].update(
+                    {
+                        "configured_source_titles_per_hour": configured,
+                        "configured_exceeds_authorized": None if configured is None else configured > authorized,
+                    }
+                )
+                return payload
+
+            seed_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM mal_user_anime_list_cache
+                WHERE list_status IN ('completed', 'watching', 'on_hold')
+                """
+            ).fetchone()
+            positive_seed_count = _safe_nonnegative_int(seed_row["count"] if seed_row is not None else 0)
+            status_rows = conn.execute(
+                """
+                SELECT
+                    source_mal_anime_id,
+                    status,
+                    fetched_at,
+                    source_type,
+                    is_complete,
+                    last_attempted_at,
+                    last_error,
+                    failure_count
+                FROM mal_recommendation_harvest_status
+                WHERE source_mal_anime_id IN (
+                    SELECT mal_anime_id
+                    FROM mal_user_anime_list_cache
+                    WHERE list_status IN ('completed', 'watching', 'on_hold')
+                )
+                """
+            ).fetchall()
+            status_by_source = {int(row["source_mal_anime_id"]): row for row in status_rows}
+            seed_rows = conn.execute(
+                """
+                SELECT mal_anime_id
+                FROM mal_user_anime_list_cache
+                WHERE list_status IN ('completed', 'watching', 'on_hold')
+                ORDER BY mal_anime_id ASC
+                """
+            ).fetchall()
+            threshold = datetime.now(timezone.utc) - timedelta(days=stale_after_days)
+            coverage_counts = {"complete": 0, "fresh": 0, "stale": 0, "failed": 0, "unharvested": 0}
+            due_sources = 0
+            source_error_counts: dict[str, int] = {}
+            source_ids = [int(row["mal_anime_id"]) for row in seed_rows]
+            for source_id in source_ids:
+                row = status_by_source.get(source_id)
+                if row is None:
+                    coverage_counts["unharvested"] += 1
+                    due_sources += 1
+                    continue
+                last_error = row["last_error"]
+                failure_count = _safe_nonnegative_int(row["failure_count"])
+                if last_error:
+                    source_error_counts[_diagnostic_error_code(last_error)] = source_error_counts.get(_diagnostic_error_code(last_error), 0) + max(1, failure_count)
+                is_complete_public = int(row["is_complete"] or 0) == 1 and str(row["source_type"] or "") == MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS
+                if is_complete_public:
+                    coverage_counts["complete"] += 1
+                if str(row["status"] or "") == "failed":
+                    coverage_counts["failed"] += 1
+                    due_sources += 1
+                    continue
+                if not is_complete_public:
+                    coverage_counts["unharvested"] += 1
+                    due_sources += 1
+                    continue
+                fetched_at = _utc_iso_from_db_timestamp(row["fetched_at"])
+                parsed = None
+                if fetched_at:
+                    try:
+                        parsed = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+                    except ValueError:
+                        parsed = None
+                if parsed is not None and parsed.astimezone(timezone.utc) >= threshold:
+                    coverage_counts["fresh"] += 1
+                else:
+                    coverage_counts["stale"] += 1
+                    due_sources += 1
+
+            open_rows = conn.execute(
+                """
+                SELECT
+                    status,
+                    COUNT(*) AS generation_count,
+                    COALESCE(SUM(pages_fetched), 0) AS pages,
+                    COALESCE(SUM(staged_edge_count), 0) AS edges
+                FROM mal_public_userrecs_crawl_generations
+                WHERE status IN ('active', 'paused', 'ready')
+                GROUP BY status
+                """
+            ).fetchall()
+            open_counts = {
+                "active": 0,
+                "paused": 0,
+                "ready": 0,
+                "total": 0,
+                "staged_pages": 0,
+                "staged_edges": 0,
+                "by_status": {
+                    "active": {"count": 0, "staged_pages": 0, "staged_edges": 0},
+                    "paused": {"count": 0, "staged_pages": 0, "staged_edges": 0},
+                    "ready": {"count": 0, "staged_pages": 0, "staged_edges": 0},
+                },
+            }
+            for row in open_rows:
+                status = str(row["status"])
+                count = _safe_nonnegative_int(row["generation_count"])
+                pages = _safe_nonnegative_int(row["pages"])
+                edges = _safe_nonnegative_int(row["edges"])
+                if status in {"active", "paused", "ready"}:
+                    open_counts[status] = count
+                    open_counts["by_status"][status] = {"count": count, "staged_pages": pages, "staged_edges": edges}
+                open_counts["total"] += count
+                open_counts["staged_pages"] += pages
+                open_counts["staged_edges"] += edges
+            actual_open_stage_row = conn.execute(
+                """
+                WITH open_generations AS (
+                    SELECT generation_id
+                    FROM mal_public_userrecs_crawl_generations
+                    WHERE status IN ('active', 'paused', 'ready')
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM mal_public_userrecs_staged_pages p JOIN open_generations g ON g.generation_id = p.generation_id) AS actual_pages,
+                    (SELECT COUNT(*) FROM mal_public_userrecs_staged_edges e JOIN open_generations g ON g.generation_id = e.generation_id) AS actual_edges
+                """
+            ).fetchone()
+            open_counts["actual_staged_pages"] = _safe_nonnegative_int(actual_open_stage_row["actual_pages"] if actual_open_stage_row is not None else 0)
+            open_counts["actual_staged_edges"] = _safe_nonnegative_int(actual_open_stage_row["actual_edges"] if actual_open_stage_row is not None else 0)
+
+            throughput_row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN datetime(fetched_at) >= datetime('now', '-1 hour') THEN 1 ELSE 0 END), 0) AS pages_last_hour,
+                    MAX(fetched_at) AS last_page_fetched_at
+                FROM mal_public_userrecs_staged_pages
+                """
+            ).fetchone()
+            page_event_row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime('now', '-1 hour') THEN 1 ELSE 0 END), 0) AS page_events_last_hour,
+                    COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime('now', '-24 hours') THEN 1 ELSE 0 END), 0) AS page_events_recent,
+                    MAX(created_at) AS last_page_event_at
+                FROM mal_public_userrecs_crawl_events
+                WHERE event_type = 'page_upsert'
+                """
+            ).fetchone()
+            started_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT generation_id) AS count
+                FROM mal_public_userrecs_crawl_events
+                WHERE event_type = 'begin'
+                  AND datetime(created_at) >= datetime('now', '-1 hour')
+                """
+            ).fetchone()
+            published_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT generation_id) AS count
+                FROM mal_public_userrecs_crawl_events
+                WHERE event_type = 'publish'
+                  AND datetime(created_at) >= datetime('now', '-1 hour')
+                """
+            ).fetchone()
+            error_events_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM mal_public_userrecs_crawl_events
+                WHERE error IS NOT NULL
+                  AND TRIM(error) <> ''
+                  AND datetime(created_at) >= datetime('now', '-24 hours')
+                """
+            ).fetchone()
+            error_code_rows = conn.execute(
+                """
+                SELECT error, COUNT(*) AS count
+                FROM mal_public_userrecs_crawl_events
+                WHERE error IS NOT NULL
+                  AND TRIM(error) <> ''
+                GROUP BY error
+                """
+            ).fetchall()
+            for row in error_code_rows:
+                code = _diagnostic_error_code(row["error"])
+                source_error_counts[code] = source_error_counts.get(code, 0) + _safe_nonnegative_int(row["count"])
+            last_error_row = conn.execute(
+                """
+                SELECT event_type, created_at, error
+                FROM mal_public_userrecs_crawl_events
+                WHERE error IS NOT NULL
+                  AND TRIM(error) <> ''
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
+            return unknown_public_userrecs_diagnostics(reason="public_userrecs_diagnostic_schema_absent", status="unknown")
+        raise
+
+    pages_last_hour = _safe_nonnegative_int(throughput_row["pages_last_hour"] if throughput_row is not None else 0)
+    sources_started_last_hour = _safe_nonnegative_int(started_row["count"] if started_row is not None else 0)
+    sources_published_last_hour = _safe_nonnegative_int(published_row["count"] if published_row is not None else 0)
+    source_start_rate = authorized if configured is None else min(authorized, configured)
+    conservative_eta_hours = None
+    if due_sources == 0:
+        conservative_eta_hours = 0
+    elif source_start_rate > 0:
+        conservative_eta_hours = int(math.ceil(due_sources / source_start_rate))
+    if due_sources == 0:
+        source_start_eta = {"eta_hours": 0, "reason_code": "no_due_sources"}
+    elif source_start_rate <= 0:
+        source_start_eta = {"eta_hours": None, "reason_code": "source_start_rate_zero"}
+    else:
+        source_start_eta = {
+            "eta_hours": conservative_eta_hours,
+            "reason_code": "authorized_source_title_rate_estimate",
+            "basis": "due source count divided by the authorized/configured hourly source-start rate",
+        }
+    completion_eta_detail = {
+        "eta_hours": None,
+        "reason_code": "unknown_pages_per_source",
+        "basis": "public MAL userrecs exposes no durable total remaining page count until terminal next-link discovery",
+    }
+    reason_codes: list[str] = []
+    if positive_seed_count == 0:
+        reason_codes.append("no_positive_seeds")
+    if due_sources > 0:
+        reason_codes.append("due_sources")
+    if open_counts["total"]:
+        reason_codes.append("open_generations")
+    if due_sources > 0 or open_counts["total"]:
+        reason_codes.append("unknown_pages_per_source")
+    if configured is None:
+        reason_codes.append("configured_source_titles_per_hour_unknown")
+    if max_pages is None:
+        reason_codes.append("max_pages_per_source_per_run_unknown")
+    if source_start_rate <= 0 and due_sources > 0:
+        reason_codes.append("source_start_rate_zero")
+    if configured is not None and configured > authorized:
+        reason_codes.append("configured_source_titles_exceed_authorized")
+    if sources_started_last_hour > authorized:
+        reason_codes.append("sources_started_last_hour_exceed_authorized")
+    if open_counts["paused"]:
+        reason_codes.append("paused_generations")
+    if coverage_counts["failed"]:
+        reason_codes.append("failed_sources")
+    if source_error_counts:
+        reason_codes.append("source_errors")
+    if _safe_nonnegative_int(error_events_row["count"] if error_events_row is not None else 0):
+        reason_codes.append("recent_error_events")
+    if positive_seed_count == 0:
+        status = "unknown"
+    else:
+        status = "ok" if not reason_codes else "degraded"
+    if not reason_codes:
+        reason_codes = ["ok"]
+    return {
+        "status": status,
+        "reason_codes": reason_codes,
+        "policy": {
+            "authorized_source_titles_per_hour": authorized,
+            "configured_source_titles_per_hour": configured,
+            "configured_source_titles_per_hour_source": "task_execute_limit" if configured is not None else "unknown",
+            "max_pages_per_source_per_run": max_pages,
+            "stale_horizon_days": stale_after_days,
+            "stale_horizon_source": "configured_or_default",
+        },
+        "positive_seed_count": positive_seed_count,
+        "coverage": {
+            **coverage_counts,
+            "fresh_ratio": _safe_ratio(coverage_counts["fresh"], positive_seed_count),
+            "total": positive_seed_count,
+            "semantics": "complete public-userrecs harvest sources only",
+        },
+        "open_generations": open_counts,
+        "hourly_throughput": {
+            "pages_fetched_last_hour": pages_last_hour,
+            "page_events_last_hour": _safe_nonnegative_int(page_event_row["page_events_last_hour"] if page_event_row is not None else 0),
+            "last_page_fetched_at": _utc_iso_from_db_timestamp(throughput_row["last_page_fetched_at"] if throughput_row is not None else None),
+            "sources_started_last_hour": sources_started_last_hour,
+            "sources_published_last_hour": sources_published_last_hour,
+        },
+        "events": {
+            "recent_window_hours": 24,
+            "page_events_recent": _safe_nonnegative_int(page_event_row["page_events_recent"] if page_event_row is not None else 0),
+            "error_events_recent": _safe_nonnegative_int(error_events_row["count"] if error_events_row is not None else 0),
+            "last_page_event_at": _utc_iso_from_db_timestamp(page_event_row["last_page_event_at"] if page_event_row is not None else None),
+            "last_error_event_at": _utc_iso_from_db_timestamp(last_error_row["created_at"] if last_error_row is not None else None),
+        },
+        "errors": {
+            "source_error_counts": dict(sorted(source_error_counts.items())),
+            "recent_24h_error_events": _safe_nonnegative_int(error_events_row["count"] if error_events_row is not None else 0),
+            "last_error": None
+            if last_error_row is None
+            else {
+                "code": _diagnostic_error_code(last_error_row["error"]),
+                "event_type": last_error_row["event_type"],
+                "created_at": _utc_iso_from_db_timestamp(last_error_row["created_at"]),
+            },
+        },
+        "backlog": {
+            "due_sources": due_sources,
+            "source_start_eta": source_start_eta,
+            "conservative_source_start_eta": conservative_eta_hours,
+            "conservative_source_start_eta_hours": conservative_eta_hours,
+            "completion_eta": completion_eta_detail,
+            "completion_eta_hours": None,
+            "completion_eta_reason_codes": [str(completion_eta_detail["reason_code"])],
+            "completion_eta_detail": completion_eta_detail,
+        },
+        "sustainability": {
+            "authorized_source_titles_per_hour": authorized,
+            "configured_source_titles_per_hour": configured,
+            "sources_started_last_hour": sources_started_last_hour,
+            "within_authorized_rate": sources_started_last_hour <= authorized,
+            "over_authorized_by": max(0, sources_started_last_hour - authorized),
+            "configured_exceeds_authorized": None if configured is None else configured > authorized,
+        },
+    }
 
 
 def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: int = 14) -> dict[str, Any]:

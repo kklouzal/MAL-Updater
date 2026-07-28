@@ -61,7 +61,7 @@ class RecommendMaintainTests(unittest.TestCase):
         self.assertEqual(plan[2]["args"][-2:], ["--max-pages", "3"])
         self.assertEqual(
             plan[3]["args"][-6:],
-            ["--limit", "1", "--search-limit", "5", "--queries-per-candidate", "1"],
+            ["--limit", "4", "--search-limit", "5", "--queries-per-candidate", "1"],
         )
         self.assertIn("--persist-snapshot", plan[4]["args"])
         self.assertNotIn("recommend-refresh-metadata", [arg for step in plan for arg in step["args"]])

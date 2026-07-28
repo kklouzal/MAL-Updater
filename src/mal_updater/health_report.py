@@ -21,6 +21,7 @@ from .db import (
     get_operational_snapshot,
     get_provider_series_title_map_by_keys,
     get_provider_stale_row_counts,
+    get_public_userrecs_diagnostics,
     list_provider_stale_row_samples,
     list_review_queue_entries,
 )
@@ -34,6 +35,7 @@ from .service_auth_state import (
 )
 from .sync_planner import MAPPING_REVIEW_HEURISTICS_REVISION
 from . import service_systemd_status as _service_systemd_status
+from .recommendation_enrichment import build_provider_enrichment_diagnostics
 
 
 def _parse_sqlite_timestamp(value: object) -> datetime | None:
@@ -766,6 +768,21 @@ def build_health_report(
     hidive_credentials = load_hidive_credentials(config)
     hidive_state = resolve_hidive_state_paths(config)
     snapshot = get_operational_snapshot(config.db_path)
+    public_userrecs_diagnostics = get_public_userrecs_diagnostics(
+        config.db_path,
+        configured_source_titles_per_hour=config.service.execute_limit_for("recommend_full_harvest"),
+        max_pages_per_source_per_run=config.service.execute_limit_for("recommend_full_harvest_pages"),
+        stale_after_days=max(1, int(config.service.recommendation_full_harvest_stale_after_days)),
+    )
+    credentialed_provider_slugs: list[str] = []
+    if crunchyroll_credentials.username and crunchyroll_credentials.password:
+        credentialed_provider_slugs.append("crunchyroll")
+    if hidive_credentials.username and hidive_credentials.password:
+        credentialed_provider_slugs.append("hidive")
+    provider_enrichment_diagnostics = build_provider_enrichment_diagnostics(
+        config,
+        provider_slugs=credentialed_provider_slugs,
+    )
 
     latest_sync_run = snapshot.get("latest_sync_run")
     latest_completed_sync_run = snapshot.get("latest_completed_sync_run")
@@ -1195,6 +1212,12 @@ def build_health_report(
                 "access_token_present": bool(secrets.access_token),
                 "refresh_token_present": bool(secrets.refresh_token),
             },
+        },
+        "coverage": {
+            "public_userrecs": public_userrecs_diagnostics,
+        },
+        "operational": {
+            "provider_enrichment": provider_enrichment_diagnostics,
         },
         "latest_sync_run": latest_sync_run,
         "latest_completed_sync_run": latest_completed_sync_run,

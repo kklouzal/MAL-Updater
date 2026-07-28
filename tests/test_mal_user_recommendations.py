@@ -21,6 +21,7 @@ from mal_updater.mal_user_recommendations import (
     PublicMalUserRecommendationsError,
     build_public_user_recs_url,
     parse_public_user_recommendations_page,
+    public_user_recs_page_fingerprint,
     validate_public_user_recs_url,
 )
 
@@ -119,7 +120,7 @@ class PublicMalUserRecommendationsParserTests(unittest.TestCase):
         counts = {edge.target_mal_anime_id: edge.num_recommendations for edge in parsed.edges}
         self.assertEqual(1, counts[1000])
         self.assertEqual(12, counts[1011])
-        self.assertEqual(1011, parsed.edges[0].target_mal_anime_id)
+        self.assertEqual([1000 + index for index in range(12)], [edge.target_mal_anime_id for edge in parsed.edges])
 
     def test_parser_validates_advertised_next_and_rejects_out_of_origin(self) -> None:
         parsed = parse_public_user_recommendations_page(
@@ -168,12 +169,28 @@ class PublicMalUserRecommendationsParserTests(unittest.TestCase):
             "https://evil.example/anime/1/Cowboy_Bebop/userrecs",
             "https://myanimelist.net/anime/2/Other/userrecs",
             "https://myanimelist.net/anime/1/Cowboy_Bebop",
+            "https://myanimelist.net/anime/1/Cowboy_Bebop/userrecs?p=2&user=private",
+            "https://myanimelist.net/anime/1/Cowboy_Bebop/userrecs?user=private",
+            "https://myanimelist.net/anime/1/Cowboy_Bebop/userrecs#private",
         ):
             with self.subTest(unsafe=unsafe):
                 with self.assertRaises(PublicMalUserRecommendationsError):
                     validate_public_user_recs_url(unsafe, public_base_url=PUBLIC_BASE_URL, source_mal_anime_id=1)
+        self.assertEqual(
+            f"{SOURCE_URL}?p=2",
+            validate_public_user_recs_url(f"{SOURCE_URL}?p=02", public_base_url=PUBLIC_BASE_URL, source_mal_anime_id=1),
+        )
         with self.assertRaises(PublicMalUserRecommendationsError):
             validate_public_user_recs_url(SOURCE_URL, public_base_url="https://proxy.example", source_mal_anime_id=1)
+
+    def test_parser_rejects_unsafe_page_url_before_deriving_targets_or_cursors(self) -> None:
+        with self.assertRaises(PublicMalUserRecommendationsError):
+            parse_public_user_recommendations_page(
+                _page([_block(2, "Two")]),
+                source_mal_anime_id=1,
+                page_url=f"{SOURCE_URL}?user=private",
+                public_base_url=PUBLIC_BASE_URL,
+            )
 
     def test_malformed_page_without_recommendation_surface_fails(self) -> None:
         with self.assertRaises(PublicMalUserRecommendationsError):
@@ -241,6 +258,74 @@ class PublicMalUserRecommendationsParserTests(unittest.TestCase):
 
 
 class PublicMalUserRecommendationsClientTests(unittest.TestCase):
+    def test_fetch_page_fetches_one_validated_cursor_with_fingerprint_and_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            start_url = build_public_user_recs_url(config.mal.public_base_url, source_mal_anime_id=1, source_title="Cowboy Bebop")
+            page2_url = f"{start_url}?p=2"
+            opener = _FakeOpener(
+                {
+                    start_url: _page(
+                        [_block(2, "Two", more_users=1), _block(3, "Three")],
+                        next_href=page2_url,
+                    ),
+                    page2_url: _page([_block(4, "Four")]),
+                }
+            )
+            client = PublicMalUserRecommendationsClient(config, opener=opener, sleep=lambda _seconds: None, clock=lambda: 0.0)
+
+            result = client.fetch_page(1, page_url=start_url)
+
+        self.assertEqual([start_url], opener.requested_urls)
+        self.assertEqual(start_url, result.requested_url)
+        self.assertEqual(start_url, result.final_url)
+        self.assertEqual(page2_url, result.next_url)
+        self.assertEqual([2, 3], [edge.target_mal_anime_id for edge in result.edges])
+        self.assertEqual([2, 3], result.anchor["target_mal_anime_ids"])
+        self.assertEqual(64, len(result.page_fingerprint))
+        self.assertEqual(
+            result.page_fingerprint,
+            public_user_recs_page_fingerprint(final_url=start_url, next_url=page2_url, edges=result.edges),
+        )
+
+    def test_fetch_page_metadata_is_privacy_safe_and_order_sensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            start_url = build_public_user_recs_url(config.mal.public_base_url, source_mal_anime_id=1, source_title="Cowboy Bebop")
+            page2_url = f"{start_url}?p=2"
+            opener = _FakeOpener(
+                {
+                    page2_url: _page(
+                        [_block(3, "Three"), _block(2, "Two", more_users=1)],
+                    ),
+                }
+            )
+            client = PublicMalUserRecommendationsClient(config, opener=opener, sleep=lambda _seconds: None, clock=lambda: 0.0)
+
+            result = client.fetch_page(1, page_url=page2_url)
+
+        self.assertEqual([page2_url], opener.requested_urls)
+        self.assertEqual([3, 2], [edge.target_mal_anime_id for edge in result.edges])
+        self.assertEqual([3, 2], result.anchor["target_mal_anime_ids"])
+        payload = result.edge_payloads(source_url=start_url, page_count=2)
+        encoded = json.dumps({"anchor": result.anchor, "edges": payload}, sort_keys=True)
+        self.assertNotIn("private", encoded)
+        self.assertNotIn("Recommended by", encoded)
+        reversed_fingerprint = public_user_recs_page_fingerprint(
+            final_url=page2_url,
+            next_url=None,
+            edges=list(reversed(result.edges)),
+        )
+        self.assertNotEqual(result.page_fingerprint, reversed_fingerprint)
+
+        for unsafe in (
+            "https://myanimelist.net/anime/2/Other/userrecs",
+            "https://evil.example/anime/1/Cowboy_Bebop/userrecs",
+        ):
+            with self.subTest(unsafe=unsafe):
+                with self.assertRaises(PublicMalUserRecommendationsError):
+                    client.fetch_page(1, page_url=unsafe)
+
     def test_client_traverses_next_page_and_merges_duplicate_targets_deterministically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = _config(Path(tmp))

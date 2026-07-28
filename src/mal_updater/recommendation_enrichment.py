@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
 
-from .config import AppConfig
+from .config import AppConfig, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS
 from .db import (
     connect,
     delete_recommendation_provider_eligibility_evidence,
@@ -1937,6 +1939,7 @@ def _select_provider_enrichment_candidates(
     }
 
     ranked: list[ProviderEnrichmentCandidate] = []
+    eligible_class_counts: dict[str, int] = {}
     cursor_rank: int | None = None
     cursor_mal_id = cursor.cursor_mal_anime_id if cursor is not None else None
     for rank, item in enumerate(candidates):
@@ -1976,6 +1979,7 @@ def _select_provider_enrichment_candidates(
             elif skip_reason == "retry_backoff":
                 summary.eligibility_retry_backoff_skips += 1
             continue
+        _append_summary_counter(eligible_class_counts, selection_class)
         attempt = attempts_by_mal_id.get(mal_id)
         ranked.append(
             ProviderEnrichmentCandidate(
@@ -1991,6 +1995,7 @@ def _select_provider_enrichment_candidates(
         )
 
     provider_state["eligible_count"] = len(ranked)
+    provider_state["eligible_class_counts"] = dict(sorted(eligible_class_counts.items()))
     if not ranked:
         provider_state["exhausted"] = True
         return []
@@ -2027,6 +2032,407 @@ def _select_provider_enrichment_candidates(
     return selected
 
 
+_PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR = 4
+_PROVIDER_ENRICHMENT_RECENT_SAMPLE_LIMIT = 5
+
+
+def _diagnostic_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _safe_nonnegative_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_metadata_ratio(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(max(0, int(numerator)) / denominator, 6)
+
+
+def _provider_enrichment_policy(config: AppConfig) -> dict[str, Any]:
+    candidate_limit = config.service.execute_limit_for("recommend_provider_eligibility_candidates")
+    if candidate_limit is None:
+        candidate_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_provider_eligibility_candidates", 4)
+    search_limit = config.service.execute_limit_for("recommend_provider_eligibility_search_results")
+    if search_limit is None:
+        search_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_provider_eligibility_search_results", 5)
+    query_limit = config.service.execute_limit_for("recommend_provider_eligibility_queries_per_candidate")
+    if query_limit is None:
+        query_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_provider_eligibility_queries_per_candidate", 1)
+    every_seconds = max(0, int(config.service.provider_eligibility_refresh_every_seconds))
+    configured_per_hour: float | None = None
+    if every_seconds > 0:
+        configured_per_hour = round(max(0, int(candidate_limit)) * 3600 / every_seconds, 6)
+    return {
+        "authorized_candidates_per_provider_hour": _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR,
+        "configured_candidates_per_provider_run": max(0, int(candidate_limit)),
+        "configured_every_seconds": every_seconds,
+        "configured_candidates_per_provider_hour": configured_per_hour,
+        "configured_candidates_per_provider_hour_source": "task_execute_limit_and_cadence",
+        "search_results_per_query": max(1, int(search_limit)),
+        "queries_per_candidate": max(1, int(query_limit)),
+        "query_policy": "local MAL metadata English/preferred-title queries only; no provider query is issued by diagnostics",
+        "search_policy": "runtime lane may issue bounded provider title searches; diagnostics only rank local due candidates",
+        "read_only_selection": True,
+        "network_io": False,
+        "writes": False,
+        "provider_search_cache_ttl_days": PROVIDER_SEARCH_CACHE_TTL_DAYS,
+        "eligibility_evidence_ttl_days": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
+    }
+
+
+def _provider_cursor_diagnostic(cursor: Any) -> dict[str, Any]:
+    if cursor is None:
+        return {
+            "present": False,
+            "cursor_mal_anime_id": None,
+            "cursor_rank_key": None,
+            "cursor_generation": 0,
+            "wrapped_at": None,
+            "last_attempted_mal_anime_id": None,
+            "last_attempted_rank_key": None,
+            "last_attempted_at": None,
+            "last_selection_class": None,
+            "last_outcome": None,
+            "updated_at": None,
+        }
+    return {
+        "present": True,
+        "cursor_mal_anime_id": cursor.cursor_mal_anime_id,
+        "cursor_rank_key": cursor.cursor_rank_key,
+        "cursor_generation": cursor.cursor_generation,
+        "wrapped_at": cursor.wrapped_at,
+        "last_attempted_mal_anime_id": cursor.last_attempted_mal_anime_id,
+        "last_attempted_rank_key": cursor.last_attempted_rank_key,
+        "last_attempted_at": cursor.last_attempted_at,
+        "last_selection_class": cursor.last_selection_class,
+        "last_outcome": cursor.last_outcome,
+        "updated_at": cursor.updated_at,
+    }
+
+
+def _provider_attempt_diagnostics(provider: str, attempts: list[Any], *, now: datetime) -> dict[str, Any]:
+    one_hour_cutoff = now - timedelta(hours=1)
+    day_cutoff = now - timedelta(hours=24)
+    parsed_attempts: list[tuple[Any, datetime | None]] = [(attempt, _diagnostic_timestamp(attempt.attempted_at)) for attempt in attempts]
+    last_hour = [attempt for attempt, parsed in parsed_attempts if parsed is not None and parsed >= one_hour_cutoff]
+    last_24h = [(attempt, parsed) for attempt, parsed in parsed_attempts if parsed is not None and parsed >= day_cutoff]
+    outcome_counts = Counter(str(attempt.last_outcome or "unknown") for attempt, _parsed in last_24h)
+    latest_samples: list[dict[str, Any]] = []
+    for attempt, _parsed in sorted(
+        last_24h,
+        key=lambda item: (item[1] or datetime.min.replace(tzinfo=timezone.utc), int(item[0].mal_anime_id)),
+        reverse=True,
+    )[:_PROVIDER_ENRICHMENT_RECENT_SAMPLE_LIMIT]:
+        latest_samples.append(
+            {
+                "provider": provider,
+                "mal_anime_id": int(attempt.mal_anime_id),
+                "selection_class": attempt.selection_class,
+                "attempted_at": attempt.attempted_at,
+                "attempt_count_for_candidate": int(attempt.attempt_count),
+                "last_outcome": attempt.last_outcome,
+                "rank_key": attempt.rank_key,
+            }
+        )
+    return {
+        "distinct_candidates_attempted_last_hour": len(last_hour),
+        "throughput_label": "distinct candidates from overwrite-per-candidate attempt table, not event count",
+        "oldest_attempted_at_last_hour": min((attempt.attempted_at for attempt in last_hour), default=None),
+        "recent_24h_outcome_counts": dict(sorted(outcome_counts.items())),
+        "recent_24h_latest_samples": latest_samples,
+    }
+
+
+def _provider_selection_eta(
+    *,
+    due_count: int,
+    selected_count: int,
+    attempts_last_hour: int,
+    oldest_attempted_at_last_hour: str | None,
+    policy: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    candidate_limit = _safe_nonnegative_count(policy.get("configured_candidates_per_provider_run"))
+    configured_hour_raw = policy.get("configured_candidates_per_provider_hour")
+    configured_hour = int(configured_hour_raw) if isinstance(configured_hour_raw, (int, float)) else 0
+    authorized = _safe_nonnegative_count(policy.get("authorized_candidates_per_provider_hour"))
+    effective_hourly_capacity = max(0, min(authorized, configured_hour) if configured_hour else authorized)
+    if due_count <= 0:
+        return {"eta_seconds": 0, "reason_code": "no_due_candidates"}
+    if candidate_limit <= 0 or effective_hourly_capacity <= 0:
+        return {"eta_seconds": None, "reason_code": "provider_enrichment_disabled"}
+    if selected_count <= 0:
+        return {"eta_seconds": None, "reason_code": "no_current_limit_selection"}
+    if attempts_last_hour < effective_hourly_capacity:
+        return {"eta_seconds": 0, "reason_code": "hourly_candidate_capacity_available"}
+    oldest = _diagnostic_timestamp(oldest_attempted_at_last_hour)
+    if oldest is None:
+        return {"eta_seconds": None, "reason_code": "hourly_candidate_window_reset_unknown"}
+    reset_at = oldest + timedelta(hours=1)
+    return {
+        "eta_seconds": max(0, int((reset_at - now).total_seconds())),
+        "reason_code": "hourly_candidate_capacity_saturated",
+        "basis": "oldest distinct candidate attempt in the last hour",
+    }
+
+
+def unknown_provider_enrichment_diagnostics(
+    *,
+    reason: str,
+    provider_slugs: list[str] | tuple[str, ...] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved_policy = dict(policy or {})
+    providers = {
+        str(provider): {
+            "status": "unknown",
+            "reason_codes": [str(reason or "unknown")],
+            "policy": resolved_policy,
+            "candidates": {
+                "ranked_total": None,
+                "with_mal_anime_id": None,
+                "metadata_available": None,
+                "metadata_missing": None,
+                "metadata_coverage_ratio": None,
+            },
+            "due": {
+                "total": None,
+                "by_class": {},
+                "current_limit_selection_count": 0,
+                "current_limit_selection_by_class": {},
+                "current_limit_selected_mal_anime_ids": [],
+                "selection_eta": {"eta_seconds": None, "reason_code": str(reason or "unknown")},
+            },
+            "cursor": _provider_cursor_diagnostic(None),
+            "attempts": {
+                "distinct_candidates_attempted_last_hour": 0,
+                "throughput_label": "distinct candidates from overwrite-per-candidate attempt table, not event count",
+                "oldest_attempted_at_last_hour": None,
+                "recent_24h_outcome_counts": {},
+                "recent_24h_latest_samples": [],
+            },
+            "availability_completion_eta": {"eta_seconds": None, "reason_code": str(reason or "unknown")},
+        }
+        for provider in (provider_slugs or [])
+    }
+    return {
+        "status": "unknown",
+        "reason_codes": [str(reason or "unknown")],
+        "policy": resolved_policy,
+        "providers": providers,
+    }
+
+
+def build_provider_enrichment_diagnostics(
+    config: AppConfig,
+    *,
+    provider_slugs: list[str] | tuple[str, ...],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return read-only provider enrichment lane diagnostics.
+
+    This deliberately reuses the in-process ranking/selection logic over local
+    SQLite state only. It does not instantiate provider clients, call provider
+    networks, update cursors, write review rows, or refresh caches.
+    """
+    policy = _provider_enrichment_policy(config)
+    providers = sorted({str(provider).strip().lower() for provider in provider_slugs if str(provider).strip()})
+    if not providers:
+        return unknown_provider_enrichment_diagnostics(reason="no_configured_credentialed_providers", policy=policy)
+
+    current = now or _utc_now()
+    current_iso = _iso(current)
+    candidate_limit = _safe_nonnegative_count(policy.get("configured_candidates_per_provider_run"))
+    try:
+        metadata = get_mal_anime_metadata_map(config.db_path)
+        mappings_by_series = {
+            (mapping.provider, mapping.provider_series_id): mapping
+            for mapping in list_series_mappings(config.db_path, approved_only=False)
+        }
+        ranked_candidates = [
+            item
+            for item in build_recommendations(
+                config,
+                limit=0,
+                require_provider_availability=False,
+                include_discovery_candidates_without_actionable_provider_evidence=True,
+                read_only=True,
+            )
+            if item.kind == "discovery_candidate"
+        ]
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "no such table" in message or "no such column" in message:
+            return unknown_provider_enrichment_diagnostics(
+                reason="provider_enrichment_schema_unavailable",
+                provider_slugs=providers,
+                policy=policy,
+            )
+        raise
+
+    candidate_ids = [_candidate_mal_id(item) for item in ranked_candidates]
+    candidates_with_mal_id = [candidate_id for candidate_id in candidate_ids if candidate_id is not None]
+    metadata_available = sum(1 for candidate_id in candidates_with_mal_id if candidate_id in metadata)
+    candidate_totals = {
+        "ranked_total": len(ranked_candidates),
+        "with_mal_anime_id": len(candidates_with_mal_id),
+        "metadata_available": metadata_available,
+        "metadata_missing": max(0, len(candidates_with_mal_id) - metadata_available),
+        "metadata_coverage_ratio": _safe_metadata_ratio(metadata_available, len(candidates_with_mal_id)),
+        "read_only_ranking": True,
+    }
+
+    provider_payloads: dict[str, Any] = {}
+    overall_reasons: set[str] = set()
+    overall_status = "ok"
+    for provider_slug in providers:
+        try:
+            all_due_summary = EnrichmentSummary()
+            all_due = _select_provider_enrichment_candidates(
+                config,
+                provider_slug=provider_slug,
+                candidates=ranked_candidates,
+                metadata=metadata,
+                mappings_by_series=mappings_by_series,
+                candidate_limit=max(candidate_limit, len(ranked_candidates)),
+                now=current_iso,
+                force_refresh=False,
+                summary=all_due_summary,
+            )
+            current_summary = EnrichmentSummary()
+            selected = _select_provider_enrichment_candidates(
+                config,
+                provider_slug=provider_slug,
+                candidates=ranked_candidates,
+                metadata=metadata,
+                mappings_by_series=mappings_by_series,
+                candidate_limit=candidate_limit,
+                now=current_iso,
+                force_refresh=False,
+                summary=current_summary,
+            )
+            attempts = list_recommendation_provider_enrichment_attempts(config.db_path, provider=provider_slug)
+            cursor = get_recommendation_provider_enrichment_cursor(config.db_path, provider=provider_slug)
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "no such table" in message or "no such column" in message:
+                provider_payloads[provider_slug] = unknown_provider_enrichment_diagnostics(
+                    reason="provider_enrichment_schema_unavailable",
+                    provider_slugs=[provider_slug],
+                    policy=policy,
+                )["providers"][provider_slug]
+                overall_reasons.add("provider_enrichment_schema_unavailable")
+                overall_status = "unknown"
+                continue
+            raise
+
+        all_state = all_due_summary.provider_cursor_states.get(provider_slug, {})
+        current_state = current_summary.provider_cursor_states.get(provider_slug, {})
+        due_by_class = Counter(candidate.selection_class for candidate in all_due)
+        selected_by_class = Counter(candidate.selection_class for candidate in selected)
+        attempt_payload = _provider_attempt_diagnostics(provider_slug, attempts, now=current)
+        selection_eta = _provider_selection_eta(
+            due_count=len(all_due),
+            selected_count=len(selected),
+            attempts_last_hour=attempt_payload["distinct_candidates_attempted_last_hour"],
+            oldest_attempted_at_last_hour=attempt_payload["oldest_attempted_at_last_hour"],
+            policy=policy,
+            now=current,
+        )
+
+        reason_codes: list[str] = []
+        configured_hour = policy.get("configured_candidates_per_provider_hour")
+        if policy.get("configured_every_seconds") == 0 or candidate_limit <= 0:
+            status = "disabled"
+            reason_codes.append("provider_enrichment_disabled")
+        elif len(ranked_candidates) == 0:
+            status = "unknown"
+            reason_codes.append("no_current_discovery_candidates")
+        elif len(all_due) > 0:
+            status = "backlog"
+            reason_codes.append("due_candidates_present")
+        else:
+            status = "ok"
+            reason_codes.append("no_due_candidates_current_rank")
+        if isinstance(configured_hour, (int, float)) and configured_hour > _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR:
+            reason_codes.append("configured_candidate_rate_exceeds_authorized")
+            if status == "ok":
+                status = "degraded"
+        if attempt_payload["distinct_candidates_attempted_last_hour"] > _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR:
+            reason_codes.append("recent_candidate_rate_exceeds_authorized")
+            status = "degraded"
+        if attempt_payload["recent_24h_outcome_counts"].get("provider_search_failure"):
+            reason_codes.append("recent_provider_search_failures")
+            if status == "ok":
+                status = "degraded"
+        for reason in reason_codes:
+            overall_reasons.add(reason)
+        if status in {"unknown", "degraded"}:
+            overall_status = status
+        elif status in {"backlog", "disabled"} and overall_status == "ok":
+            overall_status = status
+
+        provider_payloads[provider_slug] = {
+            "status": status,
+            "reason_codes": reason_codes,
+            "policy": policy,
+            "candidates": dict(candidate_totals),
+            "due": {
+                "total": len(all_due),
+                "by_class": dict(sorted(due_by_class.items())),
+                "current_limit_selection_count": len(selected),
+                "current_limit_selection_by_class": dict(sorted(selected_by_class.items())),
+                "current_limit_selected_mal_anime_ids": [candidate.mal_id for candidate in selected[:_PROVIDER_ENRICHMENT_RECENT_SAMPLE_LIMIT]],
+                "selection_eta": selection_eta,
+                "selection_skip_counts": dict(sorted(current_summary.selection_skip_counts.items())),
+                "fresh_current_skip_count": int(current_summary.eligibility_fresh_skips),
+                "retry_backoff_skip_count": int(current_summary.eligibility_retry_backoff_skips),
+                "cursor_wrapped": bool(current_state.get("wrapped")),
+                "cursor_missing": bool(current_state.get("cursor_missing")),
+                "eligible_count_check": _safe_nonnegative_count(all_state.get("eligible_count")),
+                "eligible_class_counts_check": dict(all_state.get("eligible_class_counts") or {}),
+            },
+            "cursor": _provider_cursor_diagnostic(cursor),
+            "attempts": attempt_payload,
+            "sustainability": {
+                "authorized_candidates_per_provider_hour": _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR,
+                "configured_candidates_per_provider_hour": configured_hour,
+                "distinct_candidates_attempted_last_hour": attempt_payload["distinct_candidates_attempted_last_hour"],
+                "within_authorized_rate": attempt_payload["distinct_candidates_attempted_last_hour"] <= _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR,
+                "configured_exceeds_authorized": None if not isinstance(configured_hour, (int, float)) else configured_hour > _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR,
+            },
+            "availability_completion_eta": {
+                "eta_seconds": None,
+                "reason_code": "provider_availability_completion_depends_on_provider_search_results_review_and_future_candidates"
+                if ranked_candidates
+                else "no_current_discovery_candidates",
+            },
+        }
+
+    return {
+        "status": overall_status,
+        "reason_codes": sorted(overall_reasons) or ["no_due_candidates_current_rank"],
+        "policy": policy,
+        "providers": provider_payloads,
+    }
+
+
 def _ensure_provider_series(config: AppConfig, *, provider: str, match: dict[str, Any]) -> None:
     provider_series_id = str(match["provider_series_id"])
     title = str(match.get("title") or provider_series_id)
@@ -2056,7 +2462,7 @@ def enrich_discovery_provider_availability(
     config: AppConfig,
     *,
     providers: list[ProviderTitleSearchClient],
-    candidate_limit: int = 1,
+    candidate_limit: int = 4,
     search_limit: int = 5,
     queries_per_candidate: int = 1,
     now: datetime | None = None,

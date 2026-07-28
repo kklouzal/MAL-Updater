@@ -61,7 +61,7 @@ _MAL_USER_LIST_INITIAL_DELAY_SECONDS = 15 * 60
 _RECOMMENDATION_FULL_HARVEST_INITIAL_DELAY_SECONDS = 75 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_INITIAL_DELAY_SECONDS = 45 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS = 15 * 60
-_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 1
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 4
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT = 5
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE = 1
 
@@ -1789,6 +1789,22 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             # Manual CLI --limit 0 means "all due". In the daemon's cold public
             # MAL userrecs lane, zero is a hard disable so a config typo cannot
             # turn into one giant unattended crawl.
+            task_state.update(
+                {
+                    "last_status": "disabled",
+                    "execution_state": "idle",
+                    "last_skip_reason": "execute_limit_zero",
+                }
+            )
+            _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
+            results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
+            continue
+        if spec.name.startswith("recommend_provider_eligibility_") and (
+            config.service.execute_limit_for("recommend_provider_eligibility_candidates") or 0
+        ) <= 0:
+            # Manual provider enrichment defaults remain bounded. In the daemon's
+            # credentialed provider lanes, zero is a hard disable so a config typo
+            # cannot turn into an unintended provider search batch.
             task_state.update(
                 {
                     "last_status": "disabled",

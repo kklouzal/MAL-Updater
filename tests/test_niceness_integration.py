@@ -52,7 +52,7 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
 
         command = _provider_eligibility_command(self.config, "crunchyroll")
         self.assertEqual("crunchyroll", command[command.index("--provider") + 1])
-        self.assertEqual("1", command[command.index("--limit") + 1])
+        self.assertEqual("4", command[command.index("--limit") + 1])
         self.assertEqual("5", command[command.index("--search-limit") + 1])
         self.assertEqual("1", command[command.index("--queries-per-candidate") + 1])
 
@@ -61,14 +61,14 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(604800, policy["cadences"]["provider_cold_full_seconds"])
         self.assertEqual({"mal": 120, "crunchyroll": 180, "hidive": 72}, policy["provider_hourly_budgets"])
         eligibility = policy["task_policies"]["recommend_provider_eligibility_crunchyroll"]
-        self.assertEqual(18, eligibility["task_hourly_limit"])
-        self.assertEqual(7, eligibility["projected_requests"])
+        self.assertEqual(72, eligibility["task_hourly_limit"])
+        self.assertEqual(28, eligibility["projected_requests"])
         self.assertEqual(43200, eligibility["auth_failure_backoff_floor_seconds"])
         harvest_policy = policy["task_policies"]["recommend_full_harvest"]
-        self.assertEqual(8, harvest_policy["task_hourly_limit"])
-        self.assertEqual(6, harvest_policy["projected_requests"])
+        self.assertEqual(16, harvest_policy["task_hourly_limit"])
+        self.assertEqual(12, harvest_policy["projected_requests"])
         self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
-        self.assertEqual(1, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertEqual(2, policy["execute_limits"]["recommend_full_harvest"])
         self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
         self.assertEqual(45, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
         self.assertEqual(10, policy["cold_refresh_bounds"]["crunchyroll_max_history_pages"])
@@ -120,12 +120,12 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
             if label == "recommend_provider_eligibility_crunchyroll":
                 stdout = json.dumps(
                     {
-                        "candidates_considered": 1,
+                        "candidates_considered": 4,
                         "cache_hits": 0,
                         "cache_misses": 0,
                         "provider_searches": 0,
                         "provider_detail_probes": 0,
-                        "eligibility_fresh_skips": 1,
+                        "eligibility_fresh_skips": 4,
                     }
                 )
             return {"status": "ok", "label": label, "returncode": 0, "stdout": stdout, "stderr": ""}
@@ -166,12 +166,12 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertLessEqual(counts["sync_apply"] * 8, 584)
         self.assertLessEqual(counts["mal_list_refresh"] * 3, 27)
         self.assertLessEqual(counts["recommend_metadata_refresh"] * 8, 56)
-        self.assertLessEqual(counts["recommend_provider_eligibility_crunchyroll"] * 7, 504)
+        self.assertLessEqual(counts["recommend_provider_eligibility_crunchyroll"] * 28, 2016)
 
         state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
         eligibility = state["tasks"]["recommend_provider_eligibility_crunchyroll"]
         self.assertEqual(0, eligibility["last_request_delta"])
-        self.assertEqual(1, eligibility["last_result"]["eligibility_fresh_skips"])
+        self.assertEqual(4, eligibility["last_result"]["eligibility_fresh_skips"])
         self.assertEqual(0, eligibility["last_result"]["provider_searches"])
 
 

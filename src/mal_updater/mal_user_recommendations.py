@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from html import unescape
 from html.parser import HTMLParser
+import json
 import re
 import time
 from socket import timeout as SocketTimeout
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, unquote, urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import AppConfig
@@ -82,6 +84,20 @@ class PublicMalRecommendationEdge:
 class ParsedPublicUserRecommendationsPage:
     edges: list[PublicMalRecommendationEdge]
     next_url: str | None
+
+
+@dataclass(slots=True)
+class PublicUserRecommendationsPageFetchResult:
+    source_mal_anime_id: int
+    requested_url: str
+    final_url: str
+    next_url: str | None
+    page_fingerprint: str
+    anchor: dict[str, Any]
+    edges: list[PublicMalRecommendationEdge]
+
+    def edge_payloads(self, *, source_url: str, page_count: int) -> list[dict[str, Any]]:
+        return [edge.as_edge_payload(source_url=source_url, page_count=page_count) for edge in self.edges]
 
 
 @dataclass(slots=True)
@@ -284,7 +300,23 @@ def validate_public_user_recs_url(url: str, *, public_base_url: str, source_mal_
     pattern = re.compile(_USER_RECS_PATH_RE_TEMPLATE.format(source_id=int(source_mal_anime_id)))
     if not pattern.match(decoded_path):
         raise PublicMalUserRecommendationsError("public MAL userrecs URL path is outside the source anime /userrecs surface")
-    return absolute
+    if parsed.params:
+        raise PublicMalUserRecommendationsError("public MAL userrecs URL path parameters are not retained")
+    if parsed.fragment:
+        raise PublicMalUserRecommendationsError("public MAL userrecs URL fragments are not retained")
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    normalized_query = ""
+    if query_pairs:
+        if len(query_pairs) != 1 or query_pairs[0][0] != "p":
+            raise PublicMalUserRecommendationsError("public MAL userrecs URL query is outside the supported page cursor")
+        try:
+            page_number = int(query_pairs[0][1])
+        except ValueError as exc:
+            raise PublicMalUserRecommendationsError("public MAL userrecs page cursor must be a positive integer") from exc
+        if page_number < 1:
+            raise PublicMalUserRecommendationsError("public MAL userrecs page cursor must be a positive integer")
+        normalized_query = urlencode({"p": page_number})
+    return urlunparse(parsed._replace(query=normalized_query, fragment=""))
 
 
 def _target_anime_id_from_href(href: str, *, base_url: str) -> int | None:
@@ -378,11 +410,21 @@ def _looks_like_userrecs_page_surface(capture: _SurfaceTextCapture, text: str) -
 
 
 def _dedupe_edges(edges: list[PublicMalRecommendationEdge]) -> list[PublicMalRecommendationEdge]:
+    """Deduplicate targets while preserving observed public page order.
+
+    Staged resumable crawls use page fingerprints/anchors as coherence signals.
+    Keeping the parser's observed order lets a same-content MAL page reorder
+    produce a different safe page fingerprint instead of being silently mixed
+    into an existing staged chain. Terminal publication/ranking can still sort
+    the aggregate later.
+    """
     by_target: dict[int, PublicMalRecommendationEdge] = {}
+    ordered_target_ids: list[int] = []
     for edge in edges:
         existing = by_target.get(edge.target_mal_anime_id)
         if existing is None:
             by_target[edge.target_mal_anime_id] = edge
+            ordered_target_ids.append(edge.target_mal_anime_id)
             continue
         if edge.num_recommendations > existing.num_recommendations:
             by_target[edge.target_mal_anime_id] = PublicMalRecommendationEdge(
@@ -398,7 +440,63 @@ def _dedupe_edges(edges: list[PublicMalRecommendationEdge]) -> list[PublicMalRec
                 num_recommendations=existing.num_recommendations,
                 page_url=existing.page_url,
             )
-    return sorted(by_target.values(), key=lambda edge: (-edge.num_recommendations, edge.target_mal_anime_id))
+    return [by_target[target_id] for target_id in ordered_target_ids]
+
+
+def _sort_edges_for_recommendation_rank(edges: list[PublicMalRecommendationEdge]) -> list[PublicMalRecommendationEdge]:
+    return sorted(edges, key=lambda edge: (-edge.num_recommendations, edge.target_mal_anime_id))
+
+
+def public_user_recs_page_anchor(edges: list[PublicMalRecommendationEdge]) -> dict[str, Any]:
+    """Return a deterministic privacy-safe page anchor for staged crawl coherence.
+
+    The anchor intentionally contains only aggregate target identifiers/titles that
+    are already retained by the public-userrecs graph. Recommendation prose,
+    usernames, profile links, and HTML are never included.
+    """
+    ordered = list(edges)
+    anchor: dict[str, Any] = {
+        "target_mal_anime_ids": [int(edge.target_mal_anime_id) for edge in ordered],
+    }
+    if ordered:
+        first = ordered[0]
+        last = ordered[-1]
+        anchor["first_target_mal_anime_id"] = int(first.target_mal_anime_id)
+        anchor["last_target_mal_anime_id"] = int(last.target_mal_anime_id)
+        if first.target_title:
+            anchor["first_target_title"] = first.target_title
+        if last.target_title:
+            anchor["last_target_title"] = last.target_title
+    return anchor
+
+
+def public_user_recs_page_fingerprint(
+    *,
+    final_url: str,
+    next_url: str | None,
+    edges: list[PublicMalRecommendationEdge],
+) -> str:
+    """Return a stable privacy-safe, order-sensitive fingerprint for one page.
+
+    The fingerprint is a chain/coherence guard for resumable staging, not just a
+    target-set content hash. It deliberately includes only retained aggregate
+    fields, but preserves observed page order so page-order drift cannot be
+    masked by sorting.
+    """
+    payload = {
+        "final_url": final_url,
+        "next_url": next_url,
+        "edges": [
+            {
+                "target_mal_anime_id": int(edge.target_mal_anime_id),
+                "target_title": edge.target_title,
+                "num_recommendations": int(edge.num_recommendations),
+            }
+            for edge in edges
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def parse_public_user_recommendations_page(
@@ -408,9 +506,14 @@ def parse_public_user_recommendations_page(
     page_url: str,
     public_base_url: str,
 ) -> ParsedPublicUserRecommendationsPage:
+    validated_page_url = validate_public_user_recs_url(
+        page_url,
+        public_base_url=public_base_url,
+        source_mal_anime_id=int(source_mal_anime_id),
+    )
     parser = _UserRecommendationsHTMLParser(
         source_mal_anime_id=source_mal_anime_id,
-        page_url=page_url,
+        page_url=validated_page_url,
         public_base_url=public_base_url,
     )
     try:
@@ -423,7 +526,7 @@ def parse_public_user_recommendations_page(
     if parser.next_hrefs:
         for href in parser.next_hrefs:
             candidate = validate_public_user_recs_url(
-                urljoin(page_url, href),
+                urljoin(validated_page_url, href),
                 public_base_url=public_base_url,
                 source_mal_anime_id=source_mal_anime_id,
             )
@@ -530,10 +633,54 @@ class PublicMalUserRecommendationsClient:
             status="ok",
             complete=True,
             partial=False,
-            edges=_dedupe_edges(all_edges),
+            edges=_sort_edges_for_recommendation_rank(_dedupe_edges(all_edges)),
             pages_fetched=pages,
             source_url=start_url,
             fetched_urls=fetched_urls,
+        )
+
+    def fetch_page(
+        self,
+        source_mal_anime_id: int,
+        *,
+        page_url: str,
+        max_body_bytes: int = DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
+    ) -> PublicUserRecommendationsPageFetchResult:
+        """Fetch and parse exactly one validated public MAL /userrecs page.
+
+        This resumable-crawl primitive accepts a persisted cursor URL and
+        returns only aggregate edges plus deterministic fingerprint/anchor data.
+        It deliberately does not follow the advertised next link.
+        """
+        normalized_max_body = max(1024, int(max_body_bytes))
+        validated_url = validate_public_user_recs_url(
+            page_url,
+            public_base_url=self.config.mal.public_base_url,
+            source_mal_anime_id=int(source_mal_anime_id),
+        )
+        html, final_url = self._fetch_html(
+            validated_url,
+            source_mal_anime_id=int(source_mal_anime_id),
+            max_body_bytes=normalized_max_body,
+        )
+        parsed = parse_public_user_recommendations_page(
+            html,
+            source_mal_anime_id=int(source_mal_anime_id),
+            page_url=final_url,
+            public_base_url=self.config.mal.public_base_url,
+        )
+        return PublicUserRecommendationsPageFetchResult(
+            source_mal_anime_id=int(source_mal_anime_id),
+            requested_url=validated_url,
+            final_url=final_url,
+            next_url=parsed.next_url,
+            page_fingerprint=public_user_recs_page_fingerprint(
+                final_url=final_url,
+                next_url=parsed.next_url,
+                edges=parsed.edges,
+            ),
+            anchor=public_user_recs_page_anchor(parsed.edges),
+            edges=parsed.edges,
         )
 
     def _is_timeout_error(self, exc: BaseException) -> bool:

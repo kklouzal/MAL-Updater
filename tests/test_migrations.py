@@ -35,6 +35,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "012_watch_confirmation_provenance.sql",
                 "013_mal_anime_metadata_broadcast_compatibility.sql",
                 "014_recommendation_provider_enrichment_cursor.sql",
+                "015_public_userrecs_resumable_staging.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -77,6 +78,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "012_watch_confirmation_provenance.sql",
                     "013_mal_anime_metadata_broadcast_compatibility.sql",
                     "014_recommendation_provider_enrichment_cursor.sql",
+                    "015_public_userrecs_resumable_staging.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -98,6 +100,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "012_watch_confirmation_provenance.sql",
                     "013_mal_anime_metadata_broadcast_compatibility.sql",
                     "014_recommendation_provider_enrichment_cursor.sql",
+                    "015_public_userrecs_resumable_staging.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -170,6 +173,14 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertTrue({"provider", "cursor_mal_anime_id", "cursor_rank_key_json", "cursor_generation", "last_selection_class"} <= cursor_columns)
                 attempt_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_enrichment_attempts)")}
                 self.assertTrue({"provider", "mal_anime_id", "rank_key_json", "selection_class", "attempted_at", "attempt_count", "last_outcome"} <= attempt_columns)
+                userrecs_generation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_public_userrecs_crawl_generations)")}
+                self.assertTrue({"generation_id", "source_mal_anime_id", "status", "cursor_url", "pages_fetched", "staged_edge_count"} <= userrecs_generation_columns)
+                userrecs_page_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_public_userrecs_staged_pages)")}
+                self.assertTrue({"generation_id", "page_number", "page_url", "page_fingerprint", "anchor_json", "next_url"} <= userrecs_page_columns)
+                userrecs_edge_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_public_userrecs_staged_edges)")}
+                self.assertTrue({"generation_id", "page_number", "target_mal_anime_id", "target_title", "num_recommendations"} <= userrecs_edge_columns)
+                userrecs_event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_public_userrecs_crawl_events)")}
+                self.assertTrue({"generation_id", "source_mal_anime_id", "event_type", "page_number", "page_url", "error"} <= userrecs_event_columns)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
             bootstrap_database(db_path)

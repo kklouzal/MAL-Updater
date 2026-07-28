@@ -7,15 +7,30 @@ from unittest.mock import patch
 
 from mal_updater.config import load_config
 from mal_updater.db import (
+    MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     bootstrap_database,
     connect,
+    create_or_get_active_mal_public_userrecs_generation,
+    get_active_mal_public_userrecs_generation,
+    get_mal_public_userrecs_generation,
     get_mal_anime_metadata_map,
     get_mal_recommendation_edges_map,
     list_mal_user_anime_list_cache,
+    mark_mal_public_userrecs_generation_ready,
+    replace_mal_public_userrecs_recommendation_edges,
+    replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     replace_mal_user_anime_list_cache_generation,
     upsert_mal_anime_metadata,
     upsert_series_mapping,
+)
+from mal_updater.mal_user_recommendations import (
+    PublicMalRecommendationEdge,
+    PublicMalUserRecommendationsError,
+    PublicUserRecommendationsPageFetchResult,
+    build_public_user_recs_url,
+    public_user_recs_page_anchor,
+    public_user_recs_page_fingerprint,
 )
 from mal_updater.mal_client import MalApiError
 from mal_updater.recommendation_metadata import (
@@ -23,9 +38,53 @@ from mal_updater.recommendation_metadata import (
     DETAIL_FIELDS,
     MAL_USER_LIST_FIELDS,
     MAL_USER_LIST_STATUS_PREFERENCE_FIELDS,
+    refresh_full_user_recommendation_harvest,
     refresh_mal_user_anime_list_cache,
     refresh_recommendation_metadata,
 )
+
+
+def _public_userrecs_page_result(
+    *,
+    source_id: int,
+    page_url: str,
+    next_url: str | None,
+    targets: list[tuple[int, str, int]],
+) -> PublicUserRecommendationsPageFetchResult:
+    edges = [
+        PublicMalRecommendationEdge(
+            target_mal_anime_id=target_id,
+            target_title=title,
+            num_recommendations=count,
+            page_url=page_url,
+        )
+        for target_id, title, count in targets
+    ]
+    return PublicUserRecommendationsPageFetchResult(
+        source_mal_anime_id=source_id,
+        requested_url=page_url,
+        final_url=page_url,
+        next_url=next_url,
+        page_fingerprint=public_user_recs_page_fingerprint(final_url=page_url, next_url=next_url, edges=edges),
+        anchor=public_user_recs_page_anchor(edges),
+        edges=edges,
+    )
+
+
+class _FakePublicUserRecsClient:
+    def __init__(self, pages: dict[tuple[int, str], PublicUserRecommendationsPageFetchResult | BaseException]) -> None:
+        self.pages = pages
+        self.requested: list[tuple[int, str]] = []
+
+    def fetch_page(self, source_mal_anime_id: int, *, page_url: str, max_body_bytes: int):  # type: ignore[no-untyped-def]
+        key = (int(source_mal_anime_id), page_url)
+        self.requested.append(key)
+        result = self.pages.get(key)
+        if result is None:  # pragma: no cover - fixture guard
+            raise AssertionError(f"unexpected public-userrecs fetch {key!r}")
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 class RecommendationMetadataRefreshTests(unittest.TestCase):
@@ -485,6 +544,402 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         metadata = get_mal_anime_metadata_map(self.config.db_path)
         self.assertIn(400, metadata)
         self.assertEqual("original", metadata[400].raw["source"])
+
+
+class FullUserRecommendationHarvestResumableTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.project_root = Path(self.temp_dir.name)
+        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True, exist_ok=True)
+        self.config = load_config(self.project_root)
+        bootstrap_database(self.config.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _list_item(self, anime_id: int, title: str, status: str = "completed") -> dict:
+        return {
+            "node": {"id": anime_id, "title": title},
+            "list_status": {"status": status, "score": 8, "num_episodes_watched": 12},
+        }
+
+    def _seed_positive_list(self, *items: tuple[int, str]) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.config.db_path,
+            items=[self._list_item(anime_id, title) for anime_id, title in items],
+            refresh_run_id="cached-list",
+            fetched_at="2026-07-28T00:00:00Z",
+            prune_absent=True,
+        )
+
+    def _source_url(self, anime_id: int, title: str) -> str:
+        return build_public_user_recs_url(self.config.mal.public_base_url, source_mal_anime_id=anime_id, source_title=title)
+
+    def _published_targets(self, source_id: int = 1) -> dict[int, int]:
+        with connect(self.config.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT target_mal_anime_id, num_recommendations
+                FROM mal_anime_recommendations
+                WHERE source_mal_anime_id = ? AND source_kind = 'mal_recommendation'
+                ORDER BY target_mal_anime_id
+                """,
+                (source_id,),
+            ).fetchall()
+        return {int(row["target_mal_anime_id"]): int(row["num_recommendations"] or 0) for row in rows}
+
+    def _harvest_status(self, source_id: int = 1) -> dict[str, object] | None:
+        with connect(self.config.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT status, num_edges, source_type, is_complete, pages_fetched, source_url, last_error, failure_count
+                FROM mal_recommendation_harvest_status
+                WHERE source_mal_anime_id = ?
+                """,
+                (source_id,),
+            ).fetchone()
+        return None if row is None else {key: row[key] for key in row.keys()}
+
+    def test_interrupted_multirun_resume_uses_persisted_cursor_and_terminal_publish(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2 = f"{page1}?p=2"
+        first_client = _FakePublicUserRecsClient(
+            {
+                (1, page1): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page1,
+                    next_url=page2,
+                    targets=[(10, "Ten", 3)],
+                )
+            }
+        )
+
+        first = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=first_client)
+
+        self.assertEqual("partial", first.status)
+        self.assertEqual(0, first.failed)
+        self.assertEqual(1, first.as_dict()["paused"])
+        self.assertEqual([(1, page1)], first_client.requested)
+        generation = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        self.assertIsNotNone(generation)
+        self.assertEqual("paused", generation.status)
+        self.assertEqual(page2, generation.cursor_url)
+        self.assertEqual(1, generation.pages_fetched)
+        self.assertEqual({}, self._published_targets())
+
+        second_client = _FakePublicUserRecsClient(
+            {
+                (1, page2): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page2,
+                    next_url=None,
+                    targets=[(20, "Twenty", 5)],
+                )
+            }
+        )
+
+        second = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=second_client)
+
+        self.assertEqual("ok", second.status)
+        self.assertEqual(1, second.harvested)
+        self.assertEqual(0, second.failed)
+        self.assertEqual([(1, page2)], second_client.requested)
+        self.assertIsNone(get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1))
+        self.assertEqual({10: 3, 20: 5}, self._published_targets())
+        status = self._harvest_status()
+        self.assertIsNotNone(status)
+        self.assertEqual("fetched", status["status"])
+        self.assertEqual(MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS, status["source_type"])
+        self.assertEqual(1, status["is_complete"])
+        self.assertEqual(2, status["pages_fetched"])
+
+    def test_fetch_failure_preserves_staged_generation_and_existing_published_edges(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2 = f"{page1}?p=2"
+        replace_mal_public_userrecs_recommendation_edges(
+            self.config.db_path,
+            source_mal_anime_id=1,
+            edges=[{"target_mal_anime_id": 90, "target_title": "Old", "num_recommendations": 2, "raw": {}, "provenance": {}}],
+            pages_fetched=1,
+            source_url=page1,
+        )
+        first_client = _FakePublicUserRecsClient(
+            {
+                (1, page1): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page1,
+                    next_url=page2,
+                    targets=[(10, "Ten", 3)],
+                )
+            }
+        )
+        refresh_full_user_recommendation_harvest(self.config, max_pages=1, force_refresh=True, client=first_client)
+
+        failing_client = _FakePublicUserRecsClient({(1, page2): PublicMalUserRecommendationsError("temporary parser failure")})
+        failed = refresh_full_user_recommendation_harvest(self.config, max_pages=1, force_refresh=True, client=failing_client)
+
+        self.assertEqual("failed", failed.status)
+        self.assertEqual(1, failed.failed)
+        self.assertEqual([(1, page2)], failing_client.requested)
+        generation = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        self.assertIsNotNone(generation)
+        self.assertEqual("paused", generation.status)
+        self.assertEqual(page2, generation.cursor_url)
+        self.assertEqual(1, generation.pages_fetched)
+        self.assertIn("temporary parser failure", generation.last_error or "")
+        self.assertEqual({90: 2}, self._published_targets())
+        status = self._harvest_status()
+        self.assertIsNotNone(status)
+        self.assertEqual("fetched", status["status"])
+        self.assertEqual(1, status["is_complete"])
+        self.assertIn("temporary parser failure", status["last_error"] or "")
+        self.assertEqual(0, status["failure_count"])
+
+    def test_drift_restarts_generation_before_fetching_from_source_url(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2 = f"{page1}?p=2"
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.config.db_path,
+            source_mal_anime_id=1,
+            source_title="Seed 1",
+            source_url=page1,
+        )
+        replace_mal_public_userrecs_staged_page(
+            self.config.db_path,
+            generation_id=generation.generation_id,
+            page_number=1,
+            page_url=page1,
+            page_fingerprint="old-fingerprint",
+            next_url=page2,
+            edges=[{"target_mal_anime_id": 10, "target_title": "Ten", "num_recommendations": 1, "raw": {}, "provenance": {}}],
+        )
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "UPDATE mal_public_userrecs_crawl_generations SET last_page_fingerprint = 'corrupt' WHERE generation_id = ?",
+                (generation.generation_id,),
+            )
+            conn.commit()
+        client = _FakePublicUserRecsClient(
+            {
+                (1, page1): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page1,
+                    next_url=None,
+                    targets=[(30, "Thirty", 7)],
+                )
+            }
+        )
+
+        summary = refresh_full_user_recommendation_harvest(self.config, max_pages=1, force_refresh=True, client=client)
+
+        self.assertEqual("ok", summary.status)
+        self.assertEqual(1, len(summary.restarted_sources))
+        self.assertIn("fingerprint", summary.restarted_sources[0]["reason"])
+        self.assertEqual([(1, page1)], client.requested)
+        old = get_mal_public_userrecs_generation(self.config.db_path, generation_id=generation.generation_id)
+        self.assertIsNotNone(old)
+        self.assertEqual("discarded", old.status)
+        self.assertEqual({30: 7}, self._published_targets())
+
+    def test_active_generation_is_selected_before_new_due_source_under_limit(self) -> None:
+        self._seed_positive_list((1, "Seed 1"), (2, "Seed 2"))
+        source2_url = self._source_url(2, "Seed 2")
+        create_or_get_active_mal_public_userrecs_generation(
+            self.config.db_path,
+            source_mal_anime_id=2,
+            source_title="Seed 2",
+            source_url=source2_url,
+        )
+        client = _FakePublicUserRecsClient(
+            {
+                (2, source2_url): _public_userrecs_page_result(
+                    source_id=2,
+                    page_url=source2_url,
+                    next_url=None,
+                    targets=[(200, "Two Hundred", 4)],
+                )
+            }
+        )
+
+        summary = refresh_full_user_recommendation_harvest(self.config, limit=1, max_pages=1, client=client)
+
+        self.assertEqual("ok", summary.status)
+        self.assertEqual([(2, source2_url)], client.requested)
+        self.assertEqual([2], [source["mal_anime_id"] for source in summary.harvested_sources])
+        self.assertEqual({200: 4}, self._published_targets(source_id=2))
+        self.assertEqual({}, self._published_targets(source_id=1))
+
+    def test_open_generations_do_not_starve_behind_stale_due_sources(self) -> None:
+        self._seed_positive_list((1, "Seed 1"), (2, "Seed 2"))
+        source1_url = self._source_url(1, "Seed 1")
+        source2_url = self._source_url(2, "Seed 2")
+        create_or_get_active_mal_public_userrecs_generation(
+            self.config.db_path,
+            source_mal_anime_id=2,
+            source_title="Seed 2",
+            source_url=source2_url,
+        )
+        replace_mal_public_userrecs_recommendation_edges(
+            self.config.db_path,
+            source_mal_anime_id=1,
+            edges=[{"target_mal_anime_id": 100, "target_title": "Old", "num_recommendations": 1, "raw": {}, "provenance": {}}],
+            pages_fetched=1,
+            source_url=source1_url,
+        )
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "UPDATE mal_recommendation_harvest_status SET fetched_at = '2000-01-01 00:00:00' WHERE source_mal_anime_id = 1"
+            )
+            conn.commit()
+        client = _FakePublicUserRecsClient(
+            {
+                (2, source2_url): _public_userrecs_page_result(
+                    source_id=2,
+                    page_url=source2_url,
+                    next_url=None,
+                    targets=[(200, "Two Hundred", 4)],
+                )
+            }
+        )
+
+        summary = refresh_full_user_recommendation_harvest(self.config, limit=1, max_pages=1, client=client)
+
+        self.assertEqual("ok", summary.status)
+        self.assertEqual([(2, source2_url)], client.requested)
+        self.assertEqual([2], [source["mal_anime_id"] for source in summary.harvested_sources])
+        self.assertEqual({100: 1}, self._published_targets(source_id=1))
+        self.assertEqual({200: 4}, self._published_targets(source_id=2))
+
+    def test_next_link_loop_restarts_and_discards_instead_of_mixed_publish(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2 = f"{page1}?p=2"
+        first_client = _FakePublicUserRecsClient(
+            {
+                (1, page1): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page1,
+                    next_url=page2,
+                    targets=[(10, "Ten", 3)],
+                )
+            }
+        )
+        first = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=first_client)
+        self.assertEqual("partial", first.status)
+        old_generation = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        self.assertIsNotNone(old_generation)
+
+        loop_client = _FakePublicUserRecsClient(
+            {
+                (1, page2): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page2,
+                    next_url=page1,
+                    targets=[(20, "Twenty", 5)],
+                )
+            }
+        )
+
+        loop = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=loop_client)
+
+        self.assertEqual("partial", loop.status)
+        self.assertEqual(1, len(loop.restarted_sources))
+        self.assertIn("loops", loop.restarted_sources[0]["reason"])
+        self.assertEqual([(1, page2)], loop_client.requested)
+        discarded = get_mal_public_userrecs_generation(self.config.db_path, generation_id=old_generation.generation_id)
+        self.assertIsNotNone(discarded)
+        self.assertEqual("discarded", discarded.status)
+        active = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        self.assertIsNotNone(active)
+        self.assertNotEqual(old_generation.generation_id, active.generation_id)
+        self.assertEqual("paused", active.status)
+        self.assertEqual(page1, active.cursor_url)
+        self.assertEqual({}, self._published_targets())
+
+    def test_ready_generation_drift_restarts_before_publish_and_preserves_existing_graph(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2 = f"{page1}?p=2"
+        replace_mal_public_userrecs_recommendation_edges(
+            self.config.db_path,
+            source_mal_anime_id=1,
+            edges=[{"target_mal_anime_id": 90, "target_title": "Old", "num_recommendations": 2, "raw": {}, "provenance": {}}],
+            pages_fetched=1,
+            source_url=page1,
+        )
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.config.db_path,
+            source_mal_anime_id=1,
+            source_title="Seed 1",
+            source_url=page1,
+        )
+        replace_mal_public_userrecs_staged_page(
+            self.config.db_path,
+            generation_id=generation.generation_id,
+            page_number=1,
+            page_url=page1,
+            page_fingerprint="fp-ready",
+            next_url=None,
+            edges=[{"target_mal_anime_id": 10, "target_title": "Ten", "num_recommendations": 9, "raw": {}, "provenance": {}}],
+        )
+        mark_mal_public_userrecs_generation_ready(self.config.db_path, generation_id=generation.generation_id)
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "UPDATE mal_public_userrecs_staged_pages SET page_fingerprint = 'corrupt' WHERE generation_id = ?",
+                (generation.generation_id,),
+            )
+            conn.commit()
+        client = _FakePublicUserRecsClient(
+            {
+                (1, page1): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page1,
+                    next_url=page2,
+                    targets=[(30, "Thirty", 7)],
+                )
+            }
+        )
+
+        summary = refresh_full_user_recommendation_harvest(self.config, max_pages=1, force_refresh=True, client=client)
+
+        self.assertEqual("partial", summary.status)
+        self.assertEqual(0, summary.harvested)
+        self.assertEqual(1, len(summary.restarted_sources))
+        self.assertIn("fingerprint", summary.restarted_sources[0]["reason"])
+        self.assertEqual([(1, page1)], client.requested)
+        old = get_mal_public_userrecs_generation(self.config.db_path, generation_id=generation.generation_id)
+        self.assertIsNotNone(old)
+        self.assertEqual("discarded", old.status)
+        active = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        self.assertIsNotNone(active)
+        self.assertEqual("paused", active.status)
+        self.assertEqual(page2, active.cursor_url)
+        self.assertEqual({90: 2}, self._published_targets())
+
+    def test_one_page_public_userrecs_harvest_publishes_complete_legacy_behavior(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        client = _FakePublicUserRecsClient(
+            {
+                (1, page1): _public_userrecs_page_result(
+                    source_id=1,
+                    page_url=page1,
+                    next_url=None,
+                    targets=[(10, "Ten", 3)],
+                )
+            }
+        )
+
+        summary = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+
+        self.assertEqual("ok", summary.status)
+        self.assertEqual(1, summary.harvested)
+        self.assertEqual(0, summary.failed)
+        self.assertEqual(0, summary.as_dict()["paused"])
+        self.assertEqual({10: 3}, self._published_targets())
 
 
 if __name__ == "__main__":

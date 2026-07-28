@@ -345,6 +345,7 @@ class ProviderCliTests(unittest.TestCase):
             "service-run-once": "Run one MAL-Updater daemon loop pass and exit",
             "recommend-dashboard": "sortable local HTML recommendation dashboard",
             "dashboard-serve": "live local HTTP dashboard",
+            "recommend-refresh-full-userrecs": "per-source per-run",
         }.items():
             with self.subTest(command=command):
                 help_text = command_parsers[command].format_help()
@@ -365,6 +366,9 @@ class ProviderCliTests(unittest.TestCase):
         push_args = parser.parse_args(["push-recommendations-webhook"])
         self.assertFalse(push_args.dry_run)
         self.assertTrue(parser.parse_args(["push-recommendations-webhook", "--dry-run"]).dry_run)
+
+        enrich_args = parser.parse_args(["recommend-enrich-provider-availability"])
+        self.assertEqual(4, enrich_args.limit)
 
         command_parsers = _command_parsers()
         command_help = _command_help_map()

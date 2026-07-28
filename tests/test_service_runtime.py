@@ -600,6 +600,42 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.assertEqual({"task": "sync_apply", "status": "skipped", "reason": "execute_limit_zero"}, disabled)
         self.assertFalse(any(call.kwargs.get("label") == "sync_apply" for call in run_subprocess.call_args_list))
 
+    def test_zero_provider_eligibility_candidate_limit_disables_unattended_lane(self) -> None:
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendation_full_harvest_every_seconds = 0
+        self.config.service.recommend_maintain_every_seconds = 0
+        self.config.service.provider_eligibility_refresh_every_seconds = 1
+        self.config.service.task_execute_limits["recommend_provider_eligibility_candidates"] = 0
+        now = time.time()
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "mal_refresh": {"last_run_epoch": now},
+                        "sync_fetch_crunchyroll": {"last_run_epoch": now},
+                        "sync_apply": {"last_run_epoch": now},
+                        "recommend_provider_eligibility_crunchyroll": {"last_run_epoch": 0},
+                        "health": {"last_run_epoch": now},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "returncode": 0, "stdout": "", "stderr": ""},
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+        disabled = next(item for item in result["results"] if item["task"] == "recommend_provider_eligibility_crunchyroll")
+        self.assertEqual(
+            {"task": "recommend_provider_eligibility_crunchyroll", "status": "skipped", "reason": "execute_limit_zero"},
+            disabled,
+        )
+        self.assertFalse(any(call.kwargs.get("label") == "recommend_provider_eligibility_crunchyroll" for call in run_subprocess.call_args_list))
+
     def test_recommendation_metadata_refresh_command_uses_bounded_service_limits(self) -> None:
         self.config.service.task_execute_limits["recommend_metadata_refresh"] = 4
         self.config.service.task_execute_limits["recommend_metadata_discovery_targets"] = 7
@@ -628,7 +664,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
                 "mal_updater.cli",
                 "recommend-refresh-full-userrecs",
                 "--limit",
-                "1",
+                "2",
                 "--stale-after-days",
                 "45",
                 "--max-pages",
@@ -639,11 +675,11 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         policy = effective_niceness_policy(self.config)
         self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
         self.assertEqual(45, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
-        self.assertEqual(1, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertEqual(2, policy["execute_limits"]["recommend_full_harvest"])
         self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
         self.assertIn("recommend_full_harvest", policy["task_policies"])
         self.assertEqual(
-            "recommend_full_harvest:limit=1:stale_after_days=45:max_pages=3",
+            "recommend_full_harvest:limit=2:stale_after_days=45:max_pages=3",
             _task_execution_signature(
                 self.config,
                 TaskSpec(
@@ -1099,10 +1135,10 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
 
         self.assertTrue(allowed, reason)
         self.assertIsNone(reason)
-        self.assertEqual(8, usage["task_limit"])
+        self.assertEqual(16, usage["task_limit"])
         self.assertEqual(0.95, usage["critical_ratio"])
-        self.assertEqual(6, usage["projected_request_count"])
-        self.assertEqual(6, usage["projected_request_total"])
+        self.assertEqual(12, usage["projected_request_count"])
+        self.assertEqual(12, usage["projected_request_total"])
         self.assertAlmostEqual(0.75, usage["projected_ratio"])
         self.assertEqual("configured", usage["projected_request_source"])
         self.assertEqual(0, usage["task_request_count"])
@@ -1110,7 +1146,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
 
         token = begin_api_request_context(task="recommend_full_harvest", run_id="harvest-critical")
         try:
-            for index in range(2):
+            for index in range(4):
                 record_api_request_event(
                     "mal",
                     "recommend-full-harvest",
@@ -1127,11 +1163,11 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertIn("mal_budget_projected_critical", reason or "")
-        self.assertEqual(8, usage["task_limit"])
-        self.assertEqual(2, usage["task_request_count"])
-        self.assertEqual(2, usage["global_request_count"])
-        self.assertEqual(6, usage["projected_request_count"])
-        self.assertEqual(8, usage["projected_request_total"])
+        self.assertEqual(16, usage["task_limit"])
+        self.assertEqual(4, usage["task_request_count"])
+        self.assertEqual(4, usage["global_request_count"])
+        self.assertEqual(12, usage["projected_request_count"])
+        self.assertEqual(16, usage["projected_request_total"])
         self.assertAlmostEqual(1.0, usage["projected_ratio"])
         self.assertEqual("critical", usage["backoff_level"])
 

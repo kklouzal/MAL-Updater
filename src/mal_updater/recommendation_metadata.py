@@ -12,20 +12,32 @@ from .db import (
     MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     MalAnimeMetadata,
+    MalPublicUserRecsCrawlGeneration,
     MalUserAnimeListRefreshSummary,
     abort_mal_user_anime_list_cache_refresh,
     begin_mal_user_anime_list_cache_refresh,
     connect,
+    create_or_get_active_mal_public_userrecs_generation,
     finalize_mal_user_anime_list_cache_refresh,
+    get_active_mal_public_userrecs_generation,
     get_mal_anime_metadata_map,
+    list_active_mal_public_userrecs_generations,
+    list_mal_public_userrecs_staged_pages,
     list_mal_user_anime_list_cache,
     merge_mal_user_anime_list_cache_into_metadata,
     list_series_mappings,
+    mark_mal_public_userrecs_generation_ready,
+    pause_mal_public_userrecs_generation,
+    publish_mal_public_userrecs_generation,
+    record_mal_recommendation_harvest_attempt_error,
     record_mal_recommendation_harvest_failure,
     replace_mal_anime_relations,
+    replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
     upsert_mal_user_anime_list_cache_generation,
+    restart_mal_public_userrecs_generation_after_drift,
+    resume_mal_public_userrecs_generation,
 )
 from .mal_client import MalApiError, MalClient
 from .mal_user_recommendations import (
@@ -33,6 +45,8 @@ from .mal_user_recommendations import (
     DEFAULT_PUBLIC_USER_RECS_MAX_PAGES,
     PublicMalUserRecommendationsClient,
     PublicMalUserRecommendationsError,
+    build_public_user_recs_url,
+    validate_public_user_recs_url,
 )
 
 DETAIL_FIELD_NAMES = (
@@ -200,6 +214,9 @@ class FullUserRecommendationHarvestFailure:
     error: str
     pages_fetched: int = 0
     source_url: str | None = None
+    generation_id: int | None = None
+    paused: bool = False
+    drift_restart: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -208,6 +225,9 @@ class FullUserRecommendationHarvestFailure:
             "error": self.error,
             "pages_fetched": self.pages_fetched,
             "source_url": self.source_url,
+            "generation_id": self.generation_id,
+            "paused": self.paused,
+            "drift_restart": self.drift_restart,
         }
 
 
@@ -225,6 +245,8 @@ class FullUserRecommendationHarvestSummary:
     max_pages: int
     failures: list[FullUserRecommendationHarvestFailure] = field(default_factory=list)
     harvested_sources: list[dict[str, Any]] = field(default_factory=list)
+    paused_sources: list[dict[str, Any]] = field(default_factory=list)
+    restarted_sources: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -233,6 +255,8 @@ class FullUserRecommendationHarvestSummary:
             "considered": self.considered,
             "harvested": self.harvested,
             "failed": self.failed,
+            "paused": len(self.paused_sources),
+            "drift_restarted": len(self.restarted_sources),
             "skipped_fresh": self.skipped_fresh,
             "total_edges": self.total_edges,
             "forced": self.forced,
@@ -240,10 +264,14 @@ class FullUserRecommendationHarvestSummary:
             "max_pages": self.max_pages,
             "failures": [failure.as_dict() for failure in self.failures],
             "harvested_sources": list(self.harvested_sources),
+            "paused_sources": list(self.paused_sources),
+            "restarted_sources": list(self.restarted_sources),
             "semantics": {
                 "source": "public_mal_userrecs_html",
                 "complete_when_no_next_link": True,
+                "max_pages": "per-source per-run page budget; unfinished staged generations pause and resume without publishing",
                 "partial_failure_preserves_existing_edges": True,
+                "staged_pages_publish_atomically": True,
                 "retained_fields": ["target_mal_anime_id", "target_title", "num_recommendations"],
                 "privacy": "recommendation prose and usernames are not persisted",
             },
@@ -675,6 +703,91 @@ def _full_harvest_rank_key(entry: Any, status_row: dict[str, Any] | None, *, sta
     return (status_order, age, int(entry.mal_anime_id))
 
 
+def _full_userrecs_start_url(config: AppConfig, *, source_mal_anime_id: int, source_title: str | None) -> str:
+    return validate_public_user_recs_url(
+        build_public_user_recs_url(
+            config.mal.public_base_url,
+            source_mal_anime_id=int(source_mal_anime_id),
+            source_title=source_title,
+        ),
+        public_base_url=config.mal.public_base_url,
+        source_mal_anime_id=int(source_mal_anime_id),
+    )
+
+
+def _public_userrecs_generation_drift_reason(
+    db_path: Path,
+    *,
+    generation: MalPublicUserRecsCrawlGeneration,
+) -> str | None:
+    pages = list_mal_public_userrecs_staged_pages(db_path, generation_id=generation.generation_id)
+    if not pages:
+        if generation.status == "ready":
+            return "ready generation has no staged pages"
+        if generation.cursor_url is None:
+            return "stored cursor_url is missing without staged pages"
+        if generation.pages_fetched != 0:
+            return "stored pages_fetched references missing staged pages"
+        if generation.last_page_url or generation.last_page_fingerprint:
+            return "stored last-page metadata exists without staged pages"
+        return None
+    actual_numbers = [int(page.page_number) for page in pages]
+    expected_numbers = list(range(1, len(pages) + 1))
+    if actual_numbers != expected_numbers:
+        return f"staged pages are not contiguous from page 1: {actual_numbers!r}"
+    if generation.pages_fetched != len(pages):
+        return "stored pages_fetched does not match staged page count"
+    last_page = pages[-1]
+    if generation.last_page_url != last_page.page_url:
+        return "stored last_page_url does not match final staged page"
+    if generation.last_page_fingerprint != last_page.page_fingerprint:
+        return "stored last_page_fingerprint does not match final staged page"
+    if generation.cursor_url != last_page.next_url:
+        return "stored cursor_url does not match final staged page next_url"
+    for previous, current in zip(pages, pages[1:]):
+        if previous.next_url != current.page_url:
+            return "staged next-link chain no longer matches stored page order"
+    return None
+
+
+def _public_userrecs_fetched_page_drift_reason(
+    db_path: Path,
+    *,
+    generation: MalPublicUserRecsCrawlGeneration,
+    fetched_page: Any,
+) -> str | None:
+    pages = list_mal_public_userrecs_staged_pages(db_path, generation_id=generation.generation_id)
+    page_urls = {str(page.page_url) for page in pages if page.page_url}
+    final_url = str(fetched_page.final_url)
+    next_url = fetched_page.next_url
+    if final_url in page_urls:
+        return "fetched page URL already exists in this staged generation"
+    if next_url is not None and str(next_url) in (page_urls | {final_url}):
+        return "fetched page next_url loops into this staged generation"
+    if pages:
+        last = pages[-1]
+        if generation.cursor_url != last.next_url:
+            return "stored cursor_url changed before staging fetched page"
+    return None
+
+
+def _public_userrecs_pause_source(
+    config: AppConfig,
+    *,
+    generation: MalPublicUserRecsCrawlGeneration,
+    cursor_url: str | None,
+    error: str | None,
+) -> MalPublicUserRecsCrawlGeneration:
+    if generation.status in {"active", "paused"}:
+        return pause_mal_public_userrecs_generation(
+            config.db_path,
+            generation_id=generation.generation_id,
+            cursor_url=cursor_url,
+            error=error,
+        )
+    return generation
+
+
 def refresh_full_user_recommendation_harvest(
     config: AppConfig,
     *,
@@ -685,13 +798,13 @@ def refresh_full_user_recommendation_harvest(
     max_body_bytes: int = DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
     client: Any | None = None,
 ) -> FullUserRecommendationHarvestSummary:
-    """Bounded cold path for complete public MAL user-recommendation aggregates.
+    """Resumable cold path for complete public MAL user-recommendation aggregates.
 
     Seeds come only from the cached official MAL @me anime-list positive states
     (completed/watching/on_hold). Provider-only mappings are intentionally not a
-    full-harvest source of truth. Each source is atomically replaced only after
-    public MAL pagination reaches a terminal page; malformed/looped/truncated
-    pages are recorded as failed attempts and preserve existing graph data.
+    full-harvest source of truth. Each run fetches at most ``max_pages`` per
+    selected source, stages page data in an open generation, and publishes only
+    after a terminal page proves that the staged generation is coherent.
     """
     stale_after_days = max(1, int(stale_after_days))
     normalized_max_pages = max(1, int(max_pages))
@@ -704,97 +817,387 @@ def refresh_full_user_recommendation_harvest(
         positive_entries,
         key=lambda entry: _full_harvest_rank_key(entry, status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days),
     )
-    stale_or_missing_entries = [
+    open_generations = list_active_mal_public_userrecs_generations(config.db_path, source_mal_anime_ids=source_ids)
+    open_source_ids = [int(generation.source_mal_anime_id) for generation in open_generations]
+    open_source_id_set = set(open_source_ids)
+    ranked_by_source = {int(entry.mal_anime_id): entry for entry in ranked_entries}
+
+    active_entries = [ranked_by_source[source_id] for source_id in open_source_ids if source_id in ranked_by_source]
+    due_entries = [
         entry
         for entry in ranked_entries
-        if force_refresh
-        or _full_harvest_candidate_status(status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days)
-        != "fresh"
+        if int(entry.mal_anime_id) not in open_source_id_set
+        and (
+            force_refresh
+            or _full_harvest_candidate_status(status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days)
+            != "fresh"
+        )
     ]
-    skipped_fresh = len(ranked_entries) - len(stale_or_missing_entries)
-    selected_entries = stale_or_missing_entries
+    skipped_fresh = len(ranked_entries) - len(active_entries) - len(due_entries)
+    selected_entries = [*active_entries, *due_entries]
     if limit is not None and limit > 0:
         selected_entries = selected_entries[: int(limit)]
 
     harvest_client = client or PublicMalUserRecommendationsClient(config)
     failures: list[FullUserRecommendationHarvestFailure] = []
     harvested_sources: list[dict[str, Any]] = []
+    paused_sources: list[dict[str, Any]] = []
+    restarted_sources: list[dict[str, Any]] = []
     harvested = 0
     total_edges = 0
+
     for entry in selected_entries:
-        try:
-            result = harvest_client.harvest(
-                int(entry.mal_anime_id),
-                source_title=entry.title,
-                max_pages=normalized_max_pages,
-                max_body_bytes=normalized_max_body_bytes,
-            )
-        except PublicMalUserRecommendationsError as exc:
-            record_mal_recommendation_harvest_failure(
+        source_id = int(entry.mal_anime_id)
+        source_title = entry.title
+        source_url = _full_userrecs_start_url(config, source_mal_anime_id=source_id, source_title=source_title)
+        pages_this_run = 0
+        generation = get_active_mal_public_userrecs_generation(config.db_path, source_mal_anime_id=source_id)
+        if generation is None:
+            generation = create_or_get_active_mal_public_userrecs_generation(
                 config.db_path,
-                source_mal_anime_id=int(entry.mal_anime_id),
-                source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
-                error=str(exc),
-            )
-            failures.append(
-                FullUserRecommendationHarvestFailure(
-                    mal_anime_id=int(entry.mal_anime_id),
-                    title=entry.title,
-                    error=str(exc),
-                )
-            )
-            continue
-        if not result.complete or result.partial or result.status != "ok":
-            error = result.error or "public MAL userrecs harvest did not prove completeness"
-            record_mal_recommendation_harvest_failure(
-                config.db_path,
-                source_mal_anime_id=int(entry.mal_anime_id),
-                source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
-                error=error,
-                pages_fetched=result.pages_fetched,
-                source_url=result.source_url,
-            )
-            failures.append(
-                FullUserRecommendationHarvestFailure(
-                    mal_anime_id=int(entry.mal_anime_id),
-                    title=entry.title,
-                    error=error,
-                    pages_fetched=result.pages_fetched,
-                    source_url=result.source_url,
-                )
-            )
-            continue
-        edge_payloads = [
-            edge.as_edge_payload(source_url=result.source_url or "", page_count=result.pages_fetched)
-            for edge in result.edges
-        ]
-        replaced = replace_mal_recommendation_edges(
-            config.db_path,
-            source_mal_anime_id=int(entry.mal_anime_id),
-            hop_distance=1,
-            edges=edge_payloads,
-            source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
-            complete=True,
-            pages_fetched=result.pages_fetched,
-            source_url=result.source_url,
-        )
-        if replaced:
-            harvested += 1
-            total_edges += len(edge_payloads)
-            harvested_sources.append(
-                {
-                    "mal_anime_id": int(entry.mal_anime_id),
-                    "title": entry.title,
-                    "edge_count": len(edge_payloads),
-                    "pages_fetched": result.pages_fetched,
-                    "source_url": result.source_url,
-                }
+                source_mal_anime_id=source_id,
+                source_title=source_title,
+                source_url=source_url,
+                cursor_url=source_url,
             )
 
-    if failures and harvested:
+        while True:
+            drift_reason = _public_userrecs_generation_drift_reason(config.db_path, generation=generation)
+            if drift_reason is not None:
+                generation = restart_mal_public_userrecs_generation_after_drift(
+                    config.db_path,
+                    generation_id=generation.generation_id,
+                    reason=drift_reason,
+                    cursor_url=source_url,
+                )
+                restarted_sources.append(
+                    {
+                        "mal_anime_id": source_id,
+                        "title": source_title,
+                        "generation_id": generation.generation_id,
+                        "reason": drift_reason,
+                        "cursor_url": generation.cursor_url,
+                    }
+                )
+                if pages_this_run >= normalized_max_pages:
+                    paused = _public_userrecs_pause_source(
+                        config,
+                        generation=generation,
+                        cursor_url=generation.cursor_url or source_url,
+                        error="drift restart deferred until next run because max_pages was reached",
+                    )
+                    paused_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": paused.generation_id,
+                            "pages_fetched": paused.pages_fetched,
+                            "cursor_url": paused.cursor_url,
+                            "reason": "max_pages",
+                        }
+                    )
+                    break
+                continue
+
+            if generation.status == "ready":
+                try:
+                    publication = publish_mal_public_userrecs_generation(config.db_path, generation_id=generation.generation_id)
+                except (PublicMalUserRecommendationsError, TimeoutError, ValueError, RuntimeError) as exc:
+                    error = str(exc)
+                    record_mal_recommendation_harvest_failure(
+                        config.db_path,
+                        source_mal_anime_id=source_id,
+                        source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                        error=error,
+                        pages_fetched=generation.pages_fetched,
+                        source_url=generation.source_url or source_url,
+                    )
+                    failures.append(
+                        FullUserRecommendationHarvestFailure(
+                            mal_anime_id=source_id,
+                            title=source_title,
+                            error=error,
+                            pages_fetched=generation.pages_fetched,
+                            source_url=generation.source_url or source_url,
+                            generation_id=generation.generation_id,
+                        )
+                    )
+                    break
+                harvested += 1
+                total_edges += publication.published_edge_count
+                harvested_sources.append(
+                    {
+                        "mal_anime_id": source_id,
+                        "title": source_title,
+                        "edge_count": publication.published_edge_count,
+                        "pages_fetched": publication.pages_fetched,
+                        "source_url": generation.source_url or source_url,
+                        "generation_id": publication.generation_id,
+                    }
+                )
+                break
+
+            if generation.status == "paused":
+                generation = resume_mal_public_userrecs_generation(config.db_path, generation_id=generation.generation_id)
+
+            if generation.cursor_url is None:
+                try:
+                    generation = mark_mal_public_userrecs_generation_ready(config.db_path, generation_id=generation.generation_id)
+                    continue
+                except ValueError as exc:
+                    error = str(exc)
+                    generation = _public_userrecs_pause_source(
+                        config,
+                        generation=generation,
+                        cursor_url=generation.cursor_url,
+                        error=error,
+                    )
+                    record_mal_recommendation_harvest_failure(
+                        config.db_path,
+                        source_mal_anime_id=source_id,
+                        source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                        error=error,
+                        pages_fetched=generation.pages_fetched,
+                        source_url=generation.source_url or source_url,
+                    )
+                    failures.append(
+                        FullUserRecommendationHarvestFailure(
+                            mal_anime_id=source_id,
+                            title=source_title,
+                            error=error,
+                            pages_fetched=generation.pages_fetched,
+                            source_url=generation.source_url or source_url,
+                            generation_id=generation.generation_id,
+                            paused=True,
+                        )
+                    )
+                    break
+
+            if pages_this_run >= normalized_max_pages:
+                paused = _public_userrecs_pause_source(
+                    config,
+                    generation=generation,
+                    cursor_url=generation.cursor_url,
+                    error="max_pages reached; staged generation paused with next-page cursor",
+                )
+                paused_sources.append(
+                    {
+                        "mal_anime_id": source_id,
+                        "title": source_title,
+                        "generation_id": paused.generation_id,
+                        "pages_fetched": paused.pages_fetched,
+                        "cursor_url": paused.cursor_url,
+                        "reason": "max_pages",
+                    }
+                )
+                break
+
+            try:
+                cursor_url = validate_public_user_recs_url(
+                    generation.cursor_url,
+                    public_base_url=config.mal.public_base_url,
+                    source_mal_anime_id=source_id,
+                )
+            except PublicMalUserRecommendationsError as exc:
+                drift_reason = f"stored cursor URL failed validation: {exc}"
+                generation = restart_mal_public_userrecs_generation_after_drift(
+                    config.db_path,
+                    generation_id=generation.generation_id,
+                    reason=drift_reason,
+                    cursor_url=source_url,
+                )
+                restarted_sources.append(
+                    {
+                        "mal_anime_id": source_id,
+                        "title": source_title,
+                        "generation_id": generation.generation_id,
+                        "reason": drift_reason,
+                        "cursor_url": generation.cursor_url,
+                    }
+                )
+                if pages_this_run >= normalized_max_pages:
+                    paused = _public_userrecs_pause_source(
+                        config,
+                        generation=generation,
+                        cursor_url=generation.cursor_url or source_url,
+                        error="drift restart deferred until next run because max_pages was reached",
+                    )
+                    paused_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": paused.generation_id,
+                            "pages_fetched": paused.pages_fetched,
+                            "cursor_url": paused.cursor_url,
+                            "reason": "drift_restart",
+                        }
+                    )
+                    break
+                continue
+            try:
+                fetched_page = harvest_client.fetch_page(
+                    source_id,
+                    page_url=cursor_url,
+                    max_body_bytes=normalized_max_body_bytes,
+                )
+            except (PublicMalUserRecommendationsError, TimeoutError, ValueError) as exc:
+                error = str(exc)
+                generation = _public_userrecs_pause_source(
+                    config,
+                    generation=generation,
+                    cursor_url=cursor_url,
+                    error=error,
+                )
+                record_mal_recommendation_harvest_attempt_error(
+                    config.db_path,
+                    source_mal_anime_id=source_id,
+                    source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                    error=error,
+                    pages_fetched=generation.pages_fetched,
+                    source_url=generation.source_url or source_url,
+                )
+                failures.append(
+                    FullUserRecommendationHarvestFailure(
+                        mal_anime_id=source_id,
+                        title=source_title,
+                        error=error,
+                        pages_fetched=generation.pages_fetched,
+                        source_url=generation.source_url or source_url,
+                        generation_id=generation.generation_id,
+                        paused=True,
+                    )
+                )
+                break
+
+            fetched_drift_reason = _public_userrecs_fetched_page_drift_reason(
+                config.db_path,
+                generation=generation,
+                fetched_page=fetched_page,
+            )
+            if fetched_drift_reason is not None:
+                pages_this_run += 1
+                generation = restart_mal_public_userrecs_generation_after_drift(
+                    config.db_path,
+                    generation_id=generation.generation_id,
+                    reason=fetched_drift_reason,
+                    cursor_url=source_url,
+                )
+                restarted_sources.append(
+                    {
+                        "mal_anime_id": source_id,
+                        "title": source_title,
+                        "generation_id": generation.generation_id,
+                        "reason": fetched_drift_reason,
+                        "cursor_url": generation.cursor_url,
+                    }
+                )
+                if pages_this_run >= normalized_max_pages:
+                    paused = _public_userrecs_pause_source(
+                        config,
+                        generation=generation,
+                        cursor_url=generation.cursor_url or source_url,
+                        error="drift restart deferred until next run because max_pages was reached",
+                    )
+                    paused_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": paused.generation_id,
+                            "pages_fetched": paused.pages_fetched,
+                            "cursor_url": paused.cursor_url,
+                            "reason": "drift_restart",
+                        }
+                    )
+                    break
+                continue
+
+            page_number = generation.pages_fetched + 1
+            edge_payloads = fetched_page.edge_payloads(
+                source_url=generation.source_url or source_url,
+                page_count=page_number,
+            )
+            replace_mal_public_userrecs_staged_page(
+                config.db_path,
+                generation_id=generation.generation_id,
+                page_number=page_number,
+                page_url=fetched_page.final_url,
+                page_fingerprint=fetched_page.page_fingerprint,
+                anchor=fetched_page.anchor,
+                next_url=fetched_page.next_url,
+                edges=edge_payloads,
+            )
+            pages_this_run += 1
+            generation = get_active_mal_public_userrecs_generation(config.db_path, source_mal_anime_id=source_id)
+            if generation is None:
+                failures.append(
+                    FullUserRecommendationHarvestFailure(
+                        mal_anime_id=source_id,
+                        title=source_title,
+                        error="public userrecs generation disappeared after staging",
+                        pages_fetched=page_number,
+                        source_url=source_url,
+                    )
+                )
+                break
+
+            if fetched_page.next_url is None:
+                try:
+                    generation = mark_mal_public_userrecs_generation_ready(config.db_path, generation_id=generation.generation_id)
+                    continue
+                except ValueError as exc:
+                    error = str(exc)
+                    generation = _public_userrecs_pause_source(
+                        config,
+                        generation=generation,
+                        cursor_url=generation.cursor_url,
+                        error=error,
+                    )
+                    record_mal_recommendation_harvest_failure(
+                        config.db_path,
+                        source_mal_anime_id=source_id,
+                        source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                        error=error,
+                        pages_fetched=generation.pages_fetched,
+                        source_url=generation.source_url or source_url,
+                    )
+                    failures.append(
+                        FullUserRecommendationHarvestFailure(
+                            mal_anime_id=source_id,
+                            title=source_title,
+                            error=error,
+                            pages_fetched=generation.pages_fetched,
+                            source_url=generation.source_url or source_url,
+                            generation_id=generation.generation_id,
+                            paused=True,
+                        )
+                    )
+                    break
+
+            if pages_this_run >= normalized_max_pages:
+                paused = _public_userrecs_pause_source(
+                    config,
+                    generation=generation,
+                    cursor_url=fetched_page.next_url,
+                    error="max_pages reached; staged generation paused with next-page cursor",
+                )
+                paused_sources.append(
+                    {
+                        "mal_anime_id": source_id,
+                        "title": source_title,
+                        "generation_id": paused.generation_id,
+                        "pages_fetched": paused.pages_fetched,
+                        "cursor_url": paused.cursor_url,
+                        "reason": "max_pages",
+                    }
+                )
+                break
+
+    if failures and (harvested or paused_sources):
         status = "partial"
     elif failures:
         status = "failed"
+    elif paused_sources:
+        status = "partial"
     else:
         status = "ok"
     return FullUserRecommendationHarvestSummary(
@@ -810,6 +1213,8 @@ def refresh_full_user_recommendation_harvest(
         max_pages=normalized_max_pages,
         failures=failures,
         harvested_sources=harvested_sources,
+        paused_sources=paused_sources,
+        restarted_sources=restarted_sources,
     )
 
 def refresh_recommendation_metadata(

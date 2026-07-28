@@ -61,7 +61,7 @@ Fields may be added compatibly. Consumers must tolerate task-lane absence when c
 
 ## Public MAL full-userrecs harvest summary
 
-`recommend-refresh-full-userrecs` emits a JSON object with stable counters: `status` (`ok`, `partial`, or `failed`), `seed_count`, `considered`, `harvested`, `failed`, `skipped_fresh`, `total_edges`, `forced`, `stale_after_days`, `max_pages`, `failures`, `harvested_sources`, and `semantics`. `partial` means at least one source was preserved because completeness was not proven; existing edges for failed/partial sources are not replaced. Persisted recommendation edges from this path retain only `target_mal_anime_id`, `target_title`, and `num_recommendations`; recommendation prose and usernames are not part of the durable contract.
+`recommend-refresh-full-userrecs` emits a JSON object with stable counters: `status` (`ok`, `partial`, or `failed`), `seed_count`, `considered`, `harvested`, `failed`, `paused`, `drift_restarted`, `skipped_fresh`, `total_edges`, `forced`, `stale_after_days`, `max_pages`, `failures`, `harvested_sources`, `paused_sources`, `restarted_sources`, and `semantics`. `max_pages` is a per-source per-run page budget: unfinished coherent staged generations pause with their next-page cursor and resume later. `partial` means at least one source paused or at least one source was preserved because completeness was not proven; existing edges for paused/failed/drift-restarted sources are not replaced unless a terminal coherent generation publishes atomically. Persisted recommendation edges from this path retain only `target_mal_anime_id`, `target_title`, and `num_recommendations`; recommendation prose and usernames are not part of the durable contract.
 
 ## Example payload
 

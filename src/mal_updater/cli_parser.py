@@ -408,19 +408,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recommend_full_userrecs = subparsers.add_parser(
         "recommend-refresh-full-userrecs",
-        help="Bounded cold-path harvest of complete public MAL /userrecs aggregates for cached completed/watching/on_hold MAL list titles",
+        help="Bounded cold-path harvest of complete public MAL /userrecs aggregates; --max-pages is per-source per-run",
     )
     recommend_full_userrecs.add_argument("--limit", type=int, default=0, help="How many positive MAL list source titles to harvest this run (use 0 for all due sources)")
     recommend_full_userrecs.add_argument("--force-refresh", action="store_true", help="Refresh due and fresh complete public userrecs rows without letting official-detail top-10 data overwrite them")
     recommend_full_userrecs.add_argument("--stale-after-days", type=int, default=45, help="Refresh complete public userrecs rows older than this many days (default: 45)")
-    recommend_full_userrecs.add_argument("--max-pages", type=int, default=3, help="Maximum advertised same-origin userrecs pages to follow per title before preserving existing edges as partial/failed")
+    recommend_full_userrecs.add_argument("--max-pages", type=int, default=3, metavar="PAGES_PER_SOURCE_PER_RUN", help="Per-source per-run same-origin userrecs page budget before pausing the staged generation with its next-page cursor")
     recommend_full_userrecs.add_argument("--max-body-mb", type=float, default=4.0, help="Maximum HTML body size per public MAL userrecs page before preserving existing edges as failed")
     recommend_full_userrecs.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     recommend_enrich = subparsers.add_parser(
         "recommend-enrich-provider-availability",
         help="Use bounded provider title search to enrich recommendation availability cache",
     )
-    recommend_enrich.add_argument("--limit", type=int, default=1, help="Maximum recommendation candidates to inspect per provider")
+    recommend_enrich.add_argument("--limit", type=int, default=4, help="Maximum recommendation candidates to inspect per provider (default: 4)")
     recommend_enrich.add_argument("--provider", choices=list(list_provider_slugs()), help="Provider slug to query; defaults to all registered providers")
     recommend_enrich.add_argument("--search-limit", type=int, default=5, help="Maximum provider search results per query")
     recommend_enrich.add_argument(

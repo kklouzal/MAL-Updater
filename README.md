@@ -2,7 +2,7 @@
 
 MAL-Updater is a **skill-first** OpenClaw repository for conservative **multi-provider anime → MyAnimeList sync and recommendations**, with mapping review, guarded apply runs, and unattended maintenance. Current source providers: **Crunchyroll** and **HIDIVE**.
 
-Cache niceness policy: recommendation maintenance explicitly skips fresh rows using deterministic hot/warm/cold horizons (watching/current 3 days, mapped/planned/on-hold 14 days, completed/older 90 days), while missing/failed/stale harvests and stubs remain retry-eligible. The official MAL anime-detail `recommendations` field is retained only as a paced metadata/detail top-10 fallback; the separate cold path `recommend-refresh-full-userrecs` harvests complete aggregate public MAL `/anime/<id>/<slug>/userrecs` pairs for cached MAL list positives (`completed`, `watching`, `on_hold`) with a 45-day default full-harvest horizon. That public harvest stores only target MAL id/title and aggregate recommender count, not recommendation prose or usernames, and failed/looped/truncated/partial pages never replace existing edges. MAL search is keyed by normalized query, limit, fields, and logic version (14-day positive / 3-day negative defaults). Complete MAL details may satisfy narrower reads; incomplete/corrupt rows never satisfy sync. Provider title search stays 365 days but is versioned and keyed by provider/query/limit/MAL identity. Crunchyroll enriched series/audio/child-season evidence defaults to 30 days; HIDIVE remains search-only.
+Cache niceness policy: recommendation maintenance explicitly skips fresh rows using deterministic hot/warm/cold horizons (watching/current 3 days, mapped/planned/on-hold 14 days, completed/older 90 days), while missing/failed/stale harvests and stubs remain retry-eligible. The official MAL anime-detail `recommendations` field is retained only as a paced metadata/detail top-10 fallback; the separate cold path `recommend-refresh-full-userrecs` harvests complete aggregate public MAL `/anime/<id>/<slug>/userrecs` pairs for cached MAL list positives (`completed`, `watching`, `on_hold`) with a 45-day default full-harvest horizon. That public harvest stores only target MAL id/title and aggregate recommender count, not recommendation prose or usernames; page data is staged non-authoritatively across bounded per-run page budgets, and only a terminal coherent generation atomically replaces existing edges, so pause/failure/drift preserves the published graph. MAL search is keyed by normalized query, limit, fields, and logic version (14-day positive / 3-day negative defaults). Complete MAL details may satisfy narrower reads; incomplete/corrupt rows never satisfy sync. Provider title search stays 365 days but is versioned and keyed by provider/query/limit/MAL identity. Crunchyroll enriched series/audio/child-season evidence defaults to 30 days; HIDIVE remains search-only.
 
 Within TTL, request savings are `(repeated MAL searches - unique search keys) + field-covered repeat MAL details + (repeated provider searches - unique provider keys) + repeat Crunchyroll detail/season probes`; force refresh, expiry, corruption, or logic-version changes intentionally reduce savings.
 
@@ -95,8 +95,10 @@ PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --recommendation-li
 # Default unattended service cadence is conservative: hourly provider hot/incremental
 # fetch, exact-approved apply, MAL token refresh, health, and DB/local recommendation
 # snapshot work; MAL user-list refresh runs every 8h, recommendation metadata every 12h,
-# complete public MAL userrecs cold harvest runs hourly with one source-title
-# per batch and a 45-day horizon, and one independently budgeted provider-eligibility lane daily.
+# complete public MAL userrecs cold harvest runs hourly with two source titles per batch,
+# a per-source per-run page budget, resumable staged generations,
+# and a 45-day horizon, plus one independently budgeted hourly provider-eligibility
+# lane per credentialed provider (4 candidates, 1 alias, 5 returned matches).
 # Crunchyroll cold/full work is weekly and page-bounded; HIDIVE full refresh stays manual
 # because its current fetch surface has no chunk controls. Long-lived daemon startup
 # has a deterministic grace, and kernel-backed leases suppress overlapping daemon/task
@@ -109,7 +111,7 @@ PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20
 # Live MAL writes are intentionally not part of the routine smoke-check flow.
 # Use dry-run-sync first; only run apply-sync --execute after explicit operator approval.
 PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
-PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 5 --max-pages 3
+PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 5 --max-pages 3  # --max-pages is per source per run; unfinished sources pause/resume
 PYTHONPATH=src python3 -m mal_updater.cli recommend-coverage
 ```
 
@@ -138,7 +140,7 @@ The installed daemon is a **user-level systemd service** that runs `mal_updater.
 - bounded MAL user-list refresh every 8 hours (3 pages by default)
 - one fetch lane per credentialed source provider (currently Crunchyroll + HIDIVE)
 - one shared aggregate MAL apply lane using bounded exact-approved batches by default
-- bounded recommendation metadata every 12 hours plus one daily, provider-specific eligibility lane per credentialed provider; fresh actionable eligibility evidence is a zero-request cache hit
+- bounded recommendation metadata every 12 hours plus one hourly, provider-specific eligibility lane per credentialed provider (4 candidates by default); fresh actionable eligibility evidence is a zero-request cache hit
 - hourly recommendation snapshot/health materialization remains DB/local-only
 - recurring health-check/report generation
 - attempt-level MAL/Crunchyroll/HIDIVE request logging with redacted URLs, retry/timeout outcomes, task/run attribution, monotonic run deltas, and provider-global plus task-scoped budget enforcement (legacy events remain conservatively budgeted)
