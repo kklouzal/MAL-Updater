@@ -35,6 +35,10 @@ class WatchlistEntry:
     list_id: str | None = None
     list_name: str | None = None
     list_kind: str | None = None
+    provider_item_id: str | None = None
+    provider_item_type: str | None = None
+    position: int | None = None
+    list_memberships: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

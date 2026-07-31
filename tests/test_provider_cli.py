@@ -71,6 +71,7 @@ class _CliFakeProvider:
 EXPECTED_CLI_COMMAND_SURFACE = (
     "apply-sync",
     "approve-mapping",
+    "backfill-hidive-series-urls",
     "bootstrap-audit",
     "crunchyroll-auth-login",
     "crunchyroll-fetch-snapshot",
@@ -336,7 +337,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(50, len(actual_commands))
+        self.assertEqual(51, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",

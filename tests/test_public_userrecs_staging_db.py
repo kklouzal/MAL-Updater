@@ -92,7 +92,10 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
 
     def test_migration_catalog_and_repository_package_parity_for_015(self) -> None:
         self.assertIn(db.PUBLIC_USERRECS_STAGING_MIGRATION, db.MIGRATION_FILENAMES)
-        self.assertEqual(db.PUBLIC_USERRECS_STAGING_MIGRATION, db.MIGRATION_FILENAMES[-1])
+        self.assertLess(
+            db.MIGRATION_FILENAMES.index(db.PUBLIC_USERRECS_STAGING_MIGRATION),
+            db.MIGRATION_FILENAMES.index(db.PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION),
+        )
         root_file = Path(__file__).resolve().parents[1] / "migrations" / db.PUBLIC_USERRECS_STAGING_MIGRATION
         packaged = next(migration for migration in db.MIGRATIONS if migration.name == db.PUBLIC_USERRECS_STAGING_MIGRATION)
         self.assertEqual(root_file.read_text(encoding="utf-8"), packaged.read_text(encoding="utf-8"))

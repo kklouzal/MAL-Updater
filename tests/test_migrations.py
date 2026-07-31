@@ -36,6 +36,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "013_mal_anime_metadata_broadcast_compatibility.sql",
                 "014_recommendation_provider_enrichment_cursor.sql",
                 "015_public_userrecs_resumable_staging.sql",
+                "016_provider_watchlist_membership_keys.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -79,6 +80,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "013_mal_anime_metadata_broadcast_compatibility.sql",
                     "014_recommendation_provider_enrichment_cursor.sql",
                     "015_public_userrecs_resumable_staging.sql",
+                    "016_provider_watchlist_membership_keys.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -101,6 +103,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "013_mal_anime_metadata_broadcast_compatibility.sql",
                     "014_recommendation_provider_enrichment_cursor.sql",
                     "015_public_userrecs_resumable_staging.sql",
+                    "016_provider_watchlist_membership_keys.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -126,6 +129,44 @@ class MigrationCatalogTests(unittest.TestCase):
                 root_file.read_text(encoding="utf-8"),
                 migration.read_text(encoding="utf-8"),
             )
+
+    def test_provider_watchlist_membership_migration_preserves_fk_and_cascade(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "watchlist-fk.sqlite3"
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                fk_rows = conn.execute("PRAGMA foreign_key_list(provider_watchlist)").fetchall()
+                fk_groups: dict[int, list[sqlite3.Row]] = {}
+                for row in fk_rows:
+                    fk_groups.setdefault(int(row["id"]), []).append(row)
+                self.assertTrue(
+                    any(
+                        group
+                        and group[0]["table"] == "provider_series"
+                        and group[0]["on_delete"].upper() == "CASCADE"
+                        and {(row["from"], row["to"]) for row in group}
+                        == {("provider", "provider"), ("provider_series_id", "provider_series_id")}
+                        for group in fk_groups.values()
+                    ),
+                    [dict(row) for row in fk_rows],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title)
+                    VALUES ('hidive', '2312', 'Dungeon People')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO provider_watchlist(provider, provider_series_id, list_id, provider_item_id)
+                    VALUES ('hidive', '2312', 'favorites', 'item-2312')
+                    """
+                )
+                conn.execute("DELETE FROM provider_series WHERE provider = 'hidive' AND provider_series_id = '2312'")
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM provider_watchlist WHERE provider = 'hidive' AND provider_series_id = '2312'"
+                ).fetchone()[0]
+                self.assertEqual(0, remaining)
 
     def test_v7_to_v8_failure_rolls_back_and_retry_is_clean(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -181,6 +222,8 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertTrue({"generation_id", "page_number", "target_mal_anime_id", "target_title", "num_recommendations"} <= userrecs_edge_columns)
                 userrecs_event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_public_userrecs_crawl_events)")}
                 self.assertTrue({"generation_id", "source_mal_anime_id", "event_type", "page_number", "page_url", "error"} <= userrecs_event_columns)
+                watchlist_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_watchlist)")}
+                self.assertTrue({"list_id", "list_name", "list_kind", "provider_item_id", "provider_item_type", "position"} <= watchlist_columns)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
             bootstrap_database(db_path)

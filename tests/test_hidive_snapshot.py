@@ -156,11 +156,12 @@ class HidiveSnapshotTests(unittest.TestCase):
                 "page": 1,
                 "totalPages": 1,
             }
+            custom_collection_payload = {"watchlists": [], "pagingInfo": {"moreDataAvailable": False}}
 
             with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
                 HidiveSession,
                 "json_get",
-                side_effect=[history_payload, home_payload, favourites_payload],
+                side_effect=[history_payload, home_payload, favourites_payload, custom_collection_payload],
             ):
                 result = fetch_snapshot(load_config(root), use_incremental_boundary=False)
 
@@ -209,6 +210,10 @@ class HidiveSnapshotTests(unittest.TestCase):
                 "buckets": [
                     {
                         "name": "CONTINUE WATCHING",
+                        "page": 1,
+                        "resultsPerPage": 5,
+                        "totalPages": 4,
+                        "totalResults": 18,
                         "contentList": [
                             {
                                 "id": 2002,
@@ -228,11 +233,12 @@ class HidiveSnapshotTests(unittest.TestCase):
                 ]
             }
             favourites_payload = {"events": [{"id": 5005, "title": "Favorite Show"}], "page": 1, "totalPages": 1}
+            custom_collection_payload = {"watchlists": [], "pagingInfo": {"moreDataAvailable": False}}
 
             with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
                 HidiveSession,
                 "json_get",
-                side_effect=[history_payload, home_payload, favourites_payload],
+                side_effect=[history_payload, home_payload, favourites_payload, custom_collection_payload],
             ):
                 result = fetch_snapshot(load_config(root))
 
@@ -279,28 +285,14 @@ class HidiveSnapshotTests(unittest.TestCase):
                 "page": 1,
                 "totalPages": 9,
             }
-            history_backfill_payload = {
-                "vods": [
-                    {
-                        "id": 1002,
-                        "title": "Episode 11",
-                        "duration": 1440,
-                        "watchedAt": 1770400000000,
-                        "episodeInformation": {
-                            "seasonNumber": 1,
-                            "episodeNumber": 11,
-                            "seasonTitle": "Season 1",
-                            "seriesInformation": {"id": 3560, "title": "Dusk Beyond the End of the World"},
-                        },
-                    }
-                ],
-                "page": 2,
-                "totalPages": 9,
-            }
             home_payload = {
                 "buckets": [
                     {
                         "name": "CONTINUE WATCHING",
+                        "page": 1,
+                        "resultsPerPage": 5,
+                        "totalPages": 4,
+                        "totalResults": 18,
                         "contentList": [
                             {
                                 "id": 2002,
@@ -319,25 +311,136 @@ class HidiveSnapshotTests(unittest.TestCase):
                     }
                 ]
             }
-            favourites_payload = {"events": [{"id": 5005, "title": "Favorite Show"}], "page": 1, "totalPages": 99}
-            favourites_backfill_payload = {"events": [{"id": 5006, "title": "Older Favorite Show"}], "page": 2, "totalPages": 99}
             with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
                 HidiveSession,
                 "json_get",
-                side_effect=[history_payload, history_backfill_payload, home_payload, favourites_payload, favourites_backfill_payload],
+                side_effect=[history_payload, home_payload],
             ) as mock_get:
                 result = fetch_snapshot(load_config(root))
 
         self.assertFalse(result.snapshot.raw["history_stopped_early"])
-        self.assertFalse(result.snapshot.raw["continue_stopped_early"])
+        self.assertTrue(result.snapshot.raw["continue_stopped_early"])
         self.assertFalse(result.snapshot.raw["favourite_stopped_early"])
         self.assertTrue(result.snapshot.raw["sync_boundary_present"])
         self.assertEqual("hot", result.snapshot.raw["sync_boundary_mode"])
         self.assertTrue(result.snapshot.raw["hot_surface_only"])
-        self.assertEqual({"history": True, "continue_watching": False, "watchlists": False}, result.snapshot.raw["supports"])
+        self.assertEqual({"history": True, "continue_watching": True, "watchlists": False}, result.snapshot.raw["supports"])
         self.assertEqual(1, result.snapshot.raw["history_pages_fetched"])
+        self.assertEqual(1, result.snapshot.raw["continue_pages_fetched"])
+        self.assertTrue(result.snapshot.raw["continue_partial"])
+        self.assertTrue(result.snapshot.raw["continue_unpageable"])
+        self.assertIn("continue_watching_partial_unpageable", {item["code"] for item in result.snapshot.raw["diagnostics"]})
         self.assertEqual(0, result.snapshot.raw["favourite_pages_fetched"])
-        self.assertEqual(1, mock_get.call_count)
+        self.assertEqual(2, mock_get.call_count)
+
+    def test_full_fetch_stops_on_non_advancing_history_page_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            session.state_paths.root.mkdir(parents=True, exist_ok=True)
+            history_page = {
+                "vods": [
+                    {
+                        "id": 1001,
+                        "title": "Episode 12",
+                        "duration": 1440,
+                        "watchedAt": 1770504571302,
+                        "episodeInformation": {
+                            "seasonNumber": 1,
+                            "episodeNumber": 12,
+                            "seasonTitle": "Season 1",
+                            "seriesInformation": {"id": 3560, "title": "Dusk Beyond the End of the World"},
+                        },
+                    }
+                ],
+                "page": 1,
+                "resultsPerPage": 5,
+                "totalPages": 77,
+                "totalResults": 385,
+            }
+            home_payload = {"buckets": []}
+            favourites_payload = {"events": [], "page": 1, "totalPages": 1}
+            custom_collection_payload = {"watchlists": [], "pagingInfo": {"moreDataAvailable": False}}
+
+            with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+                HidiveSession,
+                "json_get",
+                side_effect=[history_page, history_page, home_payload, favourites_payload, custom_collection_payload],
+            ) as mock_get:
+                result = fetch_snapshot(load_config(root), use_incremental_boundary=False)
+
+        self.assertEqual(1, result.history_count)
+        self.assertEqual(2, result.snapshot.raw["history_pages_fetched"])
+        self.assertTrue(result.snapshot.raw["history_stopped_early"])
+        self.assertTrue(result.snapshot.raw["history_non_advancing_detected"])
+        self.assertTrue(result.snapshot.raw["partial"])
+        self.assertIn("history_pagination_non_advancing", {item["code"] for item in result.snapshot.raw["diagnostics"]})
+        self.assertEqual(5, mock_get.call_count)
+
+    def test_custom_watchlist_detail_paginates_with_zero_last_seen_and_preserves_cross_list_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            session.state_paths.root.mkdir(parents=True, exist_ok=True)
+            history_payload = {"vods": [], "page": 1, "totalPages": 1}
+            home_payload = {"buckets": []}
+            favourites_payload = {"events": [], "page": 1, "totalPages": 1}
+            collection_payload = {
+                "watchlists": [
+                    {"watchlistExternalId": 111, "name": "Owned One", "ownership": "OWNED"},
+                    {"watchlistExternalId": 222, "name": "Owned Two", "ownership": "OWNED"},
+                ],
+                "pagingInfo": {"moreDataAvailable": False, "lastSeen": "opaque"},
+            }
+            list_one_page_one = {
+                "watchlistExternalId": 111,
+                "name": "Owned One",
+                "ownership": "OWNED",
+                "content": [
+                    {"id": 9001, "type": "VOD_SEASON", "title": "Season A", "series": {"seriesId": 7001, "title": "Shared Show"}},
+                ],
+                "pagingInfo": {"moreDataAvailable": True, "lastSeen": 0},
+            }
+            list_one_page_two = {
+                "watchlistExternalId": 111,
+                "name": "Owned One",
+                "ownership": "OWNED",
+                "content": [
+                    {"id": 9002, "type": "VOD_SEASON", "title": "Season B", "series": {"seriesId": 7002, "title": "Paged Show"}},
+                ],
+                "pagingInfo": {"moreDataAvailable": False, "lastSeen": 9002},
+            }
+            list_two_page_one = {
+                "watchlistExternalId": 222,
+                "name": "Owned Two",
+                "ownership": "OWNED",
+                "content": [
+                    {"id": 9001, "type": "VOD_SEASON", "title": "Season A", "series": {"seriesId": 7001, "title": "Shared Show"}},
+                ],
+                "pagingInfo": {"moreDataAvailable": False, "lastSeen": 9001},
+            }
+
+            with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+                HidiveSession,
+                "json_get",
+                side_effect=[history_payload, home_payload, favourites_payload, collection_payload, list_one_page_one, list_one_page_two, list_two_page_one],
+            ) as mock_get:
+                result = fetch_snapshot(load_config(root), use_incremental_boundary=False)
+
+        self.assertEqual(2, result.snapshot.raw["custom_watchlist_list_count"])
+        self.assertEqual(3, result.snapshot.raw["custom_watchlist_count"])
+        self.assertEqual(3, result.snapshot.raw["custom_watchlist_detail_pages_fetched"])
+        self.assertEqual(
+            ["watchlist:111", "watchlist:111", "watchlist:222"],
+            [entry.list_id for entry in result.snapshot.watchlist],
+        )
+        self.assertEqual(["7001", "7002", "7001"], [entry.provider_series_id for entry in result.snapshot.watchlist])
+        self.assertEqual(["9001", "9002", "9001"], [entry.provider_item_id for entry in result.snapshot.watchlist])
+        self.assertEqual({"7001", "7002"}, {series.provider_series_id for series in result.snapshot.series})
+        detail_page_two_call = mock_get.call_args_list[5]
+        self.assertEqual({"rpp": hidive_snapshot.HIDIVE_CUSTOM_WATCHLIST_RPP, "lastSeen": 0}, detail_page_two_call.kwargs["params"])
 
 
 if __name__ == "__main__":

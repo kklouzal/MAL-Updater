@@ -112,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
     ingest_snapshot = subparsers.add_parser("ingest-snapshot", help="Validate and ingest a normalized provider snapshot into SQLite")
     ingest_snapshot.add_argument("snapshot", nargs="?", type=Path, help="Snapshot JSON file path (defaults to stdin)")
+    hidive_backfill_urls = subparsers.add_parser(
+        "backfill-hidive-series-urls",
+        help="Dry-run or apply the idempotent HIDIVE /season -> /series URL correction for covered local cache/dashboard rows",
+    )
+    hidive_backfill_urls.add_argument("--apply", action="store_true", help="Actually update local SQLite rows; default is read-only dry-run")
+    hidive_backfill_urls.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     provider_stale_rows = subparsers.add_parser(
         "provider-stale-rows",
         help="Inspect read-only provider cache rows older than a cutoff, defaulting to the provider's latest completed full refresh",

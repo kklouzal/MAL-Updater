@@ -110,6 +110,22 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(SnapshotValidationError):
             validate_snapshot_payload(payload)
 
+    def test_validate_snapshot_payload_allows_cross_list_duplicate_membership(self) -> None:
+        payload = sample_snapshot()
+        payload["watchlist"][0].update({"provider_item_type": "VOD_SEASON", "provider_item_id": "season-1", "position": 0})
+        payload["watchlist"].append(
+            {
+                **payload["watchlist"][0],
+                "list_id": "watchlist:custom",
+                "list_name": "Custom",
+                "list_kind": "custom",
+            }
+        )
+
+        snapshot = validate_snapshot_payload(payload)
+
+        self.assertEqual(2, len(snapshot.watchlist))
+        self.assertEqual(["favorites", "watchlist:custom"], [entry.list_id for entry in snapshot.watchlist])
 
 class _FakeProvider:
     slug = "crunchyroll"
@@ -187,6 +203,37 @@ class IngestionTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_episode_progress").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_watchlist").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM sync_runs WHERE status = 'completed'").fetchone()[0], 1)
+
+    def test_ingest_snapshot_payload_persists_cross_list_watchlist_memberships(self) -> None:
+        payload = sample_snapshot()
+        payload["watchlist"][0].update({"provider_item_type": "VOD_SEASON", "provider_item_id": "season-1", "position": 0})
+        payload["watchlist"].append(
+            {
+                **payload["watchlist"][0],
+                "list_id": "watchlist:custom",
+                "list_name": "Custom",
+                "list_kind": "custom",
+                "position": 7,
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+
+            summary = ingest_snapshot_payload(payload, config)
+
+            self.assertEqual(2, summary.watchlist_count)
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT list_id, provider_series_id, provider_item_type, provider_item_id, position FROM provider_watchlist ORDER BY list_id"
+                ).fetchall()
+            self.assertEqual(
+                [("favorites", "series-123", "VOD_SEASON", "season-1", 0), ("watchlist:custom", "series-123", "VOD_SEASON", "season-1", 7)],
+                rows,
+            )
 
     def test_ingest_snapshot_payload_preserves_explicit_sync_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:

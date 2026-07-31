@@ -48,6 +48,52 @@ class HealthCheckCliTests(unittest.TestCase):
         exit_code, stdout = self._run_health_check_raw(*args)
         return exit_code, json.loads(stdout)
 
+    def test_health_report_surfaces_hidive_partial_surface_diagnostics(self) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                (
+                    "hidive",
+                    "1.0",
+                    "full_refresh",
+                    "completed",
+                    json.dumps(
+                        {
+                            "provider": "hidive",
+                            "contract_version": "1.0",
+                            "series_count": 1,
+                            "progress_count": 1,
+                            "watchlist_count": 0,
+                            "diagnostics": [
+                                {
+                                    "code": "history_pagination_non_advancing",
+                                    "surface": "history",
+                                    "severity": "warning",
+                                }
+                            ],
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+        payload = build_health_report(
+            self.config,
+            stale_hours=72,
+            review_issue_type=None,
+            review_worklist_limit=3,
+            mapping_coverage_threshold=0.8,
+            maintenance_review_limit=25,
+        )
+
+        self.assertEqual(["history_pagination_non_advancing"], payload["provider_surface_diagnostics"]["codes"])
+        warning = next(item for item in payload["warnings"] if item["code"] == "hidive_surface_diagnostics")
+        self.assertEqual("unhealthy", warning["health_posture"])
+        self.assertEqual("history_pagination_non_advancing", warning["diagnostics"][0]["code"])
+
     def _run_provider_stale_rows_raw(self, *args: str) -> tuple[int, str]:
         argv = [
             "mal-updater",

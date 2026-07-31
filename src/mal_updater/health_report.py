@@ -292,6 +292,50 @@ def _build_mapping_review_revision_snapshot(items: list[object]) -> dict[str, ob
         "all_current": len(stale_items) == 0,
     }
 
+
+def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(sync_run, dict):
+        return None
+    provider = sync_run.get("provider")
+    summary = sync_run.get("summary")
+    if not isinstance(provider, str) or not provider or not isinstance(summary, dict):
+        return None
+    diagnostics = summary.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        return None
+    normalized: list[dict[str, object]] = []
+    for item in diagnostics:
+        if not isinstance(item, dict):
+            continue
+        code = item.get("code")
+        if not isinstance(code, str) or not code:
+            continue
+        normalized.append(item)
+    if not normalized:
+        return None
+    codes = {str(item.get("code")) for item in normalized}
+    blocking_codes = {
+        "history_pagination_non_advancing",
+        "custom_watchlist_partial",
+        "custom_watchlist_collection_pagination_non_advancing",
+        "custom_watchlist_collection_cursor_non_advancing",
+        "custom_watchlist_collection_missing_cursor",
+        "custom_watchlist_detail_pagination_non_advancing",
+        "custom_watchlist_detail_cursor_non_advancing",
+        "custom_watchlist_detail_missing_cursor",
+    }
+    blocking = bool(codes.intersection(blocking_codes))
+    return {
+        "provider": provider,
+        "sync_run_id": sync_run.get("id"),
+        "mode": sync_run.get("mode"),
+        "diagnostics": normalized,
+        "codes": sorted(codes),
+        "severity": "warning" if blocking else "info",
+        "health_posture": "unhealthy" if blocking else "operator_visible",
+        "automation_safe": not blocking,
+    }
+
 def _format_systemd_usec_timestamp(value: str) -> str | None:
     return _service_systemd_status.format_systemd_usec_timestamp(value)
 
@@ -814,6 +858,9 @@ def build_health_report(
         latest_provider_stale_row_counts,
         latest_provider_stale_row_samples,
     )
+    provider_surface_diagnostics = _provider_surface_diagnostics_from_sync_run(
+        latest_completed_sync_run if isinstance(latest_completed_sync_run, dict) else None
+    )
     if (
         isinstance(partial_sync_coverage, dict)
         and partial_sync_coverage.get("fully_explained_by_stale_rows") is not True
@@ -965,6 +1012,22 @@ def build_health_report(
                 "mode": partial_sync_coverage.get("mode"),
                 "backfill_progress": partial_sync_coverage.get("backfill_progress"),
                 "fields": partial_sync_coverage.get("fields"),
+            }
+        )
+    if isinstance(provider_surface_diagnostics, dict):
+        provider_name = provider_surface_diagnostics.get("provider")
+        codes = provider_surface_diagnostics.get("codes")
+        code_label = ", ".join(str(code) for code in codes) if isinstance(codes, list) else "provider surface diagnostics"
+        warnings.append(
+            {
+                "code": f"{provider_name}_surface_diagnostics" if isinstance(provider_name, str) and provider_name else "provider_surface_diagnostics",
+                "detail": f"Latest completed {provider_name or 'provider'} ingest reported non-authoritative or partial provider surfaces: {code_label}",
+                "severity": provider_surface_diagnostics.get("severity"),
+                "health_posture": provider_surface_diagnostics.get("health_posture"),
+                "automation_safe": provider_surface_diagnostics.get("automation_safe"),
+                "sync_run_id": provider_surface_diagnostics.get("sync_run_id"),
+                "mode": provider_surface_diagnostics.get("mode"),
+                "diagnostics": provider_surface_diagnostics.get("diagnostics"),
             }
         )
     for provider, failure in provider_auth_failures.items():
@@ -1227,6 +1290,7 @@ def build_health_report(
         "provider_freshness": snapshot.get("provider_freshness"),
         "provider_freshness_by_provider": snapshot.get("provider_freshness_by_provider"),
         "partial_sync_coverage": partial_sync_coverage,
+        "provider_surface_diagnostics": provider_surface_diagnostics,
         "review_queue": {
             **review_queue,
             "mapping_review_revision": mapping_review_revision,

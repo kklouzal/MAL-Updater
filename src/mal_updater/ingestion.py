@@ -18,9 +18,10 @@ class IngestionSummary:
     progress_count: int
     watchlist_count: int
     sync_run_id: int | None = None
+    diagnostics: list[dict[str, Any]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "provider": self.provider,
             "contract_version": self.contract_version,
             "series_count": self.series_count,
@@ -28,6 +29,9 @@ class IngestionSummary:
             "watchlist_count": self.watchlist_count,
             "sync_run_id": self.sync_run_id,
         }
+        if self.diagnostics:
+            payload["diagnostics"] = self.diagnostics
+        return payload
 
 
 def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ingest_snapshot") -> IngestionSummary:
@@ -43,6 +47,7 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ing
             _upsert_series(conn, provider, snapshot.series)
             _upsert_progress(conn, provider, snapshot.progress)
             _upsert_watchlist(conn, provider, snapshot.watchlist)
+            diagnostics = _snapshot_diagnostics_from_raw(snapshot.raw)
             summary = IngestionSummary(
                 provider=provider,
                 contract_version=contract_version,
@@ -50,6 +55,7 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ing
                 progress_count=len(snapshot.progress),
                 watchlist_count=len(snapshot.watchlist),
                 sync_run_id=sync_run_id,
+                diagnostics=diagnostics,
             )
             _complete_sync_run(conn, sync_run_id, "completed", summary.as_dict())
             conn.commit()
@@ -89,6 +95,37 @@ def _complete_sync_run(conn, sync_run_id: int, status: str, summary: dict[str, A
 
 def _entry_json(entry: Any) -> str:
     return json.dumps(asdict(entry), sort_keys=True)
+
+
+def _snapshot_diagnostics_from_raw(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    raw_diagnostics = raw.get("diagnostics")
+    if isinstance(raw_diagnostics, list):
+        for item in raw_diagnostics:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code")
+            if not isinstance(code, str) or not code:
+                continue
+            diagnostics.append({key: value for key, value in item.items() if key != "sensitive"})
+    if raw.get("partial") is True:
+        diagnostics.append({"code": "snapshot_partial", "surface": "provider_snapshot", "severity": "warning"})
+    if raw.get("history_non_advancing_detected") is True:
+        diagnostics.append({"code": "history_pagination_non_advancing", "surface": "history", "severity": "warning"})
+    if raw.get("continue_partial") is True:
+        diagnostics.append({"code": "continue_watching_partial_unpageable", "surface": "continue_watching", "severity": "info"})
+    if raw.get("custom_watchlist_partial") is True:
+        diagnostics.append({"code": "custom_watchlist_partial", "surface": "watchlists", "severity": "warning"})
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for item in diagnostics:
+        key = (str(item.get("code")), str(item.get("surface")) if item.get("surface") is not None else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def _upsert_series(conn, provider: str, series_entries: list[Any]) -> None:
@@ -178,6 +215,9 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
 
 def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None:
     for entry in watchlist_entries:
+        list_id = entry.list_id or "default"
+        provider_item_type = entry.provider_item_type or "series"
+        provider_item_id = entry.provider_item_id or entry.provider_series_id
         conn.execute(
             """
             INSERT INTO provider_watchlist (
@@ -185,13 +225,22 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None
                 provider_series_id,
                 added_at,
                 status,
+                list_id,
+                list_name,
+                list_kind,
+                provider_item_id,
+                provider_item_type,
+                position,
                 raw_json,
                 first_seen_at,
                 last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(provider, provider_series_id) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(provider, list_id, provider_series_id, provider_item_type, provider_item_id) DO UPDATE SET
                 added_at = excluded.added_at,
                 status = excluded.status,
+                list_name = excluded.list_name,
+                list_kind = excluded.list_kind,
+                position = excluded.position,
                 raw_json = excluded.raw_json,
                 last_seen_at = CURRENT_TIMESTAMP
             """,
@@ -200,6 +249,12 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None
                 entry.provider_series_id,
                 entry.added_at,
                 entry.status,
+                list_id,
+                entry.list_name,
+                entry.list_kind,
+                provider_item_id,
+                provider_item_type,
+                entry.position,
                 _entry_json(entry),
             ),
         )

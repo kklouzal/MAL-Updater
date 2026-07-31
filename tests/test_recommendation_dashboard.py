@@ -839,7 +839,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                                 {
                                     "provider": "hidive",
                                     "provider_title": "Multi Provider Actionable",
-                                    "provider_url": "https://www.hidive.com/season/multi",
+                                    "provider_url": "https://www.hidive.com/series/multi",
                                     "identity_match_kind": "manual_verified",
                                     "match_confidence": 0.98,
                                     "review_status": "verified",
@@ -867,7 +867,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(payload["recommendations"]["mode"], "strict_actionable")
             self.assertEqual(["crunchyroll", "hidive"], row["availability"]["providers"])
             self.assertEqual("https://www.crunchyroll.com/series/multi", row["provider_badges"][0]["url"])
-            self.assertEqual("https://www.hidive.com/season/multi", row["provider_badges"][1]["url"])
+            self.assertEqual("https://www.hidive.com/series/multi", row["provider_badges"][1]["url"])
             self.assertIn("identity approved_mapping, manual_verified", row["verification"])
             self.assertIn("review verified", row["verification"])
             self.assertIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", row["evidence_freshness"])

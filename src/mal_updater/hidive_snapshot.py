@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from .config import AppConfig
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
@@ -22,6 +24,7 @@ HISTORY_BOUNDARY_MARKER_LIMIT = 25
 CONTINUE_BOUNDARY_MARKER_LIMIT = 25
 FAVOURITE_BOUNDARY_MARKER_LIMIT = 25
 INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
+HIDIVE_CUSTOM_WATCHLIST_RPP = 25
 
 
 @dataclass(slots=True)
@@ -41,6 +44,7 @@ class HidiveFetchResult:
     history_count: int
     continue_count: int
     favourite_count: int
+    custom_watchlist_count: int = 0
 
 
 def _now_string() -> str:
@@ -110,6 +114,45 @@ def _favourite_item_fingerprint(item: dict[str, Any]) -> str | None:
     return "|".join([str(provider_series_id), str(title)])
 
 
+def _stable_json_fingerprint(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _page_fingerprint(items: list[dict[str, Any]], fingerprint_func) -> str:
+    markers: list[str] = []
+    for item in items:
+        marker = fingerprint_func(item)
+        markers.append(marker if marker is not None else _stable_json_fingerprint(item))
+    return _stable_json_fingerprint(markers)
+
+
+def _diagnostic(code: str, *, surface: str, detail: str, severity: str = "warning", **extra: Any) -> dict[str, Any]:
+    return {
+        "code": code,
+        "surface": surface,
+        "severity": severity,
+        "detail": detail,
+        **{key: value for key, value in extra.items() if value is not None},
+    }
+
+
+def _paging_info(payload: dict[str, Any]) -> dict[str, Any]:
+    paging = payload.get("pagingInfo")
+    return paging if isinstance(paging, dict) else {}
+
+
+def _paging_more(payload: dict[str, Any]) -> bool:
+    return _paging_info(payload).get("moreDataAvailable") is True
+
+
+def _paging_last_seen(payload: dict[str, Any]) -> tuple[bool, Any]:
+    paging = _paging_info(payload)
+    if "lastSeen" not in paging:
+        return False, None
+    return True, paging.get("lastSeen")
+
+
 def _load_sync_boundary(state_paths: HidiveStatePaths) -> _SyncBoundary | None:
     path = state_paths.sync_boundary_path
     if not path.exists():
@@ -157,13 +200,23 @@ def _write_sync_boundary(
     favourite_items: list[dict[str, Any]],
     history_backfill_items: list[dict[str, Any]] | None = None,
     favourite_backfill_items: list[dict[str, Any]] | None = None,
+    favourite_markers_override: list[str] | None = None,
+    favourite_backfill_markers_override: list[str] | None = None,
 ) -> None:
     state_paths.root.mkdir(parents=True, exist_ok=True)
     history_markers = _unique_fingerprints(history_items, _history_item_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
     continue_markers = _unique_fingerprints(continue_items, _continue_item_fingerprint, CONTINUE_BOUNDARY_MARKER_LIMIT)
-    favourite_markers = _unique_fingerprints(favourite_items, _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
+    favourite_markers = (
+        list(favourite_markers_override[:FAVOURITE_BOUNDARY_MARKER_LIMIT])
+        if favourite_markers_override is not None
+        else _unique_fingerprints(favourite_items, _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
+    )
     history_backfill_markers = _unique_fingerprints(history_backfill_items or [], _history_item_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
-    favourite_backfill_markers = _unique_fingerprints(favourite_backfill_items or [], _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
+    favourite_backfill_markers = (
+        list(favourite_backfill_markers_override[:FAVOURITE_BOUNDARY_MARKER_LIMIT])
+        if favourite_backfill_markers_override is not None
+        else _unique_fingerprints(favourite_backfill_items or [], _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
+    )
     payload = {
         "schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
         "generated_at": generated_at,
@@ -263,7 +316,7 @@ def _fetch_history_items(
     history_markers: set[str] | None = None,
     backfill_markers: set[str] | None = None,
     max_pages: int | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool, list[dict[str, Any]]]:
     page = 1
     size = 100
     items: list[dict[str, Any]] = []
@@ -272,6 +325,8 @@ def _fetch_history_items(
     backfill_pages_fetched = 0
     stopped_early = False
     backfill_exhausted = False
+    diagnostics: list[dict[str, Any]] = []
+    seen_page_fingerprints: dict[str, int] = {}
     front_boundary_seen = not history_markers
     backfill_cursor_seen = not backfill_markers
     while True:
@@ -283,8 +338,27 @@ def _fetch_history_items(
         if not isinstance(vods, list):
             raise HidiveSnapshotError("HIDIVE history payload did not include a vods list")
         batch = [item for item in vods if isinstance(item, dict)]
+        batch_fingerprint = _page_fingerprint(batch, _history_item_fingerprint)
+        previous_page = seen_page_fingerprints.get(batch_fingerprint)
+        if previous_page is not None:
+            stopped_early = True
+            diagnostics.append(
+                _diagnostic(
+                    "history_pagination_non_advancing",
+                    surface="history",
+                    detail="HIDIVE returned a duplicate history page fingerprint before the declared terminal page; stopped to avoid repeated non-advancing requests",
+                    previous_page=previous_page,
+                    repeated_page=page,
+                    pages_fetched=pages_fetched,
+                    batch_count=len(batch),
+                    declared_total_pages=_safe_int(payload.get("totalPages")),
+                    declared_total_results=_safe_int(payload.get("totalResults")),
+                )
+            )
+            break
+        seen_page_fingerprints[batch_fingerprint] = page
         items.extend(batch)
-        batch_markers = {_history_item_fingerprint(item) for item in batch}
+        batch_markers = {marker for item in batch if (marker := _history_item_fingerprint(item))}
         if not front_boundary_seen and history_markers and history_markers.intersection(batch_markers):
             front_boundary_seen = True
         elif front_boundary_seen and not backfill_cursor_seen and backfill_markers and backfill_markers.intersection(batch_markers):
@@ -303,28 +377,63 @@ def _fetch_history_items(
         if max_pages is not None and pages_fetched >= max_pages:
             break
         page += 1
-    return items, backfill_items, pages_fetched, backfill_pages_fetched, stopped_early, backfill_exhausted
+    return items, backfill_items, pages_fetched, backfill_pages_fetched, stopped_early, backfill_exhausted, diagnostics
 
 
-def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], bool]:
+def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     payload = session.json_get("/content/home", params={"size": 100, "page": 1})
     if not isinstance(payload, dict):
         raise HidiveSnapshotError("HIDIVE home payload was not a JSON object")
     buckets = payload.get("buckets")
     if not isinstance(buckets, list):
         raise HidiveSnapshotError("HIDIVE home payload did not include a buckets list")
+    metadata: dict[str, Any] = {
+        "pages_fetched": 1,
+        "partial": False,
+        "unpageable": False,
+        "diagnostics": [],
+    }
     for bucket in buckets:
         if not isinstance(bucket, dict):
             continue
         if str(bucket.get("name") or "").strip().upper() != "CONTINUE WATCHING":
             continue
+        bucket_total_pages = _safe_int(bucket.get("totalPages"))
+        bucket_total_results = _safe_int(bucket.get("totalResults"))
+        metadata.update(
+            {
+                "bucket_page": _safe_int(bucket.get("page")),
+                "bucket_results_per_page": _safe_int(bucket.get("resultsPerPage")),
+                "bucket_total_pages": bucket_total_pages,
+                "bucket_total_results": bucket_total_results,
+            }
+        )
         content_list = bucket.get("contentList")
         if isinstance(content_list, list):
             items = [item for item in content_list if isinstance(item, dict)]
             stopped_early = bool(continue_markers and any((_continue_item_fingerprint(item) in continue_markers) for item in items))
-            return items, stopped_early
-        return [], False
-    return [], False
+            partial = bool(
+                (isinstance(bucket_total_pages, int) and bucket_total_pages > 1)
+                or (isinstance(bucket_total_results, int) and bucket_total_results > len(items))
+            )
+            metadata["partial"] = partial
+            metadata["unpageable"] = partial
+            metadata["item_count"] = len(items)
+            if partial:
+                metadata["diagnostics"] = [
+                    _diagnostic(
+                        "continue_watching_partial_unpageable",
+                        surface="continue_watching",
+                        severity="info",
+                        detail="HIDIVE home Continue Watching exposes page-1 bucket metadata but repeated home page requests return the same bucket; retained page 1 only",
+                        item_count=len(items),
+                        declared_total_pages=bucket_total_pages,
+                        declared_total_results=bucket_total_results,
+                    )
+                ]
+            return items, stopped_early, metadata
+        return [], False, metadata
+    return [], False, metadata
 
 
 def _fetch_favourite_items(
@@ -354,7 +463,7 @@ def _fetch_favourite_items(
             raise HidiveSnapshotError("HIDIVE favourites payload did not include an events/vods list")
         batch = [item for item in events if isinstance(item, dict)]
         items.extend(batch)
-        batch_markers = {_favourite_item_fingerprint(item) for item in batch}
+        batch_markers = {marker for item in batch if (marker := _favourite_item_fingerprint(item))}
         if not front_boundary_seen and favourite_markers and favourite_markers.intersection(batch_markers):
             front_boundary_seen = True
         elif front_boundary_seen and not backfill_cursor_seen and backfill_markers and backfill_markers.intersection(batch_markers):
@@ -401,6 +510,321 @@ def _favourite_item_to_watchlist(item: dict[str, Any]) -> WatchlistEntry | None:
     )
 
 
+def _custom_watchlist_external_id(item: dict[str, Any]) -> str | None:
+    value = item.get("watchlistExternalId")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _custom_watchlist_list_id(item: dict[str, Any]) -> str | None:
+    external_id = _custom_watchlist_external_id(item)
+    return f"watchlist:{external_id}" if external_id else None
+
+
+def _custom_watchlist_name(item: dict[str, Any]) -> str | None:
+    value = item.get("name")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _custom_watchlist_kind(item: dict[str, Any]) -> str:
+    if item.get("systemDefinedType") is not None:
+        return "system"
+    ownership = str(item.get("ownership") or "").strip().upper()
+    if ownership == "OWNED":
+        return "custom"
+    if ownership in {"SHARED", "SAVED"}:
+        return "shared"
+    return "custom"
+
+
+def _localized_content_title(item: dict[str, Any]) -> str | None:
+    localisations = item.get("localisations")
+    if isinstance(localisations, dict):
+        for key in ("en_US", "en-US", "en", "en_us"):
+            value = localisations.get(key)
+            if isinstance(value, dict):
+                title = value.get("title") or value.get("name")
+                if title:
+                    return str(title)
+    for key in ("title", "name"):
+        value = item.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _custom_content_series_id(item: dict[str, Any]) -> str | None:
+    series = item.get("series") if isinstance(item.get("series"), dict) else {}
+    for value in (
+        series.get("seriesId") if isinstance(series, dict) else None,
+        series.get("id") if isinstance(series, dict) else None,
+        item.get("seriesId"),
+        item.get("seriesID"),
+    ):
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    content_type = str(item.get("type") or item.get("contentType") or "").strip().upper()
+    if content_type in {"VOD_SERIES", "SERIES"} and item.get("id") is not None:
+        return str(item.get("id"))
+    return None
+
+
+def _custom_content_series_title(item: dict[str, Any]) -> str | None:
+    series = item.get("series") if isinstance(item.get("series"), dict) else {}
+    if isinstance(series, dict):
+        title = _localized_content_title(series)
+        if title:
+            return title
+    return _localized_content_title(item)
+
+
+def _custom_content_item_type(item: dict[str, Any]) -> str:
+    value = item.get("type") or item.get("contentType") or "unknown"
+    return str(value).strip().upper() or "unknown"
+
+
+def _custom_content_item_id(item: dict[str, Any], provider_series_id: str) -> str:
+    for key in ("id", "contentId", "externalAssetId"):
+        value = item.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return provider_series_id
+
+
+def _custom_content_to_series(item: dict[str, Any]) -> SeriesRef | None:
+    provider_series_id = _custom_content_series_id(item)
+    title = _custom_content_series_title(item)
+    if not provider_series_id or not title:
+        return None
+    return SeriesRef(
+        provider_series_id=provider_series_id,
+        title=title,
+        season_title=_localized_content_title(item),
+        season_number=_safe_int(item.get("seasonNumber") or item.get("season")),
+    )
+
+
+def _custom_content_to_watchlist(
+    item: dict[str, Any],
+    *,
+    list_payload: dict[str, Any],
+    position: int,
+) -> WatchlistEntry | None:
+    provider_series_id = _custom_content_series_id(item)
+    if not provider_series_id:
+        return None
+    item_type = _custom_content_item_type(item)
+    item_id = _custom_content_item_id(item, provider_series_id)
+    return WatchlistEntry(
+        provider_series_id=provider_series_id,
+        added_at=None,
+        status="in_watchlist",
+        list_id=_custom_watchlist_list_id(list_payload),
+        list_name=_custom_watchlist_name(list_payload),
+        list_kind=_custom_watchlist_kind(list_payload),
+        provider_item_id=item_id,
+        provider_item_type=item_type,
+        position=position,
+    )
+
+
+def _fetch_custom_watchlist_collection(session: HidiveSession) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]], bool]:
+    params: dict[str, Any] = {"rpp": HIDIVE_CUSTOM_WATCHLIST_RPP}
+    items: list[dict[str, Any]] = []
+    pages_fetched = 0
+    diagnostics: list[dict[str, Any]] = []
+    seen_page_fingerprints: dict[str, int] = {}
+    seen_cursors: set[str] = set()
+    while True:
+        payload = session.json_get("/api/v3/user/watchlist", params=params)
+        pages_fetched += 1
+        if not isinstance(payload, dict):
+            raise HidiveSnapshotError("HIDIVE custom watchlist collection payload was not a JSON object")
+        watchlists = payload.get("watchlists")
+        if not isinstance(watchlists, list):
+            raise HidiveSnapshotError("HIDIVE custom watchlist collection payload did not include a watchlists list")
+        batch = [item for item in watchlists if isinstance(item, dict)]
+        fingerprint = _page_fingerprint(batch, lambda item: _custom_watchlist_external_id(item))
+        previous_page = seen_page_fingerprints.get(fingerprint)
+        if previous_page is not None:
+            diagnostics.append(
+                _diagnostic(
+                    "custom_watchlist_collection_pagination_non_advancing",
+                    surface="watchlists",
+                    detail="HIDIVE custom watchlist collection returned a duplicate page fingerprint; stopped to avoid repeated non-advancing requests",
+                    previous_page=previous_page,
+                    repeated_page=pages_fetched,
+                )
+            )
+            return items, pages_fetched, diagnostics, True
+        seen_page_fingerprints[fingerprint] = pages_fetched
+        items.extend(batch)
+        if not _paging_more(payload):
+            return items, pages_fetched, diagnostics, False
+        has_cursor, cursor = _paging_last_seen(payload)
+        if not has_cursor:
+            diagnostics.append(
+                _diagnostic(
+                    "custom_watchlist_collection_missing_cursor",
+                    surface="watchlists",
+                    detail="HIDIVE custom watchlist collection reported moreDataAvailable without lastSeen; stopped before guessing a cursor",
+                    page=pages_fetched,
+                )
+            )
+            return items, pages_fetched, diagnostics, True
+        cursor_key = json.dumps(cursor, sort_keys=True, default=str)
+        if cursor_key in seen_cursors:
+            diagnostics.append(
+                _diagnostic(
+                    "custom_watchlist_collection_cursor_non_advancing",
+                    surface="watchlists",
+                    detail="HIDIVE custom watchlist collection returned a repeated lastSeen cursor; stopped to avoid repeated non-advancing requests",
+                    page=pages_fetched,
+                )
+            )
+            return items, pages_fetched, diagnostics, True
+        seen_cursors.add(cursor_key)
+        params = {"rpp": HIDIVE_CUSTOM_WATCHLIST_RPP, "lastSeen": cursor}
+
+
+def _fetch_custom_watchlist_detail(
+    session: HidiveSession,
+    list_item: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], int, list[dict[str, Any]], bool]:
+    external_id = _custom_watchlist_external_id(list_item)
+    if not external_id:
+        return list_item, [], 0, [
+            _diagnostic(
+                "custom_watchlist_missing_id",
+                surface="watchlists",
+                detail="HIDIVE custom watchlist collection row omitted watchlistExternalId; skipped detail fetch",
+            )
+        ], True
+    params: dict[str, Any] = {"rpp": HIDIVE_CUSTOM_WATCHLIST_RPP}
+    path = f"/api/v4/user/watchlist/{quote(external_id, safe='')}"
+    detail_payload: dict[str, Any] = {**list_item}
+    content_items: list[dict[str, Any]] = []
+    pages_fetched = 0
+    diagnostics: list[dict[str, Any]] = []
+    seen_page_fingerprints: dict[str, int] = {}
+    seen_cursors: set[str] = set()
+    while True:
+        payload = session.json_get(path, params=params)
+        pages_fetched += 1
+        if not isinstance(payload, dict):
+            raise HidiveSnapshotError("HIDIVE custom watchlist detail payload was not a JSON object")
+        detail_payload.update({key: value for key, value in payload.items() if key != "content"})
+        content = payload.get("content")
+        if not isinstance(content, list):
+            raise HidiveSnapshotError("HIDIVE custom watchlist detail payload did not include a content list")
+        batch = [item for item in content if isinstance(item, dict)]
+        fingerprint = _page_fingerprint(batch, lambda item: "|".join([_custom_content_item_type(item), _custom_content_item_id(item, _custom_content_series_id(item) or "")]))
+        previous_page = seen_page_fingerprints.get(fingerprint)
+        if previous_page is not None:
+            diagnostics.append(
+                _diagnostic(
+                    "custom_watchlist_detail_pagination_non_advancing",
+                    surface="watchlists",
+                    detail="HIDIVE custom watchlist detail returned a duplicate page fingerprint; stopped to avoid repeated non-advancing requests",
+                    list_id=_custom_watchlist_list_id(detail_payload),
+                    previous_page=previous_page,
+                    repeated_page=pages_fetched,
+                )
+            )
+            return detail_payload, content_items, pages_fetched, diagnostics, True
+        seen_page_fingerprints[fingerprint] = pages_fetched
+        content_items.extend(batch)
+        if not _paging_more(payload):
+            return detail_payload, content_items, pages_fetched, diagnostics, False
+        has_cursor, cursor = _paging_last_seen(payload)
+        if not has_cursor:
+            diagnostics.append(
+                _diagnostic(
+                    "custom_watchlist_detail_missing_cursor",
+                    surface="watchlists",
+                    detail="HIDIVE custom watchlist detail reported moreDataAvailable without lastSeen; stopped before guessing a cursor",
+                    list_id=_custom_watchlist_list_id(detail_payload),
+                    page=pages_fetched,
+                )
+            )
+            return detail_payload, content_items, pages_fetched, diagnostics, True
+        cursor_key = json.dumps(cursor, sort_keys=True, default=str)
+        if cursor_key in seen_cursors:
+            diagnostics.append(
+                _diagnostic(
+                    "custom_watchlist_detail_cursor_non_advancing",
+                    surface="watchlists",
+                    detail="HIDIVE custom watchlist detail returned a repeated lastSeen cursor; stopped to avoid repeated non-advancing requests",
+                    list_id=_custom_watchlist_list_id(detail_payload),
+                    page=pages_fetched,
+                )
+            )
+            return detail_payload, content_items, pages_fetched, diagnostics, True
+        seen_cursors.add(cursor_key)
+        params = {"rpp": HIDIVE_CUSTOM_WATCHLIST_RPP, "lastSeen": cursor}
+
+
+def _fetch_custom_watchlist_items(session: HidiveSession) -> tuple[list[SeriesRef], list[WatchlistEntry], dict[str, Any], list[dict[str, Any]], bool]:
+    collection_items, collection_pages, diagnostics, partial = _fetch_custom_watchlist_collection(session)
+    series_entries: list[SeriesRef] = []
+    watchlist_entries: list[WatchlistEntry] = []
+    list_summaries: list[dict[str, Any]] = []
+    detail_pages_fetched = 0
+    skipped_unknown_content = 0
+    duplicate_within_list = 0
+    for collection_item in collection_items:
+        detail_payload, content_items, pages_fetched, detail_diagnostics, detail_partial = _fetch_custom_watchlist_detail(session, collection_item)
+        diagnostics.extend(detail_diagnostics)
+        partial = partial or detail_partial
+        detail_pages_fetched += pages_fetched
+        list_seen_memberships: set[tuple[str, str]] = set()
+        emitted_for_list = 0
+        for item_index, item in enumerate(content_items):
+            series = _custom_content_to_series(item)
+            entry = _custom_content_to_watchlist(item, list_payload=detail_payload, position=item_index)
+            if series is None or entry is None:
+                skipped_unknown_content += 1
+                continue
+            membership_key = (entry.provider_item_type or "series", entry.provider_item_id or entry.provider_series_id)
+            if membership_key in list_seen_memberships:
+                duplicate_within_list += 1
+                continue
+            list_seen_memberships.add(membership_key)
+            series_entries.append(series)
+            watchlist_entries.append(entry)
+            emitted_for_list += 1
+        list_summaries.append(
+            {
+                "list_id": _custom_watchlist_list_id(detail_payload),
+                "list_name": _custom_watchlist_name(detail_payload),
+                "list_kind": _custom_watchlist_kind(detail_payload),
+                "content_count": len(content_items),
+                "emitted_membership_count": emitted_for_list,
+                "detail_pages_fetched": pages_fetched,
+                "partial": detail_partial,
+            }
+        )
+    metadata = {
+        "collection_pages_fetched": collection_pages,
+        "detail_pages_fetched": detail_pages_fetched,
+        "list_count": len(collection_items),
+        "membership_count": len(watchlist_entries),
+        "skipped_unknown_content_count": skipped_unknown_content,
+        "duplicate_within_list_count": duplicate_within_list,
+        "lists": list_summaries,
+    }
+    return series_entries, watchlist_entries, metadata, diagnostics, partial
+
+
 def _dedupe_series(entries: list[SeriesRef]) -> list[SeriesRef]:
     by_id: dict[str, SeriesRef] = {}
     for entry in entries:
@@ -438,17 +862,27 @@ def fetch_snapshot(
         # snapshots need a bounded account refresh so normal provider use is not
         # reduced to page-1 history forever.
         hot_mode = use_incremental_boundary and boundary is not None
-        history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted = _fetch_history_items(
+        history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted, history_diagnostics = _fetch_history_items(
             session,
             history_markers=set(boundary.history_markers) if boundary else None,
             backfill_markers=set(boundary.history_backfill_markers) if boundary else None,
             max_pages=1 if hot_mode else None,
         )
         if hot_mode:
-            continue_items, continue_stopped_early = [], False
+            continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(
+                session,
+                continue_markers=set(boundary.continue_markers) if boundary else None,
+            )
             favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = [], [], 0, 0, False, False
+            custom_series, custom_watchlist_entries, custom_watchlist_metadata, custom_watchlist_diagnostics, custom_watchlist_partial = [], [], {
+                "collection_pages_fetched": 0,
+                "detail_pages_fetched": 0,
+                "list_count": 0,
+                "membership_count": 0,
+                "lists": [],
+            }, [], False
         else:
-            continue_items, continue_stopped_early = _fetch_continue_items(
+            continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(
                 session,
                 continue_markers=set(boundary.continue_markers) if boundary else None,
             )
@@ -457,6 +891,7 @@ def fetch_snapshot(
                 favourite_markers=set(boundary.favourite_markers) if boundary else None,
                 backfill_markers=set(boundary.favourite_backfill_markers) if boundary else None,
             )
+            custom_series, custom_watchlist_entries, custom_watchlist_metadata, custom_watchlist_diagnostics, custom_watchlist_partial = _fetch_custom_watchlist_items(session)
     except HidiveAuthError as exc:
         raise
     except Exception as exc:
@@ -467,7 +902,12 @@ def fetch_snapshot(
     favourite_series = [series for item in favourite_items if (series := _favourite_item_to_series(item)) is not None]
     history_progress = [progress for item in history_items if (progress := _history_item_to_progress(item)) is not None]
     continue_progress = [progress for item in continue_items if (progress := _continue_item_to_progress(item)) is not None]
-    watchlist_entries = [entry for item in favourite_items if (entry := _favourite_item_to_watchlist(item)) is not None]
+    favourite_watchlist_entries = [entry for item in favourite_items if (entry := _favourite_item_to_watchlist(item)) is not None]
+    watchlist_entries = [*favourite_watchlist_entries, *custom_watchlist_entries]
+    diagnostics = [*history_diagnostics, *(continue_metadata.get("diagnostics") if isinstance(continue_metadata.get("diagnostics"), list) else []), *custom_watchlist_diagnostics]
+    history_non_advancing_detected = any(item.get("code") == "history_pagination_non_advancing" for item in diagnostics if isinstance(item, dict))
+    continue_partial = continue_metadata.get("partial") is True
+    partial = bool(hot_mode or history_non_advancing_detected or continue_partial or custom_watchlist_partial)
 
     generated_at = _now_string()
     snapshot = ProviderSnapshot(
@@ -475,22 +915,38 @@ def fetch_snapshot(
         generated_at=generated_at,
         provider="hidive",
         account_id_hint=session.token.account_id,
-        series=_dedupe_series([*history_series, *continue_series, *favourite_series]),
+        series=_dedupe_series([*history_series, *continue_series, *favourite_series, *custom_series]),
         progress=_dedupe_progress([*history_progress, *continue_progress]),
         watchlist=watchlist_entries,
         raw={
+            "partial": partial,
+            "diagnostics": diagnostics,
             "history_count": len(history_items),
             "history_pages_fetched": history_pages_fetched,
             "history_stopped_early": history_stopped_early,
+            "history_non_advancing_detected": history_non_advancing_detected,
             "history_backfill_pages_fetched": history_backfill_pages_fetched,
             "history_backfill_exhausted": history_backfill_exhausted,
             "continue_count": len(continue_items),
             "continue_stopped_early": continue_stopped_early,
+            "continue_pages_fetched": continue_metadata.get("pages_fetched"),
+            "continue_partial": continue_partial,
+            "continue_unpageable": continue_metadata.get("unpageable") is True,
+            "continue_bucket_total_pages": continue_metadata.get("bucket_total_pages"),
+            "continue_bucket_total_results": continue_metadata.get("bucket_total_results"),
             "favourite_count": len(favourite_items),
             "favourite_pages_fetched": favourite_pages_fetched,
             "favourite_stopped_early": favourite_stopped_early,
             "favourite_backfill_pages_fetched": favourite_backfill_pages_fetched,
             "favourite_backfill_exhausted": favourite_backfill_exhausted,
+            "custom_watchlist_count": len(custom_watchlist_entries),
+            "custom_watchlist_list_count": custom_watchlist_metadata.get("list_count"),
+            "custom_watchlist_collection_pages_fetched": custom_watchlist_metadata.get("collection_pages_fetched"),
+            "custom_watchlist_detail_pages_fetched": custom_watchlist_metadata.get("detail_pages_fetched"),
+            "custom_watchlist_partial": custom_watchlist_partial,
+            "custom_watchlist_lists": custom_watchlist_metadata.get("lists"),
+            "custom_watchlist_skipped_unknown_content_count": custom_watchlist_metadata.get("skipped_unknown_content_count", 0),
+            "custom_watchlist_duplicate_within_list_count": custom_watchlist_metadata.get("duplicate_within_list_count", 0),
             "sync_boundary_present": boundary is not None,
             "sync_boundary_mode": "hot" if hot_mode else "full_refresh",
             "hot_surface_only": hot_mode,
@@ -503,7 +959,7 @@ def fetch_snapshot(
             "niceness_policy": "local_host_process_gate",
             "supports": {
                 "history": True,
-                "continue_watching": not hot_mode,
+                "continue_watching": True,
                 "watchlists": not hot_mode,
             },
         },
@@ -517,12 +973,15 @@ def fetch_snapshot(
         favourite_items=favourite_items,
         history_backfill_items=[] if history_backfill_exhausted else history_backfill_items,
         favourite_backfill_items=[] if favourite_backfill_exhausted else favourite_backfill_items,
+        favourite_markers_override=boundary.favourite_markers if hot_mode and boundary else None,
+        favourite_backfill_markers_override=boundary.favourite_backfill_markers if hot_mode and boundary else None,
     )
     return HidiveFetchResult(
         snapshot=snapshot,
         history_count=len(history_items),
         continue_count=len(continue_items),
         favourite_count=len(favourite_items),
+        custom_watchlist_count=len(custom_watchlist_entries),
     )
 
 

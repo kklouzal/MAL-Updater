@@ -31,6 +31,7 @@ from .provider_registry import get_provider, list_provider_slugs
 from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
 from . import providers as _providers  # noqa: F401
 from .db import (
+    backfill_hidive_series_urls,
     bootstrap_database,
     get_mal_recommendation_harvest_coverage,
     get_latest_completed_sync_run,
@@ -948,6 +949,36 @@ def _cmd_ingest_snapshot(project_root: Path | None, snapshot_path: Path | None) 
     else:
         summary = ingest_snapshot_file(snapshot_path, config)
     print(json.dumps(summary.as_dict(), indent=2))
+    return 0
+
+
+def _cmd_backfill_hidive_series_urls(project_root: Path | None, *, apply: bool, output_format: str) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    payload = backfill_hidive_series_urls(config.db_path, apply=apply)
+    if output_format == "summary":
+        print(f"provider={payload['provider']}")
+        print(f"dry_run={payload['dry_run']}")
+        print(f"canonical_route={payload['canonical_route']}")
+        provider_series = payload.get("provider_series") if isinstance(payload.get("provider_series"), dict) else {}
+        eligibility = payload.get("eligibility") if isinstance(payload.get("eligibility"), dict) else {}
+        cache = payload.get("provider_title_search_cache") if isinstance(payload.get("provider_title_search_cache"), dict) else {}
+        snapshots = payload.get("recommendation_score_snapshots") if isinstance(payload.get("recommendation_score_snapshots"), dict) else {}
+        print(f"provider_series_matched={provider_series.get('matched', 0)}")
+        print(f"provider_series_updated={provider_series.get('updated', 0)}")
+        print(f"provider_series_sample_count={provider_series.get('sample_count', 0)}")
+        print(f"eligibility_matched={eligibility.get('matched', 0)}")
+        print(f"eligibility_updated={eligibility.get('updated', 0)}")
+        print(f"eligibility_sample_count={eligibility.get('sample_count', 0)}")
+        print(f"provider_title_search_cache_matched={cache.get('matched', 0)}")
+        print(f"provider_title_search_cache_updated={cache.get('updated', 0)}")
+        print(f"provider_title_search_cache_sample_count={cache.get('sample_count', 0)}")
+        print(f"recommendation_score_snapshots_matched={snapshots.get('matched', 0)}")
+        print(f"recommendation_score_snapshots_updated={snapshots.get('updated', 0)}")
+        print(f"recommendation_score_snapshots_sample_count={snapshots.get('sample_count', 0)}")
+    else:
+        print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -3073,6 +3104,8 @@ def _dispatch(parser, args) -> int:
         return _cmd_validate_snapshot(args.project_root, args.snapshot)
     if args.command == "ingest-snapshot":
         return _cmd_ingest_snapshot(args.project_root, args.snapshot)
+    if args.command == "backfill-hidive-series-urls":
+        return _cmd_backfill_hidive_series_urls(args.project_root, apply=args.apply, output_format=args.format)
     if args.command == "provider-stale-rows":
         return _cmd_provider_stale_rows(args.project_root, args.provider, args.cutoff, args.limit, args.format, args.older_than_days)
     if args.command == "map-series":

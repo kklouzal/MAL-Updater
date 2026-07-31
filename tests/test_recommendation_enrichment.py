@@ -2311,7 +2311,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
                 provider_series_id="707",
                 title="Eligibility Show",
                 season_title="Eligibility Show",
-                url="https://www.hidive.com/season/707",
+                url="https://www.hidive.com/series/707",
                 audio_locales=["en-US", "ja-JP"],
                 raw={"tags": ["Audio|English", "Audio|Japanese"]},
             )
@@ -2425,7 +2425,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
                 provider_series_id="2312",
                 title="Dungeon People",
                 season_title="Dungeon People",
-                url="https://www.hidive.com/season/2312",
+                url="https://www.hidive.com/series/2312",
                 audio_locales=["ja-JP", "en-US"],
                 raw={"type": "VOD_SERIES", "catalog_status": "present", "catalog_evidence_source": "hidive_algolia_vod_series", "tags": ["Audio|Japanese", "Audio|English"]},
             )

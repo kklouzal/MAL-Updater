@@ -47,7 +47,7 @@ class HidiveProviderSearchTests(unittest.TestCase):
         self.assertEqual(results[0].provider_series_id, "2312")
         self.assertEqual(results[0].title, "Dungeon People")
         self.assertEqual(results[0].season_title, "Dungeon People")
-        self.assertEqual(results[0].url, "https://www.hidive.com/season/dungeon-people")
+        self.assertEqual(results[0].url, "https://www.hidive.com/series/2312")
         self.assertEqual(results[0].audio_locales, ["en-US", "ja-JP"])
         self.assertEqual(results[0].raw["type"], "VOD_SERIES")
         self.assertIn("AUDIO|English", results[0].raw["tags"])
@@ -77,12 +77,12 @@ class HidiveProviderSearchTests(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual(results[0].audio_locales, [])
 
-    def test_url_falls_back_to_stable_season_id_when_algolia_hit_has_no_slug(self) -> None:
+    def test_url_uses_stable_series_id_when_algolia_hit_has_no_slug(self) -> None:
         payload = {"hits": [{"objectID": "VOD_SERIES_2312", "id": 2312, "type": "VOD_SERIES", "title": "Dungeon People", "tags": ["Audio|English"]}]}
 
         results = hidive._normalize_algolia_hits(payload, limit=10)
 
-        self.assertEqual("https://www.hidive.com/season/2312", results[0].url)
+        self.assertEqual("https://www.hidive.com/series/2312", results[0].url)
 
     def test_normalize_algolia_hits_dedupes_and_applies_limit(self) -> None:
         payload = {

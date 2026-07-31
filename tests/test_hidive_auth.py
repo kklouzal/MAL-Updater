@@ -34,6 +34,48 @@ class _FakeResponse:
 
 
 class HidiveAuthTests(unittest.TestCase):
+    def test_json_request_rejects_untrusted_absolute_urls_before_request(self) -> None:
+        rejected_urls = [
+            "https://attacker.example/api/v2/page",
+            "http://dce-frontoffice.imggaming.com/api/v2/page",
+            "https://user:pass@dce-frontoffice.imggaming.com/api/v2/page",
+            "https://dce-frontoffice.imggaming.com:444/api/v2/page",
+            "https://dce-frontoffice.imggaming.com/not-api/page",
+            "https://dce-frontoffice.imggaming.com/api/v2/page#fragment",
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            config.hidive.request_spacing_seconds = 0.0
+            config.hidive.request_spacing_jitter_seconds = 0.0
+            for url in rejected_urls:
+                with self.subTest(url=url), patch("mal_updater.hidive_auth.requests.request") as send:
+                    with self.assertRaisesRegex(HidiveAuthError, "absolute URL is not allowed"):
+                        hidive_auth._hidive_json_request(config, "GET", url, headers={"Authorization": "Bearer do-not-send"})
+                    send.assert_not_called()
+
+            self.assertFalse(config.api_request_events_path.exists())
+
+    def test_json_request_allows_frontoffice_api_absolute_url_without_logging_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            config.hidive.request_spacing_seconds = 0.0
+            config.hidive.request_spacing_jitter_seconds = 0.0
+            url = "https://DCE-FRONTOFFICE.IMGGAMING.COM/api/v2/page?token=query-secret&page=2"
+            headers = {"Authorization": "Bearer authorization-secret"}
+            with patch("mal_updater.hidive_auth.requests.request", return_value=_FakeResponse(200, {"ok": True})) as send:
+                payload = hidive_auth._hidive_json_request(config, "GET", url, headers=headers)
+
+            self.assertEqual({"ok": True}, payload)
+            send.assert_called_once()
+            self.assertEqual(
+                "https://dce-frontoffice.imggaming.com/api/v2/page?token=query-secret&page=2",
+                send.call_args.kwargs["url"] if "url" in send.call_args.kwargs else send.call_args.args[1],
+            )
+            events_json = config.api_request_events_path.read_text(encoding="utf-8")
+            self.assertNotIn("authorization-secret", events_json)
+            self.assertNotIn("query-secret", events_json)
+            self.assertIn('"url": "https://dce-frontoffice.imggaming.com/api/v2/page?token=%3Credacted%3E&page=%3Cvalue%3E"', events_json)
+
     def test_login_and_refresh_post_failures_are_single_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             config = load_config(Path(td))

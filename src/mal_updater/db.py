@@ -9,10 +9,14 @@ from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
+
+from .hidive_urls import canonical_hidive_series_url
 
 BROADCAST_COMPATIBILITY_MIGRATION = "013_mal_anime_metadata_broadcast_compatibility.sql"
 PROVIDER_ENRICHMENT_CURSOR_MIGRATION = "014_recommendation_provider_enrichment_cursor.sql"
 PUBLIC_USERRECS_STAGING_MIGRATION = "015_public_userrecs_resumable_staging.sql"
+PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION = "016_provider_watchlist_membership_keys.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -31,6 +35,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     BROADCAST_COMPATIBILITY_MIGRATION,
     PROVIDER_ENRICHMENT_CURSOR_MIGRATION,
     PUBLIC_USERRECS_STAGING_MIGRATION,
+    PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -4942,6 +4947,279 @@ def list_provider_stale_row_samples(
 _ALLOWED_ELIGIBILITY_PROVIDERS = {"crunchyroll", "hidive"}
 _ELIGIBILITY_STATUSES = {"unknown", "present", "absent", "stale", "review-needed"}
 _REVIEW_STATUSES = _ELIGIBILITY_STATUSES | {"verified"}
+
+
+def _hidive_url_needs_series_backfill(provider_series_id: object, url: object) -> str | None:
+    target = canonical_hidive_series_url(provider_series_id)
+    if target is None or not isinstance(url, str):
+        return None
+    current = url.strip()
+    if not current or current == target:
+        return None
+    try:
+        parsed = urlparse(current)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return None
+    if parsed.username is not None or parsed.password is not None or port is not None or parsed.fragment:
+        return None
+    if (parsed.hostname or "").casefold() not in {"hidive.com", "www.hidive.com"}:
+        return None
+    if parsed.path.startswith("/season/") and len(parsed.path) > len("/season/"):
+        return target
+    return None
+
+
+def _hidive_provider_object_url_backfill(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    provider = str(item.get("provider") or "").strip().casefold()
+    if provider != "hidive":
+        return item, None
+    provider_series_id = item.get("provider_series_id")
+    replacement = _hidive_url_needs_series_backfill(provider_series_id, item.get("provider_url"))
+    if replacement is None:
+        return item, None
+    updated = {**item, "provider_url": replacement}
+    return updated, {
+        "provider": "hidive",
+        "provider_series_id": str(provider_series_id),
+        "old_url": item.get("provider_url"),
+        "new_url": replacement,
+    }
+
+
+def _backfill_hidive_score_snapshot_context(context: Any) -> tuple[Any, list[dict[str, Any]]]:
+    if not isinstance(context, dict):
+        return context, []
+    updated_context = dict(context)
+    changes: list[dict[str, Any]] = []
+    for list_key in ("provider_eligibility_evidence", "available_provider_series"):
+        raw_items = context.get(list_key)
+        if not isinstance(raw_items, list):
+            continue
+        updated_items: list[Any] = []
+        list_changed = False
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                updated_items.append(item)
+                continue
+            updated_item, change = _hidive_provider_object_url_backfill(item)
+            updated_items.append(updated_item)
+            if change is not None:
+                list_changed = True
+                changes.append({"path": f"{list_key}[{index}].provider_url", **change})
+        if list_changed:
+            updated_context[list_key] = updated_items
+    return (updated_context if changes else context), changes
+
+
+def _backfill_result_section(candidates: list[dict[str, Any]], updated: int, *, hidden_keys: set[str] | None = None) -> dict[str, Any]:
+    hidden = hidden_keys or set()
+    samples = [{key: value for key, value in item.items() if key not in hidden} for item in candidates[:20]]
+    return {
+        "matched": len(candidates),
+        "updated": updated,
+        "sample_count": len(samples),
+        "samples": samples,
+    }
+
+
+def backfill_hidive_series_urls(db_path: Path, *, apply: bool = False) -> dict[str, Any]:
+    """Dry-run/apply correction of persisted HIDIVE VOD_SERIES URLs.
+
+    HIDIVE generic VOD_SERIES/title-search links should point at /series/{id},
+    not /season/{id-or-slug}.  This helper is intentionally idempotent and only
+    rewrites rows where the persisted URL is an old HIDIVE /season route and the
+    stable provider_series_id is available locally.
+    """
+    eligibility_candidates: list[dict[str, Any]] = []
+    provider_series_candidates: list[dict[str, Any]] = []
+    cache_candidates: list[dict[str, Any]] = []
+    score_snapshot_candidates: list[dict[str, Any]] = []
+    with connect(db_path) as conn:
+        for row in conn.execute(
+            """
+            SELECT provider_series_id, title, raw_json
+            FROM provider_series
+            WHERE provider = 'hidive' AND raw_json LIKE '%hidive.com/season/%'
+            ORDER BY provider_series_id ASC
+            """
+        ).fetchall():
+            raw = _load_json_value(row["raw_json"], None)
+            if not isinstance(raw, dict):
+                continue
+            replacement = _hidive_url_needs_series_backfill(row["provider_series_id"], raw.get("url"))
+            if replacement is None:
+                continue
+            updated_raw = {**raw, "url": replacement}
+            provider_series_candidates.append(
+                {
+                    "provider_series_id": str(row["provider_series_id"]),
+                    "title": row["title"],
+                    "old_url": raw.get("url"),
+                    "new_url": replacement,
+                    "updated_raw_json": json.dumps(updated_raw, ensure_ascii=False, sort_keys=True),
+                }
+            )
+
+        for row in conn.execute(
+            """
+            SELECT mal_anime_id, provider_series_id, provider_title, provider_url
+            FROM recommendation_provider_eligibility_evidence
+            WHERE provider = 'hidive' AND provider_url LIKE 'http%://www.hidive.com/season/%'
+            ORDER BY mal_anime_id ASC, provider_series_id ASC
+            """
+        ).fetchall():
+            replacement = _hidive_url_needs_series_backfill(row["provider_series_id"], row["provider_url"])
+            if replacement is None:
+                continue
+            eligibility_candidates.append(
+                {
+                    "mal_anime_id": int(row["mal_anime_id"]),
+                    "provider_series_id": str(row["provider_series_id"]),
+                    "provider_title": row["provider_title"],
+                    "old_url": row["provider_url"],
+                    "new_url": replacement,
+                }
+            )
+
+        for row in conn.execute(
+            """
+            SELECT provider, normalized_query, query, candidate_mal_anime_id, candidate_title, matches_json
+            FROM provider_title_search_cache
+            WHERE provider = 'hidive' AND matches_json LIKE '%hidive.com/season/%'
+            ORDER BY normalized_query ASC
+            """
+        ).fetchall():
+            try:
+                matches = json.loads(row["matches_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(matches, list):
+                continue
+            changed = False
+            updated_matches: list[Any] = []
+            changed_matches: list[dict[str, Any]] = []
+            for match in matches:
+                if not isinstance(match, dict):
+                    updated_matches.append(match)
+                    continue
+                provider_series_id = match.get("provider_series_id")
+                replacement = _hidive_url_needs_series_backfill(provider_series_id, match.get("url"))
+                if replacement is None:
+                    updated_matches.append(match)
+                    continue
+                updated_match = {**match, "url": replacement}
+                updated_matches.append(updated_match)
+                changed = True
+                changed_matches.append(
+                    {
+                        "provider_series_id": str(provider_series_id),
+                        "title": match.get("title"),
+                        "old_url": match.get("url"),
+                        "new_url": replacement,
+                    }
+                )
+            if changed:
+                cache_candidates.append(
+                    {
+                        "normalized_query": row["normalized_query"],
+                        "query": row["query"],
+                        "candidate_mal_anime_id": row["candidate_mal_anime_id"],
+                        "candidate_title": row["candidate_title"],
+                        "changed_matches": changed_matches,
+                        "updated_matches_json": json.dumps(updated_matches, ensure_ascii=False, sort_keys=True),
+                    }
+                )
+
+        for row in conn.execute(
+            """
+            SELECT id, run_id, kind, title, provider, provider_series_id, mal_anime_id, context_json
+            FROM recommendation_score_snapshots
+            WHERE context_json LIKE '%hidive.com/season/%'
+            ORDER BY id ASC
+            """
+        ).fetchall():
+            context = _load_json_value(row["context_json"], None)
+            updated_context, changes = _backfill_hidive_score_snapshot_context(context)
+            if not changes:
+                continue
+            score_snapshot_candidates.append(
+                {
+                    "id": int(row["id"]),
+                    "run_id": row["run_id"],
+                    "kind": row["kind"],
+                    "title": row["title"],
+                    "provider": row["provider"],
+                    "provider_series_id": row["provider_series_id"],
+                    "mal_anime_id": row["mal_anime_id"],
+                    "changes": changes[:20],
+                    "updated_context_json": json.dumps(updated_context, ensure_ascii=False, sort_keys=True),
+                    "old_context_json": row["context_json"],
+                }
+            )
+
+        provider_series_updated = 0
+        eligibility_updated = 0
+        cache_updated = 0
+        score_snapshot_updated = 0
+        if apply:
+            for item in provider_series_candidates:
+                cursor = conn.execute(
+                    """
+                    UPDATE provider_series
+                    SET raw_json = ?, last_seen_at = last_seen_at
+                    WHERE provider = 'hidive' AND provider_series_id = ?
+                    """,
+                    (item["updated_raw_json"], item["provider_series_id"]),
+                )
+                provider_series_updated += int(cursor.rowcount or 0)
+            for item in eligibility_candidates:
+                cursor = conn.execute(
+                    """
+                    UPDATE recommendation_provider_eligibility_evidence
+                    SET provider_url = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE provider = 'hidive' AND mal_anime_id = ? AND provider_series_id = ? AND provider_url = ?
+                    """,
+                    (item["new_url"], item["mal_anime_id"], item["provider_series_id"], item["old_url"]),
+                )
+                eligibility_updated += int(cursor.rowcount or 0)
+            for item in cache_candidates:
+                cursor = conn.execute(
+                    """
+                    UPDATE provider_title_search_cache
+                    SET matches_json = ?, fetched_at = fetched_at
+                    WHERE provider = 'hidive' AND normalized_query = ?
+                    """,
+                    (item["updated_matches_json"], item["normalized_query"]),
+                )
+                cache_updated += int(cursor.rowcount or 0)
+            for item in score_snapshot_candidates:
+                cursor = conn.execute(
+                    """
+                    UPDATE recommendation_score_snapshots
+                    SET context_json = ?
+                    WHERE id = ? AND context_json = ?
+                    """,
+                    (item["updated_context_json"], item["id"], item["old_context_json"]),
+                )
+                score_snapshot_updated += int(cursor.rowcount or 0)
+            conn.commit()
+
+    return {
+        "provider": "hidive",
+        "dry_run": not apply,
+        "canonical_route": "https://www.hidive.com/series/{series_id}",
+        "provider_series": _backfill_result_section(provider_series_candidates, provider_series_updated, hidden_keys={"updated_raw_json"}),
+        "eligibility": _backfill_result_section(eligibility_candidates, eligibility_updated),
+        "provider_title_search_cache": _backfill_result_section(cache_candidates, cache_updated, hidden_keys={"updated_matches_json"}),
+        "recommendation_score_snapshots": _backfill_result_section(
+            score_snapshot_candidates,
+            score_snapshot_updated,
+            hidden_keys={"updated_context_json", "old_context_json"},
+        ),
+    }
 
 
 def _validate_recommendation_eligibility_value(name: str, value: str, allowed: set[str]) -> str:

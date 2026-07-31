@@ -13,6 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - dependency health is checked e
 
 from ..config import AppConfig
 from ..contracts import ProviderSnapshot
+from ..hidive_urls import canonical_hidive_series_url
 from ..hidive_snapshot import fetch_snapshot as fetch_hidive_snapshot
 from ..hidive_snapshot import write_snapshot_file as write_hidive_snapshot_file
 from ..provider_registry import register_provider
@@ -90,6 +91,7 @@ class HidiveProvider:
                 "history_count": result.history_count,
                 "continue_count": result.continue_count,
                 "favourite_count": result.favourite_count,
+                "custom_watchlist_count": getattr(result, "custom_watchlist_count", 0),
                 "full_refresh_requested": full_refresh,
             },
         )
@@ -157,12 +159,10 @@ def _series_from_algolia_hit(hit: dict) -> ProviderSearchResult | None:
     title = _localized_title(hit)
     if not provider_series_id or not title:
         return None
-    slug = hit.get("slug") or hit.get("urlSlug") or hit.get("url_slug")
-    url = hit.get("url") or hit.get("webUrl")
-    if not url and slug:
-        url = f"https://www.hidive.com/season/{slug}"
-    if not url:
-        url = f"https://www.hidive.com/season/{provider_series_id}"
+    # HIDIVE frontend routes generic VOD_SERIES/title hits through /series/{id};
+    # /season/{id-or-slug} is for VOD_SEASON and leaves title-search/dashboard
+    # links stranded on the web app.
+    url = canonical_hidive_series_url(provider_series_id)
     return ProviderSearchResult(
         provider_series_id=str(provider_series_id),
         title=title,

@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -20,6 +21,7 @@ from .request_tracking import record_api_request_event
 from .provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
 
 HIDIVE_API_BASE_URL = "https://dce-frontoffice.imggaming.com/api/v2"
+HIDIVE_FRONTOFFICE_BASE_URL = "https://dce-frontoffice.imggaming.com"
 HIDIVE_REALM = "dce.hidive"
 HIDIVE_APP = "dice"
 HIDIVE_APP_VERSION = "6.60.0"
@@ -28,6 +30,7 @@ DEFAULT_HIDIVE_USERNAME_FILE = "hidive_username.txt"
 DEFAULT_HIDIVE_PASSWORD_FILE = "hidive_password.txt"
 HIDIVE_REFRESH_WINDOW_SECONDS = 90
 _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+_ALLOWED_ABSOLUTE_HIDIVE_HOST = "dce-frontoffice.imggaming.com"
 
 
 class HidiveAuthError(RuntimeError):
@@ -188,6 +191,34 @@ def _seconds_until_jwt_expiry(token: str, *, now_epoch: int | None = None) -> in
     return seconds_until_jwt_expiry(token, now_epoch=now_epoch)
 
 
+def _resolve_hidive_request_url(path: str) -> str:
+    parsed = urlsplit(path)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme.casefold() != "https":
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: only HTTPS frontoffice API URLs are permitted")
+        if not parsed.netloc:
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: missing host")
+        if parsed.fragment:
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: fragments are not permitted")
+        if parsed.username is not None or parsed.password is not None:
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: userinfo is not permitted")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: invalid port") from exc
+        if port not in (None, 443):
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: non-default HTTPS ports are not permitted")
+        hostname = (parsed.hostname or "").casefold()
+        if hostname != _ALLOWED_ABSOLUTE_HIDIVE_HOST:
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: unexpected host")
+        if not parsed.path.startswith("/api/"):
+            raise HidiveAuthError("HIDIVE absolute URL is not allowed: path must be under /api/")
+        return urlunsplit(("https", _ALLOWED_ABSOLUTE_HIDIVE_HOST, parsed.path, parsed.query, ""))
+    if path.startswith("/api/"):
+        return f"{HIDIVE_FRONTOFFICE_BASE_URL}{path}"
+    return f"{HIDIVE_API_BASE_URL}{path}"
+
+
 def resolve_hidive_state_paths(config: AppConfig, profile: str = "default") -> HidiveStatePaths:
     root = config.state_dir / "hidive" / profile
     return HidiveStatePaths(
@@ -258,7 +289,7 @@ def _hidive_json_request(
     json_body: dict[str, Any] | None = None,
     timeout_seconds: float | None = None,
 ) -> Any:
-    url = f"{HIDIVE_API_BASE_URL}{path}"
+    url = _resolve_hidive_request_url(path)
     timeout = timeout_seconds or config.request_timeout_seconds
     gate = ProviderRequestGate(
         provider="hidive",

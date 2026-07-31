@@ -38,7 +38,15 @@ PROGRESS_REQUIRED_KEYS = {
     "rating",
 }
 WATCHLIST_REQUIRED_KEYS = {"provider_series_id", "added_at", "status"}
-WATCHLIST_ALLOWED_KEYS = WATCHLIST_REQUIRED_KEYS | {"list_id", "list_name", "list_kind"}
+WATCHLIST_ALLOWED_KEYS = WATCHLIST_REQUIRED_KEYS | {
+    "list_id",
+    "list_name",
+    "list_kind",
+    "provider_item_id",
+    "provider_item_type",
+    "position",
+    "list_memberships",
+}
 
 
 def _is_iso_datetime(value: str) -> bool:
@@ -163,6 +171,10 @@ def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
     list_id = item.get("list_id")
     list_name = item.get("list_name")
     list_kind = item.get("list_kind")
+    provider_item_id = item.get("provider_item_id")
+    provider_item_type = item.get("provider_item_type")
+    position = item.get("position")
+    list_memberships = item.get("list_memberships", [])
     _expect_type(provider_series_id, str, f"{field}.provider_series_id")
     _expect_optional_type(added_at, str, f"{field}.added_at")
     if added_at is not None and not _is_iso_datetime(added_at):
@@ -171,6 +183,12 @@ def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
     _expect_optional_type(list_id, str, f"{field}.list_id")
     _expect_optional_type(list_name, str, f"{field}.list_name")
     _expect_optional_type(list_kind, str, f"{field}.list_kind")
+    _expect_optional_type(provider_item_id, str, f"{field}.provider_item_id")
+    _expect_optional_type(provider_item_type, str, f"{field}.provider_item_type")
+    _expect_non_negative_int(position, f"{field}.position")
+    _expect_type(list_memberships, list, f"{field}.list_memberships")
+    for membership_index, membership in enumerate(list_memberships):
+        _expect_type(membership, dict, f"{field}.list_memberships[{membership_index}]")
 
     return WatchlistEntry(
         provider_series_id=provider_series_id,
@@ -179,6 +197,10 @@ def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
         list_id=list_id,
         list_name=list_name,
         list_kind=list_kind,
+        provider_item_id=provider_item_id,
+        provider_item_type=provider_item_type,
+        position=position,
+        list_memberships=list_memberships,
     )
 
 
@@ -237,14 +259,20 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
             f"progress[{index}].provider_series_id",
         )
 
-    seen_watchlist_series_ids: set[str] = set()
+    seen_watchlist_memberships: set[tuple[str, str, str, str]] = set()
     for index, item in enumerate(validated_watchlist):
-        _expect_unique_id(
+        membership_key = (
+            item.list_id or "",
             item.provider_series_id,
-            seen_watchlist_series_ids,
-            field=f"watchlist[{index}].provider_series_id",
-            description="watchlist entry",
+            item.provider_item_type or "series",
+            item.provider_item_id or item.provider_series_id,
         )
+        if membership_key in seen_watchlist_memberships:
+            raise SnapshotValidationError(
+                f"watchlist[{index}] duplicates an earlier watchlist membership: "
+                + "|".join(membership_key)
+            )
+        seen_watchlist_memberships.add(membership_key)
         _expect_known_series_id(
             item.provider_series_id,
             known_series_ids,

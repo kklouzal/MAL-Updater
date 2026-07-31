@@ -212,10 +212,13 @@ def load_provider_series_states(
             s.season_number,
             s.raw_json,
             s.last_seen_at,
-            w.status AS watchlist_status
+            w.watchlist_status AS watchlist_status
         FROM provider_series s
-        LEFT JOIN provider_watchlist w
-            ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
+        LEFT JOIN (
+            SELECT provider, provider_series_id, MIN(status) AS watchlist_status
+            FROM provider_watchlist
+            GROUP BY provider, provider_series_id
+        ) w ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
         WHERE 1=1
     """
     progress_query = """
