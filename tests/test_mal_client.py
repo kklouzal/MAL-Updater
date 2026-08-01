@@ -47,6 +47,18 @@ class MalClientTests(unittest.TestCase):
             mal=MalSettings(request_spacing_seconds=0.0, request_spacing_jitter_seconds=0.0),
         )
 
+    def _secrets(self, config: AppConfig, *, access_token: str | None = None, refresh_token: str | None = None) -> MalSecrets:
+        return MalSecrets(
+            client_id="client-id",
+            client_secret=None,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id_path=config.secrets_dir / "mal_client_id.txt",
+            client_secret_path=config.secrets_dir / "mal_client_secret.txt",
+            access_token_path=config.secrets_dir / "mal_access_token.txt",
+            refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
+        )
+
     def test_token_exchange_and_refresh_failures_are_single_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
@@ -141,6 +153,7 @@ class MalClientTests(unittest.TestCase):
     def test_put_timeout_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
+            config.mal.retry_max_attempts = 5
             client = MalClient(config, MalSecrets(
                 client_id="client-id", client_secret=None, access_token="access-token", refresh_token=None,
                 client_id_path=config.secrets_dir / "mal_client_id.txt", client_secret_path=config.secrets_dir / "mal_client_secret.txt",
@@ -150,6 +163,52 @@ class MalClientTests(unittest.TestCase):
                 with self.assertRaises(MalApiError):
                     client.update_my_list_status(1, status="watching", num_watched_episodes=1)
             self.assertEqual(1, send.call_count)
+
+    def test_update_my_list_status_requires_nonblank_access_token_before_side_effects(self) -> None:
+        for access_token in (None, "", " \t\n"):
+            with self.subTest(access_token=access_token):
+                with tempfile.TemporaryDirectory() as tmp:
+                    config = self._config(Path(tmp))
+                    client = MalClient(config, self._secrets(config, access_token=access_token))
+
+                    with patch.object(client, "_pace_request", side_effect=AssertionError("pacing should not run without a token")) as pace, patch(
+                        "mal_updater.mal_client.Request", side_effect=AssertionError("request should not be constructed without a token")
+                    ) as build_request, patch(
+                        "mal_updater.mal_client.urlopen", side_effect=AssertionError("urlopen should not run without a token")
+                    ) as send, patch(
+                        "mal_updater.mal_client.record_api_request_event", side_effect=AssertionError("telemetry should not be recorded without a token")
+                    ) as telemetry:
+                        with self.assertRaisesRegex(MalApiError, "MAL access_token is not configured"):
+                            client.update_my_list_status(1, status="watching", num_watched_episodes=1)
+
+                    pace.assert_not_called()
+                    build_request.assert_not_called()
+                    send.assert_not_called()
+                    telemetry.assert_not_called()
+                    self.assertFalse(config.api_request_events_path.exists())
+
+    def test_update_my_list_status_uses_valid_access_token_for_put(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config, access_token="access-token"))
+            requests = []
+
+            def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+                requests.append(request)
+                return _JsonResponse({"status": "watching", "num_episodes_watched": 3})
+
+            with patch("mal_updater.mal_client.urlopen", fake_urlopen):
+                payload = client.update_my_list_status(99, status="watching", num_watched_episodes=3)
+
+            self.assertEqual({"status": "watching", "num_episodes_watched": 3}, payload)
+            self.assertEqual(1, len(requests))
+            request = requests[0]
+            self.assertEqual("PUT", request.get_method())
+            self.assertEqual(f"{config.mal.base_url}/anime/99/my_list_status", request.full_url)
+            self.assertEqual("Bearer access-token", request.get_header("Authorization"))
+            self.assertNotEqual("Bearer None", request.get_header("Authorization"))
+            self.assertEqual("application/x-www-form-urlencoded", request.get_header("Content-type"))
+            self.assertEqual({"status": ["watching"], "num_watched_episodes": ["3"]}, parse_qs(request.data.decode("utf-8")))
 
     def test_search_anime_strips_broader_provider_audio_noise(self) -> None:
         cases = {

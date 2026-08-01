@@ -167,6 +167,7 @@ class _CrunchyrollAuthSession:
                     params=params,
                     pacer=self.pacer,
                     phase=phase,
+                    config=self.config,
                 )
             except CrunchyrollUnauthorizedError as exc:
                 last_unauthorized = exc
@@ -285,7 +286,7 @@ def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeo
         raise
 
 
-def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, params: dict[str, Any] | None = None, config: AppConfig | None = None):
+def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, config: AppConfig, params: dict[str, Any] | None = None):
     transport = _require_curl_requests()
     request_exception = getattr(getattr(transport, "exceptions", None), "RequestException", Exception)
     try:
@@ -450,10 +451,10 @@ def _authorized_json_get(
     *,
     access_token: str,
     timeout_seconds: float,
+    config: AppConfig,
     params: dict[str, Any] | None = None,
     pacer: _CrunchyrollRequestPacer | None = None,
     phase: str | None = None,
-    config: AppConfig | None = None,
 ) -> Any:
     phase_label = phase or "GET"
     attempts = max(1, int(getattr(pacer, "retry_max_attempts", 1)))

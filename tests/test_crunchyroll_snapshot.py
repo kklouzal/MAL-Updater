@@ -56,13 +56,16 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
                     post.assert_called_once()
 
     def test_crunchyroll_snapshot_http_requires_curl_cffi_transport(self) -> None:
-        with patch.object(crunchyroll_snapshot, "curl_requests", None):
-            with self.assertRaisesRegex(CrunchyrollSnapshotError, "requires curl_cffi"):
-                crunchyroll_snapshot._http_get(
-                    "https://example.invalid/history",
-                    headers={},
-                    timeout_seconds=1.0,
-                )
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            with patch.object(crunchyroll_snapshot, "curl_requests", None):
+                with self.assertRaisesRegex(CrunchyrollSnapshotError, "requires curl_cffi"):
+                    crunchyroll_snapshot._http_get(
+                        "https://example.invalid/history",
+                        headers={},
+                        timeout_seconds=1.0,
+                        config=config,
+                    )
 
     def test_snapshot_http_helpers_record_success_and_failure_attempts(self) -> None:
         class Response:
@@ -84,6 +87,59 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
 
             events = [json.loads(line) for line in config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(["ok", "request_error"], [event["outcome"] for event in events])
+
+    def test_authorized_json_get_records_get_events_to_originating_config_without_ambient_load(self) -> None:
+        class Response:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class Transport:
+            class exceptions:
+                RequestException = TimeoutError
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, url, *, headers, timeout, params=None, impersonate=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return Response({"ok": True})
+                raise TimeoutError("simulated timeout")
+
+        with tempfile.TemporaryDirectory() as origin_td, tempfile.TemporaryDirectory() as ambient_td:
+            origin_config = load_config(Path(origin_td))
+            ambient_config = load_config(Path(ambient_td))
+            transport = Transport()
+
+            with patch.object(crunchyroll_snapshot, "curl_requests", transport), patch(
+                "mal_updater.request_tracking.load_config",
+                side_effect=AssertionError("ambient load_config should not be used for Crunchyroll GET telemetry"),
+            ) as ambient_load:
+                payload = _authorized_json_get(
+                    "https://example.invalid/success",
+                    access_token="access-token",
+                    timeout_seconds=1.0,
+                    config=origin_config,
+                )
+                with self.assertRaises(CrunchyrollSnapshotError):
+                    _authorized_json_get(
+                        "https://example.invalid/failure",
+                        access_token="access-token",
+                        timeout_seconds=1.0,
+                        config=origin_config,
+                    )
+
+            self.assertEqual({"ok": True}, payload)
+            ambient_load.assert_not_called()
+            self.assertFalse(ambient_config.api_request_events_path.exists())
+            events = [json.loads(line) for line in origin_config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["ok", "request_error"], [event["outcome"] for event in events])
+            self.assertEqual(["https://example.invalid/success", "https://example.invalid/failure"], [event["url"] for event in events])
 
     def _build_session(self, root: Path) -> _CrunchyrollAuthSession:
         config = load_config(root)
@@ -165,7 +221,8 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             session = self._build_session(root)
             calls: list[str] = []
 
-            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None):
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None, config=None):
+                self.assertIs(config, session.config)
                 calls.append(access_token)
                 if len(calls) == 1:
                     raise CrunchyrollUnauthorizedError(url, 401)
@@ -201,7 +258,8 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             session = self._build_session(root)
             calls: list[str] = []
 
-            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None):
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None, config=None):
+                self.assertIs(config, session.config)
                 calls.append(access_token)
                 if len(calls) == 1:
                     raise CrunchyrollUnauthorizedError(url, 401)
@@ -259,7 +317,8 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
             session = self._build_session(root)
             calls: list[tuple[str, dict[str, object] | None]] = []
 
-            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None):
+            def fake_authorized_get(url: str, *, access_token: str, timeout_seconds: float, params=None, pacer=None, phase=None, config=None):
+                self.assertIs(config, session.config)
                 calls.append((access_token, params))
                 raise CrunchyrollUnauthorizedError(url, 401)
 
@@ -409,6 +468,71 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             )
         return result, calls
 
+    def test_fetch_snapshot_session_get_telemetry_uses_session_config_not_ambient_load(self) -> None:
+        class Response:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class Transport:
+            class exceptions:
+                RequestException = TimeoutError
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object] | None, str | None]] = []
+
+            def get(self, url, *, headers, timeout, params=None, impersonate=None):
+                self.calls.append((url, params, headers.get("Authorization")))
+                if url == CRUNCHYROLL_ME_URL:
+                    return Response({"account_id": "acct-123", "email": "user@example.com"})
+                if url.endswith("/watch-history"):
+                    return Response({"total": 1, "data": [self_outer._history_entry(1)]})
+                if url.endswith("/watchlist"):
+                    return Response({"total": 1, "data": [self_outer._watchlist_entry(1)]})
+                raise AssertionError((url, params))
+
+        self_outer = self
+        with tempfile.TemporaryDirectory() as origin_td, tempfile.TemporaryDirectory() as ambient_td:
+            origin_root = Path(origin_td)
+            (origin_root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(origin_root)
+            ambient_config = load_config(Path(ambient_td))
+            transport = Transport()
+
+            with patch.object(crunchyroll_snapshot, "curl_requests", transport), patch(
+                "mal_updater.request_tracking.load_config",
+                side_effect=AssertionError("ambient load_config should not be used for session GET telemetry"),
+            ) as ambient_load:
+                result = _fetch_snapshot_once(session, use_incremental_boundary=True)
+
+            ambient_load.assert_not_called()
+            self.assertFalse(ambient_config.api_request_events_path.exists())
+            events = [json.loads(line) for line in session.config.api_request_events_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["ok", "ok", "ok"], [event["outcome"] for event in events])
+            self.assertEqual(["http_get", "http_get", "http_get"], [event["operation"] for event in events])
+            self.assertEqual(["GET", "GET", "GET"], [event["method"] for event in events])
+            self.assertEqual("acct-123", result.snapshot.account_id_hint)
+            self.assertEqual(
+                [
+                    (CRUNCHYROLL_ME_URL, None, "Bearer access-token"),
+                    (
+                        "https://www.crunchyroll.com/content/v2/acct-123/watch-history",
+                        {"page": 1, "page_size": 100, "locale": "en-US"},
+                        "Bearer access-token",
+                    ),
+                    (
+                        "https://www.crunchyroll.com/content/v2/discover/acct-123/watchlist",
+                        {"locale": "en-US", "n": 100, "start": 0},
+                        "Bearer access-token",
+                    ),
+                ],
+                transport.calls,
+            )
+
     def test_fetch_snapshot_recovers_watch_history_401_via_refresh_then_completes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -426,7 +550,9 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                 params=None,
                 pacer=None,
                 phase=None,
+                config=None,
             ):
+                self.assertIs(config, session.config)
                 calls.append((url, access_token, params))
                 if url == CRUNCHYROLL_ME_URL:
                     self.assertEqual(access_token, "access-token")

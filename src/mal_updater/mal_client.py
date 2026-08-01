@@ -116,8 +116,9 @@ class MalClient:
 
     def _build_auth_headers(self, require_user: bool = False) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self.secrets.access_token:
-            headers["Authorization"] = f"Bearer {self.secrets.access_token}"
+        access_token = self.secrets.access_token.strip() if self.secrets.access_token else ""
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
         elif require_user:
             raise MalApiError("MAL access_token is not configured")
         elif self.secrets.client_id:
@@ -386,6 +387,8 @@ class MalClient:
         start_date: str | None = None,
         finish_date: str | None = None,
     ) -> dict[str, Any]:
+        headers = self._build_auth_headers(require_user=True)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
         form = {
             "status": status,
             "num_watched_episodes": str(int(num_watched_episodes)),
@@ -400,11 +403,7 @@ class MalClient:
         request = Request(
             f"{self.config.mal.base_url}/anime/{anime_id}/my_list_status",
             data=payload,
-            headers={
-                "Authorization": f"Bearer {self.secrets.access_token}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
+            headers=headers,
             method="PUT",
         )
         error_context = f"MAL API update my_list_status failed for anime_id={anime_id}"
