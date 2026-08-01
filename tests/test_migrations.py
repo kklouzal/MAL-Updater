@@ -38,6 +38,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "015_public_userrecs_resumable_staging.sql",
                 "016_provider_watchlist_membership_keys.sql",
                 "017_provider_series_observation_provenance.sql",
+                "018_provider_title_search_cache_full_key.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -83,6 +84,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "015_public_userrecs_resumable_staging.sql",
                     "016_provider_watchlist_membership_keys.sql",
                     "017_provider_series_observation_provenance.sql",
+                    "018_provider_title_search_cache_full_key.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -107,6 +109,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "015_public_userrecs_resumable_staging.sql",
                     "016_provider_watchlist_membership_keys.sql",
                     "017_provider_series_observation_provenance.sql",
+                    "018_provider_title_search_cache_full_key.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -132,6 +135,101 @@ class MigrationCatalogTests(unittest.TestCase):
                 root_file.read_text(encoding="utf-8"),
                 migration.read_text(encoding="utf-8"),
             )
+
+    def test_provider_title_search_cache_uses_full_semantic_primary_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "provider-title-search-cache-schema.sqlite3"
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                table_info = conn.execute("PRAGMA table_info(provider_title_search_cache)").fetchall()
+                index_rows = conn.execute("PRAGMA index_list(provider_title_search_cache)").fetchall()
+                expiry_index_columns = conn.execute(
+                    "PRAGMA index_info(idx_provider_title_search_cache_expires)"
+                ).fetchall()
+
+        self.assertEqual(
+            [
+                "provider",
+                "normalized_query",
+                "query",
+                "candidate_mal_anime_id",
+                "candidate_title",
+                "matches_json",
+                "status",
+                "fetched_at",
+                "expires_at",
+                "logic_version",
+                "search_limit",
+                "identity_key",
+            ],
+            [row["name"] for row in table_info],
+        )
+        self.assertEqual(
+            [
+                (1, "provider"),
+                (2, "normalized_query"),
+                (3, "logic_version"),
+                (4, "search_limit"),
+                (5, "identity_key"),
+            ],
+            [(row["pk"], row["name"]) for row in table_info if row["pk"]],
+        )
+        self.assertIn("idx_provider_title_search_cache_expires", {row["name"] for row in index_rows})
+        self.assertEqual(["expires_at"], [row["name"] for row in expiry_index_columns])
+
+    def test_provider_title_search_cache_full_key_upgrade_preserves_legacy_row_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "provider-title-search-cache-upgrade.sqlite3"
+            original = db.MIGRATIONS
+            try:
+                migration_index = db.MIGRATION_FILENAMES.index(db.PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION)
+                db.MIGRATIONS = original[:migration_index]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            with connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_title_search_cache(
+                        provider, normalized_query, query, candidate_mal_anime_id,
+                        candidate_title, matches_json, status, fetched_at, expires_at
+                    ) VALUES (
+                        'hidive', 'legacy query', 'Legacy Query', 101,
+                        'Legacy Candidate', '[{"provider_series_id":"2312"}]',
+                        'ok', '2026-07-30T00:00:00Z', '2027-07-30T00:00:00Z'
+                    )
+                    """
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT provider, normalized_query, query, candidate_mal_anime_id,
+                           candidate_title, matches_json, status, fetched_at, expires_at,
+                           logic_version, search_limit, identity_key
+                    FROM provider_title_search_cache
+                    WHERE provider = 'hidive' AND normalized_query = 'legacy query'
+                    """
+                ).fetchone()
+                marker_count = conn.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                    (db.PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION,),
+                ).fetchone()[0]
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual("Legacy Query", row["query"])
+        self.assertEqual(101, row["candidate_mal_anime_id"])
+        self.assertEqual('[{"provider_series_id":"2312"}]', row["matches_json"])
+        self.assertEqual("legacy-v1", row["logic_version"])
+        self.assertEqual(10, row["search_limit"])
+        self.assertEqual("", row["identity_key"])
+        self.assertEqual(1, marker_count)
+        self.assertEqual("ok", integrity)
 
     def test_provider_watchlist_membership_migration_preserves_fk_and_cascade(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

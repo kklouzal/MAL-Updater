@@ -18,6 +18,7 @@ from mal_updater.db import (
     get_recommendation_provider_eligibility_evidence,
     get_series_mapping,
     list_recommendation_provider_enrichment_attempts,
+    upsert_provider_title_search_cache,
     upsert_mal_anime_metadata,
     upsert_recommendation_provider_eligibility_evidence,
     upsert_series_mapping,
@@ -535,6 +536,54 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(third.cache_misses, 1)
         self.assertEqual(third.provider_searches, 1)
         self.assertEqual(len(provider.calls), 2)
+
+    def test_provider_title_search_cache_hit_requires_exact_semantic_key(self):
+        self._insert_meta(301, title="Dimension Show", english="Dimension Show")
+        self._recommendations(301)
+        normalized_query = enrichment.normalize_title("Dimension Show")
+        upsert_provider_title_search_cache(
+            self.config.db_path,
+            provider="fake",
+            normalized_query=normalized_query,
+            query="Dimension Show",
+            candidate_mal_anime_id=999,
+            candidate_title="Wrong Variant",
+            matches=[{"provider_series_id": "wrong-variant", "title": "Dimension Show"}],
+            status="ok",
+            fetched_at="2026-01-01T00:00:00Z",
+            expires_at="2027-01-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_SEARCH_CACHE_LOGIC_VERSION,
+            search_limit=7,
+            identity_key="mal:999",
+        )
+        provider = FakeProvider([
+            {"provider_series_id": "fake-dimension", "title": "Dimension Show", "audio_locales": []}
+        ])
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        first = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            search_limit=5,
+            now=now,
+        )
+        second = enrichment.enrich_discovery_provider_availability(
+            self.config,
+            providers=[provider],
+            candidate_limit=1,
+            search_limit=5,
+            now=now + timedelta(days=1),
+        )
+
+        self.assertEqual(1, first.cache_misses)
+        self.assertEqual(0, first.cache_hits)
+        self.assertEqual(1, first.provider_searches)
+        self.assertEqual(1, len(provider.calls), "non-exact cache variant must not suppress provider search")
+        self.assertEqual(1, second.cache_hits)
+        self.assertEqual(0, second.cache_misses)
+        self.assertEqual(0, second.provider_searches)
+        self.assertEqual(1, len(provider.calls), "exact semantic cache hit must suppress provider search")
 
     def test_fresh_actionable_eligibility_is_zero_request_and_expiry_rechecks(self):
         self._insert_meta(102, english="Frieren")

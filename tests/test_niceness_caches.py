@@ -11,8 +11,10 @@ from mal_updater.config import load_config
 from mal_updater.db import (
     bootstrap_database,
     connect,
+    get_provider_title_search_cache,
     list_covering_mal_anime_detail_cache_nodes,
     upsert_mal_anime_detail_cache,
+    upsert_provider_title_search_cache,
 )
 from mal_updater.mal_client import MAL_DETAIL_CACHE_LOGIC_VERSION, MalClient
 
@@ -56,6 +58,138 @@ class NicenessCacheTests(unittest.TestCase):
                 conn.commit()
             self.client.search_anime("Broken")
         self.assertEqual(2, get.call_count)
+
+    def test_provider_title_search_cache_full_key_variants_are_isolated(self) -> None:
+        first = upsert_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            query="Shared Query",
+            candidate_mal_anime_id=101,
+            candidate_title="Candidate One",
+            matches=[{"provider_series_id": "cr-one", "title": "One"}],
+            status="ok",
+            fetched_at="2026-07-30T00:00:00Z",
+            expires_at="2027-07-30T00:00:00Z",
+            logic_version="provider-title-v2",
+            search_limit=5,
+            identity_key="mal:101",
+        )
+        upsert_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            query="Shared Query",
+            candidate_mal_anime_id=202,
+            candidate_title="Candidate Two",
+            matches=[{"provider_series_id": "cr-two", "title": "Two"}],
+            status="ok",
+            fetched_at="2026-07-30T00:00:00Z",
+            expires_at="2026-08-01T00:00:00Z",
+            logic_version="provider-title-v2",
+            search_limit=5,
+            identity_key="mal:202",
+        )
+        upsert_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            query="Shared Query",
+            candidate_mal_anime_id=303,
+            candidate_title="Legacy Candidate",
+            matches=[{"provider_series_id": "cr-legacy", "title": "Legacy"}],
+            status="ok",
+            fetched_at="2026-07-30T00:00:00Z",
+            expires_at="2027-07-30T00:00:00Z",
+        )
+        self.assertEqual("cr-one", first.matches[0]["provider_series_id"])
+
+        refreshed_first = upsert_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            query="Shared Query Refreshed",
+            candidate_mal_anime_id=101,
+            candidate_title="Candidate One Refreshed",
+            matches=[{"provider_series_id": "cr-one-refreshed", "title": "One Refreshed"}],
+            status="ok",
+            fetched_at="2026-08-02T00:00:00Z",
+            expires_at="2027-08-02T00:00:00Z",
+            logic_version="provider-title-v2",
+            search_limit=5,
+            identity_key="mal:101",
+        )
+
+        with connect(self.config.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT candidate_mal_anime_id, logic_version, search_limit, identity_key, matches_json
+                FROM provider_title_search_cache
+                WHERE provider = 'crunchyroll' AND normalized_query = 'shared query'
+                ORDER BY logic_version ASC, search_limit ASC, identity_key ASC
+                """
+            ).fetchall()
+        self.assertEqual(3, len(rows))
+        self.assertEqual("cr-one-refreshed", refreshed_first.matches[0]["provider_series_id"])
+
+        exact_first = get_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            now="2026-08-02T00:00:00Z",
+            logic_version="provider-title-v2",
+            search_limit=5,
+            identity_key="mal:101",
+        )
+        self.assertIsNotNone(exact_first)
+        assert exact_first is not None
+        self.assertEqual("cr-one-refreshed", exact_first.matches[0]["provider_series_id"])
+        self.assertIsNone(
+            get_provider_title_search_cache(
+                self.config.db_path,
+                provider="crunchyroll",
+                normalized_query="shared query",
+                now="2026-08-02T00:00:00Z",
+                logic_version="provider-title-v2",
+                search_limit=5,
+                identity_key="mal:202",
+            )
+        )
+        expired_without_now = get_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            logic_version="provider-title-v2",
+            search_limit=5,
+            identity_key="mal:202",
+        )
+        self.assertIsNotNone(expired_without_now)
+        assert expired_without_now is not None
+        self.assertEqual("cr-two", expired_without_now.matches[0]["provider_series_id"])
+        legacy = get_provider_title_search_cache(
+            self.config.db_path,
+            provider="crunchyroll",
+            normalized_query="shared query",
+            legacy_lookup=True,
+        )
+        self.assertIsNotNone(legacy)
+        assert legacy is not None
+        self.assertEqual("legacy-v1", legacy.logic_version)
+        self.assertEqual(10, legacy.search_limit)
+        self.assertEqual("", legacy.identity_key)
+        with self.assertRaisesRegex(ValueError, "full semantic key"):
+            get_provider_title_search_cache(
+                self.config.db_path,
+                provider="crunchyroll",
+                normalized_query="shared query",
+            )
+        with self.assertRaisesRegex(ValueError, "logic_version, search_limit, and identity_key together"):
+            get_provider_title_search_cache(
+                self.config.db_path,
+                provider="crunchyroll",
+                normalized_query="shared query",
+                logic_version="provider-title-v2",
+            )
 
     def test_covering_detail_cache_prevents_narrow_duplicate_get_but_not_incomplete_use(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

@@ -18,6 +18,7 @@ PROVIDER_ENRICHMENT_CURSOR_MIGRATION = "014_recommendation_provider_enrichment_c
 PUBLIC_USERRECS_STAGING_MIGRATION = "015_public_userrecs_resumable_staging.sql"
 PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION = "016_provider_watchlist_membership_keys.sql"
 PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION = "017_provider_series_observation_provenance.sql"
+PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION = "018_provider_title_search_cache_full_key.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -38,6 +39,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PUBLIC_USERRECS_STAGING_MIGRATION,
     PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION,
     PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,
+    PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -5088,10 +5090,11 @@ def backfill_hidive_series_urls(db_path: Path, *, apply: bool = False) -> dict[s
 
         for row in conn.execute(
             """
-            SELECT provider, normalized_query, query, candidate_mal_anime_id, candidate_title, matches_json
+            SELECT provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
+                   matches_json, logic_version, search_limit, identity_key
             FROM provider_title_search_cache
             WHERE provider = 'hidive' AND matches_json LIKE '%hidive.com/season/%'
-            ORDER BY normalized_query ASC
+            ORDER BY normalized_query ASC, logic_version ASC, search_limit ASC, identity_key ASC
             """
         ).fetchall():
             try:
@@ -5126,11 +5129,16 @@ def backfill_hidive_series_urls(db_path: Path, *, apply: bool = False) -> dict[s
             if changed:
                 cache_candidates.append(
                     {
+                        "provider": row["provider"],
                         "normalized_query": row["normalized_query"],
+                        "logic_version": row["logic_version"],
+                        "search_limit": int(row["search_limit"]),
+                        "identity_key": row["identity_key"],
                         "query": row["query"],
                         "candidate_mal_anime_id": row["candidate_mal_anime_id"],
                         "candidate_title": row["candidate_title"],
                         "changed_matches": changed_matches,
+                        "old_matches_json": row["matches_json"],
                         "updated_matches_json": json.dumps(updated_matches, ensure_ascii=False, sort_keys=True),
                     }
                 )
@@ -5192,9 +5200,21 @@ def backfill_hidive_series_urls(db_path: Path, *, apply: bool = False) -> dict[s
                     """
                     UPDATE provider_title_search_cache
                     SET matches_json = ?, fetched_at = fetched_at
-                    WHERE provider = 'hidive' AND normalized_query = ?
+                    WHERE provider = 'hidive'
+                      AND normalized_query = ?
+                      AND logic_version = ?
+                      AND search_limit = ?
+                      AND identity_key = ?
+                      AND matches_json = ?
                     """,
-                    (item["updated_matches_json"], item["normalized_query"]),
+                    (
+                        item["updated_matches_json"],
+                        item["normalized_query"],
+                        item["logic_version"],
+                        item["search_limit"],
+                        item["identity_key"],
+                        item["old_matches_json"],
+                    ),
                 )
                 cache_updated += int(cursor.rowcount or 0)
             for item in score_snapshot_candidates:
@@ -5215,7 +5235,7 @@ def backfill_hidive_series_urls(db_path: Path, *, apply: bool = False) -> dict[s
         "canonical_route": "https://www.hidive.com/series/{series_id}",
         "provider_series": _backfill_result_section(provider_series_candidates, provider_series_updated, hidden_keys={"updated_raw_json"}),
         "eligibility": _backfill_result_section(eligibility_candidates, eligibility_updated),
-        "provider_title_search_cache": _backfill_result_section(cache_candidates, cache_updated, hidden_keys={"updated_matches_json"}),
+        "provider_title_search_cache": _backfill_result_section(cache_candidates, cache_updated, hidden_keys={"old_matches_json", "updated_matches_json"}),
         "recommendation_score_snapshots": _backfill_result_section(
             score_snapshot_candidates,
             score_snapshot_updated,
@@ -5726,6 +5746,26 @@ def get_recommendation_provider_enrichment_progress(
     )
 
 
+def _provider_title_search_cache_entry_from_row(row: sqlite3.Row) -> ProviderTitleSearchCacheEntry | None:
+    matches = _load_json_value(row["matches_json"], None)
+    if not isinstance(matches, list):
+        return None
+    return ProviderTitleSearchCacheEntry(
+        provider=str(row["provider"]),
+        normalized_query=str(row["normalized_query"]),
+        query=str(row["query"]),
+        candidate_mal_anime_id=None if row["candidate_mal_anime_id"] is None else int(row["candidate_mal_anime_id"]),
+        candidate_title=row["candidate_title"],
+        matches=matches,
+        status=str(row["status"]),
+        fetched_at=str(row["fetched_at"]),
+        expires_at=str(row["expires_at"]),
+        logic_version=str(row["logic_version"]),
+        search_limit=int(row["search_limit"]),
+        identity_key=str(row["identity_key"]),
+    )
+
+
 def get_provider_title_search_cache(
     db_path: Path,
     *,
@@ -5735,22 +5775,25 @@ def get_provider_title_search_cache(
     logic_version: str | None = None,
     search_limit: int | None = None,
     identity_key: str | None = None,
+    legacy_lookup: bool = False,
 ) -> ProviderTitleSearchCacheEntry | None:
+    semantic_values = (logic_version, search_limit, identity_key)
+    supplied = [value is not None for value in semantic_values]
+    if any(supplied) and not all(supplied):
+        raise ValueError("provider title search cache lookup requires logic_version, search_limit, and identity_key together")
+    if not legacy_lookup and not all(supplied):
+        raise ValueError("provider title search cache lookup requires the full semantic key")
     with connect(db_path) as conn:
         clause = "provider = ? AND normalized_query = ?"
         params: list[object] = [provider, normalized_query]
+        if all(supplied):
+            clause += " AND logic_version = ? AND search_limit = ? AND identity_key = ?"
+            params.extend([str(logic_version), int(search_limit), str(identity_key)])
+        elif legacy_lookup:
+            clause += " AND logic_version = 'legacy-v1' AND search_limit = 10 AND identity_key = ''"
         if now is not None:
             clause += " AND expires_at > ?"
             params.append(now)
-        if logic_version is not None:
-            clause += " AND logic_version = ?"
-            params.append(logic_version)
-        if search_limit is not None:
-            clause += " AND search_limit = ?"
-            params.append(int(search_limit))
-        if identity_key is not None:
-            clause += " AND identity_key = ?"
-            params.append(identity_key)
         row = conn.execute(
             f"""
             SELECT provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
@@ -5762,20 +5805,7 @@ def get_provider_title_search_cache(
         ).fetchone()
     if row is None:
         return None
-    return ProviderTitleSearchCacheEntry(
-        provider=str(row["provider"]),
-        normalized_query=str(row["normalized_query"]),
-        query=str(row["query"]),
-        candidate_mal_anime_id=None if row["candidate_mal_anime_id"] is None else int(row["candidate_mal_anime_id"]),
-        candidate_title=row["candidate_title"],
-        matches=_load_json_value(row["matches_json"], None),
-        status=str(row["status"]),
-        fetched_at=str(row["fetched_at"]),
-        expires_at=str(row["expires_at"]),
-        logic_version=str(row["logic_version"]),
-        search_limit=int(row["search_limit"]),
-        identity_key=str(row["identity_key"]),
-    ) if isinstance(_load_json_value(row["matches_json"], None), list) else None
+    return _provider_title_search_cache_entry_from_row(row)
 
 
 def upsert_provider_title_search_cache(
@@ -5801,7 +5831,7 @@ def upsert_provider_title_search_cache(
                 provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
                 matches_json, status, fetched_at, expires_at, logic_version, search_limit, identity_key
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider, normalized_query) DO UPDATE SET
+            ON CONFLICT(provider, normalized_query, logic_version, search_limit, identity_key) DO UPDATE SET
                 query = excluded.query,
                 candidate_mal_anime_id = excluded.candidate_mal_anime_id,
                 candidate_title = excluded.candidate_title,
@@ -5809,16 +5839,20 @@ def upsert_provider_title_search_cache(
                 status = excluded.status,
                 fetched_at = excluded.fetched_at,
                 expires_at = excluded.expires_at
-                , logic_version = excluded.logic_version
-                , search_limit = excluded.search_limit
-                , identity_key = excluded.identity_key
             """,
             (provider, normalized_query, query, candidate_mal_anime_id, candidate_title,
              json.dumps(matches, ensure_ascii=False, sort_keys=True), status, fetched_at, expires_at,
              logic_version, int(search_limit), identity_key),
         )
         conn.commit()
-    entry = get_provider_title_search_cache(db_path, provider=provider, normalized_query=normalized_query)
+    entry = get_provider_title_search_cache(
+        db_path,
+        provider=provider,
+        normalized_query=normalized_query,
+        logic_version=logic_version,
+        search_limit=int(search_limit),
+        identity_key=identity_key,
+    )
     if entry is None:
         raise RuntimeError("Provider title search cache disappeared after upsert")
     return entry

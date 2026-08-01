@@ -62,6 +62,21 @@ class HidiveUrlBackfillTests(unittest.TestCase):
                 fetched_at="2026-07-30T00:00:00Z",
                 expires_at="2026-08-30T00:00:00Z",
             )
+            upsert_provider_title_search_cache(
+                db_path,
+                provider="hidive",
+                normalized_query="dungeon people",
+                query="Dungeon People",
+                candidate_mal_anime_id=2,
+                candidate_title="Dungeon People Alternate",
+                matches=[{"provider_series_id": "2312", "title": "Dungeon People", "url": "https://www.hidive.com/season/dungeon-people"}],
+                status="ok",
+                fetched_at="2026-07-30T00:00:00Z",
+                expires_at="2026-08-30T00:00:00Z",
+                logic_version="provider-title-v2",
+                search_limit=5,
+                identity_key="mal:2",
+            )
             snapshot_context = {
                 "provider_eligibility_evidence": [
                     {
@@ -120,7 +135,12 @@ class HidiveUrlBackfillTests(unittest.TestCase):
             self.assertTrue(preview["dry_run"])
             self.assertEqual(1, preview["provider_series"]["matched"])
             self.assertEqual(1, preview["eligibility"]["matched"])
-            self.assertEqual(1, preview["provider_title_search_cache"]["matched"])
+            self.assertEqual(2, preview["provider_title_search_cache"]["matched"])
+            self.assertEqual(2, preview["provider_title_search_cache"]["sample_count"])
+            self.assertEqual(
+                {"", "mal:2"},
+                {sample["identity_key"] for sample in preview["provider_title_search_cache"]["samples"]},
+            )
             self.assertEqual(1, preview["recommendation_score_snapshots"]["matched"])
             self.assertEqual(1, preview["recommendation_score_snapshots"]["sample_count"])
             with closing(sqlite3.connect(db_path)) as conn:
@@ -137,7 +157,7 @@ class HidiveUrlBackfillTests(unittest.TestCase):
 
             self.assertEqual(1, applied["provider_series"]["updated"])
             self.assertEqual(1, applied["eligibility"]["updated"])
-            self.assertEqual(1, applied["provider_title_search_cache"]["updated"])
+            self.assertEqual(2, applied["provider_title_search_cache"]["updated"])
             self.assertEqual(1, applied["recommendation_score_snapshots"]["updated"])
             self.assertEqual(0, second["provider_series"]["matched"])
             self.assertEqual(0, second["eligibility"]["matched"])
@@ -148,8 +168,17 @@ class HidiveUrlBackfillTests(unittest.TestCase):
                 self.assertEqual("https://www.hidive.com/series/2312", raw["url"])
                 provider_url = conn.execute("SELECT provider_url FROM recommendation_provider_eligibility_evidence WHERE provider='hidive'").fetchone()[0]
                 self.assertEqual("https://www.hidive.com/series/2312", provider_url)
-                matches = json.loads(conn.execute("SELECT matches_json FROM provider_title_search_cache WHERE provider='hidive'").fetchone()[0])
-                self.assertEqual("https://www.hidive.com/series/2312", matches[0]["url"])
+                cache_rows = conn.execute(
+                    """
+                    SELECT matches_json FROM provider_title_search_cache
+                    WHERE provider='hidive' AND normalized_query='dungeon people'
+                    ORDER BY logic_version, search_limit, identity_key
+                    """
+                ).fetchall()
+                self.assertEqual(2, len(cache_rows))
+                for row in cache_rows:
+                    matches = json.loads(row[0])
+                    self.assertEqual("https://www.hidive.com/series/2312", matches[0]["url"])
                 context = json.loads(conn.execute("SELECT context_json FROM recommendation_score_snapshots WHERE title='Dungeon People'").fetchone()[0])
                 self.assertEqual("https://www.hidive.com/series/2312", context["provider_eligibility_evidence"][0]["provider_url"])
                 self.assertEqual("https://www.hidive.com/season/should-stay-crunchyroll", context["provider_eligibility_evidence"][1]["provider_url"])
