@@ -86,7 +86,7 @@ This persists MAL access/refresh tokens under the runtime secrets dir.
 
 Before staging secrets, verify the runtime secrets dir is outside version control and has appropriately restrictive local permissions for the user account.
 
-Prompt for source-provider credentials only when that provider is actually being enabled.
+Prompt for source-provider credentials only when that provider is actually being enabled. The repo bootstrap helper asks per provider interactively; for non-interactive runs use `MAL_UPDATER_BOOTSTRAP_PROVIDERS=crunchyroll,hidive`, `all`, or `none` (alias: `MAL_UPDATER_BOOTSTRAP_SOURCE_PROVIDERS`). `MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS=yes|no|prompt` controls whether selected live auth bootstraps run; unselected provider credential files are neither required nor modified.
 
 #### Crunchyroll
 
@@ -101,7 +101,7 @@ Compatibility wrapper still exists:
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
 ```
 
 This creates the staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.
@@ -133,9 +133,10 @@ Before enabling unattended operation, manually review the rendered unit behavior
 ```bash
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
+
+Do not use `service-run-once` as a routine/read-only verification step. It is a live/mutating-capable manual daemon pass that can run due provider fetches, local ingest, and bounded exact-approved MAL apply work; run it only after explicit operator intent.
 
 On a fully bootstrapped install, normal background operation now means:
 - one provider fetch lane per credentialed source provider

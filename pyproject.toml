@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,15 +7,48 @@ name = "mal-updater"
 version = "0.1.4"
 description = "Conservative multi-provider anime -> MyAnimeList sync worker and recommendation engine"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
   { name = "MAL-Updater contributors" }
+]
+keywords = [
+  "anime",
+  "crunchyroll",
+  "hidive",
+  "mal",
+  "myanimelist",
+  "openclaw",
+  "recommendations",
+  "sync"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Utilities"
 ]
 dependencies = [
   "requests>=2.31.0",
   "curl_cffi>=0.14.0",
   "tomli>=2.0.1; python_version < '3.11'"
 ]
+
+[project.urls]
+Homepage = "https://github.com/kklouzal/MAL-Updater"
+Repository = "https://github.com/kklouzal/MAL-Updater"
+Issues = "https://github.com/kklouzal/MAL-Updater/issues"
+Documentation = "https://github.com/kklouzal/MAL-Updater#readme"
 
 [project.optional-dependencies]
 dev = [

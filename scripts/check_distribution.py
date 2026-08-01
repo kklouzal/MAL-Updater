@@ -9,6 +9,23 @@ from pathlib import Path, PurePosixPath
 
 
 EXPECTED_ENTRY_POINT = "mal-updater = mal_updater.cli:main"
+EXPECTED_METADATA_FIELDS = {
+    "License-Expression": "MIT",
+    "License-File": "LICENSE",
+    "Requires-Python": ">=3.10",
+}
+EXPECTED_PROJECT_URLS = {
+    "Homepage, https://github.com/kklouzal/MAL-Updater",
+    "Repository, https://github.com/kklouzal/MAL-Updater",
+    "Issues, https://github.com/kklouzal/MAL-Updater/issues",
+    "Documentation, https://github.com/kklouzal/MAL-Updater#readme",
+}
+EXPECTED_CLASSIFIERS = {
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+}
+EXPECTED_KEYWORDS = {"anime", "myanimelist", "mal", "crunchyroll", "hidive", "openclaw", "recommendations"}
 
 
 def _die(message: str) -> None:
@@ -60,6 +77,31 @@ def _check_sql_member_contents(
         _die(f"{label} migration content mismatch in {artifact_name}: {sorted(mismatched)}")
 
 
+def _metadata_values(metadata_text: str, field_name: str) -> list[str]:
+    prefix = f"{field_name}:"
+    return [line[len(prefix) :].strip() for line in metadata_text.splitlines() if line.startswith(prefix)]
+
+
+def _check_metadata(metadata_text: str, *, artifact_name: str) -> None:
+    for field_name, expected_value in EXPECTED_METADATA_FIELDS.items():
+        values = _metadata_values(metadata_text, field_name)
+        if expected_value not in values:
+            _die(f"missing metadata field in {artifact_name}: {field_name}: {expected_value}")
+    project_urls = set(_metadata_values(metadata_text, "Project-URL"))
+    missing_urls = sorted(EXPECTED_PROJECT_URLS - project_urls)
+    if missing_urls:
+        _die(f"missing metadata project URLs in {artifact_name}: {missing_urls}")
+    classifiers = set(_metadata_values(metadata_text, "Classifier"))
+    missing_classifiers = sorted(EXPECTED_CLASSIFIERS - classifiers)
+    if missing_classifiers:
+        _die(f"missing metadata classifiers in {artifact_name}: {missing_classifiers}")
+    keyword_values = _metadata_values(metadata_text, "Keywords")
+    keywords = {part.strip().lower() for value in keyword_values for part in value.split(",") if part.strip()}
+    missing_keywords = sorted(EXPECTED_KEYWORDS - keywords)
+    if missing_keywords:
+        _die(f"missing metadata keywords in {artifact_name}: {missing_keywords}")
+
+
 def _check_wheel(wheel_path: Path, expected_sql_bytes: dict[str, bytes]) -> None:
     expected_sql = sorted(expected_sql_bytes)
     try:
@@ -87,6 +129,13 @@ def _check_wheel(wheel_path: Path, expected_sql_bytes: dict[str, bytes]) -> None
         entry_points = wheel.read(entry_point_files[0]).decode("utf-8")
         if EXPECTED_ENTRY_POINT not in entry_points:
             _die(f"missing console script entry point {EXPECTED_ENTRY_POINT!r} in wheel")
+        metadata_files = [name for name in names if name.endswith(".dist-info/METADATA")]
+        if len(metadata_files) != 1:
+            _die(f"expected exactly one wheel METADATA, found {len(metadata_files)}")
+        license_files = [name for name in names if name.endswith(".dist-info/licenses/LICENSE")]
+        if len(license_files) != 1:
+            _die(f"expected exactly one wheel dist-info/licenses/LICENSE, found {len(license_files)}")
+        _check_metadata(wheel.read(metadata_files[0]).decode("utf-8"), artifact_name=wheel_path.name)
 
 
 def _tar_member_bytes(sdist: tarfile.TarFile, member_name: str) -> bytes:
@@ -139,6 +188,13 @@ def _check_sdist(sdist_path: Path, expected_sql_bytes: dict[str, bytes]) -> None
         pyproject_files = [name for name in names if PurePosixPath(name).name == "pyproject.toml"]
         if len(pyproject_files) != 1:
             _die(f"expected exactly one pyproject.toml in sdist, found {len(pyproject_files)}")
+        license_files = [name for name in names if len(PurePosixPath(name).parts) == 2 and PurePosixPath(name).name == "LICENSE"]
+        if len(license_files) != 1:
+            _die(f"expected exactly one top-level LICENSE in sdist, found {len(license_files)}")
+        pkg_info_files = [name for name in names if len(PurePosixPath(name).parts) == 2 and PurePosixPath(name).name == "PKG-INFO"]
+        if len(pkg_info_files) != 1:
+            _die(f"expected exactly one PKG-INFO in sdist, found {len(pkg_info_files)}")
+        _check_metadata(_tar_member_bytes(sdist, pkg_info_files[0]).decode("utf-8"), artifact_name=sdist_path.name)
 
 
 def check_distribution(repo_root: Path, dist_dir: Path) -> int:
@@ -156,6 +212,7 @@ def check_distribution(repo_root: Path, dist_dir: Path) -> int:
     print(f"wheel migrations: {wheel_path.name}: {sql_count} SQL files")
     print(f"sdist package/root migrations: {sdist_path.name}: {sql_count} SQL files each")
     print("wheel entry point: mal-updater -> mal_updater.cli:main")
+    print("package metadata: MIT license expression/file, project URLs, classifiers, and keywords")
     return 0
 
 

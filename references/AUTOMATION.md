@@ -48,10 +48,11 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
 
 Do not run both service install paths as routine setup. Prefer `scripts/install_user_systemd_units.sh` for normal host bootstrap; use `PYTHONPATH=src python3 -m mal_updater.cli install-service` only as the lower-level service-manager compatibility path when you intentionally want that behavior.
+
+`service-run-once` is deliberately not a routine/read-only service check. It is an opt-in live daemon pass that can run provider fetches, local ingest, and exact-approved MAL apply lanes; prefer `service-status` plus `health-check` for inspection.
 
 `service-status` is now the main structured observability surface for unattended debugging. In addition to user-systemd enabled/active state, it reports:
 
@@ -93,8 +94,9 @@ Those commands still write runtime artifacts under `.MAL-Updater/state/` and `.M
 3. MAL / provider auth setup (`provider-auth-login --provider crunchyroll` and/or `provider-auth-login --provider hidive`)
 4. `scripts/install_user_systemd_units.sh`
 5. `service-status`
-6. `service-run-once`
-7. `health-check --format summary`
+6. `health-check --format summary`
+
+Run `service-run-once` only as a separate opt-in manual daemon pass after explicit operator intent.
 
 `health-check --format summary` now mirrors the top maintenance command metadata from the richer JSON payload too, so shell/log consumers can see not just the recommended command but also why it was chosen and whether it is automation-safe or auth-interactive.
 

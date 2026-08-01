@@ -79,7 +79,7 @@ Current behavior:
 - writes snapshots through the shared provider snapshot serializer
 - exposes bounded read-only title search for recommendation enrichment via HIDIVE frontend Algolia `VOD_SERIES` results; episode/video hits are intentionally ignored for conservative provider-to-MAL matching
 
-Supported HIDIVE snapshot surfaces today are account watch history, continue-watching progress, and favourites represented as normalized watchlist entries. `--full-refresh` fetches those account-scoped surfaces without crawling the full HIDIVE catalog. The incremental/hot path uses the HIDIVE sync boundary, keeps the newest history page current, and can skip continue/favourites until a full account refresh is due. Crunchyroll page chunk controls remain Crunchyroll-only; HIDIVE rejects them rather than pretending partial page resume exists.
+Supported HIDIVE snapshot surfaces today are account auth/session state, watch history, continue-watching progress, favourites represented as normalized watchlist entries, and custom-list collection/detail memberships. Recommendation enrichment/title lookup remains bounded to specific-title search results; it is not a whole-catalog crawl. `--full-refresh` fetches the account-scoped snapshot surfaces manually without crawling the full HIDIVE catalog. The incremental/hot path uses the HIDIVE sync boundary, keeps the newest history page current, and can skip continue/favourites/custom-list expansion until a full account refresh is due. Crunchyroll page chunk controls remain Crunchyroll-only; HIDIVE rejects them rather than pretending partial page resume exists.
 
 ## CLI changes
 

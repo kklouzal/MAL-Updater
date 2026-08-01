@@ -10,12 +10,12 @@
 ## Phase 1 - Feasibility spike
 - MAL OAuth works locally
 - MAL API client can read and update test list entries
-- Python Crunchyroll auth works locally
-- normalized live sample inserts into SQLite
+- Python source-provider auth works locally for supported account-scoped surfaces
+- normalized live provider samples insert into SQLite
 
 ## Phase 2 - Read-only ingestion
-- ingest Crunchyroll watch history
-- ingest Crunchyroll watchlist
+- ingest source-provider watch history
+- ingest source-provider watchlist / continue-watching / custom-list surfaces where the provider supports them
 - normalize title/episode/progress data
 - persist raw observations + normalized watch state
 - no MAL writes yet
@@ -50,3 +50,7 @@
 - surface conflicts for approval
 - recommendations / alerts
 - periodic health checks
+
+## Detached remediation-chain status
+
+The original phase outline is historical. Current source work through the remediated chain is still review/landing/release pending; do not treat this detached source state as a pushed release or live deployment until the maintainer explicitly lands it.

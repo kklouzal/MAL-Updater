@@ -13,6 +13,25 @@ import pytest
 
 MIGRATION_CONTENT = b"CREATE TABLE demo(id INTEGER);\n"
 ENTRY_POINTS = "[console_scripts]\nmal-updater = mal_updater.cli:main\n"
+METADATA = "\n".join(
+    [
+        "Metadata-Version: 2.4",
+        "Name: mal-updater",
+        "Version: 0.0.0",
+        "Requires-Python: >=3.10",
+        "License-Expression: MIT",
+        "License-File: LICENSE",
+        "Project-URL: Homepage, https://github.com/kklouzal/MAL-Updater",
+        "Project-URL: Repository, https://github.com/kklouzal/MAL-Updater",
+        "Project-URL: Issues, https://github.com/kklouzal/MAL-Updater/issues",
+        "Project-URL: Documentation, https://github.com/kklouzal/MAL-Updater#readme",
+        "Keywords: anime,crunchyroll,hidive,mal,myanimelist,openclaw,recommendations,sync",
+        "Classifier: Development Status :: 3 - Alpha",
+        "Classifier: Environment :: Console",
+        "Classifier: Operating System :: POSIX :: Linux",
+        "",
+    ]
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -44,6 +63,8 @@ def _build_wheel(
     migration_name: str = "001_initial.sql",
     migration_content: bytes | None = MIGRATION_CONTENT,
     entry_points: str | None = ENTRY_POINTS,
+    metadata: str | None = METADATA,
+    include_license_file: bool = True,
 ) -> Path:
     wheel_path = dist_dir / "mal_updater-0.0.0-py3-none-any.whl"
     with zipfile.ZipFile(wheel_path, "w") as wheel:
@@ -51,6 +72,10 @@ def _build_wheel(
             wheel.writestr(f"mal_updater/migrations/{migration_name}", migration_content)
         if entry_points is not None:
             wheel.writestr("mal_updater-0.0.0.dist-info/entry_points.txt", entry_points)
+        if metadata is not None:
+            wheel.writestr("mal_updater-0.0.0.dist-info/METADATA", metadata)
+        if include_license_file:
+            wheel.writestr("mal_updater-0.0.0.dist-info/licenses/LICENSE", "MIT fixture license\n")
     return wheel_path
 
 
@@ -63,10 +88,16 @@ def _build_sdist(
     root_migration_content: bytes = MIGRATION_CONTENT,
     include_package_migration: bool = True,
     include_root_migration: bool = True,
+    metadata: str | None = METADATA,
+    include_license_file: bool = True,
 ) -> Path:
     sdist_path = dist_dir / "mal_updater-0.0.0.tar.gz"
     with tarfile.open(sdist_path, "w:gz") as sdist:
         _add_bytes(sdist, "mal_updater-0.0.0/pyproject.toml", b"[project]\nname = 'mal-updater'\n")
+        if include_license_file:
+            _add_bytes(sdist, "mal_updater-0.0.0/LICENSE", b"MIT fixture license\n")
+        if metadata is not None:
+            _add_bytes(sdist, "mal_updater-0.0.0/PKG-INFO", metadata.encode("utf-8"))
         if include_package_migration:
             _add_bytes(
                 sdist,
@@ -205,6 +236,36 @@ def test_distribution_check_fails_wrong_wheel_entry_point(tmp_path: Path) -> Non
     _assert_distribution_failure(repo_root, dist_dir, "missing console script entry point")
 
 
+def test_distribution_check_fails_missing_wheel_metadata(tmp_path: Path) -> None:
+    def replace_wheel(dist_dir: Path) -> None:
+        (dist_dir / "mal_updater-0.0.0-py3-none-any.whl").unlink()
+        _build_wheel(dist_dir, metadata=None)
+
+    repo_root, dist_dir = _fixture(tmp_path, replace_wheel)
+
+    _assert_distribution_failure(repo_root, dist_dir, "expected exactly one wheel METADATA")
+
+
+def test_distribution_check_fails_wrong_wheel_metadata(tmp_path: Path) -> None:
+    def replace_wheel(dist_dir: Path) -> None:
+        (dist_dir / "mal_updater-0.0.0-py3-none-any.whl").unlink()
+        _build_wheel(dist_dir, metadata=METADATA.replace("License-Expression: MIT\n", ""))
+
+    repo_root, dist_dir = _fixture(tmp_path, replace_wheel)
+
+    _assert_distribution_failure(repo_root, dist_dir, "missing metadata field")
+
+
+def test_distribution_check_fails_missing_wheel_license_file(tmp_path: Path) -> None:
+    def replace_wheel(dist_dir: Path) -> None:
+        (dist_dir / "mal_updater-0.0.0-py3-none-any.whl").unlink()
+        _build_wheel(dist_dir, include_license_file=False)
+
+    repo_root, dist_dir = _fixture(tmp_path, replace_wheel)
+
+    _assert_distribution_failure(repo_root, dist_dir, "wheel dist-info/licenses/LICENSE")
+
+
 def test_distribution_check_fails_missing_sdist_artifact(tmp_path: Path) -> None:
     def remove_sdist(dist_dir: Path) -> None:
         (dist_dir / "mal_updater-0.0.0.tar.gz").unlink()
@@ -251,6 +312,26 @@ def test_distribution_check_fails_invalid_sdist_root_migration_data(tmp_path: Pa
     repo_root, dist_dir = _fixture(tmp_path, replace_sdist)
 
     _assert_distribution_failure(repo_root, dist_dir, "sdist root migration content mismatch")
+
+
+def test_distribution_check_fails_missing_sdist_metadata(tmp_path: Path) -> None:
+    def replace_sdist(dist_dir: Path) -> None:
+        (dist_dir / "mal_updater-0.0.0.tar.gz").unlink()
+        _build_sdist(dist_dir, metadata=None)
+
+    repo_root, dist_dir = _fixture(tmp_path, replace_sdist)
+
+    _assert_distribution_failure(repo_root, dist_dir, "expected exactly one PKG-INFO")
+
+
+def test_distribution_check_fails_missing_sdist_license_file(tmp_path: Path) -> None:
+    def replace_sdist(dist_dir: Path) -> None:
+        (dist_dir / "mal_updater-0.0.0.tar.gz").unlink()
+        _build_sdist(dist_dir, include_license_file=False)
+
+    repo_root, dist_dir = _fixture(tmp_path, replace_sdist)
+
+    _assert_distribution_failure(repo_root, dist_dir, "top-level LICENSE")
 
 
 def test_distribution_cli_accepts_repo_root_for_temp_fixture(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

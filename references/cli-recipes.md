@@ -16,11 +16,12 @@ PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 scripts/install_user_systemd_units.sh
 ```
 
 Use `scripts/install_user_systemd_units.sh` as the routine install path. `install-service` remains a lower-level compatibility/repair command; do not run both install paths during normal bootstrap.
+
+`service-run-once` is intentionally excluded from routine/read-only bootstrap checks. It can run due provider fetch, local ingest, and exact-approved MAL apply lanes; use it only as an opt-in manual daemon pass after explicit operator intent.
 
 `runtime-retention-audit` is read-only and local-only. Its JSON/summary output validates suspicious runtime-root layout, reports bounded aggregate counts/bytes/oldest-newest mtimes for DB backups, health snapshots, state logs/request events, tmp, cache, and artifacts, and emits review candidates only under `diagnostic_only_no_delete_or_prune`. Traversal is capped (`--max-files-per-family`, `--max-dirs-per-family`, `--max-depth`), warning thresholds are operator-tunable (`--warn-file-count`, `--warn-total-bytes`, `--warn-oldest-days`), and DB backups remain a distinct high-value/manual-policy family.
 
@@ -66,8 +67,8 @@ Compatibility wrappers still exist for Crunchyroll-specific debugging/bootstrap:
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-fetch-snapshot --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
 ```
 
 ## Review queue triage

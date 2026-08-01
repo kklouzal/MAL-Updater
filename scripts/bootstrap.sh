@@ -76,16 +76,74 @@ prompt_yes_no() {
   done
 }
 
+first_env_value() {
+  local name
+  for name in "$@"; do
+    if [ -n "${!name:-}" ]; then
+      printf '%s\n' "${!name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+env_names_label() {
+  local joined=""
+  local name
+  for name in "$@"; do
+    if [ -z "$joined" ]; then
+      joined="$name"
+    else
+      joined="$joined, $name"
+    fi
+  done
+  printf '%s\n' "$joined"
+}
+
+stage_value_file() {
+  local path="$1"
+  local value="$2"
+  umask 077
+  mkdir -p -- "$(dirname -- "$path")"
+  printf '%s\n' "$value" > "$path"
+  chmod 600 -- "$path"
+}
+
 prompt_value() {
   local label="$1"
   local path="$2"
   local secret="$3"
+  shift 3
   local value=""
+  local env_value=""
+  local env_label=""
 
-  if [ -f "$path" ]; then
+  if [ -f "$path" ] && [ -s "$path" ]; then
+    if [ ! -t 0 ]; then
+      printf '%s is already staged at %s. Keeping existing value without showing it.\n' "$label" "$path"
+      return 0
+    fi
     if prompt_yes_no "$label is already staged at $path. Keep existing value without showing it?" yes; then
       return 0
     fi
+  elif [ -f "$path" ]; then
+    printf '%s exists at %s but is empty; treating it as missing.\n' "$label" "$path"
+  fi
+
+  if [ "$#" -gt 0 ] && env_value="$(first_env_value "$@")"; then
+    stage_value_file "$path" "$env_value"
+    printf 'Staged %s from environment-provided value at %s.\n' "$label" "$path"
+    return 0
+  fi
+
+  if [ ! -t 0 ]; then
+    env_label="$(env_names_label "$@")"
+    if [ -n "$env_label" ]; then
+      printf 'Missing %s at %s and no environment value (%s) was provided in non-interactive mode.\n' "$label" "$path" "$env_label" >&2
+    else
+      printf 'Missing %s at %s in non-interactive mode.\n' "$label" "$path" >&2
+    fi
+    return 1
   fi
 
   while [ -z "$value" ]; do
@@ -100,10 +158,179 @@ prompt_value() {
     fi
   done
 
-  umask 077
-  mkdir -p -- "$(dirname -- "$path")"
-  printf '%s\n' "$value" > "$path"
-  chmod 600 -- "$path"
+  stage_value_file "$path" "$value"
+}
+
+env_truthy() {
+  local name="$1"
+  local value="${!name:-}"
+  local normalized="${value,,}"
+  case "$normalized" in
+    1|true|yes|on) return 0 ;;
+    0|false|no|off|"") return 1 ;;
+    *)
+      printf 'Invalid boolean value for %s: %s\n' "$name" "$value" >&2
+      exit 2
+      ;;
+  esac
+}
+
+SELECTED_PROVIDERS=()
+
+append_selected_provider() {
+  local provider="$1"
+  local existing
+  for existing in "${SELECTED_PROVIDERS[@]}"; do
+    if [ "$existing" = "$provider" ]; then
+      return 0
+    fi
+  done
+  SELECTED_PROVIDERS+=("$provider")
+}
+
+provider_has_staged_input() {
+  local provider="$1"
+  case "$provider" in
+    crunchyroll)
+      [ -s "$CRUNCHYROLL_USERNAME_PATH" ] || [ -s "$CRUNCHYROLL_PASSWORD_PATH" ] || \
+        [ -n "${MAL_UPDATER_CRUNCHYROLL_USERNAME:-}" ] || [ -n "${MAL_UPDATER_CRUNCHYROLL_PASSWORD:-}" ]
+      ;;
+    hidive)
+      [ -s "$HIDIVE_USERNAME_PATH" ] || [ -s "$HIDIVE_PASSWORD_PATH" ] || \
+        [ -n "${MAL_UPDATER_HIDIVE_USERNAME:-}" ] || [ -n "${MAL_UPDATER_HIDIVE_PASSWORD:-}" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+provider_default_answer() {
+  local provider="$1"
+  if provider_has_staged_input "$provider"; then
+    printf 'yes\n'
+  else
+    printf 'no\n'
+  fi
+}
+
+parse_provider_selection() {
+  local raw="$1"
+  local normalized token
+  local provider_tokens=()
+  normalized="${raw,,}"
+  normalized="${normalized// /,}"
+  normalized="${normalized//;/,}"
+  IFS=',' read -r -a provider_tokens <<< "$normalized"
+  for token in "${provider_tokens[@]}"; do
+    token="${token//$'\t'/}"
+    token="${token//$'\r'/}"
+    token="${token//$'\n'/}"
+    case "$token" in
+      "") ;;
+      all|both)
+        append_selected_provider crunchyroll
+        append_selected_provider hidive
+        ;;
+      none|no|disabled|disable) ;;
+      crunchyroll|cr)
+        append_selected_provider crunchyroll
+        ;;
+      hidive|hi)
+        append_selected_provider hidive
+        ;;
+      *)
+        printf 'Unknown MAL_UPDATER_BOOTSTRAP_PROVIDERS entry: %s\n' "$token" >&2
+        printf 'Use comma-separated provider slugs (crunchyroll,hidive), all, or none.\n' >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+resolve_selected_providers() {
+  local raw="${MAL_UPDATER_BOOTSTRAP_PROVIDERS:-${MAL_UPDATER_BOOTSTRAP_SOURCE_PROVIDERS:-}}"
+  local legacy_seen=0
+
+  SELECTED_PROVIDERS=()
+  if [ -n "$raw" ]; then
+    parse_provider_selection "$raw"
+    return 0
+  fi
+
+  if [ -n "${MAL_UPDATER_BOOTSTRAP_ENABLE_CRUNCHYROLL:-}" ]; then
+    legacy_seen=1
+    if env_truthy MAL_UPDATER_BOOTSTRAP_ENABLE_CRUNCHYROLL; then
+      append_selected_provider crunchyroll
+    fi
+  fi
+  if [ -n "${MAL_UPDATER_BOOTSTRAP_ENABLE_HIDIVE:-}" ]; then
+    legacy_seen=1
+    if env_truthy MAL_UPDATER_BOOTSTRAP_ENABLE_HIDIVE; then
+      append_selected_provider hidive
+    fi
+  fi
+  if [ "$legacy_seen" = "1" ]; then
+    return 0
+  fi
+
+  if [ -t 0 ]; then
+    if prompt_yes_no "Enable Crunchyroll provider bootstrap in this run?" "$(provider_default_answer crunchyroll)"; then
+      append_selected_provider crunchyroll
+    fi
+    if prompt_yes_no "Enable HIDIVE provider bootstrap in this run?" "$(provider_default_answer hidive)"; then
+      append_selected_provider hidive
+    fi
+    return 0
+  fi
+
+  if provider_has_staged_input crunchyroll; then
+    append_selected_provider crunchyroll
+  fi
+  if provider_has_staged_input hidive; then
+    append_selected_provider hidive
+  fi
+}
+
+provider_is_selected() {
+  local provider="$1"
+  local existing
+  for existing in "${SELECTED_PROVIDERS[@]}"; do
+    if [ "$existing" = "$provider" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_selected_providers() {
+  if [ "${#SELECTED_PROVIDERS[@]}" -eq 0 ]; then
+    printf 'Source provider bootstraps selected: none\n'
+  else
+    printf 'Source provider bootstraps selected: %s\n' "${SELECTED_PROVIDERS[*]}"
+  fi
+}
+
+resolve_service_start() {
+  local policy="${MAL_UPDATER_BOOTSTRAP_SERVICE_START:-prompt}"
+  policy="${policy,,}"
+  case "$policy" in
+    1|true|yes|on)
+      return 0
+      ;;
+    0|false|no|off|skip)
+      return 1
+      ;;
+    prompt|"")
+      if [ -t 0 ] && prompt_yes_no "Start or restart the mal-updater user service now?" no; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      printf 'Invalid MAL_UPDATER_BOOTSTRAP_SERVICE_START value: %s\n' "$MAL_UPDATER_BOOTSTRAP_SERVICE_START" >&2
+      printf 'Use yes, no, or prompt.\n' >&2
+      exit 2
+      ;;
+  esac
 }
 
 resolve_paths() {
@@ -272,23 +499,56 @@ run_auth_step() {
   shift
   say "$description"
   printf 'This may require network access, browser interaction, or a local callback depending on the provider.\n'
-  if prompt_yes_no "Run now?" yes; then
-    run_cli "$@"
-  else
-    printf 'Skipped: %s\n' "$description"
-  fi
+  local policy="${MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS:-prompt}"
+  policy="${policy,,}"
+  case "$policy" in
+    1|true|yes|on)
+      run_cli "$@"
+      ;;
+    0|false|no|off|skip)
+      printf 'Skipped: %s\n' "$description"
+      ;;
+    prompt|"")
+      if [ -t 0 ] && prompt_yes_no "Run now?" yes; then
+        run_cli "$@"
+      else
+        printf 'Skipped: %s\n' "$description"
+      fi
+      ;;
+    *)
+      printf 'Invalid MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS value: %s\n' "$MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS" >&2
+      printf 'Use yes, no, or prompt.\n' >&2
+      exit 2
+      ;;
+  esac
 }
-
 say "MAL-Updater production bootstrap"
 printf 'Repository: %s\n' "$REPO_ROOT"
-printf 'This script stages credential files, initializes runtime state, runs auth bootstraps, audits health, and installs the user systemd service.\n'
+printf 'This script stages selected credential files, initializes runtime state, runs selected auth bootstraps, audits health, and installs the user systemd service.\n'
 printf 'It will not run apply-sync --execute or perform live MAL writes beyond auth/token exchange.\n'
+printf 'Provider selection: set MAL_UPDATER_BOOTSTRAP_PROVIDERS=crunchyroll,hidive, all, or none; when unset, interactive runs ask and non-interactive runs infer only already staged/env-provided provider credentials.\n'
+printf 'Non-interactive controls: set MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS=yes/no/prompt and MAL_UPDATER_BOOTSTRAP_SERVICE_START=yes/no/prompt to control live auth/service start; otherwise auth/service start prompts only when there is a TTY.\n'
 printf 'Virtualenv: %s\n' "$BOOTSTRAP_VENV"
 printf 'Python:     %s\n' "$PYTHON_BIN"
 
 ensure_venv
 
-if prompt_yes_no "Install/update Python package dependencies with: $PYTHON_BIN -m pip install -e .?" "$PIP_INSTALL_DEFAULT"; then
+INSTALL_DEPS=0
+if [ -t 0 ]; then
+  if prompt_yes_no "Install/update Python package dependencies with: $PYTHON_BIN -m pip install -e .?" "$PIP_INSTALL_DEFAULT"; then
+    INSTALL_DEPS=1
+  fi
+else
+  case "${PIP_INSTALL_DEFAULT,,}" in
+    1|true|yes|on) INSTALL_DEPS=1 ;;
+    0|false|no|off|"") INSTALL_DEPS=0 ;;
+    *)
+      printf 'Invalid MAL_UPDATER_BOOTSTRAP_INSTALL_DEPS value: %s\n' "$PIP_INSTALL_DEFAULT" >&2
+      exit 2
+      ;;
+  esac
+fi
+if [ "$INSTALL_DEPS" = "1" ]; then
   "$PYTHON_BIN" -m pip install -e .
 else
   printf 'Skipped dependency install. Existing environment must already provide required packages.\n'
@@ -376,19 +636,35 @@ printf '  redirect_port = 8765\n'
 printf 'Register this exact MyAnimeList API callback URI before running MAL OAuth login:\n'
 printf '  http://%s:8765/callback\n' "$REDIRECT_HOST"
 
+say "Select source provider bootstraps"
+resolve_selected_providers
+print_selected_providers
+
 say "Stage credentials"
-prompt_value "MAL client id" "$MAL_CLIENT_ID_PATH" no
-prompt_value "MAL client secret" "$MAL_CLIENT_SECRET_PATH" yes
-prompt_value "Crunchyroll username/email" "$CRUNCHYROLL_USERNAME_PATH" no
-prompt_value "Crunchyroll password" "$CRUNCHYROLL_PASSWORD_PATH" yes
-prompt_value "HIDIVE username/email" "$HIDIVE_USERNAME_PATH" no
-prompt_value "HIDIVE password" "$HIDIVE_PASSWORD_PATH" yes
+prompt_value "MAL client id" "$MAL_CLIENT_ID_PATH" no MAL_UPDATER_MAL_CLIENT_ID
+prompt_value "MAL client secret" "$MAL_CLIENT_SECRET_PATH" yes MAL_UPDATER_MAL_CLIENT_SECRET
+if provider_is_selected crunchyroll; then
+  prompt_value "Crunchyroll username/email" "$CRUNCHYROLL_USERNAME_PATH" no MAL_UPDATER_CRUNCHYROLL_USERNAME
+  prompt_value "Crunchyroll password" "$CRUNCHYROLL_PASSWORD_PATH" yes MAL_UPDATER_CRUNCHYROLL_PASSWORD
+else
+  printf 'Skipping Crunchyroll credential prompts/auth because Crunchyroll was not selected for this bootstrap run.\n'
+fi
+if provider_is_selected hidive; then
+  prompt_value "HIDIVE username/email" "$HIDIVE_USERNAME_PATH" no MAL_UPDATER_HIDIVE_USERNAME
+  prompt_value "HIDIVE password" "$HIDIVE_PASSWORD_PATH" yes MAL_UPDATER_HIDIVE_PASSWORD
+else
+  printf 'Skipping HIDIVE credential prompts/auth because HIDIVE was not selected for this bootstrap run.\n'
+fi
 chmod 700 -- "$SECRETS_DIR"
 find "$SECRETS_DIR" -type f -exec chmod 600 {} +
 
 run_auth_step "MyAnimeList OAuth login (mal-auth-login)" mal-auth-login
-run_auth_step "Crunchyroll provider auth login" provider-auth-login --provider crunchyroll
-run_auth_step "HIDIVE provider auth login" provider-auth-login --provider hidive
+if provider_is_selected crunchyroll; then
+  run_auth_step "Crunchyroll provider auth login" provider-auth-login --provider crunchyroll
+fi
+if provider_is_selected hidive; then
+  run_auth_step "HIDIVE provider auth login" provider-auth-login --provider hidive
+fi
 
 say "Read-only bootstrap audit"
 run_cli bootstrap-audit --summary
@@ -397,15 +673,20 @@ say "Read-only health check"
 run_cli health-check --format summary
 
 say "Install/update user systemd service"
+INSTALL_ARGS=()
+START_SERVICE=0
+if resolve_service_start; then
+  START_SERVICE=1
+  INSTALL_ARGS+=(--start-service)
+fi
 if [ -x "$REPO_ROOT/scripts/install_user_systemd_units.sh" ]; then
-  MAL_UPDATER_SERVICE_PYTHON_BIN="$PYTHON_BIN" "$REPO_ROOT/scripts/install_user_systemd_units.sh"
+  MAL_UPDATER_SERVICE_PYTHON_BIN="$PYTHON_BIN" "$REPO_ROOT/scripts/install_user_systemd_units.sh" "${INSTALL_ARGS[@]}"
 else
-  MAL_UPDATER_SERVICE_PYTHON_BIN="$PYTHON_BIN" bash "$REPO_ROOT/scripts/install_user_systemd_units.sh"
+  MAL_UPDATER_SERVICE_PYTHON_BIN="$PYTHON_BIN" bash "$REPO_ROOT/scripts/install_user_systemd_units.sh" "${INSTALL_ARGS[@]}"
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
-  if prompt_yes_no "Start or restart the mal-updater user service now?" no; then
-    systemctl --user restart mal-updater.service
+  if [ "$START_SERVICE" = "1" ]; then
     systemctl --user status --no-pager --lines=20 mal-updater.service || true
   else
     printf 'Service start skipped. You can start it later with: systemctl --user start mal-updater.service\n'
@@ -413,6 +694,5 @@ if command -v systemctl >/dev/null 2>&1; then
 else
   warn "systemctl not found; service install script may have reported host-specific guidance."
 fi
-
 say "Bootstrap complete"
 printf 'Review audit/health output above before enabling unattended production use.\n'

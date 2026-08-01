@@ -75,7 +75,7 @@ A new OpenClaw instance should be able to:
 4. guide the user through MAL app creation / redirect configuration
 5. stage secrets into the external runtime tree
 6. install the rendered long-lived user daemon when supported
-7. verify daemon health via `service-status`, `service-run-once`, and `health-check`
+7. verify daemon health via `service-status` and `health-check`; reserve `service-run-once` for an explicit opt-in live daemon pass because it can run provider fetch, local ingest, and exact-approved MAL apply lanes
 
 ## Guardrails
 

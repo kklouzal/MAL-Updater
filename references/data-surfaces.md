@@ -28,16 +28,16 @@ Use:
 ```bash
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
 
 These expose:
 - service install/enable/active state
-- one-pass daemon work execution (`service-run-once` is live/mutating-capable because it can run due provider fetch, local ingest, and exact-approved MAL apply lanes; use `service-status`/`health-check` for inspection only)
 - health warnings and recommended remediation commands
 - automation/runtime drift
 - persisted task cadence/backoff details, including provider-floor cooldown provenance when budget pacing was extended on purpose
+
+Use `service-run-once` only as an opt-in live/manual daemon pass. It can run due provider fetch, local ingest, and exact-approved MAL apply lanes; use `service-status`/`health-check` for inspection only.
 
 ## Recommendations
 

@@ -85,7 +85,7 @@ single-attempt. Investigate an ambiguous timeout before authenticating or
 applying again; recoverable token/credential state is left in place.
 ```
 
-`provider-auth-login` is live/provider-auth-mutating for the named provider because it logs in and writes local token/session state. `provider-fetch-snapshot` is live/provider-read and may write local cache/state; adding `--ingest` also mutates the local SQLite provider cache. HIDIVE snapshots cover account history, continue-watching, and favourites-as-watchlist surfaces; Crunchyroll additionally supports the page chunk/resume flags documented in CLI help.
+`provider-auth-login` is live/provider-auth-mutating for the named provider because it logs in and writes local token/session state. `provider-fetch-snapshot` is live/provider-read and may write local cache/state; adding `--ingest` also mutates the local SQLite provider cache. HIDIVE auth/session state plus account history, Continue Watching, favourites-as-watchlist, and custom-list collection/detail snapshots are supported; HIDIVE recommendation enrichment/title lookup remains bounded to specific-title search, and HIDIVE full refresh is manual/non-chunked. Crunchyroll additionally supports the page chunk/resume flags documented in CLI help.
 
 ## Review / sync
 
@@ -122,8 +122,9 @@ PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
+
+`service-run-once` is a live/mutating-capable manual daemon pass, not a routine inspection command. It can run due provider fetches, local ingest, and exact-approved MAL apply lanes; use it only after explicit operator intent, and use `service-status` / `health-check` for read-only verification.
 
 Use one install path, not both, for routine setup. Prefer `scripts/install_user_systemd_units.sh` for production bootstrap because it renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/` and preserves/installs the service env file. The CLI `install-service` path is a compatibility/direct service-manager path for targeted repair or tests. The tracked daemon unit uses conservative user-service sandboxing (`UMask=0077`, `NoNewPrivileges=true`, `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, and a narrow address-family allowlist) while allowing the resolved MAL-Updater runtime/config/secrets/data/state/cache/DB directories to remain writable for SQLite, logs, token refreshes, and service state through a de-duplicated `ReadWritePaths` allowlist. The deterministic renderer intentionally supports absolute systemd paths without whitespace/control characters and fails fast on unsupported path values instead of emitting ambiguous unit syntax.
 

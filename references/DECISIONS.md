@@ -18,10 +18,10 @@ Build MAL-Updater as a local Orin-hosted integration using:
 ## 2026-03-14 - Sync direction
 
 ### Decision
-One-way sync first: Crunchyroll -> MyAnimeList.
+One-way sync first: credentialed source providers -> MyAnimeList. This began as Crunchyroll-only and now includes Crunchyroll plus HIDIVE for the supported account-scoped surfaces.
 
 ### Why
-- Crunchyroll is the behavioral source of truth for watched progress
+- credentialed source-provider account surfaces are the behavioral source of truth for watched progress
 - MAL should be updated conservatively as the public-facing tracking layer
 - two-way reconciliation adds unnecessary risk early
 

@@ -25,9 +25,10 @@ Useful service-oriented commands:
 ```bash
 PYTHONPATH=src python3 -m mal_updater.cli install-service
 PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
 ```
+
+Use `service-run-once` only as an explicit live/manual daemon pass; it may run provider fetch, local ingest, and exact-approved MAL apply lanes. It is not a read-only service check.
 
 ## Configuration model
 
@@ -62,7 +63,6 @@ Default daemon/runtime files under `.MAL-Updater/state/`:
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
 PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
