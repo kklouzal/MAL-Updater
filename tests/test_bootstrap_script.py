@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pty
 import shutil
 import subprocess
 import sys
@@ -158,15 +159,37 @@ def _run_bootstrap(tmp_path: Path, env: dict[str, str]) -> subprocess.CompletedP
     )
 
 
-def test_bootstrap_skips_unselected_provider_credentials_and_auth(tmp_path: Path) -> None:
+def _run_bootstrap_with_tty_input(tmp_path: Path, env: dict[str, str], input_text: str) -> subprocess.CompletedProcess[str]:
+    repo_root, bootstrap_path = _make_bootstrap_repo(tmp_path)
+    master_fd, slave_fd = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            ["bash", str(bootstrap_path)],
+            cwd=repo_root,
+            stdin=slave_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        os.write(master_fd, input_text.encode())
+        stdout, stderr = process.communicate(timeout=30)
+        return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+    finally:
+        if slave_fd >= 0:
+            os.close(slave_fd)
+        if master_fd >= 0:
+            os.close(master_fd)
+
+
+def test_bootstrap_noninteractive_accepts_client_id_only_without_optional_mal_client_secret(tmp_path: Path) -> None:
     env, runtime, log_path = _bootstrap_env(tmp_path)
     env.update(
         {
-            "MAL_UPDATER_BOOTSTRAP_PROVIDERS": "crunchyroll",
+            "MAL_UPDATER_BOOTSTRAP_PROVIDERS": "none",
             "MAL_UPDATER_MAL_CLIENT_ID": "client-id",
-            "MAL_UPDATER_MAL_CLIENT_SECRET": "client-secret",
-            "MAL_UPDATER_CRUNCHYROLL_USERNAME": "cr-user@example.invalid",
-            "MAL_UPDATER_CRUNCHYROLL_PASSWORD": "cr-secret",
         }
     )
 
@@ -175,16 +198,34 @@ def test_bootstrap_skips_unselected_provider_credentials_and_auth(tmp_path: Path
     assert result.returncode == 0, result.stderr + result.stdout
     secrets = runtime / "secrets"
     assert (secrets / "mal_client_id.txt").read_text(encoding="utf-8") == "client-id\n"
-    assert (secrets / "mal_client_secret.txt").read_text(encoding="utf-8") == "client-secret\n"
-    assert (secrets / "crunchyroll_username.txt").read_text(encoding="utf-8") == "cr-user@example.invalid\n"
-    assert (secrets / "crunchyroll_password.txt").read_text(encoding="utf-8") == "cr-secret\n"
+    assert not (secrets / "mal_client_secret.txt").exists()
+    assert not (secrets / "crunchyroll_username.txt").exists()
+    assert not (secrets / "crunchyroll_password.txt").exists()
     assert not (secrets / "hidive_username.txt").exists()
     assert not (secrets / "hidive_password.txt").exists()
-    assert "Source provider bootstraps selected: crunchyroll" in result.stdout
-    assert "Skipping HIDIVE credential prompts/auth" in result.stdout
-    assert "provider-auth-login --provider crunchyroll" not in log_path.read_text(encoding="utf-8")
-    assert "provider-auth-login --provider hidive" not in log_path.read_text(encoding="utf-8")
-    _assert_secrets_not_echoed(result, "client-secret", "cr-secret")
+    assert "Source provider bootstraps selected: none" in result.stdout
+    assert "Optional MAL client secret" in result.stdout
+    assert "provider-auth-login" not in log_path.read_text(encoding="utf-8")
+
+
+def test_bootstrap_stages_environment_provided_optional_mal_client_secret(tmp_path: Path) -> None:
+    env, runtime, _log_path = _bootstrap_env(tmp_path)
+    env.update(
+        {
+            "MAL_UPDATER_BOOTSTRAP_PROVIDERS": "none",
+            "MAL_UPDATER_MAL_CLIENT_ID": "client-id",
+            "MAL_UPDATER_MAL_CLIENT_SECRET": "env-client-secret",
+        }
+    )
+
+    result = _run_bootstrap(tmp_path, env)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    secrets = runtime / "secrets"
+    assert (secrets / "mal_client_id.txt").read_text(encoding="utf-8") == "client-id\n"
+    assert (secrets / "mal_client_secret.txt").read_text(encoding="utf-8") == "env-client-secret\n"
+    assert "Staged MAL client secret" in result.stdout
+    _assert_secrets_not_echoed(result, "env-client-secret")
 
 
 def test_bootstrap_noninteractive_infers_existing_provider_and_preserves_secrets(tmp_path: Path) -> None:
@@ -208,6 +249,33 @@ def test_bootstrap_noninteractive_infers_existing_provider_and_preserves_secrets
     assert "Skipping Crunchyroll credential prompts/auth" in result.stdout
     _assert_secrets_not_echoed(result, "existing-secret", "existing-hidive-secret")
     assert "provider-auth-login --provider" not in log_path.read_text(encoding="utf-8")
+
+
+def test_bootstrap_interactive_allows_skipping_optional_mal_client_secret(tmp_path: Path) -> None:
+    env, runtime, _log_path = _bootstrap_env(tmp_path)
+    env.update(
+        {
+            "MAL_UPDATER_BOOTSTRAP_INSTALL_DEPS": "no",
+            "MAL_UPDATER_BOOTSTRAP_PROVIDERS": "none",
+        }
+    )
+
+    result = _run_bootstrap_with_tty_input(
+        tmp_path,
+        env,
+        "\n"  # skip dependency install
+        "interactive-client-id\n"
+        "\n"  # skip optional MAL client secret
+        "n\n",  # do not start service
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    secrets = runtime / "secrets"
+    assert (secrets / "mal_client_id.txt").read_text(encoding="utf-8") == "interactive-client-id\n"
+    assert not (secrets / "mal_client_secret.txt").exists()
+    assert "Enter MAL client secret (optional; press Enter to skip):" in result.stderr
+    assert "Skipping optional MAL client secret" in result.stdout
+    _assert_secrets_not_echoed(result, "interactive-client-id")
 
 
 def test_bootstrap_can_opt_into_selected_provider_auth_without_other_provider(tmp_path: Path) -> None:
@@ -302,6 +370,18 @@ def test_bootstrap_invalid_service_start_policy_exits_without_installing_or_star
     assert "install-systemd" not in log
     assert "systemctl " not in log
     _assert_secrets_not_echoed(result, "client-secret")
+
+
+def test_bootstrap_noninteractive_still_requires_mal_client_id(tmp_path: Path) -> None:
+    env, runtime, _log_path = _bootstrap_env(tmp_path)
+    env.update({"MAL_UPDATER_BOOTSTRAP_PROVIDERS": "none"})
+
+    result = _run_bootstrap(tmp_path, env)
+
+    assert result.returncode == 1
+    assert "Missing MAL client id" in result.stderr
+    assert not (runtime / "secrets" / "mal_client_id.txt").exists()
+    assert not (runtime / "secrets" / "mal_client_secret.txt").exists()
 
 
 def test_bootstrap_invalid_provider_selection_exits_before_secrets_install_or_auth(

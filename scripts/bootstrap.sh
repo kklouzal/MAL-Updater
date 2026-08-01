@@ -113,10 +113,16 @@ prompt_value() {
   local label="$1"
   local path="$2"
   local secret="$3"
-  shift 3
+  local required="$4"
+  shift 4
   local value=""
   local env_value=""
   local env_label=""
+  local prompt_label="$label"
+
+  if [ "$required" = "no" ]; then
+    prompt_label="$label (optional; press Enter to skip)"
+  fi
 
   if [ -f "$path" ] && [ -s "$path" ]; then
     if [ ! -t 0 ]; then
@@ -138,23 +144,37 @@ prompt_value() {
 
   if [ ! -t 0 ]; then
     env_label="$(env_names_label "$@")"
-    if [ -n "$env_label" ]; then
-      printf 'Missing %s at %s and no environment value (%s) was provided in non-interactive mode.\n' "$label" "$path" "$env_label" >&2
-    else
-      printf 'Missing %s at %s in non-interactive mode.\n' "$label" "$path" >&2
+    if [ "$required" = "yes" ]; then
+      if [ -n "$env_label" ]; then
+        printf 'Missing %s at %s and no environment value (%s) was provided in non-interactive mode.\n' "$label" "$path" "$env_label" >&2
+      else
+        printf 'Missing %s at %s in non-interactive mode.\n' "$label" "$path" >&2
+      fi
+      return 1
     fi
-    return 1
+    if [ -n "$env_label" ]; then
+      printf 'Optional %s was not staged at %s; no environment value (%s) was provided. Continuing without it.\n' "$label" "$path" "$env_label"
+    else
+      printf 'Optional %s was not staged at %s. Continuing without it.\n' "$label" "$path"
+    fi
+    return 0
   fi
 
   while [ -z "$value" ]; do
     if [ "$secret" = "yes" ]; then
-      read -r -s -p "Enter $label: " value || return 1
+      read -r -s -p "Enter $prompt_label: " value || return 1
       printf '\n'
     else
-      read -r -p "Enter $label: " value || return 1
+      read -r -p "Enter $prompt_label: " value || return 1
     fi
-    if [ -z "$value" ]; then
+    if [ -n "$value" ]; then
+      break
+    fi
+    if [ "$required" = "yes" ]; then
       printf '%s cannot be empty. Press Ctrl-C to abort or enter a value.\n' "$label"
+    else
+      printf 'Skipping optional %s; no file will be staged at %s.\n' "$label" "$path"
+      return 0
     fi
   done
 
@@ -641,17 +661,17 @@ resolve_selected_providers
 print_selected_providers
 
 say "Stage credentials"
-prompt_value "MAL client id" "$MAL_CLIENT_ID_PATH" no MAL_UPDATER_MAL_CLIENT_ID
-prompt_value "MAL client secret" "$MAL_CLIENT_SECRET_PATH" yes MAL_UPDATER_MAL_CLIENT_SECRET
+prompt_value "MAL client id" "$MAL_CLIENT_ID_PATH" no yes MAL_UPDATER_MAL_CLIENT_ID
+prompt_value "MAL client secret" "$MAL_CLIENT_SECRET_PATH" yes no MAL_UPDATER_MAL_CLIENT_SECRET
 if provider_is_selected crunchyroll; then
-  prompt_value "Crunchyroll username/email" "$CRUNCHYROLL_USERNAME_PATH" no MAL_UPDATER_CRUNCHYROLL_USERNAME
-  prompt_value "Crunchyroll password" "$CRUNCHYROLL_PASSWORD_PATH" yes MAL_UPDATER_CRUNCHYROLL_PASSWORD
+  prompt_value "Crunchyroll username/email" "$CRUNCHYROLL_USERNAME_PATH" no yes MAL_UPDATER_CRUNCHYROLL_USERNAME
+  prompt_value "Crunchyroll password" "$CRUNCHYROLL_PASSWORD_PATH" yes yes MAL_UPDATER_CRUNCHYROLL_PASSWORD
 else
   printf 'Skipping Crunchyroll credential prompts/auth because Crunchyroll was not selected for this bootstrap run.\n'
 fi
 if provider_is_selected hidive; then
-  prompt_value "HIDIVE username/email" "$HIDIVE_USERNAME_PATH" no MAL_UPDATER_HIDIVE_USERNAME
-  prompt_value "HIDIVE password" "$HIDIVE_PASSWORD_PATH" yes MAL_UPDATER_HIDIVE_PASSWORD
+  prompt_value "HIDIVE username/email" "$HIDIVE_USERNAME_PATH" no yes MAL_UPDATER_HIDIVE_USERNAME
+  prompt_value "HIDIVE password" "$HIDIVE_PASSWORD_PATH" yes yes MAL_UPDATER_HIDIVE_PASSWORD
 else
   printf 'Skipping HIDIVE credential prompts/auth because HIDIVE was not selected for this bootstrap run.\n'
 fi
