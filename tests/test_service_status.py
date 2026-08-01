@@ -364,7 +364,7 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertFalse(payload["enabled"])
         self.assertFalse(payload["active"])
         self.assertIn("JSONDecodeError", payload["service_state_parse_error"])
-        self.assertEqual(f"Expected top-level object in {self.config.health_latest_json_path.name}", payload["health_latest_parse_error"])
+        self.assertEqual(f"type=UnexpectedJsonType file={self.config.health_latest_json_path.name} expected=object", payload["health_latest_parse_error"])
         self.assertEqual({}, payload["task_state"])
         self.assertIsNone(payload["last_loop_at"])
         self.assertNotIn("api_usage", payload)
@@ -820,8 +820,8 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("enabled=False", stdout)
         self.assertIn("active=False", stdout)
-        self.assertIn("service_state_parse_error=JSONDecodeError", stdout)
-        self.assertIn(f"health_latest_parse_error=Expected top-level object in {self.config.health_latest_json_path.name}", stdout)
+        self.assertIn("service_state_parse_error=type=JSONDecodeError", stdout)
+        self.assertIn(f"health_latest_parse_error=type=UnexpectedJsonType file={self.config.health_latest_json_path.name} expected=object", stdout)
 
     def test_service_status_exposes_effective_niceness_policy_and_cache_horizons(self) -> None:
         with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr="not-found\n")):

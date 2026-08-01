@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, auth_failure_remediation, classify_auth_style_failure
 from .config import AppConfig
 from .crunchyroll_auth import resolve_crunchyroll_state_paths
 from .hidive_auth import resolve_hidive_state_paths
+from .persistence import PersistentJsonError, read_json_dict_bounded
 from .redaction import sanitize_text, sanitize_value
+
+_AUTH_STATE_JSON_MAX_BYTES = 2 * 1024 * 1024
 
 
 def load_json_dict(path: Path) -> dict[str, object] | None:
-    if not path.exists():
-        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = read_json_dict_bounded(path, max_bytes=_AUTH_STATE_JSON_MAX_BYTES)
+    except PersistentJsonError:
         return None
     return payload if isinstance(payload, dict) else None
 

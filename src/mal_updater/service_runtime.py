@@ -27,6 +27,7 @@ from .crunchyroll_auth import load_crunchyroll_credentials
 from .hidive_auth import load_hidive_credentials
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
+from .persistence import PersistentJsonError, atomic_write_json, read_json_dict_bounded
 from .redaction import sanitize_command, sanitize_text, sanitize_url, sanitize_value
 from .request_tracking import (
     begin_api_request_context,
@@ -36,7 +37,7 @@ from .request_tracking import (
     end_api_request_context,
     estimate_budget_recovery_seconds,
     estimate_budget_recovery_seconds_for_ratio,
-    prune_api_request_events,
+    prune_api_request_events_with_diagnostics,
     request_context_environment,
     summarize_recent_api_usage,
 )
@@ -64,6 +65,15 @@ _RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS = 15 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 4
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT = 5
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE = 1
+_SERVICE_STATE_MAX_BYTES = 8 * 1024 * 1024
+_LEASE_STATUS_MAX_BYTES = 256 * 1024
+
+
+class ServiceStateLoadError(RuntimeError):
+    def __init__(self, message: str) -> None:
+        safe_message = sanitize_text(message, max_length=500)
+        super().__init__(safe_message)
+        self.safe_message = safe_message
 
 
 def _now_iso() -> str:
@@ -75,15 +85,19 @@ def _iso_after_seconds(seconds: int) -> str:
 
 
 def _load_state(config: AppConfig) -> dict[str, Any]:
-    if not config.service_state_path.exists():
+    try:
+        payload = read_json_dict_bounded(config.service_state_path, max_bytes=_SERVICE_STATE_MAX_BYTES)
+    except PersistentJsonError as exc:
+        raise ServiceStateLoadError(exc.safe_message) from None
+    if payload is None:
         return {"started_at": _now_iso(), "tasks": {}}
-    payload = json.loads(config.service_state_path.read_text(encoding="utf-8"))
     safe = sanitize_value(payload, max_depth=12, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
-    return safe if isinstance(safe, dict) else payload
+    if not isinstance(safe, dict):
+        raise ServiceStateLoadError(f"type=UnexpectedJsonType file={config.service_state_path.name} expected=object")
+    return safe
 
 
 def _save_state(config: AppConfig, state: dict[str, Any]) -> None:
-    temp_path = config.service_state_path.with_suffix(f"{config.service_state_path.suffix}.{os.getpid()}.tmp")
     safe_state = sanitize_value(state, max_depth=12, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
     if isinstance(safe_state, dict):
         safe_tasks = safe_state.get("tasks")
@@ -91,16 +105,15 @@ def _save_state(config: AppConfig, state: dict[str, Any]) -> None:
             for safe_task_state in safe_tasks.values():
                 if isinstance(safe_task_state, dict) and isinstance(safe_task_state.get("last_result"), dict):
                     safe_task_state["last_result"] = _persistable_task_result(safe_task_state["last_result"])
-    temp_path.write_text(json.dumps(safe_state, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temp_path, config.service_state_path)
+    atomic_write_json(config.service_state_path, safe_state, indent=2, sort_keys=True)
 
 
 def _read_json_dict(path: Any) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        payload = read_json_dict_bounded(path, max_bytes=_LEASE_STATUS_MAX_BYTES)
+    except PersistentJsonError:
         return {}
-    if not isinstance(payload, dict):
+    if payload is None:
         return {}
     safe = sanitize_value(payload, max_depth=8, max_items=100, max_string=1_000)
     return safe if isinstance(safe, dict) else {}
@@ -119,12 +132,10 @@ class _ProcessLease:
         self.status: dict[str, Any] = {}
 
     def _write_status(self, payload: dict[str, Any]) -> None:
-        temp_path = self.status_path.with_suffix(f".json.{os.getpid()}.{self.run_id}.tmp")
         safe_payload = sanitize_value(payload, max_depth=8, max_items=100, max_string=1_000)
         if not isinstance(safe_payload, dict):
             safe_payload = {}
-        temp_path.write_text(json.dumps(safe_payload, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(temp_path, self.status_path)
+        atomic_write_json(self.status_path, safe_payload, indent=2, sort_keys=True)
         self.status = safe_payload
 
     def try_acquire(self, *, phase: str) -> bool:
@@ -921,7 +932,16 @@ def _run_maintenance_cycle_unlocked(
         include_provider_refresh=include_provider_refresh,
         local_only=local_only,
     )
-    state = _load_state(config)
+    try:
+        state = _load_state(config)
+    except ServiceStateLoadError as exc:
+        _append_log(config, f"task=recommend_maintain status=error reason=service_state_unavailable detail={exc.safe_message}")
+        return {
+            "status": "error",
+            "reason": "service_state_unavailable",
+            "service_state_parse_error": exc.safe_message,
+            "state_file": str(config.service_state_path),
+        }
     task_state = state.setdefault("tasks", {}).setdefault("recommend_maintain", {})
     started_epoch = time.time()
     started_at = datetime.fromtimestamp(started_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1013,13 +1033,11 @@ def _provider_from_refresh_command_args(command_args: object) -> str | None:
 
 def _provider_fetch_health_request(config: AppConfig, provider: str, task_state: dict[str, Any]) -> dict[str, Any] | None:
     path = config.health_latest_json_path
-    if not path.exists():
-        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = read_json_dict_bounded(path, max_bytes=_SERVICE_STATE_MAX_BYTES)
+    except PersistentJsonError:
         return None
-    if not isinstance(payload, dict):
+    if payload is None:
         return None
     maintenance = payload.get("maintenance")
     if not isinstance(maintenance, dict):
@@ -1788,13 +1806,56 @@ def _summarize_task_failure(result: dict[str, Any]) -> str | None:
 def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
     config = config or load_config()
     ensure_directories(config)
-    state = _load_state(config)
-    tasks_state = state.setdefault("tasks", {})
+    try:
+        state = _load_state(config)
+    except ServiceStateLoadError as exc:
+        _append_log(config, f"scheduler status=error reason=service_state_unavailable detail={exc.safe_message}")
+        return {
+            "status": "error",
+            "reason": "service_state_unavailable",
+            "results": [],
+            "service_state_parse_error": exc.safe_message,
+            "state_file": str(config.service_state_path),
+        }
     now = time.time()
     results: list[dict[str, Any]] = []
-    pruned = prune_api_request_events(retention_days=14, config=config)
-    if pruned:
-        _append_log(config, f"api_request_events_pruned={pruned}")
+    try:
+        prune_report = prune_api_request_events_with_diagnostics(retention_days=14, config=config)
+    except Exception as exc:
+        error_type = sanitize_text(type(exc).__name__, max_length=100)
+        _append_log(config, f"scheduler status=error reason=api_request_events_unavailable status=blocked_error error_type={error_type}")
+        return {
+            "status": "error",
+            "reason": "api_request_events_unavailable",
+            "results": [],
+            "api_request_events_prune": {"status": "blocked_error", "blocked": True, "error_type": error_type},
+            "api_request_events_file": str(config.api_request_events_path),
+            "state_file": str(config.service_state_path),
+        }
+    if prune_report.blocked:
+        _append_log(
+            config,
+            "scheduler status=error reason=api_request_events_unavailable "
+            f"status={prune_report.status} corrupt_records={prune_report.corrupt_records} "
+            f"expired_candidates={prune_report.expired_candidates} kept_records={prune_report.kept_records} "
+            f"scanned_records={prune_report.scanned_records}",
+        )
+        return {
+            "status": "error",
+            "reason": "api_request_events_unavailable",
+            "results": [],
+            "api_request_events_prune": prune_report.as_dict(),
+            "api_request_events_file": str(config.api_request_events_path),
+            "state_file": str(config.service_state_path),
+        }
+    if prune_report.actual_removed:
+        _append_log(
+            config,
+            "api_request_events_pruned="
+            f"{prune_report.actual_removed} expired_removed={prune_report.expired_removed} "
+            f"kept_records={prune_report.kept_records} scanned_records={prune_report.scanned_records}",
+        )
+    tasks_state = state.setdefault("tasks", {})
 
     for spec in _task_specs(config):
         task_state = tasks_state.setdefault(spec.name, {})

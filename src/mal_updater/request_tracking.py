@@ -12,13 +12,15 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import AppConfig, load_config
+from .persistence import DEFAULT_JSONL_MAX_LINE_BYTES, atomic_writer, iter_json_lines
 from .redaction import sanitize_text, sanitize_url
 
 REQUEST_TASK_ENV = "MAL_UPDATER_REQUEST_TASK"
 REQUEST_RUN_ENV = "MAL_UPDATER_REQUEST_RUN_ID"
+_MAX_API_EVENT_LINE_BYTES = DEFAULT_JSONL_MAX_LINE_BYTES
 
 
 @dataclass(slots=True)
@@ -31,6 +33,35 @@ class ApiRequestContext:
 @dataclass(frozen=True, slots=True)
 class ApiEventBoundary:
     event_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ApiEventPruneReport:
+    status: str
+    blocked: bool
+    actual_removed: int
+    expired_removed: int
+    expired_candidates: int
+    corrupt_records: int
+    kept_records: int
+    scanned_records: int
+
+    @property
+    def removed(self) -> int:
+        """Compatibility alias for records actually removed from disk."""
+        return self.actual_removed
+
+    def as_dict(self) -> dict[str, int | str | bool]:
+        return {
+            "status": self.status,
+            "blocked": self.blocked,
+            "actual_removed": self.actual_removed,
+            "expired_removed": self.expired_removed,
+            "expired_candidates": self.expired_candidates,
+            "corrupt_records": self.corrupt_records,
+            "kept_records": self.kept_records,
+            "scanned_records": self.scanned_records,
+        }
 
 
 @dataclass(slots=True)
@@ -130,24 +161,18 @@ def _parse_event_timestamp(value: object) -> datetime | None:
         return None
 
 
-def _iter_events(config: AppConfig | None = None) -> list[dict[str, Any]]:
+def _iter_events(config: AppConfig | None = None) -> Iterator[dict[str, Any]]:
     path = _events_path(config)
     if not path.exists():
-        return []
-    events: list[dict[str, Any]] = []
+        return
     with _event_file_lock(path, exclusive=False):
         if not path.exists():
-            return []
-        lines = path.read_text(encoding="utf-8").splitlines()
-    for line in lines:
-        if line.strip():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
+            return
+        for record in iter_json_lines(path, max_line_bytes=_MAX_API_EVENT_LINE_BYTES):
+            if record.error is not None:
                 continue
-            if isinstance(event, dict):
-                events.append(event)
-    return events
+            if isinstance(record.value, dict):
+                yield record.value
 
 
 def capture_api_event_boundary(*, config: AppConfig | None = None) -> ApiEventBoundary:
@@ -296,29 +321,100 @@ def estimate_budget_recovery_seconds(
     )
 
 
-def prune_api_request_events(*, retention_days: int = 14, config: AppConfig | None = None) -> int:
+def prune_api_request_events_with_diagnostics(*, retention_days: int = 14, config: AppConfig | None = None) -> ApiEventPruneReport:
     path = _events_path(config)
     if not path.exists():
-        return 0
+        return ApiEventPruneReport(
+            status="ok",
+            blocked=False,
+            actual_removed=0,
+            expired_removed=0,
+            expired_candidates=0,
+            corrupt_records=0,
+            kept_records=0,
+            scanned_records=0,
+        )
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    kept: list[str] = []
-    removed = 0
+    kept_records = expired_candidates = corrupt_records = scanned_records = 0
     with _event_file_lock(path, exclusive=True):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
+        if not path.exists():
+            return ApiEventPruneReport(
+                status="ok",
+                blocked=False,
+                actual_removed=0,
+                expired_removed=0,
+                expired_candidates=0,
+                corrupt_records=0,
+                kept_records=0,
+                scanned_records=0,
+            )
+
+        for record in iter_json_lines(path, max_line_bytes=_MAX_API_EVENT_LINE_BYTES):
+            scanned_records += 1
+            if record.error is not None:
+                corrupt_records += 1
                 continue
-            try:
-                event = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
-                removed += 1
+            event = record.value
+            if not isinstance(event, dict):
+                corrupt_records += 1
                 continue
-            at = _parse_event_timestamp(event.get("at") if isinstance(event, dict) else None)
+            at = _parse_event_timestamp(event.get("at"))
             if at is None:
-                removed += 1
+                corrupt_records += 1
                 continue
             if at >= cutoff:
-                kept.append(json.dumps(event, sort_keys=True))
+                kept_records += 1
             else:
-                removed += 1
-        path.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
-    return removed
+                expired_candidates += 1
+
+        if corrupt_records:
+            return ApiEventPruneReport(
+                status="blocked_corrupt",
+                blocked=True,
+                actual_removed=0,
+                expired_removed=0,
+                expired_candidates=expired_candidates,
+                corrupt_records=corrupt_records,
+                kept_records=kept_records,
+                scanned_records=scanned_records,
+            )
+
+        if expired_candidates == 0:
+            return ApiEventPruneReport(
+                status="ok",
+                blocked=False,
+                actual_removed=0,
+                expired_removed=0,
+                expired_candidates=0,
+                corrupt_records=0,
+                kept_records=kept_records,
+                scanned_records=scanned_records,
+            )
+
+        expired_removed = 0
+        with atomic_writer(path) as out:
+            for record in iter_json_lines(path, max_line_bytes=_MAX_API_EVENT_LINE_BYTES):
+                event = record.value
+                if record.error is not None or not isinstance(event, dict):
+                    raise RuntimeError("api_request_events_changed_during_locked_prune")
+                at = _parse_event_timestamp(event.get("at"))
+                if at is None:
+                    raise RuntimeError("api_request_events_changed_during_locked_prune")
+                if at >= cutoff:
+                    out.write(json.dumps(event, sort_keys=True).encode("utf-8") + b"\n")
+                else:
+                    expired_removed += 1
+    return ApiEventPruneReport(
+        status="ok",
+        blocked=False,
+        actual_removed=expired_removed,
+        expired_removed=expired_removed,
+        expired_candidates=expired_candidates,
+        corrupt_records=0,
+        kept_records=kept_records,
+        scanned_records=scanned_records,
+    )
+
+
+def prune_api_request_events(*, retention_days: int = 14, config: AppConfig | None = None) -> int:
+    return prune_api_request_events_with_diagnostics(retention_days=retention_days, config=config).removed

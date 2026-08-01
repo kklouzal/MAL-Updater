@@ -100,6 +100,45 @@ class ServiceRuntimeLeaseTests(unittest.TestCase):
         self.assertEqual("ok", result["status"])
         sleep.assert_not_called()
 
+    def test_run_pending_tasks_fails_closed_on_corrupt_service_state(self) -> None:
+        sentinel = "SENTINEL-service-state-credential-123456789"
+        self.config.service_state_path.write_text(f'{{"tasks": {{}}, "refresh_token": "{sentinel}"', encoding="utf-8")
+
+        with patch("mal_updater.service_runtime._run_subprocess") as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        rendered = json.dumps(result)
+        log_text = self.config.service_log_path.read_text(encoding="utf-8")
+        self.assertEqual("error", result["status"])
+        self.assertEqual("service_state_unavailable", result["reason"])
+        self.assertIn("JSONDecodeError", result["service_state_parse_error"])
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn(sentinel, log_text)
+        self.assertIn(sentinel, self.config.service_state_path.read_text(encoding="utf-8"))
+        run_subprocess.assert_not_called()
+
+    def test_run_pending_tasks_fails_closed_on_corrupt_api_request_events(self) -> None:
+        sentinel = "SENTINEL-api-events-credential-123456789"
+        current_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        valid = {"event_id": "valid", "at": current_at, "provider": "mal", "operation": "current", "outcome": "ok"}
+        original_events = json.dumps(valid) + "\n" + f'{{"at":"{current_at}","refresh_token":"{sentinel}"' + "\n"
+        self.config.api_request_events_path.write_text(original_events, encoding="utf-8")
+
+        with patch("mal_updater.service_runtime._run_subprocess") as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        rendered = json.dumps(result)
+        log_text = self.config.service_log_path.read_text(encoding="utf-8")
+        self.assertEqual("error", result["status"])
+        self.assertEqual("api_request_events_unavailable", result["reason"])
+        self.assertEqual("blocked_corrupt", result["api_request_events_prune"]["status"])
+        self.assertEqual(1, result["api_request_events_prune"]["corrupt_records"])
+        self.assertEqual(original_events, self.config.api_request_events_path.read_text(encoding="utf-8"))
+        self.assertFalse(self.config.service_state_path.exists())
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn(sentinel, log_text)
+        run_subprocess.assert_not_called()
+
 
 class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import subprocess
 from typing import Any
 
 from .config import AppConfig, ensure_directories, load_config
+from .persistence import PersistentJsonError, read_json_dict_bounded
 from .redaction import sanitize_text, sanitize_url, sanitize_value
 from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
 from .service_systemd_status import build_service_status_payload
@@ -16,6 +17,8 @@ from .service_units import SERVICE_UNIT_NAME, render_repo_systemd_unit_template
 SERVICE_NAME = SERVICE_UNIT_NAME
 _RECENT_LOG_LINES = 20
 _RESULT_SNIPPET_LIMIT = 240
+_SERVICE_STATUS_JSON_MAX_BYTES = 8 * 1024 * 1024
+_SERVICE_LOG_LINE_MAX_BYTES = 16 * 1024
 
 
 @dataclass(slots=True)
@@ -38,27 +41,38 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
-    if not path.exists():
-        return None, None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, sanitize_text(f"{type(exc).__name__}: {exc}", max_length=500)
-    if not isinstance(payload, dict):
-        return None, f"Expected top-level object in {path.name}"
+        payload = read_json_dict_bounded(path, max_bytes=_SERVICE_STATUS_JSON_MAX_BYTES)
+    except PersistentJsonError as exc:
+        return None, sanitize_text(exc.safe_message, max_length=500)
+    if payload is None:
+        return None, None
     return payload, None
 
 
 def _tail_lines(path: Path, *, limit: int = _RECENT_LOG_LINES) -> list[str]:
     if not path.exists():
         return []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
     if limit <= 0:
         return []
-    return [sanitize_text(line, max_length=1_000) for line in lines[-limit:]]
+    recent: deque[str] = deque(maxlen=limit)
+    try:
+        with path.open("rb") as fh:
+            while True:
+                raw = fh.readline(_SERVICE_LOG_LINE_MAX_BYTES + 1)
+                if not raw:
+                    break
+                truncated = len(raw) > _SERVICE_LOG_LINE_MAX_BYTES
+                if truncated:
+                    while raw and not raw.endswith(b"\n"):
+                        chunk = fh.readline(_SERVICE_LOG_LINE_MAX_BYTES + 1)
+                        if not chunk or chunk.endswith(b"\n"):
+                            break
+                    raw = raw[:_SERVICE_LOG_LINE_MAX_BYTES] + b"...<truncated>"
+                recent.append(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+    except OSError:
+        return []
+    return [sanitize_text(line, max_length=1_000) for line in recent]
 
 
 def _snippet(value: object, *, limit: int = _RESULT_SNIPPET_LIMIT) -> str | None:

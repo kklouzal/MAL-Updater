@@ -16,6 +16,7 @@ from mal_updater.request_tracking import (
     end_api_request_context,
     record_api_request_event,
     prune_api_request_events,
+    prune_api_request_events_with_diagnostics,
     sanitize_telemetry_url,
     summarize_recent_api_usage,
 )
@@ -154,17 +155,85 @@ class RequestTrackingTests(unittest.TestCase):
     def test_malformed_port_is_sanitized_without_masking_caller_errors(self) -> None:
         self.assertEqual("<invalid-url>", sanitize_telemetry_url("https://example.invalid:not-a-port/path?q=secret"))
 
-    def test_naive_and_malformed_timestamps_do_not_break_usage_budget_or_pruning(self) -> None:
+    def test_malformed_timestamps_block_pruning_without_losing_original_records(self) -> None:
         naive = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         rows = [
             {"at": naive, "provider": "mal", "operation": "legacy", "outcome": "ok"},
             {"at": "not-a-date", "provider": "mal", "operation": "bad", "outcome": "ok"},
             {"at": "9999-12-31T23:59:59-23:59", "provider": "mal", "operation": "overflow", "outcome": "ok"},
         ]
-        self.config.api_request_events_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        original = "".join(json.dumps(row) + "\n" for row in rows)
+        self.config.api_request_events_path.write_text(original, encoding="utf-8")
         self.assertEqual(1, summarize_recent_api_usage(provider="mal", config=self.config).request_count)
-        self.assertEqual(2, prune_api_request_events(config=self.config))
-        self.assertEqual(1, len(self._events()))
+        report = prune_api_request_events_with_diagnostics(config=self.config)
+        self.assertTrue(report.blocked)
+        self.assertEqual("blocked_corrupt", report.status)
+        self.assertEqual(0, report.actual_removed)
+        self.assertEqual(2, report.corrupt_records)
+        self.assertEqual(original, self.config.api_request_events_path.read_text(encoding="utf-8"))
+        self.assertEqual(0, prune_api_request_events(config=self.config))
+
+    def test_corrupt_jsonl_blocks_prune_and_preserves_valid_neighbors_for_repair(self) -> None:
+        sentinel = "SENTINEL-jsonl-credential-123456789"
+        old_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
+        current_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        current = {
+            "schema_version": 2,
+            "event_id": "current",
+            "at": current_at,
+            "provider": "mal",
+            "operation": "current",
+            "url": "https://example.invalid/current",
+            "method": "GET",
+            "outcome": "ok",
+        }
+        old = {**current, "event_id": "old", "at": old_at, "operation": "old"}
+        original = (
+            json.dumps(old)
+            + "\n"
+            + f'{{"at":"{current_at}","provider":"mal","refresh_token":"{sentinel}"'
+            + "\n"
+            + json.dumps(current)
+            + "\n"
+        )
+        self.config.api_request_events_path.write_text(original, encoding="utf-8")
+
+        self.assertEqual(1, summarize_recent_api_usage(provider="mal", config=self.config).request_count)
+        report = prune_api_request_events_with_diagnostics(config=self.config)
+        self.assertEqual(
+            {
+                "status": "blocked_corrupt",
+                "blocked": True,
+                "actual_removed": 0,
+                "expired_removed": 0,
+                "expired_candidates": 1,
+                "corrupt_records": 1,
+                "kept_records": 1,
+                "scanned_records": 3,
+            },
+            report.as_dict(),
+        )
+        self.assertEqual(original, self.config.api_request_events_path.read_text(encoding="utf-8"))
+        self.assertIn(sentinel, self.config.api_request_events_path.read_text(encoding="utf-8"))
+
+    def test_healthy_prune_atomically_removes_expired_records_and_keeps_valid_neighbors(self) -> None:
+        old_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
+        current_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        current = {"event_id": "current", "at": current_at, "provider": "mal", "operation": "current", "outcome": "ok"}
+        rows = [
+            {"event_id": "old-a", "at": old_at, "provider": "mal", "operation": "old-a", "outcome": "ok"},
+            current,
+            {"event_id": "old-b", "at": old_at, "provider": "mal", "operation": "old-b", "outcome": "ok"},
+        ]
+        self.config.api_request_events_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        report = prune_api_request_events_with_diagnostics(config=self.config)
+        self.assertFalse(report.blocked)
+        self.assertEqual("ok", report.status)
+        self.assertEqual(2, report.actual_removed)
+        self.assertEqual(2, report.expired_removed)
+        self.assertEqual(1, report.kept_records)
+        self.assertEqual(["current"], [event["event_id"] for event in self._events()])
 
     def test_multiprocess_append_and_prune_preserve_jsonl_integrity(self) -> None:
         # fork is the production Linux execution model and avoids serializing AppConfig.
