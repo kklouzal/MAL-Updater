@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import io
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -37,6 +40,18 @@ class ServiceStatusTests(unittest.TestCase):
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
 
+    @contextmanager
+    def _patched_env(self, values: dict[str, str], *, unset: tuple[str, ...] = ()) -> Iterator[None]:
+        with patch.dict("os.environ", values, clear=False):
+            for key in unset:
+                os.environ.pop(key, None)
+            yield
+
+    @contextmanager
+    def _home_config_fallback_env(self, fake_home: Path, *, unset: tuple[str, ...] = ()) -> Iterator[None]:
+        with self._patched_env({"HOME": str(fake_home)}, unset=("XDG_CONFIG_HOME", *unset)):
+            yield
+
     def _run_service_status_raw(self, *args: str) -> tuple[int, str]:
         argv = [
             "mal-updater",
@@ -48,7 +63,7 @@ class ServiceStatusTests(unittest.TestCase):
         with (
             patch("sys.argv", argv),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
-            patch.dict("os.environ", {"HOME": str(self.project_root / "fake-home")}, clear=False),
+            self._home_config_fallback_env(self.project_root / "fake-home"),
         ):
             exit_code = cli_main()
         return exit_code, stdout.getvalue()
@@ -59,29 +74,25 @@ class ServiceStatusTests(unittest.TestCase):
         template_target.parent.mkdir(parents=True, exist_ok=True)
         template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
         fake_home = self.project_root / "fake-home"
-        fake_python = self.project_root / "venv" / "bin" / "python"
-
-        def fake_python_probe(command: list[str], **kwargs: object) -> Mock:
-            self.assertEqual(["python3", "-c", "import sys; print(sys.executable)"], command)
-            return Mock(stdout=f"{fake_python}\n")
+        default_python = self.config.project_root / ".venv" / "bin" / "python"
 
         with (
-            patch("mal_updater.service_manager.subprocess.run", side_effect=fake_python_probe),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            patch("mal_updater.service_manager.subprocess.run", side_effect=AssertionError("unit rendering must not probe python via subprocess")),
+            self._home_config_fallback_env(fake_home, unset=("MAL_UPDATER_SERVICE_PYTHON_BIN",)),
         ):
             rendered = unit_contents(self.config)
 
         expected = render_repo_systemd_unit_template(
             self.config.project_root,
             fake_home / ".config" / "mal-updater-service.env",
-            fake_python,
+            default_python,
         )
         self.assertEqual(expected, rendered)
         self.assertIn(f"WorkingDirectory={self.config.project_root}", rendered)
         self.assertIn(f"Environment=PYTHONPATH={self.config.project_root}/src", rendered)
         self.assertIn(f"EnvironmentFile=-{fake_home}/.config/mal-updater-service.env", rendered)
         self.assertIn(
-            f"ExecStart={fake_python} -m mal_updater.cli --project-root {self.config.project_root} service-run",
+            f"ExecStart={default_python} -m mal_updater.cli --project-root {self.config.project_root} service-run",
             rendered,
         )
         self.assertIn("UMask=0077", rendered)
@@ -93,6 +104,26 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn(str(self.config.runtime_root), rendered)
         self.assertNotIn("__MAL_UPDATER_READ_WRITE_PATHS__", rendered)
 
+    def test_unit_contents_honors_service_python_bin_override(self) -> None:
+        template_source = Path(__file__).resolve().parents[1] / "ops" / "systemd-user" / "mal-updater.service"
+        template_target = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        template_target.parent.mkdir(parents=True, exist_ok=True)
+        template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        fake_python = self.project_root / "venv" / "bin" / "python"
+
+        with (
+            patch("mal_updater.service_manager.subprocess.run", side_effect=AssertionError("unit rendering must not probe python via subprocess")),
+            self._home_config_fallback_env(fake_home),
+            patch.dict("os.environ", {"MAL_UPDATER_SERVICE_PYTHON_BIN": str(fake_python)}, clear=False),
+        ):
+            rendered = unit_contents(self.config)
+
+        self.assertIn(
+            f"ExecStart={fake_python} -m mal_updater.cli --project-root {self.config.project_root} service-run",
+            rendered,
+        )
+
     def test_unit_contents_uses_xdg_config_home_for_environment_file(self) -> None:
         template_source = Path(__file__).resolve().parents[1] / "ops" / "systemd-user" / "mal-updater.service"
         template_target = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
@@ -100,14 +131,9 @@ class ServiceStatusTests(unittest.TestCase):
         template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
         fake_home = self.project_root / "fake-home"
         xdg_config_home = self.project_root / "xdg-config"
-        fake_python = self.project_root / "venv" / "bin" / "python"
-
-        def fake_python_probe(command: list[str], **kwargs: object) -> Mock:
-            self.assertEqual(["python3", "-c", "import sys; print(sys.executable)"], command)
-            return Mock(stdout=f"{fake_python}\n")
 
         with (
-            patch("mal_updater.service_manager.subprocess.run", side_effect=fake_python_probe),
+            patch("mal_updater.service_manager.subprocess.run", side_effect=AssertionError("unit rendering must not probe python via subprocess")),
             patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False),
         ):
             rendered = unit_contents(self.config)
@@ -123,7 +149,7 @@ class ServiceStatusTests(unittest.TestCase):
         fake_home = self.project_root / "fake-home"
         env_path = fake_home / ".config" / "mal-updater-service.env"
 
-        with patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False):
+        with self._home_config_fallback_env(fake_home):
             created = write_service_env_file_if_missing(self.config)
             self.assertEqual(0o600, stat.S_IMODE(created.stat().st_mode))
             existing_text = "MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=15\n"
@@ -245,7 +271,7 @@ class ServiceStatusTests(unittest.TestCase):
         fake_home = self.project_root / "fake-home"
         with (
             patch("mal_updater.service_manager._run", side_effect=fake_run),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             payload = doctor_service(self.config)
 
@@ -436,7 +462,7 @@ class ServiceStatusTests(unittest.TestCase):
         fake_home = self.project_root / "fake-home"
         with (
             patch("mal_updater.service_manager._run", side_effect=fake_run),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             payload = doctor_service(self.config)
 
@@ -452,7 +478,7 @@ class ServiceStatusTests(unittest.TestCase):
         fake_home = self.project_root / "fake-home"
         with (
             patch("mal_updater.service_manager._run", side_effect=OSError("systemctl unavailable")),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             payload = service_status()
 
@@ -504,7 +530,7 @@ class ServiceStatusTests(unittest.TestCase):
 
         with (
             patch("mal_updater.service_manager._run", side_effect=fake_run),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             exit_code, stdout = self._run_service_status_raw("--strict", "--format", "summary")
 
@@ -550,14 +576,9 @@ class ServiceStatusTests(unittest.TestCase):
         template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
         fake_home = self.project_root / "fake-home"
         xdg_config_home = self.project_root / "xdg-config"
-        fake_python = self.project_root / "venv" / "bin" / "python"
-
-        def fake_python_probe(command: list[str], **kwargs: object) -> Mock:
-            self.assertEqual(["python3", "-c", "import sys; print(sys.executable)"], command)
-            return Mock(stdout=f"{fake_python}\n")
 
         with (
-            patch("mal_updater.service_manager.subprocess.run", side_effect=fake_python_probe),
+            patch("mal_updater.service_manager.subprocess.run", side_effect=AssertionError("unit rendering must not probe python via subprocess")),
             patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False),
         ):
             unit_path = write_unit_file(self.config)
@@ -589,7 +610,7 @@ class ServiceStatusTests(unittest.TestCase):
 
         with (
             patch("mal_updater.service_manager._run", side_effect=fake_run),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             exit_code, stdout = self._run_service_status_raw("--strict")
 
@@ -626,7 +647,7 @@ class ServiceStatusTests(unittest.TestCase):
                 "mal_updater.service_systemd_status._permission_payload",
                 return_value={"exists": True, "mode_octal": None, "restrictive": False, "error": "permission inspection failed"},
             ),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             exit_code, stdout = self._run_service_status_raw("--strict", "--format", "summary")
 
@@ -702,7 +723,7 @@ class ServiceStatusTests(unittest.TestCase):
                 "result": "success",
             }
 
-        with patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False):
+        with self._home_config_fallback_env(fake_home):
             current = build_automation_installation_status(
                 self.project_root,
                 runtime_reader=runtime_reader,
@@ -1013,7 +1034,7 @@ class ServiceStatusTests(unittest.TestCase):
         fake_home = self.project_root / "fake-home"
         with (
             patch("mal_updater.service_manager._run", side_effect=fake_run),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             payload = doctor_service(self.config)
 
@@ -1067,7 +1088,7 @@ class ServiceStatusTests(unittest.TestCase):
         fake_home = self.project_root / "fake-home"
         with (
             patch("mal_updater.service_manager._run", side_effect=fake_run),
-            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+            self._home_config_fallback_env(fake_home),
         ):
             payload = doctor_service(self.config)
 

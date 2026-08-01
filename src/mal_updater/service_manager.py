@@ -12,7 +12,13 @@ from .persistence import PersistentJsonError, atomic_write_text, read_json_dict_
 from .redaction import sanitize_text, sanitize_url, sanitize_value
 from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
 from .service_systemd_status import build_service_status_payload, user_service_env_path, user_systemd_unit_dir
-from .service_units import DASHBOARD_SERVICE_UNIT_NAME, SERVICE_UNIT_NAME, render_repo_systemd_unit_template, systemd_unit_path_context
+from .service_units import (
+    DASHBOARD_SERVICE_UNIT_NAME,
+    SERVICE_UNIT_NAME,
+    render_repo_systemd_unit_template,
+    resolve_service_python_bin,
+    systemd_unit_path_context,
+)
 
 SERVICE_NAME = SERVICE_UNIT_NAME
 DASHBOARD_SERVICE_NAME = DASHBOARD_SERVICE_UNIT_NAME
@@ -390,7 +396,7 @@ def unit_contents(config: AppConfig | None = None, *, unit_name: str = SERVICE_N
     ensure_directories(config)
     repo = config.project_root
     env_file = _service_env_path()
-    python = Path(subprocess.run(["python3", "-c", "import sys; print(sys.executable)"], text=True, capture_output=True, check=True).stdout.strip())
+    python = resolve_service_python_bin(config.project_root)
     return render_repo_systemd_unit_template(repo, env_file, python, unit_name=unit_name, path_context=systemd_unit_path_context(config))
 
 
