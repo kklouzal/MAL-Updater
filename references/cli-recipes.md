@@ -125,8 +125,14 @@ PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 
 ```bash
 cd {baseDir}
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-PYTHONPATH=src python3 -m unittest tests.test_config -v
-PYTHONPATH=src python3 -m unittest tests.test_install_user_systemd_units -v
-PYTHONPATH=src python3 -m unittest tests.test_health_cli -v
+QUALITY_TMP="$(mktemp -d /tmp/mal-updater-quality.XXXXXX)"
+mkdir -p "$QUALITY_TMP/home" "$QUALITY_TMP/tmp" "$QUALITY_TMP/runtime/config"
+HOME="$QUALITY_TMP/home" \
+TMPDIR="$QUALITY_TMP/tmp" \
+MAL_UPDATER_RUNTIME_ROOT="$QUALITY_TMP/runtime" \
+MAL_UPDATER_RUNTIME_DIR="$QUALITY_TMP/runtime" \
+MAL_UPDATER_SETTINGS_PATH="$QUALITY_TMP/runtime/config/settings.toml" \
+MAL_UPDATER_CONFIG="$QUALITY_TMP/runtime/config/settings.toml" \
+MAL_UPDATER_QUALITY_TMP="$QUALITY_TMP" \
+scripts/quality.sh
 ```

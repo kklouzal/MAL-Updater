@@ -11,7 +11,7 @@ from .config import AppConfig, ensure_directories, load_config
 from .persistence import PersistentJsonError, atomic_write_text, read_json_dict_bounded
 from .redaction import sanitize_text, sanitize_url, sanitize_value
 from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
-from .service_systemd_status import build_service_status_payload
+from .service_systemd_status import build_service_status_payload, user_service_env_path, user_systemd_unit_dir
 from .service_units import DASHBOARD_SERVICE_UNIT_NAME, SERVICE_UNIT_NAME, render_repo_systemd_unit_template, systemd_unit_path_context
 
 SERVICE_NAME = SERVICE_UNIT_NAME
@@ -30,11 +30,11 @@ class ServiceCommandResult:
 
 
 def _unit_path(unit_name: str = SERVICE_NAME) -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / unit_name
+    return user_systemd_unit_dir() / unit_name
 
 
 def _service_env_path() -> Path:
-    return Path.home() / ".config" / "mal-updater-service.env"
+    return user_service_env_path()
 
 
 def _service_env_source_path(config: AppConfig) -> Path:

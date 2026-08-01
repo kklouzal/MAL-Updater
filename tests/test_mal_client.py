@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import base64
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,10 +48,17 @@ class MalClientTests(unittest.TestCase):
             mal=MalSettings(request_spacing_seconds=0.0, request_spacing_jitter_seconds=0.0),
         )
 
-    def _secrets(self, config: AppConfig, *, access_token: str | None = None, refresh_token: str | None = None) -> MalSecrets:
+    def _secrets(
+        self,
+        config: AppConfig,
+        *,
+        access_token: str | None = None,
+        refresh_token: str | None = None,
+        client_secret: str | None = None,
+    ) -> MalSecrets:
         return MalSecrets(
             client_id="client-id",
-            client_secret=None,
+            client_secret=client_secret,
             access_token=access_token,
             refresh_token=refresh_token,
             client_id_path=config.secrets_dir / "mal_client_id.txt",
@@ -77,6 +85,47 @@ class MalClientTests(unittest.TestCase):
                     with self.assertRaises(MalApiError):
                         call()
                 self.assertEqual(1, send.call_count)
+
+    def test_token_requests_use_mal_scheme_one_basic_auth_for_public_and_secret_clients(self) -> None:
+        for client_secret in (None, "client-secret"):
+            with self.subTest(client_secret=client_secret or "public-empty-password"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    config = self._config(Path(tmp))
+                    client = MalClient(config, self._secrets(config, refresh_token="refresh-token", client_secret=client_secret))
+                    requests = []
+
+                    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+                        requests.append(request)
+                        return _JsonResponse(
+                            {
+                                "access_token": "access-token",
+                                "token_type": "Bearer",
+                                "expires_in": 3600,
+                                "refresh_token": "new-refresh-token",
+                            }
+                        )
+
+                    with patch("mal_updater.mal_client.urlopen", fake_urlopen):
+                        client.exchange_code("auth-code", "verifier")
+                        client.refresh_access_token()
+
+                    expected_basic = base64.b64encode(f"client-id:{client_secret or ''}".encode("utf-8")).decode("ascii")
+                    self.assertEqual(2, len(requests))
+                    for request in requests:
+                        self.assertEqual(f"Basic {expected_basic}", request.get_header("Authorization"))
+                        body = parse_qs(request.data.decode("utf-8"))
+                        self.assertEqual(["client-id"], body["client_id"])
+                        self.assertNotIn("client_secret", body)
+
+                    exchange_body = parse_qs(requests[0].data.decode("utf-8"))
+                    self.assertEqual(["authorization_code"], exchange_body["grant_type"])
+                    self.assertEqual(["auth-code"], exchange_body["code"])
+                    self.assertEqual(["verifier"], exchange_body["code_verifier"])
+                    self.assertEqual([config.mal.redirect_uri], exchange_body["redirect_uri"])
+
+                    refresh_body = parse_qs(requests[1].data.decode("utf-8"))
+                    self.assertEqual(["refresh_token"], refresh_body["grant_type"])
+                    self.assertEqual(["refresh-token"], refresh_body["refresh_token"])
 
     def test_search_anime_strips_dub_noise_before_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

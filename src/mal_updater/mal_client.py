@@ -231,8 +231,6 @@ class MalClient:
             "code_verifier": code_verifier,
             "redirect_uri": self.config.mal.redirect_uri,
         }
-        if self.secrets.client_secret:
-            form["client_secret"] = self.secrets.client_secret
         payload = urlencode(form).encode("utf-8")
         return self._post_form(self.config.mal.token_url, payload)
 
@@ -247,8 +245,6 @@ class MalClient:
             "refresh_token": token,
             "client_id": self.secrets.client_id,
         }
-        if self.secrets.client_secret:
-            form["client_secret"] = self.secrets.client_secret
         payload = urlencode(form).encode("utf-8")
         return self._post_form(self.config.mal.token_url, payload)
 
@@ -438,7 +434,12 @@ class MalClient:
             raise MalApiError(f"{error_context}: {exc.reason}") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
-        basic = base64.b64encode(f"{self.secrets.client_id or ''}:{self.secrets.client_secret or ''}".encode("utf-8")).decode("ascii")
+        # MAL OAuth2 Scheme 1 documents client_id as the Basic auth username
+        # and client_secret as the password; public clients send an empty
+        # password: https://myanimelist.net/apiconfig/references/authorization
+        # Keep client_secret out of the form body so requests do not mix auth schemes.
+        credentials = f"{self.secrets.client_id or ''}:{self.secrets.client_secret or ''}"
+        basic = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
         request = Request(
             url,
             data=data,

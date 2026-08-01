@@ -159,6 +159,26 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             expected_env = (self.source_dir / "mal-updater-service.env.example").read_text(encoding="utf-8")
             self.assertEqual(expected_env, env_target.read_text(encoding="utf-8"))
 
+    def test_default_install_targets_follow_xdg_config_home_without_home_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            fake_home = temp_root / "fake-home"
+            xdg_config_home = temp_root / "xdg-config"
+            target_dir = xdg_config_home / "systemd" / "user"
+            env_target = xdg_config_home / "mal-updater-service.env"
+
+            with patch.dict(os.environ, {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False):
+                result = self._run_script("--no-enable", "--no-daemon-reload")
+
+            self.assertEqual(0, result.returncode, msg=result.stderr)
+            self.assertIn(f"target_dir={target_dir}", result.stdout)
+            self.assertIn(f"service_env_target={env_target}", result.stdout)
+            self.assertTrue((target_dir / "mal-updater.service").exists())
+            self.assertTrue(env_target.exists())
+            self.assertEqual(0o600, stat.S_IMODE(env_target.stat().st_mode))
+            self.assertFalse((fake_home / ".config" / "systemd" / "user" / "mal-updater.service").exists())
+            self.assertFalse((fake_home / ".config" / "mal-updater-service.env").exists())
+
     def test_canonical_systemd_renderer_matches_cli_alias_for_default_and_custom_python_inputs(self) -> None:
         source_path = self.source_dir / "mal-updater.service"
         template_text = source_path.read_text(encoding="utf-8")

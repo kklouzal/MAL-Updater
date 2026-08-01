@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from mal_updater.cli import main as cli_main
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.service_manager import doctor_service, service_status, unit_contents, write_service_env_file_if_missing
+from mal_updater.service_manager import doctor_service, service_status, unit_contents, write_service_env_file_if_missing, write_unit_file
 from mal_updater.service_systemd_status import build_automation_installation_status, read_systemd_user_unit_runtime
 from mal_updater.service_units import render_repo_systemd_unit_template
 
@@ -93,6 +93,29 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn(str(self.config.runtime_root), rendered)
         self.assertNotIn("__MAL_UPDATER_READ_WRITE_PATHS__", rendered)
 
+    def test_unit_contents_uses_xdg_config_home_for_environment_file(self) -> None:
+        template_source = Path(__file__).resolve().parents[1] / "ops" / "systemd-user" / "mal-updater.service"
+        template_target = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        template_target.parent.mkdir(parents=True, exist_ok=True)
+        template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        xdg_config_home = self.project_root / "xdg-config"
+        fake_python = self.project_root / "venv" / "bin" / "python"
+
+        def fake_python_probe(command: list[str], **kwargs: object) -> Mock:
+            self.assertEqual(["python3", "-c", "import sys; print(sys.executable)"], command)
+            return Mock(stdout=f"{fake_python}\n")
+
+        with (
+            patch("mal_updater.service_manager.subprocess.run", side_effect=fake_python_probe),
+            patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False),
+        ):
+            rendered = unit_contents(self.config)
+
+        expected_env_path = xdg_config_home / "mal-updater-service.env"
+        self.assertIn(f"EnvironmentFile=-{expected_env_path}", rendered)
+        self.assertNotIn(str(fake_home / ".config"), rendered)
+
     def test_service_manager_creates_env_file_0600_without_overwriting_existing(self) -> None:
         source = self.project_root / "ops" / "systemd-user" / "mal-updater-service.env.example"
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +135,22 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual(env_path, preserved)
         self.assertEqual(existing_text, env_path.read_text(encoding="utf-8"))
         self.assertEqual(0o644, stat.S_IMODE(env_path.stat().st_mode))
+
+    def test_service_manager_creates_env_file_under_xdg_without_home_fallback(self) -> None:
+        source = self.project_root / "ops" / "systemd-user" / "mal-updater-service.env.example"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        xdg_config_home = self.project_root / "xdg-config"
+        env_path = xdg_config_home / "mal-updater-service.env"
+
+        with patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False):
+            created = write_service_env_file_if_missing(self.config)
+
+        self.assertEqual(env_path, created)
+        self.assertEqual("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", env_path.read_text(encoding="utf-8"))
+        self.assertEqual(0o600, stat.S_IMODE(env_path.stat().st_mode))
+        self.assertFalse((fake_home / ".config" / "mal-updater-service.env").exists())
 
     def test_doctor_service_includes_recent_task_state_and_log_tail(self) -> None:
         now = datetime.now(timezone.utc)
@@ -472,6 +511,61 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("strict_ok=True", stdout)
         self.assertNotIn("strict_failures=", stdout)
+
+    def test_service_status_uses_xdg_paths_without_home_fallback(self) -> None:
+        fake_home = self.project_root / "fake-home"
+        xdg_config_home = self.project_root / "xdg-config"
+        unit_path = xdg_config_home / "systemd" / "user" / "mal-updater.service"
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text("[Unit]\nDescription=MAL-Updater\n", encoding="utf-8")
+        env_path = xdg_config_home / "mal-updater-service.env"
+        env_path.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+        env_path.chmod(0o600)
+
+        def fake_run(command: list[str], check: bool = True):
+            if command[-2:] == ["is-enabled", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="enabled\n", stderr="")
+            if command[-2:] == ["is-active", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with (
+            patch("mal_updater.service_manager._run", side_effect=fake_run),
+            patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False),
+        ):
+            payload = service_status()
+
+        self.assertEqual(str(unit_path), payload["unit_path"])
+        self.assertTrue(payload["unit_exists"])
+        self.assertEqual(str(env_path), payload["env_path"])
+        self.assertTrue(payload["env_exists"])
+        self.assertEqual("0o600", payload["env_mode_octal"])
+        self.assertFalse((fake_home / ".config" / "systemd" / "user" / "mal-updater.service").exists())
+        self.assertFalse((fake_home / ".config" / "mal-updater-service.env").exists())
+
+    def test_write_unit_file_installs_under_xdg_config_home(self) -> None:
+        template_source = Path(__file__).resolve().parents[1] / "ops" / "systemd-user" / "mal-updater.service"
+        template_target = self.project_root / "ops" / "systemd-user" / "mal-updater.service"
+        template_target.parent.mkdir(parents=True, exist_ok=True)
+        template_target.write_text(template_source.read_text(encoding="utf-8"), encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        xdg_config_home = self.project_root / "xdg-config"
+        fake_python = self.project_root / "venv" / "bin" / "python"
+
+        def fake_python_probe(command: list[str], **kwargs: object) -> Mock:
+            self.assertEqual(["python3", "-c", "import sys; print(sys.executable)"], command)
+            return Mock(stdout=f"{fake_python}\n")
+
+        with (
+            patch("mal_updater.service_manager.subprocess.run", side_effect=fake_python_probe),
+            patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(xdg_config_home)}, clear=False),
+        ):
+            unit_path = write_unit_file(self.config)
+
+        self.assertEqual(xdg_config_home / "systemd" / "user" / "mal-updater.service", unit_path)
+        self.assertTrue(unit_path.exists())
+        self.assertIn(f"EnvironmentFile=-{xdg_config_home / 'mal-updater-service.env'}", unit_path.read_text(encoding="utf-8"))
+        self.assertFalse((fake_home / ".config" / "systemd" / "user" / "mal-updater.service").exists())
 
     def test_service_status_strict_json_fails_on_env_mode_and_parse_errors(self) -> None:
         fake_home = self.project_root / "fake-home"
