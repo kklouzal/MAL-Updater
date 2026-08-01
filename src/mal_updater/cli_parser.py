@@ -48,6 +48,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit bootstrap/onboarding readiness: dependencies, runtime dirs, credentials, redirect settings, and service install prerequisites",
     )
     bootstrap_audit.add_argument("--summary", action="store_true", help="Emit terse line-oriented output instead of JSON")
+    runtime_retention_audit = subparsers.add_parser(
+        "runtime-retention-audit",
+        help="Read-only runtime-root layout and retention inventory audit; emits review candidates only, never delete/prune actions",
+    )
+    runtime_retention_audit.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
+    runtime_retention_audit.add_argument("--strict", action="store_true", help="Exit 2 when unsafe runtime layout errors are detected; retention candidates remain diagnostic-only")
+    runtime_retention_audit.add_argument("--max-files-per-family", type=int, default=10_000, help="Maximum files to count per managed runtime family before truncating")
+    runtime_retention_audit.add_argument("--max-dirs-per-family", type=int, default=2_000, help="Maximum directories to scan per managed runtime family before truncating")
+    runtime_retention_audit.add_argument("--max-depth", type=int, default=8, help="Maximum recursive depth per managed runtime family")
+    runtime_retention_audit.add_argument("--max-scan-errors-per-family", type=int, default=20, help="Maximum redacted scan errors to report per family")
+    runtime_retention_audit.add_argument("--warn-file-count", type=int, default=None, help="Override per-family file-count review threshold")
+    runtime_retention_audit.add_argument("--warn-total-bytes", type=int, default=None, help="Override per-family total-byte review threshold")
+    runtime_retention_audit.add_argument("--warn-oldest-days", type=float, default=None, help="Override per-family oldest-mtime review threshold in days")
     health_check = subparsers.add_parser("health-check", help="Emit a local operational health summary for auth material, snapshot freshness, mappings, and review backlog")
     health_check.add_argument("--stale-hours", type=float, default=72.0, help="Warn when the latest completed ingest snapshot is older than this many hours")
     health_check.add_argument("--strict", action="store_true", help="Return exit code 2 when warnings are present, while still printing the JSON payload")

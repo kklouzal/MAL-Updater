@@ -31,12 +31,16 @@ cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
 PYTHONPATH=src python3 -m mal_updater.cli status
+PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit
+PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
 PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
+
+`runtime-retention-audit` is diagnostic-only. It validates the configured runtime root for nested `.MAL-Updater` markers, repo/source overlap, symlink escapes, and missing/non-directory managed top-level paths, then reports bounded aggregate retention inventory for DB backups, health snapshots, logs/request events, tmp, cache, and artifacts. It does not enumerate secret filenames or contents and does not produce archive/delete/prune/chmod/move commands. Use `--strict` only when layout errors should fail an automation gate; old retained files and threshold review candidates stay warning-only, and scan/threshold caps are tunable with the `--max-*` and `--warn-*` options.
 
 ## Initialize runtime / DB
 

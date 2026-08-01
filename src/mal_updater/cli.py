@@ -32,6 +32,13 @@ from . import provider_snapshot
 from .provider_registry import get_provider, list_provider_slugs
 from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
 from .redaction import sanitize_text
+from .runtime_retention_audit import (
+    AuditCaps,
+    AuditOptions,
+    WarningThresholds,
+    build_runtime_retention_audit_payload,
+    render_runtime_retention_audit_summary,
+)
 from . import providers as _providers  # noqa: F401
 from .db import (
     backfill_hidive_series_urls,
@@ -317,6 +324,53 @@ def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
     else:
         sys.stdout.write(_bootstrap_guidance.render_bootstrap_audit_json(payload))
     return 0
+
+
+def _non_negative_int(value: int, *, minimum: int = 0) -> int:
+    return max(minimum, int(value))
+
+
+def _non_negative_float(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return max(0.0, float(value))
+
+
+def _cmd_runtime_retention_audit(
+    project_root: Path | None,
+    output_format: str,
+    *,
+    strict: bool,
+    max_files_per_family: int,
+    max_dirs_per_family: int,
+    max_depth: int,
+    max_scan_errors_per_family: int,
+    warn_file_count: int | None,
+    warn_total_bytes: int | None,
+    warn_oldest_days: float | None,
+) -> int:
+    config = load_config(project_root)
+    options = AuditOptions(
+        caps=AuditCaps(
+            max_files_per_family=_non_negative_int(max_files_per_family, minimum=1),
+            max_dirs_per_family=_non_negative_int(max_dirs_per_family, minimum=1),
+            max_depth=_non_negative_int(max_depth),
+            max_scan_errors_per_family=_non_negative_int(max_scan_errors_per_family),
+        ),
+        warning_threshold_overrides=WarningThresholds(
+            file_count=None if warn_file_count is None else _non_negative_int(warn_file_count),
+            total_bytes=None if warn_total_bytes is None else _non_negative_int(warn_total_bytes),
+            oldest_days=_non_negative_float(warn_oldest_days),
+        ),
+        strict=strict,
+    )
+    payload = build_runtime_retention_audit_payload(config, options)
+    if output_format == "summary":
+        sys.stdout.write(render_runtime_retention_audit_summary(payload))
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    strict_status = payload.get("strict") if isinstance(payload.get("strict"), dict) else {}
+    return 2 if strict and strict_status.get("would_fail") is True else 0
 
 
 def _emit_service_status_summary(payload: dict[str, object]) -> None:
@@ -3203,6 +3257,19 @@ def _dispatch(parser, args) -> int:
         return _cmd_exact_approved_sync_cycle(args.project_root, args.full_refresh, args.allow_stale_provider_apply)
     if args.command == "bootstrap-audit":
         return _cmd_bootstrap_audit(args.project_root, args.summary)
+    if args.command == "runtime-retention-audit":
+        return _cmd_runtime_retention_audit(
+            args.project_root,
+            args.format,
+            strict=args.strict,
+            max_files_per_family=args.max_files_per_family,
+            max_dirs_per_family=args.max_dirs_per_family,
+            max_depth=args.max_depth,
+            max_scan_errors_per_family=args.max_scan_errors_per_family,
+            warn_file_count=args.warn_file_count,
+            warn_total_bytes=args.warn_total_bytes,
+            warn_oldest_days=args.warn_oldest_days,
+        )
     if args.command == "health-check":
         return _cmd_health_check(
             args.project_root,

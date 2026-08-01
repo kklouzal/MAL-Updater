@@ -8,6 +8,8 @@ Run commands from the skill root (`{baseDir}` / repo root).
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
 PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
+PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit
+PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit --format summary
 PYTHONPATH=src python3 -m mal_updater.cli init
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli health-check
@@ -19,6 +21,8 @@ scripts/install_user_systemd_units.sh
 ```
 
 Use `scripts/install_user_systemd_units.sh` as the routine install path. `install-service` remains a lower-level compatibility/repair command; do not run both install paths during normal bootstrap.
+
+`runtime-retention-audit` is read-only and local-only. Its JSON/summary output validates suspicious runtime-root layout, reports bounded aggregate counts/bytes/oldest-newest mtimes for DB backups, health snapshots, state logs/request events, tmp, cache, and artifacts, and emits review candidates only under `diagnostic_only_no_delete_or_prune`. Traversal is capped (`--max-files-per-family`, `--max-dirs-per-family`, `--max-depth`), warning thresholds are operator-tunable (`--warn-file-count`, `--warn-total-bytes`, `--warn-oldest-days`), and DB backups remain a distinct high-value/manual-policy family.
 
 ## MAL auth
 

@@ -121,6 +121,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "review-queue-next",
     "review-queue-refresh-worklist",
     "review-queue-worklist",
+    "runtime-retention-audit",
     "service-run",
     "service-run-once",
     "service-status",
@@ -386,7 +387,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(51, len(actual_commands))
+        self.assertEqual(52, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",
@@ -396,6 +397,7 @@ class ProviderCliTests(unittest.TestCase):
             "recommend-dashboard": "sortable local HTML recommendation dashboard",
             "dashboard-serve": "live local HTTP dashboard",
             "recommend-refresh-full-userrecs": "per-source per-run",
+            "runtime-retention-audit": "retention inventory audit",
         }.items():
             with self.subTest(command=command):
                 help_text = command_parsers[command].format_help()
