@@ -22,7 +22,7 @@ from .auth_remediation import (
     provider_missing_state_descriptor,
     provider_rebootstrap_auth_descriptor,
 )
-from .config import AppConfig, load_mal_secrets
+from .config import AppConfig, load_mal_secrets, mal_callback_bind_warning
 from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
 from .service_auth_state import (
@@ -79,12 +79,11 @@ def _secrets_dir_permission_status(config) -> dict[str, object]:
         }
 
     mode = stat.S_IMODE(secrets_dir.stat().st_mode)
-    group_or_world_bits = mode & 0o077
-    restrictive = group_or_world_bits == 0
+    restrictive = mode == 0o700
     details = (
-        f"Secrets dir {secrets_dir} permissions are restrictive."
+        f"Secrets dir {secrets_dir} permissions are mode 0700."
         if restrictive
-        else f"Secrets dir {secrets_dir} is broader than recommended; tighten it to owner-only access before staging long-lived credentials/tokens."
+        else f"Secrets dir {secrets_dir} is not mode 0700; tighten it to owner-only read/write/execute before staging long-lived credentials/tokens."
     )
     return {
         "exists": True,
@@ -850,13 +849,25 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
                     "The repo-owned MAL-Updater user-systemd unit is installed, but the rendered service environment file is missing. "
                     "Re-run the installer to recreate the expected environment file before relying on unattended automation."
                 )
+            elif automation_installation.get("env_restrictive") is False:
+                automation_step = "tighten-user-systemd-daemon-env-permissions"
+                env_path = automation_installation.get("env_path")
+                automation_details = (
+                    "The MAL-Updater user-systemd environment file exists but is not mode 0600. "
+                    "Tighten it before storing service env overrides that may include sensitive paths or tokens."
+                )
             if automation_step and automation_details:
+                command = install_script_path
+                command_args = [install_script_path]
+                if automation_step == "tighten-user-systemd-daemon-env-permissions" and isinstance(env_path, str):
+                    command = f"chmod 600 {shlex.quote(env_path)}"
+                    command_args = ["chmod", "600", env_path]
                 add_onboarding_step(
                     step=automation_step,
                     details=automation_details,
                     user_action_required=False,
-                    command=install_script_path,
-                    command_args=[install_script_path],
+                    command=command,
+                    command_args=command_args,
                     applies_to="automation",
                     automation_safe=True,
                     requires_auth_interaction=False,
@@ -979,6 +990,8 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
             "operation_guidance": mal_guidance,
             "redirect_uri": config.mal.redirect_uri,
             "bind_host": config.mal.bind_host,
+            "non_loopback_callback_ack": config.mal.non_loopback_callback_ack,
+            "callback_bind_warning": mal_callback_bind_warning(config.mal),
             "redirect_host": config.mal.redirect_host,
             "redirect_port": config.mal.redirect_port,
             "auth_command": mal_auth_descriptor.command,
@@ -1042,6 +1055,8 @@ def render_bootstrap_audit_summary(payload: dict[str, object]) -> str:
         print(f"operation_mode={payload['summary']['operation_mode']}")
         print(f"mal_ready={payload['mal']['ready']}")
         print(f"mal_operation_mode={payload['mal']['operation_mode']}")
+        if payload["mal"].get("callback_bind_warning"):
+            print(f"mal_callback_bind_warning={payload['mal']['callback_bind_warning']}")
         mal_auth_degradation = payload["mal"].get("auth_degradation") if isinstance(payload["mal"].get("auth_degradation"), dict) else {}
         mal_auth_failure_kind = mal_auth_degradation.get("auth_failure_kind") if isinstance(mal_auth_degradation.get("auth_failure_kind"), str) else None
         if mal_auth_failure_kind:

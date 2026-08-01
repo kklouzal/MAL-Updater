@@ -23,7 +23,8 @@ base_url = "https://api.myanimelist.net/v2"
 public_base_url = "https://myanimelist.net"  # public read-only /anime/<id>/<slug>/userrecs aggregate surface; prose/usernames are not retained
 auth_url = "https://myanimelist.net/v1/oauth2/authorize"
 token_url = "https://myanimelist.net/v1/oauth2/token"
-bind_host = "0.0.0.0"
+bind_host = "127.0.0.1"  # loopback default; non-loopback binds require non_loopback_callback_ack = true
+non_loopback_callback_ack = false
 redirect_host = "127.0.0.1"
 redirect_port = 8765
 request_spacing_seconds = 1.0

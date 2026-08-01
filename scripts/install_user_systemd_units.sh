@@ -59,6 +59,25 @@ copy_file() {
   install -D -m "$mode" "$source_path" "$target_path"
 }
 
+service_env_permission_status() {
+  local target_path="$1"
+  python3 - "$target_path" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    mode = stat.S_IMODE(path.stat().st_mode)
+except OSError:
+    print("service_env_mode=unknown")
+    print("service_env_restrictive=false")
+else:
+    print(f"service_env_mode=0o{mode:03o}")
+    print(f"service_env_restrictive={str(mode == 0o600).lower()}")
+PY
+}
+
 render_unit_python() {
   local mode="$1"
   local source_path="$2"
@@ -187,10 +206,17 @@ if [[ "$COPY_SERVICE_ENV" == "1" ]]; then
     log "service env already exists; leaving it untouched: $SERVICE_ENV_TARGET"
   else
     service_env_action="installed"
-    copy_file "$SERVICE_ENV_SOURCE" "$SERVICE_ENV_TARGET"
+    copy_file "$SERVICE_ENV_SOURCE" "$SERVICE_ENV_TARGET" 600
   fi
 fi
 log "service_env_action=$service_env_action"
+if [[ "$DRY_RUN" != "1" && -e "$SERVICE_ENV_TARGET" ]]; then
+  service_env_status="$(service_env_permission_status "$SERVICE_ENV_TARGET")"
+  log "$service_env_status"
+  if grep -q '^service_env_restrictive=false$' <<<"$service_env_status"; then
+    log "WARNING: service env file is not mode 0600; leaving existing file untouched: $SERVICE_ENV_TARGET"
+  fi
+fi
 
 if [[ "$RELOAD_DAEMON" == "1" ]]; then
   run_cmd systemctl --user daemon-reload

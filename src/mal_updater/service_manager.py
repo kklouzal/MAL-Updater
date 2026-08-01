@@ -8,7 +8,7 @@ import subprocess
 from typing import Any
 
 from .config import AppConfig, ensure_directories, load_config
-from .persistence import PersistentJsonError, read_json_dict_bounded
+from .persistence import PersistentJsonError, atomic_write_text, read_json_dict_bounded
 from .redaction import sanitize_text, sanitize_url, sanitize_value
 from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
 from .service_systemd_status import build_service_status_payload
@@ -34,6 +34,10 @@ def _unit_path() -> Path:
 
 def _service_env_path() -> Path:
     return Path.home() / ".config" / "mal-updater-service.env"
+
+
+def _service_env_source_path(config: AppConfig) -> Path:
+    return config.project_root / "ops" / "systemd-user" / "mal-updater-service.env.example"
 
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -397,6 +401,18 @@ def write_unit_file(config: AppConfig | None = None) -> Path:
     return path
 
 
+def write_service_env_file_if_missing(config: AppConfig | None = None) -> Path:
+    config = config or load_config()
+    path = _service_env_path()
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source_path = _service_env_source_path(config)
+    content = source_path.read_text(encoding="utf-8") if source_path.exists() else "# Optional EnvironmentFile for mal-updater.service\n"
+    atomic_write_text(path, content, mode=0o600)
+    return path
+
+
 def daemon_reload() -> None:
     _run(["systemctl", "--user", "daemon-reload"])
 
@@ -414,12 +430,13 @@ def service_status() -> dict[str, Any]:
 
 def install_service(*, start_now: bool = True, config: AppConfig | None = None) -> ServiceCommandResult:
     config = config or load_config()
+    env = write_service_env_file_if_missing(config)
     unit = write_unit_file(config)
     daemon_reload()
     _run(["systemctl", "--user", "enable", SERVICE_NAME])
     if start_now:
         _run(["systemctl", "--user", "restart", SERVICE_NAME])
-    return ServiceCommandResult(status="ok", message="MAL-Updater service installed.", details={"unit_path": str(unit), **service_status()})
+    return ServiceCommandResult(status="ok", message="MAL-Updater service installed.", details={"unit_path": str(unit), "env_path": str(env), **service_status()})
 
 
 def uninstall_service(*, stop_now: bool = True) -> ServiceCommandResult:

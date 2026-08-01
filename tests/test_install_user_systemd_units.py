@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,7 +59,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertFalse(env_target.exists())
             self.assertIn("installed_units=mal-updater.service", result.stdout)
             self.assertIn("service_env_action=installed", result.stdout)
-            self.assertIn("[dry-run] install -D -m 644", result.stdout)
+            self.assertIn("[dry-run] install -D -m 600", result.stdout)
             self.assertIn("[dry-run] systemctl --user daemon-reload", result.stdout)
             self.assertIn("[dry-run] systemctl --user enable mal-updater.service", result.stdout)
 
@@ -80,8 +81,11 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, msg=result.stderr)
             self.assertTrue(target_dir.is_dir())
             self.assertTrue(env_target.exists())
+            self.assertEqual(0o600, stat.S_IMODE(env_target.stat().st_mode))
             self.assertIn("installed_units=mal-updater.service", result.stdout)
             self.assertIn("service_env_action=installed", result.stdout)
+            self.assertIn("service_env_mode=0o600", result.stdout)
+            self.assertIn("service_env_restrictive=true", result.stdout)
             self.assertIn("service enable skipped (--no-enable)", result.stdout)
             self.assertIn("user-level MAL-Updater systemd service install completed", result.stdout)
 
@@ -216,6 +220,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertEqual("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=15\n", env_target.read_text(encoding="utf-8"))
             self.assertIn("service env already exists; leaving it untouched", result.stdout)
             self.assertIn("service_env_action=preserved", result.stdout)
+            self.assertIn("service_env_restrictive=", result.stdout)
 
     def test_install_reports_updated_and_unchanged_units_separately(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import ipaddress
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +21,15 @@ def _load_toml_parser(import_module: Callable[[str], Any] = importlib.import_mod
 
 _toml_parser = _load_toml_parser()
 
+
+class ConfigError(ValueError):
+    """Sanitized, operator-facing configuration error."""
+
+    def __init__(self, safe_message: str) -> None:
+        super().__init__(safe_message)
+        self.safe_message = safe_message
+
+
 DEFAULT_COMPLETION_THRESHOLD = 0.95
 DEFAULT_CREDITS_SKIP_WINDOW_SECONDS = 120
 DEFAULT_CONTRACT_VERSION = "1.0"
@@ -26,9 +38,10 @@ DEFAULT_MAL_BASE_URL = "https://api.myanimelist.net/v2"
 DEFAULT_MAL_PUBLIC_BASE_URL = "https://myanimelist.net"
 DEFAULT_MAL_AUTH_URL = "https://myanimelist.net/v1/oauth2/authorize"
 DEFAULT_MAL_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
-DEFAULT_MAL_BIND_HOST = "0.0.0.0"
+DEFAULT_MAL_BIND_HOST = "127.0.0.1"
 DEFAULT_MAL_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_MAL_REDIRECT_PORT = 8765
+DEFAULT_MAL_NON_LOOPBACK_CALLBACK_ACK = False
 DEFAULT_MAL_REQUEST_SPACING_SECONDS = 1.0
 DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS = 0.2
 DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS = 14
@@ -201,6 +214,7 @@ class MalSettings:
     auth_url: str = DEFAULT_MAL_AUTH_URL
     token_url: str = DEFAULT_MAL_TOKEN_URL
     bind_host: str = DEFAULT_MAL_BIND_HOST
+    non_loopback_callback_ack: bool = DEFAULT_MAL_NON_LOOPBACK_CALLBACK_ACK
     redirect_host: str = DEFAULT_MAL_REDIRECT_HOST
     redirect_port: int = DEFAULT_MAL_REDIRECT_PORT
     request_spacing_seconds: float = DEFAULT_MAL_REQUEST_SPACING_SECONDS
@@ -527,14 +541,122 @@ def _get_str(data: dict[str, Any], key: str, default: str) -> str:
     return str(value)
 
 
-def _get_float(data: dict[str, Any], key: str, default: float) -> float:
-    value = data.get(key, default)
-    return float(value)
+def _setting_label(section: str | None, key: str) -> str:
+    return f"{section}.{key}" if section else key
 
 
-def _get_int(data: dict[str, Any], key: str, default: int) -> int:
-    value = data.get(key, default)
-    return int(value)
+def _coerce_float(value: object, *, label: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"Invalid numeric value for {label}") from None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ConfigError(f"Invalid numeric value for {label}") from None
+    if not math.isfinite(number):
+        raise ConfigError(f"Invalid numeric value for {label}") from None
+    return number
+
+
+def _coerce_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool):
+        raise ConfigError(f"Invalid integer value for {label}") from None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ConfigError(f"Invalid integer value for {label}") from None
+
+
+def _get_float(data: dict[str, Any], key: str, default: float, *, section: str | None = None) -> float:
+    return _coerce_float(data.get(key, default), label=_setting_label(section, key))
+
+
+def _get_int(data: dict[str, Any], key: str, default: int, *, section: str | None = None) -> int:
+    return _coerce_int(data.get(key, default), label=_setting_label(section, key))
+
+
+def _coerce_bool(value: object, *, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"Invalid boolean value for {label}") from None
+
+
+def _get_bool(data: dict[str, Any], key: str, default: bool, *, section: str | None = None) -> bool:
+    return _coerce_bool(data.get(key, default), label=_setting_label(section, key))
+
+
+def _is_loopback_callback_host(host: str) -> bool:
+    normalized = str(host).strip().lower()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    if normalized in {"localhost", "ip6-localhost", "ip6-loopback"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def mal_callback_bind_warning(mal: MalSettings) -> str | None:
+    if _is_loopback_callback_host(mal.bind_host):
+        return None
+    return (
+        "MAL OAuth callback listener is configured on a non-loopback bind_host; "
+        "only use this on a trusted network and only when another host must reach the callback."
+    )
+
+
+def _validate_mal_callback_config(mal: MalSettings) -> None:
+    if not str(mal.bind_host).strip():
+        raise ConfigError("Invalid string value for mal.bind_host") from None
+    if not 1 <= int(mal.redirect_port) <= 65535:
+        raise ConfigError("Invalid integer value for mal.redirect_port: expected 1..65535") from None
+    if mal_callback_bind_warning(mal) and not mal.non_loopback_callback_ack:
+        raise ConfigError(
+            "Refusing non-loopback MAL OAuth callback bind_host without explicit acknowledgement; "
+            "set mal.non_loopback_callback_ack = true or MAL_UPDATER_MAL_NON_LOOPBACK_CALLBACK_ACK=true "
+            "only when the callback listener must be reachable from another host."
+        ) from None
+
+
+def _validate_finite_float(label: str, value: float) -> None:
+    if not math.isfinite(value):
+        raise ConfigError(f"Invalid numeric value for {label}") from None
+
+
+def _validate_finite_numeric_config(config: AppConfig) -> None:
+    for label, value in (
+        ("completion_threshold", config.completion_threshold),
+        ("request_timeout_seconds", config.request_timeout_seconds),
+        ("mal.request_spacing_seconds", config.mal.request_spacing_seconds),
+        ("mal.request_spacing_jitter_seconds", config.mal.request_spacing_jitter_seconds),
+        ("mal.retry_backoff_base_seconds", config.mal.retry_backoff_base_seconds),
+        ("mal.retry_backoff_jitter_seconds", config.mal.retry_backoff_jitter_seconds),
+        ("mal.retry_after_cap_seconds", config.mal.retry_after_cap_seconds),
+        ("crunchyroll.request_spacing_seconds", config.crunchyroll.request_spacing_seconds),
+        ("crunchyroll.request_spacing_jitter_seconds", config.crunchyroll.request_spacing_jitter_seconds),
+        ("crunchyroll.retry_backoff_base_seconds", config.crunchyroll.retry_backoff_base_seconds),
+        ("crunchyroll.retry_backoff_jitter_seconds", config.crunchyroll.retry_backoff_jitter_seconds),
+        ("crunchyroll.retry_after_cap_seconds", config.crunchyroll.retry_after_cap_seconds),
+        ("hidive.request_spacing_seconds", config.hidive.request_spacing_seconds),
+        ("hidive.request_spacing_jitter_seconds", config.hidive.request_spacing_jitter_seconds),
+        ("hidive.retry_backoff_base_seconds", config.hidive.retry_backoff_base_seconds),
+        ("hidive.retry_backoff_jitter_seconds", config.hidive.retry_backoff_jitter_seconds),
+        ("hidive.retry_after_cap_seconds", config.hidive.retry_after_cap_seconds),
+        ("openclaw.recommendations_webhook_timeout_seconds", config.openclaw.recommendations_webhook_timeout_seconds),
+        ("service.warn_ratio", config.service.warn_ratio),
+        ("service.critical_ratio", config.service.critical_ratio),
+    ):
+        _validate_finite_float(label, value)
+
+
+def ensure_secret_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
 
 
 def _resolve_path_setting(
@@ -574,10 +696,21 @@ def _resolve_secret_path(
 def _read_toml_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open("rb") as fh:
-        data = _toml_parser.load(fh)
+    try:
+        with path.open("rb") as fh:
+            data = _toml_parser.load(fh)
+    except ValueError as exc:
+        line = getattr(exc, "lineno", None)
+        column = getattr(exc, "colno", None)
+        if line is None or column is None:
+            match = re.search(r"\(at line (\d+), column (\d+)\)", str(exc))
+            if match:
+                line = int(match.group(1))
+                column = int(match.group(2))
+        location = f" at line {line}, column {column}" if line is not None and column is not None else ""
+        raise ConfigError(f"Invalid TOML in {path.name}: {type(exc).__name__}{location}") from None
     if not isinstance(data, dict):
-        raise ValueError(f"Expected top-level TOML table in {path}")
+        raise ConfigError(f"Invalid TOML in {path.name}: expected top-level table") from None
     return data
 
 
@@ -588,7 +721,7 @@ def _read_secret_file(path: Path) -> str | None:
     return value or None
 
 
-def load_config(project_root: Path | None = None) -> AppConfig:
+def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
     root = (project_root or Path(__file__).resolve().parents[2]).resolve()
     workspace_root = _discover_workspace_root(root)
     runtime_root = _default_runtime_root(workspace_root)
@@ -678,16 +811,21 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         cache_dir=cache_dir,
         db_path=db_path,
         secret_files=secret_files_section,
-        completion_threshold=float(os.getenv("MAL_UPDATER_COMPLETION_THRESHOLD", _get_float(settings, "completion_threshold", DEFAULT_COMPLETION_THRESHOLD))),
-        credits_skip_window_seconds=int(
+        completion_threshold=_coerce_float(
+            os.getenv("MAL_UPDATER_COMPLETION_THRESHOLD", _get_float(settings, "completion_threshold", DEFAULT_COMPLETION_THRESHOLD)),
+            label="environment variable MAL_UPDATER_COMPLETION_THRESHOLD",
+        ),
+        credits_skip_window_seconds=_coerce_int(
             os.getenv(
                 "MAL_UPDATER_CREDITS_SKIP_WINDOW_SECONDS",
                 _get_int(settings, "credits_skip_window_seconds", DEFAULT_CREDITS_SKIP_WINDOW_SECONDS),
-            )
+            ),
+            label="environment variable MAL_UPDATER_CREDITS_SKIP_WINDOW_SECONDS",
         ),
         contract_version=os.getenv("MAL_UPDATER_CONTRACT_VERSION", _get_str(settings, "contract_version", DEFAULT_CONTRACT_VERSION)),
-        request_timeout_seconds=float(
-            os.getenv("MAL_UPDATER_REQUEST_TIMEOUT_SECONDS", _get_float(settings, "request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS))
+        request_timeout_seconds=_coerce_float(
+            os.getenv("MAL_UPDATER_REQUEST_TIMEOUT_SECONDS", _get_float(settings, "request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
+            label="environment variable MAL_UPDATER_REQUEST_TIMEOUT_SECONDS",
         ),
         mal=MalSettings(
             base_url=os.getenv("MAL_UPDATER_MAL_BASE_URL", _get_str(mal_section, "base_url", DEFAULT_MAL_BASE_URL)),
@@ -695,19 +833,31 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             auth_url=os.getenv("MAL_UPDATER_MAL_AUTH_URL", _get_str(mal_section, "auth_url", DEFAULT_MAL_AUTH_URL)),
             token_url=os.getenv("MAL_UPDATER_MAL_TOKEN_URL", _get_str(mal_section, "token_url", DEFAULT_MAL_TOKEN_URL)),
             bind_host=os.getenv("MAL_UPDATER_MAL_BIND_HOST", _get_str(mal_section, "bind_host", DEFAULT_MAL_BIND_HOST)),
+            non_loopback_callback_ack=_coerce_bool(
+                os.getenv(
+                    "MAL_UPDATER_MAL_NON_LOOPBACK_CALLBACK_ACK",
+                    str(_get_bool(mal_section, "non_loopback_callback_ack", DEFAULT_MAL_NON_LOOPBACK_CALLBACK_ACK, section="mal")),
+                ),
+                label="environment variable MAL_UPDATER_MAL_NON_LOOPBACK_CALLBACK_ACK",
+            ),
             redirect_host=os.getenv("MAL_UPDATER_MAL_REDIRECT_HOST", _get_str(mal_section, "redirect_host", DEFAULT_MAL_REDIRECT_HOST)),
-            redirect_port=int(os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", _get_int(mal_section, "redirect_port", DEFAULT_MAL_REDIRECT_PORT))),
-            request_spacing_seconds=float(
+            redirect_port=_coerce_int(
+                os.getenv("MAL_UPDATER_MAL_REDIRECT_PORT", _get_int(mal_section, "redirect_port", DEFAULT_MAL_REDIRECT_PORT, section="mal")),
+                label="environment variable MAL_UPDATER_MAL_REDIRECT_PORT",
+            ),
+            request_spacing_seconds=_coerce_float(
                 os.getenv(
                     "MAL_UPDATER_MAL_REQUEST_SPACING_SECONDS",
                     _get_float(mal_section, "request_spacing_seconds", DEFAULT_MAL_REQUEST_SPACING_SECONDS),
-                )
+                ),
+                label="environment variable MAL_UPDATER_MAL_REQUEST_SPACING_SECONDS",
             ),
-            request_spacing_jitter_seconds=float(
+            request_spacing_jitter_seconds=_coerce_float(
                 os.getenv(
                     "MAL_UPDATER_MAL_REQUEST_SPACING_JITTER_SECONDS",
                     _get_float(mal_section, "request_spacing_jitter_seconds", DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS),
-                )
+                ),
+                label="environment variable MAL_UPDATER_MAL_REQUEST_SPACING_JITTER_SECONDS",
             ),
             search_cache_ttl_days=max(0, int(os.getenv("MAL_UPDATER_MAL_SEARCH_CACHE_TTL_DAYS", _get_int(mal_section, "search_cache_ttl_days", DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS)))),
             search_negative_cache_ttl_days=max(0, int(os.getenv("MAL_UPDATER_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS", _get_int(mal_section, "search_negative_cache_ttl_days", DEFAULT_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS)))),
@@ -1076,7 +1226,20 @@ def load_config(project_root: Path | None = None) -> AppConfig:
             critical_ratio=float(os.getenv("MAL_UPDATER_SERVICE_CRITICAL_RATIO", _get_float(service_section, "critical_ratio", DEFAULT_SERVICE_CRITICAL_RATIO))),
         ),
     )
+    _validate_mal_callback_config(app_config.mal)
+    _validate_finite_numeric_config(app_config)
     return app_config
+
+
+def load_config(project_root: Path | None = None) -> AppConfig:
+    try:
+        return _load_config_unchecked(project_root)
+    except ConfigError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(
+            f"Invalid configuration value ({type(exc).__name__}); check MAL_UPDATER_* environment variables and settings.toml."
+        ) from None
 
 
 def load_mal_secrets(config: AppConfig) -> MalSecrets:
@@ -1139,7 +1302,6 @@ def ensure_directories(config: AppConfig) -> None:
     for path in (
         config.runtime_root,
         config.config_dir,
-        config.secrets_dir,
         config.data_dir,
         config.state_dir,
         config.cache_dir,
@@ -1148,3 +1310,4 @@ def ensure_directories(config: AppConfig) -> None:
         config.health_latest_json_path.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)
+    ensure_secret_directory(config.secrets_dir)

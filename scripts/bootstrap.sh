@@ -154,10 +154,9 @@ prompt_redirect_host() {
     return 0
   fi
 
-  selected="$detected"
+  selected="$existing"
   if [ -z "$selected" ]; then
-    selected="$existing"
-    warn "Could not detect a non-loopback LAN host IP; falling back to existing/default redirect_host: $selected"
+    selected="127.0.0.1"
   fi
 
   if [ ! -t 0 ]; then
@@ -165,7 +164,10 @@ prompt_redirect_host() {
     return 0
   fi
 
-  printf 'Detected MAL OAuth redirect host: %s\n' "$selected" >&2
+  printf 'Default MAL OAuth redirect host: %s\n' "$selected" >&2
+  if [ -n "$detected" ]; then
+    printf 'Detected non-loopback LAN host if you explicitly need another device/browser: %s\n' "$detected" >&2
+  fi
   read -r -p "Use this redirect host? [Y/n or enter override IP/host] " answer || return 1
   case "$answer" in
     ""|[Yy]|[Yy][Ee][Ss]) printf '%s\n' "$selected" ;;
@@ -179,18 +181,38 @@ prompt_redirect_host() {
   esac
 }
 
+is_loopback_host() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+import ipaddress
+import sys
+
+host = sys.argv[1].strip().lower()
+if host in {"localhost", "ip6-localhost", "ip6-loopback"}:
+    raise SystemExit(0)
+try:
+    raise SystemExit(0 if ipaddress.ip_address(host).is_loopback else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
 update_mal_runtime_settings() {
   local settings_path="$1"
   local redirect_host="$2"
-  "$PYTHON_BIN" - "$settings_path" "$redirect_host" <<'PY'
+  local bind_host="$3"
+  local non_loopback_ack="$4"
+  "$PYTHON_BIN" - "$settings_path" "$redirect_host" "$bind_host" "$non_loopback_ack" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 settings_path = Path(sys.argv[1])
 redirect_host = sys.argv[2]
+bind_host = sys.argv[3]
+non_loopback_ack = sys.argv[4].lower() in {"1", "true", "yes", "on"}
 updates = {
-    "bind_host": "0.0.0.0",
+    "bind_host": bind_host,
+    "non_loopback_callback_ack": non_loopback_ack,
     "redirect_host": redirect_host,
     "redirect_port": 8765,
 }
@@ -214,6 +236,8 @@ for index, line in enumerate(lines):
         break
 
 def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
@@ -320,9 +344,33 @@ if [ -z "$EXISTING_REDIRECT_HOST" ]; then
 fi
 DETECTED_REDIRECT_HOST="$(detect_host_ip)"
 REDIRECT_HOST="$(prompt_redirect_host "$DETECTED_REDIRECT_HOST" "$EXISTING_REDIRECT_HOST")"
-update_mal_runtime_settings "$SETTINGS_PATH" "$REDIRECT_HOST"
+BIND_HOST="127.0.0.1"
+NON_LOOPBACK_CALLBACK_ACK="false"
+if ! is_loopback_host "$REDIRECT_HOST"; then
+  if [ -n "${MAL_UPDATER_BOOTSTRAP_BIND_HOST:-}" ]; then
+    BIND_HOST="$MAL_UPDATER_BOOTSTRAP_BIND_HOST"
+  else
+    BIND_HOST="0.0.0.0"
+  fi
+  if [ -t 0 ]; then
+    warn "Non-loopback MAL OAuth callback requested; this exposes the temporary callback listener beyond loopback."
+    if prompt_yes_no "Acknowledge non-loopback callback listener exposure for this bootstrap?" no; then
+      NON_LOOPBACK_CALLBACK_ACK="true"
+    else
+      printf 'Non-loopback callback configuration requires acknowledgement. Aborting before writing settings.\n' >&2
+      exit 2
+    fi
+  elif [ "${MAL_UPDATER_BOOTSTRAP_NON_LOOPBACK_CALLBACK_ACK:-}" = "true" ] || [ "${MAL_UPDATER_BOOTSTRAP_NON_LOOPBACK_CALLBACK_ACK:-}" = "1" ]; then
+    NON_LOOPBACK_CALLBACK_ACK="true"
+  else
+    printf 'Non-loopback callback configuration requires MAL_UPDATER_BOOTSTRAP_NON_LOOPBACK_CALLBACK_ACK=true in non-interactive mode.\n' >&2
+    exit 2
+  fi
+fi
+update_mal_runtime_settings "$SETTINGS_PATH" "$REDIRECT_HOST" "$BIND_HOST" "$NON_LOOPBACK_CALLBACK_ACK"
 printf 'Updated MAL runtime settings:\n'
-printf '  bind_host = 0.0.0.0\n'
+printf '  bind_host = %s\n' "$BIND_HOST"
+printf '  non_loopback_callback_ack = %s\n' "$NON_LOOPBACK_CALLBACK_ACK"
 printf '  redirect_host = %s\n' "$REDIRECT_HOST"
 printf '  redirect_port = 8765\n'
 printf 'Register this exact MyAnimeList API callback URI before running MAL OAuth login:\n'

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -54,6 +55,16 @@ def user_service_env_path(config_home: Path | None = None) -> Path:
     return (config_home or xdg_config_home()) / "mal-updater-service.env"
 
 
+def _permission_payload(path: Path, *, expected_mode: int) -> dict[str, object]:
+    if not path.exists():
+        return {"mode_octal": None, "restrictive": None}
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return {"mode_octal": None, "restrictive": False}
+    return {"mode_octal": f"0o{mode:03o}", "restrictive": mode == expected_mode}
+
+
 def run_systemctl_status_probe(
     command: list[str],
     *,
@@ -88,6 +99,7 @@ def build_service_status_payload(
         systemctl_errors["is_enabled"] = enabled_error
     if active_error:
         systemctl_errors["is_active"] = active_error
+    env_permissions = _permission_payload(env_path, expected_mode=0o600)
     payload: dict[str, Any] = {
         "unit_path": str(unit_path),
         "unit_exists": unit_path.exists(),
@@ -97,6 +109,8 @@ def build_service_status_payload(
         "active_raw": systemctl_status_probe_output(active, active_error),
         "env_path": str(env_path),
         "env_exists": env_path.exists(),
+        "env_mode_octal": env_permissions["mode_octal"],
+        "env_restrictive": env_permissions["restrictive"],
         "systemctl_available": not systemctl_errors,
         "systemctl_status": "ok" if not systemctl_errors else "unavailable",
     }
@@ -192,6 +206,7 @@ def build_automation_installation_status(
     env_path = user_service_env_path(config_home)
     target_path = target_dir / unit_name
     installed = target_path.exists()
+    env_permissions = _permission_payload(env_path, expected_mode=0o600)
     content_matches_repo = False
     if installed:
         try:
@@ -217,6 +232,8 @@ def build_automation_installation_status(
         "target_dir": str(target_dir),
         "env_path": str(env_path),
         "env_present": env_path.exists(),
+        "env_mode_octal": env_permissions["mode_octal"],
+        "env_restrictive": env_permissions["restrictive"],
         "unit_name": unit_name,
         "unit": {
             "installed": installed,

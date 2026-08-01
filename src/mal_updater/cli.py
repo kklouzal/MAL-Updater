@@ -17,7 +17,7 @@ from . import bootstrap_guidance as _bootstrap_guidance
 from . import health_report as _health_report
 from . import review_queue_support as _review_queue_support
 from .cli_parser import build_parser
-from .config import ensure_directories, load_config, load_mal_secrets
+from .config import ConfigError, ensure_directories, load_config, load_mal_secrets, mal_callback_bind_warning
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
@@ -31,6 +31,7 @@ from .hidive_snapshot import HidiveSnapshotError
 from . import provider_snapshot
 from .provider_registry import get_provider, list_provider_slugs
 from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
+from .redaction import sanitize_text
 from . import providers as _providers  # noqa: F401
 from .db import (
     backfill_hidive_series_urls,
@@ -124,6 +125,10 @@ def _cmd_status(project_root: Path | None) -> int:
     print(f"mal.auth_url={config.mal.auth_url}")
     print(f"mal.token_url={config.mal.token_url}")
     print(f"mal.bind_host={config.mal.bind_host}")
+    print(f"mal.non_loopback_callback_ack={config.mal.non_loopback_callback_ack}")
+    warning = mal_callback_bind_warning(config.mal)
+    if warning:
+        print(f"mal.callback_bind_warning={warning}")
     print(f"mal.redirect_uri={config.mal.redirect_uri}")
     print(f"mal.request_spacing_seconds={config.mal.request_spacing_seconds}")
     print(f"mal.request_spacing_jitter_seconds={config.mal.request_spacing_jitter_seconds}")
@@ -300,6 +305,10 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
     if payload.get("active_raw"):
         print(f"active_raw={payload['active_raw']}")
     print(f"env_exists={bool(payload.get('env_exists'))}")
+    if payload.get("env_mode_octal") is not None:
+        print(f"env_mode={payload['env_mode_octal']}")
+    if payload.get("env_restrictive") is not None:
+        print(f"env_restrictive={payload['env_restrictive']}")
     print(f"service_state_exists={bool(payload.get('service_state_exists'))}")
     print(f"service_log_exists={bool(payload.get('service_log_exists'))}")
     print(f"health_latest_exists={bool(payload.get('health_latest_exists'))}")
@@ -651,6 +660,8 @@ def _cmd_health_check(
 def _cmd_mal_auth_url(project_root: Path | None, emit_json: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
+    if warning := mal_callback_bind_warning(config.mal):
+        print(f"WARNING: {warning}", file=sys.stderr)
     client = MalClient(config, load_mal_secrets(config))
     pkce = client.generate_pkce_pair()
     try:
@@ -3451,6 +3462,9 @@ def main() -> int:
         token = begin_api_request_context(task=f"cli:{args.command}", run_id=str(uuid.uuid4()))
     try:
         return _dispatch(parser, args)
+    except ConfigError as exc:
+        print(f"configuration error: {sanitize_text(exc.safe_message, max_length=1_000)}", file=sys.stderr)
+        return 2
     finally:
         if token is not None:
             end_api_request_context(token)

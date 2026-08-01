@@ -1,16 +1,41 @@
 from __future__ import annotations
 
 import os
+import stat
+import subprocess
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mal_updater.config import _load_toml_parser, _read_toml_file, load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
+from mal_updater.config import ConfigError, _load_toml_parser, _read_toml_file, ensure_directories, load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
 
 
 class ConfigLoadingTests(unittest.TestCase):
+    def _run_status_with_settings(
+        self,
+        root: Path,
+        runtime_root: Path,
+        settings_path: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            "MAL_UPDATER_RUNTIME_ROOT": str(runtime_root),
+            "MAL_UPDATER_SETTINGS_PATH": str(settings_path),
+        }
+        env.update(extra_env or {})
+        return subprocess.run(
+            [os.sys.executable, "-m", "mal_updater.cli", "--project-root", str(root), "status"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+
     def test_zero_sync_apply_execute_limit_is_preserved_as_scheduler_disable(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -37,7 +62,8 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(config.state_dir, (root / ".MAL-Updater" / "state").resolve())
             self.assertEqual(config.cache_dir, (root / ".MAL-Updater" / "cache").resolve())
             self.assertEqual(config.db_path, (root / ".MAL-Updater" / "data" / "mal_updater.sqlite3").resolve())
-            self.assertEqual(config.mal.bind_host, "0.0.0.0")
+            self.assertEqual(config.mal.bind_host, "127.0.0.1")
+            self.assertFalse(config.mal.non_loopback_callback_ack)
             self.assertEqual(config.mal.redirect_uri, "http://127.0.0.1:8765/callback")
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "mal_client_id.txt").resolve())
             self.assertFalse(config.openclaw.recommendations_webhook_enabled)
@@ -308,6 +334,123 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("mal", task_name="sync_apply"))
             self.assertEqual("task", config.service.budget_scope_for("mal", task_name="sync_apply"))
             self.assertEqual("provider", config.service.budget_scope_for("hidive", task_name="sync_fetch_hidive"))
+
+    def test_non_loopback_oauth_bind_requires_explicit_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_dir = root / ".MAL-Updater" / "config"
+            config_dir.mkdir(parents=True)
+            settings_path = config_dir / "settings.toml"
+            settings_path.write_text('[mal]\nbind_host = "0.0.0.0"\n', encoding="utf-8")
+
+            with self.assertRaises(ConfigError) as raised:
+                load_config(root)
+
+            self.assertIn("non-loopback MAL OAuth callback", raised.exception.safe_message)
+            settings_path.write_text('[mal]\nbind_host = "0.0.0.0"\nnon_loopback_callback_ack = true\n', encoding="utf-8")
+            config = load_config(root)
+            self.assertEqual("0.0.0.0", config.mal.bind_host)
+            self.assertTrue(config.mal.non_loopback_callback_ack)
+
+    def test_ensure_directories_tightens_secrets_dir_to_0700(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+
+            ensure_directories(config)
+
+            mode = stat.S_IMODE(config.secrets_dir.stat().st_mode)
+            self.assertEqual(0o700, mode)
+
+    def test_cli_invalid_env_config_exits_two_without_traceback_or_value(self) -> None:
+        cases = (
+            ("MAL_UPDATER_MAL_REDIRECT_PORT", "SENTINEL-invalid-config-value"),
+            ("MAL_UPDATER_MAL_REDIRECT_PORT", "inf"),
+            ("MAL_UPDATER_REQUEST_TIMEOUT_SECONDS", "inf"),
+        )
+        for env_name, raw_value in cases:
+            with self.subTest(env_name=env_name, raw_value=raw_value), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runtime_root = root / "runtime"
+                settings_path = runtime_root / "config" / "settings.toml"
+                settings_path.parent.mkdir(parents=True)
+                settings_path.write_text("", encoding="utf-8")
+                result = self._run_status_with_settings(root, runtime_root, settings_path, extra_env={env_name: raw_value})
+
+                self.assertEqual(2, result.returncode)
+                self.assertIn("configuration error:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr + result.stdout)
+                self.assertNotIn(raw_value, result.stderr + result.stdout)
+
+    def test_cli_invalid_toml_numeric_config_exits_two_without_traceback_or_value(self) -> None:
+        cases = (
+            ("[mal]\nredirect_port = inf\n", "inf"),
+            ('[mal]\nredirect_port = "SENTINEL-invalid-config-value"\n', "SENTINEL-invalid-config-value"),
+            ("request_timeout_seconds = inf\n", "inf"),
+        )
+        for settings_text, raw_value in cases:
+            with self.subTest(settings_text=settings_text), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runtime_root = root / "runtime"
+                settings_path = runtime_root / "config" / "settings.toml"
+                settings_path.parent.mkdir(parents=True)
+                settings_path.write_text(settings_text, encoding="utf-8")
+
+                result = self._run_status_with_settings(root, runtime_root, settings_path)
+
+                self.assertEqual(2, result.returncode)
+                self.assertIn("configuration error:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr + result.stdout)
+                self.assertNotIn(raw_value, result.stderr + result.stdout)
+
+    def test_cli_invalid_toml_table_numeric_config_exits_two_without_traceback_or_value(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime_root = root / "runtime"
+            settings_path = runtime_root / "config" / "settings.toml"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                "[service.task_hourly_limits]\nsync_apply = inf\n",
+                encoding="utf-8",
+            )
+
+            result = self._run_status_with_settings(root, runtime_root, settings_path)
+
+            self.assertEqual(2, result.returncode)
+            self.assertIn("configuration error:", result.stderr)
+            self.assertNotIn("Traceback", result.stderr + result.stdout)
+            self.assertNotIn("inf", result.stderr + result.stdout)
+
+    def test_cli_invalid_toml_config_exits_two_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime_root = root / "runtime"
+            settings_path = runtime_root / "config" / "settings.toml"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text("[mal\n", encoding="utf-8")
+            result = self._run_status_with_settings(root, runtime_root, settings_path)
+
+            self.assertEqual(2, result.returncode)
+            self.assertIn("configuration error:", result.stderr)
+            self.assertIn("Invalid TOML", result.stderr)
+            self.assertNotIn("Traceback", result.stderr + result.stdout)
+
+    def test_read_toml_file_sanitizes_parser_error_details(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings_path = Path(td) / "settings.toml"
+            settings_path.write_text('[mal]\nclient_secret = "SUPERSECRET"\nclient_secret = "OTHER"\n', encoding="utf-8")
+
+            with self.assertRaises(ConfigError) as raised:
+                _read_toml_file(settings_path)
+
+            message = raised.exception.safe_message
+            self.assertIn("Invalid TOML in settings.toml", message)
+            self.assertIn("TOMLDecodeError", message)
+            self.assertIn("line", message)
+            self.assertIn("column", message)
+            self.assertNotIn("SUPERSECRET", message)
+            self.assertNotIn("OTHER", message)
 
     def test_settings_example_standard_toml_features_parse_and_preserve_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -9,7 +9,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .config import AppConfig, MalSecrets
+from .config import AppConfig, MalSecrets, ensure_secret_directory, mal_callback_bind_warning
 from .mal_client import TokenResponse
 
 
@@ -97,7 +97,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 
 def write_secret_file(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_secret_directory(path.parent)
     with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
         tmp.write(value.strip() + "\n")
         temp_path = Path(tmp.name)
@@ -135,12 +135,17 @@ def wait_for_oauth_callback(host: str, port: int, expected_state: str | None, ti
 
 
 def format_auth_flow_prompt(config: AppConfig, authorization_url: str, timeout_seconds: float) -> str:
-    return "\n".join(
+    lines = [
+        "Starting local MAL OAuth callback listener.",
+        f"bind_host={config.mal.bind_host}",
+        f"redirect_uri={config.mal.redirect_uri}",
+        f"timeout_seconds={int(timeout_seconds)}",
+    ]
+    warning = mal_callback_bind_warning(config.mal)
+    if warning:
+        lines.extend(["", f"WARNING: {warning}"])
+    lines.extend(
         [
-            "Starting local MAL OAuth callback listener.",
-            f"bind_host={config.mal.bind_host}",
-            f"redirect_uri={config.mal.redirect_uri}",
-            f"timeout_seconds={int(timeout_seconds)}",
             "",
             "Open this URL in a browser that can reach the redirect_uri host:",
             authorization_url,
@@ -148,3 +153,4 @@ def format_auth_flow_prompt(config: AppConfig, authorization_url: str, timeout_s
             "Waiting for a single /callback hit...",
         ]
     )
+    return "\n".join(lines)

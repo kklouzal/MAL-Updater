@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from mal_updater.cli import main as cli_main
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.service_manager import doctor_service, service_status, unit_contents
+from mal_updater.service_manager import doctor_service, service_status, unit_contents, write_service_env_file_if_missing
 from mal_updater.service_systemd_status import build_automation_installation_status, read_systemd_user_unit_runtime
 from mal_updater.service_units import render_repo_systemd_unit_template
 
@@ -72,6 +73,26 @@ class ServiceStatusTests(unittest.TestCase):
             f"ExecStart={fake_python} -m mal_updater.cli --project-root {self.config.project_root} service-run",
             rendered,
         )
+
+    def test_service_manager_creates_env_file_0600_without_overwriting_existing(self) -> None:
+        source = self.project_root / "ops" / "systemd-user" / "mal-updater-service.env.example"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+        fake_home = self.project_root / "fake-home"
+        env_path = fake_home / ".config" / "mal-updater-service.env"
+
+        with patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False):
+            created = write_service_env_file_if_missing(self.config)
+            self.assertEqual(0o600, stat.S_IMODE(created.stat().st_mode))
+            existing_text = "MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=15\n"
+            created.write_text(existing_text, encoding="utf-8")
+            created.chmod(0o644)
+            preserved = write_service_env_file_if_missing(self.config)
+
+        self.assertEqual(env_path, created)
+        self.assertEqual(env_path, preserved)
+        self.assertEqual(existing_text, env_path.read_text(encoding="utf-8"))
+        self.assertEqual(0o644, stat.S_IMODE(env_path.stat().st_mode))
 
     def test_doctor_service_includes_recent_task_state_and_log_tail(self) -> None:
         now = datetime.now(timezone.utc)

@@ -18,6 +18,12 @@ Use the reported `mal.redirect_uri` value when creating/configuring the MAL app.
 Default fallback:
 - `http://127.0.0.1:8765/callback`
 
+The local callback listener binds to loopback by default. If an operator intentionally
+sets `mal.bind_host` to a non-loopback address such as `0.0.0.0`, they must also
+set `mal.non_loopback_callback_ack = true` (or
+`MAL_UPDATER_MAL_NON_LOOPBACK_CALLBACK_ACK=true`); the login prompt will warn
+that the temporary listener is reachable beyond the local machine.
+
 ## Typical flow
 
 ```bash

@@ -164,6 +164,7 @@ class AuthHelperTests(unittest.TestCase):
                     """
                     [mal]
                     bind_host = "0.0.0.0"
+                    non_loopback_callback_ack = true
                     redirect_host = "127.0.0.117"
                     redirect_port = 8765
                     """
@@ -175,6 +176,7 @@ class AuthHelperTests(unittest.TestCase):
             prompt = format_auth_flow_prompt(config, "https://example.test/auth", 300)
 
             self.assertIn("bind_host=0.0.0.0", prompt)
+            self.assertIn("WARNING: MAL OAuth callback listener is configured on a non-loopback bind_host", prompt)
             self.assertIn("redirect_uri=http://127.0.0.117:8765/callback", prompt)
             self.assertIn("https://example.test/auth", prompt)
 
@@ -187,6 +189,8 @@ class AuthHelperTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "top-secret\n")
             mode = stat.S_IMODE(path.stat().st_mode)
             self.assertEqual(mode, 0o600)
+            parent_mode = stat.S_IMODE(path.parent.stat().st_mode)
+            self.assertEqual(parent_mode, 0o700)
 
     def test_persist_token_response_writes_access_and_refresh_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as td:
