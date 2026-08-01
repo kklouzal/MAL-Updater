@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from mal_updater.config import load_config
 from mal_updater.db import (
     abort_mal_user_anime_list_cache_refresh,
     apply_migrations,
@@ -14,9 +18,11 @@ from mal_updater.db import (
     finalize_mal_user_anime_list_cache_refresh,
     get_mal_user_anime_list_cache,
     list_mal_user_anime_list_cache,
+    MalUserAnimeListRefreshConflictError,
     replace_mal_user_anime_list_cache_generation,
     upsert_mal_user_anime_list_cache_generation,
 )
+from mal_updater.recommendation_metadata import refresh_mal_user_anime_list_cache
 
 
 def _list_item(anime_id: int, title: str, status: str, *, score: int = 0, watched: int = 0) -> dict:
@@ -35,6 +41,14 @@ def _list_item(anime_id: int, title: str, status: str, *, score: int = 0, watche
     }
 
 
+def _refresh_lifecycle_row(db_path: Path, generation: int):
+    with connect(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation = ?",
+            (int(generation),),
+        ).fetchone()
+
+
 class MalUserAnimeListCacheDbTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -47,7 +61,9 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
     def test_fresh_bootstrap_and_upgrade_apply_user_list_schema_idempotently(self) -> None:
         with connect(self.db_path) as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_cache)")}
+            lifecycle_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_refresh_generations)")}
             indexes = {row["name"] for row in conn.execute("PRAGMA index_list(mal_user_anime_list_cache)")}
+            lifecycle_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(mal_user_anime_list_refresh_generations)")}
             migrations = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
         self.assertIn("mal_anime_id", columns)
         self.assertIn("list_status", columns)
@@ -76,8 +92,16 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         self.assertIn("idx_mal_user_anime_list_cache_generation", indexes)
         self.assertIn("idx_mal_user_anime_list_cache_priority_pref", indexes)
         self.assertIn("idx_mal_user_anime_list_cache_private_text_presence", indexes)
+        self.assertIn("generation", lifecycle_columns)
+        self.assertIn("refresh_run_id", lifecycle_columns)
+        self.assertIn("status", lifecycle_columns)
+        self.assertIn("fetched_at", lifecycle_columns)
+        self.assertIn("completed_at", lifecycle_columns)
+        self.assertIn("idx_mal_user_anime_list_refresh_generations_status", lifecycle_indexes)
+        self.assertIn("uq_mal_user_anime_list_refresh_generations_active", lifecycle_indexes)
         self.assertIn("007_mal_user_anime_list_cache.sql", migrations)
         self.assertIn("011_mal_user_anime_list_preference_fields.sql", migrations)
+        self.assertIn("019_mal_user_anime_list_refresh_generations.sql", migrations)
 
         db_path = Path(self.temp_dir.name) / "upgrade.sqlite3"
         with connect(db_path) as conn:
@@ -107,11 +131,300 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
                 "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = '007_mal_user_anime_list_cache.sql'"
             ).fetchone()["n"]
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_cache)")}
+            lifecycle_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_refresh_generations)")}
         self.assertEqual(1, migration_rows)
         self.assertIn("last_seen_at", columns)
         self.assertIn("list_status_json", columns)
         self.assertIn("priority", columns)
         self.assertIn("has_comments", columns)
+        self.assertIn("generation", lifecycle_columns)
+        self.assertIn("refresh_run_id", lifecycle_columns)
+
+    def test_concurrent_begins_allocate_unique_monotonic_generations(self) -> None:
+        def begin(index: int):
+            return begin_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=f"concurrent-{index}",
+                fetched_at=f"2026-07-19T00:00:{index:02d}Z",
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            allocations = list(executor.map(begin, range(8)))
+
+        generations = sorted(allocation.generation for allocation in allocations)
+        self.assertEqual(list(range(1, 9)), generations)
+        self.assertEqual(8, len({allocation.refresh_run_id for allocation in allocations}))
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT generation, status, error FROM mal_user_anime_list_refresh_generations ORDER BY generation"
+            ).fetchall()
+        self.assertEqual(1, sum(row["status"] == "active" for row in rows))
+        self.assertEqual(8, next(row["generation"] for row in rows if row["status"] == "active"))
+        for row in rows[:-1]:
+            self.assertEqual("failed", row["status"])
+            self.assertEqual("superseded by a newer MAL user anime list refresh", row["error"])
+
+    def test_begin_keeps_exactly_one_latest_active_and_supersedes_older_active(self) -> None:
+        old = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="old-active",
+            fetched_at="2026-07-19T00:00:00Z",
+        )
+        new = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="new-active",
+            fetched_at="2026-07-19T00:01:00Z",
+        )
+
+        old_lifecycle = _refresh_lifecycle_row(self.db_path, old.generation)
+        new_lifecycle = _refresh_lifecycle_row(self.db_path, new.generation)
+        self.assertIsNotNone(old_lifecycle)
+        self.assertIsNotNone(new_lifecycle)
+        assert old_lifecycle is not None
+        assert new_lifecycle is not None
+        self.assertEqual("failed", old_lifecycle["status"])
+        self.assertEqual("superseded by a newer MAL user anime list refresh", old_lifecycle["error"])
+        self.assertIsNotNone(old_lifecycle["completed_at"])
+        self.assertEqual("active", new_lifecycle["status"])
+        with connect(self.db_path) as conn:
+            self.assertEqual(
+                1,
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM mal_user_anime_list_refresh_generations WHERE status = 'active'"
+                ).fetchone()["n"],
+            )
+
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed"):
+            begin_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=old.refresh_run_id,
+                fetched_at="2026-07-19T00:02:00Z",
+            )
+
+    def test_duplicate_active_begin_returns_existing_allocation_and_terminal_reuse_rejects(self) -> None:
+        first = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="duplicate-run",
+            fetched_at="2026-07-19T00:00:00Z",
+        )
+        duplicate = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="duplicate-run",
+            fetched_at="2026-07-19T00:05:00Z",
+        )
+        self.assertEqual(first, duplicate)
+
+        finalize_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id=first.refresh_run_id,
+            generation=first.generation,
+            proven_complete=True,
+            delete_absent=False,
+        )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*completed"):
+            begin_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id="duplicate-run",
+                fetched_at="2026-07-19T00:10:00Z",
+            )
+
+    def test_generation_identity_active_and_terminal_validation_rejects_bad_operations(self) -> None:
+        generation = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="identity-run",
+            fetched_at="2026-07-19T00:00:00Z",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            upsert_mal_user_anime_list_cache_generation(
+                self.db_path,
+                items=[_list_item(10, "Unknown", "completed")],
+                refresh_run_id=generation.refresh_run_id,
+                generation=generation.generation + 100,
+                fetched_at=generation.fetched_at,
+            )
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            upsert_mal_user_anime_list_cache_generation(
+                self.db_path,
+                items=[_list_item(10, "Mismatch", "completed")],
+                refresh_run_id="wrong-run",
+                generation=generation.generation,
+                fetched_at=generation.fetched_at,
+            )
+
+        upsert_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(10, "Valid", "completed")],
+            refresh_run_id=generation.refresh_run_id,
+            generation=generation.generation,
+            fetched_at=generation.fetched_at,
+        )
+        finalize_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id=generation.refresh_run_id,
+            generation=generation.generation,
+            proven_complete=True,
+            delete_absent=False,
+        )
+
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*completed"):
+            upsert_mal_user_anime_list_cache_generation(
+                self.db_path,
+                items=[_list_item(10, "Terminal", "completed")],
+                refresh_run_id=generation.refresh_run_id,
+                generation=generation.generation,
+                fetched_at=generation.fetched_at,
+            )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*completed"):
+            finalize_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=generation.refresh_run_id,
+                generation=generation.generation,
+                proven_complete=True,
+                delete_absent=False,
+            )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*completed"):
+            abort_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=generation.refresh_run_id,
+                generation=generation.generation,
+                error="late abort",
+            )
+
+    def test_database_partial_unique_index_rejects_a_second_active_generation(self) -> None:
+        begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="only-active",
+            fetched_at="2026-07-19T00:00:00Z",
+        )
+        with connect(self.db_path) as conn:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE constraint failed"):
+                conn.execute(
+                    """
+                    INSERT INTO mal_user_anime_list_refresh_generations (
+                        refresh_run_id, status, fetched_at
+                    ) VALUES ('second-active', 'active', '2026-07-19T00:01:00Z')
+                    """
+                )
+
+    def test_old_generation_upsert_rejects_and_cannot_overwrite_newer_row(self) -> None:
+        old = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="old-overlap",
+            fetched_at="2026-07-19T00:00:00Z",
+        )
+        new = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="new-overlap",
+            fetched_at="2026-07-19T00:01:00Z",
+        )
+        upsert_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(10, "New Winner", "watching", score=7)],
+            refresh_run_id=new.refresh_run_id,
+            generation=new.generation,
+            fetched_at=new.fetched_at,
+        )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed.*cannot upsert"):
+            upsert_mal_user_anime_list_cache_generation(
+                self.db_path,
+                items=[_list_item(10, "Old Loser", "completed", score=10)],
+                refresh_run_id=old.refresh_run_id,
+                generation=old.generation,
+                fetched_at=old.fetched_at,
+            )
+        row = get_mal_user_anime_list_cache(self.db_path, 10)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual("New Winner", row.title)
+        self.assertEqual(new.generation, row.refresh_generation)
+        self.assertEqual(new.refresh_run_id, row.refresh_run_id)
+
+    def test_stale_finalize_cannot_prune_and_current_complete_can_prune_older_rows(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(10, "Existing", "completed", score=8)],
+            refresh_run_id="old-complete",
+            fetched_at="2026-07-19T00:00:00Z",
+            prune_absent=True,
+        )
+        stale = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="stale-complete",
+            fetched_at="2026-07-19T01:00:00Z",
+        )
+        upsert_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(30, "Stale", "watching", score=7)],
+            refresh_run_id=stale.refresh_run_id,
+            generation=stale.generation,
+            fetched_at=stale.fetched_at,
+        )
+        current = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="current-complete",
+            fetched_at="2026-07-19T02:00:00Z",
+        )
+        upsert_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(20, "Current", "plan_to_watch")],
+            refresh_run_id=current.refresh_run_id,
+            generation=current.generation,
+            fetched_at=current.fetched_at,
+        )
+
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed.*cannot finalize"):
+            finalize_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=stale.refresh_run_id,
+                generation=stale.generation,
+                proven_complete=True,
+                delete_absent=True,
+            )
+        self.assertEqual([10, 20, 30], [row.mal_anime_id for row in list_mal_user_anime_list_cache(self.db_path)])
+
+        complete = finalize_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id=current.refresh_run_id,
+            generation=current.generation,
+            proven_complete=True,
+            delete_absent=True,
+        )
+        self.assertEqual("ok", complete.status)
+        self.assertEqual(2, complete.pruned)
+        self.assertEqual([20], [row.mal_anime_id for row in list_mal_user_anime_list_cache(self.db_path)])
+
+    def test_superseded_abort_and_duplicate_begin_reject_without_mutating_lifecycle(self) -> None:
+        stale = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="stale-abort",
+            fetched_at="2026-07-19T01:00:00Z",
+        )
+        begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="newer-abort",
+            fetched_at="2026-07-19T02:00:00Z",
+        )
+
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed.*cannot abort"):
+            abort_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=stale.refresh_run_id,
+                generation=stale.generation,
+                error="too late",
+            )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed"):
+            begin_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=stale.refresh_run_id,
+                fetched_at="2026-07-19T03:00:00Z",
+            )
+
+        lifecycle = _refresh_lifecycle_row(self.db_path, stale.generation)
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        self.assertEqual("failed", lifecycle["status"])
+        self.assertEqual("superseded by a newer MAL user anime list refresh", lifecycle["error"])
 
     def test_privacy_safe_preference_fields_are_typed_while_raw_json_is_retained(self) -> None:
         item = _list_item(30, "Preference Seed", "completed", score=10, watched=12)
@@ -237,6 +550,11 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         )
         self.assertEqual("aborted", aborted.status)
         self.assertEqual("bounded page run", aborted.error)
+        lifecycle = _refresh_lifecycle_row(self.db_path, generation.generation)
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        self.assertEqual("failed", lifecycle["status"])
+        self.assertEqual("bounded page run", lifecycle["error"])
         self.assertEqual([10, 20], [row.mal_anime_id for row in list_mal_user_anime_list_cache(self.db_path)])
 
     def test_proven_complete_finalize_can_explicitly_prune_absent_rows(self) -> None:
@@ -268,7 +586,110 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         )
         self.assertEqual("ok", complete.status)
         self.assertEqual(1, complete.pruned)
+        lifecycle = _refresh_lifecycle_row(self.db_path, generation.generation)
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        self.assertEqual("completed", lifecycle["status"])
         self.assertEqual([20], [row.mal_anime_id for row in list_mal_user_anime_list_cache(self.db_path)])
+
+    def test_superseded_complete_refresh_fails_closed_without_cache_overwrite_or_prune(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(10, "Existing", "completed", score=8)],
+            refresh_run_id="old",
+            fetched_at="2026-07-19T00:00:00Z",
+            prune_absent=True,
+        )
+        superseded = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="superseded",
+            fetched_at="2026-07-19T01:00:00Z",
+        )
+        current = begin_mal_user_anime_list_cache_refresh(
+            self.db_path,
+            refresh_run_id="current",
+            fetched_at="2026-07-19T02:00:00Z",
+        )
+        upsert_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[_list_item(30, "Current", "watching", score=7)],
+            refresh_run_id=current.refresh_run_id,
+            generation=current.generation,
+            fetched_at=current.fetched_at,
+        )
+
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed.*cannot upsert"):
+            upsert_mal_user_anime_list_cache_generation(
+                self.db_path,
+                items=[
+                    _list_item(10, "Superseded Overwrite", "watching", score=10),
+                    _list_item(20, "Superseded New", "completed"),
+                ],
+                refresh_run_id=superseded.refresh_run_id,
+                generation=superseded.generation,
+                fetched_at=superseded.fetched_at,
+            )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "terminal.*failed.*cannot finalize"):
+            finalize_mal_user_anime_list_cache_refresh(
+                self.db_path,
+                refresh_run_id=superseded.refresh_run_id,
+                generation=superseded.generation,
+                proven_complete=True,
+                delete_absent=True,
+            )
+
+        rows = list_mal_user_anime_list_cache(self.db_path)
+        self.assertEqual([10, 30], [row.mal_anime_id for row in rows])
+        self.assertEqual("Existing", rows[0].title)
+        self.assertEqual("Current", rows[1].title)
+
+    def test_top_level_refresh_superseded_after_collection_returns_controlled_failure(self) -> None:
+        project_root = Path(self.temp_dir.name) / "refresh-project"
+        config = load_config(project_root)
+        bootstrap_database(config.db_path)
+        replace_mal_user_anime_list_cache_generation(
+            config.db_path,
+            items=[_list_item(90, "Old", "completed", score=8)],
+            refresh_run_id="old",
+            fetched_at="2026-07-19T00:00:00Z",
+            prune_absent=True,
+        )
+
+        def superseding_pages(**_: object):
+            yield {"data": [_list_item(100, "Must Not Land", "watching", score=7)], "paging": {}}
+            begin_mal_user_anime_list_cache_refresh(
+                config.db_path,
+                refresh_run_id="overlapping-new-owner",
+                fetched_at="2026-07-19T02:00:00Z",
+            )
+
+        with patch(
+            "mal_updater.recommendation_metadata.MalClient.iter_my_anime_list_pages",
+            side_effect=superseding_pages,
+        ):
+            summary = refresh_mal_user_anime_list_cache(config, max_pages=3, prune_on_complete=True)
+
+        self.assertEqual("failed", summary.status)
+        self.assertTrue(summary.partial)
+        self.assertEqual(1, summary.pages)
+        self.assertEqual(1, summary.items)
+        self.assertIn("terminal (failed)", summary.error or "")
+        self.assertEqual([90], [row.mal_anime_id for row in list_mal_user_anime_list_cache(config.db_path)])
+        lifecycle = _refresh_lifecycle_row(config.db_path, summary.generation)
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        self.assertEqual("failed", lifecycle["status"])
+        self.assertEqual("superseded by a newer MAL user anime list refresh", lifecycle["error"])
+
+    def test_top_level_refresh_does_not_swallow_unrelated_runtime_error(self) -> None:
+        config = load_config(Path(self.temp_dir.name) / "runtime-error-project")
+        bootstrap_database(config.db_path)
+        with patch(
+            "mal_updater.recommendation_metadata.MalClient.iter_my_anime_list_pages",
+            side_effect=RuntimeError("unrelated bug"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unrelated bug"):
+                refresh_mal_user_anime_list_cache(config, max_pages=3)
 
 
 if __name__ == "__main__":

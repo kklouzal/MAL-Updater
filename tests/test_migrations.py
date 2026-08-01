@@ -39,6 +39,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "016_provider_watchlist_membership_keys.sql",
                 "017_provider_series_observation_provenance.sql",
                 "018_provider_title_search_cache_full_key.sql",
+                "019_mal_user_anime_list_refresh_generations.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -85,6 +86,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "016_provider_watchlist_membership_keys.sql",
                     "017_provider_series_observation_provenance.sql",
                     "018_provider_title_search_cache_full_key.sql",
+                    "019_mal_user_anime_list_refresh_generations.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -110,6 +112,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "016_provider_watchlist_membership_keys.sql",
                     "017_provider_series_observation_provenance.sql",
                     "018_provider_title_search_cache_full_key.sql",
+                    "019_mal_user_anime_list_refresh_generations.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -555,7 +558,7 @@ class MigrationCatalogTests(unittest.TestCase):
                         mal_anime_id, title, list_status, user_score, num_episodes_watched,
                         node_json, list_status_json, raw_json, refresh_run_id, refresh_generation,
                         fetched_at, last_seen_at
-                    ) VALUES (20, 'Preference Seed', 'completed', 9, 12, '{}', ?, ?, 'run', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                    ) VALUES (20, 'Preference Seed', 'completed', 9, 12, '{}', ?, ?, 'run', 7, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
                     """,
                     (
                         json.dumps(
@@ -586,13 +589,22 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertEqual("friday", metadata["broadcast_day"])
                 self.assertEqual("23:30", metadata["broadcast_time"])
                 self.assertEqual("white", metadata["nsfw"])
-                prefs = conn.execute("SELECT priority, is_rewatching, num_times_rewatched, rewatch_value, tag_count, has_comments FROM mal_user_anime_list_cache WHERE mal_anime_id = 20").fetchone()
+                prefs = conn.execute("SELECT priority, is_rewatching, num_times_rewatched, rewatch_value, tag_count, has_comments, refresh_generation FROM mal_user_anime_list_cache WHERE mal_anime_id = 20").fetchone()
                 self.assertEqual(2, prefs["priority"])
                 self.assertEqual(1, prefs["is_rewatching"])
                 self.assertEqual(1, prefs["num_times_rewatched"])
                 self.assertEqual(5, prefs["rewatch_value"])
                 self.assertEqual(1, prefs["tag_count"])
                 self.assertEqual(1, prefs["has_comments"])
+                self.assertEqual(7, prefs["refresh_generation"])
+                lifecycle = conn.execute(
+                    "SELECT refresh_run_id, status, fetched_at, items, upserted FROM mal_user_anime_list_refresh_generations WHERE generation = 7"
+                ).fetchone()
+                self.assertEqual("run", lifecycle["refresh_run_id"])
+                self.assertEqual("completed", lifecycle["status"])
+                self.assertEqual("2026-01-01T00:00:00Z", lifecycle["fetched_at"])
+                self.assertEqual(1, lifecycle["items"])
+                self.assertEqual(1, lifecycle["upserted"])
                 columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_cache)")}
                 self.assertNotIn("comments", columns)
                 self.assertNotIn("tags_json", columns)
@@ -601,6 +613,102 @@ class MigrationCatalogTests(unittest.TestCase):
                     marker_count = conn.execute("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?", (version,)).fetchone()["n"]
                     self.assertEqual(1, marker_count)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+            next_refresh = db.begin_mal_user_anime_list_cache_refresh(
+                db_path,
+                refresh_run_id="post-upgrade-run",
+                fetched_at="2026-01-02T00:00:00Z",
+            )
+            self.assertEqual(8, next_refresh.generation)
+
+    def test_user_list_lifecycle_upgrade_preserves_colliding_legacy_generation_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "colliding-user-list-generations.sqlite3"
+            original = db.MIGRATIONS
+            migration_index = db.MIGRATION_FILENAMES.index(
+                db.MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION
+            )
+            try:
+                db.MIGRATIONS = original[:migration_index]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            legacy_rows = (
+                (101, "Run Seven B First", "run-seven-b", 7, "2026-01-01T00:00:00Z"),
+                (102, "Run Seven B Second", "run-seven-b", 7, "2026-01-01T00:01:00Z"),
+                (103, "Run Seven A", "run-seven-a", 7, "2026-01-01T00:02:00Z"),
+                (104, "Run Nine", "run-nine", 9, "2026-01-01T00:03:00Z"),
+            )
+            with connect(db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO mal_user_anime_list_cache (
+                        mal_anime_id, title, list_status, user_score, num_episodes_watched,
+                        node_json, list_status_json, raw_json, refresh_run_id,
+                        refresh_generation, fetched_at, last_seen_at
+                    ) VALUES (?, ?, 'completed', 8, 12, '{}', '{}', '{}', ?, ?, ?, ?)
+                    """,
+                    [(*row, row[-1]) for row in legacy_rows],
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                cache_rows = conn.execute(
+                    """
+                    SELECT mal_anime_id, refresh_run_id, refresh_generation
+                    FROM mal_user_anime_list_cache
+                    ORDER BY mal_anime_id
+                    """
+                ).fetchall()
+                lifecycle_rows = conn.execute(
+                    """
+                    SELECT generation, refresh_run_id, status, items, upserted
+                    FROM mal_user_anime_list_refresh_generations
+                    ORDER BY generation
+                    """
+                ).fetchall()
+                sequence = conn.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'mal_user_anime_list_refresh_generations'"
+                ).fetchone()["seq"]
+
+            self.assertEqual(4, len(cache_rows))
+            self.assertEqual(3, len(lifecycle_rows))
+            self.assertEqual(
+                {"run-seven-a", "run-seven-b", "run-nine"},
+                {row["refresh_run_id"] for row in lifecycle_rows},
+            )
+            self.assertEqual(3, len({row["generation"] for row in lifecycle_rows}))
+            generation_by_run = {
+                row["refresh_run_id"]: row["generation"] for row in lifecycle_rows
+            }
+            self.assertEqual(7, generation_by_run["run-seven-b"])
+            self.assertGreater(generation_by_run["run-seven-a"], 9)
+            self.assertEqual(9, generation_by_run["run-nine"])
+            self.assertTrue(all(row["status"] == "completed" for row in lifecycle_rows))
+            self.assertEqual(
+                {"run-seven-a": 1, "run-seven-b": 2, "run-nine": 1},
+                {row["refresh_run_id"]: row["items"] for row in lifecycle_rows},
+            )
+            self.assertEqual(
+                {"run-seven-a": 1, "run-seven-b": 2, "run-nine": 1},
+                {row["refresh_run_id"]: row["upserted"] for row in lifecycle_rows},
+            )
+            for cache_row in cache_rows:
+                self.assertEqual(
+                    generation_by_run[cache_row["refresh_run_id"]],
+                    cache_row["refresh_generation"],
+                )
+            highest_mapped_generation = max(generation_by_run.values())
+            self.assertEqual(highest_mapped_generation, sequence)
+
+            next_refresh = db.begin_mal_user_anime_list_cache_refresh(
+                db_path,
+                refresh_run_id="post-collision-upgrade",
+                fetched_at="2026-01-02T00:00:00Z",
+            )
+            self.assertGreater(next_refresh.generation, highest_mapped_generation)
 
     def test_recorded_legacy_010_schema_gets_canonical_broadcast_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -13,12 +13,13 @@ from .db import (
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     MalAnimeMetadata,
     MalPublicUserRecsCrawlGeneration,
+    MalUserAnimeListRefreshConflictError,
     MalUserAnimeListRefreshSummary,
     abort_mal_user_anime_list_cache_refresh,
     begin_mal_user_anime_list_cache_refresh,
     connect,
     create_or_get_active_mal_public_userrecs_generation,
-    finalize_mal_user_anime_list_cache_refresh,
+    finish_mal_user_anime_list_cache_refresh,
     get_active_mal_public_userrecs_generation,
     get_mal_anime_metadata_map,
     list_active_mal_public_userrecs_generations,
@@ -35,7 +36,6 @@ from .db import (
     replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
-    upsert_mal_user_anime_list_cache_generation,
     restart_mal_public_userrecs_generation_after_drift,
     resume_mal_public_userrecs_generation,
 )
@@ -567,6 +567,21 @@ def refresh_mal_user_anime_list_cache(
     unscored = 0
     pages = 0
     last_payload: dict[str, Any] | None = None
+
+    def conflict_summary(exc: MalUserAnimeListRefreshConflictError) -> MalUserAnimeListRefreshSummary:
+        return MalUserAnimeListRefreshSummary(
+            status="failed",
+            refresh_run_id=refresh.refresh_run_id,
+            generation=refresh.generation,
+            pages=pages,
+            items=len(collected),
+            scored=scored,
+            unscored=unscored,
+            by_status=dict(by_status),
+            partial=True,
+            error=str(exc),
+        )
+
     try:
         for index, status in enumerate(normalized_statuses):
             status_pages = 0
@@ -601,12 +616,14 @@ def refresh_mal_user_anime_list_cache(
             reached_budget_before_terminal = pages >= max_pages and _payload_has_next_page(last_payload)
             statuses_left_unfetched = pages >= max_pages and index < len(normalized_statuses) - 1
             if reached_budget_before_terminal or statuses_left_unfetched:
-                summary = upsert_mal_user_anime_list_cache_generation(
+                summary = finish_mal_user_anime_list_cache_refresh(
                     config.db_path,
                     items=collected,
                     refresh_run_id=refresh.refresh_run_id,
                     generation=refresh.generation,
                     fetched_at=refresh.fetched_at,
+                    proven_complete=False,
+                    delete_absent=False,
                 )
                 summary.status = "partial"
                 summary.pages = pages
@@ -617,13 +634,18 @@ def refresh_mal_user_anime_list_cache(
                 summary.error = "max_pages reached before MAL anime list pagination completed; seen rows upserted and absent rows retained"
                 summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(config.db_path)
                 return summary
+    except MalUserAnimeListRefreshConflictError as exc:
+        return conflict_summary(exc)
     except (MalApiError, TimeoutError, ValueError) as exc:
-        summary = abort_mal_user_anime_list_cache_refresh(
-            config.db_path,
-            refresh_run_id=refresh.refresh_run_id,
-            generation=refresh.generation,
-            error=str(exc),
-        )
+        try:
+            summary = abort_mal_user_anime_list_cache_refresh(
+                config.db_path,
+                refresh_run_id=refresh.refresh_run_id,
+                generation=refresh.generation,
+                error=str(exc),
+            )
+        except MalUserAnimeListRefreshConflictError as conflict:
+            return conflict_summary(conflict)
         summary.status = "failed"
         summary.pages = pages
         summary.items = len(collected)
@@ -632,24 +654,20 @@ def refresh_mal_user_anime_list_cache(
         summary.by_status = dict(by_status)
         summary.partial = True
         return summary
-    upsert = upsert_mal_user_anime_list_cache_generation(
-        config.db_path,
-        items=collected,
-        refresh_run_id=refresh.refresh_run_id,
-        generation=refresh.generation,
-        fetched_at=refresh.fetched_at,
-    )
-    summary = finalize_mal_user_anime_list_cache_refresh(
-        config.db_path,
-        refresh_run_id=refresh.refresh_run_id,
-        generation=refresh.generation,
-        proven_complete=True,
-        delete_absent=bool(all_statuses and prune_on_complete),
-    )
+    try:
+        summary = finish_mal_user_anime_list_cache_refresh(
+            config.db_path,
+            items=collected,
+            refresh_run_id=refresh.refresh_run_id,
+            generation=refresh.generation,
+            fetched_at=refresh.fetched_at,
+            proven_complete=True,
+            delete_absent=bool(all_statuses and prune_on_complete),
+        )
+    except MalUserAnimeListRefreshConflictError as exc:
+        return conflict_summary(exc)
     summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(config.db_path)
     summary.pages = pages
-    summary.items = upsert.items
-    summary.upserted = upsert.upserted
     summary.scored = scored
     summary.unscored = unscored
     summary.by_status = dict(by_status)

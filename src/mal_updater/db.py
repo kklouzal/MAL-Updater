@@ -19,6 +19,7 @@ PUBLIC_USERRECS_STAGING_MIGRATION = "015_public_userrecs_resumable_staging.sql"
 PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION = "016_provider_watchlist_membership_keys.sql"
 PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION = "017_provider_series_observation_provenance.sql"
 PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION = "018_provider_title_search_cache_full_key.sql"
+MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION = "019_mal_user_anime_list_refresh_generations.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -40,6 +41,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION,
     PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,
     PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION,
+    MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -1507,6 +1509,10 @@ def upsert_watch_confirmation_provenance(
 
 
 _ALLOWED_MAL_USER_LIST_STATUSES = {"completed", "watching", "on_hold", "dropped", "plan_to_watch"}
+_MAL_USER_LIST_REFRESH_ACTIVE_STATUS = "active"
+_MAL_USER_LIST_REFRESH_TERMINAL_STATUSES = {"completed", "partial", "failed"}
+_MAL_USER_LIST_REFRESH_ERROR_MAX_LENGTH = 2000
+_MAL_USER_LIST_REFRESH_SUPERSEDED_ERROR = "superseded by a newer MAL user anime list refresh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1514,6 +1520,10 @@ class MalUserAnimeListRefreshGeneration:
     refresh_run_id: str
     generation: int
     fetched_at: str
+
+
+class MalUserAnimeListRefreshConflictError(RuntimeError):
+    """A cache refresh lost ownership of the current active generation."""
 
 
 def _normalize_mal_user_list_status(value: Any) -> str | None:
@@ -1555,9 +1565,150 @@ def _clamp_optional_int(value: Any, *, minimum: int, maximum: int | None = None)
     return coerced
 
 
-def _next_mal_user_list_generation(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT COALESCE(MAX(refresh_generation), 0) + 1 AS generation FROM mal_user_anime_list_cache").fetchone()
-    return int(row["generation"] or 1)
+def _bounded_mal_user_list_refresh_error(error: str | None) -> str | None:
+    if error is None:
+        return None
+    text = str(error)
+    if len(text) <= _MAL_USER_LIST_REFRESH_ERROR_MAX_LENGTH:
+        return text
+    return text[: _MAL_USER_LIST_REFRESH_ERROR_MAX_LENGTH - 1] + "…"
+
+
+def _coerce_mal_user_list_refresh_run_id(refresh_run_id: str) -> str:
+    run_id = str(refresh_run_id).strip()
+    if not run_id:
+        raise ValueError("refresh_run_id is required")
+    return run_id
+
+
+def _coerce_mal_user_list_refresh_generation(generation: int) -> int:
+    try:
+        value = int(generation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("refresh generation must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError("refresh generation must be a positive integer")
+    return value
+
+
+def _fetch_mal_user_list_refresh_generation(
+    conn: sqlite3.Connection,
+    *,
+    refresh_run_id: str,
+    generation: int,
+) -> sqlite3.Row:
+    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
+    generation_id = _coerce_mal_user_list_refresh_generation(generation)
+    row = conn.execute(
+        """
+        SELECT *
+        FROM mal_user_anime_list_refresh_generations
+        WHERE generation = ?
+        """,
+        (generation_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown MAL user anime list refresh generation {generation_id}")
+    if str(row["refresh_run_id"]) != run_id:
+        raise ValueError(
+            "MAL user anime list refresh generation/run mismatch: "
+            f"generation {generation_id} belongs to a different refresh_run_id"
+        )
+    return row
+
+
+def _require_active_mal_user_list_refresh_generation(
+    conn: sqlite3.Connection,
+    *,
+    refresh_run_id: str,
+    generation: int,
+    operation: str,
+) -> sqlite3.Row:
+    row = _fetch_mal_user_list_refresh_generation(
+        conn,
+        refresh_run_id=refresh_run_id,
+        generation=generation,
+    )
+    status = str(row["status"])
+    if status != _MAL_USER_LIST_REFRESH_ACTIVE_STATUS:
+        raise MalUserAnimeListRefreshConflictError(
+            "MAL user anime list refresh generation "
+            f"{int(row['generation'])} for refresh_run_id={row['refresh_run_id']!r} "
+            f"is terminal ({status}); cannot {operation}"
+        )
+    return row
+
+
+def _latest_mal_user_list_refresh_generation(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(generation), 0) AS generation FROM mal_user_anime_list_refresh_generations"
+    ).fetchone()
+    return int(row["generation"] or 0)
+
+
+def _require_current_mal_user_list_refresh_generation(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    operation: str,
+) -> None:
+    generation = int(row["generation"])
+    latest_generation = _latest_mal_user_list_refresh_generation(conn)
+    if latest_generation != generation:
+        raise MalUserAnimeListRefreshConflictError(
+            "stale MAL user anime list refresh generation "
+            f"{generation} cannot {operation}; latest generation is {latest_generation}"
+        )
+
+
+def _active_mal_user_list_refresh_generation_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM mal_user_anime_list_refresh_generations WHERE status = 'active'"
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _require_single_active_mal_user_list_refresh_generation(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    active_count = _active_mal_user_list_refresh_generation_count(conn)
+    if active_count != 1:
+        raise MalUserAnimeListRefreshConflictError(
+            "expected exactly one active MAL user anime list refresh generation; "
+            f"found {active_count}"
+        )
+    if str(row["status"]) != _MAL_USER_LIST_REFRESH_ACTIVE_STATUS:
+        raise MalUserAnimeListRefreshConflictError(
+            "MAL user anime list refresh generation "
+            f"{int(row['generation'])} is not active after begin"
+        )
+
+
+def _summarize_mal_user_list_refresh_rows(rows: Iterable[sqlite3.Row]) -> tuple[dict[str, int], int, int, dict[str, int]]:
+    by_status: dict[str, int] = {}
+    scored = 0
+    unscored = 0
+    preference_counts = _empty_preference_counts()
+    for row in rows:
+        status = row["list_status"]
+        score = row["user_score"]
+        if status:
+            by_status[str(status)] = by_status.get(str(status), 0) + 1
+        if score is not None and int(score) > 0:
+            scored += 1
+        else:
+            unscored += 1
+        if row["priority"] is not None:
+            preference_counts["with_priority"] += 1
+        if row["is_rewatching"] is not None:
+            preference_counts["with_rewatching"] += 1
+        if row["num_times_rewatched"] is not None:
+            preference_counts["with_num_times_rewatched"] += 1
+        if row["rewatch_value"] is not None:
+            preference_counts["with_rewatch_value"] += 1
+        if int(row["tag_count"] or 0) > 0:
+            preference_counts["with_tags"] += 1
+        if int(row["has_comments"] or 0) > 0:
+            preference_counts["with_comments"] += 1
+    return by_status, scored, unscored, preference_counts
 
 
 def begin_mal_user_anime_list_cache_refresh(
@@ -1566,20 +1717,93 @@ def begin_mal_user_anime_list_cache_refresh(
     refresh_run_id: str,
     fetched_at: str,
 ) -> MalUserAnimeListRefreshGeneration:
-    """Allocate a cache refresh generation without pruning any existing rows."""
-    if not str(refresh_run_id).strip():
-        raise ValueError("refresh_run_id is required")
-    if not str(fetched_at).strip():
+    """Allocate the sole active cache refresh generation without pruning any rows."""
+    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
+    fetched = str(fetched_at).strip()
+    if not fetched:
         raise ValueError("fetched_at is required")
     conn = connect(db_path)
     try:
-        generation = _next_mal_user_list_generation(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT generation, refresh_run_id, status, fetched_at
+            FROM mal_user_anime_list_refresh_generations
+            WHERE refresh_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if existing is not None:
+            status = str(existing["status"])
+            if status == _MAL_USER_LIST_REFRESH_ACTIVE_STATUS:
+                latest_generation = _latest_mal_user_list_refresh_generation(conn)
+                if int(existing["generation"]) == latest_generation:
+                    conn.commit()
+                    return MalUserAnimeListRefreshGeneration(
+                        refresh_run_id=str(existing["refresh_run_id"]),
+                        generation=int(existing["generation"]),
+                        fetched_at=str(existing["fetched_at"]),
+                    )
+                conn.execute(
+                    """
+                    UPDATE mal_user_anime_list_refresh_generations
+                    SET status = 'failed',
+                        completed_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP,
+                        error = ?
+                    WHERE generation = ? AND refresh_run_id = ? AND status = 'active'
+                    """,
+                    (_MAL_USER_LIST_REFRESH_SUPERSEDED_ERROR, int(existing["generation"]), run_id),
+                )
+                raise MalUserAnimeListRefreshConflictError(
+                    "refresh_run_id belongs to stale active MAL user anime list "
+                    f"refresh generation {int(existing['generation'])}; "
+                    f"latest generation is {latest_generation}"
+                )
+            if status in _MAL_USER_LIST_REFRESH_TERMINAL_STATUSES:
+                raise MalUserAnimeListRefreshConflictError(
+                    "refresh_run_id already belongs to terminal MAL user anime list "
+                    f"refresh generation {int(existing['generation'])} ({status})"
+                )
+            raise RuntimeError(
+                "refresh_run_id belongs to MAL user anime list refresh generation "
+                f"{int(existing['generation'])} with unsupported status {status!r}"
+            )
+        conn.execute(
+            """
+            UPDATE mal_user_anime_list_refresh_generations
+            SET status = 'failed',
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                error = ?
+            WHERE status = 'active'
+            """,
+            (_MAL_USER_LIST_REFRESH_SUPERSEDED_ERROR,),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO mal_user_anime_list_refresh_generations (refresh_run_id, status, fetched_at)
+            VALUES (?, 'active', ?)
+            """,
+            (run_id, fetched),
+        )
+        generation = int(cursor.lastrowid)
+        inserted = _fetch_mal_user_list_refresh_generation(
+            conn,
+            refresh_run_id=run_id,
+            generation=generation,
+        )
+        _require_single_active_mal_user_list_refresh_generation(conn, inserted)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     return MalUserAnimeListRefreshGeneration(
-        refresh_run_id=str(refresh_run_id),
+        refresh_run_id=run_id,
         generation=generation,
-        fetched_at=str(fetched_at),
+        fetched_at=fetched,
     )
 
 
@@ -1707,6 +1931,11 @@ def upsert_mal_user_anime_list_cache_generation(
     fetched_at: str,
 ) -> MalUserAnimeListRefreshSummary:
     """Upsert rows for a refresh generation without deleting absent prior rows."""
+    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
+    generation_id = _coerce_mal_user_list_refresh_generation(generation)
+    fetched = str(fetched_at).strip()
+    if not fetched:
+        raise ValueError("fetched_at is required")
     prepared: list[tuple[Any, ...]] = []
     seen_ids: set[int] = set()
     for item in items:
@@ -1714,9 +1943,9 @@ def upsert_mal_user_anime_list_cache_generation(
             continue
         row = _prepare_mal_user_list_cache_item(
             item,
-            refresh_run_id=str(refresh_run_id),
-            generation=int(generation),
-            fetched_at=str(fetched_at),
+            refresh_run_id=run_id,
+            generation=generation_id,
+            fetched_at=fetched,
         )
         if row is None:
             continue
@@ -1727,7 +1956,20 @@ def upsert_mal_user_anime_list_cache_generation(
         prepared.append(row)
     conn = connect(db_path)
     try:
-        with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        lifecycle = _require_active_mal_user_list_refresh_generation(
+            conn,
+            refresh_run_id=run_id,
+            generation=generation_id,
+            operation="upsert cache rows",
+        )
+        _require_current_mal_user_list_refresh_generation(
+            conn,
+            lifecycle,
+            operation="upsert cache rows",
+        )
+        changes_before = conn.total_changes
+        if prepared:
             conn.executemany(
                 """
                 INSERT INTO mal_user_anime_list_cache (
@@ -1759,28 +2001,205 @@ def upsert_mal_user_anime_list_cache_generation(
                     fetched_at = excluded.fetched_at,
                     last_seen_at = excluded.last_seen_at,
                     updated_at = CURRENT_TIMESTAMP
+                WHERE mal_user_anime_list_cache.refresh_generation <= excluded.refresh_generation
                 """,
                 prepared,
             )
-            preserved_absent = conn.execute(
-                "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
-                (int(generation),),
-            ).fetchone()["n"]
+        changed_rows = conn.total_changes - changes_before
+        preserved_absent = conn.execute(
+            "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+            (generation_id,),
+        ).fetchone()["n"]
+        conn.execute(
+            """
+            UPDATE mal_user_anime_list_refresh_generations
+            SET items = items + ?,
+                upserted = upserted + ?,
+                preserved_absent = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE generation = ? AND refresh_run_id = ? AND status = 'active'
+            """,
+            (len(prepared), int(changed_rows), int(preserved_absent or 0), generation_id, run_id),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     by_status, scored, unscored, preference_counts = _summarize_prepared_mal_user_list_rows(prepared)
     return MalUserAnimeListRefreshSummary(
         status="upserted",
-        refresh_run_id=str(refresh_run_id),
-        generation=int(generation),
+        refresh_run_id=run_id,
+        generation=generation_id,
         items=len(prepared),
-        upserted=len(prepared),
+        upserted=int(changed_rows),
         preserved_absent=int(preserved_absent or 0),
         scored=scored,
         unscored=unscored,
         preference_counts=preference_counts,
         by_status=by_status,
         partial=True,
+    )
+
+
+def finish_mal_user_anime_list_cache_refresh(
+    db_path: Path,
+    *,
+    items: Iterable[dict[str, Any]],
+    refresh_run_id: str,
+    generation: int,
+    fetched_at: str,
+    proven_complete: bool,
+    delete_absent: bool = False,
+) -> MalUserAnimeListRefreshSummary:
+    """Atomically upsert rows and terminalize a refresh generation."""
+    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
+    generation_id = _coerce_mal_user_list_refresh_generation(generation)
+    fetched = str(fetched_at).strip()
+    if not fetched:
+        raise ValueError("fetched_at is required")
+    if delete_absent and not proven_complete:
+        raise ValueError("delete_absent requires proven_complete=True")
+    prepared: list[tuple[Any, ...]] = []
+    seen_ids: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        row = _prepare_mal_user_list_cache_item(
+            item,
+            refresh_run_id=run_id,
+            generation=generation_id,
+            fetched_at=fetched,
+        )
+        if row is None:
+            continue
+        mal_anime_id = int(row[0])
+        if mal_anime_id in seen_ids:
+            continue
+        seen_ids.add(mal_anime_id)
+        prepared.append(row)
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        lifecycle = _require_active_mal_user_list_refresh_generation(
+            conn,
+            refresh_run_id=run_id,
+            generation=generation_id,
+            operation="finish refresh",
+        )
+        _require_current_mal_user_list_refresh_generation(
+            conn,
+            lifecycle,
+            operation="finish refresh",
+        )
+        changes_before = conn.total_changes
+        if prepared:
+            conn.executemany(
+                """
+                INSERT INTO mal_user_anime_list_cache (
+                    mal_anime_id, title, list_status, user_score, num_episodes_watched,
+                    start_date, finish_date, list_updated_at, priority, is_rewatching,
+                    num_times_rewatched, rewatch_value, tag_count, has_comments,
+                    node_json, list_status_json, raw_json, refresh_run_id,
+                    refresh_generation, fetched_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mal_anime_id) DO UPDATE SET
+                    title = excluded.title,
+                    list_status = excluded.list_status,
+                    user_score = excluded.user_score,
+                    num_episodes_watched = excluded.num_episodes_watched,
+                    start_date = excluded.start_date,
+                    finish_date = excluded.finish_date,
+                    list_updated_at = excluded.list_updated_at,
+                    priority = excluded.priority,
+                    is_rewatching = excluded.is_rewatching,
+                    num_times_rewatched = excluded.num_times_rewatched,
+                    rewatch_value = excluded.rewatch_value,
+                    tag_count = excluded.tag_count,
+                    has_comments = excluded.has_comments,
+                    node_json = excluded.node_json,
+                    list_status_json = excluded.list_status_json,
+                    raw_json = excluded.raw_json,
+                    refresh_run_id = excluded.refresh_run_id,
+                    refresh_generation = excluded.refresh_generation,
+                    fetched_at = excluded.fetched_at,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE mal_user_anime_list_cache.refresh_generation <= excluded.refresh_generation
+                """,
+                prepared,
+            )
+        changed_rows = conn.total_changes - changes_before
+        current = conn.execute(
+            """
+            SELECT
+                list_status,
+                user_score,
+                priority,
+                is_rewatching,
+                num_times_rewatched,
+                rewatch_value,
+                tag_count,
+                has_comments
+            FROM mal_user_anime_list_cache
+            WHERE refresh_generation = ? AND refresh_run_id = ?
+            """,
+            (generation_id, run_id),
+        ).fetchall()
+        pruned = 0
+        if delete_absent:
+            pruned = conn.execute(
+                "DELETE FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+                (generation_id,),
+            ).rowcount
+        preserved_absent = conn.execute(
+            "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+            (generation_id,),
+        ).fetchone()["n"]
+        lifecycle_status = "completed" if proven_complete else "partial"
+        conn.execute(
+            """
+            UPDATE mal_user_anime_list_refresh_generations
+            SET status = ?,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                items = items + ?,
+                upserted = upserted + ?,
+                pruned = ?,
+                preserved_absent = ?
+            WHERE generation = ? AND refresh_run_id = ? AND status = 'active'
+            """,
+            (
+                lifecycle_status,
+                len(prepared),
+                int(changed_rows),
+                int(pruned or 0),
+                int(preserved_absent or 0),
+                generation_id,
+                run_id,
+            ),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    by_status, scored, unscored, preference_counts = _summarize_mal_user_list_refresh_rows(current)
+    return MalUserAnimeListRefreshSummary(
+        status="ok" if proven_complete else "partial",
+        refresh_run_id=run_id,
+        generation=generation_id,
+        items=len(prepared),
+        upserted=int(changed_rows),
+        pruned=int(pruned or 0),
+        preserved_absent=int(preserved_absent or 0),
+        scored=scored,
+        unscored=unscored,
+        preference_counts=preference_counts,
+        by_status=by_status,
+        partial=not proven_complete,
     )
 
 
@@ -1793,68 +2212,74 @@ def finalize_mal_user_anime_list_cache_refresh(
     delete_absent: bool = False,
 ) -> MalUserAnimeListRefreshSummary:
     """Finalize a refresh generation; absent rows are deleted only with explicit proof."""
+    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
+    generation_id = _coerce_mal_user_list_refresh_generation(generation)
     if delete_absent and not proven_complete:
         raise ValueError("delete_absent requires proven_complete=True")
     conn = connect(db_path)
     try:
-        with conn:
-            current = conn.execute(
-                """
-                SELECT
-                    list_status,
-                    user_score,
-                    priority,
-                    is_rewatching,
-                    num_times_rewatched,
-                    rewatch_value,
-                    tag_count,
-                    has_comments
-                FROM mal_user_anime_list_cache
-                WHERE refresh_generation = ? AND refresh_run_id = ?
-                """,
-                (int(generation), str(refresh_run_id)),
-            ).fetchall()
-            pruned = 0
-            if delete_absent:
-                pruned = conn.execute(
-                    "DELETE FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
-                    (int(generation),),
-                ).rowcount
-            preserved_absent = conn.execute(
-                "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
-                (int(generation),),
-            ).fetchone()["n"]
+        conn.execute("BEGIN IMMEDIATE")
+        lifecycle = _require_active_mal_user_list_refresh_generation(
+            conn,
+            refresh_run_id=run_id,
+            generation=generation_id,
+            operation="finalize refresh",
+        )
+        _require_current_mal_user_list_refresh_generation(
+            conn,
+            lifecycle,
+            operation="finalize refresh",
+        )
+        current = conn.execute(
+            """
+            SELECT
+                list_status,
+                user_score,
+                priority,
+                is_rewatching,
+                num_times_rewatched,
+                rewatch_value,
+                tag_count,
+                has_comments
+            FROM mal_user_anime_list_cache
+            WHERE refresh_generation = ? AND refresh_run_id = ?
+            """,
+            (generation_id, run_id),
+        ).fetchall()
+        pruned = 0
+        if delete_absent:
+            pruned = conn.execute(
+                "DELETE FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+                (generation_id,),
+            ).rowcount
+        preserved_absent = conn.execute(
+            "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+            (generation_id,),
+        ).fetchone()["n"]
+        lifecycle_status = "completed" if proven_complete else "partial"
+        conn.execute(
+            """
+            UPDATE mal_user_anime_list_refresh_generations
+            SET status = ?,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                pruned = ?,
+                preserved_absent = ?
+            WHERE generation = ? AND refresh_run_id = ? AND status = 'active'
+            """,
+            (lifecycle_status, int(pruned or 0), int(preserved_absent or 0), generation_id, run_id),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    by_status: dict[str, int] = {}
-    scored = 0
-    unscored = 0
-    preference_counts = _empty_preference_counts()
-    for row in current:
-        status = row["list_status"]
-        score = row["user_score"]
-        if status:
-            by_status[str(status)] = by_status.get(str(status), 0) + 1
-        if score is not None and int(score) > 0:
-            scored += 1
-        else:
-            unscored += 1
-        if row["priority"] is not None:
-            preference_counts["with_priority"] += 1
-        if row["is_rewatching"] is not None:
-            preference_counts["with_rewatching"] += 1
-        if row["num_times_rewatched"] is not None:
-            preference_counts["with_num_times_rewatched"] += 1
-        if row["rewatch_value"] is not None:
-            preference_counts["with_rewatch_value"] += 1
-        if int(row["tag_count"] or 0) > 0:
-            preference_counts["with_tags"] += 1
-        if int(row["has_comments"] or 0) > 0:
-            preference_counts["with_comments"] += 1
+    by_status, scored, unscored, preference_counts = _summarize_mal_user_list_refresh_rows(current)
     return MalUserAnimeListRefreshSummary(
-        status="ok" if proven_complete else "aborted",
-        refresh_run_id=str(refresh_run_id),
-        generation=int(generation),
+        status="ok" if proven_complete else "partial",
+        refresh_run_id=run_id,
+        generation=generation_id,
         items=len(current),
         upserted=len(current),
         pruned=int(pruned or 0),
@@ -1874,16 +2299,76 @@ def abort_mal_user_anime_list_cache_refresh(
     generation: int,
     error: str | None = None,
 ) -> MalUserAnimeListRefreshSummary:
-    summary = finalize_mal_user_anime_list_cache_refresh(
-        db_path,
-        refresh_run_id=refresh_run_id,
-        generation=generation,
-        proven_complete=False,
-        delete_absent=False,
+    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
+    generation_id = _coerce_mal_user_list_refresh_generation(generation)
+    bounded_error = _bounded_mal_user_list_refresh_error(error)
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        lifecycle = _require_active_mal_user_list_refresh_generation(
+            conn,
+            refresh_run_id=run_id,
+            generation=generation_id,
+            operation="abort refresh",
+        )
+        _require_current_mal_user_list_refresh_generation(
+            conn,
+            lifecycle,
+            operation="abort refresh",
+        )
+        current = conn.execute(
+            """
+            SELECT
+                list_status,
+                user_score,
+                priority,
+                is_rewatching,
+                num_times_rewatched,
+                rewatch_value,
+                tag_count,
+                has_comments
+            FROM mal_user_anime_list_cache
+            WHERE refresh_generation = ? AND refresh_run_id = ?
+            """,
+            (generation_id, run_id),
+        ).fetchall()
+        preserved_absent = conn.execute(
+            "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
+            (generation_id,),
+        ).fetchone()["n"]
+        conn.execute(
+            """
+            UPDATE mal_user_anime_list_refresh_generations
+            SET status = 'failed',
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                error = ?,
+                preserved_absent = ?
+            WHERE generation = ? AND refresh_run_id = ? AND status = 'active'
+            """,
+            (bounded_error, int(preserved_absent or 0), generation_id, run_id),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    by_status, scored, unscored, preference_counts = _summarize_mal_user_list_refresh_rows(current)
+    return MalUserAnimeListRefreshSummary(
+        status="aborted",
+        refresh_run_id=run_id,
+        generation=generation_id,
+        items=len(current),
+        upserted=len(current),
+        preserved_absent=int(preserved_absent or 0),
+        scored=scored,
+        unscored=unscored,
+        preference_counts=preference_counts,
+        by_status=by_status,
+        partial=True,
+        error=bounded_error,
     )
-    summary.status = "aborted"
-    summary.error = error
-    return summary
 
 
 def replace_mal_user_anime_list_cache_generation(
@@ -1913,18 +2398,16 @@ def replace_mal_user_anime_list_cache_generation(
         generation=refresh.generation,
         fetched_at=refresh.fetched_at,
     )
-    if not prune_absent:
-        upsert.status = "ok"
-        upsert.partial = False
-        return upsert
     finalized = finalize_mal_user_anime_list_cache_refresh(
         db_path,
         refresh_run_id=refresh.refresh_run_id,
         generation=refresh.generation,
         proven_complete=True,
-        delete_absent=True,
+        delete_absent=bool(prune_absent),
     )
     finalized.pages = upsert.pages
+    finalized.items = upsert.items
+    finalized.upserted = upsert.upserted
     return finalized
 
 
