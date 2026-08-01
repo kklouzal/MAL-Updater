@@ -1,0 +1,23 @@
+# Direct CI/local-quality constraints for MAL-Updater.
+#
+# This is intentionally NOT a full transitive lock file. It pins the direct
+# runtime/build/quality tools validated by CI while allowing pip to resolve
+# transitive dependencies per Python minor/platform. If full transitive
+# reproducibility becomes required, replace this with a generated lock per
+# supported Python/platform instead of treating this file as that lock.
+
+# Build backend / build frontend used by isolated package builds.
+setuptools==83.0.0
+wheel==0.47.0
+build==1.5.0
+
+# Runtime direct dependencies constrained for CI and wheel smoke installs.
+requests==2.34.2
+curl_cffi==0.16.0
+tomli==2.4.1; python_version < "3.11"
+
+# Quality gates.
+pytest==8.4.2
+coverage==7.15.2
+ruff==0.14.14
+mypy==1.20.2

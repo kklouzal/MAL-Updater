@@ -39,6 +39,17 @@ PYTHONPATH=src python3 -m mal_updater.cli status
 
 Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, provider-specific operation-mode guidance/next-command hints, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts, secrets-dir permission posture, blocking/non-blocking onboarding counts, explicit recommended commands for automation-friendly consumers, and top-level `recommended_command` / `recommended_automation_command` selections so machine consumers do not have to re-implement bootstrap prioritization. Those onboarding/recommended-command entries now preserve stable `reason_code`, `automation_safe`, and `requires_auth_interaction` metadata too, and auth-driven reauth/rebootstrap steps carry `auth_failure_kind` / `auth_remediation_kind` so bootstrap automation does not have to reverse-engineer the reason from freeform detail text. MAL and provider `operation_guidance` now preserve that same next-command metadata (`next_command_reason_code`, automation-safe posture, auth-interaction posture, and auth-remediation classification when applicable) so per-lane guidance stays aligned with the top-level recommendation surfaces instead of dropping back to a bare command string. `bootstrap-audit` now also mirrors health-driven provider refresh pressure there: when the latest health artifact still recommends either a provider `refresh_ingested_snapshot` or `refresh_full_snapshot`, the affected provider stays bootstrap-ready but surfaces the matching safe refresh/full-refresh fetch command as its next operator action instead of hiding that remediation in health-check alone. `bootstrap-audit --summary` now also surfaces the top recommended command plus its `reason_code`, automation-safe posture, and auth-interaction requirement so terse/operator and shell-script flows can stay aligned with the full JSON payload, and it emits the same metadata for MAL/provider next-command hints too. Staged auth is now treated conservatively there across both MAL and source providers: if repeated unattended `mal_refresh` failures or provider session residue/fetch failures already suggest auth degradation, bootstrap-audit downgrades that lane from healthy/ready posture to explicit re-auth or re-bootstrap guidance instead of trusting token-file presence alone. Those auth-degradation surfaces now also classify the residue into more specific operator-readable buckets such as revoked/invalid token, missing refresh material, malformed token payload, or generic session/login auth failure so the next step is better justified, and `bootstrap-audit --summary` surfaces the same terse auth-failure/remediation kinds for quick operator triage.
 
+## Local quality gates
+
+The CI-equivalent local gate is:
+
+```bash
+python -m pip install -c constraints/ci.txt -e ".[dev]"
+scripts/quality.sh
+```
+
+This runs hermetic full tests under coverage with unique `/tmp` runtime/settings paths, scoped lint/type checks, isolated sdist+wheel builds, package migration inspection, and clean-venv `mal-updater --help` / `init` wheel smokes. See `references/QUALITY.md` for the exact gate scope and current repo-wide lint/type debt.
+
 ## What bootstrap-audit covers
 
 - resolved skill root, workspace root, and runtime root
@@ -176,12 +187,27 @@ If you reuse or adapt MAL-Updater, attribution to the original project/repo is a
 
 ## Testing
 
-The repo now bootstraps its own local import paths for test runs, so root-level validation works without extra environment setup.
+Use hermetic `/tmp` runtime/settings for every test command so validation never reads or writes a live `.MAL-Updater/` tree.
 
 ```bash
 cd <repo-root>
-pytest -q
-python3 -m unittest discover -s tests -v
+python -m pip install -c constraints/ci.txt -e ".[dev]"
+scripts/quality.sh
+```
+
+For a pytest-only iteration, keep the same isolated runtime contract:
+
+```bash
+cd <repo-root>
+tmp="$(mktemp -d /tmp/mal-updater-test.XXXXXX)"
+mkdir -p "$tmp/runtime/config" "$tmp/tmp"
+: > "$tmp/runtime/config/settings.toml"
+MAL_UPDATER_RUNTIME_ROOT="$tmp/runtime" \
+MAL_UPDATER_RUNTIME_DIR="$tmp/runtime" \
+MAL_UPDATER_SETTINGS_PATH="$tmp/runtime/config/settings.toml" \
+MAL_UPDATER_CONFIG="$tmp/runtime/config/settings.toml" \
+TMPDIR="$tmp/tmp" \
+python -m pytest -q
 ```
 
 ## Issue reporting / feedback
@@ -199,6 +225,7 @@ Use the upstream issue tracker for bug reports, integration problems, unexpected
 - Command cookbook: `references/cli-recipes.md`
 - Operations: `references/OPERATIONS.md`
 - Automation: `references/AUTOMATION.md`
+- Quality/CI gates: `references/QUALITY.md`
 - MAL OAuth details: `references/MAL_OAUTH.md`
 
 ## Production bootstrap script

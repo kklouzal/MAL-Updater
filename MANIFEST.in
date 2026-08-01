@@ -1,0 +1,3 @@
+# Keep root migrations in sdists for source-tree invocation compatibility;
+# installed wheels use the package migration tree declared in pyproject.toml.
+include migrations/*.sql

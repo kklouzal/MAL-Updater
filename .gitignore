@@ -1,6 +1,12 @@
 __pycache__/
 .pytest_cache/
+.coverage
+.coverage.*
+.mypy_cache/
+.ruff_cache/
+htmlcov/
 .venv/
+.venv*/
 .env
 .env.*
 *.local
@@ -21,5 +27,7 @@ secrets/
 node_modules/
 target/
 *.egg-info/
+build/
+dist/
 1/
 .DS_Store

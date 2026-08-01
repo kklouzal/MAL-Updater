@@ -121,6 +121,37 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(2400, config.service.auth_failure_backoff_floor_seconds_for("mal", task_name="sync_apply"))
             self.assertEqual("task", config.service.budget_scope_for("mal", task_name="sync_apply"))
 
+    def test_runtime_dir_and_config_aliases_resolve_hermetic_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            runtime_root = Path(td) / "ci-runtime"
+            settings_path = Path(td) / "ci-config" / "settings.toml"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text("[mal]\nredirect_port = 8766\n", encoding="utf-8")
+
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "MAL_UPDATER_RUNTIME_ROOT": "",
+                "MAL_UPDATER_SETTINGS_PATH": "",
+                "MAL_UPDATER_RUNTIME_DIR": str(runtime_root),
+                "MAL_UPDATER_CONFIG": str(settings_path),
+            }
+            result = subprocess.run(
+                [os.sys.executable, "-m", "mal_updater.cli", "--project-root", str(root), "status"],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(f"runtime_root={runtime_root.resolve()}", result.stdout)
+        self.assertIn(f"settings_path={settings_path.resolve()}", result.stdout)
+        self.assertIn(f"config_dir={(runtime_root / 'config').resolve()}", result.stdout)
+        self.assertIn("mal.redirect_uri=http://127.0.0.1:8766/callback", result.stdout)
+
     def test_env_overrides_service_crunchyroll_provider_caps(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

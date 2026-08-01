@@ -18,7 +18,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = []
+dev = [
+  "build>=1.3,<2",
+  "coverage[toml]>=7.10,<8",
+  "mypy>=1.18,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.14,<0.15"
+]
 
 [project.scripts]
 mal-updater = "mal_updater.cli:main"
@@ -31,3 +37,53 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "mal_updater.migrations" = ["*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/mal_updater"]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 1
+skip_empty = true
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+# Repo-wide default ruff currently has existing unused-import/unused-variable
+# debt. Keep the blocking CI lint non-fake by checking parse/runtime-critical
+# pyflakes/pycodestyle families until the broader cleanup is scheduled.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_configs = true
+files = [
+  "src/mal_updater/auth.py",
+  "src/mal_updater/auth_failure_signals.py",
+  "src/mal_updater/auth_remediation.py",
+  "src/mal_updater/auth_utils.py",
+  "src/mal_updater/cli_parser.py",
+  "src/mal_updater/contracts",
+  "src/mal_updater/hidive_auth.py",
+  "src/mal_updater/hidive_urls.py",
+  "src/mal_updater/ingestion.py",
+  "src/mal_updater/maintenance_command_semantics.py",
+  "src/mal_updater/mal_user_recommendations.py",
+  "src/mal_updater/persistence.py",
+  "src/mal_updater/provider_niceness.py",
+  "src/mal_updater/provider_registry.py",
+  "src/mal_updater/provider_snapshot.py",
+  "src/mal_updater/provider_types.py",
+  "src/mal_updater/providers/__init__.py",
+  "src/mal_updater/recommendation_actionability.py",
+  "src/mal_updater/request_tracking.py",
+  "src/mal_updater/service_auth_state.py",
+  "src/mal_updater/service_systemd_status.py",
+  "src/mal_updater/service_units.py"
+]

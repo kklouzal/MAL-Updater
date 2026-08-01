@@ -490,8 +490,16 @@ def _discover_workspace_root(project_root: Path) -> Path:
     return project_root.resolve()
 
 
+def _first_env_value(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
 def _default_runtime_root(workspace_root: Path) -> Path:
-    env_override = os.getenv("MAL_UPDATER_RUNTIME_ROOT")
+    env_override = _first_env_value("MAL_UPDATER_RUNTIME_ROOT", "MAL_UPDATER_RUNTIME_DIR")
     if env_override:
         return _resolve_from(Path.cwd(), env_override)
     return (workspace_root / DEFAULT_RUNTIME_DIR_NAME).resolve()
@@ -728,7 +736,7 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
     default_config_dir = (runtime_root / "config").resolve()
     settings_path = _resolve_from(
         Path.cwd(),
-        os.getenv("MAL_UPDATER_SETTINGS_PATH", str(default_config_dir / "settings.toml")),
+        _first_env_value("MAL_UPDATER_SETTINGS_PATH", "MAL_UPDATER_CONFIG") or str(default_config_dir / "settings.toml"),
     )
     settings = _read_toml_file(settings_path)
 
