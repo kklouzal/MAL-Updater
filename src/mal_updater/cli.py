@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 from collections import Counter
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -2674,7 +2676,7 @@ def _iter_exact_approved_sync_cycle_providers(config) -> list[tuple[str, Path]]:
     return providers
 
 
-def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool) -> int:
+def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool, allow_stale_provider_apply: bool = False) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
@@ -2682,23 +2684,102 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
     provider_targets = _iter_exact_approved_sync_cycle_providers(config)
     fetches: list[dict[str, object]] = []
     for provider_slug, snapshot_path in provider_targets:
-        exit_code = _cmd_provider_fetch_snapshot(
-            config.project_root,
-            provider_slug,
-            "default",
-            snapshot_path,
-            True,
-            full_refresh,
-        )
-        fetches.append(
+        fetch_stdout = io.StringIO()
+        fetch_stderr = io.StringIO()
+        with redirect_stdout(fetch_stdout), redirect_stderr(fetch_stderr):
+            exit_code = _cmd_provider_fetch_snapshot(
+                config.project_root,
+                provider_slug,
+                "default",
+                snapshot_path,
+                True,
+                full_refresh,
+            )
+        fetch_payload: dict[str, object] = {
+            "provider": provider_slug,
+            "snapshot_path": str(snapshot_path),
+            "full_refresh": full_refresh,
+            "exit_code": exit_code,
+            "status": "ok" if exit_code == 0 else "failed",
+            "failed": exit_code != 0,
+        }
+        fetches.append(fetch_payload)
+
+    failed_fetches = [item for item in fetches if item["exit_code"] != 0]
+    provider_refresh_reason: str | None = None
+    if not provider_targets:
+        provider_refresh_status = "not_configured"
+        provider_refresh_reason = "no_provider_targets"
+    elif failed_fetches:
+        provider_refresh_status = "failed"
+        provider_refresh_reason = "provider_refresh_failed"
+    else:
+        provider_refresh_status = "ok"
+
+    stale_provider_apply_authorized = bool(provider_refresh_reason and allow_stale_provider_apply)
+    warnings: list[dict[str, object]] = []
+    if provider_refresh_reason == "no_provider_targets":
+        warnings.append(
             {
-                "provider": provider_slug,
-                "snapshot_path": str(snapshot_path),
-                "full_refresh": full_refresh,
-                "exit_code": exit_code,
-                "status": "ok" if exit_code == 0 else "warning",
+                "code": "no_provider_targets",
+                "message": "No credentialed provider targets were configured; applying would use stale local DB state.",
             }
         )
+    if provider_refresh_reason == "provider_refresh_failed":
+        warnings.append(
+            {
+                "code": "provider_refresh_failed",
+                "message": "One or more configured provider refreshes failed; applying would use stale local DB state.",
+                "providers": [str(item["provider"]) for item in failed_fetches],
+            }
+        )
+    if stale_provider_apply_authorized:
+        warnings.append(
+            {
+                "code": "stale_provider_apply_authorized",
+                "message": "Operator supplied --allow-stale-provider-apply, so exact-approved apply may proceed using existing local DB state.",
+                "reason": provider_refresh_reason,
+            }
+        )
+
+    if provider_refresh_reason and not allow_stale_provider_apply:
+        apply_payload = {
+            "exact_approved_only": True,
+            "limit": 0,
+            "mapping_limit": 5,
+            "execute": True,
+            "status": "skipped",
+            "skipped": True,
+            "skip_reason": provider_refresh_reason,
+            "reason": provider_refresh_reason,
+        }
+        summary = {
+            "status": "aborted",
+            "reason": provider_refresh_reason,
+            "allow_stale_provider_apply": allow_stale_provider_apply,
+            "stale_provider_apply_authorized": False,
+            "stale_provider_apply_reason": provider_refresh_reason,
+            "provider_refresh": {
+                "status": provider_refresh_status,
+                "reason": provider_refresh_reason,
+                "target_count": len(provider_targets),
+                "attempted_count": len(fetches),
+                "succeeded_count": len([item for item in fetches if item["exit_code"] == 0]),
+                "failed_count": len(failed_fetches),
+                "failed_providers": [str(item["provider"]) for item in failed_fetches],
+            },
+            "providers_considered": [provider for provider, _ in provider_targets],
+            "providers_fetch_attempted": [str(item["provider"]) for item in fetches],
+            "providers_fetched": [str(item["provider"]) for item in fetches if item["exit_code"] == 0],
+            "providers_failed": [str(item["provider"]) for item in failed_fetches],
+            "fetches": fetches,
+            "apply_skipped": True,
+            "apply_skip_reason": provider_refresh_reason,
+            "warnings": warnings,
+            "apply": apply_payload,
+        }
+        print(json.dumps(summary, indent=2))
+        return 1
 
     try:
         apply_results = _run_apply_sync(
@@ -2711,22 +2792,50 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
         apply_exit_code = 1
-        apply_payload = {"exact_approved_only": True, "limit": 0, "execute": True, "status": "error", "error": str(exc)}
+        apply_payload = {
+            "exact_approved_only": True,
+            "limit": 0,
+            "mapping_limit": 5,
+            "execute": True,
+            "status": "error",
+            "skipped": False,
+            "error": str(exc),
+        }
     else:
         apply_exit_code = 0
         apply_payload = {
             "exact_approved_only": True,
             "limit": 0,
+            "mapping_limit": 5,
             "execute": True,
             "status": "ok",
+            "skipped": False,
             "results": [item.as_dict() for item in apply_results],
         }
 
     summary = {
-        "status": "ok" if apply_exit_code == 0 and all(item["exit_code"] == 0 for item in fetches) else "ok_with_warnings" if apply_exit_code == 0 else "error",
+        "status": "error" if apply_exit_code != 0 else "ok_with_warnings" if warnings else "ok",
+        "reason": "apply_failed" if apply_exit_code != 0 else "stale_provider_apply_authorized" if stale_provider_apply_authorized else None,
+        "allow_stale_provider_apply": allow_stale_provider_apply,
+        "stale_provider_apply_authorized": stale_provider_apply_authorized,
+        "stale_provider_apply_reason": provider_refresh_reason,
+        "provider_refresh": {
+            "status": provider_refresh_status,
+            "reason": provider_refresh_reason,
+            "target_count": len(provider_targets),
+            "attempted_count": len(fetches),
+            "succeeded_count": len([item for item in fetches if item["exit_code"] == 0]),
+            "failed_count": len(failed_fetches),
+            "failed_providers": [str(item["provider"]) for item in failed_fetches],
+        },
         "providers_considered": [provider for provider, _ in provider_targets],
-        "providers_fetched": [item["provider"] for item in fetches],
+        "providers_fetch_attempted": [str(item["provider"]) for item in fetches],
+        "providers_fetched": [str(item["provider"]) for item in fetches if item["exit_code"] == 0],
+        "providers_failed": [str(item["provider"]) for item in failed_fetches],
         "fetches": fetches,
+        "apply_skipped": False,
+        "apply_skip_reason": None,
+        "warnings": warnings,
         "apply": apply_payload,
     }
     print(json.dumps(summary, indent=2))
@@ -3030,7 +3139,7 @@ def _dispatch(parser, args) -> int:
     if args.command == "service-run-once":
         return _cmd_service_run_once(args.project_root)
     if args.command == "exact-approved-sync-cycle":
-        return _cmd_exact_approved_sync_cycle(args.project_root, args.full_refresh)
+        return _cmd_exact_approved_sync_cycle(args.project_root, args.full_refresh, args.allow_stale_provider_apply)
     if args.command == "bootstrap-audit":
         return _cmd_bootstrap_audit(args.project_root, args.summary)
     if args.command == "health-check":

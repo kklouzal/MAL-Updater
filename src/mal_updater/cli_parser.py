@@ -32,6 +32,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Request full-refresh provider fetches before the exact-approved MAL apply pass",
     )
+    exact_approved_sync_cycle.add_argument(
+        "--allow-stale-provider-apply",
+        action="store_true",
+        help=(
+            "Explicitly allow the exact-approved MAL apply pass to proceed when no configured provider "
+            "refresh ran successfully; default skips apply and exits non-zero instead of using stale DB state"
+        ),
+    )
     bootstrap_audit = subparsers.add_parser(
         "bootstrap-audit",
         help="Audit bootstrap/onboarding readiness: dependencies, runtime dirs, credentials, redirect settings, and service install prerequisites",

@@ -105,6 +105,9 @@ PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --recommendation-li
 # passes while safely recovering after a dead process. Provider/MAL budget
 # guards still skip or back off any task when pacing limits are reached.
 PYTHONPATH=src python3 -m mal_updater.cli exact-approved-sync-cycle
+# exact-approved-sync-cycle aborts before apply if no provider targets are configured
+# or any provider refresh fails; use --allow-stale-provider-apply only for an
+# intentional stale-local-DB apply after reviewing the JSON warning evidence.
 PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 0 --mapping-limit 5 --persist-review-queue
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --provider all
 PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only

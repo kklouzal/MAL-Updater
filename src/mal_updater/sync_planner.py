@@ -801,7 +801,6 @@ def build_dry_run_sync_plan(
                 reasons=reasons,
                 provider=state.provider,
             )
-            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=reasons)
             proposals.append(proposal)
             continue
 
@@ -829,7 +828,6 @@ def build_dry_run_sync_plan(
                 reasons=mapping_reasons,
                 provider=state.provider,
             )
-            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=mapping_reasons)
             proposals.append(proposal)
             continue
 
@@ -854,7 +852,6 @@ def build_dry_run_sync_plan(
                 reasons=mapping_reasons + [f"mal_details_lookup_failed:{exc}"],
                 provider=state.provider,
             )
-            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=mapping_reasons)
             proposals.append(proposal)
             continue
         proposal = _plan_status_update(
@@ -866,7 +863,6 @@ def build_dry_run_sync_plan(
             persisted_mapping_approved=approved,
             extra_reasons=mapping_reasons,
         )
-        _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=mapping_reasons)
         proposals.append(proposal)
     return proposals
 
@@ -930,7 +926,8 @@ def execute_approved_sync(
                 reasons=error_reasons,
                 provider=state.provider,
             )
-            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=error_reasons)
+            if not dry_run:
+                _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=error_reasons)
             results.append(
                 ApplyResult(
                     provider=state.provider,
@@ -958,7 +955,8 @@ def execute_approved_sync(
                 *(["exact_approved_only_enabled"] if exact_approved_only else []),
             ],
         )
-        _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=proposal.reasons)
+        if not dry_run:
+            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=proposal.reasons)
         if proposal.decision != "propose_update":
             results.append(
                 ApplyResult(
