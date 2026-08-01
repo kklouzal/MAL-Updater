@@ -705,7 +705,11 @@ def _load_sync_boundary(state_paths: CrunchyrollStatePaths) -> _SyncBoundary | N
         return None
     if not isinstance(payload, dict):
         return None
-    if int(payload.get("schema_version") or 0) != SYNC_BOUNDARY_SCHEMA_VERSION:
+    try:
+        schema_version = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return None
+    if schema_version != SYNC_BOUNDARY_SCHEMA_VERSION:
         return None
     history = payload.get("history") if isinstance(payload.get("history"), dict) else {}
     watchlist = payload.get("watchlist") if isinstance(payload.get("watchlist"), dict) else {}
@@ -717,6 +721,15 @@ def _load_sync_boundary(state_paths: CrunchyrollStatePaths) -> _SyncBoundary | N
         history_backfill_markers=[str(item) for item in history.get("backfill_seen", []) if item],
         watchlist_backfill_markers=[str(item) for item in watchlist.get("backfill_seen", []) if item],
     )
+
+
+def _load_requested_sync_boundary(state_paths: CrunchyrollStatePaths) -> tuple[_SyncBoundary | None, str]:
+    if not state_paths.sync_boundary_path.exists():
+        return None, "missing"
+    boundary = _load_sync_boundary(state_paths)
+    if boundary is None:
+        return None, "invalid_or_corrupt"
+    return boundary, "loaded"
 
 
 def _unique_fingerprints(entries: list[dict[str, Any]], fingerprint_func, limit: int) -> list[str]:
@@ -836,7 +849,6 @@ def _fetch_snapshot_once(
     watchlist_start: int = 0,
 ) -> CrunchyrollFetchResult:
     config = session.config
-    hot_mode = use_incremental_boundary
     _log_fetch_progress(f"account endpoint={CRUNCHYROLL_ME_URL}")
     account_payload = session.authorized_json_get(CRUNCHYROLL_ME_URL, phase="account")
     if not isinstance(account_payload, dict):
@@ -848,9 +860,33 @@ def _fetch_snapshot_once(
     if account_payload.get("email"):
         session.account_email = str(account_payload.get("email"))
 
-    boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
-    if boundary and boundary.account_id_hint and boundary.account_id_hint != account_id:
-        boundary = None
+    requested_incremental_boundary = use_incremental_boundary
+    boundary_file_present = session.state_paths.sync_boundary_path.exists()
+    loaded_boundary, sync_boundary_load_status = (
+        _load_requested_sync_boundary(session.state_paths)
+        if requested_incremental_boundary
+        else (None, "not_requested")
+    )
+    boundary: _SyncBoundary | None = None
+    sync_boundary_account_match: bool | None = None
+    if requested_incremental_boundary:
+        if loaded_boundary is not None:
+            sync_boundary_account_match = loaded_boundary.account_id_hint == account_id
+            if sync_boundary_account_match:
+                sync_boundary_load_status = "valid_account_match"
+                boundary = loaded_boundary
+            elif loaded_boundary.account_id_hint:
+                sync_boundary_load_status = "account_mismatch"
+            else:
+                sync_boundary_load_status = "missing_account_hint"
+
+    hot_mode = requested_incremental_boundary and boundary is not None
+    sync_boundary_bootstrap = requested_incremental_boundary and not hot_mode
+    sync_boundary_refresh_kind = (
+        "hot"
+        if hot_mode
+        else "bootstrap_full_refresh" if sync_boundary_bootstrap else "explicit_full_refresh"
+    )
     history_markers = set(boundary.history_markers) if boundary else set()
     watchlist_markers = set(boundary.watchlist_markers) if boundary else set()
     history_backfill_markers = set(boundary.history_backfill_markers) if boundary else set()
@@ -1008,10 +1044,25 @@ def _fetch_snapshot_once(
             "session_state_path": str(session.state_paths.session_state_path),
             "sync_boundary_path": str(session.state_paths.sync_boundary_path),
             "sync_boundary_present": boundary is not None,
+            "sync_boundary_file_present": boundary_file_present,
             "sync_boundary_mode": "hot" if hot_mode else "full_refresh",
+            "sync_boundary_requested_mode": "incremental" if requested_incremental_boundary else "full_refresh",
+            "sync_boundary_requested_incremental": requested_incremental_boundary,
+            "requested_incremental_boundary": requested_incremental_boundary,
+            "sync_boundary_effective_hot": hot_mode,
+            "effective_hot": hot_mode,
+            "explicit_full_refresh": not requested_incremental_boundary,
+            "sync_boundary_refresh_kind": sync_boundary_refresh_kind,
+            "sync_boundary_bootstrap": sync_boundary_bootstrap,
+            "bootstrap_full_refresh": sync_boundary_bootstrap,
+            "sync_boundary_bootstrap_complete": sync_boundary_bootstrap and not (history_partial or watchlist_partial),
+            "bootstrap_full_refresh_complete": sync_boundary_bootstrap and not (history_partial or watchlist_partial),
+            "sync_boundary_usable": boundary is not None,
+            "sync_boundary_load_status": sync_boundary_load_status,
+            "sync_boundary_loaded_account_id_hint": loaded_boundary.account_id_hint if loaded_boundary is not None else None,
             "hot_surface_only": hot_mode,
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
-            "sync_boundary_account_match": None if boundary is None else boundary.account_id_hint == account_id,
+            "sync_boundary_account_match": sync_boundary_account_match,
             "refresh_token_present": session.state_paths.refresh_token_path.exists(),
             "device_id_present": session.state_paths.device_id_path.exists(),
             "device_type_hint": session.token.device_type,

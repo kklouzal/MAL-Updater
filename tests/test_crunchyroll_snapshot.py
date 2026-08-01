@@ -372,6 +372,43 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             },
         }
 
+    def _fetch_with_synthetic_pages(
+        self,
+        session: _CrunchyrollAuthSession,
+        *,
+        use_incremental_boundary: bool = True,
+        history_total: int = 150,
+        watchlist_total: int = 120,
+        max_history_pages: int | None = None,
+        max_watchlist_pages: int | None = None,
+    ):
+        calls: list[tuple[str, dict[str, object] | None]] = []
+
+        def fake_get(url: str, *, params: dict[str, object] | None = None, phase: str | None = None):
+            calls.append((url, params))
+            if url == CRUNCHYROLL_ME_URL:
+                return {"account_id": "acct-123", "email": "user@example.com"}
+            if url.endswith("/watch-history"):
+                page = int(params["page"])
+                start_index = (page - 1) * 100 + 1
+                end_index = min(history_total, start_index + 99)
+                return {"total": history_total, "data": [self._history_entry(idx) for idx in range(start_index, end_index + 1)]}
+            if url.endswith("/watchlist"):
+                start = int(params["start"])
+                start_index = start + 1
+                end_index = min(watchlist_total, start_index + 99)
+                return {"total": watchlist_total, "data": [self._watchlist_entry(idx) for idx in range(start_index, end_index + 1)]}
+            raise AssertionError((url, params, phase))
+
+        with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+            result = _fetch_snapshot_once(
+                session,
+                use_incremental_boundary=use_incremental_boundary,
+                max_history_pages=max_history_pages,
+                max_watchlist_pages=max_watchlist_pages,
+            )
+        return result, calls
+
     def test_fetch_snapshot_recovers_watch_history_401_via_refresh_then_completes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -434,6 +471,11 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
                         "refreshed-access-token",
                         {"page": 1, "page_size": 100, "locale": "en-US"},
                     ),
+                    (
+                        "https://www.crunchyroll.com/content/v2/discover/acct-123/watchlist",
+                        "refreshed-access-token",
+                        {"locale": "en-US", "n": 100, "start": 0},
+                    ),
                 ],
             )
             self.assertEqual(session.auth_source, "refresh_token_recovery")
@@ -445,11 +487,15 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertEqual(result.snapshot.account_id_hint, "acct-123")
             self.assertEqual(result.snapshot.raw["auth_source"], "refresh_token_recovery")
             self.assertEqual(result.snapshot.raw["history_count"], 1)
-            self.assertEqual(result.snapshot.raw["watchlist_count"], 0)
+            self.assertEqual(result.snapshot.raw["watchlist_count"], 1)
             self.assertFalse(result.snapshot.raw["history_stopped_early"])
             self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
-            self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "hot")
-            self.assertTrue(result.snapshot.raw["hot_surface_only"])
+            self.assertEqual(result.snapshot.raw["sync_boundary_requested_mode"], "incremental")
+            self.assertFalse(result.snapshot.raw["sync_boundary_effective_hot"])
+            self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "full_refresh")
+            self.assertEqual(result.snapshot.raw["sync_boundary_refresh_kind"], "bootstrap_full_refresh")
+            self.assertTrue(result.snapshot.raw["sync_boundary_bootstrap_complete"])
+            self.assertFalse(result.snapshot.raw["hot_surface_only"])
             mock_refresh.assert_called_once()
             mock_login.assert_not_called()
 
@@ -457,6 +503,99 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertEqual(session_state["crunchyroll_phase"], "python_live_snapshot")
             self.assertIsNone(session_state["last_error"])
             self.assertEqual(session_state["last_account_id_hint"], "acct-123")
+
+    def test_requested_incremental_without_boundary_bootstraps_all_history_and_watchlist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+
+            result, calls = self._fetch_with_synthetic_pages(session, use_incremental_boundary=True)
+
+            raw = result.snapshot.raw
+            self.assertEqual([call[1]["page"] for call in calls if call[0].endswith("/watch-history")], [1, 2])
+            self.assertEqual([call[1]["start"] for call in calls if call[0].endswith("/watchlist")], [0, 100])
+            self.assertFalse(raw["partial"])
+            self.assertEqual(raw["history_count"], 150)
+            self.assertEqual(raw["watchlist_count"], 120)
+            self.assertFalse(raw["sync_boundary_file_present"])
+            self.assertFalse(raw["sync_boundary_present"])
+            self.assertEqual(raw["sync_boundary_load_status"], "missing")
+            self.assertEqual(raw["sync_boundary_requested_mode"], "incremental")
+            self.assertTrue(raw["sync_boundary_requested_incremental"])
+            self.assertFalse(raw["sync_boundary_effective_hot"])
+            self.assertEqual(raw["sync_boundary_mode"], "full_refresh")
+            self.assertEqual(raw["sync_boundary_refresh_kind"], "bootstrap_full_refresh")
+            self.assertTrue(raw["sync_boundary_bootstrap"])
+            self.assertTrue(raw["sync_boundary_bootstrap_complete"])
+            self.assertFalse(raw["hot_surface_only"])
+            saved = json.loads(result.state_paths.sync_boundary_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["account_id_hint"], "acct-123")
+            self.assertEqual(saved["history"]["retained_count"], 150)
+            self.assertEqual(saved["watchlist"]["retained_count"], 120)
+
+    def test_requested_incremental_with_account_mismatched_boundary_bootstraps_current_account(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            _write_sync_boundary(
+                state_paths=session.state_paths,
+                generated_at="2026-03-14T19:00:00Z",
+                account_id_hint="other-account",
+                history_entries=[self._history_entry(500)],
+                watchlist_entries=[self._watchlist_entry(700)],
+            )
+
+            result, calls = self._fetch_with_synthetic_pages(session, use_incremental_boundary=True)
+
+            raw = result.snapshot.raw
+            self.assertEqual([call[1]["page"] for call in calls if call[0].endswith("/watch-history")], [1, 2])
+            self.assertEqual([call[1]["start"] for call in calls if call[0].endswith("/watchlist")], [0, 100])
+            self.assertTrue(raw["sync_boundary_file_present"])
+            self.assertFalse(raw["sync_boundary_present"])
+            self.assertFalse(raw["sync_boundary_account_match"])
+            self.assertEqual(raw["sync_boundary_loaded_account_id_hint"], "other-account")
+            self.assertEqual(raw["sync_boundary_load_status"], "account_mismatch")
+            self.assertFalse(raw["sync_boundary_effective_hot"])
+            self.assertEqual(raw["sync_boundary_refresh_kind"], "bootstrap_full_refresh")
+            self.assertTrue(raw["sync_boundary_bootstrap_complete"])
+            saved = json.loads(result.state_paths.sync_boundary_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["account_id_hint"], "acct-123")
+            self.assertFalse(any("episode-500" in marker for marker in saved["history"]["first_seen"]))
+            self.assertFalse(any("watch-700" in marker for marker in saved["watchlist"]["first_seen"]))
+
+    def test_page_limited_incremental_bootstrap_is_partial_and_does_not_advance_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+
+            result, calls = self._fetch_with_synthetic_pages(
+                session,
+                use_incremental_boundary=True,
+                history_total=250,
+                watchlist_total=220,
+                max_history_pages=1,
+                max_watchlist_pages=1,
+            )
+
+            raw = result.snapshot.raw
+            self.assertEqual([call[1]["page"] for call in calls if call[0].endswith("/watch-history")], [1])
+            self.assertEqual([call[1]["start"] for call in calls if call[0].endswith("/watchlist")], [0])
+            self.assertTrue(raw["partial"])
+            self.assertTrue(raw["history_partial"])
+            self.assertTrue(raw["watchlist_partial"])
+            self.assertEqual(raw["history_next_page"], 2)
+            self.assertEqual(raw["watchlist_next_start"], 100)
+            self.assertFalse(raw["sync_boundary_effective_hot"])
+            self.assertEqual(raw["sync_boundary_refresh_kind"], "bootstrap_full_refresh")
+            self.assertTrue(raw["sync_boundary_bootstrap"])
+            self.assertFalse(raw["sync_boundary_bootstrap_complete"])
+            self.assertFalse(result.state_paths.sync_boundary_path.exists())
+            session_state = json.loads(result.state_paths.session_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(session_state["crunchyroll_phase"], "python_live_snapshot_partial")
+            self.assertEqual(session_state["last_error"], "partial snapshot; sync boundary not advanced")
 
     def test_fetch_snapshot_uses_incremental_boundary_to_stop_history_and_watchlist_early(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -506,6 +645,11 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertFalse(result.snapshot.raw["history_stopped_early"])
             self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
             self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "hot")
+            self.assertEqual(result.snapshot.raw["sync_boundary_requested_mode"], "incremental")
+            self.assertTrue(result.snapshot.raw["sync_boundary_effective_hot"])
+            self.assertEqual(result.snapshot.raw["sync_boundary_refresh_kind"], "hot")
+            self.assertFalse(result.snapshot.raw["sync_boundary_bootstrap"])
+            self.assertTrue(result.snapshot.raw["sync_boundary_account_match"])
             self.assertTrue(result.snapshot.raw["hot_surface_only"])
             self.assertTrue(result.state_paths.sync_boundary_path.exists())
             saved = json.loads(result.state_paths.sync_boundary_path.read_text(encoding="utf-8"))
@@ -561,6 +705,11 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertFalse(result.snapshot.raw["history_stopped_early"])
             self.assertFalse(result.snapshot.raw["watchlist_stopped_early"])
             self.assertEqual(result.snapshot.raw["sync_boundary_mode"], "full_refresh")
+            self.assertEqual(result.snapshot.raw["sync_boundary_requested_mode"], "full_refresh")
+            self.assertFalse(result.snapshot.raw["sync_boundary_requested_incremental"])
+            self.assertFalse(result.snapshot.raw["sync_boundary_effective_hot"])
+            self.assertEqual(result.snapshot.raw["sync_boundary_refresh_kind"], "explicit_full_refresh")
+            self.assertFalse(result.snapshot.raw["sync_boundary_bootstrap"])
 
     def test_authorized_json_get_wraps_request_error_with_phase_and_endpoint(self) -> None:
         class FakeTransport:

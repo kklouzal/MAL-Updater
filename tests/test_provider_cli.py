@@ -43,7 +43,16 @@ class _CliFakeProvider:
     slug = "hidive"
     display_name = "HIDIVE"
 
-    def __init__(self, *, snapshot: ProviderSnapshot | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        snapshot: ProviderSnapshot | None = None,
+        error: Exception | None = None,
+        slug: str = "hidive",
+        display_name: str = "HIDIVE",
+    ) -> None:
+        self.slug = slug
+        self.display_name = display_name
         self.snapshot = snapshot or _sample_provider_snapshot()
         self.error = error
 
@@ -300,6 +309,46 @@ class ProviderCliTests(unittest.TestCase):
             self.assertEqual("hot", ingest_mock.call_args.kwargs["mode"])
             self.assertIn("Partial HIDIVE snapshot detected", stderr.getvalue())
             self.assertNotIn("Crunchyroll", stderr.getvalue())
+
+    def test_provider_fetch_snapshot_ingests_completed_bootstrap_as_full_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            snapshot = _sample_provider_snapshot(
+                provider="crunchyroll",
+                raw={"partial": False, "sync_boundary_refresh_kind": "bootstrap_full_refresh"},
+            )
+            provider = _CliFakeProvider(snapshot=snapshot, slug="crunchyroll", display_name="Crunchyroll")
+            output = io.StringIO()
+
+            with patch("mal_updater.cli.get_provider", return_value=provider), patch(
+                "mal_updater.cli.ingest_snapshot_payload", return_value=_FakeSummary()
+            ) as ingest_mock, redirect_stdout(output):
+                rc = _cmd_provider_fetch_snapshot(root, "crunchyroll", "default", None, ingest=True, full_refresh=False)
+
+            self.assertEqual(0, rc)
+            self.assertEqual("full_refresh", ingest_mock.call_args.kwargs["mode"])
+
+    def test_provider_fetch_snapshot_ingests_partial_bootstrap_as_hot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            snapshot = _sample_provider_snapshot(
+                provider="crunchyroll",
+                raw={"partial": True, "sync_boundary_refresh_kind": "bootstrap_full_refresh"},
+            )
+            provider = _CliFakeProvider(snapshot=snapshot, slug="crunchyroll", display_name="Crunchyroll")
+            output = io.StringIO()
+            stderr = io.StringIO()
+
+            with patch("mal_updater.cli.get_provider", return_value=provider), patch(
+                "mal_updater.cli.ingest_snapshot_payload", return_value=_FakeSummary()
+            ) as ingest_mock, redirect_stdout(output), redirect_stderr(stderr):
+                rc = _cmd_provider_fetch_snapshot(root, "crunchyroll", "default", None, ingest=True, full_refresh=False)
+
+            self.assertEqual(0, rc)
+            self.assertEqual("hot", ingest_mock.call_args.kwargs["mode"])
+            self.assertIn("Partial Crunchyroll snapshot detected", stderr.getvalue())
 
     def test_hidive_provider_fetch_signature_accepts_protocol_page_kwargs_safely(self) -> None:
         protocol_parameters = inspect.signature(ProviderModule.fetch_snapshot).parameters

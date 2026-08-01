@@ -46,7 +46,9 @@ class CrunchyrollProvider:
             snapshot=result.snapshot,
             metadata={
                 "provider": self.slug,
-                "used_incremental_boundary": not full_refresh,
+                "requested_incremental_boundary": not full_refresh,
+                "used_incremental_boundary": bool(result.snapshot.raw.get("sync_boundary_effective_hot")),
+                "sync_boundary_refresh_kind": result.snapshot.raw.get("sync_boundary_refresh_kind"),
                 "account_email": result.account_email,
                 "state_paths": {
                     "root": str(result.state_paths.root),

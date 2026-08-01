@@ -902,9 +902,17 @@ def _cmd_provider_fetch_snapshot(
         print(f"Wrote {provider.display_name} snapshot to {target_path}")
 
     if ingest:
-        is_partial = bool(payload.get("raw", {}).get("partial")) if isinstance(payload.get("raw"), dict) else False
-        ingest_mode = "full_refresh" if full_refresh and not is_partial else "hot"
-        if full_refresh and is_partial:
+        raw = payload.get("raw", {})
+        raw = raw if isinstance(raw, dict) else {}
+        is_partial = bool(raw.get("partial"))
+        bootstrap_full_refresh = provider_slug == "crunchyroll" and bool(
+            raw.get("bootstrap_full_refresh")
+            or raw.get("sync_boundary_bootstrap")
+            or raw.get("sync_boundary_refresh_kind") == "bootstrap_full_refresh"
+        )
+        completed_bootstrap_full_refresh = bootstrap_full_refresh and not is_partial
+        ingest_mode = "full_refresh" if (full_refresh or completed_bootstrap_full_refresh) and not is_partial else "hot"
+        if (full_refresh or bootstrap_full_refresh) and is_partial:
             print(
                 f"Partial {provider.display_name} snapshot detected; ingesting as hot instead of marking a completed full refresh",
                 file=sys.stderr,
