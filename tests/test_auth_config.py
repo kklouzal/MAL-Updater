@@ -387,7 +387,7 @@ class AuthHelperTests(unittest.TestCase):
             bootstrap_database(config.db_path)
             with connect(config.db_path) as conn:
                 conn.executemany(
-                    "INSERT INTO provider_series(provider, provider_series_id, title) VALUES (?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, account_observed_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
                     [("crunchyroll", "series-cr", "Crunchyroll Show"), ("hidive", "series-hd", "HIDIVE Show")],
                 )
 
@@ -424,7 +424,7 @@ class AuthHelperTests(unittest.TestCase):
             bootstrap_database(config.db_path)
             with connect(config.db_path) as conn:
                 conn.executemany(
-                    "INSERT INTO provider_series(provider, provider_series_id, title) VALUES (?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, account_observed_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
                     [("crunchyroll", "series-cr", "Crunchyroll Show"), ("hidive", "series-hd", "HIDIVE Show")],
                 )
 

@@ -2436,22 +2436,49 @@ def build_provider_enrichment_diagnostics(
 def _ensure_provider_series(config: AppConfig, *, provider: str, match: dict[str, Any]) -> None:
     provider_series_id = str(match["provider_series_id"])
     title = str(match.get("title") or provider_series_id)
+    season_number = _int_value(_raw_lookup(match, "season_number"))
     with connect(config.db_path) as conn:
         conn.execute(
             """
-            INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO provider_series (
+                provider,
+                provider_series_id,
+                title,
+                season_title,
+                season_number,
+                raw_json,
+                catalog_observed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(provider, provider_series_id) DO UPDATE SET
-                title = excluded.title,
-                season_title = excluded.season_title,
-                raw_json = excluded.raw_json,
-                last_seen_at = CURRENT_TIMESTAMP
+                title = CASE
+                    WHEN provider_series.account_observed_at IS NULL THEN excluded.title
+                    ELSE provider_series.title
+                END,
+                season_title = CASE
+                    WHEN provider_series.account_observed_at IS NULL THEN excluded.season_title
+                    ELSE provider_series.season_title
+                END,
+                season_number = CASE
+                    WHEN provider_series.account_observed_at IS NULL THEN excluded.season_number
+                    ELSE provider_series.season_number
+                END,
+                raw_json = CASE
+                    WHEN provider_series.account_observed_at IS NULL THEN excluded.raw_json
+                    ELSE provider_series.raw_json
+                END,
+                last_seen_at = CASE
+                    WHEN provider_series.account_observed_at IS NULL THEN CURRENT_TIMESTAMP
+                    ELSE provider_series.last_seen_at
+                END,
+                catalog_observed_at = CURRENT_TIMESTAMP
             """,
             (
                 provider,
                 provider_series_id,
                 title,
                 match.get("season_title"),
+                season_number,
                 json.dumps(match, ensure_ascii=False, sort_keys=True),
             ),
         )

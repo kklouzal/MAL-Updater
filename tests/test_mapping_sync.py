@@ -6647,8 +6647,8 @@ class MappingTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "hidive",
@@ -6722,8 +6722,8 @@ class MappingTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "hidive",
@@ -6766,8 +6766,8 @@ class MappingTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -6838,8 +6838,8 @@ class MappingTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -7248,8 +7248,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -7329,8 +7329,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -7426,8 +7426,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -7475,8 +7475,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     ("hidive", "1181", "Dororo", "Dororo", None, json.dumps({"title": "Dororo", "season_title": "Dororo"})),
                 )
@@ -7948,8 +7948,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -8029,8 +8029,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",
@@ -8104,8 +8104,8 @@ class DryRunPlannerTests(unittest.TestCase):
             with connect(config.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         "crunchyroll",

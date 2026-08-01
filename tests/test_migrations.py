@@ -37,6 +37,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "014_recommendation_provider_enrichment_cursor.sql",
                 "015_public_userrecs_resumable_staging.sql",
                 "016_provider_watchlist_membership_keys.sql",
+                "017_provider_series_observation_provenance.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -81,6 +82,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "014_recommendation_provider_enrichment_cursor.sql",
                     "015_public_userrecs_resumable_staging.sql",
                     "016_provider_watchlist_membership_keys.sql",
+                    "017_provider_series_observation_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -104,6 +106,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "014_recommendation_provider_enrichment_cursor.sql",
                     "015_public_userrecs_resumable_staging.sql",
                     "016_provider_watchlist_membership_keys.sql",
+                    "017_provider_series_observation_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -167,6 +170,131 @@ class MigrationCatalogTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM provider_watchlist WHERE provider = 'hidive' AND provider_series_id = '2312'"
                 ).fetchone()[0]
                 self.assertEqual(0, remaining)
+
+    def test_provider_series_observation_provenance_current_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "provider-provenance-current.sqlite3"
+            bootstrap_database(db_path)
+
+            with connect(db_path) as conn:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_series)")}
+                self.assertTrue({"account_observed_at", "catalog_observed_at"} <= columns)
+                self.assertEqual(
+                    1,
+                    conn.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (db.PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,),
+                    ).fetchone()[0],
+                )
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+    def test_provider_series_observation_provenance_upgrade_backfills_linked_and_ambiguous_legacy_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "provider-provenance-upgrade.sqlite3"
+            original = db.MIGRATIONS
+            migration_index = db.MIGRATION_FILENAMES.index(db.PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION)
+            try:
+                db.MIGRATIONS = original[:migration_index]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            with connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, last_seen_at)
+                    VALUES
+                        ('crunchyroll', 'linked-progress', 'Linked Progress', '2026-01-01T00:00:00Z'),
+                        ('crunchyroll', 'linked-watchlist', 'Linked Watchlist', '2026-01-02T00:00:00Z'),
+                        ('crunchyroll', 'ambiguous-legacy', 'Ambiguous Legacy', '2026-01-03T00:00:00Z')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO provider_episode_progress(
+                        provider, provider_episode_id, provider_series_id, raw_json, last_seen_at
+                    ) VALUES
+                        ('crunchyroll', 'progress-old', 'linked-progress', '{}', '2026-01-04T00:00:00Z'),
+                        ('crunchyroll', 'progress-new', 'linked-progress', '{}', '2026-01-05T00:00:00Z')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO provider_watchlist(
+                        provider, provider_series_id, list_id, provider_item_id, raw_json, last_seen_at
+                    ) VALUES ('crunchyroll', 'linked-watchlist', 'default', 'linked-watchlist', '{}', '2026-01-06T00:00:00Z')
+                    """
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+            bootstrap_database(db_path)
+
+            with connect(db_path) as conn:
+                rows = {
+                    row["provider_series_id"]: row
+                    for row in conn.execute(
+                        """
+                        SELECT provider_series_id, last_seen_at, account_observed_at, catalog_observed_at
+                        FROM provider_series
+                        ORDER BY provider_series_id
+                        """
+                    )
+                }
+                self.assertEqual("2026-01-05T00:00:00Z", rows["linked-progress"]["account_observed_at"])
+                self.assertEqual("2026-01-06T00:00:00Z", rows["linked-watchlist"]["account_observed_at"])
+                self.assertEqual("2026-01-03T00:00:00Z", rows["ambiguous-legacy"]["account_observed_at"])
+                self.assertIsNone(rows["linked-progress"]["catalog_observed_at"])
+                self.assertIsNone(rows["linked-watchlist"]["catalog_observed_at"])
+                self.assertIsNone(rows["ambiguous-legacy"]["catalog_observed_at"])
+                self.assertEqual(
+                    1,
+                    conn.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                        (db.PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,),
+                    ).fetchone()[0],
+                )
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+    def test_provider_series_observation_provenance_bootstrap_accepts_already_marked_deployed_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "provider-provenance-deployed.sqlite3"
+            original = db.MIGRATIONS
+            migration_index = db.MIGRATION_FILENAMES.index(db.PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION)
+            try:
+                db.MIGRATIONS = original[:migration_index]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            with connect(db_path) as conn:
+                conn.execute("ALTER TABLE provider_series ADD COLUMN account_observed_at TEXT")
+                conn.execute("ALTER TABLE provider_series ADD COLUMN catalog_observed_at TEXT")
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(provider, provider_series_id, title, last_seen_at, account_observed_at)
+                    VALUES ('crunchyroll', 'legacy-live-row', 'Legacy Live Row', '2026-01-07T00:00:00Z', '2026-01-07T00:00:00Z')
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)",
+                    (db.PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,),
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+
+            with connect(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT account_observed_at, catalog_observed_at
+                    FROM provider_series
+                    WHERE provider = 'crunchyroll' AND provider_series_id = 'legacy-live-row'
+                    """
+                ).fetchone()
+                self.assertEqual("2026-01-07T00:00:00Z", row["account_observed_at"])
+                self.assertIsNone(row["catalog_observed_at"])
+                self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
     def test_v7_to_v8_failure_rolls_back_and_retry_is_clean(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

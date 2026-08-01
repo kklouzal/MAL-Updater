@@ -278,7 +278,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         with connect(self.config.db_path) as conn:
             conn.execute(
-                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 ("crunchyroll", "series-1", "Example Show", "Example Show", 1, "{}"),
             )
             conn.execute(
@@ -319,7 +319,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 4):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             conn.execute(
@@ -366,7 +366,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):
@@ -844,7 +844,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         with connect(self.config.db_path) as conn:
             conn.execute(
-                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 ("crunchyroll", "series-1", "Example Show", "Example Show Season 1", 1, "{}"),
             )
             conn.execute(
@@ -1073,7 +1073,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):
@@ -1126,7 +1126,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         with connect(self.config.db_path) as conn:
             conn.execute(
-                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 ("crunchyroll", "cr-series-1", "Crunchy Example", "Crunchy Example", 1, "{}"),
             )
             conn.execute(
@@ -1134,7 +1134,7 @@ class HealthCheckCliTests(unittest.TestCase):
                 ("crunchyroll", "cr-series-1", 1001, 0.99, "auto_exact", 1, None),
             )
             conn.execute(
-                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 ("hidive", "hidive-series-1", "HIDIVE Example", "HIDIVE Example", 1, "{}"),
             )
             conn.execute(
@@ -1176,7 +1176,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):
@@ -1232,7 +1232,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 7):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 5):
@@ -1308,7 +1308,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):
@@ -1342,7 +1342,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):
@@ -1379,7 +1379,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):
@@ -1415,7 +1415,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 5):
@@ -2176,7 +2176,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 4):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             conn.execute(
@@ -2459,7 +2459,7 @@ class HealthCheckCliTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             for idx in range(1, 6):
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", f"series-{idx}", f"Example Show {idx}", f"Example Show {idx}", 1, "{}"),
                 )
             for idx in range(1, 4):

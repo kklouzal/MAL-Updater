@@ -136,13 +136,14 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json, account_observed_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(provider, provider_series_id) DO UPDATE SET
                     title = excluded.title,
                     season_title = excluded.season_title,
                     raw_json = excluded.raw_json,
-                    last_seen_at = CURRENT_TIMESTAMP
+                    last_seen_at = CURRENT_TIMESTAMP,
+                    account_observed_at = CURRENT_TIMESTAMP
                 """,
                 (provider, provider_series_id, title, title, json.dumps(raw or {}, sort_keys=True)),
             )
@@ -207,6 +208,110 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             last_verified_at=last_verified_at,
             logic_version=logic_version,
         )
+
+    def test_ensure_provider_series_records_catalog_provenance_without_overwriting_account_observed_rows(self):
+        enrichment._ensure_provider_series(
+            self.config,
+            provider="crunchyroll",
+            match={
+                "provider_series_id": "catalog-only",
+                "title": "Catalog Title",
+                "season_title": "Catalog Season",
+                "season_number": 1,
+                "raw": {"source": "catalog"},
+            },
+        )
+        with connect(self.config.db_path) as conn:
+            catalog_row = conn.execute(
+                """
+                SELECT title, season_title, season_number, raw_json, account_observed_at, catalog_observed_at
+                FROM provider_series
+                WHERE provider = 'crunchyroll' AND provider_series_id = 'catalog-only'
+                """
+            ).fetchone()
+            self.assertEqual("Catalog Title", catalog_row["title"])
+            self.assertEqual("Catalog Season", catalog_row["season_title"])
+            self.assertEqual(1, catalog_row["season_number"])
+            self.assertIsNone(catalog_row["account_observed_at"])
+            self.assertIsNotNone(catalog_row["catalog_observed_at"])
+            conn.execute(
+                """
+                UPDATE provider_series
+                SET catalog_observed_at = '2026-01-01T00:00:00Z',
+                    last_seen_at = '2026-01-01T00:00:00Z'
+                WHERE provider = 'crunchyroll' AND provider_series_id = 'catalog-only'
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO provider_series(
+                    provider, provider_series_id, title, season_title, season_number, raw_json,
+                    last_seen_at, account_observed_at, catalog_observed_at
+                ) VALUES (
+                    'crunchyroll', 'account-row', 'Account Title', 'Account Season', 3,
+                    '{"source":"account"}', '2026-02-03T00:00:00Z',
+                    '2026-02-01T00:00:00Z', '2026-02-02T00:00:00Z'
+                )
+                """
+            )
+            conn.commit()
+
+        enrichment._ensure_provider_series(
+            self.config,
+            provider="crunchyroll",
+            match={
+                "provider_series_id": "catalog-only",
+                "title": "Catalog Updated",
+                "season_title": "Catalog Updated Season",
+                "season_number": 2,
+                "raw": {"source": "catalog-refresh"},
+            },
+        )
+        enrichment._ensure_provider_series(
+            self.config,
+            provider="crunchyroll",
+            match={
+                "provider_series_id": "account-row",
+                "title": "Catalog Should Not Replace Account",
+                "season_title": "Catalog Season Replace Attempt",
+                "season_number": 9,
+                "raw": {"source": "catalog-conflict"},
+            },
+        )
+
+        with connect(self.config.db_path) as conn:
+            catalog_row = conn.execute(
+                """
+                SELECT title, season_title, season_number, raw_json, last_seen_at,
+                       account_observed_at, catalog_observed_at
+                FROM provider_series
+                WHERE provider = 'crunchyroll' AND provider_series_id = 'catalog-only'
+                """
+            ).fetchone()
+            account_row = conn.execute(
+                """
+                SELECT title, season_title, season_number, raw_json, last_seen_at,
+                       account_observed_at, catalog_observed_at
+                FROM provider_series
+                WHERE provider = 'crunchyroll' AND provider_series_id = 'account-row'
+                """
+            ).fetchone()
+
+        self.assertEqual("Catalog Updated", catalog_row["title"])
+        self.assertEqual("Catalog Updated Season", catalog_row["season_title"])
+        self.assertEqual(2, catalog_row["season_number"])
+        self.assertIn("catalog-refresh", catalog_row["raw_json"])
+        self.assertIsNone(catalog_row["account_observed_at"])
+        self.assertNotEqual("2026-01-01T00:00:00Z", catalog_row["last_seen_at"])
+        self.assertNotEqual("2026-01-01T00:00:00Z", catalog_row["catalog_observed_at"])
+
+        self.assertEqual("Account Title", account_row["title"])
+        self.assertEqual("Account Season", account_row["season_title"])
+        self.assertEqual(3, account_row["season_number"])
+        self.assertEqual('{"source":"account"}', account_row["raw_json"])
+        self.assertEqual("2026-02-03T00:00:00Z", account_row["last_seen_at"])
+        self.assertEqual("2026-02-01T00:00:00Z", account_row["account_observed_at"])
+        self.assertNotEqual("2026-02-02T00:00:00Z", account_row["catalog_observed_at"])
 
     def _review_entry(self, *, decision="strong_provider_search_candidate_no_auto_link", query="Merge Show", audio_locales=None, **match_overrides):
         match = self._provider_match(audio_locales=audio_locales, **match_overrides)

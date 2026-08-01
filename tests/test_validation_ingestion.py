@@ -13,6 +13,7 @@ from mal_updater.cli import _cmd_provider_fetch_snapshot
 from mal_updater.config import load_config
 from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from mal_updater.contracts.crunchyroll import CrunchyrollSnapshot as CrunchyrollSnapshotCompatAlias
+from mal_updater.db import bootstrap_database
 from mal_updater.ingestion import ingest_snapshot_payload
 from mal_updater.provider_types import ProviderFetchResult
 from mal_updater.validation import SnapshotValidationError, validate_snapshot_payload
@@ -223,6 +224,50 @@ class IngestionTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_episode_progress").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_watchlist").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM sync_runs WHERE status = 'completed'").fetchone()[0], 1)
+
+    def test_ingest_snapshot_payload_stamps_account_provenance_and_preserves_catalog_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            bootstrap_database(config.db_path)
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute(
+                    """
+                    INSERT INTO provider_series(
+                        provider, provider_series_id, title, season_title, raw_json,
+                        last_seen_at, catalog_observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "series-123",
+                        "Catalog Title",
+                        "Catalog Season",
+                        json.dumps({"source": "catalog"}),
+                        "2026-01-01T00:00:00Z",
+                        "2026-01-02T00:00:00Z",
+                    ),
+                )
+                conn.commit()
+
+            ingest_snapshot_payload(payload, config)
+
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """
+                    SELECT title, season_title, account_observed_at, catalog_observed_at
+                    FROM provider_series
+                    WHERE provider = 'crunchyroll' AND provider_series_id = 'series-123'
+                    """
+                ).fetchone()
+            self.assertEqual("Example Show", row["title"])
+            self.assertEqual("Example Show Season 1", row["season_title"])
+            self.assertIsNotNone(row["account_observed_at"])
+            self.assertEqual("2026-01-02T00:00:00Z", row["catalog_observed_at"])
 
     def test_ingest_snapshot_payload_rolls_back_provider_rows_when_watchlist_upsert_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:

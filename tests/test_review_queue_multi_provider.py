@@ -24,8 +24,8 @@ class ReviewQueueMultiProviderTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
-                VALUES (?, ?, ?, ?, '{}')
+                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json, account_observed_at)
+                VALUES (?, ?, ?, ?, '{}', CURRENT_TIMESTAMP)
                 """,
                 (provider, provider_series_id, title, season_title),
             )

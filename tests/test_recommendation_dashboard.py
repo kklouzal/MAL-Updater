@@ -456,7 +456,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             db_path = Path(temp_dir) / "state.db"
             bootstrap_database(db_path)
             with connect(db_path) as conn:
-                conn.execute("INSERT INTO provider_series (provider, provider_series_id, title) VALUES ('crunchyroll', 'cr-1', 'Show')")
+                conn.execute("INSERT INTO provider_series (provider, provider_series_id, title, account_observed_at) VALUES ('crunchyroll', 'cr-1', 'Show', CURRENT_TIMESTAMP)")
                 conn.execute("INSERT INTO mal_series_mapping (provider, provider_series_id, mal_anime_id, mapping_source, approved_by_user) VALUES ('crunchyroll', 'cr-1', 123, 'user_exact', 1)")
                 conn.execute("INSERT INTO review_queue (provider, provider_series_id, issue_type, payload_json) VALUES ('crunchyroll', 'cr-1', 'mapping_candidate', '{}')")
                 conn.execute(
@@ -992,8 +992,8 @@ class RecommendationDashboardTests(unittest.TestCase):
             with connect(db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
-                    VALUES ('crunchyroll', 'seed-series', 'Read Only Seed', 'Read Only Seed (English Dub)', '{}')
+                    INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json, account_observed_at)
+                    VALUES ('crunchyroll', 'seed-series', 'Read Only Seed', 'Read Only Seed (English Dub)', '{}', CURRENT_TIMESTAMP)
                     """
                 )
                 conn.execute(

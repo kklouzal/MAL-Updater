@@ -40,8 +40,8 @@ class WatchConfirmationProvenanceTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json, last_seen_at)
-                VALUES ('crunchyroll', 'series-2', 'Provider Two', 'Provider Two Dub', '{}', '2026-07-25T00:05:00Z')
+                INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json, last_seen_at, account_observed_at)
+                VALUES ('crunchyroll', 'series-2', 'Provider Two', 'Provider Two Dub', '{}', '2026-07-25T00:05:00Z', '2026-07-25T00:05:00Z')
                 """
             )
             conn.execute(

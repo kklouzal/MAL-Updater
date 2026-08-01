@@ -68,6 +68,8 @@ class ProviderSeriesState:
     provider_start_year: int | None = None
     provider_start_year_is_trustworthy: bool = False
     verified_identity_evidence: dict[str, Any] | None = None
+    account_observed_at: str | None = None
+    catalog_observed_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -212,6 +214,8 @@ def load_provider_series_states(
             s.season_number,
             s.raw_json,
             s.last_seen_at,
+            s.account_observed_at,
+            s.catalog_observed_at,
             w.watchlist_status AS watchlist_status
         FROM provider_series s
         LEFT JOIN (
@@ -219,7 +223,7 @@ def load_provider_series_states(
             FROM provider_watchlist
             GROUP BY provider, provider_series_id
         ) w ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
-        WHERE 1=1
+        WHERE s.account_observed_at IS NOT NULL
     """
     progress_query = """
         SELECT
@@ -304,7 +308,7 @@ def load_provider_series_states(
                     provider_evidence,
                     extract_provider_mapping_evidence({"identity_evidence": raw_identity_evidence}),
                 )
-        sort_key = summary["last_watched_at"] or row["last_seen_at"]
+        sort_key = summary["last_watched_at"] or row["account_observed_at"]
         states.append(
             (
                 sort_key,
@@ -323,7 +327,7 @@ def load_provider_series_states(
                     last_watched_at=summary["last_watched_at"],
                     completion_audit=summary["completion_audit"],
                     last_progress_seen_at=summary["last_progress_seen_at"],
-                    last_series_seen_at=row["last_seen_at"],
+                    last_series_seen_at=row["account_observed_at"],
                     verified_mal_anime_id=verified_identity.mal_anime_id if verified_identity else None,
                     verified_identity_kind=verified_identity.identity_match_kind if verified_identity else None,
                     verified_identity_evidence=verified_identity_evidence,
@@ -331,6 +335,8 @@ def load_provider_series_states(
                     provider_season_count=provider_evidence.season_count,
                     provider_start_year=provider_evidence.start_year,
                     provider_start_year_is_trustworthy=provider_evidence.start_year_is_trustworthy,
+                    account_observed_at=row["account_observed_at"],
+                    catalog_observed_at=row["catalog_observed_at"],
                 ),
             )
         )

@@ -17,6 +17,7 @@ BROADCAST_COMPATIBILITY_MIGRATION = "013_mal_anime_metadata_broadcast_compatibil
 PROVIDER_ENRICHMENT_CURSOR_MIGRATION = "014_recommendation_provider_enrichment_cursor.sql"
 PUBLIC_USERRECS_STAGING_MIGRATION = "015_public_userrecs_resumable_staging.sql"
 PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION = "016_provider_watchlist_membership_keys.sql"
+PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION = "017_provider_series_observation_provenance.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -36,6 +37,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_ENRICHMENT_CURSOR_MIGRATION,
     PUBLIC_USERRECS_STAGING_MIGRATION,
     PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION,
+    PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"

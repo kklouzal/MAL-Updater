@@ -28,8 +28,8 @@ class HidiveUrlBackfillTests(unittest.TestCase):
             with connect(db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, raw_json)
-                    VALUES ('hidive', '2312', 'Dungeon People', 'Dungeon People', ?)
+                    INSERT INTO provider_series(provider, provider_series_id, title, season_title, raw_json, account_observed_at)
+                    VALUES ('hidive', '2312', 'Dungeon People', 'Dungeon People', ?, CURRENT_TIMESTAMP)
                     """,
                     (json.dumps({"provider_series_id": "2312", "title": "Dungeon People", "url": "https://www.hidive.com/season/dungeon-people"}),),
                 )

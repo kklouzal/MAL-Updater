@@ -102,8 +102,8 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         with connect(self.config.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO provider_series (provider, provider_series_id, title, raw_json)
-                VALUES ('crunchyroll', ?, ?, '{}')
+                INSERT INTO provider_series (provider, provider_series_id, title, raw_json, account_observed_at)
+                VALUES ('crunchyroll', ?, ?, '{}', CURRENT_TIMESTAMP)
                 """,
                 (provider_series_id, title),
             )

@@ -74,7 +74,7 @@ class HealthCheckCycleScriptTests(unittest.TestCase):
 
             with connect(config.db_path) as conn:
                 conn.execute(
-                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO provider_series(provider, provider_series_id, title, season_title, season_number, raw_json, account_observed_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     ("crunchyroll", "series-1", "Example Show", "Example Show", 1, "{}"),
                 )
                 conn.execute(

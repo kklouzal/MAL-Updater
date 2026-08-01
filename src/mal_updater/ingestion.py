@@ -148,14 +148,16 @@ def _upsert_series(conn, provider: str, series_entries: list[Any]) -> None:
                 season_number,
                 raw_json,
                 first_seen_at,
-                last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                last_seen_at,
+                account_observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(provider, provider_series_id) DO UPDATE SET
                 title = excluded.title,
                 season_title = excluded.season_title,
                 season_number = excluded.season_number,
                 raw_json = excluded.raw_json,
-                last_seen_at = CURRENT_TIMESTAMP
+                last_seen_at = CURRENT_TIMESTAMP,
+                account_observed_at = CURRENT_TIMESTAMP
             """,
             (
                 provider,
