@@ -42,6 +42,7 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ing
     contract_version = snapshot.contract_version
 
     with connect(config.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         sync_run_id = _insert_sync_run(conn, provider, contract_version, mode)
         try:
             _upsert_series(conn, provider, snapshot.series)
@@ -61,7 +62,8 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ing
             conn.commit()
             return summary
         except Exception as exc:
-            _complete_sync_run(conn, sync_run_id, "failed", {"error": str(exc)})
+            conn.rollback()
+            _insert_failed_sync_run(conn, provider, contract_version, mode, exc)
             conn.commit()
             raise
 
@@ -80,6 +82,12 @@ def _insert_sync_run(conn, provider: str, contract_version: str, mode: str) -> i
         (provider, contract_version, mode, "running"),
     )
     return int(cursor.lastrowid)
+
+
+def _insert_failed_sync_run(conn, provider: str, contract_version: str, mode: str, exc: Exception) -> int:
+    sync_run_id = _insert_sync_run(conn, provider, contract_version, mode)
+    _complete_sync_run(conn, sync_run_id, "failed", {"error": str(exc)})
+    return sync_run_id
 
 
 def _complete_sync_run(conn, sync_run_id: int, status: str, summary: dict[str, Any]) -> None:

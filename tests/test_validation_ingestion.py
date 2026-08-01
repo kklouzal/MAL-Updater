@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +184,24 @@ class _FakeProvider:
 
 
 class IngestionTests(unittest.TestCase):
+    def _provider_table_rows(self, db_path: Path) -> dict[str, list[tuple[object, ...]]]:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            return {
+                "provider_series": conn.execute(
+                    "SELECT * FROM provider_series ORDER BY provider, provider_series_id"
+                ).fetchall(),
+                "provider_episode_progress": conn.execute(
+                    "SELECT * FROM provider_episode_progress ORDER BY provider, provider_episode_id"
+                ).fetchall(),
+                "provider_watchlist": conn.execute(
+                    """
+                    SELECT *
+                    FROM provider_watchlist
+                    ORDER BY provider, list_id, provider_series_id, provider_item_type, provider_item_id
+                    """
+                ).fetchall(),
+            }
+
     def test_ingest_snapshot_payload_writes_rows_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -203,6 +223,58 @@ class IngestionTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_episode_progress").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM provider_watchlist").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM sync_runs WHERE status = 'completed'").fetchone()[0], 1)
+
+    def test_ingest_snapshot_payload_rolls_back_provider_rows_when_watchlist_upsert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            ingest_snapshot_payload(sample_snapshot(), config)
+            before_provider_rows = self._provider_table_rows(config.db_path)
+
+            payload = sample_snapshot()
+            payload["series"][0]["title"] = "Updated Show"
+            payload["progress"][0]["playback_position_ms"] = 42
+            payload["watchlist"][0]["status"] = "planned"
+            payload["watchlist"].append(
+                {
+                    **payload["watchlist"][0],
+                    "list_id": "watchlist:custom",
+                    "list_name": "Custom",
+                    "list_kind": "custom",
+                    "position": 1,
+                }
+            )
+
+            import mal_updater.ingestion as ingestion_module
+
+            original_entry_json = ingestion_module._entry_json
+            watchlist_entries_seen = 0
+
+            def fail_on_second_watchlist_entry(entry: object) -> str:
+                nonlocal watchlist_entries_seen
+                if isinstance(entry, WatchlistEntry):
+                    watchlist_entries_seen += 1
+                    if watchlist_entries_seen == 2:
+                        raise RuntimeError("injected watchlist upsert failure")
+                return original_entry_json(entry)
+
+            with patch("mal_updater.ingestion._entry_json", side_effect=fail_on_second_watchlist_entry):
+                with self.assertRaisesRegex(RuntimeError, "injected watchlist upsert failure"):
+                    ingest_snapshot_payload(payload, config, mode="hot")
+
+            self.assertEqual(before_provider_rows, self._provider_table_rows(config.db_path))
+
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                runs = conn.execute("SELECT status, mode, summary_json FROM sync_runs ORDER BY id").fetchall()
+                self.assertEqual(2, len(runs))
+                self.assertEqual("completed", runs[0]["status"])
+                self.assertEqual("failed", runs[1]["status"])
+                self.assertEqual("hot", runs[1]["mode"])
+                self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM sync_runs WHERE status = 'running'").fetchone()[0])
+                failure_summary = json.loads(runs[1]["summary_json"])
+                self.assertIn("injected watchlist upsert failure", failure_summary["error"])
 
     def test_ingest_snapshot_payload_persists_cross_list_watchlist_memberships(self) -> None:
         payload = sample_snapshot()
