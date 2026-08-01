@@ -12,9 +12,10 @@ from .persistence import PersistentJsonError, atomic_write_text, read_json_dict_
 from .redaction import sanitize_text, sanitize_url, sanitize_value
 from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
 from .service_systemd_status import build_service_status_payload
-from .service_units import SERVICE_UNIT_NAME, render_repo_systemd_unit_template
+from .service_units import DASHBOARD_SERVICE_UNIT_NAME, SERVICE_UNIT_NAME, render_repo_systemd_unit_template, systemd_unit_path_context
 
 SERVICE_NAME = SERVICE_UNIT_NAME
+DASHBOARD_SERVICE_NAME = DASHBOARD_SERVICE_UNIT_NAME
 _RECENT_LOG_LINES = 20
 _RESULT_SNIPPET_LIMIT = 240
 _SERVICE_STATUS_JSON_MAX_BYTES = 8 * 1024 * 1024
@@ -28,8 +29,8 @@ class ServiceCommandResult:
     details: dict[str, Any] | None = None
 
 
-def _unit_path() -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
+def _unit_path(unit_name: str = SERVICE_NAME) -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / unit_name
 
 
 def _service_env_path() -> Path:
@@ -384,20 +385,20 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
     return summary or None
 
 
-def unit_contents(config: AppConfig | None = None) -> str:
+def unit_contents(config: AppConfig | None = None, *, unit_name: str = SERVICE_NAME) -> str:
     config = config or load_config()
     ensure_directories(config)
     repo = config.project_root
     env_file = _service_env_path()
     python = Path(subprocess.run(["python3", "-c", "import sys; print(sys.executable)"], text=True, capture_output=True, check=True).stdout.strip())
-    return render_repo_systemd_unit_template(repo, env_file, python)
+    return render_repo_systemd_unit_template(repo, env_file, python, unit_name=unit_name, path_context=systemd_unit_path_context(config))
 
 
-def write_unit_file(config: AppConfig | None = None) -> Path:
+def write_unit_file(config: AppConfig | None = None, *, unit_name: str = SERVICE_NAME) -> Path:
     config = config or load_config()
-    path = _unit_path()
+    path = _unit_path(unit_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(unit_contents(config), encoding="utf-8")
+    path.write_text(unit_contents(config, unit_name=unit_name), encoding="utf-8")
     return path
 
 
@@ -428,15 +429,33 @@ def service_status() -> dict[str, Any]:
     return safe if isinstance(safe, dict) else {}
 
 
-def install_service(*, start_now: bool = True, config: AppConfig | None = None) -> ServiceCommandResult:
+def install_service(
+    *,
+    start_now: bool = True,
+    config: AppConfig | None = None,
+    install_dashboard: bool = False,
+    enable_dashboard: bool = False,
+) -> ServiceCommandResult:
     config = config or load_config()
     env = write_service_env_file_if_missing(config)
     unit = write_unit_file(config)
+    dashboard_unit = None
+    if install_dashboard or enable_dashboard:
+        dashboard_unit = write_unit_file(config, unit_name=DASHBOARD_SERVICE_NAME)
     daemon_reload()
     _run(["systemctl", "--user", "enable", SERVICE_NAME])
+    if enable_dashboard:
+        _run(["systemctl", "--user", "enable", DASHBOARD_SERVICE_NAME])
     if start_now:
         _run(["systemctl", "--user", "restart", SERVICE_NAME])
-    return ServiceCommandResult(status="ok", message="MAL-Updater service installed.", details={"unit_path": str(unit), "env_path": str(env), **service_status()})
+    details = {
+        "unit_path": str(unit),
+        "env_path": str(env),
+        "dashboard_unit_path": str(dashboard_unit) if dashboard_unit else None,
+        "dashboard_enabled": bool(enable_dashboard),
+        **service_status(),
+    }
+    return ServiceCommandResult(status="ok", message="MAL-Updater service installed.", details=details)
 
 
 def uninstall_service(*, stop_now: bool = True) -> ServiceCommandResult:

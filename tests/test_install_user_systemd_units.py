@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.cli import _render_systemd_unit_template
-from mal_updater.service_units import render_systemd_unit_template
+from mal_updater.config import load_config
+from mal_updater.service_units import render_systemd_unit_template, systemd_unit_path_context
 
 
 class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
@@ -19,6 +20,21 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
         self.source_dir = self.repo_root / "ops" / "systemd-user"
         self.fake_bin_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.fake_bin_dir.cleanup)
+        self.runtime_dir = tempfile.TemporaryDirectory(prefix="mal-updater-install-test-runtime-", dir="/tmp")
+        self.addCleanup(self.runtime_dir.cleanup)
+        self.settings_path = Path(self.runtime_dir.name) / "config" / "settings.toml"
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text("", encoding="utf-8")
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "MAL_UPDATER_RUNTIME_ROOT": self.runtime_dir.name,
+                "MAL_UPDATER_SETTINGS_PATH": str(self.settings_path),
+            },
+            clear=False,
+        )
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         fake_systemctl = Path(self.fake_bin_dir.name) / "systemctl"
         fake_systemctl.write_text(
             "#!/usr/bin/env bash\n"
@@ -28,9 +44,36 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
         )
         fake_systemctl.chmod(0o755)
 
+    def _renderer_env(self) -> dict[str, str]:
+        return {
+            "MAL_UPDATER_RUNTIME_ROOT": self.runtime_dir.name,
+            "MAL_UPDATER_SETTINGS_PATH": str(self.settings_path),
+        }
+
+    def _render_path_context(self) -> dict[str, str]:
+        with patch.dict(os.environ, self._renderer_env(), clear=False):
+            return systemd_unit_path_context(load_config())
+
+    def _render_cli_unit(
+        self,
+        source_path: Path,
+        env_target: Path,
+        python_bin: Path | None = None,
+    ) -> str:
+        with patch.dict(os.environ, self._renderer_env(), clear=False):
+            os.environ.pop("MAL_UPDATER_SERVICE_PYTHON_BIN", None)
+            return _render_systemd_unit_template(
+                source_path,
+                self.repo_root,
+                env_target,
+                python_bin,
+                path_context=systemd_unit_path_context(load_config()),
+            )
+
     def _run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin_dir.name}:{env.get('PATH', '')}"
+        env.update(self._renderer_env())
         return subprocess.run(
             [str(self.script_path), *args],
             cwd=self.repo_root,
@@ -57,6 +100,8 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, msg=result.stderr)
             self.assertFalse(target_dir.exists())
             self.assertFalse(env_target.exists())
+            self.assertIn("selected_units=mal-updater.service", result.stdout)
+            self.assertIn("dashboard_unit_action=skipped", result.stdout)
             self.assertIn("installed_units=mal-updater.service", result.stdout)
             self.assertIn("service_env_action=installed", result.stdout)
             self.assertIn("[dry-run] install -D -m 600", result.stdout)
@@ -88,6 +133,7 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertIn("service_env_restrictive=true", result.stdout)
             self.assertIn("service enable skipped (--no-enable)", result.stdout)
             self.assertIn("user-level MAL-Updater systemd service install completed", result.stdout)
+            self.assertFalse((target_dir / "mal-updater-dashboard.service").exists())
 
             copied_path = target_dir / "mal-updater.service"
             self.assertTrue(copied_path.exists())
@@ -96,8 +142,19 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertNotIn("__MAL_UPDATER_SERVICE_ENV_FILE__", rendered)
             self.assertNotIn("__MAL_UPDATER_PYTHON_BIN__", rendered)
             self.assertNotIn("__MAL_UPDATER_WORKSPACE_ROOT__", rendered)
+            self.assertNotIn("__MAL_UPDATER_RUNTIME_ROOT__", rendered)
+            self.assertNotIn("__MAL_UPDATER_CONFIG_DIR__", rendered)
+            self.assertNotIn("__MAL_UPDATER_DB_DIR__", rendered)
+            self.assertNotIn("__MAL_UPDATER_READ_WRITE_PATHS__", rendered)
             self.assertIn(str(self.repo_root), rendered)
             self.assertIn(f"ExecStart={self.repo_root}/.venv/bin/python -m mal_updater.cli", rendered)
+            self.assertIn("UMask=0077", rendered)
+            self.assertIn("NoNewPrivileges=true", rendered)
+            self.assertIn("PrivateTmp=true", rendered)
+            self.assertIn("ProtectSystem=strict", rendered)
+            self.assertIn("ProtectHome=read-only", rendered)
+            self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", rendered)
+            self.assertIn(f"ReadWritePaths={self.runtime_dir.name}", rendered)
 
             expected_env = (self.source_dir / "mal-updater-service.env.example").read_text(encoding="utf-8")
             self.assertEqual(expected_env, env_target.read_text(encoding="utf-8"))
@@ -110,22 +167,23 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-service.env"
             default_python = self.repo_root / ".venv" / "bin" / "python"
             custom_python = temp_root / "custom-venv" / "bin" / "python"
+            path_context = self._render_path_context()
 
-            with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("MAL_UPDATER_SERVICE_PYTHON_BIN", None)
-                rendered_by_alias_default = _render_systemd_unit_template(source_path, self.repo_root, env_target)
+            rendered_by_alias_default = self._render_cli_unit(source_path, env_target)
             rendered_by_canonical_default = render_systemd_unit_template(
                 template_text,
                 project_root=self.repo_root,
                 env_path=env_target,
                 python_bin=default_python,
+                path_context=path_context,
             )
-            rendered_by_alias_custom = _render_systemd_unit_template(source_path, self.repo_root, env_target, custom_python)
+            rendered_by_alias_custom = self._render_cli_unit(source_path, env_target, custom_python)
             rendered_by_canonical_custom = render_systemd_unit_template(
                 template_text,
                 project_root=self.repo_root,
                 env_path=env_target,
                 python_bin=custom_python,
+                path_context=path_context,
             )
 
             self.assertEqual(rendered_by_canonical_default, rendered_by_alias_default)
@@ -150,9 +208,8 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
 
             self.assertEqual(0, result.returncode, msg=result.stderr)
             rendered_by_script = (target_dir / "mal-updater.service").read_text(encoding="utf-8")
-            rendered_by_cli = _render_systemd_unit_template(
+            rendered_by_cli = self._render_cli_unit(
                 self.source_dir / "mal-updater.service",
-                self.repo_root,
                 env_target,
                 self.repo_root / ".venv" / "bin" / "python",
             )
@@ -166,6 +223,9 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
                 rendered_by_script,
             )
             self.assertIn("Restart=always", rendered_by_script)
+            self.assertIn("UMask=0077", rendered_by_script)
+            self.assertIn("ProtectSystem=strict", rendered_by_script)
+            self.assertIn("ProtectHome=read-only", rendered_by_script)
             self.assertIn("WantedBy=default.target", rendered_by_script)
 
     def test_script_and_cli_systemd_rendering_preserve_custom_python_divergence(self) -> None:
@@ -188,9 +248,8 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
 
             self.assertEqual(0, result.returncode, msg=result.stderr)
             rendered_by_script = (target_dir / "mal-updater.service").read_text(encoding="utf-8")
-            rendered_by_cli_same_inputs = _render_systemd_unit_template(
+            rendered_by_cli_same_inputs = self._render_cli_unit(
                 self.source_dir / "mal-updater.service",
-                self.repo_root,
                 env_target,
                 custom_python,
             )
@@ -198,6 +257,58 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             self.assertEqual(rendered_by_cli_same_inputs, rendered_by_script)
             self.assertIn(f"ExecStart={custom_python} -m mal_updater.cli --project-root {self.repo_root} service-run", rendered_by_script)
             self.assertNotIn(f"ExecStart={self.repo_root}/.venv/bin/python", rendered_by_script)
+
+    def test_dashboard_unit_requires_explicit_install_and_stays_loopback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            target_dir = temp_root / "systemd" / "user"
+            env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-service.env"
+
+            result = self._run_script(
+                "--target-dir",
+                str(target_dir),
+                "--service-env-target",
+                str(env_target),
+                "--install-dashboard",
+                "--no-enable",
+                "--no-daemon-reload",
+            )
+
+            self.assertEqual(0, result.returncode, msg=result.stderr)
+            self.assertIn("selected_units=mal-updater.service,mal-updater-dashboard.service", result.stdout)
+            self.assertIn("installed_units=mal-updater.service,mal-updater-dashboard.service", result.stdout)
+            self.assertIn("dashboard enable skipped", result.stdout)
+            dashboard_unit = target_dir / "mal-updater-dashboard.service"
+            self.assertTrue(dashboard_unit.exists())
+            rendered = dashboard_unit.read_text(encoding="utf-8")
+            self.assertIn("dashboard-serve --host 127.0.0.1", rendered)
+            self.assertNotIn("--host 0.0.0.0", rendered)
+            self.assertIn(f"ExecStart={self.repo_root}/.venv/bin/python -m mal_updater.cli", rendered)
+            self.assertIn(f"EnvironmentFile=-{env_target}", rendered)
+            self.assertIn("NoNewPrivileges=true", rendered)
+            self.assertIn("ProtectHome=read-only", rendered)
+
+    def test_enable_dashboard_is_an_explicit_opt_in_and_does_not_restart_dashboard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            target_dir = temp_root / "systemd" / "user"
+            env_target = temp_root / ".MAL-Updater" / "config" / "mal-updater-service.env"
+
+            result = self._run_script(
+                "--target-dir",
+                str(target_dir),
+                "--service-env-target",
+                str(env_target),
+                "--enable-dashboard",
+                "--start-service",
+                "--dry-run",
+            )
+
+            self.assertEqual(0, result.returncode, msg=result.stderr)
+            self.assertIn("[dry-run] systemctl --user enable mal-updater.service", result.stdout)
+            self.assertIn("[dry-run] systemctl --user enable mal-updater-dashboard.service", result.stdout)
+            self.assertIn("[dry-run] systemctl --user restart mal-updater.service", result.stdout)
+            self.assertNotIn("restart mal-updater-dashboard.service", result.stdout)
 
     def test_existing_service_env_is_left_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -230,9 +341,8 @@ class InstallUserSystemdUnitsScriptTests(unittest.TestCase):
             target_dir.mkdir(parents=True, exist_ok=True)
 
             unit_path = self.source_dir / "mal-updater.service"
-            rendered_unchanged = _render_systemd_unit_template(
+            rendered_unchanged = self._render_cli_unit(
                 unit_path,
-                self.repo_root,
                 env_target,
                 self.repo_root / ".venv" / "bin" / "python",
             )

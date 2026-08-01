@@ -7,28 +7,36 @@ TARGET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SERVICE_ENV_SOURCE="$SOURCE_DIR/mal-updater-service.env.example"
 SERVICE_ENV_TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/mal-updater-service.env"
 ENABLE_SERVICE=1
+ENABLE_DASHBOARD=0
+INSTALL_DASHBOARD=0
 RELOAD_DAEMON=1
 START_SERVICE=0
 COPY_SERVICE_ENV=1
 DRY_RUN=0
 SERVICE_PYTHON_BIN="${MAL_UPDATER_SERVICE_PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
+UNITS=("mal-updater.service")
+DASHBOARD_UNIT_NAME="mal-updater-dashboard.service"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/install_user_systemd_units.sh [options]
 
 Render and install the repo-owned user-level MAL-Updater daemon service.
+The optional local dashboard unit is source-tracked but installed only with an
+explicit opt-in flag; it binds to 127.0.0.1 by template default.
 
 Options:
-  --target-dir PATH           Override the systemd user unit target directory.
-  --service-env-target PATH   Override where the optional service env file is copied.
-  --no-enable                 Copy/update the service unit but do not enable it.
-  --start-service             After install/reload, start the service immediately.
-  --no-daemon-reload          Skip `systemctl --user daemon-reload`.
-  --no-service-env            Do not copy the example service env file.
-  --service-python-bin PATH   Python executable for the rendered service (default: repo .venv).
-  --dry-run                   Print planned actions without changing anything.
-  -h, --help                  Show this help.
+  --target-dir PATH             Override the systemd user unit target directory.
+  --service-env-target PATH     Override where the optional service env file is copied.
+  --no-enable                   Copy/update selected service units but do not enable the main daemon.
+  --install-dashboard           Also render/install the optional dashboard service unit without enabling it.
+  --enable-dashboard            Render/install and enable the optional dashboard service unit.
+  --start-service               After install/reload, restart the main daemon service immediately.
+  --no-daemon-reload            Skip `systemctl --user daemon-reload`.
+  --no-service-env              Do not copy the example service env file.
+  --service-python-bin PATH     Python executable for rendered services (default: repo .venv).
+  --dry-run                     Print planned actions without changing anything.
+  -h, --help                    Show this help.
 EOF
 }
 
@@ -94,9 +102,17 @@ src_dir = str(repo_root / "src")
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from mal_updater.service_units import render_systemd_unit_template_file
+from mal_updater.config import load_config
+from mal_updater.service_units import render_systemd_unit_template_file, systemd_unit_path_context
 
-rendered = render_systemd_unit_template_file(source_path, repo_root, sys.argv[5], sys.argv[6])
+config = load_config(repo_root)
+rendered = render_systemd_unit_template_file(
+    source_path,
+    repo_root,
+    sys.argv[5],
+    sys.argv[6],
+    path_context=systemd_unit_path_context(config),
+)
 if mode == "stdout":
     print(rendered, end="")
 elif mode == "write":
@@ -124,6 +140,17 @@ render_unit() {
   render_unit_python write "$source_path" "$target_path"
 }
 
+append_unique_unit() {
+  local unit_name="$1"
+  local existing
+  for existing in "${UNITS[@]}"; do
+    if [[ "$existing" == "$unit_name" ]]; then
+      return 0
+    fi
+  done
+  UNITS+=("$unit_name")
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target-dir)
@@ -138,6 +165,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-enable)
       ENABLE_SERVICE=0
+      shift
+      ;;
+    --install-dashboard)
+      INSTALL_DASHBOARD=1
+      shift
+      ;;
+    --enable-dashboard)
+      INSTALL_DASHBOARD=1
+      ENABLE_DASHBOARD=1
       shift
       ;;
     --start-service)
@@ -173,31 +209,54 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-UNIT_NAME="mal-updater.service"
-SOURCE_PATH="$SOURCE_DIR/$UNIT_NAME"
-TARGET_PATH="$TARGET_DIR/$UNIT_NAME"
-
-if [[ ! -f "$SOURCE_PATH" ]]; then
-  echo "missing source unit file: $SOURCE_PATH" >&2
-  exit 1
+if [[ "$INSTALL_DASHBOARD" == "1" ]]; then
+  append_unique_unit "$DASHBOARD_UNIT_NAME"
 fi
+
+for unit_name in "${UNITS[@]}"; do
+  source_path="$SOURCE_DIR/$unit_name"
+  if [[ ! -f "$source_path" ]]; then
+    echo "missing source unit file: $source_path" >&2
+    exit 1
+  fi
+done
 
 log "repo_root=$ROOT_DIR"
 log "source_dir=$SOURCE_DIR"
 log "target_dir=$TARGET_DIR"
 log "service_env_target=$SERVICE_ENV_TARGET"
 log "service_python_bin=$SERVICE_PYTHON_BIN"
-
-rendered_content="$(render_unit_content "$SOURCE_PATH")"
-
-if [[ ! -e "$TARGET_PATH" ]]; then
-  log "installed_units=$UNIT_NAME"
-elif [[ "$(cat "$TARGET_PATH")" == "$rendered_content" ]]; then
-  log "unchanged_units=$UNIT_NAME"
-else
-  log "updated_units=$UNIT_NAME"
+log "selected_units=$(IFS=,; echo "${UNITS[*]}")"
+if [[ "$INSTALL_DASHBOARD" != "1" ]]; then
+  log "dashboard_unit_action=skipped (use --install-dashboard or --enable-dashboard to install optional dashboard)"
 fi
-render_unit "$SOURCE_PATH" "$TARGET_PATH"
+
+installed_units=()
+updated_units=()
+unchanged_units=()
+for unit_name in "${UNITS[@]}"; do
+  source_path="$SOURCE_DIR/$unit_name"
+  target_path="$TARGET_DIR/$unit_name"
+  rendered_content="$(render_unit_content "$source_path")"
+  if [[ ! -e "$target_path" ]]; then
+    installed_units+=("$unit_name")
+  elif [[ "$(cat "$target_path")" == "$rendered_content" ]]; then
+    unchanged_units+=("$unit_name")
+  else
+    updated_units+=("$unit_name")
+  fi
+  render_unit "$source_path" "$target_path"
+done
+
+if [[ ${#installed_units[@]} -gt 0 ]]; then
+  log "installed_units=$(IFS=,; echo "${installed_units[*]}")"
+fi
+if [[ ${#updated_units[@]} -gt 0 ]]; then
+  log "updated_units=$(IFS=,; echo "${updated_units[*]}")"
+fi
+if [[ ${#unchanged_units[@]} -gt 0 ]]; then
+  log "unchanged_units=$(IFS=,; echo "${unchanged_units[*]}")"
+fi
 
 service_env_action="skipped"
 if [[ "$COPY_SERVICE_ENV" == "1" ]]; then
@@ -223,17 +282,25 @@ if [[ "$RELOAD_DAEMON" == "1" ]]; then
 fi
 
 if [[ "$ENABLE_SERVICE" == "1" ]]; then
-  run_cmd systemctl --user enable "$UNIT_NAME"
+  run_cmd systemctl --user enable "mal-updater.service"
 else
   log "service enable skipped (--no-enable)"
 fi
 
-if [[ "$START_SERVICE" == "1" ]]; then
-  run_cmd systemctl --user restart "$UNIT_NAME"
+if [[ "$ENABLE_DASHBOARD" == "1" ]]; then
+  run_cmd systemctl --user enable "$DASHBOARD_UNIT_NAME"
+elif [[ "$INSTALL_DASHBOARD" == "1" ]]; then
+  log "dashboard enable skipped (use --enable-dashboard to opt in)"
 fi
 
-if ! run_cmd systemctl --user status "$UNIT_NAME" --no-pager; then
-  log "service status probe failed; continuing"
+if [[ "$START_SERVICE" == "1" ]]; then
+  run_cmd systemctl --user restart "mal-updater.service"
 fi
+
+for unit_name in "${UNITS[@]}"; do
+  if ! run_cmd systemctl --user status "$unit_name" --no-pager; then
+    log "service status probe failed for $unit_name; continuing"
+  fi
+done
 
 log "user-level MAL-Updater systemd service install completed"

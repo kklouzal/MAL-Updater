@@ -33,6 +33,7 @@ PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
 PYTHONPATH=src python3 -m mal_updater.cli status
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
+PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
 PYTHONPATH=src python3 -m mal_updater.cli health-check
 PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 ```
@@ -115,11 +116,16 @@ cd <repo-root>
 scripts/install_user_systemd_units.sh
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
+PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 ```
 
-Use one install path, not both, for routine setup. Prefer `scripts/install_user_systemd_units.sh` for production bootstrap because it renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/` and preserves/installs the service env file. The CLI `install-service` path is a compatibility/direct service-manager path for targeted repair or tests.
+Use one install path, not both, for routine setup. Prefer `scripts/install_user_systemd_units.sh` for production bootstrap because it renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/` and preserves/installs the service env file. The CLI `install-service` path is a compatibility/direct service-manager path for targeted repair or tests. The tracked daemon unit uses conservative user-service sandboxing (`UMask=0077`, `NoNewPrivileges=true`, `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, and a narrow address-family allowlist) while allowing the resolved MAL-Updater runtime/config/secrets/data/state/cache/DB directories to remain writable for SQLite, logs, token refreshes, and service state through a de-duplicated `ReadWritePaths` allowlist. The deterministic renderer intentionally supports absolute systemd paths without whitespace/control characters and fails fast on unsupported path values instead of emitting ambiguous unit syntax.
+
+The optional dashboard unit `mal-updater-dashboard.service` is also tracked and rendered by the same installer, but it is not installed or enabled unless explicitly requested. Use `scripts/install_user_systemd_units.sh --install-dashboard` to render it without enabling it, or `--enable-dashboard` to opt in to enablement. Its template runs `dashboard-serve --host 127.0.0.1` through the repo venv and the same service env file; do not change it to a non-loopback bind unless you are deliberately reviewing a separate exposure decision. `--start-service` restarts only the main daemon, not the optional dashboard.
+
+`service-status` remains a non-failing inspection command by default. Add `--strict` for automation gates; strict mode exits 2 when the main daemon unit/env/systemctl/runtime parse status is not automation-ready. A stopped, disabled, or absent optional dashboard is not considered a main-daemon failure.
 
 ### Request budgets and telemetry
 

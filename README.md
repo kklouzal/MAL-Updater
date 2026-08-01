@@ -51,6 +51,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 - current MAL redirect URI
 - whether the repo-owned **user-systemd daemon service** can be installed on this host
 - whether the repo-owned user-systemd daemon is missing, outdated, disabled, inactive, or missing its rendered env file for this user
+- whether the optional loopback dashboard user unit is installed/current without treating its stopped/disabled default state as daemon failure
 - whether manual foreground CLI operation is merely acceptable during bootstrap/spot checks or the daemon is now the expected unattended path
 
 ## Bootstrap / onboarding flow
@@ -64,7 +65,7 @@ Use `bootstrap-audit --summary` when you only need a terse onboarding checklist.
 7. Run the provider bootstrap command at the point the audit/onboarding flow says that provider is ready:
    - Crunchyroll: `provider-auth-login --provider crunchyroll` (or the compatibility wrapper `crunchyroll-auth-login`)
    - HIDIVE: `provider-auth-login --provider hidive`
-8. Install the unattended daemon with `scripts/install_user_systemd_units.sh` when the host supports user systemd
+8. Install the unattended daemon with `scripts/install_user_systemd_units.sh` when the host supports user systemd; add `--install-dashboard` or `--enable-dashboard` only if you explicitly want the optional 127.0.0.1 dashboard unit rendered/enabled
 
 Normal unattended operation now assumes **all credentialed providers stay enabled** and are swept by separate background fetch lanes before aggregate MAL planning/apply runs.
 
@@ -89,6 +90,7 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider all --o
 PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchyroll
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
+PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
 PYTHONPATH=src python3 -m mal_updater.cli service-run-once
 PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --dry-run
 PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --recommendation-limit 100 --provider-max-history-pages 2 --provider-max-watchlist-pages 2

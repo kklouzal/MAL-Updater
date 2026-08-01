@@ -30,6 +30,7 @@ from .service_auth_state import (
     mal_bootstrap_auth_issue,
     provider_bootstrap_auth_issue,
 )
+from .service_units import systemd_unit_path_context
 
 
 def _parse_sqlite_timestamp(value: object) -> datetime | None:
@@ -578,7 +579,10 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
     hidive_state = resolve_hidive_state_paths(config)
     runtime_initialization = _runtime_initialization_status(config)
     secrets_dir_permissions = _secrets_dir_permission_status(config)
-    automation_installation = service_systemd_status.build_automation_installation_status(config.project_root)
+    automation_installation = service_systemd_status.build_automation_installation_status(
+        config.project_root,
+        path_context=systemd_unit_path_context(config),
+    )
     service_state = load_service_state(config)
 
     dependency_checks = {
@@ -812,8 +816,8 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
         )
     if isinstance(automation_installation, dict):
         install_script_path = automation_installation.get("install_script_path")
-        missing_units = automation_installation.get("missing_units") if isinstance(automation_installation.get("missing_units"), list) else []
-        outdated_units = automation_installation.get("outdated_units") if isinstance(automation_installation.get("outdated_units"), list) else []
+        missing_units = automation_installation.get("missing_required_units") if isinstance(automation_installation.get("missing_required_units"), list) else []
+        outdated_units = automation_installation.get("outdated_required_units") if isinstance(automation_installation.get("outdated_required_units"), list) else []
         disabled_services = automation_installation.get("disabled_services") if isinstance(automation_installation.get("disabled_services"), list) else []
         inactive_services = automation_installation.get("inactive_services") if isinstance(automation_installation.get("inactive_services"), list) else []
         if isinstance(install_script_path, str) and install_script_path:
@@ -976,7 +980,8 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
             "installer_script": str(config.project_root / "scripts" / "install_user_systemd_units.sh"),
             "service_manager_available": dependency_checks["systemctl"],
             "service_unit_name": "mal-updater.service",
-            "service_model": "user-systemd daemon",
+            "service_unit_names": ["mal-updater.service", "mal-updater-dashboard.service"],
+            "service_model": "user-systemd daemon plus optional loopback dashboard",
             "automation_installation": automation_installation,
         },
         "operation_modes": operation_modes,
@@ -1007,8 +1012,10 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
             "partially_staged_provider_count": operation_modes.get("partially_staged_provider_count"),
             "runtime_initialized": runtime_initialization["ready"],
             "secrets_dir_restrictive": secrets_dir_permissions["restrictive"],
-            "automation_installed": automation_installation.get("all_units_installed") if isinstance(automation_installation, dict) else None,
-            "automation_current": automation_installation.get("all_units_current") if isinstance(automation_installation, dict) else None,
+            "automation_installed": automation_installation.get("required_units_installed") if isinstance(automation_installation, dict) else None,
+            "automation_current": automation_installation.get("required_units_current") if isinstance(automation_installation, dict) else None,
+            "automation_all_tracked_installed": automation_installation.get("all_tracked_units_installed") if isinstance(automation_installation, dict) else None,
+            "automation_all_tracked_current": automation_installation.get("all_tracked_units_current") if isinstance(automation_installation, dict) else None,
             "automation_enabled": automation_installation.get("service_enabled") if isinstance(automation_installation, dict) else None,
             "automation_active": automation_installation.get("service_active") if isinstance(automation_installation, dict) else None,
             "operation_mode": operation_modes.get("mode"),
@@ -1048,6 +1055,10 @@ def render_bootstrap_audit_summary(payload: dict[str, object]) -> str:
             print(f"automation_installed={payload['summary']['automation_installed']}")
         if payload["summary"].get("automation_current") is not None:
             print(f"automation_current={payload['summary']['automation_current']}")
+        if payload["summary"].get("automation_all_tracked_installed") is not None:
+            print(f"automation_all_tracked_installed={payload['summary']['automation_all_tracked_installed']}")
+        if payload["summary"].get("automation_all_tracked_current") is not None:
+            print(f"automation_all_tracked_current={payload['summary']['automation_all_tracked_current']}")
         if payload["summary"].get("automation_enabled") is not None:
             print(f"automation_enabled={payload['summary']['automation_enabled']}")
         if payload["summary"].get("automation_active") is not None:

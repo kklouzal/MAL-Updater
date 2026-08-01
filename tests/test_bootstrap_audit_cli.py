@@ -11,14 +11,27 @@ from unittest.mock import patch
 from mal_updater import bootstrap_guidance
 from mal_updater.cli import main as cli_main
 from mal_updater.config import load_config
+from mal_updater.service_units import render_repo_systemd_unit_template
 
 
 class BootstrapAuditCliTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="mal-updater-bootstrap-test-", dir="/tmp")
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
-        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
+        settings_path = self.project_root / ".MAL-Updater" / "config" / "settings.toml"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text("", encoding="utf-8")
+        self.env_patch = patch.dict(
+            "os.environ",
+            {
+                "MAL_UPDATER_RUNTIME_ROOT": str(self.project_root / ".MAL-Updater"),
+                "MAL_UPDATER_SETTINGS_PATH": str(settings_path),
+            },
+            clear=False,
+        )
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         scripts_dir = self.project_root / "scripts"
         scripts_dir.mkdir(parents=True)
         (scripts_dir / "install_user_systemd_units.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -26,6 +39,10 @@ class BootstrapAuditCliTests(unittest.TestCase):
         ops_dir.mkdir(parents=True)
         (ops_dir / "mal-updater.service").write_text(
             "[Unit]\nDescription=MAL-Updater\n[Service]\nEnvironmentFile=__MAL_UPDATER_SERVICE_ENV_FILE__\nWorkingDirectory=__MAL_UPDATER_REPO_ROOT__\n",
+            encoding="utf-8",
+        )
+        (ops_dir / "mal-updater-dashboard.service").write_text(
+            "[Unit]\nDescription=MAL-Updater dashboard\n[Service]\nEnvironmentFile=__MAL_UPDATER_SERVICE_ENV_FILE__\nWorkingDirectory=__MAL_UPDATER_REPO_ROOT__\nExecStart=__MAL_UPDATER_PYTHON_BIN__ -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ dashboard-serve --host 127.0.0.1\n",
             encoding="utf-8",
         )
 
@@ -125,6 +142,45 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertTrue(mal_auth_command["requires_auth_interaction"])
         self.assertIsNone(payload["mal"]["operation_guidance"]["next_command"])
         self.assertNotIn("next_command_reason_code", payload["mal"]["operation_guidance"])
+
+    def test_bootstrap_audit_optional_dashboard_absence_does_not_block_main_daemon_readiness(self) -> None:
+        xdg_config_home = self.project_root / ".config"
+        target_dir = xdg_config_home / "systemd" / "user"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        env_path = xdg_config_home / "mal-updater-service.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+        env_path.chmod(0o600)
+        main_rendered = render_repo_systemd_unit_template(self.project_root, env_path)
+        (target_dir / "mal-updater.service").write_text(main_rendered, encoding="utf-8")
+
+        def runtime_reader(unit_name: str) -> dict[str, object]:
+            self.assertEqual("mal-updater.service", unit_name)
+            return {
+                "available": True,
+                "active_state": "active",
+                "sub_state": "running",
+                "unit_file_state": "enabled",
+                "result": "success",
+            }
+
+        with (
+            patch("importlib.util.find_spec", return_value=None),
+            patch("mal_updater.service_systemd_status.read_systemd_user_unit_runtime", side_effect=runtime_reader),
+        ):
+            exit_code, stdout = self._run_bootstrap_audit_raw()
+        payload = json.loads(stdout)
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(payload["summary"]["automation_installed"])
+        self.assertTrue(payload["summary"]["automation_current"])
+        self.assertFalse(payload["summary"]["automation_all_tracked_installed"])
+        self.assertEqual(["mal-updater-dashboard.service"], payload["services"]["automation_installation"]["missing_optional_units"])
+        self.assertEqual([], payload["services"]["automation_installation"]["missing_required_units"])
+        self.assertNotIn(
+            "install-user-systemd-daemon",
+            {step.get("step") for step in payload["onboarding_steps"]},
+        )
 
     def test_bootstrap_audit_summary_reports_provider_missing_state_and_next_commands(self) -> None:
         secrets_dir = self.project_root / ".MAL-Updater" / "secrets"

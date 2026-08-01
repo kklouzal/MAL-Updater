@@ -35,6 +35,7 @@ from .service_auth_state import (
 )
 from .sync_planner import MAPPING_REVIEW_HEURISTICS_REVISION
 from . import service_systemd_status as _service_systemd_status
+from .service_units import systemd_unit_path_context
 from .recommendation_enrichment import build_provider_enrichment_diagnostics
 
 
@@ -342,10 +343,11 @@ def _format_systemd_usec_timestamp(value: str) -> str | None:
 def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
     return _service_systemd_status.read_systemd_user_unit_runtime(unit_name)
 
-def _build_automation_installation_status(project_root: Path) -> dict[str, object] | None:
+def _build_automation_installation_status(config: AppConfig) -> dict[str, object] | None:
     return _service_systemd_status.build_automation_installation_status(
-        project_root,
+        config.project_root,
         runtime_reader=_read_systemd_user_unit_runtime,
+        path_context=systemd_unit_path_context(config),
     )
 
 def _build_health_maintenance_commands(
@@ -511,8 +513,8 @@ def _build_health_maintenance_commands(
                 requires_auth_interaction=False,
             )
 
-    missing_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
-    outdated_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
+    missing_units = automation_installation.get("missing_required_units") if isinstance(automation_installation, dict) else None
+    outdated_units = automation_installation.get("outdated_required_units") if isinstance(automation_installation, dict) else None
     disabled_services = automation_installation.get("disabled_services") if isinstance(automation_installation, dict) else None
     inactive_services = automation_installation.get("inactive_services") if isinstance(automation_installation, dict) else None
     install_script_path = automation_installation.get("install_script_path") if isinstance(automation_installation, dict) else None
@@ -735,6 +737,12 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
         all_units_current = automation.get("all_units_current")
         if isinstance(all_units_current, bool):
             print(f"automation_all_units_current={all_units_current}")
+        all_tracked_units_installed = automation.get("all_tracked_units_installed")
+        if isinstance(all_tracked_units_installed, bool):
+            print(f"automation_all_tracked_units_installed={all_tracked_units_installed}")
+        all_tracked_units_current = automation.get("all_tracked_units_current")
+        if isinstance(all_tracked_units_current, bool):
+            print(f"automation_all_tracked_units_current={all_tracked_units_current}")
         service_enabled = automation.get("service_enabled")
         if isinstance(service_enabled, bool):
             print(f"automation_service_enabled={service_enabled}")
@@ -908,7 +916,7 @@ def build_health_report(
         snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
         snapshot.get("mappings") if isinstance(snapshot.get("mappings"), dict) else None,
     )
-    automation_installation = _build_automation_installation_status(config.project_root)
+    automation_installation = _build_automation_installation_status(config)
     service_state = load_service_state(config)
     provider_auth_failures = {
         provider: payload
@@ -932,8 +940,8 @@ def build_health_report(
         warnings.append({"code": "missing_hidive_state", "detail": "HIDIVE authorisation token or refresh token is missing"})
     if not secrets.client_id or not secrets.access_token or not secrets.refresh_token:
         warnings.append({"code": "missing_mal_auth_material", "detail": "MAL client id/access token/refresh token are not all present"})
-    missing_automation_units = automation_installation.get("missing_units") if isinstance(automation_installation, dict) else None
-    outdated_automation_units = automation_installation.get("outdated_units") if isinstance(automation_installation, dict) else None
+    missing_automation_units = automation_installation.get("missing_required_units") if isinstance(automation_installation, dict) else None
+    outdated_automation_units = automation_installation.get("outdated_required_units") if isinstance(automation_installation, dict) else None
     disabled_automation_services = automation_installation.get("disabled_services") if isinstance(automation_installation, dict) else None
     inactive_automation_services = automation_installation.get("inactive_services") if isinstance(automation_installation, dict) else None
     if isinstance(missing_automation_units, list) and missing_automation_units:

@@ -18,11 +18,22 @@ from mal_updater.service_units import render_repo_systemd_unit_template
 
 class ServiceStatusTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="mal-updater-service-status-test-", dir="/tmp")
         self.addCleanup(self.temp_dir.cleanup)
         self.project_root = Path(self.temp_dir.name)
-        (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True)
-        (self.project_root / ".MAL-Updater" / "config" / "settings.toml").write_text("[service]\nfull_refresh_every_seconds = 86400\n", encoding="utf-8")
+        settings_path = self.project_root / ".MAL-Updater" / "config" / "settings.toml"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text("[service]\nfull_refresh_every_seconds = 86400\n", encoding="utf-8")
+        self.env_patch = patch.dict(
+            "os.environ",
+            {
+                "MAL_UPDATER_RUNTIME_ROOT": str(self.project_root / ".MAL-Updater"),
+                "MAL_UPDATER_SETTINGS_PATH": str(settings_path),
+            },
+            clear=False,
+        )
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
 
@@ -73,6 +84,14 @@ class ServiceStatusTests(unittest.TestCase):
             f"ExecStart={fake_python} -m mal_updater.cli --project-root {self.config.project_root} service-run",
             rendered,
         )
+        self.assertIn("UMask=0077", rendered)
+        self.assertIn("NoNewPrivileges=true", rendered)
+        self.assertIn("PrivateTmp=true", rendered)
+        self.assertIn("ProtectSystem=strict", rendered)
+        self.assertIn("ProtectHome=read-only", rendered)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", rendered)
+        self.assertIn(str(self.config.runtime_root), rendered)
+        self.assertNotIn("__MAL_UPDATER_READ_WRITE_PATHS__", rendered)
 
     def test_service_manager_creates_env_file_0600_without_overwriting_existing(self) -> None:
         source = self.project_root / "ops" / "systemd-user" / "mal-updater-service.env.example"
@@ -417,6 +436,110 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertIn("enabled=False", stdout)
         self.assertIn("active=False", stdout)
 
+    def test_service_status_strict_returns_nonzero_for_main_daemon_failures(self) -> None:
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="disabled\n", stderr="")):
+            exit_code, stdout = self._run_service_status_raw("--strict", "--format", "summary")
+
+        self.assertEqual(2, exit_code)
+        self.assertIn("strict_ok=False", stdout)
+        self.assertIn("main_unit_missing", stdout)
+        self.assertIn("main_unit_not_enabled", stdout)
+        self.assertIn("main_unit_not_active", stdout)
+
+    def test_service_status_strict_success_is_main_daemon_only(self) -> None:
+        fake_home = self.project_root / "fake-home"
+        unit_path = fake_home / ".config" / "systemd" / "user" / "mal-updater.service"
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text("[Unit]\nDescription=MAL-Updater\n", encoding="utf-8")
+        env_path = fake_home / ".config" / "mal-updater-service.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+        env_path.chmod(0o600)
+
+        def fake_run(command: list[str], check: bool = True):
+            if command[-2:] == ["is-enabled", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="enabled\n", stderr="")
+            if command[-2:] == ["is-active", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with (
+            patch("mal_updater.service_manager._run", side_effect=fake_run),
+            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+        ):
+            exit_code, stdout = self._run_service_status_raw("--strict", "--format", "summary")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("strict_ok=True", stdout)
+        self.assertNotIn("strict_failures=", stdout)
+
+    def test_service_status_strict_json_fails_on_env_mode_and_parse_errors(self) -> None:
+        fake_home = self.project_root / "fake-home"
+        unit_path = fake_home / ".config" / "systemd" / "user" / "mal-updater.service"
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text("[Unit]\nDescription=MAL-Updater\n", encoding="utf-8")
+        env_path = fake_home / ".config" / "mal-updater-service.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+        env_path.chmod(0o644)
+        self.config.service_state_path.write_text("{not-json", encoding="utf-8")
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text("[]", encoding="utf-8")
+
+        def fake_run(command: list[str], check: bool = True):
+            if command[-2:] == ["is-enabled", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="enabled\n", stderr="")
+            if command[-2:] == ["is-active", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with (
+            patch("mal_updater.service_manager._run", side_effect=fake_run),
+            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+        ):
+            exit_code, stdout = self._run_service_status_raw("--strict")
+
+        payload = json.loads(stdout)
+        failures = set(payload["strict"]["failures"])
+        self.assertEqual(2, exit_code)
+        self.assertFalse(payload["strict"]["ok"])
+        self.assertIn("service_env_not_0600", failures)
+        self.assertIn("service_state_parse_error", failures)
+        self.assertIn("health_latest_parse_error", failures)
+        self.assertNotIn("main_unit_missing", failures)
+        self.assertNotIn("main_unit_not_enabled", failures)
+        self.assertNotIn("main_unit_not_active", failures)
+
+    def test_service_status_strict_fails_safely_when_env_permissions_are_unknown(self) -> None:
+        fake_home = self.project_root / "fake-home"
+        unit_path = fake_home / ".config" / "systemd" / "user" / "mal-updater.service"
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text("[Unit]\nDescription=MAL-Updater\n", encoding="utf-8")
+        env_path = fake_home / ".config" / "mal-updater-service.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS=30\n", encoding="utf-8")
+
+        def fake_run(command: list[str], check: bool = True):
+            if command[-2:] == ["is-enabled", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="enabled\n", stderr="")
+            if command[-2:] == ["is-active", "mal-updater.service"]:
+                return Mock(returncode=0, stdout="active\n", stderr="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with (
+            patch("mal_updater.service_manager._run", side_effect=fake_run),
+            patch(
+                "mal_updater.service_systemd_status._permission_payload",
+                return_value={"exists": True, "mode_octal": None, "restrictive": False, "error": "permission inspection failed"},
+            ),
+            patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False),
+        ):
+            exit_code, stdout = self._run_service_status_raw("--strict", "--format", "summary")
+
+        self.assertEqual(2, exit_code)
+        self.assertIn("strict_ok=False", stdout)
+        self.assertIn("service_env_permissions_unknown", stdout)
+
     def test_systemd_runtime_reader_reports_unavailable_without_crashing_on_oserror(self) -> None:
         with patch("mal_updater.service_systemd_status.subprocess.run", side_effect=OSError("systemctl unavailable")):
             runtime_state = read_systemd_user_unit_runtime("mal-updater.service")
@@ -442,6 +565,22 @@ class ServiceStatusTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        dashboard_source_path = self.project_root / "ops" / "systemd-user" / "mal-updater-dashboard.service"
+        dashboard_source_path.write_text(
+            "\n".join(
+                [
+                    "[Unit]",
+                    "Description=MAL-Updater dashboard",
+                    "",
+                    "[Service]",
+                    "WorkingDirectory=__MAL_UPDATER_REPO_ROOT__",
+                    "EnvironmentFile=-__MAL_UPDATER_SERVICE_ENV_FILE__",
+                    "ExecStart=__MAL_UPDATER_PYTHON_BIN__ -m mal_updater.cli --project-root __MAL_UPDATER_REPO_ROOT__ dashboard-serve --host 127.0.0.1",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
         script_path = self.project_root / "scripts" / "install_user_systemd_units.sh"
         script_path.parent.mkdir(parents=True, exist_ok=True)
         script_path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -452,37 +591,57 @@ class ServiceStatusTests(unittest.TestCase):
         rendered = render_repo_systemd_unit_template(self.project_root, env_path)
         target_path = target_dir / "mal-updater.service"
         target_path.write_text(rendered, encoding="utf-8")
-        runtime_state = {
-            "available": True,
-            "active_state": "active",
-            "sub_state": "running",
-            "unit_file_state": "enabled",
-            "next_elapse_at": None,
-            "last_trigger_at": None,
-            "result": "success",
-        }
+        dashboard_target_path = target_dir / "mal-updater-dashboard.service"
+        dashboard_target_path.write_text(
+            render_repo_systemd_unit_template(self.project_root, env_path, unit_name="mal-updater-dashboard.service"),
+            encoding="utf-8",
+        )
+
+        def runtime_reader(unit_name: str) -> dict[str, object]:
+            return {
+                "available": True,
+                "active_state": "inactive" if unit_name == "mal-updater-dashboard.service" else "active",
+                "sub_state": "dead" if unit_name == "mal-updater-dashboard.service" else "running",
+                "unit_file_state": "disabled" if unit_name == "mal-updater-dashboard.service" else "enabled",
+                "next_elapse_at": None,
+                "last_trigger_at": None,
+                "result": "success",
+            }
 
         with patch.dict("os.environ", {"HOME": str(fake_home)}, clear=False):
             current = build_automation_installation_status(
                 self.project_root,
-                runtime_reader=Mock(return_value=runtime_state),
+                runtime_reader=runtime_reader,
             )
             target_path.write_text("[Unit]\nDescription=stale\n", encoding="utf-8")
             outdated = build_automation_installation_status(
                 self.project_root,
-                runtime_reader=Mock(return_value=runtime_state),
+                runtime_reader=runtime_reader,
             )
 
         self.assertIsNotNone(current)
+        self.assertTrue(current["required_units_installed"])
+        self.assertTrue(current["required_units_current"])
         self.assertTrue(current["all_units_installed"])
         self.assertTrue(current["all_units_current"])
+        self.assertTrue(current["all_tracked_units_installed"])
+        self.assertTrue(current["all_tracked_units_current"])
         self.assertEqual([], current["outdated_units"])
+        self.assertEqual([], current["disabled_services"])
+        self.assertEqual([], current["inactive_services"])
+        self.assertEqual(["mal-updater-dashboard.service"], current["optional_disabled_services"])
+        self.assertEqual(["mal-updater-dashboard.service"], current["optional_inactive_services"])
         self.assertTrue(current["service_enabled"])
         self.assertTrue(current["service_active"])
         self.assertIsNotNone(outdated)
+        self.assertTrue(outdated["required_units_installed"])
+        self.assertFalse(outdated["required_units_current"])
         self.assertTrue(outdated["all_units_installed"])
         self.assertFalse(outdated["all_units_current"])
+        self.assertTrue(outdated["all_tracked_units_installed"])
+        self.assertFalse(outdated["all_tracked_units_current"])
         self.assertEqual(["mal-updater.service"], outdated["outdated_units"])
+        self.assertEqual(["mal-updater.service"], outdated["outdated_required_units"])
         self.assertFalse(outdated["unit"]["content_matches_repo"])
 
     def test_service_status_summary_format_emits_operator_lines(self) -> None:

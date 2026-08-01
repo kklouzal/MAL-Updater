@@ -69,7 +69,7 @@ from .recommendations import build_recommendations, group_recommendations, trim_
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
 from . import service_systemd_status as _service_systemd_status
-from .service_units import render_systemd_unit_template_file as _render_systemd_unit_template
+from .service_units import SERVICE_UNIT_NAME, render_systemd_unit_template_file as _render_systemd_unit_template
 from .sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
     MAPPING_REVIEW_NO_QUEUE_DECISIONS,
@@ -176,21 +176,52 @@ def _cmd_status(project_root: Path | None) -> int:
     return 0
 
 
-def _cmd_service_status(project_root: Path | None, output_format: str) -> int:
+def _service_status_strict_failures(payload: dict[str, object]) -> list[str]:
+    failures: list[str] = []
+    if payload.get("systemctl_available") is False:
+        failures.append("systemctl_unavailable")
+    if payload.get("unit_exists") is not True:
+        failures.append("main_unit_missing")
+    if payload.get("enabled") is not True:
+        failures.append("main_unit_not_enabled")
+    if payload.get("active") is not True:
+        failures.append("main_unit_not_active")
+    env_exists = payload.get("env_exists")
+    if env_exists is not True:
+        failures.append("service_env_missing")
+    elif payload.get("env_restrictive") is not True:
+        if payload.get("env_mode_octal") is None:
+            failures.append("service_env_permissions_unknown")
+        else:
+            failures.append("service_env_not_0600")
+    for key, reason in (
+        ("service_state_parse_error", "service_state_parse_error"),
+        ("health_latest_parse_error", "health_latest_parse_error"),
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            failures.append(reason)
+    return failures
+
+
+def _cmd_service_status(project_root: Path | None, output_format: str, *, strict: bool = False) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     payload = doctor_service(config)
+    strict_failures = _service_status_strict_failures(payload)
+    if strict:
+        payload = {**payload, "strict": {"ok": not strict_failures, "failures": strict_failures, "unit_name": SERVICE_UNIT_NAME}}
     if output_format == "summary":
         _emit_service_status_summary(payload)
     else:
         print(json.dumps(payload, indent=2))
-    return 0
+    return 2 if strict and strict_failures else 0
 
 
-def _cmd_install_service(project_root: Path | None, start_now: bool) -> int:
+def _cmd_install_service(project_root: Path | None, start_now: bool, *, install_dashboard: bool = False, enable_dashboard: bool = False) -> int:
     config = load_config(project_root)
     ensure_directories(config)
-    result = install_service(start_now=start_now, config=config)
+    result = install_service(start_now=start_now, config=config, install_dashboard=install_dashboard, enable_dashboard=enable_dashboard)
     print(json.dumps(result.details or {"status": result.status, "message": result.message}, indent=2))
     return 0
 
@@ -304,6 +335,12 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
         print(f"enabled_raw={payload['enabled_raw']}")
     if payload.get("active_raw"):
         print(f"active_raw={payload['active_raw']}")
+    strict_status = payload.get("strict") if isinstance(payload.get("strict"), dict) else None
+    if strict_status is not None:
+        print(f"strict_ok={bool(strict_status.get('ok'))}")
+        strict_failures = strict_status.get("failures") if isinstance(strict_status.get("failures"), list) else []
+        if strict_failures:
+            print("strict_failures=" + ", ".join(str(item) for item in strict_failures))
     print(f"env_exists={bool(payload.get('env_exists'))}")
     if payload.get("env_mode_octal") is not None:
         print(f"env_mode={payload['env_mode_octal']}")
@@ -3142,7 +3179,12 @@ def _dispatch(parser, args) -> int:
     if args.command == "status":
         return _cmd_status(args.project_root)
     if args.command == "install-service":
-        return _cmd_install_service(args.project_root, start_now=not args.no_start)
+        return _cmd_install_service(
+            args.project_root,
+            start_now=not args.no_start,
+            install_dashboard=args.install_dashboard,
+            enable_dashboard=args.enable_dashboard,
+        )
     if args.command == "uninstall-service":
         return _cmd_uninstall_service(stop_now=not args.no_stop)
     if args.command == "start-service":
@@ -3152,7 +3194,7 @@ def _dispatch(parser, args) -> int:
     if args.command == "restart-service":
         return _cmd_restart_service()
     if args.command == "service-status":
-        return _cmd_service_status(args.project_root, args.format)
+        return _cmd_service_status(args.project_root, args.format, strict=args.strict)
     if args.command == "service-run":
         return _cmd_service_run(args.project_root)
     if args.command == "service-run-once":

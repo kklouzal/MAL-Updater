@@ -14,6 +14,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="Print resolved config, runtime paths, and secret presence")
     install_service_parser = subparsers.add_parser("install-service", help="Install/update the repo-owned user systemd service for the long-lived MAL-Updater daemon")
     install_service_parser.add_argument("--no-start", action="store_true", help="Write/enable the service but do not restart it immediately")
+    install_service_parser.add_argument("--install-dashboard", action="store_true", help="Also write the optional loopback dashboard user service unit without enabling it")
+    install_service_parser.add_argument("--enable-dashboard", action="store_true", help="Also write and enable the optional loopback dashboard user service unit; does not start it")
     uninstall_service_parser = subparsers.add_parser("uninstall-service", help="Disable and remove the repo-owned user systemd service")
     uninstall_service_parser.add_argument("--no-stop", action="store_true", help="Remove/disable the service without attempting a stop first")
     subparsers.add_parser("start-service", help="Start the MAL-Updater user service")
@@ -21,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("restart-service", help="Restart the MAL-Updater user service")
     service_status = subparsers.add_parser("service-status", help="Print MAL-Updater user service health/runtime status")
     service_status.add_argument("--format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
+    service_status.add_argument("--strict", action="store_true", help="Exit non-zero when the main daemon status is not automation-ready; optional dashboard stopped/disabled state is ignored")
     subparsers.add_parser("service-run", help="Run the MAL-Updater daemon loop in the foreground")
     subparsers.add_parser("service-run-once", help="Run one MAL-Updater daemon loop pass and exit")
     exact_approved_sync_cycle = subparsers.add_parser(
