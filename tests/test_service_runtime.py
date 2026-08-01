@@ -13,7 +13,7 @@ from unittest.mock import patch
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
 from mal_updater.request_tracking import begin_api_request_context, end_api_request_context, estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, _task_execution_signature, effective_niceness_policy, run_pending_tasks, run_service_loop
+from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, _save_state, _task_execution_signature, effective_niceness_policy, run_pending_tasks, run_service_loop
 
 
 class ServiceRuntimeLeaseTests(unittest.TestCase):
@@ -2045,6 +2045,82 @@ class ServiceRuntimeSubprocessTests(unittest.TestCase):
         self.assertIn("timeout_seconds=30", log_text)
         self.assertIn("status=ok", log_text)
         self.assertNotIn("super-secret", log_text)
+
+    def test_run_subprocess_sanitizes_and_bounds_stdout_stderr_and_failure_log(self) -> None:
+        sentinel = "SENTINEL-subprocess-credential-123456789"
+        result = _run_subprocess(
+            self.config,
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    f"print('authorization: Bearer {sentinel} ' + 'x' * 12000); "
+                    f"print('password={sentinel} HTTP 401 invalid_grant', file=sys.stderr); "
+                    "raise SystemExit(7)"
+                ),
+            ],
+            label="sensitive_failure",
+        )
+
+        rendered = json.dumps(result)
+        self.assertEqual("error", result["status"])
+        self.assertEqual(7, result["returncode"])
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("<redacted>", rendered)
+        self.assertIn("HTTP 401 invalid_grant", result["stderr"])
+        self.assertLessEqual(len(result["stdout"]), 4000)
+        self.assertIn("truncated", result["stdout"])
+        log_text = self.config.service_log_path.read_text(encoding="utf-8")
+        self.assertNotIn(sentinel, log_text)
+        self.assertIn("HTTP 401 invalid_grant", log_text)
+
+    def test_run_subprocess_timeout_sanitizes_partial_streams(self) -> None:
+        sentinel = "SENTINEL-timeout-credential-123456789"
+        self.config.service.task_timeout_seconds = 1
+        result = _run_subprocess(
+            self.config,
+            [
+                sys.executable,
+                "-c",
+                f"import sys,time; print('access_token={sentinel}', flush=True); print('Bearer {sentinel}', file=sys.stderr, flush=True); time.sleep(2)",
+            ],
+            label="sensitive_timeout",
+        )
+
+        rendered = json.dumps(result)
+        self.assertEqual("subprocess_timeout", result["reason"])
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("<redacted>", rendered)
+
+    def test_save_state_persists_only_sanitized_bounded_stream_summaries(self) -> None:
+        sentinel = "SENTINEL-state-credential-123456789"
+        state = {
+            "tasks": {
+                "sensitive": {
+                    "last_status": "error",
+                    "last_error": f"HTTP 401 invalid_grant refresh_token={sentinel}",
+                    "last_result": {
+                        "status": "error",
+                        "stderr": f"password={sentinel} HTTP 401 invalid_grant " + ("x" * 12_000),
+                        "stdout": f'{{"access_token":"{sentinel}"}}',
+                        "response_text": f"secret={sentinel}",
+                    },
+                }
+            }
+        }
+
+        _save_state(self.config, state)
+        persisted = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))
+        rendered = json.dumps(persisted)
+        persisted_result = persisted["tasks"]["sensitive"]["last_result"]
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("HTTP 401 invalid_grant", rendered)
+        self.assertNotIn("stdout", persisted_result)
+        self.assertNotIn("stderr", persisted_result)
+        self.assertNotIn("response_text", persisted_result)
+        self.assertLessEqual(len(persisted_result["stderr_snippet"]), 500)
+        self.assertIn("truncated", persisted_result["stderr_snippet"])
 
     def test_run_subprocess_timeout_returns_status_reason_and_log(self) -> None:
         self.config.service.task_timeout_seconds = 1

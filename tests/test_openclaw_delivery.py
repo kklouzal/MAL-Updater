@@ -3,8 +3,10 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from unittest.mock import patch
 
 from mal_updater.cli import main as cli_main
@@ -111,6 +113,75 @@ openclaw_hook_token = "openclaw_hook_token.txt"
         self.assertIn("Delivery posture:", posted["message"])
         self.assertEqual("fresh", result.payload["structured_payload"]["delivery_mode"])
         self.assertEqual(7.0, urlopen_mock.call_args.kwargs["timeout"])
+
+    def test_delivery_result_sanitizes_url_and_bounds_response_body(self) -> None:
+        sentinel = "SENTINEL-webhook-credential-123456789"
+        self.config.openclaw.recommendations_webhook_url = (
+            f"http://user:{sentinel}@127.0.0.1:18789/hooks/agent?token={sentinel}&route=discord#private"
+        )
+        fake_sections = [{"key": "continue_next", "count": 1, "items": [{"title": "Test Show"}]}]
+        body = f'HTTP 401 invalid_grant {{"access_token":"{sentinel}"}} ' + ("x" * 5000)
+        with (
+            patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[object()]),
+            patch("mal_updater.openclaw_delivery.group_recommendations", return_value=fake_sections),
+            patch("mal_updater.openclaw_delivery.urlopen", return_value=_Response(status=200, body=body)),
+        ):
+            result = deliver_recommendations_via_openclaw(self.config, limit=10, include_dormant=False)
+
+        rendered = json.dumps(result.as_dict())
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("HTTP 401 invalid_grant", result.response_text or "")
+        self.assertLessEqual(len(result.response_text or ""), 500)
+        self.assertIn("token=%3Credacted%3E", result.request_url or "")
+        self.assertIn("route=%3Cvalue%3E", result.request_url or "")
+
+    def test_delivery_url_error_does_not_echo_credentialed_url(self) -> None:
+        sentinel = "SENTINEL-webhook-url-error-123456789"
+        self.config.openclaw.recommendations_webhook_url = f"http://user:{sentinel}@example.invalid/hook?token={sentinel}"
+        fake_sections = [{"key": "continue_next", "count": 1, "items": [{"title": "Test Show"}]}]
+        with (
+            patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[object()]),
+            patch("mal_updater.openclaw_delivery.group_recommendations", return_value=fake_sections),
+            patch(
+                "mal_updater.openclaw_delivery.urlopen",
+                side_effect=URLError(f"failed {self.config.openclaw.recommendations_webhook_url} password={sentinel}"),
+            ),
+        ):
+            with self.assertRaisesRegex(Exception, "OpenClaw recommendation webhook request failed") as raised:
+                deliver_recommendations_via_openclaw(self.config, limit=10, include_dormant=False)
+
+        rendered_traceback = "".join(
+            traceback.format_exception(type(raised.exception), raised.exception, raised.exception.__traceback__)
+        )
+        self.assertNotIn(sentinel, rendered_traceback)
+        self.assertIn("failed http://example.invalid/hook?token=%3Credacted%3E", rendered_traceback)
+        self.assertIn("password=<redacted>", rendered_traceback)
+
+    def test_delivery_http_error_sanitizes_and_bounds_error_body(self) -> None:
+        sentinel = "SENTINEL-webhook-http-error-123456789"
+        self.config.openclaw.recommendations_webhook_url = f"http://user:{sentinel}@example.invalid/hook?token={sentinel}"
+        fake_sections = [{"key": "continue_next", "count": 1, "items": [{"title": "Test Show"}]}]
+        error = HTTPError(
+            self.config.openclaw.recommendations_webhook_url,
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO((f"HTTP 401 invalid_grant refresh_token={sentinel} " + ("x" * 20_000)).encode()),
+        )
+        with (
+            patch("mal_updater.openclaw_delivery.build_recommendations", return_value=[object()]),
+            patch("mal_updater.openclaw_delivery.group_recommendations", return_value=fake_sections),
+            patch("mal_updater.openclaw_delivery.urlopen", side_effect=error),
+        ):
+            result = deliver_recommendations_via_openclaw(self.config, limit=10, include_dormant=False)
+
+        rendered = json.dumps(result.as_dict())
+        self.assertEqual("http_error", result.status)
+        self.assertEqual(401, result.http_status)
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("HTTP 401 invalid_grant", result.response_text or "")
+        self.assertLessEqual(len(result.response_text or ""), 500)
+        self.assertIn("truncated", result.response_text or "")
 
     def test_build_recommendation_delivery_payload_suppresses_recent_items_before_trimming(self) -> None:
         fake_sections = [

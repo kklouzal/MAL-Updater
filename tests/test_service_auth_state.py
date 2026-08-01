@@ -98,6 +98,37 @@ class ServiceAuthStateTests(unittest.TestCase):
         )
         self.assertIsNone(mal_bootstrap_auth_issue(service_state, min_consecutive_failures=4))
 
+    def test_auth_classification_retains_markers_but_redacts_credentials_and_account_fields(self) -> None:
+        sentinel = "SENTINEL-auth-state-credential-123456789"
+        session_path = resolve_hidive_state_paths(self.config).session_state_path
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(
+            json.dumps(
+                {
+                    "hidive_phase": "auth_failed",
+                    "last_error": f"HTTP 401 invalid_grant refresh_token={sentinel} username=user@example.invalid",
+                }
+            ),
+            encoding="utf-8",
+        )
+        service_state = {
+            "tasks": {
+                "sync_fetch_hidive": {
+                    "failure_backoff_reason": f"HTTP 401 invalid_grant access_token={sentinel}",
+                    "failure_backoff_consecutive_failures": 2,
+                }
+            }
+        }
+
+        issue = provider_service_auth_failure(service_state, provider="hidive", config=self.config)
+        self.assertIsNotNone(issue)
+        rendered = json.dumps(issue)
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn("user@example.invalid", rendered)
+        self.assertIn("HTTP 401 invalid_grant", rendered)
+        assert issue is not None
+        self.assertEqual("invalid_grant", issue["auth_failure_kind"])
+
     def test_provider_issues_preserve_service_and_session_residue_semantics(self) -> None:
         hidive_session = resolve_hidive_state_paths(self.config).session_state_path
         hidive_session.parent.mkdir(parents=True, exist_ok=True)

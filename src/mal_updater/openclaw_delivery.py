@@ -8,7 +8,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import AppConfig, load_openclaw_recommendations_hook_token
+from .redaction import sanitize_text, sanitize_url
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
+
+_RESPONSE_READ_LIMIT = 8_192
+_RESPONSE_SUMMARY_LIMIT = 500
 
 
 class OpenClawDeliveryError(RuntimeError):
@@ -29,11 +33,11 @@ class OpenClawRecommendationDeliveryResult:
     def as_dict(self) -> dict[str, object]:
         return {
             "status": self.status,
-            "request_url": self.request_url,
+            "request_url": sanitize_url(self.request_url, max_length=1_000) if self.request_url else None,
             "payload": self.payload,
             "http_status": self.http_status,
-            "response_text": self.response_text,
-            "reason": self.reason,
+            "response_text": sanitize_text(self.response_text, max_length=_RESPONSE_SUMMARY_LIMIT) if self.response_text else None,
+            "reason": sanitize_text(self.reason, max_length=500) if self.reason else None,
             "token_path": self.token_path,
             "request_id": self.request_id,
         }
@@ -56,6 +60,22 @@ _SECTION_DELIVERY_TIERS = {
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _read_bounded_response_text(response: object) -> str:
+    reader = getattr(response, "read")
+    try:
+        body = reader(_RESPONSE_READ_LIMIT + 1)
+    except TypeError:
+        # Tiny test doubles and a few compatible response wrappers expose
+        # read() without a size argument. The operator-visible result remains
+        # bounded below even when that compatibility path is needed.
+        body = reader()
+    if isinstance(body, str):
+        raw_text = body
+    else:
+        raw_text = bytes(body).decode("utf-8", errors="replace")
+    return sanitize_text(raw_text, max_length=_RESPONSE_SUMMARY_LIMIT)
 
 
 def _normalize_delivery_mode(value: str | None) -> str:
@@ -349,7 +369,7 @@ def deliver_recommendations_via_openclaw(
     if payload.get("item_count", 0) == 0:
         return OpenClawRecommendationDeliveryResult(
             status="no_recommendations",
-            request_url=request_url or None,
+            request_url=sanitize_url(request_url, max_length=1_000) if request_url else None,
             payload=payload,
             reason="no_recommendations",
             token_path=str(token_path),
@@ -385,7 +405,7 @@ def deliver_recommendations_via_openclaw(
     if dry_run:
         return OpenClawRecommendationDeliveryResult(
             status="dry_run",
-            request_url=request_url,
+            request_url=sanitize_url(request_url, max_length=1_000),
             payload=result_payload,
             token_path=str(token_path),
             request_id=request_id,
@@ -405,29 +425,30 @@ def deliver_recommendations_via_openclaw(
     timeout_seconds = max(1.0, float(config.openclaw.recommendations_webhook_timeout_seconds))
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
+            response_text = _read_bounded_response_text(response)
             status_code = getattr(response, "status", None) or response.getcode()
     except HTTPError as exc:
         try:
-            error_text = exc.read().decode("utf-8", errors="replace") if exc.fp is not None else str(exc)
+            error_text = _read_bounded_response_text(exc) if exc.fp is not None else sanitize_text(str(exc), max_length=_RESPONSE_SUMMARY_LIMIT)
         finally:
             exc.close()
         return OpenClawRecommendationDeliveryResult(
             status="http_error",
-            request_url=request_url,
+            request_url=sanitize_url(request_url, max_length=1_000),
             payload=result_payload,
             http_status=exc.code,
             response_text=error_text,
-            reason=str(exc),
+            reason=sanitize_text(str(exc), max_length=500),
             token_path=str(token_path),
             request_id=request_id,
         )
     except URLError as exc:
-        raise OpenClawDeliveryError(f"OpenClaw recommendation webhook request failed: {exc}") from exc
+        safe_reason = sanitize_text(exc, max_length=500)
+        raise OpenClawDeliveryError(f"OpenClaw recommendation webhook request failed: {safe_reason}") from None
 
     return OpenClawRecommendationDeliveryResult(
         status="delivered",
-        request_url=request_url,
+        request_url=sanitize_url(request_url, max_length=1_000),
         payload=result_payload,
         http_status=int(status_code) if status_code is not None else None,
         response_text=response_text,

@@ -235,6 +235,59 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual("hot", fetch_summary["planned_fetch_mode"])
         self.assertIn("failure_backoff_remaining_seconds", fetch_summary)
 
+    def test_doctor_service_sanitizes_contaminated_state_log_and_health(self) -> None:
+        sentinel = "SENTINEL-doctor-credential-123456789"
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "last_loop_at": "2026-03-20T21:55:00Z",
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_status": "error",
+                            "last_error": f"HTTP 401 invalid_grant access_token={sentinel}",
+                            "failure_backoff_reason": f"Bearer {sentinel} HTTP 401 invalid_grant",
+                            "last_result": {
+                                "status": "error",
+                                "request_url": f"https://user:{sentinel}@example.invalid/hook?token={sentinel}&page=2#private",
+                                "stderr": f"password={sentinel} useful failure",
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.config.service_log_path.write_text(
+            f"authorization: Bearer {sentinel} HTTP 401 invalid_grant\n" + ("x" * 5000),
+            encoding="utf-8",
+        )
+        self.config.health_latest_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.health_latest_json_path.write_text(
+            json.dumps(
+                {
+                    "healthy": False,
+                    "warning_count": 1,
+                    "warnings": [{"code": "auth_degraded", "detail": f"refresh_token={sentinel}"}],
+                    "maintenance": {
+                        "recommended_command": {"command": f"tool --api-key={sentinel}"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr=f"Basic {sentinel}")):
+            payload = doctor_service(self.config)
+
+        rendered = json.dumps(payload)
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("HTTP 401 invalid_grant", rendered)
+        self.assertIn("auth_degraded", rendered)
+        warning = payload["health_latest_summary"]["warnings"][0]
+        self.assertEqual("auth_degraded", warning["code"])
+        self.assertIn("https://example.invalid/hook?token=%3Credacted%3E&page=%3Cvalue%3E", rendered)
+        self.assertTrue(all(len(line) <= 1000 for line in payload["service_log_tail"]))
+
     def test_doctor_service_reports_running_subprocess_state(self) -> None:
         started_epoch = datetime.now(timezone.utc).timestamp() - 12
         self.config.service_state_path.write_text(

@@ -7,6 +7,7 @@ from .auth_failure_signals import AUTH_STYLE_SESSION_PHASES, auth_failure_remedi
 from .config import AppConfig
 from .crunchyroll_auth import resolve_crunchyroll_state_paths
 from .hidive_auth import resolve_hidive_state_paths
+from .redaction import sanitize_text, sanitize_value
 
 
 def load_json_dict(path: Path) -> dict[str, object] | None:
@@ -20,7 +21,9 @@ def load_json_dict(path: Path) -> dict[str, object] | None:
 
 
 def load_service_state(config: AppConfig) -> dict[str, object] | None:
-    return load_json_dict(config.service_state_path)
+    payload = load_json_dict(config.service_state_path)
+    safe = sanitize_value(payload, max_depth=10, max_items=500, max_string=2_000)
+    return safe if isinstance(safe, dict) else None
 
 
 def provider_auth_session_residue(config: AppConfig, provider: str) -> dict[str, object] | None:
@@ -41,7 +44,7 @@ def provider_auth_session_residue(config: AppConfig, provider: str) -> dict[str,
     if isinstance(phase, str) and phase in AUTH_STYLE_SESSION_PHASES:
         residue["session_phase"] = phase
     if isinstance(last_error, str) and last_error.strip():
-        residue["session_last_error"] = last_error.strip()
+        residue["session_last_error"] = sanitize_text(last_error.strip(), max_length=500)
     return residue or None
 
 
@@ -83,7 +86,7 @@ def task_service_auth_failure(
     remediation = auth_failure_remediation(auth_failure_kind)
     payload: dict[str, object] = {
         subject_key: subject_value,
-        "reason": reason.strip(),
+        "reason": sanitize_text(reason.strip(), max_length=500),
         "consecutive_failures": int(consecutive_failures),
         "auth_failure_kind": auth_failure_kind.get("kind"),
         "auth_failure_label": auth_failure_kind.get("label"),
@@ -100,7 +103,8 @@ def task_service_auth_failure(
         payload["failure_backoff_floor_seconds"] = int(task_state["failure_backoff_floor_seconds"])
     if isinstance(session_residue, dict):
         payload.update(session_residue)
-    return payload
+    safe_payload = sanitize_value(payload, max_depth=6, max_items=50, max_string=500)
+    return safe_payload if isinstance(safe_payload, dict) else None
 
 
 def provider_service_auth_failure(
@@ -178,9 +182,9 @@ def provider_bootstrap_auth_issue(
             reason = "provider session state looks auth-degraded"
 
     remediation = auth_failure_remediation(auth_failure_kind)
-    return {
+    payload = {
         "provider": provider,
-        "reason": reason,
+        "reason": sanitize_text(reason, max_length=500),
         "source": "session_state",
         "auth_failure_kind": auth_failure_kind.get("kind"),
         "auth_failure_label": auth_failure_kind.get("label"),
@@ -188,6 +192,8 @@ def provider_bootstrap_auth_issue(
         "auth_remediation_detail": remediation.get("detail"),
         **session_residue,
     }
+    safe_payload = sanitize_value(payload, max_depth=6, max_items=50, max_string=500)
+    return safe_payload if isinstance(safe_payload, dict) else None
 
 
 __all__ = [

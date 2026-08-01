@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import threading
 import uuid
 import fcntl
@@ -14,9 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .config import AppConfig, load_config
+from .redaction import sanitize_text, sanitize_url
 
 REQUEST_TASK_ENV = "MAL_UPDATER_REQUEST_TASK"
 REQUEST_RUN_ENV = "MAL_UPDATER_REQUEST_RUN_ID"
@@ -65,10 +64,6 @@ class ApiUsageSummary:
 
 _request_context: ContextVar[ApiRequestContext | None] = ContextVar("mal_updater_api_request_context", default=None)
 _append_lock = threading.Lock()
-_SENSITIVE_QUERY_KEY = re.compile(r"(?:token|secret|password|code|key|auth|credential|session|query|^q$)", re.I)
-_URL_IN_TEXT = re.compile(r"https?://[^\s]+", re.I)
-_SENSITIVE_TEXT_VALUE = re.compile(r"(?i)\b(token|secret|password|code|key|authorization|credential|session|query|q)\s*([=:])\s*([^\s,;&]+)")
-_AUTH_TEXT_VALUE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
 
 
 def begin_api_request_context(*, task: str | None, run_id: str | None = None) -> Token[ApiRequestContext | None]:
@@ -96,28 +91,14 @@ def request_context_environment(*, task: str, run_id: str) -> dict[str, str]:
 
 
 def sanitize_telemetry_url(url: str) -> str:
-    """Keep the established URL field while removing credentials and query values."""
-    try:
-        parsed = urlsplit(str(url))
-        hostname = parsed.hostname or ""
-        port = parsed.port
-        if port:
-            hostname = f"{hostname}:{port}"
-        query = urlencode([(key, "<redacted>" if _SENSITIVE_QUERY_KEY.search(key) else "<value>") for key, _ in parse_qsl(parsed.query, keep_blank_values=True)])
-        return urlunsplit((parsed.scheme, hostname, parsed.path, query, ""))
-    except ValueError:
-        # urlsplit is lazy: malformed brackets/ports can raise while accessing
-        # components or reconstructing the sanitized URL, not only at parse time.
-        return "<invalid-url>"
+    """Compatibility wrapper around the shared central URL sanitizer."""
+    return sanitize_url(url, max_length=1_000)
 
 
 def _safe_error(error: object) -> str | None:
     if error is None:
         return None
-    value = _URL_IN_TEXT.sub(lambda match: sanitize_telemetry_url(match.group(0)), str(error))
-    value = _SENSITIVE_TEXT_VALUE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", value)
-    value = _AUTH_TEXT_VALUE.sub(lambda match: f"{match.group(1)} <redacted>", value)
-    return value[:300]
+    return sanitize_text(error, max_length=300)
 
 
 def _events_path(config: AppConfig | None = None) -> Path:
@@ -231,15 +212,15 @@ def record_api_request_event(
         "schema_version": 2,
         "event_id": event_id,
         "at": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
-        "provider": provider,
-        "operation": operation,
+        "provider": sanitize_text(provider, max_length=100),
+        "operation": sanitize_text(operation, max_length=200),
         "url": sanitize_telemetry_url(url),
-        "method": method.upper(),
-        "outcome": outcome,
+        "method": sanitize_text(method.upper(), max_length=20),
+        "outcome": sanitize_text(outcome, max_length=100),
         "status_code": status_code,
         "error": _safe_error(error),
-        "task": context.task,
-        "run_id": context.run_id,
+        "task": sanitize_text(context.task, max_length=200) if context.task is not None else None,
+        "run_id": sanitize_text(context.run_id, max_length=200) if context.run_id is not None else None,
         "attempt_sequence": context.sequence,
     }
     path = _events_path(config)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,17 +124,26 @@ class RecommendMaintainTests(unittest.TestCase):
             config = self._config(Path(tmp))
             ensure_directories(config)
             calls: list[str] = []
+            sentinel = "SENTINEL-maintenance-credential-123456789"
 
             def fake_run(_config: AppConfig, _args: list[str], *, label: str) -> dict[str, object]:
                 calls.append(label)
                 if label == "maintain_recommend_provider_eligibility":
-                    return {"status": "error", "label": label, "returncode": 4, "stderr": "boom", "stdout": ""}
+                    return {
+                        "status": "error",
+                        "label": label,
+                        "returncode": 4,
+                        "stderr": f"HTTP 401 invalid_grant password={sentinel}",
+                        "stdout": f'access_token={sentinel}',
+                    }
                 return {"status": "ok", "label": label, "returncode": 0, "stderr": "", "stdout": "{}"}
 
             with patch("mal_updater.service_runtime._available_source_providers", return_value=[]), patch(
                 "mal_updater.service_runtime._run_subprocess", side_effect=fake_run
             ):
                 result = run_maintenance_cycle(config, dry_run=False)
+
+            persisted = json.loads(config.service_state_path.read_text(encoding="utf-8"))
 
         self.assertEqual(
             calls,
@@ -148,6 +158,10 @@ class RecommendMaintainTests(unittest.TestCase):
         self.assertEqual(result["status"], "partial_error")
         self.assertEqual(len(result["failures"]), 1)
         self.assertEqual(result["failures"][0]["label"], "maintain_recommend_provider_eligibility")
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertNotIn(sentinel, json.dumps(persisted))
+        self.assertIn("HTTP 401 invalid_grant", result["failures"][0]["reason"])
+        self.assertNotIn("stderr", persisted["tasks"]["recommend_maintain"]["last_errors"][0])
 
     def test_daemon_local_only_plan_has_no_network_children(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

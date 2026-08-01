@@ -28,6 +28,10 @@ class RequestTrackingTests(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         (self.root / ".MAL-Updater" / "config").mkdir(parents=True)
         self.config = load_config(self.root)
+        # Test invocations intentionally provide a unique runtime root.  Keep
+        # individual cases isolated within it so process-safe append tests do
+        # not share telemetry with earlier cases in this module.
+        self.config.state_dir = self.root / ".MAL-Updater" / "state"
         ensure_directories(self.config)
 
     def _events(self) -> list[dict]:
@@ -60,6 +64,25 @@ class RequestTrackingTests(unittest.TestCase):
         for secret in ("Private Title", "PrivateTitle", "public-key", "token-value", "hunter2", "user:pass"):
             self.assertNotIn(secret, serialized)
         self.assertIn("q=%3Credacted%3E", first["url"])
+
+    def test_shared_sanitizer_preserves_request_markers_and_removes_sentinels(self) -> None:
+        sentinel = "SENTINEL-request-credential-123456789"
+        record_api_request_event(
+            "mal",
+            "refresh",
+            url=f"https://user:{sentinel}@example.invalid/token?access_token={sentinel}&page=9#private",
+            method="POST",
+            outcome="request_error",
+            status_code=401,
+            error=f'HTTP 401 invalid_grant {{"refresh_token":"{sentinel}"}} Basic {sentinel}',
+            config=self.config,
+        )
+        event = self._events()[0]
+        rendered = json.dumps(event)
+        self.assertNotIn(sentinel, rendered)
+        self.assertIn("HTTP 401 invalid_grant", event["error"])
+        self.assertIn("access_token=%3Credacted%3E", event["url"])
+        self.assertIn("page=%3Cvalue%3E", event["url"])
 
     def test_run_boundary_counts_only_matching_attributed_attempts_during_overlap(self) -> None:
         boundary = capture_api_event_boundary(config=self.config)

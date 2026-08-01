@@ -8,6 +8,7 @@ import subprocess
 from typing import Any
 
 from .config import AppConfig, ensure_directories, load_config
+from .redaction import sanitize_text, sanitize_url, sanitize_value
 from .service_runtime import TaskSpec, _planned_fetch_mode, effective_niceness_policy
 from .service_systemd_status import build_service_status_payload
 from .service_units import SERVICE_UNIT_NAME, render_repo_systemd_unit_template
@@ -42,7 +43,7 @@ def _read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        return None, sanitize_text(f"{type(exc).__name__}: {exc}", max_length=500)
     if not isinstance(payload, dict):
         return None, f"Expected top-level object in {path.name}"
     return payload, None
@@ -57,7 +58,7 @@ def _tail_lines(path: Path, *, limit: int = _RECENT_LOG_LINES) -> list[str]:
         return []
     if limit <= 0:
         return []
-    return lines[-limit:]
+    return [sanitize_text(line, max_length=1_000) for line in lines[-limit:]]
 
 
 def _snippet(value: object, *, limit: int = _RESULT_SNIPPET_LIMIT) -> str | None:
@@ -66,9 +67,7 @@ def _snippet(value: object, *, limit: int = _RESULT_SNIPPET_LIMIT) -> str | None
     trimmed = value.strip()
     if not trimmed:
         return None
-    if len(trimmed) <= limit:
-        return trimmed
-    return trimmed[: limit - 3] + "..."
+    return sanitize_text(trimmed, max_length=limit)
 
 
 def _parse_iso_timestamp(value: object) -> datetime | None:
@@ -104,14 +103,70 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
     ):
         field_value = value.get(field)
         if field_value is not None:
-            summary[field] = field_value
-    stdout_snippet = _snippet(value.get("stdout"))
-    stderr_snippet = _snippet(value.get("stderr"))
+            if field == "request_url" and isinstance(field_value, str):
+                summary[field] = sanitize_url(field_value, max_length=1_000)
+            else:
+                summary[field] = sanitize_value(field_value, max_depth=3, max_items=25, max_string=500)
+    stdout_snippet = _snippet(value.get("stdout_snippet") or value.get("stdout"))
+    stderr_snippet = _snippet(value.get("stderr_snippet") or value.get("stderr"))
     if stdout_snippet is not None:
         summary["stdout_snippet"] = stdout_snippet
     if stderr_snippet is not None:
         summary["stderr_snippet"] = stderr_snippet
     return summary or None
+
+
+def _shape_health_diagnostic_fields(value: object) -> object:
+    """Give trusted health diagnostic markers an explicit non-secret name."""
+
+    if not isinstance(value, dict):
+        return value
+    shaped = dict(value)
+    warnings = shaped.get("warnings")
+    if isinstance(warnings, list):
+        shaped_warnings: list[object] = []
+        for warning in warnings:
+            if not isinstance(warning, dict):
+                shaped_warnings.append(warning)
+                continue
+            shaped_warning = dict(warning)
+            if "code" in shaped_warning:
+                shaped_warning["reason_code"] = shaped_warning.pop("code")
+            diagnostics = shaped_warning.get("diagnostics")
+            if isinstance(diagnostics, list):
+                shaped_warning["diagnostics"] = [
+                    {"reason_code": diagnostic.get("code"), **{key: item for key, item in diagnostic.items() if key != "code"}}
+                    if isinstance(diagnostic, dict) and "code" in diagnostic
+                    else diagnostic
+                    for diagnostic in diagnostics
+                ]
+            shaped_warnings.append(shaped_warning)
+        shaped["warnings"] = shaped_warnings
+    return shaped
+
+
+def _restore_health_diagnostic_fields(value: object) -> None:
+    """Restore the established health-report shape after sanitization."""
+
+    if not isinstance(value, dict):
+        return
+    health = value.get("health_latest_summary")
+    if not isinstance(health, dict):
+        return
+    warnings = health.get("warnings")
+    if not isinstance(warnings, list):
+        return
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            continue
+        if "reason_code" in warning:
+            warning["code"] = warning.pop("reason_code")
+        diagnostics = warning.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            continue
+        for diagnostic in diagnostics:
+            if isinstance(diagnostic, dict) and "reason_code" in diagnostic:
+                diagnostic["code"] = diagnostic.pop("reason_code")
 
 
 def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state: dict[str, Any]) -> dict[str, Any]:
@@ -246,7 +301,10 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
     ):
         field_value = value.get(field)
         if field_value is not None:
-            summary[field] = field_value
+            if field == "request_url" and isinstance(field_value, str):
+                summary[field] = sanitize_url(field_value, max_length=1_000)
+            else:
+                summary[field] = sanitize_value(field_value, max_depth=3, max_items=25, max_string=500)
     if isinstance(value.get("last_run_epoch"), (int, float)):
         summary["last_run_epoch"] = value["last_run_epoch"]
     if isinstance(value.get("every_seconds"), int):
@@ -330,12 +388,14 @@ def daemon_reload() -> None:
 
 
 def service_status() -> dict[str, Any]:
-    return build_service_status_payload(
+    payload = build_service_status_payload(
         unit_name=SERVICE_NAME,
         unit_path=_unit_path(),
         env_path=_service_env_path(),
         runner=_run,
     )
+    safe = sanitize_value(payload, max_depth=6, max_items=100, max_string=1_000)
+    return safe if isinstance(safe, dict) else {}
 
 
 def install_service(*, start_now: bool = True, config: AppConfig | None = None) -> ServiceCommandResult:
@@ -406,9 +466,16 @@ def doctor_service(config: AppConfig | None = None) -> dict[str, Any]:
         "health_latest_json_path": str(config.health_latest_json_path),
         "health_latest_exists": config.health_latest_json_path.exists(),
         "health_latest_parse_error": recent_health_error,
-        "health_latest_summary": recent_health,
+        "health_latest_summary": sanitize_value(
+            _shape_health_diagnostic_fields(recent_health),
+            max_depth=8,
+            max_items=100,
+            max_string=1_000,
+        ),
         "niceness_policy": effective_niceness_policy(config),
     }
     if isinstance(service_state, dict) and isinstance(service_state.get("api_usage"), dict):
-        payload["api_usage"] = service_state["api_usage"]
-    return payload
+        payload["api_usage"] = sanitize_value(service_state["api_usage"], max_depth=5, max_items=100, max_string=500)
+    safe_payload = sanitize_value(payload, max_depth=10, max_items=200, max_string=1_000)
+    _restore_health_diagnostic_fields(safe_payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}

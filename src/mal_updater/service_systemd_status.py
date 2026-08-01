@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 from typing import Any, Callable
 
+from .redaction import sanitize_text, sanitize_value
 from .service_units import SERVICE_UNIT_NAME, render_systemd_unit_template_file
 
 SYSTEMD_USER_UNIT_RUNTIME_PROPERTIES = (
@@ -67,10 +68,10 @@ def run_systemctl_status_probe(
 
 def systemctl_status_probe_output(result: subprocess.CompletedProcess[str] | None, error: str | None) -> str:
     if error:
-        return error
+        return sanitize_text(error, max_length=1_000)
     if result is None:
         return ""
-    return (result.stdout or "").strip() or (result.stderr or "").strip()
+    return sanitize_text((result.stdout or "").strip() or (result.stderr or "").strip(), max_length=1_000)
 
 
 def build_service_status_payload(
@@ -102,7 +103,8 @@ def build_service_status_payload(
     if systemctl_errors:
         payload["systemctl_errors"] = systemctl_errors
         payload["systemctl_error"] = "; ".join(f"{name}: {error}" for name, error in systemctl_errors.items())
-    return payload
+    safe = sanitize_value(payload, max_depth=5, max_items=100, max_string=1_000)
+    return safe if isinstance(safe, dict) else {}
 
 
 def read_systemd_user_unit_runtime(
@@ -121,7 +123,8 @@ def read_systemd_user_unit_runtime(
         unit_payload = payload.get(unit_name) if unit_name in payload else payload
         if not isinstance(unit_payload, dict):
             return {"available": False, "error": f"runtime state override for {unit_name} must be an object"}
-        return dict(unit_payload)
+        safe = sanitize_value(unit_payload, max_depth=5, max_items=100, max_string=1_000)
+        return safe if isinstance(safe, dict) else {"available": False, "error": "runtime state override is invalid"}
 
     systemctl_runner = runner or subprocess.run
     try:
@@ -139,14 +142,14 @@ def read_systemd_user_unit_runtime(
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"available": False, "error": str(exc)}
+        return {"available": False, "error": sanitize_text(exc, max_length=1_000)}
 
     if result.returncode != 0:
         error = (result.stderr or result.stdout or f"systemctl exited with code {result.returncode}").strip()
-        return {"available": False, "error": error}
+        return {"available": False, "error": sanitize_text(error, max_length=1_000)}
 
     runtime = parse_systemctl_show_properties(result.stdout, SYSTEMD_USER_UNIT_RUNTIME_PROPERTIES)
-    return {
+    payload = {
         "available": True,
         "active_state": runtime.get("ActiveState") or None,
         "sub_state": runtime.get("SubState") or None,
@@ -155,6 +158,8 @@ def read_systemd_user_unit_runtime(
         "last_trigger_at": format_systemd_usec_timestamp(runtime.get("LastTriggerUSec") or ""),
         "result": runtime.get("Result") or None,
     }
+    safe = sanitize_value(payload, max_depth=5, max_items=100, max_string=1_000)
+    return safe if isinstance(safe, dict) else {"available": False, "error": "runtime state is invalid"}
 
 
 def parse_systemctl_show_properties(output: str, properties: tuple[str, ...] = SYSTEMD_USER_UNIT_RUNTIME_PROPERTIES) -> dict[str, str]:
@@ -205,7 +210,7 @@ def build_automation_installation_status(
             active = normalize_systemd_active_state(runtime_state.get("active_state"))
         else:
             runtime_state_error = str(runtime_state.get("error") or "runtime state unavailable")
-    return {
+    payload = {
         "available": True,
         "source_dir": str(source_dir),
         "install_script_path": str(script_path),
@@ -232,6 +237,8 @@ def build_automation_installation_status(
         "disabled_services": [] if (enabled is None or enabled) else [unit_name],
         "inactive_services": [] if (active is None or active) else [unit_name],
     }
+    safe = sanitize_value(payload, max_depth=7, max_items=100, max_string=1_000)
+    return safe if isinstance(safe, dict) else None
 
 
 def _run_status_command(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:

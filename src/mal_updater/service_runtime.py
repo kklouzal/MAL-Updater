@@ -6,7 +6,6 @@ import fcntl
 import json
 import math
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -28,6 +27,7 @@ from .crunchyroll_auth import load_crunchyroll_credentials
 from .hidive_auth import load_hidive_credentials
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
+from .redaction import sanitize_command, sanitize_text, sanitize_url, sanitize_value
 from .request_tracking import (
     begin_api_request_context,
     capture_api_event_boundary,
@@ -77,12 +77,21 @@ def _iso_after_seconds(seconds: int) -> str:
 def _load_state(config: AppConfig) -> dict[str, Any]:
     if not config.service_state_path.exists():
         return {"started_at": _now_iso(), "tasks": {}}
-    return json.loads(config.service_state_path.read_text(encoding="utf-8"))
+    payload = json.loads(config.service_state_path.read_text(encoding="utf-8"))
+    safe = sanitize_value(payload, max_depth=12, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
+    return safe if isinstance(safe, dict) else payload
 
 
 def _save_state(config: AppConfig, state: dict[str, Any]) -> None:
     temp_path = config.service_state_path.with_suffix(f"{config.service_state_path.suffix}.{os.getpid()}.tmp")
-    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    safe_state = sanitize_value(state, max_depth=12, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
+    if isinstance(safe_state, dict):
+        safe_tasks = safe_state.get("tasks")
+        if isinstance(safe_tasks, dict):
+            for safe_task_state in safe_tasks.values():
+                if isinstance(safe_task_state, dict) and isinstance(safe_task_state.get("last_result"), dict):
+                    safe_task_state["last_result"] = _persistable_task_result(safe_task_state["last_result"])
+    temp_path.write_text(json.dumps(safe_state, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(temp_path, config.service_state_path)
 
 
@@ -91,7 +100,10 @@ def _read_json_dict(path: Any) -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    safe = sanitize_value(payload, max_depth=8, max_items=100, max_string=1_000)
+    return safe if isinstance(safe, dict) else {}
 
 
 class _ProcessLease:
@@ -108,9 +120,12 @@ class _ProcessLease:
 
     def _write_status(self, payload: dict[str, Any]) -> None:
         temp_path = self.status_path.with_suffix(f".json.{os.getpid()}.{self.run_id}.tmp")
-        temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        safe_payload = sanitize_value(payload, max_depth=8, max_items=100, max_string=1_000)
+        if not isinstance(safe_payload, dict):
+            safe_payload = {}
+        temp_path.write_text(json.dumps(safe_payload, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(temp_path, self.status_path)
-        self.status = payload
+        self.status = safe_payload
 
     def try_acquire(self, *, phase: str) -> bool:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +206,7 @@ def _set_task_next_due(task_state: dict[str, Any], *, base_epoch: float, every_s
 
 def _append_log(config: AppConfig, message: str) -> None:
     with config.service_log_path.open("a", encoding="utf-8") as fh:
-        fh.write(f"[{_now_iso()}] {message}\n")
+        fh.write(f"[{_now_iso()}] {sanitize_text(message, max_length=2_000)}\n")
 
 
 def _mark_task_decision(task_state: dict[str, Any], *, decision_at: str | None = None) -> None:
@@ -349,31 +364,65 @@ def _finalize_run_request_delta(
     return payload
 
 
-_SENSITIVE_ARG_NAMES = {"--token", "--access-token", "--refresh-token", "--client-secret", "--password", "--secret"}
-_SENSITIVE_ARG_PREFIXES = ("token=", "access_token=", "refresh_token=", "client_secret=", "password=", "secret=")
+_SUBPROCESS_STREAM_LIMIT = 4_000
+_MAINTENANCE_RESULT_LIMIT = 50
+_SUBPROCESS_JSON_RESULT_FIELDS = {
+    "cache_hits",
+    "cache_misses",
+    "candidates_considered",
+    "considered",
+    "discovery_considered",
+    "discovery_refreshed",
+    "eligibility_expired_retries",
+    "eligibility_fresh_skips",
+    "failed",
+    "harvested",
+    "provider_detail_probes",
+    "provider_searches",
+    "queries_selected",
+    "refreshed",
+    "seed_count",
+    "skipped_fresh",
+    "total_edges",
+}
 
 
 def _redacted_command(args: list[str]) -> str:
-    redacted: list[str] = []
-    redact_next = False
-    for arg in args:
-        if redact_next:
-            redacted.append("<redacted>")
-            redact_next = False
-            continue
-        lowered = arg.lower()
-        if lowered in _SENSITIVE_ARG_NAMES:
-            redacted.append(arg)
-            redact_next = True
-        elif any(lowered.startswith(prefix) for prefix in _SENSITIVE_ARG_PREFIXES):
-            name = arg.split("=", 1)[0]
-            redacted.append(f"{name}=<redacted>")
-        elif any(lowered.startswith(f"{name}=") for name in _SENSITIVE_ARG_NAMES):
-            name = arg.split("=", 1)[0]
-            redacted.append(f"{name}=<redacted>")
-        else:
-            redacted.append(arg)
-    return shlex.join(redacted)
+    return sanitize_command(args, max_length=2_000)
+
+
+def _subprocess_stream(value: object) -> str:
+    return sanitize_text(value or "", max_length=_SUBPROCESS_STREAM_LIMIT)
+
+
+def _persistable_task_result(result: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        key: value
+        for key, value in result.items()
+        if key not in {"stdout", "stderr", "response_text", "payload", "hook_request"}
+    }
+    for stream_name in ("stdout", "stderr"):
+        value = result.get(stream_name)
+        if isinstance(value, str) and value.strip():
+            summary[f"{stream_name}_snippet"] = sanitize_text(value.strip(), max_length=500)
+    safe = sanitize_value(summary, max_depth=6, max_items=100, max_string=1_000)
+    return safe if isinstance(safe, dict) else {}
+
+
+def _project_subprocess_json_stdout(stdout: object) -> dict[str, Any]:
+    if not isinstance(stdout, str) or not stdout.strip():
+        return {}
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        key: max(0, int(value))
+        for key in _SUBPROCESS_JSON_RESULT_FIELDS
+        if isinstance((value := payload.get(key)), int) and not isinstance(value, bool)
+    }
 
 
 def _run_subprocess(config: AppConfig, args: list[str], *, label: str, run_id: str | None = None) -> dict[str, Any]:
@@ -419,10 +468,10 @@ def _run_subprocess(config: AppConfig, args: list[str], *, label: str, run_id: s
             stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
             payload = {
                 "status": "error",
-                "label": label,
+                "label": sanitize_text(label, max_length=200),
                 "returncode": None,
-                "stdout": stdout,
-                "stderr": stderr,
+                "stdout": _subprocess_stream(stdout),
+                "stderr": _subprocess_stream(stderr),
                 "timed_out": True,
                 "timeout_seconds": timeout_seconds,
                 "duration_seconds": duration_seconds,
@@ -437,21 +486,24 @@ def _run_subprocess(config: AppConfig, args: list[str], *, label: str, run_id: s
     status = "ok" if result.returncode == 0 else "error"
     payload = {
         "status": status,
-        "label": label,
+        "label": sanitize_text(label, max_length=200),
         "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": _subprocess_stream(result.stdout),
+        "stderr": _subprocess_stream(result.stderr),
         "timed_out": False,
         "timeout_seconds": timeout_seconds,
         "duration_seconds": duration_seconds,
         "command": command,
     }
+    # Parse the complete in-memory child JSON before bounding stdout, but only
+    # retain the small operational counter projection used by scheduler lanes.
+    payload.update(_project_subprocess_json_stdout(result.stdout))
     if result.returncode == 0:
         _append_log(config, f"task={label} status=ok returncode=0 duration_seconds={duration_seconds} command={command}")
     else:
-        detail = (result.stderr.strip() or result.stdout.strip()).splitlines()[0:1]
+        detail = (payload["stderr"].strip() or payload["stdout"].strip()).splitlines()[0:1]
         detail_text = detail[0] if detail else ""
-        _append_log(config, f"task={label} status=error returncode={result.returncode} duration_seconds={duration_seconds} command={command} stderr={detail_text}")
+        _append_log(config, f"task={sanitize_text(label, max_length=200)} status=error returncode={result.returncode} duration_seconds={duration_seconds} command={command} detail={detail_text}")
     return payload
 
 
@@ -886,9 +938,15 @@ def _run_maintenance_cycle_unlocked(
         command_args = list(step["args"])
         _mark_task_running(config, state, "recommend_maintain", command_args)
         result = _run_subprocess(config, command_args, label=str(step["label"]))
-        results.append(result)
+        bounded_result = sanitize_value(result, max_depth=5, max_items=50, max_string=_SUBPROCESS_STREAM_LIMIT)
+        if isinstance(bounded_result, dict):
+            results.append(bounded_result)
         if result.get("status") != "ok":
-            failures.append({"label": step["label"], "returncode": result.get("returncode"), "stderr": result.get("stderr")})
+            failures.append({
+                "label": sanitize_text(step["label"], max_length=200),
+                "returncode": result.get("returncode"),
+                "reason": _summarize_task_failure(result) or "subprocess_error",
+            })
 
     finished_epoch = time.time()
     finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -899,12 +957,17 @@ def _run_maintenance_cycle_unlocked(
     if int(config.service.recommend_maintain_every_seconds) > 0:
         _set_task_next_due(task_state, base_epoch=finished_epoch, every_seconds=config.service.recommend_maintain_every_seconds)
     if failures:
-        task_state["last_errors"] = failures
+        task_state["last_errors"] = failures[-_MAINTENANCE_RESULT_LIMIT:]
     else:
         task_state.pop("last_errors", None)
     state["last_maintenance_cycle_at"] = finished_at
     _save_state(config, state)
-    return {"status": status, "results": results, "failures": failures, "state_file": str(config.service_state_path)}
+    return {
+        "status": status,
+        "results": results[-_MAINTENANCE_RESULT_LIMIT:],
+        "failures": failures[-_MAINTENANCE_RESULT_LIMIT:],
+        "state_file": str(config.service_state_path),
+    }
 
 
 def run_maintenance_cycle(config: AppConfig, **kwargs: Any) -> dict[str, Any]:
@@ -1199,7 +1262,7 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
             "delivery_limit": delivery_limit,
             "delivery_mode": delivery_mode,
             "request_id": request_id,
-            "request_url": preview.request_url,
+            "request_url": sanitize_url(preview.request_url) if preview.request_url else None,
             "suppressed_recent_item_count": len(suppressed_fingerprints),
             "repeat_cooldown_days": 90,
         }
@@ -1211,7 +1274,7 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
             "delivery_limit": delivery_limit,
             "delivery_mode": delivery_mode,
             "request_id": request_id,
-            "request_url": preview.request_url,
+            "request_url": sanitize_url(preview.request_url) if preview.request_url else None,
             "suppressed_recent_item_count": len(suppressed_fingerprints),
             "repeat_cooldown_days": 90,
         }
@@ -1230,15 +1293,13 @@ def _push_recommendations_webhook_task(config: AppConfig, task_state: dict[str, 
         "delivery_limit": delivery_limit,
         "delivery_mode": delivery_mode,
         "request_id": delivery.request_id,
-        "request_url": delivery.request_url,
+        "request_url": sanitize_url(delivery.request_url) if delivery.request_url else None,
         "http_status": delivery.http_status,
         "suppressed_recent_item_count": len(suppressed_fingerprints),
         "repeat_cooldown_days": 90,
     }
     if delivery.reason is not None:
-        result["reason"] = delivery.reason
-    if delivery.response_text is not None:
-        result["response_text"] = delivery.response_text
+        result["reason"] = sanitize_text(delivery.reason, max_length=500)
     if delivery.status == "delivered" and delivery.request_id:
         task_state["last_delivery_request_id"] = delivery.request_id
         task_state["last_delivery_http_status"] = delivery.http_status
@@ -1694,6 +1755,7 @@ def _set_failure_backoff(
     cooldown_seconds, failure_class, floor_seconds = _failure_backoff_seconds(config, spec, task_state, reason=reason)
     consecutive_failures = int(task_state.get("failure_backoff_consecutive_failures", 0)) + 1
     task_state["failure_backoff_consecutive_failures"] = consecutive_failures
+    reason = sanitize_text(reason, max_length=500)
     task_state["failure_backoff_reason"] = reason
     task_state["failure_backoff_class"] = failure_class
     task_state["failure_backoff_floor_seconds"] = floor_seconds
@@ -1713,13 +1775,13 @@ def _set_failure_backoff(
 def _summarize_task_failure(result: dict[str, Any]) -> str | None:
     reason = result.get("reason")
     if isinstance(reason, str) and reason.strip():
-        return reason.strip()
+        return sanitize_text(reason.strip(), max_length=500)
     stderr = result.get("stderr")
     if isinstance(stderr, str) and stderr.strip():
-        return stderr.strip().splitlines()[0]
+        return sanitize_text(stderr.strip().splitlines()[0], max_length=500)
     stdout = result.get("stdout")
     if isinstance(stdout, str) and stdout.strip():
-        return stdout.strip().splitlines()[0]
+        return sanitize_text(stdout.strip().splitlines()[0], max_length=500)
     return None
 
 
@@ -2048,7 +2110,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                     result = {
                         "status": "error",
                         "label": "push_recommendations_webhook",
-                        "reason": str(exc),
+                        "reason": sanitize_text(exc, max_length=500),
                     }
                 result["delivery_limit"] = _recommendations_webhook_push_limit(config)
             elif spec.name == "health":
@@ -2068,7 +2130,8 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                         fetch_mode=planned_fetch_mode, finished_at=finished_at,
                     )
                 )
-            task_state.update({"last_status": task_status, "last_result": result})
+            persisted_result = _persistable_task_result(result)
+            task_state.update({"last_status": task_status, "last_result": persisted_result})
             if task_succeeded or task_status == "error":
                 task_state.update({"last_run_epoch": now, "last_run_at": finished_at})
             task_state["execution_state"] = "idle"
@@ -2134,7 +2197,8 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             # Failed/ambiguous attempts are still present in telemetry, but do
             # not teach the scheduler a new success projection.
             failed_request_delta: dict[str, Any] = {}
-            task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": "error", "last_error": f"{type(exc).__name__}: {exc}"})
+            exception_reason = sanitize_text(f"{type(exc).__name__}: {exc}", max_length=500)
+            task_state.update({"last_run_epoch": now, "last_run_at": finished_at, "last_status": "error", "last_error": exception_reason})
             _clear_task_running(task_state)
             _record_task_timing(task_state, started_epoch=started_epoch, finished_epoch=finished_epoch, started_at=started_at, finished_at=finished_at)
             task_state.pop("last_skip_reason", None)
@@ -2145,16 +2209,16 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             task_state.pop("budget_backoff_remaining_seconds", None)
             task_state.pop("budget_backoff_floor_seconds", None)
             task_state.pop("budget_backoff_cooldown_source", None)
-            failure_backoff = _set_failure_backoff(config, spec, task_state, now=now, reason=f"{type(exc).__name__}: {exc}")
+            failure_backoff = _set_failure_backoff(config, spec, task_state, now=now, reason=exception_reason)
             _set_task_next_due(
                 task_state,
                 base_epoch=now,
                 every_seconds=int(failure_backoff["failure_backoff_remaining_seconds"]),
             )
-            results.append({"task": spec.name, "status": "error", "error": f"{type(exc).__name__}: {exc}", **failed_request_delta, **failure_backoff})
+            results.append({"task": spec.name, "status": "error", "error": exception_reason, **failed_request_delta, **failure_backoff})
             _append_log(
                 config,
-                f"task={spec.name} status=error error={type(exc).__name__}: {exc} failure_backoff={failure_backoff['failure_backoff_remaining_seconds']}s",
+                f"task={spec.name} status=error error={exception_reason} failure_backoff={failure_backoff['failure_backoff_remaining_seconds']}s",
             )
         finally:
             end_api_request_context(request_context_token)
@@ -2166,7 +2230,9 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
         for provider in sorted(tracked_providers)
     }
     _save_state(config, state)
-    return {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}
+    payload = {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}
+    safe_payload = sanitize_value(payload, max_depth=10, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
+    return safe_payload if isinstance(safe_payload, dict) else {"status": "error", "reason": "result_sanitization_failed"}
 
 
 def run_pending_tasks(config: AppConfig | None = None) -> dict[str, Any]:
