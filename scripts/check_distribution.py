@@ -8,7 +8,11 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 
-EXPECTED_ENTRY_POINT = "mal-updater = mal_updater.cli:main"
+EXPECTED_ENTRY_POINTS = {
+    "mal-updater = mal_updater.cli:main",
+    "mal-updater-container = mal_updater.container_runtime:main",
+    "mal-updater-tools = mal_updater.container_lifecycle:main",
+}
 EXPECTED_METADATA_FIELDS = {
     "License-Expression": "MIT",
     "License-File": "LICENSE",
@@ -127,8 +131,9 @@ def _check_wheel(wheel_path: Path, expected_sql_bytes: dict[str, bytes]) -> None
         if len(entry_point_files) != 1:
             _die(f"expected exactly one wheel entry_points.txt, found {len(entry_point_files)}")
         entry_points = wheel.read(entry_point_files[0]).decode("utf-8")
-        if EXPECTED_ENTRY_POINT not in entry_points:
-            _die(f"missing console script entry point {EXPECTED_ENTRY_POINT!r} in wheel")
+        for expected in EXPECTED_ENTRY_POINTS:
+            if expected not in entry_points:
+                _die(f"missing console script entry point {expected!r} in wheel")
         metadata_files = [name for name in names if name.endswith(".dist-info/METADATA")]
         if len(metadata_files) != 1:
             _die(f"expected exactly one wheel METADATA, found {len(metadata_files)}")
@@ -211,7 +216,7 @@ def check_distribution(repo_root: Path, dist_dir: Path) -> int:
     print(f"source migration parity: {sql_count} SQL files")
     print(f"wheel migrations: {wheel_path.name}: {sql_count} SQL files")
     print(f"sdist package/root migrations: {sdist_path.name}: {sql_count} SQL files each")
-    print("wheel entry point: mal-updater -> mal_updater.cli:main")
+    print("wheel entry points: mal-updater, mal-updater-container, mal-updater-tools")
     print("package metadata: MIT license expression/file, project URLs, classifiers, and keywords")
     return 0
 

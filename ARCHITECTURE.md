@@ -10,6 +10,7 @@ MAL-Updater is a **skill-first repository**:
 - `scripts/` contains deterministic wrappers/install helpers
 - `ops/systemd-user/` contains portable systemd templates
 - `tests/` remains bundled for auditability
+- `Dockerfile` and `compose.yaml` package one container product with dashboard and optional daemon components; see `references/CONTAINERS.md`
 
 ## Runtime boundary
 
@@ -36,7 +37,7 @@ Use the repo-local Python CLI for business logic and operator workflows.
 
 ### Daemon
 
-The unattended model is a **long-lived user-level systemd daemon**.
+Native installs use a **long-lived user-level systemd daemon**. The container product uses a small Python supervisor and `tini` to run the same daemon beside the dashboard only after explicit enablement; it defaults to inert setup mode.
 
 The installed unit runs:
 
@@ -85,3 +86,7 @@ A new OpenClaw instance should be able to:
 - preserve full-repo auditability for third parties
 - prefer the daemon-first runtime model over ad-hoc timers or OpenClaw cron
 - because this repo is public, keep all tracked artifacts anonymized: no personal identities, personal emails, host-specific absolute paths, private workspace references, real account identifiers, or real secrets in code/references/tests/history
+
+### Container control plane security
+
+The container HTTP control plane (`container_runtime.py` + `container_web.py`) defaults to deny: only liveness/readiness and first-run claim are unauthenticated. It uses scrypt password hashes, server-side ephemeral sessions, synchronizer CSRF tokens, write-only atomic credential files, allowlisted settings, and a persisted daemon-enable gate. The scheduler is not started until required MAL setup is complete and an authenticated administrator explicitly enables it. See `references/CONTAINERS.md` for threat model and recovery.

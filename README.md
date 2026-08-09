@@ -1,266 +1,77 @@
 # MAL-Updater
 
-MAL-Updater is a **skill-first** OpenClaw repository for conservative **multi-provider anime → MyAnimeList sync and recommendations**, with mapping review, guarded apply runs, and unattended maintenance. Current source providers: **Crunchyroll** and **HIDIVE**.
+Container-first private LAN control plane for conservative provider-to-MyAnimeList sync and recommendations.
 
-Cache niceness policy: recommendation maintenance explicitly skips fresh rows using deterministic hot/warm/cold horizons (watching/current 3 days, mapped/planned/on-hold 14 days, completed/older 90 days), while missing/failed/stale harvests and stubs remain retry-eligible. The official MAL anime-detail `recommendations` field is retained only as a paced metadata/detail top-10 fallback; the separate cold path `recommend-refresh-full-userrecs` harvests complete aggregate public MAL `/anime/<id>/<slug>/userrecs` pairs for cached MAL list positives (`completed`, `watching`, `on_hold`) with a 45-day default full-harvest horizon. That public harvest stores only target MAL id/title and aggregate recommender count, not recommendation prose or usernames; page data is staged non-authoritatively across bounded per-run page budgets, and only a terminal coherent generation atomically replaces existing edges, so pause/failure/drift preserves the published graph. MAL search is keyed by normalized query, limit, fields, and logic version (14-day positive / 3-day negative defaults). Complete MAL details may satisfy narrower reads; incomplete/corrupt rows never satisfy sync. Provider title search stays 365 days but is versioned and keyed by provider/query/limit/MAL identity. Crunchyroll enriched series/audio/child-season evidence defaults to 30 days; HIDIVE account auth/history/Continue Watching/favourites/custom-list snapshots are supported, while HIDIVE recommendation enrichment/title lookup remains bounded search-only and full refresh stays manual/non-chunked.
-
-Within TTL, request savings are `(repeated MAL searches - unique search keys) + field-covered repeat MAL details + (repeated provider searches - unique provider keys) + repeat Crunchyroll detail/season probes`; force refresh, expiry, corruption, or logic-version changes intentionally reduce savings.
-
-This repository is the skill package.
-
-## Repository contract
-
-- `SKILL.md` at the repo root is the canonical skill entrypoint.
-- The Python CLI under `src/mal_updater/` contains the real business logic.
-- Runtime state lives **outside** the skill tree under the workspace runtime root `.MAL-Updater/` by default.
-- The repo keeps code, references, scripts, templates, tests, and supporting artifacts bundled so third parties can audit the whole artifact.
-- Background work now centers on a **long-lived user-level systemd daemon**, not user timers or OpenClaw cron.
-
-## Default runtime layout
-
-MAL-Updater externalizes runtime state to the workspace root:
-
-- `.MAL-Updater/config/`
-- `.MAL-Updater/secrets/`
-- `.MAL-Updater/data/`
-- `.MAL-Updater/state/`
-- `.MAL-Updater/cache/`
-
-Override paths only when the operator explicitly wants a different layout.
-
-## First commands on a new install
+## Quick start (container)
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
-PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit --format summary
-PYTHONPATH=src python3 -m mal_updater.cli init
-PYTHONPATH=src python3 -m mal_updater.cli status
+mkdir mal-updater && cd mal-updater
+curl -O https://raw.githubusercontent.com/kklouzal/MAL-Updater/master/compose.yaml
+curl -O https://raw.githubusercontent.com/kklouzal/MAL-Updater/master/.env.example
+cp .env.example .env
+# edit .env only for non-secret knobs such as image tag or port
+docker compose up -d
+docker compose logs mal-updater | grep first_run_setup_token
 ```
 
-Use `bootstrap-audit --summary` when you only need a terse onboarding checklist. The default JSON now also includes provider readiness, provider-specific operation-mode guidance/next-command hints, runtime-initialization readiness, daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts, secrets-dir permission posture, blocking/non-blocking onboarding counts, explicit recommended commands for automation-friendly consumers, and top-level `recommended_command` / `recommended_automation_command` selections so machine consumers do not have to re-implement bootstrap prioritization. Those onboarding/recommended-command entries now preserve stable `reason_code`, `automation_safe`, and `requires_auth_interaction` metadata too, and auth-driven reauth/rebootstrap steps carry `auth_failure_kind` / `auth_remediation_kind` so bootstrap automation does not have to reverse-engineer the reason from freeform detail text. MAL and provider `operation_guidance` now preserve that same next-command metadata (`next_command_reason_code`, automation-safe posture, auth-interaction posture, and auth-remediation classification when applicable) so per-lane guidance stays aligned with the top-level recommendation surfaces instead of dropping back to a bare command string. `bootstrap-audit` now also mirrors health-driven provider refresh pressure there: when the latest health artifact still recommends either a provider `refresh_ingested_snapshot` or `refresh_full_snapshot`, the affected provider stays bootstrap-ready but surfaces the matching safe refresh/full-refresh fetch command as its next operator action instead of hiding that remediation in health-check alone. `bootstrap-audit --summary` now also surfaces the top recommended command plus its `reason_code`, automation-safe posture, and auth-interaction requirement so terse/operator and shell-script flows can stay aligned with the full JSON payload, and it emits the same metadata for MAL/provider next-command hints too. Staged auth is now treated conservatively there across both MAL and source providers: if repeated unattended `mal_refresh` failures or provider session residue/fetch failures already suggest auth degradation, bootstrap-audit downgrades that lane from healthy/ready posture to explicit re-auth or re-bootstrap guidance instead of trusting token-file presence alone. Those auth-degradation surfaces now also classify the residue into more specific operator-readable buckets such as revoked/invalid token, missing refresh material, malformed token payload, or generic session/login auth failure so the next step is better justified, and `bootstrap-audit --summary` surfaces the same terse auth-failure/remediation kinds for quick operator triage.
+Open: **http://localhost/** (or `http://<lan-host>/` if you changed the port). Paste the one-time claim token from the logs, set an admin password, then complete Settings.
 
-Use `runtime-retention-audit` when you need a read-only look at the configured runtime root and retained local state. It emits JSON by default, supports `--format summary`, never reads secret file contents, and always marks the payload as `diagnostic_only_no_delete_or_prune`; review candidates are policy-neutral aggregates for DB backups, health snapshots, logs/request events, tmp, cache, and artifacts rather than cleanup commands.
-
-## Local quality gates
-
-The CI-equivalent local gate is:
+The image defaults to a pinned GHCR release (`ghcr.io/kklouzal/mal-updater:0.1.4`). For local development builds use:
 
 ```bash
-python -m pip install -c constraints/ci.txt -e ".[dev]"
-scripts/quality.sh
+docker compose -f compose.yaml -f compose.build.yaml up -d --build
 ```
 
-This runs hermetic full tests under coverage with unique `/tmp` runtime/settings paths, scoped lint/type checks, isolated sdist+wheel builds, package migration inspection, and clean-venv `mal-updater --help` / `init` wheel smokes. See `references/QUALITY.md` for the exact gate scope and current repo-wide lint/type debt.
+## First-run setup
 
-## What bootstrap-audit covers
+1. Claim the fresh install with the log token.
+2. Sign in with the local admin password. Sessions are server-side and are invalidated by container restart or password change.
+3. Add MAL app credentials in Settings. Saving credentials never tests or calls MAL.
+4. Use **Test connection** explicitly when desired. Tests are user-triggered, rate-limited, timeout-bounded, and redact errors.
+5. Start MAL OAuth from Settings. Configure the MAL app callback as `http://localhost/oauth/mal/callback` for local access, or the exact trusted LAN/proxy URL you use.
+6. Add provider credentials and test them only when intentionally requested.
+7. Enable automation explicitly. The daemon will not start until setup is complete.
 
-- resolved skill root, workspace root, and runtime root
-- runtime path layout
-- dependency checks (`python3`, `systemctl`, optional provider/runtime extras)
-- MAL client id / token presence, including repeated unattended MAL token-refresh failures that already imply the staged refresh material needs a fresh `mal-auth-login`
-- Crunchyroll credentials / staged auth-state presence
-- HIDIVE credentials / staged auth-state presence
-- staged provider auth degradation signals from provider session residue or repeated unattended auth-style failures, so bootstrap can recommend re-bootstrap before the daemon is treated as healthy
-- current MAL redirect URI
-- whether the repo-owned **user-systemd daemon service** can be installed on this host
-- whether the repo-owned user-systemd daemon is missing, outdated, disabled, inactive, or missing its rendered env file for this user
-- whether the optional loopback dashboard user unit is installed/current without treating its stopped/disabled default state as daemon failure
-- whether manual foreground CLI operation is merely acceptable during bootstrap/spot checks or the daemon is now the expected unattended path
+## Security and LAN deployment
 
-## Bootstrap / onboarding flow
+Use this product on a private LAN or behind a trusted reverse proxy. Do not expose it directly to the WAN. If a reverse proxy is used, only enable forwarded headers with an explicit trusted proxy allowlist; otherwise Host/scheme are taken from the direct request. Secrets live in the Docker volume under `/data/secrets` with restrictive permissions. The container runs non-root after startup, with read-only root filesystem, dropped capabilities, no-new-privileges, and a tmpfs `/tmp`.
 
-1. Run `bootstrap-audit`
-2. Create the external runtime dirs and SQLite DB with `init`
-3. Create the MyAnimeList app and configure the callback URI printed by the bootstrap helper or reported by `status`
-4. Stage the MAL client id in `.MAL-Updater/secrets/`
-5. Run `mal-auth-login` to persist MAL access/refresh tokens
-6. For each source provider you want enabled, stage that provider's credentials in `.MAL-Updater/secrets/`
-7. Run the provider bootstrap command at the point the audit/onboarding flow says that provider is ready:
-   - Crunchyroll: `provider-auth-login --provider crunchyroll` (or the compatibility wrapper `crunchyroll-auth-login`)
-   - HIDIVE: `provider-auth-login --provider hidive`
-8. Install the unattended daemon with `scripts/install_user_systemd_units.sh` when the host supports user systemd; add `--install-dashboard` or `--enable-dashboard` only if you explicitly want the optional 127.0.0.1 dashboard unit rendered/enabled
+## Container tools
 
-Normal unattended operation now assumes **all credentialed providers stay enabled** and are swept by separate background fetch lanes before aggregate MAL planning/apply runs.
-
-Provider pacing/politeness policy: Crunchyroll and HIDIVE access must stay account-scoped and title/detail-specific. Do not use MAL-Updater to crawl or scrape whole Crunchyroll/HIDIVE libraries; provider fetch/full-refresh commands are for the signed-in account's currently reachable history/watchlist/continue-watching surfaces, and recommendation enrichment should query provider details only for specific titles when needed. MAL metadata/recommendation refreshes may cover broader mapped/recommended MAL IDs, but keep them paced by the client throttling, prefer bounded limits for catch-up work, and spread large refreshes over time. The public MAL full-userrecs cold path is likewise bounded by source-title count, page/body limits, same-origin `/userrecs` validation, retry/backoff, and the MAL request-start gate. MAL (1.0s ±0.2s), Crunchyroll (22.5s ±7.5s), and HIDIVE (5s ±1s) request-start spacing is coordinated by a provider-wide host/process gate rather than per client object. These values are configurable local niceness controls, not claims about undocumented provider limits. Safe reads/auth requests use bounded transient retries for timeouts, selected 5xx, and 429 responses; `Retry-After` is honored only up to the configured cap, and MAL PUT writes are never retried automatically.
-
-Crunchyroll recommendation maintenance now opens one authenticated request session for the whole enrichment batch. Search, series-detail, and child-season probes reuse that token/account context and one provider pacer, reducing a candidate that needs all three surfaces from three token refreshes plus three reads to one token refresh plus three reads. A 401 invalidates stale account context, then performs at most one refresh-token recovery and one credential fallback for the batch.
-
-Generated health, service, and bootstrap guidance use the provider-generic forms (`provider-auth-login --provider <slug>`, `provider-fetch-snapshot --provider <slug>`) for both Crunchyroll and HIDIVE. The older Crunchyroll-specific wrappers remain accepted for manual compatibility only.
-
-See `references/bootstrap-onboarding.md` for the detailed agent-facing flow.
-
-## Core commands
+All lifecycle operations use the Compose tools profile and the same persistent volume:
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli status
-PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
-PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit
-PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit --format summary
-PYTHONPATH=src python3 -m mal_updater.cli health-check
-PYTHONPATH=src python3 -m mal_updater.cli health-check-cycle
-PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider all --format summary
-PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider all --older-than-days 30 --format summary
-PYTHONPATH=src python3 -m mal_updater.cli provider-stale-rows --provider crunchyroll
-PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
-PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
-PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --dry-run
-PYTHONPATH=src python3 -m mal_updater.cli recommend-maintain --recommendation-limit 100 --provider-max-history-pages 2 --provider-max-watchlist-pages 2
-# Default unattended service cadence is conservative: hourly provider hot/incremental
-# fetch, exact-approved apply, MAL token refresh, health, and DB/local recommendation
-# snapshot work; MAL user-list refresh runs every 8h, recommendation metadata every 12h,
-# complete public MAL userrecs cold harvest runs hourly with two source titles per batch,
-# a per-source per-run page budget, resumable staged generations,
-# and a 45-day horizon, plus one independently budgeted hourly provider-eligibility
-# lane per credentialed provider (4 candidates, 1 alias, 5 returned matches).
-# Crunchyroll cold/full work is weekly and page-bounded; HIDIVE full refresh stays manual
-# because its current fetch surface has no chunk controls. Long-lived daemon startup
-# has a deterministic grace, and kernel-backed leases suppress overlapping daemon/task
-# passes while safely recovering after a dead process. Provider/MAL budget
-# guards still skip or back off any task when pacing limits are reached.
-PYTHONPATH=src python3 -m mal_updater.cli exact-approved-sync-cycle
-# exact-approved-sync-cycle aborts before apply if no provider targets are configured
-# or any provider refresh fails; use --allow-stale-provider-apply only for an
-# intentional stale-local-DB apply after reviewing the JSON warning evidence.
-PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 0 --mapping-limit 5 --persist-review-queue
-PYTHONPATH=src python3 -m mal_updater.cli list-mappings --provider all
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only
-# Live MAL writes are intentionally not part of the routine smoke-check flow.
-# Use dry-run-sync first; only run apply-sync --execute after explicit operator approval.
-PYTHONPATH=src python3 -m mal_updater.cli recommend --limit 20
-PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 5 --max-pages 3  # --max-pages is per source per run; unfinished sources pause/resume
-PYTHONPATH=src python3 -m mal_updater.cli recommend-coverage
+docker compose --profile tools run --rm cli version
+docker compose --profile tools run --rm cli backup /data/state/backups/manual.tar.gz
+docker compose --profile tools run --rm cli backup-inspect --verify /data/state/backups/manual.tar.gz
+docker compose --profile tools run --rm cli restore --dry-run /data/state/backups/manual.tar.gz
+docker compose --profile tools run --rm cli restore --yes /data/state/backups/manual.tar.gz
+docker compose --profile tools run --rm cli admin-reset --yes
+docker compose --profile tools run --rm cli support-bundle /data/state/support/support.tar.gz
 ```
 
-`service-run-once` is intentionally not part of routine/read-only verification. It is an opt-in live daemon pass that can run due provider fetches, local ingest, and bounded exact-approved MAL apply lanes; use `service-status` plus `health-check` for inspection unless an operator explicitly wants one manual daemon pass.
+Backups contain a SQLite-consistent DB copy, config, secrets, state, a manifest, and SHA-256 checksums. Restore verifies first, requires `--yes`, and creates an automatic pre-restore backup. Support bundles are deliberately redacted and do not include secret contents, usernames, database rows, tokens, or logs.
 
-Grouped recommendation output now includes per-section provider metadata (`providers`, `provider_counts`, `provider_label`, `mixed_providers`, `multi_provider_item_count`) so operators can see when a section mixes Crunchyroll/HIDIVE/MAL-derived items or contains merged cross-provider availability. Individual recommendation items now also expose effective availability fields (`providers`, `provider_count`, `multi_provider`, `provider_label`) rather than only the surviving primary provider. Equivalent mapped continue/episode recommendations that appear from multiple source providers are also merged conservatively into one primary item with alternate-provider context instead of emitting duplicate operator alerts. Global recommendation ranking now also uses that effective availability as a tie-break before applying `--limit`, and merged cross-provider continue/episode items now get a small raw-priority bonus plus explicit reason/context metadata for that broader availability, so consensus availability can matter slightly even before the tie-break without overwhelming the existing scoring model. Discovery-candidate scoring now also surfaces support-balance evidence (`best_single_source_votes`, `cross_seed_support_votes`, `effective_best_single_source_votes`, `effective_cross_seed_support_votes`, `support_balance_bonus`) so bursty one-seed recommendation spikes do not crowd out steadier cross-seed consensus when totals are otherwise close, and that support-spread bonus is now counted conservatively after neutral/stale seed weighting instead of trusting raw vote spread alone. Discovery ranking also adds modest freshness / seed-activity evidence (`start_season`, `start_season_label`, `freshness_bucket`, `freshness_bonus`, `freshness_penalty`, `catalog_age_in_seasons`, `recent_seed_activity_bonus`, `freshest_supporting_seed_days`) so tied discovery candidates prefer newer catalog entries, very old catalog entries take a small explainable age decay, and recommendations backed by more recently active watch history still rise above stale ties rather than relying almost entirely on aggregate votes + overlap metadata. Discovery ranking now also carries small explainable seed-quality calibration (`seed_quality_bonus`, `supporting_seed_scores`, `best_supporting_seed_score`) so support from highly scored or more deeply completed seed titles can break near-ties without overpowering vote totals, overlap metadata, or broader consensus, and it now also records the symmetric low-confidence side (`seed_quality_penalty`, `penalized_seed_scores`, `lowest_supporting_seed_score`) so discovery candidates supported mainly by poorly scored/disliked seeds get tempered slightly instead of reading as equally strong taste matches. Candidates backed only by explicitly dropped or otherwise disliked-only seed titles are now filtered out entirely instead of being shown with a cosmetic penalty, mixed-signal candidates now also discount negative supporting seeds from their support-count boost while recording `negative_supporting_seed_ids`, `negative_support_ratio`, `base_effective_supporting_seed_count`, `stale_consensus_discount`, `effective_supporting_seed_count`, and `mixed_signal_penalty`, explicitly neutral MAL seed scores now count more conservatively via `neutral_supporting_seed_ids`, `neutral_support_ratio`, and `neutral_support_penalty`, and materially old supporting seed activity now also gets a small explainable decay via `stale_supporting_seed_ids`, `stale_support_ratio`, and `stale_support_penalty`; stale-heavy discovery candidates now also receive a bounded consensus discount before the final multi-seed support boost so old support does not read like equally current multi-seed agreement. Near-ties with similar vote/support posture now also get a small `metadata_affinity_bonus` when cached MAL metadata lines up across multiple seed dimensions at once (`metadata_match_dimensions` spanning genre/studio/source, with a mild extra nod to broadly popular candidates), and metadata-rich ties now also expose a bounded `metadata_quality_bonus` plus `metadata_mean_band` / `metadata_popularity_band` so higher-MAL-mean and more broadly adopted candidates can break otherwise flat metadata-rich ties without overpowering the core recommendation graph. Discovery candidates now also carry small global catalog quality/adoption calibration fields (`catalog_quality_bonus`, `catalog_mean_band`, `catalog_popularity_band`, `catalog_quality_penalty`, `catalog_low_mean_band`, `catalog_niche_popularity_band`, `catalog_quality_adjustment`) even outside metadata-rich ties, so flatter recommendation races can still break a little more honestly on elite mean or broader adoption while mildly tempering low-mean or very niche catalog entries; the net adjustment is exposed directly so operators can audit boosts and dampeners without recomputing the score by hand, and without pretending those catalog signals should outweigh consensus support. Metadata refresh target selection follows that same recommendation ordering, and discovery-target metadata refresh now skips MAL IDs that already have provider mappings so the slow lane spends its bounded MAL calls on genuinely unmapped candidate context instead of partially refreshing mapped seed titles that belong to the normal seed refresh lane.
+## Upgrades and rollback
 
-`health-check-cycle` now accepts the same review/maintenance tuning knobs as `health-check` (`--review-issue-type`, `--review-worklist-limit`, `--mapping-coverage-threshold`, `--maintenance-review-limit`) so unattended/manual cycle runs can reuse the same backlog and coverage policy instead of silently falling back to defaults. Persisted mapping-review backlog replacement is always recommended as a full scan (`review-mappings --limit 0 --persist-review-queue`), because partial queue replacement is rejected as unsafe; `--maintenance-review-limit` is a deprecated compatibility option and is ignored for that persisted low-coverage command. When optional auto-remediation runs a repo CLI command, the cycle now executes it with the configured `--project-root` and working directory rather than assuming the caller launched from the repo root.
+Before upgrading, create and verify a backup. Pin the new image tag in `.env`, then run `docker compose pull && docker compose up -d`. Startup performs migrations before readiness turns green. If startup fails, restore the pre-upgrade backup and pin the previous image tag. SQLite schema rollback is limited: once a newer migration mutates a DB, older binaries may not understand it, so rollback means restoring the backup taken before upgrade, not downgrading the live DB in place.
 
-`runtime-retention-audit` is a read-only local diagnostic for the `.MAL-Updater/` runtime tree. It emits JSON by default (or stable key/value summary), marks `diagnostic_only_no_delete_or_prune`, detects nested runtime roots, repo/source overlap, symlink escapes, and missing/non-directory managed top-level paths, and inventories DB backups, health snapshots, logs/request events, tmp, cache, and artifacts as aggregate review candidates only. It never enumerates secret filenames or emits cleanup commands.
+## Health semantics
 
-The full command cookbook lives in `references/cli-recipes.md`.
+- `/healthz`: liveness; returns 200 when the web process can answer.
+- `/readyz`: readiness; returns 200 only when setup is complete and enabled automation is running. It returns 503 during first-run setup or daemon degradation.
 
-HIDIVE title-search/dashboard links now use the frontend's generic series route (`https://www.hidive.com/series/{series_id}`) for `VOD_SERIES` hits. Existing local SQLite caches can be inspected safely with `backfill-hidive-series-urls` (dry-run by default) and corrected with `backfill-hidive-series-urls --apply` after review; the helper is local/idempotent, does not call HIDIVE or MAL, and only rewrites safe old HIDIVE `/season/...` URLs in `provider_series.raw_json.url`, `recommendation_provider_eligibility_evidence.provider_url`, provider-title-search `matches_json[].url`, and HIDIVE provider-object `provider_url` values inside `recommendation_score_snapshots.context_json` (`provider_eligibility_evidence` / `available_provider_series`) when a `provider_series_id` is present. HIDIVE snapshots also include custom watchlist collection/detail memberships on account refreshes, keep duplicate memberships across distinct lists, include Continue Watching page 1 in hot/hourly snapshots, and surface explicit partial/non-advancing diagnostics instead of pruning retained rows.
+## Legacy/systemd advanced path
 
-Review-queue backlog triage surfaces are now provider-aware across Crunchyroll and HIDIVE as well, so `health-check`, `review-queue-next`, `review-queue-worklist`, `list-review-queue`, and related queue filters/summary labels resolve series titles from the matching provider instead of silently assuming Crunchyroll-only catalog rows. `health-check` now also aggregates provider counts and approved-mapping coverage across all persisted source providers while still judging partial-refresh residue against the specific provider touched by the latest ingest run, so multi-provider installs no longer hide HIDIVE-side mapping residue behind a Crunchyroll-only coverage snapshot. When a successful provider full refresh touches fewer rows than remain cached and the exact gap is explained by older `last_seen_at` rows, `health-check` now reports `latest_sync_run_stale_provider_rows` instead of repeatedly recommending another full refresh; ordinary incremental partial-coverage gaps still surface `refresh_full_snapshot` as operator-visible remediation; unattended auto-upgrade is permitted only for the weekly/page-bounded Crunchyroll lane, while HIDIVE full refresh remains manual. That stale-row diagnostic now includes small read-only samples of the older series/progress/watchlist rows, and `provider-stale-rows --provider <slug>` gives operators a dedicated diagnostic view that defaults to the provider's latest completed full-refresh cutoff (or accepts an explicit `--cutoff`) without making any archive/prune decision; it also reports per-family `last_seen_at` ranges, exact oldest/newest age-in-days ranges, per-sample `age_days` plus child-row `linked_series_posture` / `linked_series_last_seen_at` evidence in the JSON sample rows, coarse age buckets (`0-7`, `8-30`, `31+` days), and child-row linkage counts showing whether stale progress/watchlist rows point at stale, current, or missing series rows, so operators can distinguish fresh churn and dependency shape from long-retained residue before choosing policy. `--older-than-days` adds a second read-only age threshold for isolating rows that are both stale since the cutoff and old enough to be credible retention candidates, still without archiving or pruning anything. `--provider all` aggregates that same read-only diagnostic across every known provider, and `--format summary` emits stable key/value aggregate plus per-provider stale-count, last-seen range, age-in-days range, age-filter, child-linkage, and policy lines for terse shell/operator checks. Live `provider-fetch-snapshot --full-refresh --ingest` runs persist that refresh as `sync_runs.mode=full_refresh`, so health classification can distinguish real full resweeps from ordinary snapshot ingests after manual or daemon refreshes. `list-mappings` now follows that same multi-provider posture: it lists all persisted mappings by default and can optionally be narrowed with `--provider crunchyroll` or `--provider hidive`. Mapping search/query generation now also treats generic sequel labels such as `Second Stage` / `2nd Stage` and `Second Beat` / `2nd Beat` as later-season evidence, and the small franchise-specific alias lane now also handles punctuation-significant sequel labels such as `The Devil is a Part-Timer!!` without collapsing them back into the base title, so explicit provider `Season 2` / `Season 3` titles can recover more MAL sequel naming drift conservatively. MAL anime-search requests now sanitize provider language/audio availability suffixes such as `(English Dub)`, `[German Dub]`, `(Latin American Spanish Dub)`, and `(English Sub)` before calling MAL, reducing avoidable `invalid q` telemetry while keeping mapping heuristics conservative.
+The historical user-systemd CLI path remains for advanced/manual installs from a source checkout. Container deployment is the supported product path for end users; do not mix the container volume with the host `.MAL-Updater` runtime.
 
-## Automation model
+## Troubleshooting
 
-Repo-owned automation/runtime files live under:
+- Lost admin password: run `docker compose --profile tools run --rm cli admin-reset --yes`, restart, then claim again with the new log token.
+- Setup token not visible: `docker compose logs --tail=200 mal-updater`.
+- Readiness degraded: check dashboard status and container logs; automation may be disabled or the child daemon may be restarting.
+- OAuth callback mismatch: update the MAL app callback to the exact browser URL plus `/oauth/mal/callback`.
 
-- `scripts/install_user_systemd_units.sh`
-- `src/mal_updater/service_manager.py`
-- `src/mal_updater/service_runtime.py`
-- `ops/systemd-user/mal-updater.service`
+## Release/support policy
 
-The installed daemon is a **user-level systemd service** that runs `mal_updater.cli service-run` in the foreground and owns its own internal loop cadence for:
-
-`service-status` / `service-status --format summary` now surface persisted per-task cadence, decision timing, last-run start/finish/duration, next-due timing, budget-provider labels, budget backoff level (`warn` vs `critical`), adaptive failure-backoff state (reason / class / floor / countdown / consecutive failures), active cooldown countdowns, whether a provider-specific cooldown floor extended the wait, and each provider fetch lane's currently planned fetch mode / planned full-refresh reason (for example when a periodic or health-driven full refresh is now due). They now also derive a compact per-task execution-state view (`waiting_until_due`, `due_now`, `cooling_down_for_budget`, `cooling_down_after_failure`, or `awaiting_schedule`) with reason/detail/countdown metadata, so operators can tell at a glance whether a lane is merely waiting, currently due, or intentionally cooling down instead of reconstructing that posture from raw timestamps alone. For cadence-driven resweeps that are already due, service-status now also shows when that full refresh became due plus how many seconds overdue it currently is, so operators can distinguish a mildly late resweep from a long-stale one. When a due full refresh was recently budget-deferred and the daemon fell back to incremental, service-status now also flags that deferred resweep posture explicitly so unattended behavior is inspectable without reading raw state files. The terse summary surface now also emits each task's condensed last-result outcome (`status` / `label` / `returncode` / `reason` / fetch-mode or deferred-full-refresh context plus stdout/stderr snippets when present), so operators can inspect the latest lane outcome from shell/log-friendly output without reopening the richer JSON payload. Request-budget projection observability there is now richer too: task state and terse summary surfaces preserve the active projection source/count plus the current history window, sample count, chosen history mode (for fetch lanes), and effective percentile posture (`configured` vs burst-driven `auto`) so operators can see whether a skip/allow decision came from cold-start seeds, smoothed observed history, or a conservative learned percentile without reopening raw daemon state. Health-check summary and the health excerpt inside `service-status --format summary` now also emit the top recommended maintenance command's `reason_code`, automation-safe posture, auth-interaction posture, and any auth-failure/remediation classification alongside the command string, so terse operator/automation flows can triage maintenance without reopening the full JSON artifact. Service budget defaults are now also provider-generic: new source providers can inherit shared source-provider hourly/backoff defaults without being implicitly treated as Crunchyroll unless you add a provider-specific override. The repo now also ships opinionated provider defaults for the currently supported source providers, so Crunchyroll gets a deeper learned-history / conservative percentile posture by default and HIDIVE now also ships a conservative learned p90 percentile baseline alongside its quieter hourly/backoff/auth-failure limits instead of relying only on hard-coded request counts. The daemon can now also honor optional task-specific budget overrides (for example a stricter `sync_apply` MAL lane) while still falling back to provider/shared defaults when no per-task policy is configured, and the repo now seeds conservative built-in task defaults for unattended MAL lanes: `sync_apply` ships hourly budget / projected request cost / learned-history depth / conservative learned p90 percentile / cooldown floors plus a bounded unattended execution posture via `service.task_execute_limits`, while `mal_refresh` now also ships a small explicit cold-start projected request seed plus a shallow learned-history window so new installs do not treat token refresh as a zero-cost mystery lane. Unattended `sync_apply` no longer attempts a full aggregate pass by default; it advances MAL in bounded exact-approved batches so one oversized historical run is less likely to poison the lane. Budgeting is now also modestly projection-aware: each budgeted lane can take an explicit `service.task_projected_request_counts` override, a fetch-mode-specific `service.task_projected_request_counts_by_mode` override for expensive paths like full refreshes, or learn from short rolling observed request-delta history (including fetch-mode-specific incremental vs full-refresh history), then warn/skip before a run that would likely push the provider over its configured hourly threshold instead of only reacting after the raw count is already too high. Learned projections are now tunable per task and per provider, so burstier providers can keep deeper history and/or conservative percentile baselines by default while specific lanes still override that policy when needed. When neither task nor provider percentile is configured, the daemon still auto-switches bursty lanes onto a conservative learned p90 baseline once the observed request history shows clear spikes, so unattended budgeting reacts earlier without forcing operators to pre-tune every lane. The repo now also ships built-in mode-specific projection defaults for both Crunchyroll (`sync_fetch_crunchyroll`: `4` incremental / `55` full refresh) and HIDIVE (`sync_fetch_hidive`: `4` incremental / `71` full refresh) so fresh unattended installs do not treat ordinary fetches or heavier cold-start resweeps like unknown zero-cost paths; those shipped defaults now behave as cold-start seeds rather than permanent hard overrides, so learned request history can take over once the daemon has real evidence. When a lane's execution posture changes materially (for example bounded unattended apply replacing an old full-pass posture), the daemon now resets stale projected-request/backoff state for that lane so old pathological history does not keep poisoning future unattended decisions. If an overdue full refresh is budget-blocked the daemon also now degrades gracefully to an incremental fetch instead of starving the lane completely until the heavier run fits.
-
-- MAL token refresh
-- bounded MAL user-list refresh every 8 hours (3 pages by default)
-- one fetch lane per credentialed source provider (currently Crunchyroll + HIDIVE)
-- one shared aggregate MAL apply lane using bounded exact-approved batches by default
-- bounded recommendation metadata every 12 hours plus one hourly, provider-specific eligibility lane per credentialed provider (4 candidates by default); fresh actionable eligibility evidence is a zero-request cache hit
-- hourly recommendation snapshot/health materialization remains DB/local-only
-- recurring health-check/report generation
-- attempt-level MAL/Crunchyroll/HIDIVE request logging with redacted URLs, retry/timeout outcomes, task/run attribution, monotonic run deltas, and provider-global plus task-scoped budget enforcement (legacy events remain conservatively budgeted)
-- Crunchyroll full refresh is weekly by default and bounded to 10 history pages plus 2 watchlist pages per run; budget pressure downgrades it to hot/incremental without advancing the cold anchor. HIDIVE full refresh stays explicit/manual because its current fetch surface has no chunk controls.
-- health-driven full-refresh escalation is honored unattended only for the page-bounded Crunchyroll lane; HIDIVE health pressure remains an operator-visible manual action while the daemon keeps its hot lane bounded
-- broader auth-fragility health escalation: health-check now treats repeated unattended provider failures as auth-related not just for obvious `401`/`unauthorized` residue, but also for refresh/login failure text and provider session-state `auth_failed` residue so re-bootstrap guidance triggers sooner on brittle hosts
-
-## Security / boundaries
-
-- Do not commit real credentials.
-- Keep live secrets in `.MAL-Updater/secrets/`.
-- Restrict secrets-dir permissions appropriately for the local user before staging long-lived credentials or tokens there.
-- Keep generated runtime state out of the repo tree.
-- This is a **public GitHub repository**. Any code, references, examples, tests, commit metadata, or other tracked artifacts that could be uploaded must stay anonymized: no personal identities, personal email addresses, host-specific absolute paths, private workspace paths, real account identifiers, real API keys/tokens, or machine-local secrets.
-- Use obviously fake placeholders in tracked examples/tests, and treat history rewrites as acceptable when needed to remove accidentally committed identifying residue.
-- Prefer `dry-run-sync` before live `apply-sync --execute` unless a live apply is explicitly intended.
-- Treat Crunchyroll auth/fetch instability as real operational residue.
-- Manually review the rendered user-systemd daemon/unit behavior before enabling unattended operation on a host you care about.
-
-## License / attribution
-
-This project is released under the **MIT License**. You can use, modify, and redistribute it freely as long as the license/copyright notice is preserved.
-
-If you reuse or adapt MAL-Updater, attribution to the original project/repo is appreciated:
-- <https://github.com/kklouzal/MAL-Updater>
-
-## Testing
-
-Use hermetic `/tmp` runtime/settings for every test command so validation never reads or writes a live `.MAL-Updater/` tree.
-
-```bash
-cd <repo-root>
-python -m pip install -c constraints/ci.txt -e ".[dev]"
-scripts/quality.sh
-```
-
-For a pytest-only iteration, keep the same isolated runtime contract:
-
-```bash
-cd <repo-root>
-tmp="$(mktemp -d /tmp/mal-updater-test.XXXXXX)"
-mkdir -p "$tmp/runtime/config" "$tmp/tmp"
-: > "$tmp/runtime/config/settings.toml"
-MAL_UPDATER_RUNTIME_ROOT="$tmp/runtime" \
-MAL_UPDATER_RUNTIME_DIR="$tmp/runtime" \
-MAL_UPDATER_SETTINGS_PATH="$tmp/runtime/config/settings.toml" \
-MAL_UPDATER_CONFIG="$tmp/runtime/config/settings.toml" \
-TMPDIR="$tmp/tmp" \
-python -m pytest -q
-```
-
-## Issue reporting / feedback
-
-If you encounter problems while using MAL-Updater — whether in the OpenClaw skill surface or the Python back-end daemon/runtime — report them upstream via a GitHub issue at:
-
-- <https://github.com/kklouzal/MAL-Updater/issues>
-
-Use the upstream issue tracker for bug reports, integration problems, unexpected runtime behavior, and feature requests so the maintainer can continue improving both the skill and the back-end.
-
-## References
-
-- Skill entrypoint: `SKILL.md`
-- Bootstrap flow: `references/bootstrap-onboarding.md`
-- Command cookbook: `references/cli-recipes.md`
-- Operations: `references/OPERATIONS.md`
-- Automation: `references/AUTOMATION.md`
-- Quality/CI gates: `references/QUALITY.md`
-- MAL OAuth details: `references/MAL_OAUTH.md`
-
-## Production bootstrap script
-
-For an interactive production setup, run the repo-owned bootstrap helper from the repo root, or use an explicit path to this checkout from any current directory:
-
-```bash
-cd <repo-root>
-scripts/bootstrap.sh
-# from elsewhere: /path/to/MAL-Updater/scripts/bootstrap.sh
-```
-
-The script resolves the repository root from its own location, creates or reuses a repo-local virtualenv at `.venv` by default, installs the package in editable mode with required Crunchyroll transport dependencies into that virtualenv (`.venv/bin/python -m pip install -e .`), runs CLI/bootstrap/audit/health steps with the same virtualenv Python, stages the mandatory MAL client id, optional MAL client secret, and only the selected source-provider credentials, runs selected auth bootstraps, prints read-only audit/health summaries, and installs the user-level systemd service with `scripts/install_user_systemd_units.sh` rendered to use that same Python. During bootstrap it defaults the MAL OAuth callback to loopback (`127.0.0.1:8765`) and only writes a non-loopback callback bind after an explicit acknowledgement/warning; set `MAL_UPDATER_BOOTSTRAP_REDIRECT_HOST=<ip-or-hostname>` plus `MAL_UPDATER_BOOTSTRAP_NON_LOOPBACK_CALLBACK_ACK=true` for non-interactive remote-browser bootstrap. Register the exact callback URI printed by the script in the MyAnimeList API app before accepting the MAL OAuth login step. It prompts before dependency install, asks which source providers to enable when no provider selection is supplied, prompts before each auth step, and prompts before service start/restart; service installation/enabling remains handled by the repo-owned install script. Set `MAL_UPDATER_BOOTSTRAP_VENV=/path/to/venv` to use a different virtualenv path, or `PYTHON_BIN=/path/to/python3` to choose the interpreter used to create the virtualenv.
-
-Provider bootstrap selection is explicit and portable. Set `MAL_UPDATER_BOOTSTRAP_PROVIDERS=crunchyroll,hidive`, `all`, or `none` for non-interactive runs; `MAL_UPDATER_BOOTSTRAP_SOURCE_PROVIDERS` is accepted as an alias. When no selection is set, interactive runs ask per provider and non-interactive runs infer only already staged/env-provided provider credentials. Set `MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS=yes|no|prompt` to control auth execution and `MAL_UPDATER_BOOTSTRAP_SERVICE_START=yes|no|prompt` to control service start/restart. Secrets may be pre-staged in files or supplied through the usual `MAL_UPDATER_*` credential environment variables for one non-interactive staging run; values are never printed.
-
-Credential prompts never echo passwords/secrets, and existing credential files can be kept without displaying their contents. By default, files are written under the resolved runtime secrets directory, normally `.MAL-Updater/secrets/`, with directory mode `700` and one-line secret files mode `600`:
-
-- `mal_client_id.txt`
-- `mal_client_secret.txt` (optional)
-- `crunchyroll_username.txt` / `crunchyroll_password.txt` only when Crunchyroll is selected
-- `hidive_username.txt` / `hidive_password.txt` only when HIDIVE is selected
-
-The selected auth steps are interactive/live and may require browser/callback or provider network access:
-
-- `mal-auth-login`
-- `provider-auth-login --provider crunchyroll`
-- `provider-auth-login --provider hidive`
-
-The bootstrap script intentionally does **not** run `apply-sync --execute` or any destructive/live MAL write path beyond OAuth/provider token exchange. It also avoids live provider fetches; use the normal audited CLI flow after bootstrap when you are ready to fetch snapshots or sync.
+Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM where GitHub supports it, and a curated release bundle containing compose/env/docs. Patch releases are intended to be safe upgrades within the same minor line; backup before every upgrade.

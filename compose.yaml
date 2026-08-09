@@ -1,0 +1,52 @@
+name: mal-updater
+
+services:
+  mal-updater:
+    image: ${MAL_UPDATER_IMAGE:-ghcr.io/kklouzal/mal-updater:0.1.4}
+    restart: unless-stopped
+    ports:
+      - "${MAL_UPDATER_HTTP_PORT:-80}:8080"
+    environment:
+      MAL_UPDATER_UID: ${MAL_UPDATER_UID:-10001}
+      MAL_UPDATER_GID: ${MAL_UPDATER_GID:-10001}
+    volumes:
+      - mal-updater-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+
+  cli:
+    profiles: ["tools"]
+    image: ${MAL_UPDATER_IMAGE:-ghcr.io/kklouzal/mal-updater:0.1.4}
+    entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint", "mal-updater-tools"]
+    command: ["version"]
+    environment:
+      MAL_UPDATER_UID: ${MAL_UPDATER_UID:-10001}
+      MAL_UPDATER_GID: ${MAL_UPDATER_GID:-10001}
+    volumes:
+      - mal-updater-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "SETGID", "SETUID"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  mal-updater-data:

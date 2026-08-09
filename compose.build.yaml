@@ -1,0 +1,13 @@
+services:
+  mal-updater:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${MAL_UPDATER_PYTHON_IMAGE:-python:3.13.7-slim-bookworm@sha256:67a1e1f215ccda113cfc024e8639049257e88f273898f595b61476d128d387e8}
+    image: ${MAL_UPDATER_IMAGE:-mal-updater:local}
+  cli:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${MAL_UPDATER_PYTHON_IMAGE:-python:3.13.7-slim-bookworm@sha256:67a1e1f215ccda113cfc024e8639049257e88f273898f595b61476d128d387e8}
+    image: ${MAL_UPDATER_IMAGE:-mal-updater:local}

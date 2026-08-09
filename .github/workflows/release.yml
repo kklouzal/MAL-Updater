@@ -1,0 +1,57 @@
+name: release
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+jobs:
+  quality:
+    uses: ./.github/workflows/quality.yml
+  release:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - run: pip install build && python -m build
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: {registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}'}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with: {images: 'ghcr.io/${{ github.repository }}', tags: 'type=semver,pattern={{version}}'}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: '${{ steps.meta.outputs.tags }}'
+          labels: '${{ steps.meta.outputs.labels }}'
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@v3
+      - run: cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.build.outputs.digest }}"
+      - run: |
+          mkdir -p release-bundle/docs
+          cp compose.yaml .env.example README.md LICENSE release-bundle/
+          cp references/CONTAINERS.md references/OPERATIONS.md release-bundle/docs/
+          cp dist/* release-bundle/
+          (cd release-bundle && sha256sum * docs/* > SHA256SUMS)
+          tar -czf "mal-updater-${GITHUB_REF_NAME}.tar.gz" release-bundle
+          sha256sum dist/* "mal-updater-${GITHUB_REF_NAME}.tar.gz" > SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'mal-updater-*.tar.gz'
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*
+            mal-updater-*.tar.gz
+            SHA256SUMS

@@ -12,7 +12,7 @@ import pytest
 
 
 MIGRATION_CONTENT = b"CREATE TABLE demo(id INTEGER);\n"
-ENTRY_POINTS = "[console_scripts]\nmal-updater = mal_updater.cli:main\n"
+ENTRY_POINTS = "[console_scripts]\nmal-updater = mal_updater.cli:main\nmal-updater-container = mal_updater.container_runtime:main\nmal-updater-tools = mal_updater.container_lifecycle:main\n"
 METADATA = "\n".join(
     [
         "Metadata-Version: 2.4",
