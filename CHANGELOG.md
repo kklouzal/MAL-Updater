@@ -2,7 +2,7 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
-## [0.2.1] - 2026-08-09
+## [0.2.2] - 2026-08-09
 
 ### Added
 
@@ -30,4 +30,4 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ## Earlier development builds
 
-Versions through 0.1.4 were pre-container-development package versions and were not published as supported GitHub/GHCR releases. The v0.2.0 workflow published a signed image but failed before creating a GitHub Release because the environment template was absent from the Git checkout; use 0.2.1 instead.
+Versions through 0.1.4 were pre-container-development package versions and were not published as supported GitHub/GHCR releases. The v0.2.0 workflow published a signed image but failed before creating a GitHub Release. Version 0.2.1 published a release whose top-level checksums used unusable build-directory prefixes. Use 0.2.2 instead.

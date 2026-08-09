@@ -46,7 +46,8 @@ jobs:
           cp dist/* release-bundle/
           (cd release-bundle && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
           tar -czf "mal-updater-${GITHUB_REF_NAME}.tar.gz" release-bundle
-          sha256sum dist/* "mal-updater-${GITHUB_REF_NAME}.tar.gz" > SHA256SUMS
+          (cd dist && sha256sum *) > SHA256SUMS
+          sha256sum "mal-updater-${GITHUB_REF_NAME}.tar.gz" >> SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'mal-updater-*.tar.gz'

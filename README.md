@@ -16,7 +16,7 @@ docker compose logs mal-updater | grep first_run_setup_token
 
 Open: **http://localhost/** (or `http://<lan-host>/` if you changed the port). Paste the one-time claim token from the logs, set an admin password, then complete Settings.
 
-The image defaults to the pinned first complete container release (`ghcr.io/kklouzal/mal-updater:0.2.1`). For local development builds use:
+The image defaults to the pinned first fully verified container release (`ghcr.io/kklouzal/mal-updater:0.2.2`). For local development builds use:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
@@ -74,4 +74,4 @@ The historical user-systemd CLI path remains for advanced/manual installs from a
 
 ## Release/support policy
 
-MAL-Updater remains alpha software. Version 0.2.1 is the first complete supported container release; the legacy source/systemd path is advanced-use only. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle containing compose/env/docs. Patch releases are intended to be safe upgrades within the same minor line; backup before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+MAL-Updater remains alpha software. Version 0.2.2 is the first fully verified supported container release; the legacy source/systemd path is advanced-use only. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle containing compose/env/docs. Patch releases are intended to be safe upgrades within the same minor line; backup before every upgrade. See `CHANGELOG.md` for release history and known limitations.
