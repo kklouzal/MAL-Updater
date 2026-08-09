@@ -5,7 +5,6 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
 from typing import Any
 from .config import ensure_directories, load_config
-from .container_web import ControlStore
 
 FORMAT = 1
 MAX_ARCHIVE = 4 * 1024**3
@@ -125,14 +124,10 @@ def main(argv=None) -> int:
     b = sub.add_parser("backup"); b.add_argument("archive", type=Path)
     i = sub.add_parser("backup-inspect"); i.add_argument("archive", type=Path); i.add_argument("--verify", action="store_true")
     r = sub.add_parser("restore"); r.add_argument("archive", type=Path); r.add_argument("--dry-run", action="store_true"); r.add_argument("--yes", action="store_true")
-    a = sub.add_parser("admin-reset"); a.add_argument("--yes", action="store_true")
     s = sub.add_parser("support-bundle"); s.add_argument("archive", type=Path); sub.add_parser("version"); args = p.parse_args(argv)
     if args.cmd == "backup": out = {"archive": str(backup(args.project_root, args.archive))}
     elif args.cmd == "backup-inspect": out = inspect(args.archive, args.verify)
     elif args.cmd == "restore": out = restore(args.project_root, args.archive, args.yes, args.dry_run)
-    elif args.cmd == "admin-reset":
-        if not args.yes: raise SystemExit("admin-reset requires --yes")
-        c = _runtime(args.project_root); store = ControlStore(c); store.auth_path.unlink(missing_ok=True); out = {"reset": True, "instruction": "Restart and retrieve the new one-time claim token from logs."}
     elif args.cmd == "support-bundle": out = {"archive": str(support(args.project_root, args.archive))}
     else: out = about()
     print(json.dumps(out, indent=2, sort_keys=True)); return 0

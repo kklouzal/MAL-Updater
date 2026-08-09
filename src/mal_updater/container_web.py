@@ -1,8 +1,7 @@
-"""Authenticated, deny-by-default container control plane state."""
+"""Trusted-LAN container control-plane state."""
 from __future__ import annotations
 
-import hashlib, hmac, ipaddress, json, os, secrets, threading, time
-from dataclasses import dataclass
+import json, os, secrets, threading, time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
@@ -12,10 +11,6 @@ from .config import AppConfig, load_mal_secrets
 from .persistence import atomic_write_json, atomic_write_text
 
 MAX_BODY = 64 * 1024
-PASSWORD_MIN = 12
-PASSWORD_MAX_BYTES = 1024
-SESSION_TTL = 12 * 3600
-SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -24,39 +19,6 @@ def _read_json(path: Path) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
-
-
-def _validate_password(password: str) -> bytes:
-    raw = password.encode("utf-8")
-    if len(raw) > PASSWORD_MAX_BYTES:
-        raise ValueError("password too long")
-    if len(password) < PASSWORD_MIN or password.lower() == password or password.upper() == password or not any(c.isdigit() for c in password):
-        raise ValueError("password must be at least 12 characters with upper/lower case and a digit")
-    return raw
-
-
-def hash_password(password: str, *, salt: bytes | None = None) -> str:
-    raw = _validate_password(password)
-    salt = salt or os.urandom(16)
-    digest = hashlib.scrypt(raw, salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32)
-    return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${salt.hex()}${digest.hex()}"
-
-
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        raw = password.encode("utf-8")
-        if len(raw) > PASSWORD_MAX_BYTES:
-            return False
-        kind, n, r, p, salt_hex, expected_hex = encoded.split("$")
-        n_i, r_i, p_i = int(n), int(r), int(p)
-        expected = bytes.fromhex(expected_hex)
-        salt = bytes.fromhex(salt_hex)
-        if kind != "scrypt" or (n_i, r_i, p_i) != (SCRYPT_N, SCRYPT_R, SCRYPT_P) or len(salt) != 16 or len(expected) != 32:
-            return False
-        actual = hashlib.scrypt(raw, salt=salt, n=n_i, r=r_i, p=p_i, dklen=32)
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError, UnicodeError):
-        return False
 
 
 class RateLimiter:
@@ -75,78 +37,30 @@ class RateLimiter:
         with self._lock:
             self._hits.pop(key, None)
 
-
-@dataclass
-class Session:
-    csrf: str
-    expires: float
-
-
 class ControlStore:
     SECRET_NAMES = {
         "mal_client_id": "mal_client_id.txt", "mal_client_secret": "mal_client_secret.txt",
         "crunchyroll_username": "crunchyroll_username.txt", "crunchyroll_password": "crunchyroll_password.txt",
         "hidive_username": "hidive_username.txt", "hidive_password": "hidive_password.txt",
     }
-    def __init__(self, config: AppConfig, *, setup_token: str | None = None):
+    def __init__(self, config: AppConfig):
         self.config = config
-        self.auth_path = config.secrets_dir / "container_auth.json"
         self.state_path = config.state_dir / "container-control.json"
         self.audit_path = config.state_dir / "container-audit.jsonl"
-        self.setup_token = setup_token or secrets.token_urlsafe(32)
-        self.sessions: dict[str, Session] = {}
+        # A process-local synchronizer token protects credential-free mutations.
+        # It is readable only through same-origin fetch under the browser SOP and
+        # is intentionally neither a credential nor persisted installation state.
+        self.csrf_token = secrets.token_urlsafe(32)
         self.oauth: dict[str, dict[str, Any]] = {}
         self.rate = RateLimiter()
         self.lock = threading.RLock()
-    @property
-    def claimed(self) -> bool:
-        return bool(_read_json(self.auth_path).get("password_hash"))
-    def claim(self, token: str, password: str) -> None:
-        with self.lock:
-            if self.claimed:
-                raise ValueError("setup already claimed")
-            if not self.setup_token or not hmac.compare_digest(token, self.setup_token):
-                raise ValueError("invalid setup token")
-            password_hash = hash_password(password)
-            atomic_write_json(self.auth_path, {"version": 1, "password_hash": password_hash}, mode=0o600)
-            self.setup_token = ""
-            self.audit("setup_claimed")
-    def login(self, password: str, key: str) -> tuple[str, str]:
-        if not self.rate.allow(key):
-            raise PermissionError("rate_limited")
-        if not verify_password(password, str(_read_json(self.auth_path).get("password_hash", ""))):
-            raise ValueError("invalid credentials")
-        self.rate.clear(key)
-        sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        with self.lock:
-            self.sessions[sid] = Session(csrf, time.monotonic() + SESSION_TTL)
-        self.audit("login")
-        return sid, csrf
-    def session(self, sid: str | None) -> Session | None:
-        with self.lock:
-            item = self.sessions.get(sid or "")
-            if not item or item.expires < time.monotonic():
-                self.sessions.pop(sid or "", None)
-                return None
-            return item
-    def logout(self, sid: str) -> None:
-        with self.lock: self.sessions.pop(sid, None)
-        self.audit("logout")
-    def change_password(self, old: str, new: str) -> None:
-        with self.lock:
-            data = _read_json(self.auth_path)
-            if not verify_password(old, str(data.get("password_hash", ""))):
-                raise ValueError("invalid credentials")
-            atomic_write_json(self.auth_path, {"version": 1, "password_hash": hash_password(new)}, mode=0o600)
-            self.sessions.clear()
-        self.audit("password_changed")
     def status(self) -> dict[str, Any]:
         with self.lock:
             state = _read_json(self.state_path)
         present = {k: (self.config.secrets_dir / v).is_file() for k, v in self.SECRET_NAMES.items()}
         mal = load_mal_secrets(self.config)
-        complete = self.claimed and bool(mal.client_id) and bool(mal.access_token and mal.refresh_token)
-        return {"claimed": self.claimed, "setup_complete": complete, "daemon_enabled": bool(state.get("daemon_enabled")), "mal_oauth_complete": bool(mal.access_token and mal.refresh_token), "secrets_present": present, "providers": {"crunchyroll_enabled": bool(state.get("crunchyroll_enabled")), "hidive_enabled": bool(state.get("hidive_enabled"))}, "write_posture": "conservative; onboarding does not approve MAL writes"}
+        complete = bool(mal.client_id) and bool(mal.access_token and mal.refresh_token)
+        return {"setup_complete": complete, "daemon_enabled": bool(state.get("daemon_enabled")), "mal_oauth_complete": bool(mal.access_token and mal.refresh_token), "secrets_present": present, "providers": {"crunchyroll_enabled": bool(state.get("crunchyroll_enabled")), "hidive_enabled": bool(state.get("hidive_enabled"))}, "write_posture": "conservative; onboarding does not approve MAL writes"}
     def save_settings(self, data: dict[str, Any]) -> None:
         allowed = {"crunchyroll_enabled", "hidive_enabled", "sync_every_seconds", "health_every_seconds"}
         if set(data) - allowed: raise ValueError("unknown setting")

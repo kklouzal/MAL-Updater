@@ -2,37 +2,40 @@
 
 ## Product shape
 
-One image runs an authenticated HTTP control plane and the existing scheduler as a supervised child. Automation is persisted disabled and cannot start until admin claim, MAL client ID, and OAuth tokens exist. `tini` is PID 1. The Python supervisor applies bounded exponential restart backoff and forwards shutdown.
+One image runs a credential-free trusted-LAN HTTP control plane and the existing scheduler as a supervised child. Automation is persisted disabled and cannot start until the MAL client ID and OAuth tokens exist. `tini` is PID 1. The Python supervisor applies bounded exponential restart backoff and forwards shutdown.
 
 ## Persistent data and container boundary
 
 The single `/data` volume contains `config`, `secrets`, `data`, `state`, and disposable `cache`. The entrypoint reconciles volume ownership as root, then drops to the configured UID/GID (default 10001). The root filesystem is read-only; `/tmp` is a bounded noexec tmpfs. Never mount the canonical host `.MAL-Updater` runtime into this product.
 
+Legacy `/data/secrets/container_auth.json` files from v0.2.2 are ignored. No migration, deletion, or reset is required, and new installs do not create that file.
+
 ## Health
 
-`/healthz` is unauthenticated liveness. `/readyz` is 200 only after setup is complete and, when enabled, the child daemon is alive. All other operational/status surfaces require authentication.
+`/healthz` is liveness. `/readyz` is 200 only after required MAL setup is complete and, when enabled, the child daemon is alive. Dashboard, status, settings, and recommendation read surfaces open directly without an installation claim or user session.
 
 ## Base image and dependencies
 
 Release/local builds default to the same Python 3.13.7 Bookworm digest. Python dependencies are constrained by `constraints/ci.txt`; Debian runtime packages are version-pinned. Multi-architecture release builds must override the base with a verified multi-architecture digest if the recorded default digest is platform-specific.
 
-## Authenticated first run and settings
+## Trusted-LAN control plane and settings
 
-A fresh `/data` volume is not an open dashboard. The root page is the setup wizard and the runtime prints one `first_run_setup_token` event to container logs. Claim it with `POST /api/setup/claim` and a strong admin password. Only an scrypt hash and random server material are persisted in `/data/secrets/container_auth.json` (0600). The claim token is held only in process memory and becomes unusable after claim.
+A fresh `/data` volume opens directly to the dashboard and Settings. The runtime emits only a normal `container_starting` event: there is no first-run token, claim endpoint, login/logout, dashboard password, session cookie, password change/reset, or admin-reset lifecycle command.
 
-All dashboard, status, settings, OAuth and write APIs require the `HttpOnly; SameSite=Strict` server-side session cookie; only `/healthz`, `/readyz`, and the unclaimed setup status/claim surface are public. Mutations require the per-session `X-CSRF-Token` returned by login. Login and claim attempts are rate-limited. JSON bodies are capped at 64 KiB, mutation routes require `application/json`, and responses use CSP, frame, MIME-sniffing and referrer protections. Browser state is not placed in localStorage. Set `MAL_UPDATER_COOKIE_SECURE=true` when accessed exclusively through a trusted TLS reverse proxy. This application accepts private LAN HTTP, but **must not be exposed directly to the Internet/WAN**.
+This is intentionally a **trusted-LAN-only** product. Every client able to reach the control plane can read status and mutate settings. Do not expose it directly to the Internet/WAN. Put network access control or an authenticating trusted reverse proxy in front if client-level access control is required.
 
-`GET /api/settings` returns presence booleans, never secret values. `POST /api/secrets` accepts only the documented MAL/Crunchyroll/HIDIVE fields and supports explicit replacement/removal. Non-secret settings are allowlisted and atomically regenerated; arbitrary TOML is rejected. Audit JSONL records event names and changed field names, never values.
+Mutations use a process-local synchronizer CSRF token. The UI obtains it from `GET /api/csrf` through the browser same-origin policy, retains it only in memory, and supplies `X-CSRF-Token`. The server also rejects mismatched `Origin` and cross-site `Sec-Fetch-Site` values. The token rotates on process restart and is neither a user credential nor persisted installation state. JSON bodies are capped at 64 KiB, mutation routes require `application/json`, Host values must be loopback/private IP or explicitly trusted, and responses use CSP, frame, MIME-sniffing, permissions, and referrer protections.
 
-MAL OAuth starts at `POST /api/oauth/mal/start`. The generated callback is exactly `<current trusted host>/oauth/mal/callback`; loopback/private-IP Host values only are accepted to prevent Host-header callback poisoning. State and PKCE verifier are single-use, expire after ten minutes, and tokens are atomically persisted by the existing credential helper. Provider connection tests are deliberately not automatic: saving credentials does no network I/O. Connection tests are explicit, authenticated, rate-limited, timeout-bounded actions; secret values and provider error details are not returned.
+`GET /api/settings` returns presence booleans, never secret values. `POST /api/secrets` accepts only the documented MAL/Crunchyroll/HIDIVE fields and supports explicit replacement/removal. Non-secret settings are allowlisted and atomically regenerated; arbitrary TOML is rejected. Secret files remain mode 0600 and the secrets directory remains restrictive. Audit JSONL records event names and changed field names, never values.
 
-Automation is enabled with authenticated `POST /api/daemon` (`{"enabled":true}`) only after admin claim, MAL client ID, and MAL OAuth tokens are present. The in-process supervisor observes the persisted flag and starts/stops the existing daemon without Compose environment edits. Onboarding never enables MAL writes; existing conservative approval/write controls remain authoritative. `healthz` is liveness; `readyz` means setup is complete and, when enabled, the daemon is alive.
+MAL OAuth starts at `POST /api/oauth/mal/start`. The generated callback is exactly `<current trusted host>/oauth/mal/callback`; loopback/private-IP Host values or explicit trusted hostnames only are accepted to prevent Host-header callback poisoning. State and PKCE verifier are single-use, expire after ten minutes, and tokens are atomically persisted by the existing credential helper.
 
-Password recovery/reset is intentionally offline so an unauthenticated HTTP endpoint cannot seize the installation: stop the service, back up `/data`, remove `/data/secrets/container_auth.json` using the volume-mounted CLI/admin container, and restart to obtain a new one-time claim token. This invalidates prior in-memory sessions. Release tooling should add a purpose-built `container-reset-admin` CLI before stable release.
+Provider connection tests remain deliberate network actions: saving credentials performs no network I/O. Connection tests are explicit, CSRF-protected, per-client rate-limited, timeout-bounded actions; secret values and provider error details are not returned. MAL OAuth and Crunchyroll/HIDIVE provider authentication and token/session secret handling are unchanged by removal of dashboard authentication.
 
+Automation is enabled with CSRF-protected `POST /api/daemon` (`{"enabled":true}`) only after the MAL client ID and MAL OAuth tokens are present. The in-process supervisor observes the persisted flag and starts/stops the existing daemon without Compose environment edits. Onboarding never enables MAL writes; existing conservative approval/write controls remain authoritative.
 
 ## Product container lifecycle commands
 
 The release bundle is designed so `docker compose up -d` starts the pinned GHCR image on port 80 with a persistent `mal-updater-data` volume. Use `compose.build.yaml` only for local development builds. Lifecycle tools run through the `tools` profile and never require host `.MAL-Updater` or systemd services.
 
-See README for backup, verify, restore, admin-reset, support-bundle, upgrade, rollback, health, and first-run claim-token commands.
+See README for backup, verify, restore, support-bundle, upgrade, rollback, and health commands.

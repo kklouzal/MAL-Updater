@@ -33,7 +33,9 @@ class LifecycleTests(unittest.TestCase):
   with self.assertRaises(ValueError): inspect(bad,True)
   link=self.config.state_dir/'bad-link'; link.symlink_to('/etc/passwd')
   with self.assertRaises(ValueError): backup(ROOT,Path(self.t.name)/'link.tar.gz')
- def test_about_and_admin_reset_cli(self):
+ def test_about_and_version_cli(self):
   self.assertEqual('MAL-Updater',about()['product'])
   self.assertEqual(0,main(['--project-root',str(ROOT),'version']))
+ def test_admin_reset_command_is_removed(self):
+  with self.assertRaises(SystemExit): main(['--project-root',str(ROOT),'admin-reset','--yes'])
 if __name__=='__main__': unittest.main()

@@ -1,7 +1,6 @@
 from __future__ import annotations
-import base64, json, os, signal, subprocess, sys, threading, time
+import base64, hmac, json, os, signal, subprocess, sys, threading, time
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Sequence
@@ -11,7 +10,7 @@ from urllib.request import Request, urlopen
 
 from .auth import persist_token_response
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
-from .container_web import ControlStore, MAX_BODY, SESSION_TTL
+from .container_web import ControlStore, MAX_BODY
 from .container_ui import page as product_page
 from .db import bootstrap_database
 from .mal_client import TokenResponse
@@ -29,11 +28,8 @@ def daemon_command(project_root: Path) -> list[str]:
 def _status_payload(*, config: AppConfig, daemon: subprocess.Popen[bytes] | None, store: ControlStore) -> dict[str, Any]:
     state = store.status(); running = daemon is not None and daemon.poll() is None; enabled = state["daemon_enabled"]
     return {"status": "ok" if not enabled or running else "degraded", "ready": bool(state["setup_complete"] and (not enabled or running)), "mode": "operational" if enabled else "setup", "daemon_enabled": enabled, "daemon_running": running, "database_initialized": config.db_path.is_file(), "setup_complete": state["setup_complete"]}
-def _page(_title: str, _body: str) -> str:
-    return product_page("login")
-def hmac_compare(a: str, b: str) -> bool:
-    import hmac
-    return hmac.compare_digest(a, b)
+def _oauth_complete_page() -> str:
+    return """<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>MAL OAuth complete</title></head><body><main><h1>MAL OAuth complete</h1><p>Tokens were saved. Return to the <a href=\"/\">MAL-Updater dashboard</a>.</p></main></body></html>"""
 
 def _split_host(host: str) -> tuple[str, int | None]:
     if not host or any(x in host for x in "\r\n/@") or len(host) > 253: raise ValueError("invalid host")
@@ -74,8 +70,13 @@ def _oauth_exchange(config: AppConfig, code: str, verifier: str, redirect_uri: s
     if not isinstance(raw, dict) or not isinstance(raw.get("access_token"), str): raise ValueError("OAuth token response invalid")
     return TokenResponse(raw["access_token"], str(raw.get("token_type", "Bearer")), raw.get("expires_in"), raw.get("refresh_token"), raw.get("scope"), raw)
 
+def _default_connection_tester(config: AppConfig, kind: str, timeout: int) -> None:
+    del config, kind, timeout
+    raise ValueError("connection testing unavailable")
+
 def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[bytes] | None], store: ControlStore, *, oauth_exchange: Any = None, connection_tester: Any = None) -> type:
-    dashboard = make_dashboard_handler(config.db_path); secure_default = env_flag("MAL_UPDATER_COOKIE_SECURE")
+    dashboard = make_dashboard_handler(config.db_path)
+    test_connection = connection_tester or (lambda kind, timeout: _default_connection_tester(config, kind, timeout))
     class Handler(dashboard):
         server_version = "MAL-Updater"
         sys_version = ""
@@ -90,11 +91,6 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
         def _send_html(self, text: str, status: HTTPStatus = HTTPStatus.OK) -> None:
             body = text.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self._headers(); self.send_header("Content-Length", str(len(body))); self.end_headers()
             if self.command != "HEAD": self.wfile.write(body)
-        def _sid(self) -> str | None:
-            try: cookie = SimpleCookie(self.headers.get("Cookie", ""))
-            except Exception: return None
-            morsel = cookie.get("mal_session"); return morsel.value if morsel else None
-        def _session(self): return store.session(self._sid())
         def _json(self) -> dict[str, Any]:
             if self.headers.get("Transfer-Encoding"): raise ValueError("transfer encoding unsupported")
             if self.headers.get("Content-Type", "").split(";", 1)[0].lower() != "application/json": raise TypeError("content type")
@@ -106,13 +102,8 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
             value = json.loads(self.rfile.read(length));
             if not isinstance(value, dict): raise ValueError("object required")
             return value
-        def _require(self, write: bool = False):
-            session = self._session()
-            if not session: self._send_json({"error": "authentication_required"}, HTTPStatus.UNAUTHORIZED); return None
-            if write and not hmac_compare(self.headers.get("X-CSRF-Token", ""), session.csrf): self._send_json({"error": "csrf_failed"}, HTTPStatus.FORBIDDEN); return None
-            return session
         def _origin(self) -> tuple[str, str]:
-            host, scheme = self.headers.get("Host", ""), ("https" if secure_default else "http")
+            host, scheme = self.headers.get("Host", ""), "http"
             if _trusted_proxy(self.client_address[0]):
                 forwarded_host = self.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
                 forwarded_proto = self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
@@ -120,28 +111,39 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
                 if forwarded_proto in {"http", "https"}: scheme = forwarded_proto
             if not valid_host(host): raise ValueError("invalid host")
             return scheme, host
+        def _require_mutation(self) -> bool:
+            try: scheme, host = self._origin()
+            except ValueError:
+                self._send_json({"error": "invalid_host"}, HTTPStatus.BAD_REQUEST); return False
+            expected_origin = f"{scheme}://{host}"
+            supplied_origin = self.headers.get("Origin")
+            if supplied_origin and supplied_origin.rstrip("/") != expected_origin:
+                self._send_json({"error": "cross_origin_forbidden"}, HTTPStatus.FORBIDDEN); return False
+            fetch_site = self.headers.get("Sec-Fetch-Site", "")
+            if fetch_site and fetch_site not in {"same-origin", "none"}:
+                self._send_json({"error": "cross_origin_forbidden"}, HTTPStatus.FORBIDDEN); return False
+            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), store.csrf_token):
+                self._send_json({"error": "csrf_failed"}, HTTPStatus.FORBIDDEN); return False
+            return True
         def do_GET(self) -> None:
             parsed = urlparse(self.path); path = parsed.path
             if path in {"/healthz", "/readyz"}:
                 payload = _status_payload(config=config, daemon=daemon_ref[0], store=store); self._send_json(payload, HTTPStatus.OK if path == "/healthz" or payload["ready"] else HTTPStatus.SERVICE_UNAVAILABLE); return
-            if path == "/setup/status" and not store.claimed: self._send_json({"claimed": False, "setup_required": True}); return
-            if not store.claimed:
-                if path == "/": self._send_html(product_page("claim")); return
-                self._send_json({"error": "setup_required"}, HTTPStatus.UNAUTHORIZED); return
-            if path == "/login": self._send_html(product_page("login")); return
+            try: self._origin()
+            except ValueError: self._send_json({"error": "invalid_host"}, HTTPStatus.BAD_REQUEST); return
             if path == "/oauth/mal/callback":
-                # State is the callback bearer credential; SameSite=Strict omits the admin cookie.
+                # The single-use OAuth state is the callback bearer credential.
                 q = parse_qs(parsed.query); state, code = q.get("state", [""])[0], q.get("code", [""])[0]
                 try:
                     flow = store.consume_oauth(state)
                     if not code: raise ValueError("authorization code missing")
                     token = (oauth_exchange or _oauth_exchange)(config, code, flow["verifier"], flow["redirect_uri"])
-                    persist_token_response(token, load_mal_secrets(config)); store.audit("mal_oauth_completed"); self._send_html(_page("MAL OAuth complete", "done")); return
+                    persist_token_response(token, load_mal_secrets(config)); store.audit("mal_oauth_completed"); self._send_html(_oauth_complete_page()); return
                 except Exception: self._send_json({"error": "oauth_failed"}, HTTPStatus.BAD_REQUEST); return
-            if not self._require(): return
+            if path == "/api/csrf": self._send_json({"csrf_token": store.csrf_token}); return
             if path == "/api/status": self._send_json(_status_payload(config=config, daemon=daemon_ref[0], store=store)); return
             if path == "/api/settings": self._send_json(store.status()); return
-            if path in {"/", "/settings"}: self._send_html(product_page("app")); return
+            if path in {"/", "/settings"}: self._send_html(product_page()); return
             self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
         def do_HEAD(self) -> None: self.do_GET()
         def do_POST(self) -> None:
@@ -151,15 +153,7 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
             except Exception: self._send_json({"error": "invalid_request"}, HTTPStatus.BAD_REQUEST); return
             path, key = urlparse(self.path).path, self.client_address[0]
             try:
-                if path == "/api/setup/claim" and not store.claimed:
-                    if not store.rate.allow("claim:" + key): raise PermissionError("rate_limited")
-                    store.claim(str(data.get("setup_token", "")), str(data.get("password", ""))); self._send_json({"ok": True}, HTTPStatus.CREATED); return
-                if path == "/api/login":
-                    sid, csrf = store.login(str(data.get("password", "")), "login:" + key); scheme, _ = self._origin(); secure = secure_default or scheme == "https"
-                    body = json.dumps({"ok": True, "csrf_token": csrf}).encode(); self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Set-Cookie", f"mal_session={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict" + ("; Secure" if secure else "")); self._headers(); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-                if not self._require(write=True): return
-                if path == "/api/logout": store.logout(self._sid() or ""); self._send_json({"ok": True}); return
-                if path == "/api/password": store.change_password(str(data.get("current_password", "")), str(data.get("new_password", ""))); self._send_json({"ok": True}); return
+                if not self._require_mutation(): return
                 if path == "/api/settings": store.save_settings(data); self._send_json(store.status()); return
                 if path == "/api/secrets": store.save_secrets(data.get("replace", {}), data.get("remove", [])); self._send_json(store.status()); return
                 if path == "/api/daemon":
@@ -169,8 +163,8 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
                     kind = str(data.get("kind", ""))
                     if kind not in {"mal", "crunchyroll", "hidive"}: raise ValueError("unknown connection")
                     if not store.rate.allow("connection-test:" + key): raise PermissionError("rate_limited")
-                    if connection_tester is None: raise ValueError("connection testing unavailable")
-                    connection_tester(kind, timeout=10); self._send_json({"ok": True, "kind": kind, "message": "Connection succeeded"}); return
+                    test_connection(kind, timeout=10)
+                    self._send_json({"ok": True, "kind": kind, "message": "Connection succeeded"}); return
                 if path == "/api/oauth/mal/start":
                     scheme, host = self._origin(); self._send_json(store.begin_oauth(f"{scheme}://{host}/oauth/mal/callback")); return
                 self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
@@ -187,7 +181,7 @@ def _terminate_process(p: subprocess.Popen[bytes], timeout: float = 20) -> None:
         except subprocess.TimeoutExpired: p.kill(); p.wait(timeout=5)
 def run_container(*, project_root: Path | None = None, host: str = "0.0.0.0", port: int = 8080, popen: Any = subprocess.Popen) -> int:
     config = initialize_runtime(project_root); store = ControlStore(config); daemon_ref = [None]
-    print(json.dumps({"event": "first_run_setup_token", "setup_token": store.setup_token}) if not store.claimed else json.dumps({"event": "container_starting"}), flush=True)
+    print(json.dumps({"event": "container_starting"}), flush=True)
     server = ThreadingHTTPServer((host, port), make_container_handler(config, daemon_ref, store)); stop = threading.Event()
     def supervise():
         failures, next_start = 0, 0.0

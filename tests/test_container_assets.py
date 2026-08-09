@@ -27,7 +27,9 @@ class ContainerAssetTests(unittest.TestCase):
         self.assertIn("no-new-privileges:true", text)
         self.assertIn("/healthz", text)
         self.assertIn('profiles: ["tools"]', text)
-        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.2", text)
+        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.3", text)
+        self.assertNotIn("first_run_setup_token", text)
+        self.assertNotIn("container_auth.json", text)
 
     def test_build_context_excludes_runtime_and_secrets(self) -> None:
         ignored = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()

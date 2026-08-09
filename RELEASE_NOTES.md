@@ -1,28 +1,27 @@
-# MAL-Updater 0.2.2
+# MAL-Updater 0.2.3
 
-This is the first fully verified supported **alpha container release** of MAL-Updater. The minor line bump from the unpublished 0.1.4 development package reflects a materially expanded product surface: a hardened container runtime, authenticated setup/control UI, Compose deployment, lifecycle tooling, and a complete release supply chain. Version 0.2.2 supersedes v0.2.1, whose top-level checksum file retained build-directory prefixes and therefore could not validate downloaded standalone Python artifacts, and the incomplete v0.2.0 publication.
+This alpha patch removes MAL-Updater's container dashboard claim/login/password surface for its trusted-LAN-only deployment model. The dashboard and Settings open directly, while MAL OAuth and Crunchyroll/HIDIVE provider authentication and secret handling remain intact. Legacy `container_auth.json` files are ignored.
 
 ## Install
 
-Download and extract `mal-updater-v0.2.2.tar.gz`, copy `.env.example` to `.env`, then run:
+Download and extract `mal-updater-v0.2.3.tar.gz`, copy `.env.example` to `.env`, then run:
 
 ```bash
 docker compose up -d
-docker compose logs mal-updater | grep first_run_setup_token
 ```
 
-The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.2`. Follow the bundled README for first-run claim and setup.
+The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.3`. Open the dashboard and complete MAL configuration/OAuth in Settings; no claim or dashboard login is required.
 
 ## Included artifacts
 
 - Curated Compose bundle with environment template, documentation, license, release metadata, and internal checksums
-- Python 0.2.2 wheel and source distribution
+- Python 0.2.3 wheel and source distribution
 - Top-level SHA-256 checksums
 - AMD64/ARM64 GHCR image with build provenance and SBOM
 - Keyless Sigstore signature for the immutable image digest
 
 ## Support status
 
-Alpha; intended for private LAN use or behind a trusted reverse proxy. Do not expose it directly to the public Internet. Container deployment is the supported end-user path. The source/user-systemd path remains advanced-use only, and its runtime must not be mixed with the container volume.
+Alpha; intended for a trusted private LAN or behind a trusted reverse proxy. The dashboard has no user authentication, so every client that can reach it can change settings. Do not expose it directly to the public Internet. Mutations retain process-local synchronizer CSRF and same-origin/cross-site checks, but network reachability is the access boundary. Container deployment is the supported end-user path. The source/user-systemd path remains advanced-use only, and its runtime must not be mixed with the container volume.
 
 Back up before upgrading. Database rollback means restoring the backup created before migration, not running an older image against a newer database.
