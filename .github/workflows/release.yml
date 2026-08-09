@@ -18,6 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.13'}
       - run: pip install build && python -m build
+      - run: python scripts/check_distribution.py dist
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -39,10 +40,11 @@ jobs:
       - run: cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.build.outputs.digest }}"
       - run: |
           mkdir -p release-bundle/docs
-          cp compose.yaml .env.example README.md LICENSE release-bundle/
+          cp compose.yaml .env.example README.md CHANGELOG.md RELEASE_NOTES.md LICENSE release-bundle/
+          printf '%s\n' "${GITHUB_REF_NAME#v}" > release-bundle/VERSION
           cp references/CONTAINERS.md references/OPERATIONS.md release-bundle/docs/
           cp dist/* release-bundle/
-          (cd release-bundle && sha256sum * docs/* > SHA256SUMS)
+          (cd release-bundle && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
           tar -czf "mal-updater-${GITHUB_REF_NAME}.tar.gz" release-bundle
           sha256sum dist/* "mal-updater-${GITHUB_REF_NAME}.tar.gz" > SHA256SUMS
       - uses: actions/attest-build-provenance@v2
@@ -50,7 +52,7 @@ jobs:
           subject-path: 'mal-updater-*.tar.gz'
       - uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           files: |
             dist/*
             mal-updater-*.tar.gz
