@@ -20,7 +20,7 @@ Release/local builds default to the same Python 3.13.7 Bookworm digest. Python d
 
 ## Trusted-LAN control plane and settings
 
-A fresh `/data` volume opens directly to the dashboard and Settings. The runtime emits only a normal `container_starting` event: there is no first-run token, claim endpoint, login/logout, dashboard password, session cookie, password change/reset, or admin-reset lifecycle command.
+A fresh `/data` volume opens directly to the database-backed recommendations/operations dashboard at `/` (`/dashboard` is an alias) and the configuration control page at `/settings`; both pages link to each other. The dashboard payload is available at `GET /api/dashboard`. The runtime emits only a normal `container_starting` event: there is no first-run token, claim endpoint, login/logout, dashboard password, session cookie, password change/reset, or admin-reset lifecycle command.
 
 This is intentionally a **trusted-LAN-only** product. Every client able to reach the control plane can read status and mutate settings. Do not expose it directly to the Internet/WAN. Put network access control or an authenticating trusted reverse proxy in front if client-level access control is required.
 

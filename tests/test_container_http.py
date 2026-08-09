@@ -29,9 +29,16 @@ class HttpTests(unittest.TestCase):
  def http_error(self,request):
   with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(request,timeout=5)
   return cm.exception
- def test_dashboard_is_direct_and_mutations_use_bootstrap_csrf(self):
-  with urllib.request.urlopen(self.base+'/',timeout=5) as r: html=r.read().decode()
-  self.assertIn('Trusted LAN control plane',html); self.assertIn('aria-live',html); self.assertNotIn('Claim installation',html); self.assertNotIn('Sign in',html)
+ def test_dashboard_routes_are_db_backed_and_settings_is_the_control_page(self):
+  for path in ('/','/dashboard'):
+   with urllib.request.urlopen(self.base+path,timeout=5) as r:
+    html=r.read().decode(); self.assertEqual('nosniff',r.headers['X-Content-Type-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
+   self.assertIn('MAL-Updater live dashboard',html); self.assertIn('/api/dashboard',html); self.assertIn('href="/settings"',html); self.assertNotIn('Trusted LAN control plane',html)
+  response,dashboard=self.get_json('/api/dashboard')
+  self.assertIn('recommendations',dashboard); self.assertEqual('no-store',response.headers['Cache-Control']); self.assertEqual('DENY',response.headers['X-Frame-Options'])
+  with urllib.request.urlopen(self.base+'/settings',timeout=5) as r: settings_html=r.read().decode()
+  self.assertIn('Trusted LAN control plane',settings_html); self.assertIn('aria-live',settings_html); self.assertIn('href="/"',settings_html); self.assertNotIn('Claim installation',settings_html); self.assertNotIn('Sign in',settings_html)
+ def test_mutations_use_bootstrap_csrf(self):
   _,settings=self.get_json('/api/settings'); self.assertNotIn('claimed',settings)
   _,csrf_payload=self.get_json('/api/csrf'); csrf=csrf_payload['csrf_token']
   _,j=post(self.base+'/api/connections/test',{'kind':'mal'},csrf,self.base)
@@ -51,7 +58,7 @@ class HttpTests(unittest.TestCase):
   oversized=self.http_error(urllib.request.Request(self.base+'/api/daemon',data=b'{}',headers={'Content-Type':'application/json','Content-Length':str(64*1024+1)},method='POST')); self.assertEqual(413,oversized.code)
   for path in ('/api/login','/api/logout','/api/password','/api/setup/claim'):
    error=self.http_error(urllib.request.Request(self.base+path,data=b'{}',headers={'Content-Type':'application/json','X-CSRF-Token':self.store.csrf_token},method='POST')); self.assertEqual(404,error.code)
- def test_trusted_host_validation_covers_pages_and_oauth_callback(self):
-  for path in ('/','/api/csrf','/oauth/mal/callback?state=x&code=fake'):
+ def test_trusted_host_validation_covers_pages_dashboard_api_and_oauth_callback(self):
+  for path in ('/','/dashboard','/api/dashboard','/settings','/api/csrf','/oauth/mal/callback?state=x&code=fake'):
    error=self.http_error(urllib.request.Request(self.base+path,headers={'Host':'public.example'})); self.assertEqual(400,error.code)
 if __name__=='__main__': unittest.main()

@@ -1348,12 +1348,12 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     }
 
 
-def render_dynamic_dashboard_html(*, title: str = "MAL-Updater live dashboard") -> str:
+def render_dynamic_dashboard_html(*, title: str = "MAL-Updater live dashboard", settings_href: str | None = None) -> str:
     template = """<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <title>__TITLE__</title><style>
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#101418;color:#eef3f8}a{color:#8cc8ff}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}table{border-collapse:collapse;width:100%;background:#161d24;margin:.75rem 0 1.5rem}th,td{border:1px solid #2b3642;padding:.45rem .6rem;vertical-align:top}th{background:#243140;text-align:left}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.05rem .45rem;font-weight:700;margin:.05rem .2rem .05rem 0}.diagnostic-row{opacity:.82}.diagnostic-label{color:#ffd37a;font-weight:700}code{white-space:pre-wrap}
-</style></head><body><h1>__TITLE__</h1><p class=\"muted\">Live local strict dashboard. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#101418;color:#eef3f8}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}table{border-collapse:collapse;width:100%;background:#161d24;margin:.75rem 0 1.5rem}th,td{border:1px solid #2b3642;padding:.45rem .6rem;vertical-align:top}th{background:#243140;text-align:left}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.05rem .45rem;font-weight:700;margin:.05rem .2rem .05rem 0}.diagnostic-row{opacity:.82}.diagnostic-label{color:#ffd37a;font-weight:700}code{white-space:pre-wrap}
+</style></head><body>__NAVIGATION__<h1>__TITLE__</h1><p class=\"muted\">Live local strict dashboard. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const countValue = value => {
   if (value == null) return '';
@@ -1378,10 +1378,11 @@ function emptyState(state){ if (!state || state.strict_actionable_count !== 0) r
 async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No stale/partial/failure indicators.</li>'; const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown/unverified provider or dub evidence; only Watchable now is actionable.</section>' : '<section class=\"banner good\"><strong>Watchable now dashboard:</strong> actionable discovery rows require verified current Crunchyroll/HIDIVE identity/catalog presence plus explicit English-dub evidence.</section>'; document.getElementById('app').innerHTML = `${mode}<div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({watchable_now: state.strict_actionable_count, ranked_unverified_discovery: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${publicUserrecsSection(data.coverage?.public_userrecs)}${providerEnrichmentSection(data.operational?.provider_enrichment)}${emptyState(state)}<section><h2>Indicators</h2><ul>${indicators}</ul></section><section><h2>Recommendations</h2>${Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => { const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''}; const total = data.recommendations?.section_totals?.[name] ?? rows.length; const countLabel = rows.length < total ? `${rows.length} of ${total}` : `${total}`; return `<h3>${esc(meta.label || name)} (${esc(countLabel)})</h3>${meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : ''}${recTable(rows, meta)}`; }).join('') || recTable([])}</section><section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`; }
 refresh().catch(err => document.getElementById('app').innerHTML = `<p class=\"bad\">${esc(err.message)}</p>`); setInterval(refresh, 60000);
 </script></body></html>"""
-    return template.replace("__TITLE__", escape(title))
+    navigation = f'<nav class="top-nav"><a href="{escape(settings_href, quote=True)}">Settings</a></nav>' if settings_href else ""
+    return template.replace("__TITLE__", escape(title)).replace("__NAVIGATION__", navigation)
 
 
-def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14) -> type[BaseHTTPRequestHandler]:
+def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14, settings_href: str | None = None) -> type[BaseHTTPRequestHandler]:
     default_limit = normalize_dashboard_limit(limit)
 
     class DashboardHandler(BaseHTTPRequestHandler):
@@ -1411,7 +1412,7 @@ def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECO
             query = parse_qs(parsed.query)
             request_limit = normalize_dashboard_limit(query.get("limit", [None])[0], default=default_limit)
             if parsed.path in ("/", "/dashboard"):
-                self._send_html(render_dynamic_dashboard_html())
+                self._send_html(render_dynamic_dashboard_html(settings_href=settings_href))
                 return
             if parsed.path == "/api/dashboard":
                 self._send_json(build_dashboard_payload(db_path, limit=request_limit, stale_after_days=stale_after_days))
