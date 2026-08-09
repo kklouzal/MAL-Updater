@@ -5,6 +5,7 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from typing import Any, Callable, Protocol
 
 from .config import AppConfig, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS
@@ -43,6 +44,8 @@ PROVIDER_SEARCH_CACHE_LOGIC_VERSION = "provider-title-v2"
 PROVIDER_DETAIL_CACHE_LOGIC_VERSION = "crunchyroll-detail-v1"
 PROVIDER_ELIGIBILITY_LOGIC_VERSION = "provider-eligibility-v1"
 PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS = 7
+PROVIDER_ENRICHMENT_TRAVERSAL_SAFETY_FACTOR = 1.25
+PROVIDER_NO_MATCH_SERIES_ID = "__provider_search_no_match__"
 DISCOVERY_PROVIDER_SEARCH_REVIEW_ISSUE = "discovery_provider_search_match_review"
 DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS = STRICT_PROVIDER_ELIGIBILITY_PROVIDERS
 VERIFIED_PROVIDER_SEARCH_IDENTITY_KINDS = frozenset({
@@ -1808,6 +1811,29 @@ _DUE_SELECTION_CLASSES = frozenset({
     "logic_refresh_due",
 })
 
+_SELECTION_CLASS_PRIORITY = {
+    "uncovered": 0,
+    "failed_retry_due": 1,
+    "stale_refresh_due": 2,
+    "expired_refresh_due": 3,
+    "logic_refresh_due": 4,
+    "mapping_refresh_due": 5,
+    "force_refresh": 6,
+}
+
+
+def _effective_evidence_refresh_horizon(
+    config: AppConfig, *, candidate_population: int, candidates_per_run: int
+) -> timedelta:
+    """Keep evidence fresh long enough for this lane to traverse its ranked universe."""
+    cadence_seconds = max(0, int(config.service.provider_eligibility_refresh_every_seconds))
+    capacity = max(0, int(candidates_per_run))
+    floor = timedelta(days=PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS)
+    if cadence_seconds <= 0 or capacity <= 0 or candidate_population <= 0:
+        return floor
+    traversal_seconds = ceil(candidate_population / capacity) * cadence_seconds
+    return max(floor, timedelta(seconds=ceil(traversal_seconds * PROVIDER_ENRICHMENT_TRAVERSAL_SAFETY_FACTOR)))
+
 
 def _candidate_rank_key(item: Recommendation, *, mal_id: int, rank: int) -> dict[str, Any]:
     return {
@@ -2001,9 +2027,16 @@ def _select_provider_enrichment_candidates(
         return []
 
     if cursor_rank is not None:
-        after = [candidate for candidate in ranked if candidate.rank > cursor_rank]
-        before = [candidate for candidate in ranked if candidate.rank <= cursor_rank]
-        ordered = [*after, *before]
+        # Cursor fairness applies within each priority class; initial coverage is
+        # never displaced by refresh work merely because it lies before cursor.
+        ordered = []
+        for selection_class in sorted(
+            {candidate.selection_class for candidate in ranked},
+            key=lambda value: (_SELECTION_CLASS_PRIORITY.get(value, 99), value),
+        ):
+            class_rows = [candidate for candidate in ranked if candidate.selection_class == selection_class]
+            ordered.extend(candidate for candidate in class_rows if candidate.rank > cursor_rank)
+            ordered.extend(candidate for candidate in class_rows if candidate.rank <= cursor_rank)
         selected = ordered[:limit]
         if any(candidate.rank <= cursor_rank for candidate in selected):
             provider_state["wrapped"] = True
@@ -2018,6 +2051,7 @@ def _select_provider_enrichment_candidates(
         selected = sorted(
             ranked,
             key=lambda candidate: (
+                _SELECTION_CLASS_PRIORITY.get(candidate.selection_class, 99),
                 1 if candidate.previous_attempted_at is not None else 0,
                 candidate.previous_attempted_at or "",
                 candidate.rank,
@@ -2355,6 +2389,17 @@ def build_provider_enrichment_diagnostics(
             policy=policy,
             now=current,
         )
+        refresh_horizon = _effective_evidence_refresh_horizon(
+            config,
+            candidate_population=len(ranked_candidates),
+            candidates_per_run=candidate_limit,
+        )
+        traversal_runs = ceil(len(ranked_candidates) / candidate_limit) if candidate_limit > 0 else None
+        traversal_seconds = (
+            traversal_runs * int(policy.get("configured_every_seconds") or 0)
+            if traversal_runs is not None
+            else None
+        )
 
         reason_codes: list[str] = []
         configured_hour = policy.get("configured_candidates_per_provider_hour")
@@ -2407,6 +2452,9 @@ def build_provider_enrichment_diagnostics(
                 "cursor_missing": bool(current_state.get("cursor_missing")),
                 "eligible_count_check": _safe_nonnegative_count(all_state.get("eligible_count")),
                 "eligible_class_counts_check": dict(all_state.get("eligible_class_counts") or {}),
+                "initial_coverage_backlog": int(due_by_class.get("uncovered", 0)),
+                "refresh_backlog": sum(int(due_by_class.get(name, 0)) for name in _DUE_SELECTION_CLASSES),
+                "retry_backoff": int(current_summary.selection_skip_counts.get("retry_backoff", 0)),
             },
             "cursor": _provider_cursor_diagnostic(cursor),
             "attempts": attempt_payload,
@@ -2416,6 +2464,14 @@ def build_provider_enrichment_diagnostics(
                 "distinct_candidates_attempted_last_hour": attempt_payload["distinct_candidates_attempted_last_hour"],
                 "within_authorized_rate": attempt_payload["distinct_candidates_attempted_last_hour"] <= _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR,
                 "configured_exceeds_authorized": None if not isinstance(configured_hour, (int, float)) else configured_hour > _PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR,
+                "candidate_population": len(ranked_candidates),
+                "traversal_runs": traversal_runs,
+                "traversal_seconds": traversal_seconds,
+                "effective_refresh_horizon_seconds": int(refresh_horizon.total_seconds()),
+                "refresh_horizon_floor_days": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
+                "recirculation_risk": bool(
+                    traversal_seconds is not None and traversal_seconds >= refresh_horizon.total_seconds()
+                ),
             },
             "availability_completion_eta": {
                 "eta_seconds": None,
@@ -2499,7 +2555,6 @@ def enrich_discovery_provider_availability(
     current = now or _utc_now()
     fetched_at = _iso(current)
     expires_at = _iso(current + timedelta(days=PROVIDER_SEARCH_CACHE_TTL_DAYS))
-    eligibility_expires_at = _iso(current + timedelta(days=PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS))
     summary = EnrichmentSummary()
     metadata = get_mal_anime_metadata_map(config.db_path)
     mappings_by_series = {
@@ -2522,6 +2577,12 @@ def enrich_discovery_provider_availability(
         )
         if r.kind == "discovery_candidate"
     ]
+    eligibility_refresh_horizon = _effective_evidence_refresh_horizon(
+        config,
+        candidate_population=len(candidates),
+        candidates_per_run=candidate_limit,
+    )
+    eligibility_expires_at = _iso(current + eligibility_refresh_horizon)
     review_entries: list[dict[str, Any]] = []
     child_probe_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     child_probe_failures: set[tuple[str, str]] = set()
@@ -2771,6 +2832,33 @@ def enrich_discovery_provider_availability(
                     })
                 elif outcome not in {"provider_search_failure", "strong_match", "ambiguous_match"}:
                     outcome = "searched_no_match" if searched_provider else "cache_hit_no_match"
+                    if provider_slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS:
+                        # A successful bounded search with no acceptable identity is
+                        # useful negative coverage, not an auto-link. Persist it so
+                        # cursor wraps do not immediately recirculate this candidate.
+                        upsert_recommendation_provider_eligibility_evidence(
+                            config.db_path,
+                            mal_anime_id=selection.mal_id,
+                            provider=provider_slug,
+                            provider_series_id=PROVIDER_NO_MATCH_SERIES_ID,
+                            provider_title=None,
+                            identity_match_kind="provider_title_search_no_match",
+                            review_status="verified",
+                            catalog_status="absent",
+                            english_dub_status="absent",
+                            audio_locales=[],
+                            source_evidence={
+                                "source": "provider_title_search",
+                                "result": "no_acceptable_match",
+                                "query": query,
+                                "search_limit": search_limit,
+                            },
+                            fetched_at=fetched_at,
+                            expires_at=eligibility_expires_at,
+                            last_verified_at=fetched_at,
+                            logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+                        )
+                        summary.eligibility_evidence_upserted += 1
         finally:
             update_recommendation_provider_enrichment_attempt_outcome(
                 config.db_path,

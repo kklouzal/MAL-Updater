@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -8,6 +9,8 @@ import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from mal_updater.config import ConfigError, _load_toml_parser, _read_toml_file, ensure_directories, load_config, load_mal_secrets, load_openclaw_recommendations_hook_token
 
@@ -537,3 +540,9 @@ class ConfigLoadingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_pytest_blocks_canonical_runtime_before_sqlite_open() -> None:
+    canonical_db = Path(__file__).resolve().parents[1] / ".MAL-Updater" / "data" / "mal_updater.sqlite3"
+    with pytest.raises(AssertionError, match="blocked canonical MAL-Updater runtime"):
+        sqlite3.connect(canonical_db)

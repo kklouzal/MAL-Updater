@@ -711,7 +711,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual({"fresh_covered": 1}, summary.selection_skip_counts)
         self.assertEqual(["Needs Coverage"], [call[0] for call in provider.calls])
 
-    def test_provider_cursor_wraps_and_cache_hit_no_match_still_advances(self):
+    def test_provider_no_match_is_covered_until_retry_horizon(self):
         self._insert_meta(903, english="Wrapped One")
         self._insert_meta(904, english="Wrapped Two")
         self._recommendations(903, 904)
@@ -723,12 +723,44 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=1))
         wrapped = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(hours=2))
 
-        self.assertEqual([903], [item["mal_anime_id"] for item in wrapped.selected_candidates])
-        self.assertEqual(1, wrapped.cache_hits)
+        self.assertEqual([], wrapped.selected_candidates)
+        self.assertEqual(0, wrapped.cache_hits)
         self.assertEqual(0, wrapped.provider_searches)
-        self.assertEqual("cache_hit_no_match", wrapped.selected_candidates[0]["outcome"])
-        self.assertTrue(wrapped.provider_cursor_states["crunchyroll"]["wrapped"])
         self.assertEqual(["Wrapped One", "Wrapped Two"], [call[0] for call in provider.calls])
+        evidence = get_recommendation_provider_eligibility_evidence(
+            self.config.db_path, mal_anime_id=903, provider="crunchyroll",
+            provider_series_id=enrichment.PROVIDER_NO_MATCH_SERIES_ID,
+        )
+        self.assertIsNotNone(evidence)
+        self.assertEqual("absent", evidence.catalog_status)
+
+    def test_uncovered_precedes_expired_refresh_across_cursor(self):
+        self._insert_meta(920, english="Expired First")
+        self._insert_meta(921, english="Fresh Initial")
+        self._recommendations(920, 921)
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path, mal_anime_id=920, provider="crunchyroll",
+            provider_series_id="old", fetched_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-02T00:00:00Z", identity_match_kind="provider_title_search_exact",
+            review_status="verified", catalog_status="absent", english_dub_status="absent",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1,
+            now=datetime(2026, 2, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual([921], [item["mal_anime_id"] for item in summary.selected_candidates])
+        self.assertEqual("uncovered", summary.selected_candidates[0]["selection_class"])
+
+    def test_effective_refresh_horizon_covers_capacity_traversal_with_margin(self):
+        self.config.service.provider_eligibility_refresh_every_seconds = 3600
+        horizon = enrichment._effective_evidence_refresh_horizon(
+            self.config, candidate_population=965, candidates_per_run=4,
+        )
+        self.assertGreaterEqual(horizon, timedelta(hours=302, minutes=30))
+        self.assertGreater(horizon, timedelta(days=enrichment.PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS))
 
     def test_provider_cursor_membership_change_uses_unattempted_ranked_candidate(self):
         self._insert_meta(905, english="Departing Cursor")
