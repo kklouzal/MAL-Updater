@@ -37,7 +37,7 @@ Use the repo-local Python CLI for business logic and operator workflows.
 
 ### Daemon
 
-Native installs use a **long-lived user-level systemd daemon**. The container product uses a small Python supervisor and `tini` to run the same daemon beside the dashboard only after explicit enablement; it defaults to inert setup mode.
+Native installs use a **long-lived user-level systemd daemon**. The container product uses a small Python supervisor and `tini` to run the same daemon beside the dashboard whenever required MAL prerequisites are present; incomplete setup is a blocked state rather than a user-disable mode.
 
 The installed unit runs:
 
@@ -89,4 +89,4 @@ A new OpenClaw instance should be able to:
 
 ### Container control plane security
 
-The container HTTP control plane (`container_runtime.py` + `container_web.py`) is intentionally credential-free on a trusted LAN: dashboard and Settings open directly, while MAL OAuth and provider credentials remain separate protected secret material. Mutations require a process-local synchronizer CSRF token and same-origin/cross-site checks. Trusted-host validation, bounded JSON bodies, content-type enforcement, CSP/security headers, atomic secret files, allowlisted settings, explicit connection-test rate limits, and a persisted daemon-enable gate remain in place. The scheduler is not started until required MAL setup is complete and a LAN operator explicitly enables it. See `references/CONTAINERS.md` for the threat model.
+The container HTTP control plane (`container_runtime.py` + `container_web.py`) is intentionally credential-free on a trusted LAN: dashboard and Settings open directly, while MAL OAuth and provider credentials remain separate protected secret material. Mutations require a process-local synchronizer CSRF token and same-origin/cross-site checks. Trusted-host validation, bounded JSON bodies, content-type enforcement, CSP/security headers, atomic secret files, allowlisted settings, and explicit connection-test rate limits remain in place. The scheduler is always desired: it starts only when required MAL setup is complete, stops if those prerequisites are lost, and restarts automatically when they return. Provider lanes remain independently selected by their own credentials and readiness. See `references/CONTAINERS.md` for the threat model.

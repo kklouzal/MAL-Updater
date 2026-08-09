@@ -38,25 +38,34 @@ class HttpTests(unittest.TestCase):
   self.assertIn('recommendations',dashboard); self.assertEqual('no-store',response.headers['Cache-Control']); self.assertEqual('DENY',response.headers['X-Frame-Options'])
   with urllib.request.urlopen(self.base+'/settings',timeout=5) as r: settings_html=r.read().decode()
   self.assertIn('Trusted LAN control plane',settings_html); self.assertIn('aria-live',settings_html); self.assertIn('href="/"',settings_html); self.assertNotIn('Claim installation',settings_html); self.assertNotIn('Sign in',settings_html)
+  self.assertNotIn('Enable automation',settings_html); self.assertNotIn('Disable automation',settings_html); self.assertNotIn('/api/daemon',settings_html)
+  self.assertIn("api('/api/status')",settings_html)
  def test_mutations_use_bootstrap_csrf(self):
   _,settings=self.get_json('/api/settings'); self.assertNotIn('claimed',settings)
   _,csrf_payload=self.get_json('/api/csrf'); csrf=csrf_payload['csrf_token']
   _,j=post(self.base+'/api/connections/test',{'kind':'mal'},csrf,self.base)
   self.assertEqual('Connection succeeded',j['message']); self.assertNotIn('mock ok',json.dumps(j)); self.assertEqual([('mal',10)],self.calls)
   self.assertFalse((self.config.secrets_dir/'container_auth.json').exists())
- def test_readiness_depends_on_mal_setup_not_admin_claim(self):
+ def test_readiness_requires_mal_setup_and_running_scheduler(self):
   error=self.http_error(self.base+'/readyz'); self.assertEqual(503,error.code)
   self.store.save_secrets({'mal_client_id':'fake-client'})
   (self.config.secrets_dir/'mal_access_token.txt').write_text('access\n',encoding='utf-8')
   (self.config.secrets_dir/'mal_refresh_token.txt').write_text('refresh\n',encoding='utf-8')
   self.assertTrue(self.store.status()['setup_complete'])
-  _,ready=self.get_json('/readyz'); self.assertTrue(ready['ready'])
+  error=self.http_error(self.base+'/readyz'); self.assertEqual(503,error.code)
+  blocked=json.loads(error.read()); self.assertEqual('blocked',blocked['automation_state']); self.assertEqual(['scheduler_not_running'],blocked['automation_blockers'])
+
+  running=unittest.mock.Mock(); running.poll.return_value=None
+  self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=5)
+  self.server=ThreadingHTTPServer(('127.0.0.1',0),make_container_handler(self.config,[running],self.store,connection_tester=lambda kind,timeout: None))
+  self.thread=threading.Thread(target=self.server.serve_forever,daemon=True); self.thread.start(); self.base=f'http://127.0.0.1:{self.server.server_port}'
+  _,ready=self.get_json('/readyz'); self.assertTrue(ready['ready']); self.assertEqual('running',ready['automation_state'])
  def test_csrf_origin_json_limits_and_dead_auth_routes(self):
-  missing=self.http_error(urllib.request.Request(self.base+'/api/daemon',data=b'{"enabled":false}',headers={'Content-Type':'application/json'},method='POST')); self.assertEqual(403,missing.code)
-  cross=self.http_error(urllib.request.Request(self.base+'/api/daemon',data=b'{"enabled":false}',headers={'Content-Type':'application/json','X-CSRF-Token':self.store.csrf_token,'Origin':'http://evil.example'},method='POST')); self.assertEqual(403,cross.code)
-  media=self.http_error(urllib.request.Request(self.base+'/api/daemon',data=b'{}',headers={'Content-Type':'text/plain'},method='POST')); self.assertEqual(415,media.code)
-  oversized=self.http_error(urllib.request.Request(self.base+'/api/daemon',data=b'{}',headers={'Content-Type':'application/json','Content-Length':str(64*1024+1)},method='POST')); self.assertEqual(413,oversized.code)
-  for path in ('/api/login','/api/logout','/api/password','/api/setup/claim'):
+  missing=self.http_error(urllib.request.Request(self.base+'/api/settings',data=b'{}',headers={'Content-Type':'application/json'},method='POST')); self.assertEqual(403,missing.code)
+  cross=self.http_error(urllib.request.Request(self.base+'/api/settings',data=b'{}',headers={'Content-Type':'application/json','X-CSRF-Token':self.store.csrf_token,'Origin':'http://evil.example'},method='POST')); self.assertEqual(403,cross.code)
+  media=self.http_error(urllib.request.Request(self.base+'/api/settings',data=b'{}',headers={'Content-Type':'text/plain'},method='POST')); self.assertEqual(415,media.code)
+  oversized=self.http_error(urllib.request.Request(self.base+'/api/settings',data=b'{}',headers={'Content-Type':'application/json','Content-Length':str(64*1024+1)},method='POST')); self.assertEqual(413,oversized.code)
+  for path in ('/api/daemon','/api/login','/api/logout','/api/password','/api/setup/claim'):
    error=self.http_error(urllib.request.Request(self.base+path,data=b'{}',headers={'Content-Type':'application/json','X-CSRF-Token':self.store.csrf_token},method='POST')); self.assertEqual(404,error.code)
  def test_trusted_host_validation_covers_pages_dashboard_api_and_oauth_callback(self):
   for path in ('/','/dashboard','/api/dashboard','/settings','/api/csrf','/oauth/mal/callback?state=x&code=fake'):

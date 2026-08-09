@@ -1,21 +1,21 @@
-# MAL-Updater 0.2.3
+# MAL-Updater 0.2.4
 
-This alpha patch removes MAL-Updater's container dashboard claim/login/password surface for its trusted-LAN-only deployment model. The dashboard and Settings open directly, while MAL OAuth and Crunchyroll/HIDIVE provider authentication and secret handling remain intact. Legacy `container_auth.json` files are ignored.
+This alpha patch makes container automation the always-on product backbone. The scheduler starts automatically when required MAL client/OAuth prerequisites are complete, stops safely if they are lost, and restarts automatically when restored. There is no dashboard enable/disable control or daemon mutation API. Legacy `daemon_enabled:false` state is ignored. Provider lanes remain independently credential/readiness-gated, and conservative MAL write/mapping controls remain intact.
 
 ## Install
 
-Download and extract `mal-updater-v0.2.3.tar.gz`, copy `.env.example` to `.env`, then run:
+Download and extract `mal-updater-v0.2.4.tar.gz`, copy `.env.example` to `.env`, then run:
 
 ```bash
 docker compose up -d
 ```
 
-The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.3`. Open the dashboard and complete MAL configuration/OAuth in Settings; no claim or dashboard login is required.
+The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.4`. Open the dashboard and complete MAL configuration/OAuth in Settings; automation starts automatically after setup is complete.
 
 ## Included artifacts
 
 - Curated Compose bundle with environment template, documentation, license, release metadata, and internal checksums
-- Python 0.2.3 wheel and source distribution
+- Python 0.2.4 wheel and source distribution
 - Top-level SHA-256 checksums
 - AMD64/ARM64 GHCR image with build provenance and SBOM
 - Keyless Sigstore signature for the immutable image digest

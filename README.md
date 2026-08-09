@@ -15,7 +15,7 @@ docker compose up -d
 
 Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
 
-The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.3`. For local development builds use:
+The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.4`. For local development builds use:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
@@ -27,7 +27,7 @@ docker compose -f compose.yaml -f compose.build.yaml up -d --build
 2. Use **Test connection** explicitly when desired. Tests are user-triggered, rate-limited, timeout-bounded, and redact errors.
 3. Start MAL OAuth from Settings. Configure the MAL app callback as `http://localhost/oauth/mal/callback` for local access, or the exact trusted LAN/proxy URL you use.
 4. Add Crunchyroll/HIDIVE credentials and test them only when intentionally requested.
-5. Enable automation explicitly. The daemon will not start until the MAL client ID and MAL OAuth tokens are present.
+5. Automation starts automatically after the MAL client ID and MAL OAuth tokens are present. Until then it remains safely blocked; removing either prerequisite stops it, and restoring the prerequisite starts it again without a toggle.
 
 Dashboard access is deliberately credential-free for this trusted-LAN-only product. MAL OAuth and provider authentication remain unchanged and their secrets remain outside the UI response surface.
 
@@ -61,7 +61,7 @@ Before upgrading, create and verify a backup. Pin the new image tag in `.env`, t
 ## Health semantics
 
 - `/healthz`: liveness; returns 200 when the web process can answer.
-- `/readyz`: readiness; returns 200 once required MAL setup is complete and, when automation is enabled, the daemon is running. It returns 503 while MAL setup is incomplete or the enabled daemon is degraded.
+- `/readyz`: readiness; returns 200 only while required MAL setup is complete and the automatically supervised scheduler is running. It returns 503 with blocked status while prerequisites are missing, startup is in progress, or the scheduler is degraded/restarting.
 
 ## Legacy/systemd advanced path
 
@@ -70,10 +70,10 @@ The historical user-systemd CLI path remains for advanced/manual installs from a
 ## Troubleshooting
 
 - Dashboard/settings unavailable: check `docker compose logs --tail=200 mal-updater` and confirm the requested hostname is loopback, private-IP, or explicitly listed in `MAL_UPDATER_TRUSTED_HOSTS`.
-- Readiness degraded: complete MAL credentials/OAuth, or inspect logs if enabled automation is restarting.
+- Readiness degraded: complete MAL credentials/OAuth, or inspect logs if the automatically supervised scheduler is restarting.
 - OAuth callback mismatch: update the MAL app callback to the exact browser URL plus `/oauth/mal/callback`.
 - UI mutation reports CSRF failure after a restart: reload the page to obtain the new process-local token.
 
 ## Release/support policy
 
-MAL-Updater remains alpha software. Version 0.2.3 removes the container dashboard claim/login/password surface for the trusted-LAN product while preserving provider/MAL authentication and the control-plane hardening described above. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+MAL-Updater remains alpha software. Version 0.2.4 makes container automation always desired and prerequisite-driven; version 0.2.3 removed the dashboard claim/login/password surface. Provider/MAL authentication and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.

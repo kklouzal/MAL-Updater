@@ -16,18 +16,29 @@ from .db import bootstrap_database
 from .mal_client import TokenResponse
 from .recommendation_dashboard import make_dashboard_handler
 
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-def env_flag(name: str, *, default: bool = False) -> bool:
-    value = os.getenv(name); return default if value is None else value.strip().lower() in _TRUE_VALUES
-def setup_mode(store: ControlStore | None = None) -> bool:
-    return not (store.status()["daemon_enabled"] if store else env_flag("MAL_UPDATER_CONTAINER_ENABLE_DAEMON"))
 def initialize_runtime(project_root: Path | None = None) -> AppConfig:
     config = load_config(project_root); ensure_directories(config); bootstrap_database(config.db_path); return config
 def daemon_command(project_root: Path) -> list[str]:
     return [sys.executable, "-m", "mal_updater.cli", "--project-root", str(project_root), "service-run"]
 def _status_payload(*, config: AppConfig, daemon: subprocess.Popen[bytes] | None, store: ControlStore) -> dict[str, Any]:
-    state = store.status(); running = daemon is not None and daemon.poll() is None; enabled = state["daemon_enabled"]
-    return {"status": "ok" if not enabled or running else "degraded", "ready": bool(state["setup_complete"] and (not enabled or running)), "mode": "operational" if enabled else "setup", "daemon_enabled": enabled, "daemon_running": running, "database_initialized": config.db_path.is_file(), "setup_complete": state["setup_complete"]}
+    state = store.status()
+    process_running = daemon is not None and daemon.poll() is None
+    prerequisites_satisfied = bool(state["automation_prerequisites_satisfied"])
+    running = prerequisites_satisfied and process_running
+    automation_state = "running" if running else "blocked"
+    automation_blockers = state["automation_blockers"] if not prerequisites_satisfied else ([] if running else ["scheduler_not_running"])
+    return {
+        "status": "ok" if running else automation_state,
+        "ready": running,
+        "mode": "operational" if running else automation_state,
+        "automation_desired": True,
+        "automation_prerequisites_satisfied": prerequisites_satisfied,
+        "automation_state": automation_state,
+        "automation_blockers": automation_blockers,
+        "daemon_running": process_running,
+        "database_initialized": config.db_path.is_file(),
+        "setup_complete": state["setup_complete"],
+    }
 def _oauth_complete_page() -> str:
     return """<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>MAL OAuth complete</title></head><body><main><h1>MAL OAuth complete</h1><p>Tokens were saved. Return to the <a href=\"/\">MAL-Updater dashboard</a>.</p></main></body></html>"""
 
@@ -157,9 +168,6 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
                 if not self._require_mutation(): return
                 if path == "/api/settings": store.save_settings(data); self._send_json(store.status()); return
                 if path == "/api/secrets": store.save_secrets(data.get("replace", {}), data.get("remove", [])); self._send_json(store.status()); return
-                if path == "/api/daemon":
-                    if set(data) != {"enabled"} or not isinstance(data["enabled"], bool): raise ValueError("invalid daemon request")
-                    store.set_daemon(data["enabled"]); self._send_json(store.status()); return
                 if path == "/api/connections/test":
                     kind = str(data.get("kind", ""))
                     if kind not in {"mal", "crunchyroll", "hidive"}: raise ValueError("unknown connection")
@@ -180,21 +188,47 @@ def _terminate_process(p: subprocess.Popen[bytes], timeout: float = 20) -> None:
         p.terminate()
         try: p.wait(timeout=timeout)
         except subprocess.TimeoutExpired: p.kill(); p.wait(timeout=5)
+
+class SchedulerSupervisor:
+    """Keep the scheduler running whenever its required MAL setup is present."""
+
+    def __init__(self, config: AppConfig, store: ControlStore, daemon_ref: list[subprocess.Popen[bytes] | None], *, popen: Any = subprocess.Popen):
+        self.config = config
+        self.store = store
+        self.daemon_ref = daemon_ref
+        self.popen = popen
+        self.failures = 0
+        self.next_start = 0.0
+
+    def reconcile(self, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        child = self.daemon_ref[0]
+        prerequisites_satisfied = bool(self.store.status()["automation_prerequisites_satisfied"])
+
+        if not prerequisites_satisfied:
+            if child is not None and child.poll() is None:
+                _terminate_process(child)
+            self.daemon_ref[0] = None
+            self.failures = 0
+            self.next_start = 0.0
+            return
+
+        if child is not None and child.poll() is not None:
+            self.failures += 1
+            self.next_start = now + min(60, 2 ** min(self.failures, 6))
+            self.daemon_ref[0] = None
+
+        if self.daemon_ref[0] is None and now >= self.next_start:
+            self.daemon_ref[0] = self.popen(daemon_command(self.config.project_root), start_new_session=False)
+
 def run_container(*, project_root: Path | None = None, host: str = "0.0.0.0", port: int = 8080, popen: Any = subprocess.Popen) -> int:
     config = initialize_runtime(project_root); store = ControlStore(config); daemon_ref = [None]
     print(json.dumps({"event": "container_starting"}), flush=True)
     server = ThreadingHTTPServer((host, port), make_container_handler(config, daemon_ref, store)); stop = threading.Event()
+    scheduler = SchedulerSupervisor(config, store, daemon_ref, popen=popen)
     def supervise():
-        failures, next_start = 0, 0.0
         while not stop.wait(1):
-            enabled = store.status()["daemon_enabled"]
-            child = daemon_ref[0]
-            if child is not None and child.poll() is not None:
-                failures += 1; next_start = time.monotonic() + min(60, 2 ** min(failures, 6)); daemon_ref[0] = None
-            if enabled and daemon_ref[0] is None and time.monotonic() >= next_start:
-                daemon_ref[0] = popen(daemon_command(config.project_root), start_new_session=False)
-            if not enabled and daemon_ref[0] is not None:
-                _terminate_process(daemon_ref[0]); daemon_ref[0] = None; failures = 0
+            scheduler.reconcile()
     supervisor = threading.Thread(target=supervise, daemon=True); supervisor.start()
     def request_stop(*_): stop.set(); threading.Thread(target=server.shutdown, daemon=True).start()
     previous = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGTERM, signal.SIGINT)}

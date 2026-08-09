@@ -60,7 +60,25 @@ class ControlStore:
         present = {k: (self.config.secrets_dir / v).is_file() for k, v in self.SECRET_NAMES.items()}
         mal = load_mal_secrets(self.config)
         complete = bool(mal.client_id) and bool(mal.access_token and mal.refresh_token)
-        return {"setup_complete": complete, "daemon_enabled": bool(state.get("daemon_enabled")), "mal_oauth_complete": bool(mal.access_token and mal.refresh_token), "secrets_present": present, "providers": {"crunchyroll_enabled": bool(state.get("crunchyroll_enabled")), "hidive_enabled": bool(state.get("hidive_enabled"))}, "write_posture": "conservative; onboarding does not approve MAL writes"}
+        blockers = []
+        if not mal.client_id:
+            blockers.append("mal_client_id")
+        if not (mal.access_token and mal.refresh_token):
+            blockers.append("mal_oauth_tokens")
+        return {
+            "setup_complete": complete,
+            "automation_desired": True,
+            "automation_prerequisites_satisfied": complete,
+            "automation_state": "ready" if complete else "blocked",
+            "automation_blockers": blockers,
+            "mal_oauth_complete": bool(mal.access_token and mal.refresh_token),
+            "secrets_present": present,
+            "providers": {
+                "crunchyroll_enabled": bool(state.get("crunchyroll_enabled")),
+                "hidive_enabled": bool(state.get("hidive_enabled")),
+            },
+            "write_posture": "conservative; onboarding does not approve MAL writes",
+        }
     def save_settings(self, data: dict[str, Any]) -> None:
         allowed = {"crunchyroll_enabled", "hidive_enabled", "sync_every_seconds", "health_every_seconds"}
         if set(data) - allowed: raise ValueError("unknown setting")
@@ -86,16 +104,7 @@ class ControlStore:
                 write_secret_file(self.config.secrets_dir / self.SECRET_NAMES[name], value)
             for name in remove or []:
                 (self.config.secrets_dir / self.SECRET_NAMES[name]).unlink(missing_ok=True)
-            if any(name.startswith("mal_") for name in remove or []):
-                state = _read_json(self.state_path); state["daemon_enabled"] = False
-                atomic_write_json(self.state_path, state, mode=0o600)
         self.audit("secrets_changed", replaced=sorted(data), removed=sorted(remove or []))
-    def set_daemon(self, enabled: bool) -> None:
-        if enabled and not self.status()["setup_complete"]: raise ValueError("setup incomplete")
-        with self.lock:
-            state = _read_json(self.state_path); state["daemon_enabled"] = enabled
-            atomic_write_json(self.state_path, state, mode=0o600)
-        self.audit("daemon_state_changed", enabled=enabled)
     def begin_oauth(self, redirect_uri: str) -> dict[str, str]:
         parsed = urlparse(redirect_uri)
         if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.path != "/oauth/mal/callback" or parsed.query or parsed.fragment:

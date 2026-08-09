@@ -2,7 +2,7 @@
 
 ## Product shape
 
-One image runs a credential-free trusted-LAN HTTP control plane and the existing scheduler as a supervised child. Automation is persisted disabled and cannot start until the MAL client ID and OAuth tokens exist. `tini` is PID 1. The Python supervisor applies bounded exponential restart backoff and forwards shutdown.
+One image runs a credential-free trusted-LAN HTTP control plane and the existing scheduler as a supervised child. Automation is always desired but remains blocked until the MAL client ID and OAuth tokens exist. The supervisor starts it automatically when those prerequisites appear, stops it if they disappear, and starts it again when restored. `tini` is PID 1. The Python supervisor retains bounded exponential restart backoff and forwards shutdown.
 
 ## Persistent data and container boundary
 
@@ -12,7 +12,7 @@ Legacy `/data/secrets/container_auth.json` files from v0.2.2 are ignored. No mig
 
 ## Health
 
-`/healthz` is liveness. `/readyz` is 200 only after required MAL setup is complete and, when enabled, the child daemon is alive. Dashboard, status, settings, and recommendation read surfaces open directly without an installation claim or user session.
+`/healthz` is liveness. `/readyz` is 200 only after required MAL setup is complete and the child scheduler is alive. Missing prerequisites, scheduler startup, and scheduler restart/backoff report blocked/not-ready. Dashboard, status, settings, and recommendation read surfaces open directly without an installation claim or user session.
 
 ## Base image and dependencies
 
@@ -32,7 +32,7 @@ MAL OAuth starts at `POST /api/oauth/mal/start`. The generated callback is exact
 
 Provider connection tests remain deliberate network actions: saving credentials performs no network I/O. Connection tests are explicit, CSRF-protected, per-client rate-limited, timeout-bounded actions; secret values and provider error details are not returned. MAL OAuth and Crunchyroll/HIDIVE provider authentication and token/session secret handling are unchanged by removal of dashboard authentication.
 
-Automation is enabled with CSRF-protected `POST /api/daemon` (`{"enabled":true}`) only after the MAL client ID and MAL OAuth tokens are present. The in-process supervisor observes the persisted flag and starts/stops the existing daemon without Compose environment edits. Onboarding never enables MAL writes; existing conservative approval/write controls remain authoritative.
+Container automation has no normal enable/disable control or mutation API. The in-process supervisor derives desired process state from the required MAL client ID and OAuth token material: complete prerequisites start the scheduler, loss stops it, and restoration starts it again without Compose edits or another user action. Legacy `daemon_enabled` values in `container-control.json`, including `false`, are ignored. Provider task lanes remain independently gated by their own credentials and existing runtime readiness/backoff policy. Onboarding still does not approve MAL writes; existing exact-approved/conservative write limits and mapping ambiguity controls remain authoritative.
 
 ## Product container lifecycle commands
 

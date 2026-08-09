@@ -2,6 +2,15 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [0.2.4] - 2026-08-09
+
+### Changed
+
+- Made container automation always desired rather than user-toggleable. The scheduler starts automatically when the MAL client ID and OAuth tokens are present, stops safely if either prerequisite is lost, and starts again when prerequisites return.
+- Removed the dashboard automation enable/disable button and `POST /api/daemon`. Legacy persisted `daemon_enabled:false` state is ignored so upgraded complete installations start without migration or another user action.
+- Readiness now reports running only while the scheduler is actually alive and blocked/not-ready during missing prerequisites, startup, or restart backoff. Provider lanes remain independently credential-gated, and existing pacing/backoff, conservative MAL write, mapping ambiguity, CSRF/security-header, and secret-hygiene controls are unchanged.
+- Updated the pinned container/bundle version to 0.2.4.
+
 ## [0.2.3] - 2026-08-09
 
 ### Changed
