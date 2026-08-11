@@ -15,7 +15,7 @@ docker compose up -d
 
 Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
 
-The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.4`. For local development builds use:
+The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.5`. For local development builds use:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
@@ -45,14 +45,14 @@ All lifecycle operations use the Compose tools profile and the same persistent v
 
 ```bash
 docker compose --profile tools run --rm cli version
-docker compose --profile tools run --rm cli backup /data/state/backups/manual.tar.gz
-docker compose --profile tools run --rm cli backup-inspect --verify /data/state/backups/manual.tar.gz
-docker compose --profile tools run --rm cli restore --dry-run /data/state/backups/manual.tar.gz
-docker compose --profile tools run --rm cli restore --yes /data/state/backups/manual.tar.gz
+docker compose --profile tools run --rm cli backup /data/backups/manual.tar.gz
+docker compose --profile tools run --rm cli backup-inspect --verify /data/backups/manual.tar.gz
+docker compose --profile tools run --rm cli restore --dry-run /data/backups/manual.tar.gz
+docker compose --profile tools run --rm cli restore --yes /data/backups/manual.tar.gz
 docker compose --profile tools run --rm cli support-bundle /data/state/support/support.tar.gz
 ```
 
-Backups contain a SQLite-consistent DB copy, config, secrets, state, a manifest, and SHA-256 checksums. Restore verifies first, requires `--yes`, and creates an automatic pre-restore backup. Support bundles are deliberately redacted and do not include secret contents, usernames, database rows, tokens, or logs.
+Backups contain a SQLite-consistent DB copy, config, secrets, state, a manifest, and SHA-256 checksums. Keep production backup destinations under `/data`; lifecycle work is staged on that persistent destination volume rather than bounded `/tmp`, and the destination subtree is excluded from its own archive. Restore verifies first, requires `--yes`, and creates an automatic pre-restore backup. Support bundles are deliberately redacted and do not include secret contents, usernames, database rows, tokens, or logs.
 
 ## Upgrades and rollback
 
@@ -76,4 +76,4 @@ The historical user-systemd CLI path remains for advanced/manual installs from a
 
 ## Release/support policy
 
-MAL-Updater remains alpha software. Version 0.2.4 makes container automation always desired and prerequisite-driven; version 0.2.3 removed the dashboard claim/login/password surface. Provider/MAL authentication and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+MAL-Updater remains alpha software. Version 0.2.5 adds fail-closed stale-write reconciliation, a 14-day recommendation snapshot horizon with a 30-run-per-kind floor, and large-volume-safe container backups; version 0.2.4 made container automation always desired and prerequisite-driven, and version 0.2.3 removed the dashboard claim/login/password surface. Provider/MAL authentication and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.

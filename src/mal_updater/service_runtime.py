@@ -41,6 +41,7 @@ from .request_tracking import (
     request_context_environment,
     summarize_recent_api_usage,
 )
+from .recommendation_snapshot_retention import prune_recommendation_score_snapshots
 
 
 @dataclass(slots=True)
@@ -1855,6 +1856,27 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             f"{prune_report.actual_removed} expired_removed={prune_report.expired_removed} "
             f"kept_records={prune_report.kept_records} scanned_records={prune_report.scanned_records}",
         )
+    try:
+        snapshot_prune = prune_recommendation_score_snapshots(
+            config.db_path,
+            retention_days=config.service.recommendation_snapshot_retention_days,
+            min_runs_per_kind=config.service.recommendation_snapshot_min_runs_per_kind,
+            batch_size=config.service.recommendation_snapshot_prune_batch_size,
+        ).as_dict()
+    except Exception as exc:
+        snapshot_prune = {
+            "status": "blocked_error",
+            "error_type": sanitize_text(type(exc).__name__, max_length=100),
+            "deleted_rows": 0,
+        }
+    state["recommendation_snapshot_retention"] = snapshot_prune
+    if snapshot_prune.get("deleted_rows"):
+        _append_log(
+            config,
+            "recommendation_score_snapshots_pruned="
+            f"{snapshot_prune['deleted_rows']} remaining_eligible={snapshot_prune.get('remaining_eligible_rows', 0)} "
+            f"rows_after={snapshot_prune.get('rows_after', 0)}",
+        )
     tasks_state = state.setdefault("tasks", {})
 
     for spec in _task_specs(config):
@@ -2291,7 +2313,13 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
         for provider in sorted(tracked_providers)
     }
     _save_state(config, state)
-    payload = {"status": "ok", "results": results, "state_file": str(config.service_state_path), "api_usage": state["api_usage"]}
+    payload = {
+        "status": "ok",
+        "results": results,
+        "state_file": str(config.service_state_path),
+        "api_usage": state["api_usage"],
+        "recommendation_snapshot_retention": snapshot_prune,
+    }
     safe_payload = sanitize_value(payload, max_depth=10, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
     return safe_payload if isinstance(safe_payload, dict) else {"status": "error", "reason": "result_sanitization_failed"}
 

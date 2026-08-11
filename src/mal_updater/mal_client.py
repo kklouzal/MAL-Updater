@@ -101,6 +101,19 @@ def _read_http_error_detail(exc: HTTPError) -> str:
         exc.close()
 
 
+def _decode_json_object(body: bytes, *, error_context: str) -> dict[str, Any]:
+    """Decode a JSON object without reflecting an upstream body into errors."""
+    if not body.strip():
+        raise MalApiError(f"{error_context}: empty response body")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MalApiError(f"{error_context}: malformed JSON response") from exc
+    if not isinstance(payload, dict):
+        raise MalApiError(f"{error_context}: JSON response must be an object")
+    return payload
+
+
 class MalClient:
     def __init__(self, config: AppConfig, secrets: MalSecrets):
         self.config = config
@@ -142,7 +155,7 @@ class MalClient:
         return False
 
     def _format_timeout_message(self, error_context: str, exc: BaseException, *, attempts: int = _TIMEOUT_RETRY_ATTEMPTS) -> str:
-        return f"{error_context}: timeout after {attempts} attempts: {exc}"
+        return f"{error_context}: timeout after {attempts} attempts"
 
     def _request_with_timeout_retry(
         self,
@@ -295,7 +308,15 @@ class MalClient:
                 expires_at=(now + timedelta(days=max(0, ttl_days))).isoformat().replace("+00:00", "Z"))
         return response
 
-    def get_anime_details(self, anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status", force_refresh: bool = False, cache_ttl_days: int | None = None) -> dict[str, Any]:
+    def get_anime_details(
+        self,
+        anime_id: int,
+        *,
+        fields: str = "id,title,num_episodes,my_list_status",
+        force_refresh: bool = False,
+        require_user: bool = False,
+        cache_ttl_days: int | None = None,
+    ) -> dict[str, Any]:
         fields_key = ",".join(sorted({part.strip() for part in fields.split(",") if part.strip()}))
         now = datetime.now(timezone.utc).replace(microsecond=0)
         now_iso = now.isoformat().replace("+00:00", "Z")
@@ -312,7 +333,7 @@ class MalClient:
                 return cached.response
         response = self._get_json(
             f"/anime/{anime_id}?{urlencode({'fields': fields})}",
-            headers=self._build_auth_headers(require_user=False),
+            headers=self._build_auth_headers(require_user=require_user),
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
         ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
@@ -406,16 +427,16 @@ class MalClient:
         try:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                    body = response.read().decode("utf-8")
+                    result = _decode_json_object(response.read(), error_context=error_context)
                     record_api_request_event("mal", "update_my_list_status", url=request.full_url, method="PUT", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
-                    return json.loads(body) if body else {"status": status, "num_episodes_watched": num_watched_episodes}
+                    return result
 
             return self._request_with_timeout_retry(error_context, _send, operation="update_my_list_status", url=request.full_url, method="PUT")
         except HTTPError as exc:
-            detail = _read_http_error_detail(exc)
-            raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
+            _read_http_error_detail(exc)
+            raise MalApiError(f"{error_context}: HTTP {exc.code}") from exc
         except URLError as exc:
-            raise MalApiError(f"{error_context}: {exc.reason}") from exc
+            raise MalApiError(f"{error_context}: network error") from exc
 
     def _get_json(self, path_or_url: str, *, headers: dict[str, str], error_context: str) -> dict[str, Any]:
         url = path_or_url if path_or_url.startswith("http") else f"{self.config.mal.base_url}{path_or_url}"
@@ -423,15 +444,16 @@ class MalClient:
         try:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+                    result = _decode_json_object(response.read(), error_context=error_context)
                     record_api_request_event("mal", "get_json", url=url, method="GET", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
-                    return json.loads(response.read().decode("utf-8"))
+                    return result
 
             return self._request_with_timeout_retry(error_context, _send, operation="get_json", url=url, method="GET")
         except HTTPError as exc:
-            detail = _read_http_error_detail(exc)
-            raise MalApiError(f"{error_context}: HTTP {exc.code}: {detail}") from exc
+            _read_http_error_detail(exc)
+            raise MalApiError(f"{error_context}: HTTP {exc.code}") from exc
         except URLError as exc:
-            raise MalApiError(f"{error_context}: {exc.reason}") from exc
+            raise MalApiError(f"{error_context}: network error") from exc
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
         # MAL OAuth2 Scheme 1 documents client_id as the Basic auth username
@@ -453,15 +475,16 @@ class MalClient:
         try:
             def _send() -> dict[str, Any]:
                 with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+                    result = _decode_json_object(response.read(), error_context="MAL token request failed")
                     record_api_request_event("mal", "token_request", url=url, method="POST", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
-                    return json.loads(response.read().decode("utf-8"))
+                    return result
 
             raw = self._request_with_timeout_retry("MAL token request failed", _send, operation="token_request", url=url, method="POST")
         except HTTPError as exc:
-            detail = _read_http_error_detail(exc)
-            raise MalApiError(f"MAL token request failed: HTTP {exc.code}: {detail}") from exc
+            _read_http_error_detail(exc)
+            raise MalApiError(f"MAL token request failed: HTTP {exc.code}") from exc
         except URLError as exc:
-            raise MalApiError(f"MAL token request failed: {exc.reason}") from exc
+            raise MalApiError("MAL token request failed: network error") from exc
         return TokenResponse(
             access_token=raw["access_token"],
             token_type=raw.get("token_type", "Bearer"),

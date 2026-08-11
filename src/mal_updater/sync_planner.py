@@ -7,10 +7,13 @@ from typing import Any
 
 from .config import AppConfig, load_mal_secrets
 from .db import (
+    MalUserAnimeListCacheEntry,
     PersistedSeriesMapping,
     connect,
+    get_mal_user_anime_list_cache,
     get_series_mapping,
     list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
+    reconcile_mal_user_state_after_write,
     replace_review_queue_entries,
     upsert_series_mapping,
     upsert_watch_confirmation_provenance,
@@ -20,6 +23,7 @@ from .mapping import SeriesMappingInput, extract_provider_mapping_evidence, map_
 
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
+MAL_USER_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 MAPPING_REVIEW_HEURISTICS_REVISION = "2026-07-24b"
 AUTO_CLASSIFIED_PROVIDER_SHELL_DECISION = "auto_classified_provider_shell"
 AUTO_CLASSIFIED_AGGREGATE_PROGRESS_DECISION = "auto_classified_aggregate_progress"
@@ -910,12 +914,19 @@ def execute_approved_sync(
             detail = client.get_anime_details(
                 persisted.mal_anime_id,
                 fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
+                force_refresh=not dry_run,
+                require_user=not dry_run,
             )
         except MalApiError as exc:
+            lookup_reason = (
+                f"mal_details_lookup_failed:{exc}"
+                if dry_run
+                else f"mal_live_state_revalidation_failed:{exc}"
+            )
             error_reasons = [
                 "using_user_approved_mapping",
                 *(["exact_approved_only_enabled"] if exact_approved_only else []),
-                f"mal_details_lookup_failed:{exc}",
+                lookup_reason,
             ]
             proposal = SyncProposal(
                 provider_series_id=state.provider_series_id,
@@ -948,6 +959,108 @@ def execute_approved_sync(
                 )
             )
             continue
+
+        evidence_reasons: list[str] = []
+        if not dry_run:
+            live_status, validation_reason = _validated_live_mal_user_state(
+                detail,
+                expected_anime_id=persisted.mal_anime_id,
+            )
+            if validation_reason is not None:
+                error_reasons = [
+                    "using_user_approved_mapping",
+                    "executor_revalidated_live_mal_state",
+                    *( ["exact_approved_only_enabled"] if exact_approved_only else []),
+                    validation_reason,
+                    "mal_live_user_state_invalid_fail_closed",
+                ]
+                proposal = SyncProposal(
+                    provider_series_id=state.provider_series_id,
+                    provider_title=state.title,
+                    mapping_status="approved",
+                    confidence=float(persisted.confidence or 1.0),
+                    mal_anime_id=persisted.mal_anime_id,
+                    mal_title=_coerce_optional_str(detail.get("title")) if isinstance(detail, dict) else None,
+                    current_my_list_status=None,
+                    proposed_my_list_status=None,
+                    decision="review",
+                    mapping_source=persisted.mapping_source,
+                    persisted_mapping_approved=True,
+                    completion_audit=state.completion_audit,
+                    reasons=error_reasons,
+                    provider=state.provider,
+                )
+                _persist_watch_confirmation_provenance_snapshot(
+                    config,
+                    state,
+                    proposal,
+                    detail=detail if isinstance(detail, dict) else None,
+                    mapping_reasons=error_reasons,
+                )
+                results.append(
+                    ApplyResult(
+                        provider=state.provider,
+                        provider_series_id=state.provider_series_id,
+                        mal_anime_id=persisted.mal_anime_id,
+                        mal_title=proposal.mal_title,
+                        applied=False,
+                        proposal_decision="error",
+                        requested_status=None,
+                        response_status=None,
+                        reasons=error_reasons,
+                    )
+                )
+                continue
+            detail = {**detail, "my_list_status": live_status}
+            evidence_reasons = _mal_user_list_cache_conflict_reasons(
+                get_mal_user_anime_list_cache(config.db_path, persisted.mal_anime_id),
+                live_status,
+            )
+            if evidence_reasons:
+                proposal = SyncProposal(
+                    provider_series_id=state.provider_series_id,
+                    provider_title=state.title,
+                    mapping_status="approved",
+                    confidence=float(persisted.confidence or 1.0),
+                    mal_anime_id=persisted.mal_anime_id,
+                    mal_title=_coerce_optional_str(detail.get("title")),
+                    current_my_list_status=detail.get("my_list_status") if isinstance(detail.get("my_list_status"), dict) else None,
+                    proposed_my_list_status=None,
+                    decision="review",
+                    mapping_source=persisted.mapping_source,
+                    persisted_mapping_approved=True,
+                    completion_audit=state.completion_audit,
+                    reasons=[
+                        "using_user_approved_mapping",
+                        "executor_revalidated_live_mal_state",
+                        *(["exact_approved_only_enabled"] if exact_approved_only else []),
+                        *evidence_reasons,
+                        "conflicting_mal_user_state_evidence_fail_closed",
+                    ],
+                    provider=state.provider,
+                )
+                _persist_watch_confirmation_provenance_snapshot(
+                    config,
+                    state,
+                    proposal,
+                    detail=detail,
+                    mapping_reasons=proposal.reasons,
+                )
+                results.append(
+                    ApplyResult(
+                        provider=state.provider,
+                        provider_series_id=state.provider_series_id,
+                        mal_anime_id=persisted.mal_anime_id,
+                        mal_title=proposal.mal_title,
+                        applied=False,
+                        proposal_decision="review",
+                        requested_status=None,
+                        response_status=proposal.current_my_list_status,
+                        reasons=proposal.reasons,
+                    )
+                )
+                continue
+
         proposal = _plan_status_update(
             state,
             detail,
@@ -957,7 +1070,7 @@ def execute_approved_sync(
             persisted_mapping_approved=True,
             extra_reasons=[
                 "using_user_approved_mapping",
-                "executor_revalidated_live_mal_state",
+                *(["executor_revalidated_live_mal_state"] if not dry_run else []),
                 *(["exact_approved_only_enabled"] if exact_approved_only else []),
             ],
         )
@@ -994,6 +1107,7 @@ def execute_approved_sync(
                     start_date=_coerce_optional_str(requested.get("start_date")),
                     finish_date=_coerce_optional_str(requested.get("finish_date")),
                 )
+                response_status = _validated_mal_write_result(response, requested=requested)
             except MalApiError as exc:
                 reasons.append(f"mal_update_failed:{exc}")
                 results.append(
@@ -1010,9 +1124,13 @@ def execute_approved_sync(
                     )
                 )
                 continue
-            response_status = response
+            reconcile_mal_user_state_after_write(
+                config.db_path,
+                mal_anime_id=persisted.mal_anime_id,
+                list_status=response_status,
+            )
             applied = True
-            reasons.append("applied_to_mal")
+            reasons.extend(["applied_to_mal", "reconciled_local_mal_user_state_caches"])
         results.append(
             ApplyResult(
                 provider=state.provider,
@@ -1027,6 +1145,93 @@ def execute_approved_sync(
             )
         )
     return results
+
+
+def _safe_mal_list_status_result(response: dict[str, Any]) -> dict[str, Any]:
+    """Keep task output/cache reconciliation to validated, non-textual sync fields."""
+    allowed_fields = (
+        "status",
+        "num_episodes_watched",
+        "score",
+        "start_date",
+        "finish_date",
+        "updated_at",
+    )
+    return {field: response[field] for field in allowed_fields if field in response}
+
+
+def _validated_live_mal_user_state(
+    detail: Any,
+    *,
+    expected_anime_id: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the authenticated detail shape before it can authorize a write."""
+    if not isinstance(detail, dict):
+        return None, "mal_live_detail_invalid:not_object"
+    anime_id = detail.get("id")
+    if isinstance(anime_id, bool) or not isinstance(anime_id, int) or anime_id != int(expected_anime_id):
+        return None, "mal_live_detail_invalid:anime_id_mismatch_or_missing"
+    if not isinstance(detail.get("title"), str) or not detail["title"].strip():
+        return None, "mal_live_detail_invalid:title_missing_or_invalid"
+    if "my_list_status" not in detail or not isinstance(detail.get("my_list_status"), dict):
+        return None, "mal_live_detail_invalid:my_list_status_missing_or_invalid"
+    status = detail["my_list_status"]
+    list_status = status.get("status")
+    if not isinstance(list_status, str) or list_status not in MAL_USER_LIST_STATUSES:
+        return None, "mal_live_detail_invalid:my_list_status_status_invalid"
+    watched = status.get("num_episodes_watched")
+    if isinstance(watched, bool) or not isinstance(watched, int) or watched < 0:
+        return None, "mal_live_detail_invalid:my_list_status_progress_invalid"
+    score = status.get("score")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 10):
+        return None, "mal_live_detail_invalid:my_list_status_score_invalid"
+    for field_name in ("start_date", "finish_date", "updated_at"):
+        if field_name in status and status[field_name] is not None and not isinstance(status[field_name], str):
+            return None, f"mal_live_detail_invalid:my_list_status_{field_name}_invalid"
+    return _safe_mal_list_status_result(status), None
+
+
+def _validated_mal_write_result(response: Any, *, requested: dict[str, Any]) -> dict[str, Any]:
+    """Require the PUT response to confirm the requested status and progress."""
+    if not isinstance(response, dict):
+        raise MalApiError("MAL update response is not an object")
+    status = response.get("status")
+    watched = response.get("num_episodes_watched")
+    if not isinstance(status, str) or status not in MAL_USER_LIST_STATUSES:
+        raise MalApiError("MAL update response has invalid status")
+    if isinstance(watched, bool) or not isinstance(watched, int) or watched < 0:
+        raise MalApiError("MAL update response has invalid progress")
+    if status != requested.get("status") or watched != int(requested.get("num_watched_episodes") or 0):
+        raise MalApiError("MAL update response does not confirm requested status and progress")
+    score = response.get("score")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 10):
+        raise MalApiError("MAL update response has invalid score")
+    for field_name in ("start_date", "finish_date", "updated_at"):
+        if field_name in response and response[field_name] is not None and not isinstance(response[field_name], str):
+            raise MalApiError(f"MAL update response has invalid {field_name}")
+    return _safe_mal_list_status_result(response)
+
+
+def _mal_user_list_cache_conflict_reasons(
+    cached: MalUserAnimeListCacheEntry | None,
+    live_status: dict[str, Any] | None,
+) -> list[str]:
+    """Return only fail-closed conflicts; a successful live read remains authoritative."""
+    if cached is None:
+        return []
+    cached_watched = int(cached.num_episodes_watched or 0)
+    live_watched = int((live_status or {}).get("num_episodes_watched") or 0)
+    cached_status = _coerce_optional_str(cached.list_status)
+    live_list_status = _coerce_optional_str((live_status or {}).get("status"))
+    reasons: list[str] = []
+    if cached_watched > live_watched:
+        reasons.append(f"mal_user_list_cache_progress_ahead_of_live_detail cached={cached_watched} live={live_watched}")
+    if cached_status == "completed" and live_list_status != "completed":
+        reasons.append(
+            "mal_user_list_cache_completed_conflicts_with_live_detail "
+            f"cached={cached_status} live={live_list_status or 'missing'}"
+        )
+    return reasons
 
 
 def _resolve_mapping_for_sync(
@@ -1167,6 +1372,36 @@ def _plan_status_update(
 
     if current_list_status == "plan_to_watch" and proposed_watched > 0:
         reasons.append("override_plan_to_watch_due_to_provider_watch_evidence")
+
+    allowed_forward_status_changes = {
+        ("plan_to_watch", "watching"),
+        ("plan_to_watch", "completed"),
+        ("watching", "completed"),
+    }
+    proposed_list_status = str(proposed_status["status"])
+    if (
+        current_list_status
+        and current_list_status != "completed"
+        and proposed_list_status != current_list_status
+        and (current_list_status, proposed_list_status) not in allowed_forward_status_changes
+    ):
+        return SyncProposal(
+            provider_series_id=state.provider_series_id,
+            provider_title=state.title,
+            mapping_status=mapping_status,
+            confidence=confidence,
+            mal_anime_id=mal_anime_id,
+            mal_title=mal_title,
+            current_my_list_status=current_status,
+            proposed_my_list_status=None,
+            decision="review",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
+            completion_audit=state.completion_audit,
+            reasons=reasons
+            + [f"refusing_destructive_mal_status_change current={current_list_status} proposed={proposed_list_status}"],
+            provider=state.provider,
+        )
 
     if current_watched > proposed_watched:
         return SyncProposal(

@@ -31,6 +31,14 @@ class _JsonResponse:
         return json.dumps(self._payload).encode("utf-8")
 
 
+class _RawResponse(_JsonResponse):
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+
 class MalClientTests(unittest.TestCase):
     def _config(self, root: Path) -> AppConfig:
         runtime_root = root / ".MAL-Updater"
@@ -212,6 +220,56 @@ class MalClientTests(unittest.TestCase):
                 with self.assertRaises(MalApiError):
                     client.update_my_list_status(1, status="watching", num_watched_episodes=1)
             self.assertEqual(1, send.call_count)
+
+    def test_mal_write_error_does_not_reflect_upstream_response_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config, access_token="***"))
+            error = HTTPError(
+                "https://example.invalid",
+                400,
+                "bad request",
+                {},
+                io.BytesIO(b'password=*** Bearer secret-token'),
+            )
+
+            with patch("mal_updater.mal_client.urlopen", side_effect=error):
+                with self.assertRaises(MalApiError) as raised:
+                    client.update_my_list_status(53590, status="watching", num_watched_episodes=10)
+
+            rendered = str(raised.exception)
+            self.assertNotIn("hunter2", rendered)
+            self.assertNotIn("secret-token", rendered)
+            self.assertEqual("MAL API update my_list_status failed for anime_id=53590: HTTP 400", rendered)
+
+    def test_update_my_list_status_rejects_empty_or_malformed_json_response(self) -> None:
+        cases = (
+            (b"", "empty response body"),
+            (b"not-json password=hunter2", "malformed JSON response"),
+            (b"[]", "JSON response must be an object"),
+        )
+        for body, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                config = self._config(Path(tmp))
+                client = MalClient(config, self._secrets(config, access_token="access-token"))
+                with patch("mal_updater.mal_client.urlopen", return_value=_RawResponse(body)):
+                    with self.assertRaisesRegex(MalApiError, expected) as raised:
+                        client.update_my_list_status(53590, status="watching", num_watched_episodes=10)
+                self.assertNotIn("hunter2", str(raised.exception))
+
+    def test_live_user_detail_revalidation_requires_access_token_before_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config, access_token=None))
+
+            with patch(
+                "mal_updater.mal_client.urlopen",
+                side_effect=AssertionError("authenticated live-state read must fail before network without a token"),
+            ) as send:
+                with self.assertRaisesRegex(MalApiError, "MAL access_token is not configured"):
+                    client.get_anime_details(53590, force_refresh=True, require_user=True)
+
+            send.assert_not_called()
 
     def test_update_my_list_status_requires_nonblank_access_token_before_side_effects(self) -> None:
         for access_token in (None, "", " \t\n"):

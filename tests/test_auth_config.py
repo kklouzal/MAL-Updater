@@ -323,8 +323,10 @@ class AuthHelperTests(unittest.TestCase):
                 with self.assertRaises(MalApiError) as exc:
                     client.search_anime("Example")
 
-            self.assertIn("timeout after 2 attempts", str(exc.exception))
-            self.assertIn("timed out", str(exc.exception))
+            message = str(exc.exception)
+            self.assertIn("timeout after 2 attempts", message)
+            self.assertNotIn("timed out", message)
+            self.assertNotIn(repr(TimeoutError("timed out")), message)
 
     def test_review_mappings_rejects_partial_queue_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as td:

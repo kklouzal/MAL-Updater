@@ -38,4 +38,4 @@ Container automation has no normal enable/disable control or mutation API. The i
 
 The release bundle is designed so `docker compose up -d` starts the pinned GHCR image on port 80 with a persistent `mal-updater-data` volume. Use `compose.build.yaml` only for local development builds. Lifecycle tools run through the `tools` profile and never require host `.MAL-Updater` or systemd services.
 
-See README for backup, verify, restore, support-bundle, upgrade, rollback, and health commands.
+See README for backup, verify, restore, support-bundle, upgrade, rollback, and health commands. Production backup destinations must be under the persistent `/data` volume (for example `/data/backups`); backup and verify staging uses the archive's destination volume rather than the bounded `/tmp` tmpfs, and archive destinations inside the runtime root are excluded recursively.

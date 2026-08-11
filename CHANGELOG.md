@@ -2,6 +2,18 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [0.2.5] - 2026-08-11
+
+### Fixed
+
+- MAL synchronization now fails closed when the live remote row no longer matches the planned base row, and reconciles validated non-textual fields into the local cache without leaking raw network exception text.
+- Recommendation score snapshots now default to a bounded 14-day operational horizon, preserve the newest 30 runs per kind, and expose capped per-pass deletion plus remaining-eligible telemetry so existing excess drains safely over successive passes.
+- Container backups, verification, and restore pre-backups stage on the persistent destination volume rather than the bounded `/tmp` tmpfs. Large SQLite databases retain online-backup consistency, atomic archives, manifests/checksums, restore compatibility, symlink/traversal protections, and destination-recursion exclusion.
+
+### Changed
+
+- Updated the pinned container/bundle and Python package version to 0.2.5. Trusted-LAN and container hardening posture is unchanged.
+
 ## [0.2.4] - 2026-08-09
 
 ### Changed

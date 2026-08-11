@@ -2,7 +2,7 @@ name: mal-updater
 
 services:
   mal-updater:
-    image: ${MAL_UPDATER_IMAGE:-ghcr.io/kklouzal/mal-updater:0.2.4}
+    image: ${MAL_UPDATER_IMAGE:-ghcr.io/kklouzal/mal-updater:0.2.5}
     restart: unless-stopped
     ports:
       - "${MAL_UPDATER_HTTP_PORT:-80}:8080"
@@ -33,7 +33,7 @@ services:
 
   cli:
     profiles: ["tools"]
-    image: ${MAL_UPDATER_IMAGE:-ghcr.io/kklouzal/mal-updater:0.2.4}
+    image: ${MAL_UPDATER_IMAGE:-ghcr.io/kklouzal/mal-updater:0.2.5}
     entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint", "mal-updater-tools"]
     command: ["version"]
     environment:

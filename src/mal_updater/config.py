@@ -83,6 +83,9 @@ DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS = 45
 DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
+DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS = 14
+DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND = 30
+DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE = 10_000
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
 DEFAULT_SERVICE_STARTUP_GRACE_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
@@ -278,6 +281,9 @@ class ServiceSettings:
     provider_eligibility_refresh_every_seconds: int = DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS
     recommend_maintain_every_seconds: int = DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS
     recommendations_webhook_push_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS
+    recommendation_snapshot_retention_days: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS
+    recommendation_snapshot_min_runs_per_kind: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND
+    recommendation_snapshot_prune_batch_size: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
     startup_grace_seconds: int = DEFAULT_SERVICE_STARTUP_GRACE_SECONDS
     task_timeout_seconds: int = DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS
@@ -1027,6 +1033,45 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
                         DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS,
                     ),
                 )
+            ),
+            recommendation_snapshot_retention_days=max(
+                1,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS",
+                        _get_int(
+                            service_section,
+                            "recommendation_snapshot_retention_days",
+                            DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS,
+                        ),
+                    )
+                ),
+            ),
+            recommendation_snapshot_min_runs_per_kind=max(
+                1,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND",
+                        _get_int(
+                            service_section,
+                            "recommendation_snapshot_min_runs_per_kind",
+                            DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND,
+                        ),
+                    )
+                ),
+            ),
+            recommendation_snapshot_prune_batch_size=max(
+                1,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE",
+                        _get_int(
+                            service_section,
+                            "recommendation_snapshot_prune_batch_size",
+                            DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE,
+                        ),
+                    )
+                ),
             ),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
             startup_grace_seconds=max(

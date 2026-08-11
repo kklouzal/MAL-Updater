@@ -2423,6 +2423,65 @@ def get_mal_user_anime_list_cache(db_path: Path, mal_anime_id: int) -> MalUserAn
     return None if row is None else _mal_user_list_entry_from_row(row)
 
 
+def reconcile_mal_user_state_after_write(
+    db_path: Path,
+    *,
+    mal_anime_id: int,
+    list_status: dict[str, Any],
+) -> None:
+    """Remove stale detail state and reconcile an existing @me-list cache row.
+
+    MAL's update response is the committed user-list status.  Detail cache rows
+    mix long-lived catalog metadata with that mutable status, so invalidation is
+    safer than extending their lifetime with a partial update response.
+    """
+    anime_id = int(mal_anime_id)
+    committed = dict(list_status)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM mal_anime_detail_cache
+            WHERE mal_anime_id = ?
+              AND (',' || fields_key || ',') LIKE '%,my_list_status,%'
+            """,
+            (anime_id,),
+        )
+        row = conn.execute(
+            "SELECT * FROM mal_user_anime_list_cache WHERE mal_anime_id = ?",
+            (anime_id,),
+        ).fetchone()
+        if row is not None:
+            prior_status = _load_json_value(row["list_status_json"], {})
+            if not isinstance(prior_status, dict):
+                prior_status = {}
+            merged_status = {**prior_status, **committed}
+            raw = _load_json_value(row["raw_json"], {})
+            if not isinstance(raw, dict):
+                raw = {}
+            raw["list_status"] = merged_status
+            conn.execute(
+                """
+                UPDATE mal_user_anime_list_cache
+                SET list_status = ?, user_score = ?, num_episodes_watched = ?,
+                    start_date = ?, finish_date = ?, list_updated_at = ?,
+                    list_status_json = ?, raw_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE mal_anime_id = ?
+                """,
+                (
+                    _normalize_mal_user_list_status(merged_status.get("status")),
+                    _clamp_optional_int(merged_status.get("score"), minimum=0, maximum=10),
+                    _clamp_optional_int(merged_status.get("num_episodes_watched"), minimum=0),
+                    merged_status.get("start_date") if isinstance(merged_status.get("start_date"), str) else None,
+                    merged_status.get("finish_date") if isinstance(merged_status.get("finish_date"), str) else None,
+                    merged_status.get("updated_at") if isinstance(merged_status.get("updated_at"), str) else row["list_updated_at"],
+                    json.dumps(merged_status, ensure_ascii=False, sort_keys=True),
+                    json.dumps(raw, ensure_ascii=False, sort_keys=True),
+                    anime_id,
+                ),
+            )
+        conn.commit()
+
+
 def list_mal_user_anime_list_cache(db_path: Path, *, statuses: Iterable[str] | None = None) -> list[MalUserAnimeListCacheEntry]:
     params: list[Any] = []
     where = ""

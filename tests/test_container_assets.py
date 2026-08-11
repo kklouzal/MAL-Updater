@@ -27,7 +27,7 @@ class ContainerAssetTests(unittest.TestCase):
         self.assertIn("no-new-privileges:true", text)
         self.assertIn("/healthz", text)
         self.assertIn('profiles: ["tools"]', text)
-        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.4", text)
+        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.5", text)
         self.assertNotIn("first_run_setup_token", text)
         self.assertNotIn("container_auth.json", text)
 

@@ -115,6 +115,24 @@ Atomicity guarantee: fetched pages/edges are staged in an open generation and re
 
 ## User-systemd daemon
 
+The scheduler also bounds `recommendation_score_snapshots` during each task
+pass. By default it deletes at most 10,000 rows older than 14 days while always
+preserving the newest 30 distinct runs for each recommendation kind (including
+the current dashboard run). Fourteen days is the bounded operational history
+horizon; the independent run floor protects sparse kinds and immediately makes
+older high-volume history eligible instead of waiting through a growth-prone
+90-day window. The result is recorded in service state as
+`recommendation_snapshot_retention`, including deleted/remaining eligible rows
+and SQLite page/freelist counts. Configure the three
+`service.recommendation_snapshot_*` settings shown in
+`references/settings.toml.example` if the defaults need adjustment.
+
+Deletion bounds future logical growth but SQLite does not shrink the database
+file automatically. No live-service `VACUUM` is attempted. After the initial
+backlog has drained, an operator who needs disk space returned should stop all
+MAL-Updater writers, take/verify a backup, confirm sufficient temporary free
+space, run a one-time SQLite `VACUUM`, and then restart the service.
+
 ```bash
 cd <repo-root>
 scripts/install_user_systemd_units.sh
