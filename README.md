@@ -15,7 +15,7 @@ docker compose up -d
 
 Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
 
-The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.5`. For local development builds use:
+The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.6`. For local development builds use:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
@@ -37,7 +37,7 @@ Use this product only on a private trusted LAN or behind a trusted reverse proxy
 
 Mutations require a process-local synchronizer CSRF token obtained by the dashboard through a same-origin request; explicit cross-origin and cross-site browser requests are rejected. This is CSRF protection, not an access credential. Trusted-host validation, 64 KiB JSON body limits, required JSON content types, CSP/security headers, connection-test rate limits, and secret redaction remain enforced.
 
-Secrets live in the Docker volume under `/data/secrets` with restrictive permissions. The container runs non-root after startup, with read-only root filesystem, dropped capabilities, no-new-privileges, and a bounded tmpfs `/tmp`.
+Secrets live in the Docker volume under `/data/secrets` with restrictive permissions. The container runs non-root after startup, with a read-only root filesystem, no-new-privileges, a bounded tmpfs `/tmp`, and all capabilities dropped except the narrow startup set. `CAP_KILL` lets root `tini` forward shutdown signals to its different-UID child; the Python application remains UID/GID 10001 by default.
 
 ## Container tools
 
@@ -73,7 +73,8 @@ The historical user-systemd CLI path remains for advanced/manual installs from a
 - Readiness degraded: complete MAL credentials/OAuth, or inspect logs if the automatically supervised scheduler is restarting.
 - OAuth callback mismatch: update the MAL app callback to the exact browser URL plus `/oauth/mal/callback`.
 - UI mutation reports CSRF failure after a restart: reload the page to obtain the new process-local token.
+- Restart logs contain `Unexpected error when forwarding signal: 'Operation not permitted'`: upgrade to 0.2.6 or later. A healthy restart lets `tini` forward TERM to the non-root Python child and emits no `tini` fatal error.
 
 ## Release/support policy
 
-MAL-Updater remains alpha software. Version 0.2.5 adds fail-closed stale-write reconciliation, a 14-day recommendation snapshot horizon with a 30-run-per-kind floor, and large-volume-safe container backups; version 0.2.4 made container automation always desired and prerequisite-driven, and version 0.2.3 removed the dashboard claim/login/password surface. Provider/MAL authentication and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+MAL-Updater remains alpha software. Version 0.2.6 restores graceful container shutdown while preserving the non-root application and other container hardening; version 0.2.5 added fail-closed stale-write reconciliation, bounded recommendation snapshot retention, and large-volume-safe container backups. Provider/MAL authentication and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.

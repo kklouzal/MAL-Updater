@@ -2,6 +2,16 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [0.2.6] - 2026-08-11
+
+### Fixed
+
+- Restored graceful Compose stop/restart by retaining `CAP_KILL` for root `tini`, allowing PID 1 to forward signals to the different-UID Python child. The application still drops to UID/GID 10001 by default; all capabilities are still dropped before the narrow `CHOWN`, `DAC_OVERRIDE`, `KILL`, `SETGID`, and `SETUID` startup set is added, and the read-only root filesystem and no-new-privileges controls remain enabled.
+
+### Changed
+
+- Updated the pinned container/bundle and Python package version to 0.2.6. MAL synchronization, recommendation retention, and provider behavior are unchanged.
+
 ## [0.2.5] - 2026-08-11
 
 ### Fixed

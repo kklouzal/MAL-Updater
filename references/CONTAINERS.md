@@ -2,11 +2,13 @@
 
 ## Product shape
 
-One image runs a credential-free trusted-LAN HTTP control plane and the existing scheduler as a supervised child. Automation is always desired but remains blocked until the MAL client ID and OAuth tokens exist. The supervisor starts it automatically when those prerequisites appear, stops it if they disappear, and starts it again when restored. `tini` is PID 1. The Python supervisor retains bounded exponential restart backoff and forwards shutdown.
+One image runs a credential-free trusted-LAN HTTP control plane and the existing scheduler as a supervised child. Automation is always desired but remains blocked until the MAL client ID and OAuth tokens exist. The supervisor starts it automatically when those prerequisites appear, stops it if they disappear, and starts it again when restored. `tini` is root PID 1 and retains `CAP_KILL` so Linux permits it to forward TERM and other shutdown signals to the different-UID application child. The Python supervisor retains bounded exponential restart backoff and forwards shutdown.
 
 ## Persistent data and container boundary
 
-The single `/data` volume contains `config`, `secrets`, `data`, `state`, and disposable `cache`. The entrypoint reconciles volume ownership as root, then drops to the configured UID/GID (default 10001). The root filesystem is read-only; `/tmp` is a bounded noexec tmpfs. Never mount the canonical host `.MAL-Updater` runtime into this product.
+The single `/data` volume contains `config`, `secrets`, `data`, `state`, and disposable `cache`. The entrypoint reconciles volume ownership as root, then drops the application to the configured UID/GID (default 10001). Compose drops all capabilities and adds only `CHOWN`, `DAC_OVERRIDE`, `KILL`, `SETGID`, and `SETUID`; `CAP_KILL` is required by root `tini` because Linux signal permission checks otherwise reject forwarding to its UID 10001 child. The root filesystem is read-only, no-new-privileges remains enabled, and `/tmp` is a bounded noexec tmpfs. Never mount the canonical host `.MAL-Updater` runtime into this product.
+
+To validate shutdown safely on a non-production deployment, start the Compose service, confirm PID 1 is `tini` and its child runs as the configured non-root UID, then run `docker compose restart mal-updater`. The old container should stop within the 30-second grace period, the replacement should become healthy, and logs spanning the restart should contain neither `[FATAL tini` nor `Unexpected error when forwarding signal`. `docker compose kill -s TERM mal-updater` is an equivalent direct TERM check, but it stops the service and therefore should be followed by `docker compose up -d mal-updater`.
 
 Legacy `/data/secrets/container_auth.json` files from v0.2.2 are ignored. No migration, deletion, or reset is required, and new installs do not create that file.
 

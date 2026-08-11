@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -27,7 +28,12 @@ class ContainerAssetTests(unittest.TestCase):
         self.assertIn("no-new-privileges:true", text)
         self.assertIn("/healthz", text)
         self.assertIn('profiles: ["tools"]', text)
-        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.5", text)
+        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.6", text)
+        self.assertEqual(2, len(re.findall(r"\bKILL\b", text)))
+        self.assertIn("- KILL\n      - SETGID", text)
+        self.assertIn('["CHOWN", "DAC_OVERRIDE", "KILL", "SETGID", "SETUID"]', text)
+        self.assertEqual(2, text.count("cap_drop"))
+        self.assertEqual(2, text.count("ALL"))
         self.assertNotIn("first_run_setup_token", text)
         self.assertNotIn("container_auth.json", text)
 

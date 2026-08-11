@@ -1,28 +1,30 @@
-# MAL-Updater 0.2.5
+# MAL-Updater 0.2.6
 
-This alpha patch hardens synchronization and long-running storage. MAL writes now fail closed if the live remote row has changed since planning, while validated non-textual fields reconcile safely into the cache. Recommendation score snapshots now default to a 14-day operational horizon while preserving the newest 30 runs per kind; bounded per-pass deletion and remaining-eligible telemetry drain existing excess safely over successive scheduler passes. Container lifecycle backups now support large SQLite databases by staging on the persistent destination volume instead of the 64 MiB `/tmp` tmpfs; online consistency, atomic publication, checksums/manifests, verification, restore compatibility, and archive safety controls remain intact.
+This alpha patch restores graceful container stop and restart. Compose still drops every capability by default, but now adds `CAP_KILL` to the narrow startup set so root `tini` PID 1 can forward shutdown signals to the different-UID Python child. The application remains non-root (UID/GID 10001 by default), the root filesystem remains read-only, and no-new-privileges remains enabled. MAL synchronization, recommendation retention, and provider behavior are unchanged.
 
 ## Install
 
-Download and extract `mal-updater-v0.2.5.tar.gz`, copy `.env.example` to `.env`, then run:
+Download and extract `mal-updater-v0.2.6.tar.gz`, copy `.env.example` to `.env`, then run:
 
 ```bash
 docker compose up -d
 ```
 
-The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.5`. Open the dashboard and complete MAL configuration/OAuth in Settings; automation starts automatically after setup is complete.
+The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.6`. Open the dashboard and complete MAL configuration/OAuth in Settings; automation starts automatically after setup is complete.
 
 Before upgrading, create and verify a backup under `/data`, for example:
 
 ```bash
-docker compose --profile tools run --rm cli backup /data/backups/pre-0.2.5.tar.gz
-docker compose --profile tools run --rm cli backup-inspect --verify /data/backups/pre-0.2.5.tar.gz
+docker compose --profile tools run --rm cli backup /data/backups/pre-0.2.6.tar.gz
+docker compose --profile tools run --rm cli backup-inspect --verify /data/backups/pre-0.2.6.tar.gz
 ```
+
+After upgrading, `docker compose restart mal-updater` should stop within the configured grace period, return healthy, and produce no `[FATAL tini` or `Unexpected error when forwarding signal` log entry.
 
 ## Included artifacts
 
 - Curated Compose bundle with environment template, documentation, license, release metadata, and internal checksums
-- Python 0.2.5 wheel and source distribution
+- Python 0.2.6 wheel and source distribution
 - Top-level SHA-256 checksums
 - AMD64/ARM64 GHCR image with build provenance and SBOM
 - Keyless Sigstore signature for the immutable image digest
