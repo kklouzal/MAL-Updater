@@ -15,7 +15,7 @@ docker compose up -d
 
 Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
 
-The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.8`. For local development builds use:
+The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.9`. For local development builds use:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
@@ -77,4 +77,4 @@ The historical user-systemd CLI path remains for advanced/manual installs from a
 
 ## Release/support policy
 
-MAL-Updater remains alpha software. Version 0.2.8 polishes the recommendation dashboards without changing provider/MAL behavior; version 0.2.7 added conservative recurring runtime housekeeping and threshold-gated SQLite compaction. Provider/MAL authentication, conservative MAL-write controls, and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+MAL-Updater remains alpha software. Version 0.2.9 finishes the recommendation dashboard title/provider-proof polish without changing provider/MAL behavior; version 0.2.8 introduced the broader dashboard presentation improvements. Provider/MAL authentication, conservative MAL-write controls, and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.

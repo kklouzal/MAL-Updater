@@ -233,8 +233,9 @@ class RecommendationDashboardTests(unittest.TestCase):
 
         html = render_recommendation_dashboard([item])
 
-        for label in ("English title / provider proof", "Score", "Source count", "Total votes", "MAL mean", "MAL popularity", "Genres"):
+        for label in ("Title", "Score", "Source count", "Total votes", "MAL mean", "MAL popularity", "Genres"):
             self.assertIn(label, html)
+        self.assertNotIn("English title / provider proof", html)
         for hidden_label in ("English dub", "Provider progress", "MAL watch status"):
             self.assertNotIn(f">{hidden_label}<", html)
         self.assertNotIn('data-key="provider_evidence"', html)
@@ -642,6 +643,8 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn("https://www.crunchyroll.com/series/actionable", html)
         self.assertIn('class="provider-link"', html)
         self.assertIn('aria-label="Open Crunchyroll provider proof"', html)
+        self.assertNotIn("Actionable Candidate</span></a> Actionable Candidate", html)
+        self.assertEqual(1, html.count(">Actionable Candidate</span>"))
         self.assertRegex(
             html,
             r'<span class="title-text">Actionable Candidate</span><div class="title-providers" aria-label="Provider proof"><a class="provider-link"',
@@ -1454,12 +1457,14 @@ class RecommendationDashboardTests(unittest.TestCase):
     def test_live_dashboard_recommendation_table_combines_provider_with_title_and_omits_removed_columns(self) -> None:
         html = render_dynamic_dashboard_html()
 
-        self.assertIn("${titleLabel} / provider proof", html)
+        self.assertIn("const headings = ['Priority', 'Title', 'Identity/review/catalog'", html)
+        self.assertNotIn("${titleLabel} / provider proof", html)
         self.assertIn('class="title-providers" aria-label="Provider proof"', html)
         self.assertIn('scope="row"', html)
         self.assertIn('class="table-scroll" tabindex="0" role="region"', html)
         self.assertIn('class=\"provider-link\"', html)
         self.assertIn('aria-label=\"${esc(`Open ${provider} provider proof`)}\"', html)
+        self.assertNotIn("const title = b.title", html)
         for heading in ("English dub", "Provider progress", "MAL watch status"):
             self.assertNotIn(f"<th>{heading}</th>", html)
         self.assertNotIn("const progress = r =>", html)

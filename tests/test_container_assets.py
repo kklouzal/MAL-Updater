@@ -28,7 +28,7 @@ class ContainerAssetTests(unittest.TestCase):
         self.assertIn("no-new-privileges:true", text)
         self.assertIn("/healthz", text)
         self.assertIn('profiles: ["tools"]', text)
-        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.8", text)
+        self.assertIn("ghcr.io/kklouzal/mal-updater:0.2.9", text)
         self.assertEqual(2, len(re.findall(r"\bKILL\b", text)))
         self.assertIn("- KILL\n      - SETGID", text)
         self.assertIn('["CHOWN", "DAC_OVERRIDE", "KILL", "SETGID", "SETUID"]', text)

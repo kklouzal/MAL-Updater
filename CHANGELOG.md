@@ -2,6 +2,13 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [0.2.9] - 2026-08-12
+
+### Changed
+
+- Simplified the static and live recommendation table heading to `Title` and removed repeated provider-seen titles beside provider proof buttons, while retaining accessible proof links and the underlying evidence data.
+- Updated the pinned container/bundle and Python package version to 0.2.9. Provider and MAL behavior remains unchanged, including credential gates, pacing/backoff, mapping and stale-write safeguards, and the unattended `sync_apply` limit of 8.
+
 ## [0.2.8] - 2026-08-12
 
 ### Changed
