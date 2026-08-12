@@ -24,6 +24,9 @@ from .config import (
     load_mal_secrets,
 )
 from .crunchyroll_auth import load_crunchyroll_credentials
+from .database_maintenance import compact_database_if_due
+from .runtime_housekeeping import inspect_service_log, prune_health_history, rotate_service_log
+from .runtime_retention_audit import build_runtime_retention_audit_payload
 from .hidive_auth import load_hidive_credentials
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
@@ -217,8 +220,24 @@ def _set_task_next_due(task_state: dict[str, Any], *, base_epoch: float, every_s
 
 
 def _append_log(config: AppConfig, message: str) -> None:
-    with config.service_log_path.open("a", encoding="utf-8") as fh:
-        fh.write(f"[{_now_iso()}] {sanitize_text(message, max_length=2_000)}\n")
+    line = f"[{_now_iso()}] {sanitize_text(message, max_length=2_000)}\n"
+    max_bytes = max(1, int(config.service.service_log_max_bytes))
+    encoded = line.encode("utf-8")
+    if len(encoded) > max_bytes:
+        encoded = encoded[:max_bytes]
+        if max_bytes >= 1:
+            encoded = encoded[:-1] + b"\n"
+        line = encoded.decode("utf-8", errors="ignore")
+    # Rotation diagnostics are persisted by the scheduler housekeeping state.
+    # This write path deliberately does not log rotation failures recursively.
+    rotation = rotate_service_log(config, incoming_bytes=len(line.encode("utf-8"))).as_dict()
+    if rotation.get("status") == "blocked":
+        return
+    try:
+        with config.service_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        return
 
 
 def _mark_task_decision(task_state: dict[str, Any], *, decision_at: str | None = None) -> None:
@@ -536,6 +555,7 @@ def _mark_task_running(config: AppConfig, state: dict[str, Any], task_name: str,
         }
     )
     state["last_loop_at"] = _now_iso()
+    state["service_log_retention"] = inspect_service_log(config).as_dict()
     _save_state(config, state)
     return started_epoch, started_at
 
@@ -626,6 +646,12 @@ def _task_specs(config: AppConfig) -> list[TaskSpec]:
             )
     if int(config.service.recommend_maintain_every_seconds) > 0:
         specs.append(TaskSpec("recommend_maintain", config.service.recommend_maintain_every_seconds, budget_provider=None))
+    if int(config.service.db_compaction_every_seconds) > 0:
+        specs.append(TaskSpec("db_compaction", config.service.db_compaction_every_seconds, budget_provider=None))
+    if int(config.service.health_history_retention_every_seconds) > 0:
+        specs.append(TaskSpec("health_history_retention", config.service.health_history_retention_every_seconds, budget_provider=None))
+    if int(config.service.runtime_retention_audit_every_seconds) > 0:
+        specs.append(TaskSpec("runtime_retention_audit", config.service.runtime_retention_audit_every_seconds, budget_provider=None))
     if int(config.service.recommendations_webhook_push_every_seconds) > 0 and config.openclaw.recommendations_webhook_enabled:
         specs.append(TaskSpec("push_recommendations_webhook", config.service.recommendations_webhook_push_every_seconds, budget_provider=None))
     specs.append(TaskSpec("health", config.service.health_every_seconds, budget_provider=None))
@@ -1897,7 +1923,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             and float(task_state.get("next_due_epoch", 0)) > now
         ):
             continue
-        if spec.name == "recommend_maintain" and "last_run_epoch" not in task_state:
+        if spec.name in {"recommend_maintain", "db_compaction", "health_history_retention", "runtime_retention_audit"} and "last_run_epoch" not in task_state:
             if task_state.get("last_status") == "scheduled" and float(task_state.get("next_due_epoch", 0)) > now:
                 continue
             if not task_state.get("last_status"):
@@ -2186,6 +2212,39 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 command_args = _recommend_maintain_command(config)
                 started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
                 result = _run_subprocess(config, command_args, label="recommend_maintain")
+            elif spec.name == "db_compaction":
+                previous_compaction: dict[str, Any] = dict(task_state)
+                if isinstance(task_state.get("last_result"), dict):
+                    previous_compaction.update(task_state["last_result"])
+                result = compact_database_if_due(config, previous=previous_compaction).as_dict()
+                result["label"] = "db_compaction"
+                if result.get("status") == "compacted":
+                    task_state["last_success_epoch"] = result.get("last_success_epoch", time.time())
+                    task_state["last_success_at"] = result.get("attempted_at")
+                    task_state["last_bytes_reclaimed"] = result.get("bytes_reclaimed", 0)
+                elif result.get("status") in {"blocked", "error"}:
+                    result["status"] = "error"
+            elif spec.name == "health_history_retention":
+                result = prune_health_history(config).as_dict()
+                if result.get("status") == "blocked":
+                    result["status"] = "error"
+            elif spec.name == "runtime_retention_audit":
+                audit = build_runtime_retention_audit_payload(config)
+                totals = audit.get("retention_inventory", {}).get("totals", {}) if isinstance(audit.get("retention_inventory"), dict) else {}
+                result = {
+                    "status": str(audit.get("status") or "error"),
+                    "label": "runtime_retention_audit",
+                    "read_only": True,
+                    "mutation_policy": audit.get("mutation_policy"),
+                    "review_candidate_count": audit.get("review_candidate_count", 0),
+                    "scan_error_count": audit.get("scan_error_count", 0),
+                    "truncated": audit.get("truncated", False),
+                    "file_count": totals.get("file_count", 0) if isinstance(totals, dict) else 0,
+                    "total_bytes": totals.get("total_bytes", 0) if isinstance(totals, dict) else 0,
+                    "backup_deletion_performed": False,
+                }
+                if result["status"] == "error":
+                    result["reason"] = "runtime_retention_audit_layout_error"
             elif spec.name == "push_recommendations_webhook":
                 try:
                     result = _push_recommendations_webhook_task(config, task_state)
@@ -2205,7 +2264,13 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             finished_epoch = time.time()
             finished_at = datetime.fromtimestamp(finished_epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             task_status = result.get("status", "ok")
-            task_succeeded = task_status == "ok"
+            task_succeeded = task_status == "ok" or (
+                spec.name == "db_compaction" and task_status in {"skipped", "compacted"}
+            ) or (
+                spec.name == "health_history_retention" and task_status in {"no_change", "pruned"}
+            ) or (
+                spec.name == "runtime_retention_audit" and task_status in {"ok", "warning"}
+            )
             if task_succeeded and spec.budget_provider is not None and isinstance(usage, dict):
                 result.update(
                     _finalize_run_request_delta(

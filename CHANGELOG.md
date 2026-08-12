@@ -2,6 +2,17 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [0.2.7] - 2026-08-12
+
+### Added
+
+- Added a low-frequency, threshold-gated `db_compaction` scheduler housekeeping lane that verifies a fresh backup, checks volume headroom, excludes repo-native DB writers, records skip/block/success evidence, and keeps hourly recommendation snapshot pruning logical-only.
+- Added conservative recurring runtime housekeeping: daily age/count-bounded health-history retention, append-time size-bounded service-log rotation, and a weekly read-only retention inventory that keeps backup and ambiguous-runtime deletion human-gated.
+
+### Changed
+
+- Updated the pinned container/bundle and Python package version to 0.2.7. Conservative MAL/provider safeguards remain unchanged, including the unattended `sync_apply` limit of 8.
+
 ## [0.2.6] - 2026-08-11
 
 ### Fixed

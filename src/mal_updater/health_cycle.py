@@ -10,6 +10,7 @@ from typing import Iterator, TextIO
 
 from .config import AppConfig, ensure_directories
 from .health_report import build_health_report, health_report_exit_code, render_health_report, render_health_report_json
+from .persistence import atomic_write_text
 
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -91,8 +92,8 @@ def _run_health_check_json(
         mapping_coverage_threshold=mapping_coverage_threshold,
         maintenance_review_limit=maintenance_review_limit,
     )
-    json_path.write_text(render_health_report_json(payload), encoding="utf-8")
-    config.health_latest_json_path.write_text(render_health_report_json(payload, trailing_newline=False), encoding="utf-8")
+    atomic_write_text(json_path, render_health_report_json(payload))
+    atomic_write_text(config.health_latest_json_path, render_health_report_json(payload, trailing_newline=False))
     return health_report_exit_code(payload, strict=False), payload
 
 

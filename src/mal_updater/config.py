@@ -86,6 +86,18 @@ DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS = 14
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND = 30
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE = 10_000
+DEFAULT_SERVICE_DB_COMPACTION_EVERY_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_SERVICE_DB_COMPACTION_MIN_INTERVAL_SECONDS = 30 * 24 * 60 * 60
+DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_BYTES = 128 * 1024 * 1024
+DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_RATIO = 0.10
+DEFAULT_SERVICE_DB_COMPACTION_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
+DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_EVERY_SECONDS = 24 * 60 * 60
+DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_DAYS = 90
+DEFAULT_SERVICE_HEALTH_HISTORY_MIN_COUNT = 168
+DEFAULT_SERVICE_HEALTH_HISTORY_PRUNE_BATCH_SIZE = 100
+DEFAULT_SERVICE_LOG_MAX_BYTES = 16 * 1024 * 1024
+DEFAULT_SERVICE_LOG_RETAINED_GENERATIONS = 5
+DEFAULT_SERVICE_RUNTIME_RETENTION_AUDIT_EVERY_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_SERVICE_LOOP_SLEEP_SECONDS = 30
 DEFAULT_SERVICE_STARTUP_GRACE_SECONDS = 30
 DEFAULT_SERVICE_CRUNCHYROLL_HOURLY_LIMIT = 180
@@ -284,6 +296,18 @@ class ServiceSettings:
     recommendation_snapshot_retention_days: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS
     recommendation_snapshot_min_runs_per_kind: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND
     recommendation_snapshot_prune_batch_size: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE
+    db_compaction_every_seconds: int = DEFAULT_SERVICE_DB_COMPACTION_EVERY_SECONDS
+    db_compaction_min_interval_seconds: int = DEFAULT_SERVICE_DB_COMPACTION_MIN_INTERVAL_SECONDS
+    db_compaction_min_freelist_bytes: int = DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_BYTES
+    db_compaction_min_freelist_ratio: float = DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_RATIO
+    db_compaction_free_space_margin_bytes: int = DEFAULT_SERVICE_DB_COMPACTION_FREE_SPACE_MARGIN_BYTES
+    health_history_retention_every_seconds: int = DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_EVERY_SECONDS
+    health_history_retention_days: int = DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_DAYS
+    health_history_min_count: int = DEFAULT_SERVICE_HEALTH_HISTORY_MIN_COUNT
+    health_history_prune_batch_size: int = DEFAULT_SERVICE_HEALTH_HISTORY_PRUNE_BATCH_SIZE
+    service_log_max_bytes: int = DEFAULT_SERVICE_LOG_MAX_BYTES
+    service_log_retained_generations: int = DEFAULT_SERVICE_LOG_RETAINED_GENERATIONS
+    runtime_retention_audit_every_seconds: int = DEFAULT_SERVICE_RUNTIME_RETENTION_AUDIT_EVERY_SECONDS
     loop_sleep_seconds: int = DEFAULT_SERVICE_LOOP_SLEEP_SECONDS
     startup_grace_seconds: int = DEFAULT_SERVICE_STARTUP_GRACE_SECONDS
     task_timeout_seconds: int = DEFAULT_SERVICE_TASK_TIMEOUT_SECONDS
@@ -1072,6 +1096,79 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
                         ),
                     )
                 ),
+            ),
+            db_compaction_every_seconds=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_DB_COMPACTION_EVERY_SECONDS",
+                        _get_int(service_section, "db_compaction_every_seconds", DEFAULT_SERVICE_DB_COMPACTION_EVERY_SECONDS),
+                    )
+                ),
+            ),
+            db_compaction_min_interval_seconds=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_DB_COMPACTION_MIN_INTERVAL_SECONDS",
+                        _get_int(service_section, "db_compaction_min_interval_seconds", DEFAULT_SERVICE_DB_COMPACTION_MIN_INTERVAL_SECONDS),
+                    )
+                ),
+            ),
+            db_compaction_min_freelist_bytes=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_DB_COMPACTION_MIN_FREELIST_BYTES",
+                        _get_int(service_section, "db_compaction_min_freelist_bytes", DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_BYTES),
+                    )
+                ),
+            ),
+            db_compaction_min_freelist_ratio=max(
+                0.0,
+                float(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_DB_COMPACTION_MIN_FREELIST_RATIO",
+                        _get_float(service_section, "db_compaction_min_freelist_ratio", DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_RATIO),
+                    )
+                ),
+            ),
+            db_compaction_free_space_margin_bytes=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_DB_COMPACTION_FREE_SPACE_MARGIN_BYTES",
+                        _get_int(service_section, "db_compaction_free_space_margin_bytes", DEFAULT_SERVICE_DB_COMPACTION_FREE_SPACE_MARGIN_BYTES),
+                    )
+                ),
+            ),
+            health_history_retention_every_seconds=max(
+                0,
+                int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_HISTORY_RETENTION_EVERY_SECONDS", _get_int(service_section, "health_history_retention_every_seconds", DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_EVERY_SECONDS))),
+            ),
+            health_history_retention_days=max(
+                1,
+                int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_HISTORY_RETENTION_DAYS", _get_int(service_section, "health_history_retention_days", DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_DAYS))),
+            ),
+            health_history_min_count=max(
+                1,
+                int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_HISTORY_MIN_COUNT", _get_int(service_section, "health_history_min_count", DEFAULT_SERVICE_HEALTH_HISTORY_MIN_COUNT))),
+            ),
+            health_history_prune_batch_size=max(
+                1,
+                int(os.getenv("MAL_UPDATER_SERVICE_HEALTH_HISTORY_PRUNE_BATCH_SIZE", _get_int(service_section, "health_history_prune_batch_size", DEFAULT_SERVICE_HEALTH_HISTORY_PRUNE_BATCH_SIZE))),
+            ),
+            service_log_max_bytes=max(
+                1,
+                int(os.getenv("MAL_UPDATER_SERVICE_LOG_MAX_BYTES", _get_int(service_section, "service_log_max_bytes", DEFAULT_SERVICE_LOG_MAX_BYTES))),
+            ),
+            service_log_retained_generations=max(
+                1,
+                int(os.getenv("MAL_UPDATER_SERVICE_LOG_RETAINED_GENERATIONS", _get_int(service_section, "service_log_retained_generations", DEFAULT_SERVICE_LOG_RETAINED_GENERATIONS))),
+            ),
+            runtime_retention_audit_every_seconds=max(
+                0,
+                int(os.getenv("MAL_UPDATER_SERVICE_RUNTIME_RETENTION_AUDIT_EVERY_SECONDS", _get_int(service_section, "runtime_retention_audit_every_seconds", DEFAULT_SERVICE_RUNTIME_RETENTION_AUDIT_EVERY_SECONDS))),
             ),
             loop_sleep_seconds=int(os.getenv("MAL_UPDATER_SERVICE_LOOP_SLEEP_SECONDS", _get_int(service_section, "loop_sleep_seconds", DEFAULT_SERVICE_LOOP_SLEEP_SECONDS))),
             startup_grace_seconds=max(

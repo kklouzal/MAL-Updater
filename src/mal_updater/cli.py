@@ -672,6 +672,23 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
                 last_result_http_status = last_result.get("http_status") if isinstance(last_result.get("http_status"), int) else None
                 if last_result_http_status is not None:
                     print(f"task_{task_name}_last_result_http_status={last_result_http_status}")
+                for result_field in (
+                    "db_size_before",
+                    "db_size_after",
+                    "freelist_bytes",
+                    "freelist_ratio",
+                    "bytes_reclaimed",
+                    "backup_archive",
+                    "backup_archive_sha256",
+                    "required_free_bytes",
+                    "available_free_bytes",
+                    "initial_available_free_bytes",
+                    "post_backup_available_free_bytes",
+                    "error_type",
+                ):
+                    result_value = last_result.get(result_field)
+                    if isinstance(result_value, (str, int, float)) and not isinstance(result_value, bool):
+                        print(f"task_{task_name}_last_result_{result_field}={result_value}")
 
     service_log_tail = payload.get("service_log_tail")
     if isinstance(service_log_tail, list) and service_log_tail:

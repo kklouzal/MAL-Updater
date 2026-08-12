@@ -125,6 +125,39 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
         "request_id",
         "request_url",
         "http_status",
+        "db_size_before",
+        "db_size_after",
+        "freelist_bytes",
+        "freelist_ratio",
+        "bytes_reclaimed",
+        "backup_archive",
+        "backup_archive_sha256",
+        "required_free_bytes",
+        "available_free_bytes",
+        "initial_available_free_bytes",
+        "post_backup_available_free_bytes",
+        "error_type",
+        "retention_days",
+        "min_count",
+        "batch_size",
+        "scanned_count",
+        "scanned_bytes",
+        "eligible_count",
+        "eligible_bytes",
+        "deleted_count",
+        "deleted_bytes",
+        "remaining_count",
+        "remaining_bytes",
+        "remaining_eligible_count",
+        "latest_preserved",
+        "read_only",
+        "mutation_policy",
+        "review_candidate_count",
+        "scan_error_count",
+        "truncated",
+        "file_count",
+        "total_bytes",
+        "backup_deletion_performed",
     ):
         field_value = value.get(field)
         if field_value is not None:
@@ -496,6 +529,9 @@ def doctor_service(config: AppConfig | None = None) -> dict[str, Any]:
     status = service_status()
     service_state, service_state_error = _read_json(config.service_state_path)
     recent_health, recent_health_error = _read_json(config.health_latest_json_path)
+    from .runtime_housekeeping import inspect_service_log
+
+    service_log_retention = inspect_service_log(config).as_dict()
 
     task_state: dict[str, Any] = {}
     if isinstance(service_state, dict):
@@ -512,6 +548,11 @@ def doctor_service(config: AppConfig | None = None) -> dict[str, Any]:
         "service_log_path": str(config.service_log_path),
         "service_log_exists": config.service_log_path.exists(),
         "service_log_tail": _tail_lines(config.service_log_path),
+        "service_log_retention": (
+            service_state.get("service_log_retention")
+            if isinstance(service_state, dict) and isinstance(service_state.get("service_log_retention"), dict)
+            else service_log_retention
+        ),
         "service_state_path": str(config.service_state_path),
         "service_state_exists": config.service_state_path.exists(),
         "service_state_parse_error": service_state_error,

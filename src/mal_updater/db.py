@@ -547,6 +547,19 @@ class WatchConfirmationProvenance:
 class ManagedConnection(sqlite3.Connection):
     """SQLite connection that preserves transaction context semantics and closes on exit."""
 
+    _mal_lock_handle: Any = None
+
+    def close(self) -> None:
+        lock_handle = getattr(self, "_mal_lock_handle", None)
+        try:
+            super().close()
+        finally:
+            if lock_handle is not None:
+                from .database_maintenance import release_database_lock
+
+                self._mal_lock_handle = None
+                release_database_lock(lock_handle)
+
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
         try:
             return bool(super().__exit__(exc_type, exc_value, traceback))
@@ -555,7 +568,17 @@ class ManagedConnection(sqlite3.Connection):
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, factory=ManagedConnection)
+    from .database_maintenance import acquire_database_lock
+
+    lock_handle = acquire_database_lock(db_path, exclusive=False, blocking=True)
+    try:
+        conn = sqlite3.connect(db_path, factory=ManagedConnection)
+    except BaseException:
+        from .database_maintenance import release_database_lock
+
+        release_database_lock(lock_handle)
+        raise
+    conn._mal_lock_handle = lock_handle
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
