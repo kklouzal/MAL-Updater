@@ -1,32 +1,32 @@
-# MAL-Updater 0.2.7
+# MAL-Updater 0.2.8
 
-This alpha patch adds conservative recurring housekeeping for long-running installations. A low-frequency SQLite compaction lane runs only when both freelist thresholds and the minimum interval are satisfied, obtains the repo-native writer lease, verifies a fresh backup, and confirms volume headroom before `VACUUM`. Daily health-history pruning is age/count/batch bounded, service logs rotate at append time with bounded generations, and the weekly runtime-retention inventory remains read-only. Backup deletion and ambiguous-runtime deletion remain human-gated.
+This alpha patch polishes the static and live recommendation dashboards. Recommendation tables now use scoped horizontal scrolling, responsive spacing, sticky headers, clearer row highlighting, keyboard-visible focus states, accessible sort buttons, and explicit empty-section messages. Provider proof links appear beneath each title, reducing table width and keeping the title/provider relationship clear. Diagnostic-only dub, provider-progress, and MAL-watch fields remain available in row and JSON evidence but are no longer presented as primary dashboard columns.
 
-Provider and MAL behavior is unchanged. Existing credential gates, pacing/backoff, ambiguity handling, stale-write reconciliation, and the unattended `sync_apply` limit of 8 remain in force. Housekeeping does not make provider or MAL network writes.
+Provider and MAL behavior is unchanged. Existing credential gates, pacing/backoff, ambiguity handling, stale-write reconciliation, and the unattended `sync_apply` limit of 8 remain in force. This release does not add provider or MAL writes.
 
 ## Install
 
-Download and extract `mal-updater-v0.2.7.tar.gz`, copy `.env.example` to `.env`, then run:
+Download and extract `mal-updater-v0.2.8.tar.gz`, copy `.env.example` to `.env`, then run:
 
 ```bash
 docker compose up -d
 ```
 
-The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.7`. Open the dashboard and complete MAL configuration/OAuth in Settings; automation starts automatically after setup is complete.
+The bundle pins `ghcr.io/kklouzal/mal-updater:0.2.8`. Open the dashboard and complete MAL configuration/OAuth in Settings; automation starts automatically after setup is complete.
 
 Before upgrading, create and verify a backup under `/data`, for example:
 
 ```bash
-docker compose --profile tools run --rm cli backup /data/backups/pre-0.2.7.tar.gz
-docker compose --profile tools run --rm cli backup-inspect --verify /data/backups/pre-0.2.7.tar.gz
+docker compose --profile tools run --rm cli backup /data/backups/pre-0.2.8.tar.gz
+docker compose --profile tools run --rm cli backup-inspect --verify /data/backups/pre-0.2.8.tar.gz
 ```
 
-After upgrading, wait for readiness and inspect service status/housekeeping evidence. The compaction lane normally skips until its interval and both freelist thresholds are satisfied; a skip is not a failure.
+After upgrading, wait for readiness and inspect the dashboard and service status.
 
 ## Included artifacts
 
 - Curated Compose bundle with environment template, documentation, license, release metadata, and internal checksums
-- Python 0.2.7 wheel and source distribution
+- Python 0.2.8 wheel and source distribution
 - Top-level SHA-256 checksums
 - AMD64/ARM64 GHCR image with build provenance and SBOM
 - Keyless Sigstore signature for the immutable image digest

@@ -2,6 +2,14 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [0.2.8] - 2026-08-12
+
+### Changed
+
+- Polished the static and live recommendation dashboards with scoped horizontal table scrolling, responsive spacing, sticky headers, clearer row highlighting, keyboard-visible focus states, accessible sort buttons, and explicit empty-section messages.
+- Moved provider proof links beneath each title and removed diagnostic-only dub/provider-progress/MAL-watch columns from the presentation while retaining their row and JSON evidence for diagnostics.
+- Updated the pinned container/bundle and Python package version to 0.2.8. Provider and MAL behavior remains unchanged, including credential gates, pacing/backoff, mapping and stale-write safeguards, and the unattended `sync_apply` limit of 8.
+
 ## [0.2.7] - 2026-08-12
 
 ### Added

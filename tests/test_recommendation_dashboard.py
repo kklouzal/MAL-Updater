@@ -205,7 +205,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(1, counts["pending_review"])
             self.assertEqual(0, counts["stale"])
 
-    def test_render_includes_sortable_requested_columns_and_escapes_content(self) -> None:
+    def test_render_combines_provider_proof_with_title_and_hides_diagnostic_only_columns(self) -> None:
         item = Recommendation(
             kind="discovery_candidate",
             priority=87,
@@ -233,29 +233,27 @@ class RecommendationDashboardTests(unittest.TestCase):
 
         html = render_recommendation_dashboard([item])
 
-        for label in (
-            "English title",
-            "Score",
-            "Source count",
-            "Total votes",
-            "Crunchyroll",
-            "HIDIVE",
-            "English dub",
-            "MAL mean",
-            "MAL popularity",
-            "Provider progress",
-            "MAL watch status",
-            "Genres",
-        ):
+        for label in ("English title / provider proof", "Score", "Source count", "Total votes", "MAL mean", "MAL popularity", "Genres"):
             self.assertIn(label, html)
-        self.assertIn('data-key="score" data-type="number"', html)
-        self.assertIn("The Great Show", html)
+        for hidden_label in ("English dub", "Provider progress", "MAL watch status"):
+            self.assertNotIn(f">{hidden_label}<", html)
+        self.assertNotIn('data-key="provider_evidence"', html)
+        self.assertIn('data-key="score" data-type="number" aria-sort="none"', html)
+        self.assertIn('data-key="title" data-sort-value="The Great Show (A &lt;Great&gt; Show (English Dub))"', html)
+        self.assertIn('<span class="title-text">The Great Show', html)
+        self.assertRegex(
+            html,
+            r'<span class="title-text">The Great Show.*?</span><div class="title-providers" aria-label="Provider proof">.*?Crunchyroll.*?<br>.*?HIDIVE',
+        )
         self.assertIn("Action, Comedy", html)
         self.assertNotIn("recommended by 2 watched/mapped seed title", html)
         self.assertIn("34", html)
         self.assertIn("321", html)
-        self.assertIn("2/12", html)
-        self.assertIn("watching (2/12)", html)
+        self.assertNotIn(">2/12<", html)
+        self.assertNotIn("watching (2/12)", html)
+        self.assertIn("class=\"table-scroll\"", html)
+        self.assertIn("aria-sort=\"none\"", html)
+        self.assertIn("cell?.dataset.sortValue ?? cell?.textContent.trim()", html)
         self.assertIn("addEventListener('click'", html)
 
     def test_dashboard_marks_hidive_mapping_backed_discovery_availability(self) -> None:
@@ -351,7 +349,7 @@ class RecommendationDashboardTests(unittest.TestCase):
 
             self.assertEqual(output, written)
             html = output.read_text(encoding="utf-8")
-            self.assertIn("No recommendations found.", html)
+            self.assertIn("No recommendations in this section.", html)
             self.assertIn("Click any column header to sort", html)
 
     def test_recommend_dashboard_cli_defaults_to_dashboard_limit_and_include_dormant_is_diagnostic(self) -> None:
@@ -642,7 +640,13 @@ class RecommendationDashboardTests(unittest.TestCase):
 
         self.assertIn("Watchable now", html)
         self.assertIn("https://www.crunchyroll.com/series/actionable", html)
-        self.assertIn("English dub evidence", html)
+        self.assertIn('class="provider-link"', html)
+        self.assertIn('aria-label="Open Crunchyroll provider proof"', html)
+        self.assertRegex(
+            html,
+            r'<span class="title-text">Actionable Candidate</span><div class="title-providers" aria-label="Provider proof"><a class="provider-link"',
+        )
+        self.assertNotIn(">English dub evidence<", html)
         self.assertIn("identity approved_mapping", html)
         self.assertIn("review verified", html)
         self.assertIn("catalog present", html)
@@ -688,7 +692,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn("Ranked discovery recommendations", html)
         self.assertNotIn("Watchable now — verified provider+dub proof", html)
         self.assertIn("Crunchyroll (unverified)", html)
-        self.assertIn("present (unverified)", html)
+        self.assertNotIn("present (unverified)", html)
         self.assertIn("review review-needed", html)
         self.assertIn("catalog present", html)
 
@@ -1266,10 +1270,12 @@ class RecommendationDashboardTests(unittest.TestCase):
 
         html = render_recommendation_dashboard([item])
 
-        for text in ("Dub status", "Availability match", "Availability confidence", "Match source", "Mapping confidence", "Review"):
+        self.assertNotIn(">Dub status<", html)
+        for text in ("Availability match", "Availability confidence", "Match source", "Mapping confidence", "Review"):
             self.assertIn(text, html)
-        for text in ("title_alias", "provider_search", "0.62", "none", "yes"):
+        for text in ("title_alias", "provider_search", "0.62", "yes"):
             self.assertIn(text, html)
+        self.assertNotIn(">none<", html)
 
     def test_dashboard_api_payload_exposes_availability_match_dub_and_review_details(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1444,6 +1450,31 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual([], write_actions)
             merge_mock.assert_not_called()
             self.assertEqual(before_bytes, config.db_path.read_bytes())
+
+    def test_live_dashboard_recommendation_table_combines_provider_with_title_and_omits_removed_columns(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn("${titleLabel} / provider proof", html)
+        self.assertIn('class="title-providers" aria-label="Provider proof"', html)
+        self.assertIn('scope="row"', html)
+        self.assertIn('class="table-scroll" tabindex="0" role="region"', html)
+        self.assertIn('class=\"provider-link\"', html)
+        self.assertIn('aria-label=\"${esc(`Open ${provider} provider proof`)}\"', html)
+        for heading in ("English dub", "Provider progress", "MAL watch status"):
+            self.assertNotIn(f"<th>{heading}</th>", html)
+        self.assertNotIn("const progress = r =>", html)
+
+    def test_live_dashboard_scopes_wide_tables_and_wraps_recent_sync_runs(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn("table{border-collapse:collapse;width:100%;background:#161d24}", html)
+        self.assertIn(".table-scroll table{min-width:70rem}", html)
+        self.assertIn(".ordinary-table-scroll table{min-width:36rem}", html)
+        self.assertNotIn("table{border-collapse:collapse;width:100%;min-width:70rem", html)
+        self.assertIn(
+            'class=\"ordinary-table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Recent provider sync runs table\"',
+            html,
+        )
 
     def test_live_dashboard_nested_operational_counts_render_without_object_stringification(self) -> None:
         html = render_dynamic_dashboard_html()

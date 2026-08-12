@@ -439,7 +439,11 @@ def _provider_evidence_html(badges: list[dict[str, Any]]) -> str:
         title = str(badge.get("title") or "").strip()
         body = f'<span class="provider-badge provider-{css_provider}">{label}</span>'
         if url:
-            body = f'<a href="{escape(url, quote=True)}" rel="noreferrer noopener">{body}</a>'
+            accessible_label = f"Open {badge.get('label') or _provider_label(badge.get('provider'))} provider proof"
+            body = (
+                f'<a class="provider-link" href="{escape(url, quote=True)}" rel="noreferrer noopener" '
+                f'aria-label="{escape(str(accessible_label), quote=True)}">{body}</a>'
+            )
         if title:
             body += f' <span class="meta">{escape(title)}</span>'
         parts.append(body)
@@ -537,17 +541,13 @@ def _row(item: Recommendation) -> dict[str, Any]:
     return _mark_discovery_row_visibility(row)
 
 
-_COLUMNS: tuple[tuple[str, str, str], ...] = (
+# Presentation-only columns. Provider proof is rendered beneath the title; dub,
+# provider-progress, and MAL-watch fields remain available in row/JSON evidence.
+_DASHBOARD_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("title", "Title", "text"),
     ("score", "Score", "number"),
     ("source_count", "Source count", "number"),
     ("total_votes", "Total votes", "number"),
-    ("crunchyroll", "Crunchyroll", "text"),
-    ("hidive", "HIDIVE", "text"),
-    ("provider_evidence", "Provider evidence", "text"),
-    ("english_dub", "English dub", "text"),
-    ("english_dub_evidence", "English dub evidence", "text"),
-    ("dub_status", "Dub status", "text"),
     ("verification", "Identity/review/catalog", "text"),
     ("evidence_freshness", "Evidence freshness/expiry", "text"),
     ("availability_match_kind", "Availability match", "text"),
@@ -558,8 +558,6 @@ _COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("mal_mean", "MAL mean", "number"),
     ("mal_popularity", "MAL popularity", "number"),
     ("genres", "Genres", "text"),
-    ("provider_progress", "Provider progress", "text"),
-    ("mal_watch_status", "MAL watch status", "text"),
     ("why_recommended", "Why recommended", "text"),
     ("scorecard_summary", "Scorecard", "text"),
     ("seed_details", "Top watched seeds", "text"),
@@ -772,27 +770,36 @@ def _recommendation_table(rows: list[dict[str, Any]], table_id: str, head_cells:
     body_rows = []
     for row in rows:
         cell_parts: list[str] = []
-        for key, _, _ in _COLUMNS:
+        for key, _, _ in _DASHBOARD_COLUMNS:
             value = row.get(key, "")
-            if key == "provider_evidence" and row.get("provider_evidence_html"):
-                cell_parts.append(f'<td data-key="{escape(key)}">{row["provider_evidence_html"]}</td>')
+            if key == "title":
+                providers = str(row.get("provider_evidence_html") or "")
+                provider_block = f'<div class="title-providers" aria-label="Provider proof">{providers}</div>' if providers else '<div class="title-providers muted">Provider proof unavailable</div>'
+                cell_parts.append(
+                    f'<th scope="row" data-key="title" data-sort-value="{escape(str(value), quote=True)}">'
+                    f'<span class="title-text">{escape(str(value))}</span>{provider_block}</th>'
+                )
             else:
                 cell_parts.append(f'<td data-key="{escape(key)}">{escape(str(value))}</td>')
         cells = "".join(cell_parts)
         body_rows.append(f'<tr data-kind="{escape(str(row.get("kind", "")))}" data-providers="{escape(str(row.get("providers", "")))}">{cells}</tr>')
-    body = "\n".join(body_rows) or f'<tr><td colspan="{len(_COLUMNS)}">No recommendations found.</td></tr>'
-    return f"""<table id="{escape(table_id)}" class="recommendations">
+    body = "\n".join(body_rows) or f'<tr class="table-empty"><td colspan="{len(_DASHBOARD_COLUMNS)}">No recommendations in this section.</td></tr>'
+    caption = f'{escape(title_label)} recommendations; provider proof appears below each title.'
+    return f"""<div class="table-scroll" tabindex="0" role="region" aria-label="{escape(title_label)} recommendations table">
+  <table id="{escape(table_id)}" class="recommendations">
+    <caption class="sr-only">{caption}</caption>
     <thead><tr>{head_cells}</tr></thead>
     <tbody>
 {body}
     </tbody>
-  </table>"""
+  </table>
+  </div>"""
 
 
 def _table_head_cells(*, title_label: str = "Title") -> str:
     return "".join(
-        f'<th scope="col" data-key="{escape(key)}" data-type="{escape(kind)}" tabindex="0">{escape(title_label if key == "title" else label)}</th>'
-        for key, label, kind in _COLUMNS
+        f'<th scope="col" data-key="{escape(key)}" data-type="{escape(kind)}" aria-sort="none"><button type="button" class="sort-button">{escape((title_label + " / provider proof") if key == "title" else label)}<span aria-hidden="true" class="sort-indicator"></span></button></th>'
+        for key, label, kind in _DASHBOARD_COLUMNS
     )
 
 
@@ -838,9 +845,14 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
             if meta.get("diagnostic_only") == "true":
                 description += '<p class="warn"><strong>Discovery only:</strong> these rows lack strict actionable provider+dub proof and are not watch-now eligible.</p>'
             count_label = _section_count_label(len(section_rows), total_rows)
+            table_or_empty = (
+                _recommendation_table(section_rows, f"recommendations-{index}", title_label=meta.get("title_label", "Title"))
+                if section_rows
+                else '<p class="muted" role="status">No recommendations in this section.</p>'
+            )
             sections.append(
                 f'<section><h2>{escape(meta["label"])} ({escape(count_label)})</h2>{description}'
-                f'{_recommendation_table(section_rows, f"recommendations-{index}", title_label=meta.get("title_label", "Title"))}</section>'
+                f'{table_or_empty}</section>'
             )
         body = "\n  ".join(sections)
     else:
@@ -852,15 +864,28 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)}</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; background: #101418; color: #eef3f8; }}
-    section {{ margin-top: 2rem; }}
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0 auto; padding: 1.5rem; max-width: 110rem; background: #101418; color: #eef3f8; line-height: 1.45; }}
+    section {{ margin-top: 2rem; }} h1, h2 {{ line-height: 1.2; }} a {{ color: #8cc8ff; }}
+    .table-scroll {{ overflow-x: auto; margin: .75rem 0 1.5rem; border: 1px solid #2b3642; border-radius: .55rem; }}
+    .table-scroll:focus-visible {{ outline: 3px solid #8cc8ff; outline-offset: 2px; }}
     table {{ border-collapse: collapse; width: 100%; background: #161d24; }}
-    th, td {{ border: 1px solid #2b3642; padding: .45rem .6rem; vertical-align: top; }}
-    th {{ cursor: pointer; position: sticky; top: 0; background: #243140; }}
-    tbody tr:nth-child(even) {{ background: #121920; }}
-    .meta {{ color: #aebccc; }} .warn {{ color: #ffd37a; }} .good {{ color: #b9f6ca; }}
+    .table-scroll table.recommendations {{ min-width: 72rem; }}
+    th, td {{ border-right: 1px solid #2b3642; border-bottom: 1px solid #2b3642; padding: .65rem .75rem; vertical-align: top; text-align: left; }}
+    th:last-child, td:last-child {{ border-right: 0; }} tbody tr:last-child > * {{ border-bottom: 0; }}
+    .recommendations thead th {{ position: sticky; top: 0; z-index: 1; background: #243140; }}
+    .recommendations tbody th {{ min-width: 16rem; font-weight: 650; }} tbody tr:nth-child(even) {{ background: #121920; }} tbody tr:hover {{ background: #1c2732; }}
+    .sort-button {{ all: unset; display: flex; align-items: center; gap: .35rem; width: 100%; cursor: pointer; font-weight: 700; }}
+    .sort-button:focus-visible {{ outline: 2px solid #8cc8ff; outline-offset: 3px; }}
+    th[aria-sort="ascending"] .sort-indicator::after {{ content: "▲"; }} th[aria-sort="descending"] .sort-indicator::after {{ content: "▼"; }}
+    .title-text {{ display: block; }} .title-providers {{ display: block; margin-top: .45rem; font-size: .88rem; font-weight: 400; }}
+    .meta, .muted {{ color: #aebccc; }} .warn {{ color: #ffd37a; }} .good {{ color: #b9f6ca; }}
     .banner, .empty-state {{ background: #161d24; border: 1px solid #2b3642; border-radius: .6rem; padding: 1rem; }}
-    .provider-badge {{ display: inline-block; border: 1px solid #4b9fff; border-radius: 999px; padding: .05rem .45rem; font-weight: 700; }}
+    .provider-badge {{ display: inline-block; border: 1px solid #4b9fff; border-radius: 999px; padding: .08rem .5rem; font-weight: 700; }}
+    .provider-link {{ display: inline-block; border-radius: 999px; text-decoration: none; }} .provider-link:hover .provider-badge {{ background: #243f5a; }}
+    .provider-link:focus-visible {{ outline: 3px solid #8cc8ff; outline-offset: 2px; }}
+    .table-empty {{ text-align: center; color: #aebccc; }} .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }}
+    @media (max-width: 48rem) {{ body {{ padding: 1rem; }} section {{ margin-top: 1.5rem; }} th, td {{ padding: .55rem .6rem; }} .banner, .empty-state {{ padding: .8rem; }} }}
   </style>
 </head>
 <body>
@@ -871,29 +896,29 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
   <script>
   (() => {{
     const getValue = (row, key, type) => {{
-      const text = row.querySelector(`[data-key="${{key}}"]`)?.textContent.trim() || '';
+      const cell = row.querySelector(`[data-key="${{key}}"]`);
+      const text = cell?.dataset.sortValue ?? cell?.textContent.trim() ?? '';
       return type === 'number' ? (text === '' ? Number.NEGATIVE_INFINITY : Number(text)) : text.toLowerCase();
     }};
     document.querySelectorAll('table.recommendations').forEach(table => {{
       const tbody = table.tBodies[0];
-      table.querySelectorAll('th').forEach(th => {{
-        th.addEventListener('click', () => {{
+      table.querySelectorAll('thead th').forEach(th => {{
+        th.querySelector('button')?.addEventListener('click', () => {{
           const key = th.dataset.key;
           const type = th.dataset.type;
-          const direction = th.dataset.direction === 'asc' ? 'desc' : 'asc';
-          table.querySelectorAll('th').forEach(other => delete other.dataset.direction);
-          th.dataset.direction = direction;
-          const rows = Array.from(tbody.rows);
+          const direction = th.getAttribute('aria-sort') === 'ascending' ? 'descending' : 'ascending';
+          table.querySelectorAll('thead th').forEach(other => other.setAttribute('aria-sort', 'none'));
+          th.setAttribute('aria-sort', direction);
+          const rows = Array.from(tbody.rows).filter(row => !row.classList.contains('table-empty'));
           rows.sort((a, b) => {{
             const av = getValue(a, key, type);
             const bv = getValue(b, key, type);
-            if (av < bv) return direction === 'asc' ? -1 : 1;
-            if (av > bv) return direction === 'asc' ? 1 : -1;
+            if (av < bv) return direction === 'ascending' ? -1 : 1;
+            if (av > bv) return direction === 'ascending' ? 1 : -1;
             return 0;
           }});
           rows.forEach(row => tbody.appendChild(row));
         }});
-        th.addEventListener('keydown', event => {{ if (event.key === 'Enter' || event.key === ' ') th.click(); }});
       }});
     }});
   }})();
@@ -1352,7 +1377,7 @@ def render_dynamic_dashboard_html(*, title: str = "MAL-Updater live dashboard", 
     template = """<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <title>__TITLE__</title><style>
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#101418;color:#eef3f8}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}table{border-collapse:collapse;width:100%;background:#161d24;margin:.75rem 0 1.5rem}th,td{border:1px solid #2b3642;padding:.45rem .6rem;vertical-align:top}th{background:#243140;text-align:left}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.05rem .45rem;font-weight:700;margin:.05rem .2rem .05rem 0}.diagnostic-row{opacity:.82}.diagnostic-label{color:#ffd37a;font-weight:700}code{white-space:pre-wrap}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:70rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}th,td{padding:.55rem .6rem}}
 </style></head><body>__NAVIGATION__<h1>__TITLE__</h1><p class=\"muted\">Live local strict dashboard. Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const countValue = value => {
@@ -1365,12 +1390,12 @@ const countValue = value => {
   return esc(value);
 };
 const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${countValue(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
-const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const label = `<span class=\"provider-badge\">${esc(b.label || b.provider)}</span>`; const title = b.title ? ` <span class=\"muted\">${esc(b.title)}</span>` : ''; return `${b.url ? `<a href=\"${esc(b.url)}\" rel=\"noreferrer noopener\">${label}</a>` : label}${title}`; }).join('<br>'); };
+const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const provider = b.label || b.provider; const label = `<span class=\"provider-badge\">${esc(provider)}</span>`; const title = b.title ? ` <span class=\"muted\">${esc(b.title)}</span>` : ''; return `${b.url ? `<a class=\"provider-link\" href=\"${esc(b.url)}\" rel=\"noreferrer noopener\" aria-label=\"${esc(`Open ${provider} provider proof`)}\">${label}</a>` : label}${title}`; }).join('<br>'); };
 const seedDetails = e => (e?.top_supporting_seeds || []).map(s => { const bits = []; if (s.num_recommendation_votes != null) bits.push(`${s.num_recommendation_votes} MAL vote${s.num_recommendation_votes === 1 ? '' : 's'}`); if (s.user_score != null) bits.push(`score ${s.user_score}`); if (s.status) bits.push(s.status); return `${esc(s.title || s.mal_anime_id || 'MAL seed')}${bits.length ? ` <span class=\"muted\">(${esc(bits.join(', '))})</span>` : ''}`; }).join('<br>') || esc(e?.compact_seeds || '');
 const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary || '');
 const genreText = r => Array.isArray(r.genres) ? r.genres.join(', ') : (r.genres ?? '');
-function recTable(rows, meta = {}){ if(!rows?.length) return '<p class=\"muted\">No rows in latest snapshot.</p>'; const progress = r => { const c = r.context || {}; const done = c.completed_episode_count ?? c.max_completed_episode_number; const max = c.max_episode_number ?? c.available_episode_count; return done != null && max != null ? `${done}/${max}` : (done != null ? `${done}` : ''); }; const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; return `${diag}<table><thead><tr><th>Priority</th><th>${esc(titleLabel)}</th><th>Provider proof</th><th>English dub</th><th>Identity/review/catalog</th><th>Freshness/expiry</th><th>Why recommended</th><th>Scorecard</th><th>Top watched seeds</th><th>Genres</th><th>Provider progress</th><th>MAL watch status</th></tr></thead><tbody>${rows.map(r => { const e = r.evidence || {}; const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">discovery only · unverified</div>' : ''; return `<tr class=\"${diagnostic}\"><td>${esc(r.priority ?? r.score)}</td><td>${diagnosticLabel}${esc(r.display_title || r.english_title || r.title)}</td><td>${providerBadges(r)}</td><td>${esc(r.english_dub_evidence || e.dub_signal || '')}</td><td>${esc(r.verification || e.verification_label || r.unverified_evidence_label || '')}</td><td>${esc(r.evidence_freshness || e.evidence_freshness_label || '')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td><td>${esc(progress(r))}</td><td>${esc(e.mal_watch_status || '')}</td></tr>`; }).join('')}</tbody></table>`; }
-function syncTable(runs){ if(!runs?.length) return '<p class=\"muted\">No sync runs recorded.</p>'; return `<table><thead><tr><th>ID</th><th>Provider</th><th>Mode</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.provider)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td><td>${esc(r.started_at)}</td><td>${esc(r.completed_at)}</td></tr>`).join('')}</tbody></table>`; }
+function recTable(rows, meta = {}){ const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; if(!rows?.length) return `${diag}<p class=\"muted\" role=\"status\">No recommendations in this section.</p>`; const headings = ['Priority', `${titleLabel} / provider proof`, 'Identity/review/catalog', 'Freshness/expiry', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']; const head = headings.map(label => `<th scope=\"col\">${esc(label)}</th>`).join(''); const body = rows.map(r => { const e = r.evidence || {}; const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">discovery only · unverified</div>' : ''; const title = esc(r.display_title || r.english_title || r.title); return `<tr class=\"${diagnostic}\"><td>${esc(r.priority ?? r.score)}</td><th scope=\"row\">${diagnosticLabel}<span class=\"title-text\">${title}</span><div class=\"title-providers\" aria-label=\"Provider proof\">${providerBadges(r)}</div></th><td>${esc(r.verification || e.verification_label || r.unverified_evidence_label || '')}</td><td>${esc(r.evidence_freshness || e.evidence_freshness_label || '')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td></tr>`; }).join(''); return `${diag}<div class=\"table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"${esc(titleLabel)} recommendations table\"><table><caption class=\"sr-only\">${esc(titleLabel)} recommendations; provider proof appears below each title.</caption><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`; }
+function syncTable(runs){ if(!runs?.length) return '<p class=\"muted\">No sync runs recorded.</p>'; return `<div class=\"ordinary-table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Recent provider sync runs table\"><table><thead><tr><th>ID</th><th>Provider</th><th>Mode</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.provider)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td><td>${esc(r.started_at)}</td><td>${esc(r.completed_at)}</td></tr>`).join('')}</tbody></table></div>`; }
 const etaText = (hours, reasons = []) => hours == null ? `unknown${reasons.length ? ` (${esc(reasons.join(', '))})` : ''}` : (hours === 0 ? 'ready now' : `~${esc(hours)}h`);
 function publicUserrecsSection(p){ if(!p) return ''; const c = p.coverage || {}; const o = p.open_generations || {}; const h = p.hourly_throughput || {}; const b = p.backlog || {}; const s = p.sustainability || {}; return `<section><h2>Public MAL userrecs crawl</h2><div class=\"grid\"><section class=\"card\"><h3>Crawl coverage</h3>${count({status:p.status, positive_seeds:p.positive_seed_count, complete:c.complete, fresh:c.fresh, stale:c.stale, failed:c.failed, unharvested:c.unharvested, fresh_ratio:c.fresh_ratio})}</section><section class=\"card\"><h3>Backlog/open</h3>${count({due_sources:b.due_sources, active:o.active, paused:o.paused, ready:o.ready, open_total:o.total, staged_pages:o.staged_pages, staged_edges:o.staged_edges})}</section><section class=\"card\"><h3>Hourly throughput</h3>${count({pages_fetched_last_hour:h.pages_fetched_last_hour, last_page:h.last_page_fetched_at, sources_started:h.sources_started_last_hour, sources_published:h.sources_published_last_hour})}</section><section class=\"card\"><h3>Source-start ETA</h3>${count({eta:etaText(b.conservative_source_start_eta_hours), authorized_per_hour:s.authorized_source_titles_per_hour, configured_per_hour:s.configured_source_titles_per_hour, within_authorized_rate:s.within_authorized_rate})}</section><section class=\"card\"><h3>Completion ETA</h3>${count({eta:etaText(b.completion_eta_hours, b.completion_eta_reason_codes || ['unknown_pages_per_source'])})}</section></div></section>`; }
 function providerEnrichmentSection(e){ const providers = e?.providers || {}; const cards = Object.entries(providers).map(([slug,p]) => { const c = p.candidates || {}; const d = p.due || {}; const a = p.attempts || {}; const cur = p.cursor || {}; const eta = d.selection_eta || {}; const complete = p.availability_completion_eta || {}; return `<section class="card"><h3>${esc(slug)}</h3>${count({status:p.status, reasons:p.reason_codes, candidates:c.ranked_total, metadata_coverage:c.metadata_coverage_ratio, due:d.total, due_by_class:d.by_class, selected_now:d.current_limit_selection_count, selection_eta_seconds:eta.eta_seconds, selection_eta_reason:eta.reason_code, cursor_mal_id:cur.cursor_mal_anime_id, cursor_generation:cur.cursor_generation, attempted_last_hour:a.distinct_candidates_attempted_last_hour, recent_outcomes:a.recent_24h_outcome_counts, availability_completion_eta:complete.reason_code})}</section>`; }).join(''); if(!cards) return `<section><h2>Provider enrichment health</h2><p class="muted">${esc(e?.reason_codes?.join(', ') || 'No configured credentialed provider enrichment lanes detected.')}</p></section>`; return `<section><h2>Provider enrichment health</h2><div class="grid">${cards}</div></section>`; }
