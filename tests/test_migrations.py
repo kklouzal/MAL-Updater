@@ -40,6 +40,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "017_provider_series_observation_provenance.sql",
                 "018_provider_title_search_cache_full_key.sql",
                 "019_mal_user_anime_list_refresh_generations.sql",
+                "020_provider_eligibility_refresh_lifecycle.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -87,6 +88,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "017_provider_series_observation_provenance.sql",
                     "018_provider_title_search_cache_full_key.sql",
                     "019_mal_user_anime_list_refresh_generations.sql",
+                    "020_provider_eligibility_refresh_lifecycle.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -113,6 +115,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "017_provider_series_observation_provenance.sql",
                     "018_provider_title_search_cache_full_key.sql",
                     "019_mal_user_anime_list_refresh_generations.sql",
+                    "020_provider_eligibility_refresh_lifecycle.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )

@@ -20,6 +20,7 @@ PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION = "016_provider_watchlist_membership_key
 PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION = "017_provider_series_observation_provenance.sql"
 PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION = "018_provider_title_search_cache_full_key.sql"
 MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION = "019_mal_user_anime_list_refresh_generations.sql"
+PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION = "020_provider_eligibility_refresh_lifecycle.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -42,6 +43,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION,
     PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION,
     MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION,
+    PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -410,6 +412,13 @@ class RecommendationProviderEligibilityEvidence:
     failure_count: int
     next_retry_at: str | None
     logic_version: str
+    verification_outcome: str
+    refresh_due_at: str | None
+    refresh_schedule_version: str
+    refresh_schedule_key: str | None
+    last_successful_positive_at: str | None
+    invalidated_at: str | None
+    invalidation_reason: str | None
     created_at: str
     updated_at: str
 
@@ -662,6 +671,50 @@ def _repair_recorded_broadcast_compatibility_migration(conn: sqlite3.Connection)
         raise
 
 
+def _backfill_provider_eligibility_refresh_lifecycle(conn: sqlite3.Connection) -> None:
+    """Populate deterministic schedules after the additive lifecycle columns exist."""
+    from .provider_eligibility_lifecycle import (
+        PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+        provider_eligibility_refresh_due_at,
+        provider_eligibility_refresh_schedule_key,
+    )
+
+    rows = conn.execute(
+        """
+        SELECT mal_anime_id, provider, provider_series_id, last_verified_at, verification_outcome
+        FROM recommendation_provider_eligibility_evidence
+        """
+    ).fetchall()
+    for row in rows:
+        semantic = {
+            "mal_anime_id": int(row["mal_anime_id"]),
+            "provider": str(row["provider"]),
+            "provider_series_id": str(row["provider_series_id"]),
+        }
+        schedule_key = provider_eligibility_refresh_schedule_key(**semantic)
+        refresh_due_at = None
+        if row["last_verified_at"] is not None and str(row["verification_outcome"]) in {"positive", "negative"}:
+            refresh_due_at = provider_eligibility_refresh_due_at(
+                successful_verified_at=str(row["last_verified_at"]),
+                **semantic,
+            )
+        conn.execute(
+            """
+            UPDATE recommendation_provider_eligibility_evidence
+            SET refresh_due_at = ?, refresh_schedule_version = ?, refresh_schedule_key = ?
+            WHERE mal_anime_id = ? AND provider = ? AND provider_series_id = ?
+            """,
+            (
+                refresh_due_at,
+                PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+                schedule_key,
+                semantic["mal_anime_id"],
+                semantic["provider"],
+                semantic["provider_series_id"],
+            ),
+        )
+
+
 def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -687,6 +740,8 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
                 _execute_migration_statement(conn, statement)
             if version == BROADCAST_COMPATIBILITY_MIGRATION:
                 _repair_mal_anime_metadata_broadcast_columns(conn)
+            if version == PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION:
+                _backfill_provider_eligibility_refresh_lifecycle(conn)
             conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
             conn.commit()
         except BaseException:
@@ -5847,6 +5902,13 @@ def _recommendation_provider_eligibility_from_db(row: sqlite3.Row) -> Recommenda
         failure_count=int(row["failure_count"]),
         next_retry_at=row["next_retry_at"],
         logic_version=str(row["logic_version"]),
+        verification_outcome=str(row["verification_outcome"]),
+        refresh_due_at=row["refresh_due_at"],
+        refresh_schedule_version=str(row["refresh_schedule_version"]),
+        refresh_schedule_key=row["refresh_schedule_key"],
+        last_successful_positive_at=row["last_successful_positive_at"],
+        invalidated_at=row["invalidated_at"],
+        invalidation_reason=row["invalidation_reason"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -5875,11 +5937,93 @@ def upsert_recommendation_provider_eligibility_evidence(
     failure_count: int = 0,
     next_retry_at: str | None = None,
     logic_version: str = "legacy-v1",
+    verification_outcome: str | None = None,
+    refresh_due_at: str | None = None,
+    refresh_schedule_version: str = "provider-eligibility-120d-v1",
+    refresh_schedule_key: str | None = None,
+    last_successful_positive_at: str | None = None,
+    invalidated_at: str | None = None,
+    invalidation_reason: str | None = None,
 ) -> RecommendationProviderEligibilityEvidence:
     normalized_provider = _validate_recommendation_eligibility_provider(provider)
     normalized_review_status = _validate_recommendation_eligibility_value("review_status", review_status, _REVIEW_STATUSES)
     normalized_catalog_status = _validate_recommendation_eligibility_value("catalog_status", catalog_status, _ELIGIBILITY_STATUSES)
     normalized_english_dub_status = _validate_recommendation_eligibility_value("english_dub_status", english_dub_status, _ELIGIBILITY_STATUSES)
+    if verification_outcome is None:
+        if (
+            normalized_review_status == "verified"
+            and normalized_catalog_status == "present"
+            and normalized_english_dub_status == "present"
+            and last_verified_at is not None
+        ):
+            verification_outcome = "positive"
+        elif normalized_review_status == "verified" and (
+            normalized_catalog_status == "absent" or normalized_english_dub_status == "absent"
+        ):
+            verification_outcome = "negative"
+        else:
+            verification_outcome = "unknown"
+    normalized_verification_outcome = _validate_recommendation_eligibility_value(
+        "verification_outcome", verification_outcome, {"unknown", "positive", "negative"}
+    )
+    existing = get_recommendation_provider_eligibility_evidence(
+        db_path,
+        mal_anime_id=mal_anime_id,
+        provider=normalized_provider,
+        provider_series_id=provider_series_id,
+    )
+    if normalized_verification_outcome == "unknown" and existing is not None and existing.last_successful_positive_at and not existing.invalidated_at:
+        provider_title = existing.provider_title
+        provider_url = existing.provider_url
+        identity_match_kind = existing.identity_match_kind
+        match_confidence = existing.match_confidence
+        normalized_review_status = existing.review_status
+        normalized_catalog_status = existing.catalog_status
+        normalized_english_dub_status = existing.english_dub_status
+        explicit_dub_evidence_source = existing.explicit_dub_evidence_source
+        audio_locales = existing.audio_locales
+        source_evidence = existing.source_evidence
+        fetched_at = existing.fetched_at
+        expires_at = existing.expires_at
+        last_verified_at = existing.last_verified_at
+        normalized_verification_outcome = existing.verification_outcome
+        last_successful_positive_at = existing.last_successful_positive_at
+        invalidated_at = existing.invalidated_at
+        invalidation_reason = existing.invalidation_reason
+    if (
+        existing is not None
+        and refresh_due_at is None
+        and normalized_verification_outcome == existing.verification_outcome
+        and last_verified_at == existing.last_verified_at
+    ):
+        refresh_due_at = existing.refresh_due_at
+        refresh_schedule_version = existing.refresh_schedule_version
+        refresh_schedule_key = existing.refresh_schedule_key
+    if normalized_verification_outcome == "positive":
+        last_successful_positive_at = last_successful_positive_at or last_verified_at or fetched_at
+        invalidated_at = None
+        invalidation_reason = None
+    elif normalized_verification_outcome == "negative":
+        invalidated_at = invalidated_at or last_verified_at or fetched_at
+    if refresh_schedule_key is None:
+        from .provider_eligibility_lifecycle import provider_eligibility_refresh_schedule_key
+
+        refresh_schedule_key = provider_eligibility_refresh_schedule_key(
+            mal_anime_id=mal_anime_id,
+            provider=normalized_provider,
+            provider_series_id=provider_series_id,
+            schedule_version=refresh_schedule_version,
+        )
+    if refresh_due_at is None and normalized_verification_outcome in {"positive", "negative"}:
+        from .provider_eligibility_lifecycle import provider_eligibility_refresh_due_at
+
+        refresh_due_at = provider_eligibility_refresh_due_at(
+            successful_verified_at=last_verified_at or fetched_at,
+            mal_anime_id=mal_anime_id,
+            provider=normalized_provider,
+            provider_series_id=provider_series_id,
+            schedule_version=refresh_schedule_version,
+        )
     if match_confidence is not None and not 0.0 <= float(match_confidence) <= 1.0:
         raise ValueError("match_confidence must be between 0.0 and 1.0")
     with connect(db_path) as conn:
@@ -5890,8 +6034,10 @@ def upsert_recommendation_provider_eligibility_evidence(
                 identity_match_kind, match_confidence, review_status, catalog_status, english_dub_status,
                 explicit_dub_evidence_source, audio_locales_json, source_evidence_json,
                 fetched_at, expires_at, last_verified_at, refresh_status,
-                failure_count, next_retry_at, logic_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                failure_count, next_retry_at, logic_version, verification_outcome,
+                refresh_due_at, refresh_schedule_version, refresh_schedule_key,
+                last_successful_positive_at, invalidated_at, invalidation_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mal_anime_id, provider, provider_series_id) DO UPDATE SET
                 provider_title = excluded.provider_title,
                 provider_url = excluded.provider_url,
@@ -5910,6 +6056,13 @@ def upsert_recommendation_provider_eligibility_evidence(
                 failure_count = excluded.failure_count,
                 next_retry_at = excluded.next_retry_at,
                 logic_version = excluded.logic_version,
+                verification_outcome = excluded.verification_outcome,
+                refresh_due_at = excluded.refresh_due_at,
+                refresh_schedule_version = excluded.refresh_schedule_version,
+                refresh_schedule_key = excluded.refresh_schedule_key,
+                last_successful_positive_at = excluded.last_successful_positive_at,
+                invalidated_at = excluded.invalidated_at,
+                invalidation_reason = excluded.invalidation_reason,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -5921,6 +6074,8 @@ def upsert_recommendation_provider_eligibility_evidence(
                 json.dumps(source_evidence or {}, ensure_ascii=False, sort_keys=True),
                 fetched_at, expires_at, last_verified_at, str(refresh_status),
                 max(0, int(failure_count)), next_retry_at, str(logic_version),
+                normalized_verification_outcome, refresh_due_at, str(refresh_schedule_version), refresh_schedule_key,
+                last_successful_positive_at, invalidated_at, invalidation_reason,
             ),
         )
         conn.commit()
@@ -5930,6 +6085,203 @@ def upsert_recommendation_provider_eligibility_evidence(
     if evidence is None:
         raise RuntimeError("Recommendation eligibility evidence disappeared after upsert")
     return evidence
+
+
+def record_recommendation_provider_eligibility_lifecycle_result(
+    db_path: Path,
+    *,
+    mal_anime_id: int,
+    provider: str,
+    provider_series_id: str,
+    outcome: str,
+    attempted_at: str,
+    refresh_due_at: str | None = None,
+    refresh_schedule_version: str = "provider-eligibility-120d-v1",
+    refresh_schedule_key: str | None = None,
+    next_retry_at: str | None = None,
+    invalidation_reason: str | None = None,
+) -> RecommendationProviderEligibilityEvidence:
+    """Apply lifecycle-only state while preserving last-known-good positive evidence on unknown/failure."""
+    normalized_outcome = _validate_recommendation_eligibility_value(
+        "outcome", outcome, {"positive", "negative", "unknown", "failed", "invalidated"}
+    )
+    existing = get_recommendation_provider_eligibility_evidence(
+        db_path,
+        mal_anime_id=mal_anime_id,
+        provider=provider,
+        provider_series_id=provider_series_id,
+    )
+    if existing is None:
+        raise ValueError("eligibility evidence row does not exist")
+    failure_count = existing.failure_count + 1 if normalized_outcome == "failed" else 0
+    verification_outcome = normalized_outcome if normalized_outcome in {"positive", "negative"} else existing.verification_outcome
+    positive_at = attempted_at if normalized_outcome == "positive" else existing.last_successful_positive_at
+    invalidated_at = (
+        attempted_at
+        if normalized_outcome in {"negative", "invalidated"}
+        else None
+        if normalized_outcome == "positive"
+        else existing.invalidated_at
+    )
+    reason = (
+        invalidation_reason
+        if normalized_outcome in {"negative", "invalidated"}
+        else None
+        if normalized_outcome == "positive"
+        else existing.invalidation_reason
+    )
+    return upsert_recommendation_provider_eligibility_evidence(
+        db_path,
+        mal_anime_id=existing.mal_anime_id,
+        provider=existing.provider,
+        provider_series_id=existing.provider_series_id,
+        provider_title=existing.provider_title,
+        provider_url=existing.provider_url,
+        identity_match_kind=existing.identity_match_kind,
+        match_confidence=existing.match_confidence,
+        review_status=existing.review_status,
+        catalog_status=existing.catalog_status,
+        english_dub_status=existing.english_dub_status,
+        explicit_dub_evidence_source=existing.explicit_dub_evidence_source,
+        audio_locales=existing.audio_locales,
+        source_evidence=existing.source_evidence,
+        fetched_at=existing.fetched_at,
+        expires_at=existing.expires_at,
+        last_verified_at=existing.last_verified_at,
+        refresh_status="failed" if normalized_outcome == "failed" else "ok",
+        failure_count=failure_count,
+        next_retry_at=next_retry_at if normalized_outcome == "failed" else None,
+        logic_version=existing.logic_version,
+        verification_outcome=verification_outcome,
+        refresh_due_at=refresh_due_at if normalized_outcome in {"positive", "negative"} else existing.refresh_due_at,
+        refresh_schedule_version=refresh_schedule_version,
+        refresh_schedule_key=refresh_schedule_key or existing.refresh_schedule_key,
+        last_successful_positive_at=positive_at,
+        invalidated_at=invalidated_at,
+        invalidation_reason=reason,
+    )
+
+
+def record_recommendation_provider_eligibility_negative_scope(
+    db_path: Path,
+    *,
+    mal_anime_id: int,
+    provider: str,
+    attempted_at: str,
+    expires_at: str,
+    refresh_due_at: str | None,
+    refresh_schedule_version: str,
+    refresh_schedule_key: str,
+    invalidation_reason: str,
+    source_evidence: dict[str, Any],
+    logic_version: str,
+    provider_series_id: str = "__provider_search_no_match__",
+) -> int:
+    """Atomically revoke prior positives and persist affirmative negative coverage."""
+    normalized_provider = _validate_recommendation_eligibility_provider(provider)
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        contradicted = conn.execute(
+            """
+            UPDATE recommendation_provider_eligibility_evidence
+            SET verification_outcome = 'negative', invalidated_at = ?, invalidation_reason = ?,
+                refresh_status = 'ok', failure_count = 0, next_retry_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE mal_anime_id = ? AND provider = ?
+              AND last_successful_positive_at IS NOT NULL AND invalidated_at IS NULL
+            """,
+            (attempted_at, invalidation_reason, int(mal_anime_id), normalized_provider),
+        ).rowcount
+        conn.execute(
+            """
+            INSERT INTO recommendation_provider_eligibility_evidence (
+                mal_anime_id, provider, provider_series_id, identity_match_kind,
+                review_status, catalog_status, english_dub_status, audio_locales_json,
+                source_evidence_json, fetched_at, expires_at, last_verified_at,
+                refresh_status, failure_count, next_retry_at, logic_version,
+                verification_outcome, refresh_due_at, refresh_schedule_version,
+                refresh_schedule_key, invalidated_at, invalidation_reason
+            ) VALUES (?, ?, ?, 'provider_title_search_no_match', 'verified', 'absent', 'absent',
+                      '[]', ?, ?, ?, ?, 'ok', 0, NULL, ?, 'negative', ?, ?, ?, ?, ?)
+            ON CONFLICT(mal_anime_id, provider, provider_series_id) DO UPDATE SET
+                identity_match_kind = excluded.identity_match_kind,
+                review_status = excluded.review_status,
+                catalog_status = excluded.catalog_status,
+                english_dub_status = excluded.english_dub_status,
+                audio_locales_json = excluded.audio_locales_json,
+                source_evidence_json = excluded.source_evidence_json,
+                fetched_at = excluded.fetched_at,
+                expires_at = excluded.expires_at,
+                last_verified_at = excluded.last_verified_at,
+                refresh_status = 'ok', failure_count = 0, next_retry_at = NULL,
+                logic_version = excluded.logic_version,
+                verification_outcome = 'negative',
+                refresh_due_at = excluded.refresh_due_at,
+                refresh_schedule_version = excluded.refresh_schedule_version,
+                refresh_schedule_key = excluded.refresh_schedule_key,
+                invalidated_at = excluded.invalidated_at,
+                invalidation_reason = excluded.invalidation_reason,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                int(mal_anime_id), normalized_provider, provider_series_id,
+                json.dumps(source_evidence, ensure_ascii=False, sort_keys=True),
+                attempted_at, expires_at, attempted_at, logic_version,
+                refresh_due_at, refresh_schedule_version, refresh_schedule_key,
+                attempted_at, invalidation_reason,
+            ),
+        )
+        conn.commit()
+    return max(0, int(contradicted or 0))
+
+
+def get_recommendation_provider_eligibility_lifecycle_counts(
+    db_path: Path, *, provider: str, now: str
+) -> dict[str, int]:
+    normalized_provider = _validate_recommendation_eligibility_provider(provider)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN refresh_due_at IS NOT NULL AND refresh_due_at <= ? THEN 1 ELSE 0 END) AS due,
+                SUM(CASE WHEN refresh_due_at IS NOT NULL AND refresh_due_at < ? THEN 1 ELSE 0 END) AS overdue,
+                SUM(CASE WHEN refresh_status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN refresh_status = 'failed' AND next_retry_at > ? THEN 1 ELSE 0 END) AS backoff,
+                SUM(CASE WHEN last_successful_positive_at IS NOT NULL AND invalidated_at IS NULL THEN 1 ELSE 0 END) AS preserved_positive,
+                SUM(CASE WHEN invalidated_at IS NOT NULL THEN 1 ELSE 0 END) AS invalidated
+            FROM recommendation_provider_eligibility_evidence
+            WHERE provider = ?
+            """,
+            (now, now, now, normalized_provider),
+        ).fetchone()
+    return {key: int(row[key] or 0) for key in ("due", "overdue", "failed", "backoff", "preserved_positive", "invalidated")}
+
+
+def list_due_recommendation_provider_eligibility_evidence(
+    db_path: Path,
+    *,
+    provider: str,
+    now: str,
+    limit: int,
+) -> list[RecommendationProviderEligibilityEvidence]:
+    normalized_provider = _validate_recommendation_eligibility_provider(provider)
+    bounded_limit = max(0, int(limit))
+    if bounded_limit == 0:
+        return []
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM recommendation_provider_eligibility_evidence
+            WHERE provider = ?
+              AND refresh_due_at IS NOT NULL
+              AND refresh_due_at <= ?
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY refresh_due_at ASC, mal_anime_id ASC, provider_series_id ASC
+            LIMIT ?
+            """,
+            (normalized_provider, now, now, bounded_limit),
+        ).fetchall()
+    return [_recommendation_provider_eligibility_from_db(row) for row in rows]
 
 
 def get_recommendation_provider_eligibility_evidence(
@@ -6003,10 +6355,13 @@ def list_recommendation_provider_eligibility_evidence_for_mal_ids(
         conditions.append("provider = ?")
         params.append(normalized_provider)
     if actionable_only:
-        conditions.extend(["review_status = 'verified'", "catalog_status = 'present'", "english_dub_status = 'present'"])
-        if now is not None:
-            conditions.append("expires_at > ?")
-            params.append(now)
+        conditions.extend([
+            "review_status = 'verified'",
+            "catalog_status = 'present'",
+            "english_dub_status = 'present'",
+            "last_successful_positive_at IS NOT NULL",
+            "invalidated_at IS NULL",
+        ])
     with connect(db_path) as conn:
         rows = conn.execute(
             f"""
@@ -6026,7 +6381,11 @@ def mark_stale_recommendation_provider_eligibility_evidence(
     mal_anime_id: int | None = None,
     provider: str | None = None,
 ) -> int:
-    conditions = ["expires_at <= ?", "(catalog_status != 'stale' OR english_dub_status != 'stale' OR review_status != 'stale')"]
+    conditions = [
+        "expires_at <= ?",
+        "(last_successful_positive_at IS NULL OR invalidated_at IS NOT NULL)",
+        "(catalog_status != 'stale' OR english_dub_status != 'stale' OR review_status != 'stale')",
+    ]
     params: list[object] = [now]
     if mal_anime_id is not None:
         conditions.append("mal_anime_id = ?")
@@ -6474,9 +6833,10 @@ def find_covering_mal_anime_detail_cache(db_path: Path, *, mal_anime_id: int, re
         rows = conn.execute("""
             SELECT status, response_json, fetched_at, expires_at, failure_count, next_retry_at
             FROM mal_anime_detail_cache
-            WHERE mal_anime_id=? AND logic_version=? AND status='ok' AND expires_at>?
+            WHERE mal_anime_id=? AND logic_version=? AND status='ok'
+              AND (? = '' OR expires_at > ?)
             ORDER BY fetched_at DESC
-        """, (int(mal_anime_id), logic_version, now)).fetchall()
+        """, (int(mal_anime_id), logic_version, now, now)).fetchall()
     for row in rows:
         response = _load_json_value(row["response_json"], None)
         if isinstance(response, dict) and required_fields.issubset(response):
@@ -6598,8 +6958,22 @@ def record_provider_enriched_detail_failure(db_path: Path, *, provider: str, pro
             INSERT INTO provider_enriched_detail_cache(provider, provider_series_id, logic_version, status,
                 detail_json, fetched_at, expires_at, failure_count, next_retry_at)
             VALUES (?, ?, ?, 'failed', ?, ?, ?, 1, ?)
-            ON CONFLICT(provider, provider_series_id, logic_version) DO UPDATE SET status='failed',
-                detail_json=excluded.detail_json, fetched_at=excluded.fetched_at, expires_at=excluded.expires_at,
+            ON CONFLICT(provider, provider_series_id, logic_version) DO UPDATE SET status=CASE
+                    WHEN provider_enriched_detail_cache.status='ok' THEN 'ok'
+                    ELSE 'failed'
+                END,
+                detail_json=CASE
+                    WHEN provider_enriched_detail_cache.status='ok' THEN provider_enriched_detail_cache.detail_json
+                    ELSE excluded.detail_json
+                END,
+                fetched_at=CASE
+                    WHEN provider_enriched_detail_cache.status='ok' THEN provider_enriched_detail_cache.fetched_at
+                    ELSE excluded.fetched_at
+                END,
+                expires_at=CASE
+                    WHEN provider_enriched_detail_cache.status='ok' THEN provider_enriched_detail_cache.expires_at
+                    ELSE excluded.expires_at
+                END,
                 failure_count=MIN(provider_enriched_detail_cache.failure_count + 1, 8),
                 next_retry_at=excluded.next_retry_at
         """, (provider, provider_series_id, logic_version, json.dumps({"error": error}), fetched_at, expires_at, next_retry_at))

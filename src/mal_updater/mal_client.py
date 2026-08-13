@@ -18,6 +18,7 @@ from .config import AppConfig, MalSecrets
 from .request_tracking import record_api_request_event
 from .provider_niceness import ProviderRequestGate, retry_delay_seconds
 from .db import bootstrap_database, find_covering_mal_anime_detail_cache, get_mal_anime_detail_cache, get_mal_anime_search_cache, upsert_mal_anime_detail_cache, upsert_mal_anime_search_cache
+from .periodic_evidence_lifecycle import periodic_evidence_is_due
 
 
 @dataclass(slots=True)
@@ -290,9 +291,20 @@ class MalClient:
         if cache_available:
             bootstrap_database(self.config.db_path)
         if cache_available and not force_refresh:
-            cached = get_mal_anime_search_cache(self.config.db_path, cache_key=cache_key, now=now_iso)
+            cached = get_mal_anime_search_cache(self.config.db_path, cache_key=cache_key)
             if cached is not None:
-                return cached.response
+                if cached.status == "negative":
+                    if cached.expires_at > now_iso:
+                        return cached.response
+                elif cached.status == "ok" and not periodic_evidence_is_due(
+                    successful_at=cached.fetched_at,
+                    surface="mal_search_positive",
+                    identity={"cache_key": cache_key},
+                    now=now,
+                    target_days=self.config.mal.search_cache_ttl_days,
+                    jitter_days=min(15, self.config.mal.search_cache_ttl_days),
+                ):
+                    return cached.response
         encoded_query = urlencode({"q": sanitized_query, "limit": limit, "fields": fields})
         response = self._get_json(
             f"/anime?{encoded_query}",
@@ -325,11 +337,24 @@ class MalClient:
             bootstrap_database(self.config.db_path)
         if cache_available and not force_refresh:
             cached = get_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
-                                                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now=now_iso)
+                                                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION)
             if cached is None:
                 cached = find_covering_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id),
-                    required_fields=set(fields_key.split(",")), logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now=now_iso)
-            if cached is not None and cached.status == "ok" and all(field in cached.response for field in fields_key.split(",")):
+                    required_fields=set(fields_key.split(",")), logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now="")
+            ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
+            if (
+                cached is not None
+                and cached.status == "ok"
+                and all(field in cached.response for field in fields_key.split(","))
+                and not periodic_evidence_is_due(
+                    successful_at=cached.fetched_at,
+                    surface="mal_detail",
+                    identity={"mal_anime_id": int(anime_id), "fields": fields_key, "logic_version": MAL_DETAIL_CACHE_LOGIC_VERSION},
+                    now=now,
+                    target_days=ttl,
+                    jitter_days=min(15, ttl),
+                )
+            ):
                 return cached.response
         response = self._get_json(
             f"/anime/{anime_id}?{urlencode({'fields': fields})}",

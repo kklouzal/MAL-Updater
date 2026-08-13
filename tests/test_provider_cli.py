@@ -420,7 +420,7 @@ class ProviderCliTests(unittest.TestCase):
         self.assertTrue(parser.parse_args(["push-recommendations-webhook", "--dry-run"]).dry_run)
 
         enrich_args = parser.parse_args(["recommend-enrich-provider-availability"])
-        self.assertEqual(4, enrich_args.limit)
+        self.assertEqual(2, enrich_args.limit)
 
         command_parsers = _command_parsers()
         command_help = _command_help_map()

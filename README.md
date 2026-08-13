@@ -2,6 +2,8 @@
 
 Container-first trusted-LAN control plane for conservative provider-to-MyAnimeList sync and recommendations.
 
+Periodic durable positive evidence uses a deterministic 120-day +/-15-day refresh window with stale-while-revalidate read/display semantics. Negative/no-match claims retain shorter cadences, provider-title search remains identity-only, and stale evidence never authorizes MAL/provider writes or strict availability by itself. Operational retention, auth/retry/backoff, health thresholds, backups, and explicit deletion remain separate policies.
+
 ## Quick start (container)
 
 ```bash

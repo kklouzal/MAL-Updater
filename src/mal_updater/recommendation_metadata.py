@@ -40,6 +40,7 @@ from .db import (
     resume_mal_public_userrecs_generation,
 )
 from .mal_client import MalApiError, MalClient
+from .periodic_evidence_lifecycle import periodic_evidence_is_due
 from .mal_user_recommendations import (
     DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
     DEFAULT_PUBLIC_USER_RECS_MAX_PAGES,
@@ -83,12 +84,12 @@ DETAIL_FIELD_NAMES = (
 )
 DETAIL_FIELDS = ",".join(DETAIL_FIELD_NAMES)
 DISCOVERY_DETAIL_FIELDS = ",".join(field for field in DETAIL_FIELD_NAMES if field not in {"related_anime", "recommendations"})
-DEFAULT_HARVEST_STALE_AFTER_DAYS = 30
-DEFAULT_METADATA_STALE_AFTER_DAYS = 14
-DEFAULT_HOT_METADATA_STALE_AFTER_DAYS = 3
-DEFAULT_WARM_METADATA_STALE_AFTER_DAYS = 14
-DEFAULT_COLD_METADATA_STALE_AFTER_DAYS = 90
-DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS = 45
+DEFAULT_HARVEST_STALE_AFTER_DAYS = 120
+DEFAULT_METADATA_STALE_AFTER_DAYS = 120
+DEFAULT_HOT_METADATA_STALE_AFTER_DAYS = 120
+DEFAULT_WARM_METADATA_STALE_AFTER_DAYS = 120
+DEFAULT_COLD_METADATA_STALE_AFTER_DAYS = 120
+DEFAULT_FULL_USER_RECOMMENDATION_HARVEST_STALE_AFTER_DAYS = 120
 MAL_USER_LIST_POSITIVE_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
 MAL_USER_LIST_SUPPRESSION_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 MAL_USER_LIST_STATUS_PREFERENCE_FIELDS = (
@@ -701,18 +702,35 @@ def _full_harvest_status_rows(db_path: Path, source_ids: set[int]) -> dict[int, 
     return {int(row["source_mal_anime_id"]): {key: row[key] for key in row.keys()} for row in rows}
 
 
-def _full_harvest_candidate_status(row: dict[str, Any] | None, *, stale_after_days: int) -> str:
+def _full_harvest_candidate_status(
+    row: dict[str, Any] | None,
+    *,
+    stale_after_days: int,
+    source_mal_anime_id: int | None = None,
+) -> str:
     if row is None:
         return "unharvested"
     if str(row.get("status") or "") == "failed":
         return "failed"
     if not bool(row.get("is_complete")) or str(row.get("source_type") or "") != MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS:
         return "unharvested"
-    return "stale" if _is_stale(row.get("fetched_at"), stale_after_days=stale_after_days) else "fresh"
+    if source_mal_anime_id is None:
+        return "stale" if _is_stale(row.get("fetched_at"), stale_after_days=stale_after_days) else "fresh"
+    return "stale" if periodic_evidence_is_due(
+        successful_at=row.get("fetched_at"),
+        surface="complete_public_userrecs_harvest",
+        identity={"source_mal_anime_id": int(source_mal_anime_id)},
+        target_days=stale_after_days,
+        jitter_days=min(15, stale_after_days),
+    ) else "fresh"
 
 
 def _full_harvest_rank_key(entry: Any, status_row: dict[str, Any] | None, *, stale_after_days: int) -> tuple[int, tuple[int, str], int]:
-    status = _full_harvest_candidate_status(status_row, stale_after_days=stale_after_days)
+    status = _full_harvest_candidate_status(
+        status_row,
+        stale_after_days=stale_after_days,
+        source_mal_anime_id=int(entry.mal_anime_id),
+    )
     status_order = {"unharvested": 0, "failed": 1, "stale": 2, "fresh": 3}.get(status, 4)
     if status == "failed":
         age = _metadata_age_sort_value(status_row.get("last_attempted_at") if status_row else None)
@@ -847,7 +865,11 @@ def refresh_full_user_recommendation_harvest(
         if int(entry.mal_anime_id) not in open_source_id_set
         and (
             force_refresh
-            or _full_harvest_candidate_status(status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days)
+            or _full_harvest_candidate_status(
+                status_rows.get(int(entry.mal_anime_id)),
+                stale_after_days=stale_after_days,
+                source_mal_anime_id=int(entry.mal_anime_id),
+            )
             != "fresh"
         )
     ]
@@ -1285,7 +1307,14 @@ def refresh_recommendation_metadata(
         else:
             tier, horizon = "cold", cold_stale_after_days
         needs_retry = metadata is None or state is None or state.harvest_status in HARVEST_RETRY_STATUSES
-        if force_refresh or needs_retry or _is_stale(metadata.fetched_at if metadata else None, stale_after_days=horizon):
+        metadata_due = periodic_evidence_is_due(
+            successful_at=metadata.fetched_at if metadata else None,
+            surface="recommendation_metadata",
+            identity={"mal_anime_id": int(anime_id), "tier": tier},
+            target_days=horizon,
+            jitter_days=min(15, max(0, int(horizon))),
+        )
+        if force_refresh or needs_retry or metadata_due:
             anime_ids.append(anime_id)
             refresh_tiers["retry" if needs_retry else tier] += 1
     fresh_skipped = len(ranked_ids) - len(anime_ids)

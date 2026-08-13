@@ -628,7 +628,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             providers=[provider],
             candidate_limit=1,
             queries_per_candidate=1,
-            now=now + timedelta(days=8),
+            now=now + timedelta(days=136),
         )
         self.assertEqual(1, expired.eligibility_expired_retries)
         self.assertEqual(1, expired.provider_searches)
@@ -753,6 +753,33 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
         self.assertEqual([921], [item["mal_anime_id"] for item in summary.selected_candidates])
         self.assertEqual("uncovered", summary.selected_candidates[0]["selection_class"])
+
+    def test_limit_two_reserves_one_due_and_one_uncovered_slot(self):
+        self._insert_meta(922, english="Overdue Refresh")
+        self._insert_meta(923, english="Uncovered First")
+        self._insert_meta(924, english="Uncovered Second")
+        self._recommendations(922, 923, 924)
+        upsert_recommendation_provider_eligibility_evidence(
+            self.config.db_path, mal_anime_id=922, provider="crunchyroll",
+            provider_series_id="due", fetched_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-08T00:00:00Z", identity_match_kind="provider_title_search_exact",
+            review_status="verified", catalog_status="present", english_dub_status="present",
+            audio_locales=["en-US"], last_verified_at="2026-01-01T00:00:00Z",
+            refresh_due_at="2026-02-01T00:00:00Z",
+            logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        )
+        provider = FakeProvider([])
+        provider.slug = "crunchyroll"
+
+        summary = enrichment.enrich_discovery_provider_availability(
+            self.config, providers=[provider], candidate_limit=2, queries_per_candidate=1,
+            now=datetime(2026, 2, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(["expired_refresh_due", "uncovered"], [
+            item["selection_class"] for item in summary.selected_candidates
+        ])
+        self.assertEqual([922, 923], [item["mal_anime_id"] for item in summary.selected_candidates])
 
     def test_effective_refresh_horizon_covers_capacity_traversal_with_margin(self):
         self.config.service.provider_eligibility_refresh_every_seconds = 3600
@@ -935,19 +962,19 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now)
         provider.fail = True
-        failed = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=8))
+        failed = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=136))
         self.assertEqual(1, failed.provider_search_failures)
         evidence = get_recommendation_provider_eligibility_evidence(self.config.db_path, mal_anime_id=103, provider="crunchyroll", provider_series_id="cr-retry")
         self.assertEqual("failed", evidence.refresh_status)
         self.assertEqual(1, evidence.failure_count)
         self.assertIsNotNone(evidence.next_retry_at)
 
-        backed_off = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=8, minutes=30))
+        backed_off = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=136, minutes=30))
         self.assertEqual(1, backed_off.eligibility_retry_backoff_skips)
         self.assertEqual(2, len(provider.calls))
 
         provider.fail = False
-        recovered = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=8, hours=2))
+        recovered = enrichment.enrich_discovery_provider_availability(self.config, providers=[provider], candidate_limit=1, queries_per_candidate=1, now=now + timedelta(days=136, hours=2))
         self.assertEqual(1, recovered.eligibility_expired_retries)
         evidence = get_recommendation_provider_eligibility_evidence(self.config.db_path, mal_anime_id=103, provider="crunchyroll", provider_series_id="cr-retry")
         self.assertEqual("ok", evidence.refresh_status)

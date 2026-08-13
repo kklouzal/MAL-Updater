@@ -819,9 +819,9 @@ class RecommendationTests(unittest.TestCase):
             if item.kind == "discovery_candidate"
         ]
 
-        self.assertEqual([301], [item.context["mal_anime_id"] for item in strict])
+        self.assertEqual([304, 301], [item.context["mal_anime_id"] for item in strict])
         self.assertEqual(sorted(targets), sorted(item.context["mal_anime_id"] for item in internal))
-        item = strict[0]
+        item = next(item for item in strict if item.context["mal_anime_id"] == 301)
         self.assertEqual("crunchyroll", item.provider)
         self.assertEqual("present", item.context["english_dub_signal"])
         self.assertEqual("verified_provider_eligibility", item.context["availability_confidence"])
@@ -900,10 +900,13 @@ class RecommendationTests(unittest.TestCase):
             if item.kind == "discovery_candidate"
         ]
 
-        self.assertEqual(sorted(accepted), sorted(item.context["mal_anime_id"] for item in strict))
+        self.assertEqual(sorted((*accepted, 925)), sorted(item.context["mal_anime_id"] for item in strict))
         self.assertEqual(sorted([*accepted, *rejected]), sorted(item.context["mal_anime_id"] for item in diagnostic))
         identities = {item.context["mal_anime_id"]: item.context["provider_eligibility_evidence"][0]["identity_match_kind"] for item in strict}
-        self.assertEqual({mal_id: data[1] for mal_id, data in accepted.items()}, identities)
+        self.assertEqual(
+            {**{mal_id: data[1] for mal_id, data in accepted.items()}, 925: "provider_title_search_exact"},
+            identities,
+        )
 
     def test_diagnostic_discovery_carries_review_needed_provider_catalog_and_dub_evidence(self) -> None:
         self._insert_series("seed-review-evidence", title="Seed Review Evidence", season_title="Seed Review Evidence (English Dub)", watchlist_status="fully_watched")

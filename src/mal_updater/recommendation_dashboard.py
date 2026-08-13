@@ -19,6 +19,7 @@ from .db import (
     get_operational_snapshot,
     get_public_userrecs_diagnostics,
     list_latest_recommendation_snapshot_rows,
+    list_recommendation_provider_eligibility_evidence_for_mal_ids,
     unknown_public_userrecs_diagnostics,
 )
 from .hidive_auth import load_hidive_credentials
@@ -200,6 +201,17 @@ def _availability_evidence_details(context: dict[str, Any]) -> list[dict[str, An
                 "fetched_at": item.get("fetched_at"),
                 "last_verified_at": item.get("last_verified_at"),
                 "expires_at": item.get("expires_at"),
+                "refresh_due_at": item.get("refresh_due_at"),
+                "last_successful_positive_at": item.get("last_successful_positive_at"),
+                "invalidated_at": item.get("invalidated_at"),
+                "invalidation_reason": item.get("invalidation_reason"),
+                "refresh_status": item.get("refresh_status"),
+                "failure_count": item.get("failure_count"),
+                "next_retry_at": item.get("next_retry_at"),
+                "refresh_due": item.get("refresh_due"),
+                "refresh_overdue": item.get("refresh_overdue"),
+                "refresh_failed": item.get("refresh_failed"),
+                "last_known_good_preserved": item.get("last_known_good_preserved"),
                 "fresh": item.get("fresh"),
                 "expired": item.get("expired"),
             }
@@ -213,7 +225,16 @@ def _format_evidence_freshness(details: list[dict[str, Any]]) -> str:
         provider = item.get("label") or _provider_label(item.get("provider"))
         verified = item.get("last_verified_at") or item.get("fetched_at") or "unknown verification time"
         expires = item.get("expires_at") or "unknown expiry"
-        state = "expired" if item.get("expired") else "fresh" if item.get("fresh") else "unknown freshness"
+        if item.get("invalidated_at"):
+            state = "invalidated"
+        elif item.get("refresh_failed"):
+            state = "refresh failed; last-known-good preserved" if item.get("last_known_good_preserved") else "refresh failed"
+        elif item.get("refresh_overdue"):
+            state = "refresh overdue"
+        elif item.get("refresh_due"):
+            state = "refresh due"
+        else:
+            state = "expired" if item.get("expired") else "fresh" if item.get("fresh") else "unknown freshness"
         labels.append(f"{provider}: {state}; verified {verified}; expires {expires}")
     return "; ".join(labels)
 
@@ -325,6 +346,60 @@ def _provider_eligibility_evidence_for_actionability(row: dict[str, Any]) -> lis
     evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else _snapshot_evidence(row)
     details = evidence.get("provider_eligibility_evidence")
     return details if isinstance(details, list) else []
+
+
+def _overlay_current_eligibility_evidence(db_path: Path, rows: list[dict[str, Any]]) -> None:
+    """Overlay authoritative DB lifecycle state onto snapshot-embedded evidence."""
+    mal_ids = {
+        int(context["mal_anime_id"])
+        for row in rows
+        if isinstance((context := row.get("context")), dict)
+        and isinstance(context.get("mal_anime_id"), int)
+    }
+    if not mal_ids:
+        return
+    current_by_key = {
+        (item.mal_anime_id, item.provider, item.provider_series_id): item
+        for item in list_recommendation_provider_eligibility_evidence_for_mal_ids(db_path, mal_ids)
+    }
+    now = _utc_now_z()
+    for row in rows:
+        context = row.get("context") if isinstance(row.get("context"), dict) else {}
+        mal_id = context.get("mal_anime_id")
+        embedded = context.get("provider_eligibility_evidence")
+        if not isinstance(mal_id, int) or not isinstance(embedded, list):
+            continue
+        overlaid: list[dict[str, Any]] = []
+        for item in embedded:
+            if not isinstance(item, dict):
+                continue
+            key = (mal_id, str(item.get("provider") or "").lower(), str(item.get("provider_series_id") or ""))
+            current = current_by_key.get(key)
+            if current is None:
+                # Old snapshots may predate DB-backed lifecycle evidence. Absence
+                # alone is not affirmative invalidation; current rows are the
+                # authoritative overlay whenever present.
+                overlaid.append(item)
+                continue
+            overlaid.append(
+                {
+                    **item,
+                    "verification_outcome": current.verification_outcome,
+                    "refresh_due_at": current.refresh_due_at,
+                    "refresh_status": current.refresh_status,
+                    "failure_count": current.failure_count,
+                    "next_retry_at": current.next_retry_at,
+                    "last_successful_positive_at": current.last_successful_positive_at,
+                    "invalidated_at": current.invalidated_at,
+                    "invalidation_reason": current.invalidation_reason,
+                    "refresh_due": current.refresh_due_at is not None and current.refresh_due_at <= now,
+                    "refresh_overdue": current.refresh_due_at is not None and current.refresh_due_at < now,
+                    "refresh_failed": current.refresh_status == "failed",
+                    "last_known_good_preserved": bool(current.last_successful_positive_at and not current.invalidated_at),
+                }
+            )
+        context["provider_eligibility_evidence"] = overlaid
+        row["context"] = context
 
 
 def _strict_actionability_failure_reasons(row: dict[str, Any]) -> list[str]:
@@ -1068,7 +1143,8 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
         rows = conn.execute(
             """
             SELECT provider, identity_match_kind, review_status, catalog_status, english_dub_status,
-                   audio_locales_json, fetched_at, expires_at, last_verified_at
+                   audio_locales_json, fetched_at, expires_at, last_verified_at,
+                   last_successful_positive_at, invalidated_at
             FROM recommendation_provider_eligibility_evidence
             """
         ).fetchall()
@@ -1088,6 +1164,8 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
             "fetched_at": row["fetched_at"],
             "expires_at": row["expires_at"],
             "last_verified_at": row["last_verified_at"],
+            "last_successful_positive_at": row["last_successful_positive_at"],
+            "invalidated_at": row["invalidated_at"],
         }
         if is_strict_provider_eligibility_actionable(evidence):
             counts["strict_current"] += 1
@@ -1105,7 +1183,8 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
             except ValueError:
                 expired = False
         verification_only_stale = reasons == ["current provider verification stale or missing"]
-        if row["review_status"] == "stale" or row["catalog_status"] == "stale" or row["english_dub_status"] == "stale" or expired or verification_only_stale:
+        last_known_positive = bool(row["last_successful_positive_at"] and not row["invalidated_at"])
+        if row["review_status"] == "stale" or row["catalog_status"] == "stale" or row["english_dub_status"] == "stale" or ((expired or verification_only_stale) and not last_known_positive):
             counts["stale"] += 1
     return counts
 
@@ -1291,6 +1370,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     latest_run_id = latest_snapshot.get("run_id") if latest_snapshot else None
     latest_raw_rows = list_latest_recommendation_snapshot_rows(db_path, limit=None)
     rows = [_snapshot_row_to_dict(row) for row in latest_raw_rows]
+    _overlay_current_eligibility_evidence(db_path, rows)
     latest_has_discovery = any(row.kind == "discovery_candidate" for row in latest_raw_rows)
     diagnostic_source_snapshot: dict[str, Any] | None = None
     if not latest_has_discovery:

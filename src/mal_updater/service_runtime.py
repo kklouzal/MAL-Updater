@@ -66,7 +66,7 @@ _MAL_USER_LIST_INITIAL_DELAY_SECONDS = 15 * 60
 _RECOMMENDATION_FULL_HARVEST_INITIAL_DELAY_SECONDS = 75 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_INITIAL_DELAY_SECONDS = 45 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS = 15 * 60
-_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 4
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 2
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT = 5
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE = 1
 _SERVICE_STATE_MAX_BYTES = 8 * 1024 * 1024
@@ -766,6 +766,15 @@ def effective_niceness_policy(config: AppConfig) -> dict[str, Any]:
             "crunchyroll_max_history_pages": int(config.service.crunchyroll_provider_max_history_pages),
             "crunchyroll_max_watchlist_pages": int(config.service.crunchyroll_provider_max_watchlist_pages),
             "hidive_unattended_full_refresh": False,
+        },
+        "periodic_evidence_refresh_policy": {
+            "target_days": 120,
+            "jitter_days": 15,
+            "window_days": {"minimum": 105, "maximum": 135},
+            "stale_while_revalidate": True,
+            "negative_absence_uses_shorter_cadence": True,
+            "provider_title_identity_only_days": PROVIDER_SEARCH_CACHE_TTL_DAYS,
+            "same_cycle_provider_fetch_required_for_unattended_apply": True,
         },
         "cache_horizons_days": {
             "mal_search_positive": int(config.mal.search_cache_ttl_days),
@@ -1904,6 +1913,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             f"rows_after={snapshot_prune.get('rows_after', 0)}",
         )
     tasks_state = state.setdefault("tasks", {})
+    provider_fetch_success_this_cycle: set[str] = set()
 
     for spec in _task_specs(config):
         task_state = tasks_state.setdefault(spec.name, {})
@@ -1942,6 +1952,32 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
         last_run = float(task_state.get("last_run_epoch", 0))
         planned_fetch_mode, planned_full_refresh_reasons, health_request = _planned_fetch_mode(config, spec, task_state, now=now)
         health_requested_run = isinstance(health_request, dict)
+        if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) > 0:
+            required_providers = _available_source_providers(config)
+            missing_fresh_fetches = [
+                provider for provider in required_providers if provider not in provider_fetch_success_this_cycle
+            ]
+            if missing_fresh_fetches:
+                task_state.update(
+                    {
+                        "last_status": "skipped",
+                        "execution_state": "idle",
+                        "last_skip_reason": "same_cycle_provider_fetch_required",
+                        "same_cycle_provider_fetch_required": required_providers,
+                        "same_cycle_provider_fetch_missing": missing_fresh_fetches,
+                    }
+                )
+                _set_task_next_due(task_state, base_epoch=now, every_seconds=min(60, max(5, int(spec.every_seconds))))
+                results.append(
+                    {
+                        "task": spec.name,
+                        "status": "skipped",
+                        "reason": "same_cycle_provider_fetch_required",
+                        "required_providers": required_providers,
+                        "missing_providers": missing_fresh_fetches,
+                    }
+                )
+                continue
         if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) <= 0:
             # Manual `apply-sync --limit 0` retains its explicit full-scan
             # meaning. In unattended service config, zero is a hard disable so
@@ -2204,6 +2240,14 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                         "provider_detail_probes",
                         "eligibility_fresh_skips",
                         "eligibility_expired_retries",
+                        "eligibility_due",
+                        "eligibility_overdue",
+                        "eligibility_failed",
+                        "eligibility_backoff",
+                        "eligibility_preserved_positive",
+                        "eligibility_contradicted",
+                        "eligibility_invalidated",
+                        "lease_busy",
                     ):
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
@@ -2294,6 +2338,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 task_state["last_skip_reason"] = str(result.get("reason") or task_status)
             fetch_succeeded = task_succeeded
             if spec.name.startswith("sync_fetch_") and fetch_succeeded:
+                provider_fetch_success_this_cycle.add(spec.name.removeprefix("sync_fetch_"))
                 task_state["last_fetch_mode"] = "full_refresh" if full_refresh_requested else "hot"
                 task_state["last_fetch_mode_at"] = finished_at
                 if isinstance(health_request, dict) and isinstance(health_request.get("health_mtime"), (int, float)):

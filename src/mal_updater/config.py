@@ -44,10 +44,10 @@ DEFAULT_MAL_REDIRECT_PORT = 8765
 DEFAULT_MAL_NON_LOOPBACK_CALLBACK_ACK = False
 DEFAULT_MAL_REQUEST_SPACING_SECONDS = 1.0
 DEFAULT_MAL_REQUEST_SPACING_JITTER_SECONDS = 0.2
-DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS = 14
+DEFAULT_MAL_SEARCH_CACHE_TTL_DAYS = 120
 DEFAULT_MAL_SEARCH_NEGATIVE_CACHE_TTL_DAYS = 3
-DEFAULT_MAL_DETAIL_CACHE_TTL_DAYS = 14
-DEFAULT_PROVIDER_DETAIL_CACHE_TTL_DAYS = 30
+DEFAULT_MAL_DETAIL_CACHE_TTL_DAYS = 120
+DEFAULT_PROVIDER_DETAIL_CACHE_TTL_DAYS = 120
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 22.5
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 7.5
@@ -79,8 +79,10 @@ DEFAULT_SERVICE_MAL_REFRESH_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_MAL_LIST_REFRESH_EVERY_SECONDS = 8 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_METADATA_REFRESH_EVERY_SECONDS = 12 * 60 * 60
 DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS = 60 * 60
-DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS = 45
+DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS = 120
 DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS = 60 * 60
+DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_TARGET_DAYS = 120
+DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_JITTER_DAYS = 15
 DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS = 60 * 60
 DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS = 14
@@ -141,7 +143,7 @@ DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
     "recommend_metadata_discovery_targets": 5,
     "recommend_full_harvest": 2,
     "recommend_full_harvest_pages": 3,
-    "recommend_provider_eligibility_candidates": 4,
+    "recommend_provider_eligibility_candidates": 2,
     "recommend_provider_eligibility_search_results": 5,
     "recommend_provider_eligibility_queries_per_candidate": 1,
     "recommendation_snapshot": 100,
@@ -291,6 +293,8 @@ class ServiceSettings:
     recommendation_full_harvest_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_EVERY_SECONDS
     recommendation_full_harvest_stale_after_days: int = DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS
     provider_eligibility_refresh_every_seconds: int = DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_EVERY_SECONDS
+    provider_eligibility_refresh_target_days: int = DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_TARGET_DAYS
+    provider_eligibility_refresh_jitter_days: int = DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_JITTER_DAYS
     recommend_maintain_every_seconds: int = DEFAULT_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS
     recommendations_webhook_push_every_seconds: int = DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS
     recommendation_snapshot_retention_days: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS
@@ -1038,6 +1042,32 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
                     ),
                 )
             ),
+            provider_eligibility_refresh_target_days=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_TARGET_DAYS",
+                        _get_int(
+                            service_section,
+                            "provider_eligibility_refresh_target_days",
+                            DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_TARGET_DAYS,
+                        ),
+                    )
+                ),
+            ),
+            provider_eligibility_refresh_jitter_days=max(
+                0,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_JITTER_DAYS",
+                        _get_int(
+                            service_section,
+                            "provider_eligibility_refresh_jitter_days",
+                            DEFAULT_SERVICE_PROVIDER_ELIGIBILITY_REFRESH_JITTER_DAYS,
+                        ),
+                    )
+                ),
+            ),
             recommend_maintain_every_seconds=int(
                 os.getenv(
                     "MAL_UPDATER_SERVICE_RECOMMEND_MAINTAIN_EVERY_SECONDS",
@@ -1378,6 +1408,15 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
     )
     _validate_mal_callback_config(app_config.mal)
     _validate_finite_numeric_config(app_config)
+    if (
+        app_config.service.provider_eligibility_refresh_target_days > 0
+        and app_config.service.provider_eligibility_refresh_jitter_days
+        > app_config.service.provider_eligibility_refresh_target_days
+    ):
+        raise ConfigError(
+            "service.provider_eligibility_refresh_jitter_days must not exceed "
+            "service.provider_eligibility_refresh_target_days"
+        ) from None
     return app_config
 
 

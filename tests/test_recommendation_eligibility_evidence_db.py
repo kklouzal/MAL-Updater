@@ -139,14 +139,14 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
             now="2026-07-19T12:00:00+00:00",
         )
         self.assertEqual([updated], actionable)
-        self.assertEqual([], list_recommendation_provider_eligibility_evidence_for_mal_ids(
+        self.assertEqual([updated], list_recommendation_provider_eligibility_evidence_for_mal_ids(
             self.db_path,
             [101],
             actionable_only=True,
             now="2026-07-21T00:00:00+00:00",
         ))
 
-        self.assertEqual(1, mark_stale_recommendation_provider_eligibility_evidence(
+        self.assertEqual(0, mark_stale_recommendation_provider_eligibility_evidence(
             self.db_path,
             now="2026-07-21T00:00:00+00:00",
             provider="crunchyroll",
@@ -159,9 +159,9 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
         )
         self.assertIsNotNone(stale)
         assert stale is not None
-        self.assertEqual("stale", stale.review_status)
-        self.assertEqual("stale", stale.catalog_status)
-        self.assertEqual("stale", stale.english_dub_status)
+        self.assertEqual("verified", stale.review_status)
+        self.assertEqual("present", stale.catalog_status)
+        self.assertEqual("present", stale.english_dub_status)
         self.assertEqual(1, delete_recommendation_provider_eligibility_evidence(
             self.db_path,
             mal_anime_id=101,

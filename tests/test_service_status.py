@@ -1127,6 +1127,6 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertEqual(28800, policy["cadences"]["mal_user_list_refresh_seconds"])
         self.assertEqual(43200, policy["cadences"]["recommendation_metadata_refresh_seconds"])
         self.assertEqual(3600, policy["cadences"]["provider_eligibility_refresh_seconds"])
-        self.assertEqual(14, policy["cache_horizons_days"]["mal_search_positive"])
+        self.assertEqual(120, policy["cache_horizons_days"]["mal_search_positive"])
         self.assertEqual(7, policy["cache_horizons_days"]["provider_eligibility_evidence"])
         self.assertTrue(policy["thresholds"]["task_and_provider_global_budgets_enforced"])

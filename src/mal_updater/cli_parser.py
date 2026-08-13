@@ -450,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
         "recommend-enrich-provider-availability",
         help="Use bounded provider title search to enrich recommendation availability cache",
     )
-    recommend_enrich.add_argument("--limit", type=int, default=4, help="Maximum recommendation candidates to inspect per provider (default: 4)")
+    recommend_enrich.add_argument("--limit", type=int, default=2, help="Maximum recommendation candidates to inspect per provider (default: 2)")
     recommend_enrich.add_argument("--provider", choices=list(list_provider_slugs()), help="Provider slug to query; defaults to all registered providers")
     recommend_enrich.add_argument("--search-limit", type=int, default=5, help="Maximum provider search results per query")
     recommend_enrich.add_argument(

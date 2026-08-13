@@ -3201,7 +3201,7 @@ def _cmd_recommend_enrich_provider_availability(
     summary = enrich_discovery_provider_availability(
         config,
         providers=providers,
-        candidate_limit=_normalize_limit(limit) or 4,
+        candidate_limit=_normalize_limit(limit) or 2,
         search_limit=_normalize_limit(search_limit) or 5,
         queries_per_candidate=max(0, int(queries_per_candidate)),
         persist_review_queue=not dry_run,

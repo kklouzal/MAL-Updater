@@ -617,6 +617,37 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             _apply_sync_command(self.config),
         )
 
+    def test_enabled_sync_apply_requires_successful_same_cycle_provider_fetch(self) -> None:
+        self.config.service.sync_every_seconds = 0
+        self.config.service.health_every_seconds = 3600
+        self.config.service.mal_refresh_every_seconds = 3600
+        self.config.service.recommendation_metadata_refresh_every_seconds = 0
+        self.config.service.recommendation_full_harvest_every_seconds = 0
+        self.config.service.recommend_maintain_every_seconds = 0
+        self.config.service.provider_eligibility_refresh_every_seconds = 0
+        self.config.service.task_execute_limits["sync_apply"] = 2
+        now = time.time()
+        self.config.service_state_path.write_text(
+            json.dumps({"started_at": "2026-03-20T20:00:00Z", "tasks": {
+                "mal_refresh": {"last_run_epoch": now},
+                "health": {"last_run_epoch": now},
+                "sync_fetch_crunchyroll": {"last_run_epoch": 0},
+                "sync_apply": {"last_run_epoch": 0},
+            }}), encoding="utf-8",
+        )
+        with patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "error", "returncode": 1, "stdout": "", "stderr": "fetch failed"},
+            ],
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+        apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual("skipped", apply_result["status"])
+        self.assertEqual("same_cycle_provider_fetch_required", apply_result["reason"])
+        self.assertEqual(["crunchyroll"], apply_result["missing_providers"])
+        self.assertFalse(any(call.kwargs.get("label") == "sync_apply" for call in run_subprocess.call_args_list))
+
     def test_zero_sync_apply_limit_disables_unattended_execution(self) -> None:
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
@@ -705,7 +736,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
                 "--limit",
                 "2",
                 "--stale-after-days",
-                "45",
+                "120",
                 "--max-pages",
                 "3",
             ],
@@ -713,12 +744,12 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         )
         policy = effective_niceness_policy(self.config)
         self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
-        self.assertEqual(45, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
+        self.assertEqual(120, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
         self.assertEqual(2, policy["execute_limits"]["recommend_full_harvest"])
         self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
         self.assertIn("recommend_full_harvest", policy["task_policies"])
         self.assertEqual(
-            "recommend_full_harvest:limit=2:stale_after_days=45:max_pages=3",
+            "recommend_full_harvest:limit=2:stale_after_days=120:max_pages=3",
             _task_execution_signature(
                 self.config,
                 TaskSpec(

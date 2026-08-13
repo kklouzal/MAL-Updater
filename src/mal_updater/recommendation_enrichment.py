@@ -22,6 +22,8 @@ from .db import (
     list_recommendation_provider_enrichment_attempts,
     list_series_mappings,
     list_recommendation_provider_eligibility_evidence_for_mal_ids,
+    get_recommendation_provider_eligibility_lifecycle_counts,
+    record_recommendation_provider_eligibility_negative_scope,
     replace_review_queue_entries,
     upsert_provider_title_search_cache,
     upsert_provider_enriched_detail_cache,
@@ -38,6 +40,13 @@ from .recommendation_actionability import (
     strict_provider_last_verified_at_for_persistence,
 )
 from .recommendations import Recommendation, build_recommendations
+from .periodic_evidence_lifecycle import periodic_evidence_is_due
+from .provider_eligibility_lifecycle import (
+    PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+    ProviderEligibilityProcessLease,
+    provider_eligibility_refresh_due_at,
+    provider_eligibility_refresh_schedule_key,
+)
 
 PROVIDER_SEARCH_CACHE_TTL_DAYS = 365
 PROVIDER_SEARCH_CACHE_LOGIC_VERSION = "provider-title-v2"
@@ -100,6 +109,15 @@ class EnrichmentSummary:
     provider_cursor_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     selection_class_counts: dict[str, int] = field(default_factory=dict)
     selection_skip_counts: dict[str, int] = field(default_factory=dict)
+    eligibility_due: int = 0
+    eligibility_overdue: int = 0
+    eligibility_failed: int = 0
+    eligibility_backoff: int = 0
+    eligibility_preserved_positive: int = 0
+    eligibility_contradicted: int = 0
+    eligibility_invalidated: int = 0
+    lease_busy: int = 0
+    refresh_policy: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -133,6 +151,15 @@ class EnrichmentSummary:
             "provider_cursor_states": self.provider_cursor_states,
             "selection_class_counts": dict(sorted(self.selection_class_counts.items())),
             "selection_skip_counts": dict(sorted(self.selection_skip_counts.items())),
+            "eligibility_due": self.eligibility_due,
+            "eligibility_overdue": self.eligibility_overdue,
+            "eligibility_failed": self.eligibility_failed,
+            "eligibility_backoff": self.eligibility_backoff,
+            "eligibility_preserved_positive": self.eligibility_preserved_positive,
+            "eligibility_contradicted": self.eligibility_contradicted,
+            "eligibility_invalidated": self.eligibility_invalidated,
+            "lease_busy": self.lease_busy,
+            "refresh_policy": dict(self.refresh_policy),
             "cache_ttl_days": PROVIDER_SEARCH_CACHE_TTL_DAYS,
             "eligibility_evidence_ttl_days": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
         }
@@ -607,13 +634,23 @@ def _fetch_provider_children_if_available(
     current_iso = _iso(current)
     if provider_slug == "crunchyroll" and provider_series_id:
         cached = get_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
-            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION, now=current_iso)
+            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION)
+        detail_target_days = max(0, int(getattr(config.mal, "provider_detail_cache_ttl_days", 120)))
         if cached is not None:
-            if cached.status == "failed" and cached.next_retry_at and cached.next_retry_at > current_iso:
-                return [], False
             children = _provider_child_items_from_match(cached.response)
-            if children:
+            retry_backoff_active = bool(cached.next_retry_at and cached.next_retry_at > current_iso)
+            refresh_due = periodic_evidence_is_due(
+                successful_at=cached.fetched_at,
+                surface="provider_detail",
+                identity={"provider": provider_slug, "provider_series_id": provider_series_id, "logic_version": PROVIDER_DETAIL_CACHE_LOGIC_VERSION},
+                now=current,
+                target_days=detail_target_days,
+                jitter_days=min(15, detail_target_days),
+            )
+            if children and (retry_backoff_active or not refresh_due):
                 return children, False
+            if cached.status == "failed" and retry_backoff_active:
+                return [], False
     children_func = getattr(provider, "fetch_search_result_children", None)
     if not callable(children_func):
         return [], False
@@ -997,9 +1034,20 @@ def _fetch_provider_detail_if_available(
     current_iso = _iso(current)
     if provider_slug == "crunchyroll" and provider_series_id and not force_refresh:
         cached = get_provider_enriched_detail_cache(config.db_path, provider=provider_slug,
-            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION, now=current_iso)
+            provider_series_id=provider_series_id, logic_version=PROVIDER_DETAIL_CACHE_LOGIC_VERSION)
+        detail_target_days = max(0, int(getattr(config.mal, "provider_detail_cache_ttl_days", 120)))
         if cached is not None and cached.status == "ok":
-            return _match_to_dict(cached.response), False
+            retry_backoff_active = bool(cached.next_retry_at and cached.next_retry_at > current_iso)
+            refresh_due = periodic_evidence_is_due(
+                successful_at=cached.fetched_at,
+                surface="provider_detail",
+                identity={"provider": provider_slug, "provider_series_id": provider_series_id, "logic_version": PROVIDER_DETAIL_CACHE_LOGIC_VERSION},
+                now=current,
+                target_days=detail_target_days,
+                jitter_days=min(15, detail_target_days),
+            )
+            if retry_backoff_active or not refresh_due:
+                return _match_to_dict(cached.response), False
         if cached is not None and cached.status == "failed" and cached.next_retry_at and cached.next_retry_at > current_iso:
             return match, False
     if provider_session is None and provider_session_factory is not None:
@@ -1132,6 +1180,26 @@ def _upsert_search_eligibility_evidence(
         failure_count=0,
         next_retry_at=None,
         logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+        verification_outcome="positive" if verified_actionable else "unknown",
+        refresh_due_at=(
+            provider_eligibility_refresh_due_at(
+                successful_verified_at=fetched_at,
+                mal_anime_id=int(mal_anime_id),
+                provider=provider,
+                provider_series_id=str(provider_series_id),
+                target_days=config.service.provider_eligibility_refresh_target_days,
+                jitter_days=config.service.provider_eligibility_refresh_jitter_days,
+            )
+            if verified_actionable
+            else None
+        ),
+        refresh_schedule_version=PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+        refresh_schedule_key=provider_eligibility_refresh_schedule_key(
+            mal_anime_id=int(mal_anime_id),
+            provider=provider,
+            provider_series_id=str(provider_series_id),
+        ),
+        last_successful_positive_at=last_verified_at if verified_actionable else None,
     )
     return True, verified_identity, verified_actionable
 
@@ -1167,6 +1235,20 @@ def _record_eligibility_refresh_failure(
         next_retry_at=_iso(now + timedelta(hours=delay_hours)),
         logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
     )
+
+
+def _record_selection_refresh_failures(
+    config: AppConfig,
+    selection: ProviderEnrichmentCandidate,
+    *,
+    now: datetime,
+) -> int:
+    preserved = 0
+    for evidence in selection.due_evidence:
+        _record_eligibility_refresh_failure(config, evidence, now=now)
+        if evidence.last_successful_positive_at and not evidence.invalidated_at:
+            preserved += 1
+    return preserved
 
 
 def _decode_json_object(value: Any) -> dict[str, Any]:
@@ -1812,13 +1894,13 @@ _DUE_SELECTION_CLASSES = frozenset({
 })
 
 _SELECTION_CLASS_PRIORITY = {
-    "uncovered": 0,
-    "failed_retry_due": 1,
-    "stale_refresh_due": 2,
+    "force_refresh": 0,
+    "mapping_refresh_due": 1,
+    "failed_retry_due": 2,
     "expired_refresh_due": 3,
-    "logic_refresh_due": 4,
-    "mapping_refresh_due": 5,
-    "force_refresh": 6,
+    "stale_refresh_due": 4,
+    "logic_refresh_due": 5,
+    "uncovered": 6,
 }
 
 
@@ -1861,9 +1943,6 @@ def _provider_selection_class(
         return "force_refresh", None, tuple(evidence_rows)
     if not evidence_rows:
         return "uncovered", None, ()
-    if any(is_strict_provider_eligibility_actionable(evidence, now=now) for evidence in evidence_rows):
-        return None, "fresh_covered", ()
-
     failed_due: list[Any] = []
     failed_backoff: list[Any] = []
     stale_due: list[Any] = []
@@ -1879,13 +1958,24 @@ def _provider_selection_class(
                 continue
             failed_due.append(evidence)
             continue
-        if str(getattr(evidence, "logic_version", "")) != PROVIDER_ELIGIBILITY_LOGIC_VERSION:
+        refresh_due_at = getattr(evidence, "refresh_due_at", None)
+        if refresh_due_at is not None and str(refresh_due_at) <= now:
+            expired_due.append(evidence)
+            continue
+        if str(getattr(evidence, "logic_version", "")) not in {
+            PROVIDER_ELIGIBILITY_LOGIC_VERSION,
+            PROVIDER_DETAIL_CACHE_LOGIC_VERSION,
+        }:
             logic_due.append(evidence)
             continue
         if _evidence_is_stale(evidence):
             stale_due.append(evidence)
             continue
-        if str(getattr(evidence, "expires_at", "")) <= now:
+        if (
+            str(getattr(evidence, "verification_outcome", "")) != "positive"
+            and getattr(evidence, "refresh_due_at", None) is None
+            and str(getattr(evidence, "expires_at", "")) <= now
+        ):
             expired_due.append(evidence)
             continue
         fresh_current.append(evidence)
@@ -2026,38 +2116,56 @@ def _select_provider_enrichment_candidates(
         provider_state["exhausted"] = True
         return []
 
-    if cursor_rank is not None:
-        # Cursor fairness applies within each priority class; initial coverage is
-        # never displaced by refresh work merely because it lies before cursor.
-        ordered = []
-        for selection_class in sorted(
-            {candidate.selection_class for candidate in ranked},
-            key=lambda value: (_SELECTION_CLASS_PRIORITY.get(value, 99), value),
-        ):
-            class_rows = [candidate for candidate in ranked if candidate.selection_class == selection_class]
-            ordered.extend(candidate for candidate in class_rows if candidate.rank > cursor_rank)
-            ordered.extend(candidate for candidate in class_rows if candidate.rank <= cursor_rank)
-        selected = ordered[:limit]
-        if any(candidate.rank <= cursor_rank for candidate in selected):
-            provider_state["wrapped"] = True
-            for candidate in selected:
-                if candidate.rank <= cursor_rank:
-                    candidate.cursor_wrapped = True
-    else:
-        if cursor_mal_id is not None:
-            provider_state["cursor_missing"] = True
-        # First run or cursor target aged out of the ranked set: prefer never-attempted
-        # candidates in current rank order, then the least-recently attempted rows.
-        selected = sorted(
-            ranked,
-            key=lambda candidate: (
-                _SELECTION_CLASS_PRIORITY.get(candidate.selection_class, 99),
-                1 if candidate.previous_attempted_at is not None else 0,
-                candidate.previous_attempted_at or "",
-                candidate.rank,
-                candidate.mal_id,
-            ),
-        )[:limit]
+    def traversal_order(rows: list[ProviderEnrichmentCandidate]) -> list[ProviderEnrichmentCandidate]:
+        if cursor_rank is None:
+            return sorted(
+                rows,
+                key=lambda candidate: (
+                    1 if candidate.previous_attempted_at is not None else 0,
+                    candidate.previous_attempted_at or "",
+                    candidate.rank,
+                    candidate.mal_id,
+                ),
+            )
+        return [candidate for candidate in rows if candidate.rank > cursor_rank] + [
+            candidate for candidate in rows if candidate.rank <= cursor_rank
+        ]
+
+    def due_order_key(candidate: ProviderEnrichmentCandidate) -> tuple[Any, ...]:
+        timestamps = [
+            str(getattr(evidence, "next_retry_at", None) or getattr(evidence, "refresh_due_at", None) or "")
+            for evidence in candidate.due_evidence
+        ]
+        identities = sorted(
+            str(getattr(evidence, "provider_series_id", "")) for evidence in candidate.due_evidence
+        )
+        return (
+            _SELECTION_CLASS_PRIORITY.get(candidate.selection_class, 99),
+            min(timestamps, default=""),
+            candidate.mal_id,
+            identities[0] if identities else "",
+        )
+
+    uncovered = traversal_order([candidate for candidate in ranked if candidate.selection_class == "uncovered"])
+    due = sorted(
+        [candidate for candidate in ranked if candidate.selection_class != "uncovered"],
+        key=due_order_key,
+    )
+    selected: list[ProviderEnrichmentCandidate] = []
+    # With the configured capacity of two, reserve one slot for each class so
+    # continuous initial coverage cannot starve persisted due work (and vice versa).
+    if limit >= 2 and uncovered and due:
+        selected.extend((due.pop(0), uncovered.pop(0)))
+    combined = due + uncovered
+    selected.extend(candidate for candidate in combined if candidate not in selected)
+    selected = selected[:limit]
+    if cursor_rank is None and cursor_mal_id is not None:
+        provider_state["cursor_missing"] = True
+    if cursor_rank is not None and any(candidate.rank <= cursor_rank for candidate in selected):
+        provider_state["wrapped"] = True
+        for candidate in selected:
+            if candidate.rank <= cursor_rank:
+                candidate.cursor_wrapped = True
 
     provider_state["selected_mal_anime_ids"] = [candidate.mal_id for candidate in selected]
     provider_state["selected_classes"] = [candidate.selection_class for candidate in selected]
@@ -2066,7 +2174,7 @@ def _select_provider_enrichment_candidates(
     return selected
 
 
-_PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR = 4
+_PROVIDER_ENRICHMENT_AUTHORIZED_CANDIDATES_PER_PROVIDER_HOUR = 2
 _PROVIDER_ENRICHMENT_RECENT_SAMPLE_LIMIT = 5
 
 
@@ -2127,6 +2235,13 @@ def _provider_enrichment_policy(config: AppConfig) -> dict[str, Any]:
         "writes": False,
         "provider_search_cache_ttl_days": PROVIDER_SEARCH_CACHE_TTL_DAYS,
         "eligibility_evidence_ttl_days": PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS,
+        "refresh_target_days": max(0, int(config.service.provider_eligibility_refresh_target_days)),
+        "refresh_jitter_days": max(0, int(config.service.provider_eligibility_refresh_jitter_days)),
+        "refresh_schedule_version": PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+        "refresh_window_days": {
+            "minimum": max(0, int(config.service.provider_eligibility_refresh_target_days) - int(config.service.provider_eligibility_refresh_jitter_days)),
+            "maximum": int(config.service.provider_eligibility_refresh_target_days) + int(config.service.provider_eligibility_refresh_jitter_days),
+        },
     }
 
 
@@ -2389,11 +2504,7 @@ def build_provider_enrichment_diagnostics(
             policy=policy,
             now=current,
         )
-        refresh_horizon = _effective_evidence_refresh_horizon(
-            config,
-            candidate_population=len(ranked_candidates),
-            candidates_per_run=candidate_limit,
-        )
+        refresh_horizon = timedelta(days=max(0, int(config.service.provider_eligibility_refresh_target_days)))
         traversal_runs = ceil(len(ranked_candidates) / candidate_limit) if candidate_limit > 0 else None
         traversal_seconds = (
             traversal_runs * int(policy.get("configured_every_seconds") or 0)
@@ -2479,6 +2590,9 @@ def build_provider_enrichment_diagnostics(
                 if ranked_candidates
                 else "no_current_discovery_candidates",
             },
+            "lifecycle": get_recommendation_provider_eligibility_lifecycle_counts(
+                config.db_path, provider=provider_slug, now=current_iso
+            ),
         }
 
     return {
@@ -2545,7 +2659,7 @@ def enrich_discovery_provider_availability(
     config: AppConfig,
     *,
     providers: list[ProviderTitleSearchClient],
-    candidate_limit: int = 4,
+    candidate_limit: int = 2,
     search_limit: int = 5,
     queries_per_candidate: int = 1,
     now: datetime | None = None,
@@ -2577,16 +2691,40 @@ def enrich_discovery_provider_availability(
         )
         if r.kind == "discovery_candidate"
     ]
-    eligibility_refresh_horizon = _effective_evidence_refresh_horizon(
-        config,
-        candidate_population=len(candidates),
-        candidates_per_run=candidate_limit,
-    )
-    eligibility_expires_at = _iso(current + eligibility_refresh_horizon)
+    # Legacy expires_at remains a short diagnostic/cache timestamp. Lifecycle
+    # scheduling is independently persisted in refresh_due_at and is never
+    # derived from population size, rank, batch size, or traversal duration.
+    eligibility_expires_at = _iso(current + timedelta(days=PROVIDER_ELIGIBILITY_EVIDENCE_TTL_DAYS))
+    summary.refresh_policy = {
+        "target_days": max(0, int(config.service.provider_eligibility_refresh_target_days)),
+        "jitter_days": max(0, int(config.service.provider_eligibility_refresh_jitter_days)),
+        "window_days": [
+            max(0, int(config.service.provider_eligibility_refresh_target_days) - int(config.service.provider_eligibility_refresh_jitter_days)),
+            int(config.service.provider_eligibility_refresh_target_days) + int(config.service.provider_eligibility_refresh_jitter_days),
+        ],
+        "schedule_version": PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+        "capacity_per_provider_run": max(0, int(candidate_limit)),
+    }
+    acquired_leases: list[ProviderEligibilityProcessLease] = []
+    available_providers: list[ProviderTitleSearchClient] = []
+    for provider_client in providers:
+        provider_slug = str(getattr(provider_client, "slug", provider_client.__class__.__name__)).strip().lower()
+        lease = ProviderEligibilityProcessLease(config.service_leases_dir, provider_slug)
+        if not lease.try_acquire():
+            summary.lease_busy += 1
+            summary.provider_cursor_states[provider_slug] = {"status": "skipped", "reason": "lease_busy"}
+            continue
+        acquired_leases.append(lease)
+        available_providers.append(provider_client)
+    providers = available_providers
     review_entries: list[dict[str, Any]] = []
     child_probe_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     child_probe_failures: set[tuple[str, str]] = set()
     provider_sessions: dict[str, Any] = {}
+
+    def release_leases() -> None:
+        while acquired_leases:
+            acquired_leases.pop().release()
 
     def request_session(provider: ProviderTitleSearchClient) -> Any | None:
         slug = str(getattr(provider, "slug", ""))
@@ -2638,8 +2776,9 @@ def enrich_discovery_provider_availability(
             if due_failure_recorded:
                 return
             due_failure_recorded = True
-            for evidence in selection.due_evidence:
-                _record_eligibility_refresh_failure(config, evidence, now=current)
+            summary.eligibility_preserved_positive += _record_selection_refresh_failures(
+                config, selection, now=current
+            )
 
         try:
             if meta is None:
@@ -2763,10 +2902,15 @@ def enrich_discovery_provider_availability(
                             )
                             if detail_attempted:
                                 summary.provider_detail_probes += 1
-                        except Exception as exc:  # detail enrichment is optional; keep the search hit evidence
+                        except Exception as exc:  # incomplete detail refresh must not overwrite stronger evidence
                             summary.provider_detail_failures += 1
                             if len(summary.failure_details) < 10:
                                 summary.failure_details.append({"provider": provider_slug, "query": query, "detail_error": str(exc)})
+                            if existing_evidence is not None and existing_evidence.last_successful_positive_at and not existing_evidence.invalidated_at:
+                                _record_eligibility_refresh_failure(config, existing_evidence, now=current)
+                                summary.eligibility_preserved_positive += 1
+                                outcome = "provider_detail_failure_preserved_positive"
+                                continue
                         provider_series_id = match.get("provider_series_id") or provider_series_id
                         _ensure_provider_series(config, provider=provider_slug, match=match)
                         summary.strong_matches += 1
@@ -2832,33 +2976,46 @@ def enrich_discovery_provider_availability(
                     })
                 elif outcome not in {"provider_search_failure", "strong_match", "ambiguous_match"}:
                     outcome = "searched_no_match" if searched_provider else "cache_hit_no_match"
-                    if provider_slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS:
+                    if provider_slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS and searched_provider:
                         # A successful bounded search with no acceptable identity is
                         # useful negative coverage, not an auto-link. Persist it so
                         # cursor wraps do not immediately recirculate this candidate.
-                        upsert_recommendation_provider_eligibility_evidence(
+                        negative_due_at = provider_eligibility_refresh_due_at(
+                            successful_verified_at=fetched_at,
+                            mal_anime_id=selection.mal_id,
+                            provider=provider_slug,
+                            provider_series_id=PROVIDER_NO_MATCH_SERIES_ID,
+                            target_days=config.service.provider_eligibility_refresh_target_days,
+                            jitter_days=config.service.provider_eligibility_refresh_jitter_days,
+                        )
+                        contradicted = record_recommendation_provider_eligibility_negative_scope(
                             config.db_path,
                             mal_anime_id=selection.mal_id,
                             provider=provider_slug,
                             provider_series_id=PROVIDER_NO_MATCH_SERIES_ID,
-                            provider_title=None,
-                            identity_match_kind="provider_title_search_no_match",
-                            review_status="verified",
-                            catalog_status="absent",
-                            english_dub_status="absent",
-                            audio_locales=[],
+                            attempted_at=fetched_at,
+                            expires_at=eligibility_expires_at,
+                            refresh_due_at=negative_due_at,
+                            refresh_schedule_version=PROVIDER_ELIGIBILITY_REFRESH_SCHEDULE_VERSION,
+                            refresh_schedule_key=provider_eligibility_refresh_schedule_key(
+                                mal_anime_id=selection.mal_id,
+                                provider=provider_slug,
+                                provider_series_id=PROVIDER_NO_MATCH_SERIES_ID,
+                            ),
+                            invalidation_reason="successful_affirmative_no_match",
                             source_evidence={
                                 "source": "provider_title_search",
                                 "result": "no_acceptable_match",
                                 "query": query,
                                 "search_limit": search_limit,
                             },
-                            fetched_at=fetched_at,
-                            expires_at=eligibility_expires_at,
-                            last_verified_at=fetched_at,
                             logic_version=PROVIDER_ELIGIBILITY_LOGIC_VERSION,
                         )
                         summary.eligibility_evidence_upserted += 1
+                        summary.eligibility_contradicted += contradicted
+        except Exception:
+            record_due_failures_once()
+            raise
         finally:
             update_recommendation_provider_enrichment_attempt_outcome(
                 config.db_path,
@@ -2868,24 +3025,37 @@ def enrich_discovery_provider_availability(
             )
             selected_payload["outcome"] = outcome
 
-    for provider in providers:
-        provider_slug = str(getattr(provider, "slug", provider.__class__.__name__)).strip().lower()
-        if not callable(getattr(provider, "search_title", None)):
-            summary.providers_skipped.append(provider_slug)
-            continue
-        selected = _select_provider_enrichment_candidates(
-            config,
-            provider_slug=provider_slug,
-            candidates=candidates,
-            metadata=metadata,
-            mappings_by_series=mappings_by_series,
-            candidate_limit=candidate_limit,
-            now=fetched_at,
-            force_refresh=force_refresh,
-            summary=summary,
-        )
-        for selection in selected:
-            process_selection(provider, selection)
+    try:
+        for provider in providers:
+            provider_slug = str(getattr(provider, "slug", provider.__class__.__name__)).strip().lower()
+            if not callable(getattr(provider, "search_title", None)):
+                summary.providers_skipped.append(provider_slug)
+                continue
+            selected = _select_provider_enrichment_candidates(
+                config,
+                provider_slug=provider_slug,
+                candidates=candidates,
+                metadata=metadata,
+                mappings_by_series=mappings_by_series,
+                candidate_limit=candidate_limit,
+                now=fetched_at,
+                force_refresh=force_refresh,
+                summary=summary,
+            )
+            for selection in selected:
+                process_selection(provider, selection)
+            if provider_slug in DISCOVERY_PROVIDER_ELIGIBILITY_PROVIDERS:
+                lifecycle_counts = get_recommendation_provider_eligibility_lifecycle_counts(
+                    config.db_path, provider=provider_slug, now=fetched_at
+                )
+                summary.eligibility_due += lifecycle_counts["due"]
+                summary.eligibility_overdue += lifecycle_counts["overdue"]
+                summary.eligibility_failed += lifecycle_counts["failed"]
+                summary.eligibility_backoff += lifecycle_counts["backoff"]
+                summary.eligibility_preserved_positive += lifecycle_counts["preserved_positive"]
+                summary.eligibility_invalidated += lifecycle_counts["invalidated"]
+    finally:
+        release_leases()
     review_entries = _dedupe_discovery_review_entries(_coalesce_discovery_review_entries(review_entries))
     should_refresh_review_queue = bool(
         review_entries

@@ -117,6 +117,8 @@ def _evidence_is_current(evidence: Any, *, now: datetime) -> bool:
 
 
 def _has_non_stale_last_verified_at(evidence: Any, *, now: datetime) -> bool:
+    if _value(evidence, "verification_outcome") == "positive" and _coerce_datetime(_value(evidence, "last_successful_positive_at")) is not None:
+        return _coerce_datetime(_value(evidence, "invalidated_at")) is None
     if _coerce_datetime(_value(evidence, "last_verified_at")) is None:
         return False
     return _evidence_is_current(evidence, now=now)
@@ -125,6 +127,11 @@ def _has_non_stale_last_verified_at(evidence: Any, *, now: datetime) -> bool:
 def strict_provider_eligibility_actionability(evidence: Any, *, now: Any = None) -> StrictProviderActionability:
     current = _coerce_now(now)
     missing: list[str] = []
+
+    if _coerce_datetime(_value(evidence, "invalidated_at")) is not None or _normalized_text(
+        _value(evidence, "verification_outcome")
+    ) == "negative":
+        missing.append("provider eligibility explicitly invalidated")
 
     provider = _normalized_text(_value(evidence, "provider"))
     identity_match_kind = _normalized_text(_value(evidence, "identity_match_kind"))

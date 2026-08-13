@@ -52,7 +52,7 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
 
         command = _provider_eligibility_command(self.config, "crunchyroll")
         self.assertEqual("crunchyroll", command[command.index("--provider") + 1])
-        self.assertEqual("4", command[command.index("--limit") + 1])
+        self.assertEqual("2", command[command.index("--limit") + 1])
         self.assertEqual("5", command[command.index("--search-limit") + 1])
         self.assertEqual("1", command[command.index("--queries-per-candidate") + 1])
 
@@ -70,7 +70,7 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
         self.assertEqual(2, policy["execute_limits"]["recommend_full_harvest"])
         self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
-        self.assertEqual(45, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
+        self.assertEqual(120, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
         self.assertEqual(10, policy["cold_refresh_bounds"]["crunchyroll_max_history_pages"])
         self.assertEqual(2, policy["cold_refresh_bounds"]["crunchyroll_max_watchlist_pages"])
         self.assertFalse(policy["cold_refresh_bounds"]["hidive_unattended_full_refresh"])

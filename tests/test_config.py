@@ -50,6 +50,29 @@ class ConfigLoadingTests(unittest.TestCase):
             config = load_config(root)
         self.assertEqual(0, config.service.execute_limit_for("sync_apply"))
 
+    def test_zero_provider_eligibility_refresh_target_explicitly_disables_due_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
+                "[service]\nprovider_eligibility_refresh_target_days = 0\n",
+                encoding="utf-8",
+            )
+            config = load_config(root)
+        self.assertEqual(0, config.service.provider_eligibility_refresh_target_days)
+
+    def test_provider_eligibility_jitter_cannot_exceed_positive_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "config" / "settings.toml").write_text(
+                "[service]\nprovider_eligibility_refresh_target_days = 10\n"
+                "provider_eligibility_refresh_jitter_days = 11\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "refresh_jitter_days"):
+                load_config(root)
+
     def test_defaults_resolve_under_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -82,8 +105,10 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(8 * 60 * 60, config.service.mal_list_refresh_every_seconds)
             self.assertEqual(12 * 60 * 60, config.service.recommendation_metadata_refresh_every_seconds)
             self.assertEqual(60 * 60, config.service.recommendation_full_harvest_every_seconds)
-            self.assertEqual(45, config.service.recommendation_full_harvest_stale_after_days)
+            self.assertEqual(120, config.service.recommendation_full_harvest_stale_after_days)
             self.assertEqual(60 * 60, config.service.provider_eligibility_refresh_every_seconds)
+            self.assertEqual(120, config.service.provider_eligibility_refresh_target_days)
+            self.assertEqual(15, config.service.provider_eligibility_refresh_jitter_days)
             self.assertEqual(60 * 60, config.service.recommend_maintain_every_seconds)
             self.assertEqual(14, config.service.recommendation_snapshot_retention_days)
             self.assertEqual(30, config.service.recommendation_snapshot_min_runs_per_kind)
@@ -114,7 +139,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(3, config.service.task_projected_request_counts["mal_list_refresh"])
             self.assertEqual(8, config.service.task_projected_request_counts["sync_apply"])
             self.assertEqual(28, config.service.task_projected_request_counts["recommend_provider_eligibility_crunchyroll"])
-            self.assertEqual(4, config.service.task_execute_limits["recommend_provider_eligibility_candidates"])
+            self.assertEqual(2, config.service.task_execute_limits["recommend_provider_eligibility_candidates"])
             self.assertEqual(1, config.service.task_execute_limits["recommend_provider_eligibility_queries_per_candidate"])
             self.assertEqual(8, config.service.task_execute_limits["sync_apply"])
             self.assertEqual(2, config.service.task_execute_limits["recommend_full_harvest"])
@@ -525,7 +550,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual("fresh", parsed["openclaw"]["recommendations_webhook_delivery_mode"])
             self.assertEqual(604800, parsed["service"]["full_refresh_every_seconds"])
             self.assertEqual(3600, parsed["service"]["recommendation_full_harvest_every_seconds"])
-            self.assertEqual(45, parsed["service"]["recommendation_full_harvest_stale_after_days"])
+            self.assertEqual(120, parsed["service"]["recommendation_full_harvest_stale_after_days"])
             self.assertEqual(180, parsed["service"]["crunchyroll_hourly_limit"])
             self.assertEqual(16, parsed["service"]["task_hourly_limits"]["recommend_full_harvest"])
             self.assertEqual(2, parsed["service"]["task_execute_limits"]["recommend_full_harvest"])

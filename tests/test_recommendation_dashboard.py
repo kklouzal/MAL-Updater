@@ -797,7 +797,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(5, counts["total"])
             self.assertEqual(2, counts["strict_current"])
             self.assertEqual(1, counts["pending_review"])
-            self.assertEqual(1, counts["stale"])
+            self.assertEqual(0, counts["stale"])
             self.assertEqual(2, payload["recommendations"]["section_totals"]["discovery_available_now"])
             self.assertEqual(1, payload["recommendations"]["section_totals"]["discovery_high_confidence"])
             dormant = payload["recommendations"]["sections"]["discovery_high_confidence"][0]
