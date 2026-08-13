@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .hidive_urls import canonical_hidive_series_url
 
@@ -21,6 +23,8 @@ PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION = "017_provider_series_observat
 PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION = "018_provider_title_search_cache_full_key.sql"
 MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION = "019_mal_user_anime_list_refresh_generations.sql"
 PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION = "020_provider_eligibility_refresh_lifecycle.sql"
+PUBLIC_USERRECS_DURABLE_QUEUE_MIGRATION = "021_public_userrecs_durable_queue_and_snapshot_guards.sql"
+MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION = "022_mal_user_list_durable_pagination.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -44,6 +48,8 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION,
     MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION,
     PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION,
+    PUBLIC_USERRECS_DURABLE_QUEUE_MIGRATION,
+    MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -249,6 +255,7 @@ class MalUserAnimeListRefreshSummary:
     by_status: dict[str, int] | None = None
     partial: bool = False
     error: str | None = None
+    traversal: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -267,6 +274,7 @@ class MalUserAnimeListRefreshSummary:
             "by_status": dict(self.by_status or {}),
             "partial": self.partial,
             "error": self.error,
+            "traversal": dict(self.traversal or {}),
         }
 
 
@@ -337,6 +345,49 @@ class MalPublicUserRecsCrawlGeneration:
     completed_at: str | None
     published_at: str | None
     discarded_at: str | None
+    created_at: str
+    updated_at: str
+    logic_version: str = "public-userrecs-snapshot-v2"
+    generation_key: str | None = None
+    attempt_count: int = 0
+    restart_count: int = 0
+    drift_count: int = 0
+    next_retry_at: str | None = None
+    retry_class: str | None = None
+    first_page_revalidated_at: str | None = None
+    boundary_revalidated_at: str | None = None
+    terminal_evidence_json: str = "{}"
+    quarantined_at: str | None = None
+    quarantine_reason: str | None = None
+    claim_token: str | None = None
+    claim_expires_at: str | None = None
+    generation_revision: int = 0
+    staged_revision: int = 0
+    validated_staged_revision: int | None = None
+    validation_fingerprint: str | None = None
+
+    @property
+    def terminal_evidence(self) -> dict[str, Any]:
+        value = _load_json_value(self.terminal_evidence_json, {})
+        return value if isinstance(value, dict) else {}
+
+
+@dataclass(slots=True)
+class MalPublicUserRecsSourceQueueRow:
+    source_mal_anime_id: int
+    queue_class: str
+    eligible: bool
+    enqueued_at: str
+    class_entered_at: str
+    last_selected_at: str | None
+    selection_count: int
+    selection_sequence: int
+    next_retry_at: str | None
+    claim_token: str | None
+    claim_expires_at: str | None
+    last_generation_id: int | None
+    last_outcome: str | None
+    last_error_code: str | None
     created_at: str
     updated_at: str
 
@@ -1604,6 +1655,63 @@ class MalUserAnimeListRefreshConflictError(RuntimeError):
     """A cache refresh lost ownership of the current active generation."""
 
 
+MAL_USER_LIST_PAGINATION_LOGIC_VERSION = "mal-user-list-pagination-v2"
+MAL_USER_LIST_CLAIM_SECONDS = 15 * 60
+MAL_USER_LIST_MAX_DRIFT_RESTARTS = 2
+
+
+@dataclass(frozen=True, slots=True)
+class MalUserAnimeListTraversalGeneration:
+    refresh_run_id: str
+    generation: int
+    fetched_at: str
+    account_key: str
+    account_id: int
+    account_name: str
+    query_identity: str
+    query: dict[str, Any]
+    claim_token: str | None
+    claim_expires_at: str | None
+    revision: int
+    requests_attempted: int
+    requests_succeeded: int
+    requests_failed: int
+    restart_count: int
+    drift_count: int
+    quarantined_at: str | None
+    publication_epoch: int
+    identity_assertion_nonce: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MalUserAnimeListTraversalPartition:
+    generation: int
+    partition_key: str
+    requested_status: str | None
+    ordinal: int
+    initial_url: str
+    next_url: str | None
+    page_sequence: int
+    item_count: int
+    terminal: bool
+    terminal_explicit: bool
+    empty_proven: bool
+    first_page_fingerprint: str | None
+    final_page_url: str | None
+    final_page_fingerprint: str | None
+    page1_validated_at: str | None
+    boundary_validated_at: str | None
+    attempt_count: int
+    retry_count: int
+    requests_succeeded: int
+    requests_failed: int
+    next_retry_at: str | None
+    retry_class: str | None
+    fairness_sequence: int
+    first_started_at: str | None
+    terminal_at: str | None
+
+
 def _normalize_mal_user_list_status(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1731,7 +1839,13 @@ def _require_current_mal_user_list_refresh_generation(
     operation: str,
 ) -> None:
     generation = int(row["generation"])
-    latest_generation = _latest_mal_user_list_refresh_generation(conn)
+    # Legacy lifecycle helpers own only the legacy/accountless namespace. A
+    # durable account/query traversal may coexist and must not supersede or be
+    # pruned by these compatibility APIs.
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(generation), 0) AS generation FROM mal_user_anime_list_refresh_generations WHERE account_id IS NULL"
+    ).fetchone()
+    latest_generation = int(latest["generation"] or 0)
     if latest_generation != generation:
         raise MalUserAnimeListRefreshConflictError(
             "stale MAL user anime list refresh generation "
@@ -1747,7 +1861,10 @@ def _active_mal_user_list_refresh_generation_count(conn: sqlite3.Connection) -> 
 
 
 def _require_single_active_mal_user_list_refresh_generation(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
-    active_count = _active_mal_user_list_refresh_generation_count(conn)
+    active = conn.execute(
+        "SELECT COUNT(*) AS n FROM mal_user_anime_list_refresh_generations WHERE status='active' AND account_id IS NULL"
+    ).fetchone()
+    active_count = int(active["n"] or 0)
     if active_count != 1:
         raise MalUserAnimeListRefreshConflictError(
             "expected exactly one active MAL user anime list refresh generation; "
@@ -1854,7 +1971,7 @@ def begin_mal_user_anime_list_cache_refresh(
                 completed_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP,
                 error = ?
-            WHERE status = 'active'
+            WHERE status = 'active' AND account_id IS NULL
             """,
             (_MAL_USER_LIST_REFRESH_SUPERSEDED_ERROR,),
         )
@@ -3205,6 +3322,17 @@ _PUBLIC_USERRECS_OPEN_GENERATION_STATUSES = frozenset({"active", "paused", "read
 _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES = frozenset({"active", "paused"})
 _PUBLIC_USERRECS_EVENT_LIMIT_PER_SOURCE = 200
 _PUBLIC_USERRECS_RETAINED_FIELDS = ["target_mal_anime_id", "target_title", "num_recommendations"]
+PUBLIC_USERRECS_LOGIC_VERSION = "public-userrecs-snapshot-v2"
+PUBLIC_USERRECS_MAX_DRIFT_RESTARTS = 3
+PUBLIC_USERRECS_CLAIM_SECONDS = 15 * 60
+_PUBLIC_USERRECS_QUEUE_CLASS_PRIORITY = {
+    "never_started": 0,
+    "resumable": 1,
+    "retry_due": 2,
+    "refresh_due": 3,
+    "fresh": 4,
+    "quarantined": 5,
+}
 _UNSET = object()
 
 
@@ -3235,6 +3363,7 @@ def _public_userrecs_sanitized_anchor(anchor: dict[str, Any] | None) -> dict[str
 
 
 def _public_userrecs_generation_from_row(row: sqlite3.Row) -> MalPublicUserRecsCrawlGeneration:
+    keys = set(row.keys())
     return MalPublicUserRecsCrawlGeneration(
         generation_id=int(row["generation_id"]),
         source_mal_anime_id=int(row["source_mal_anime_id"]),
@@ -3251,6 +3380,48 @@ def _public_userrecs_generation_from_row(row: sqlite3.Row) -> MalPublicUserRecsC
         completed_at=row["completed_at"],
         published_at=row["published_at"],
         discarded_at=row["discarded_at"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        logic_version=str(row["logic_version"]) if "logic_version" in keys else "public-userrecs-snapshot-v2",
+        generation_key=row["generation_key"] if "generation_key" in keys else None,
+        attempt_count=int(row["attempt_count"] or 0) if "attempt_count" in keys else 0,
+        restart_count=int(row["restart_count"] or 0) if "restart_count" in keys else 0,
+        drift_count=int(row["drift_count"] or 0) if "drift_count" in keys else 0,
+        next_retry_at=row["next_retry_at"] if "next_retry_at" in keys else None,
+        retry_class=row["retry_class"] if "retry_class" in keys else None,
+        first_page_revalidated_at=row["first_page_revalidated_at"] if "first_page_revalidated_at" in keys else None,
+        boundary_revalidated_at=row["boundary_revalidated_at"] if "boundary_revalidated_at" in keys else None,
+        terminal_evidence_json=str(row["terminal_evidence_json"] or "{}") if "terminal_evidence_json" in keys else "{}",
+        quarantined_at=row["quarantined_at"] if "quarantined_at" in keys else None,
+        quarantine_reason=row["quarantine_reason"] if "quarantine_reason" in keys else None,
+        claim_token=row["claim_token"] if "claim_token" in keys else None,
+        claim_expires_at=row["claim_expires_at"] if "claim_expires_at" in keys else None,
+        generation_revision=int(row["generation_revision"] or 0) if "generation_revision" in keys else 0,
+        staged_revision=int(row["staged_revision"] or 0) if "staged_revision" in keys else 0,
+        validated_staged_revision=(
+            None if "validated_staged_revision" not in keys or row["validated_staged_revision"] is None
+            else int(row["validated_staged_revision"])
+        ),
+        validation_fingerprint=row["validation_fingerprint"] if "validation_fingerprint" in keys else None,
+    )
+
+
+def _public_userrecs_queue_from_row(row: sqlite3.Row) -> MalPublicUserRecsSourceQueueRow:
+    return MalPublicUserRecsSourceQueueRow(
+        source_mal_anime_id=int(row["source_mal_anime_id"]),
+        queue_class=str(row["queue_class"]),
+        eligible=bool(row["eligible"]),
+        enqueued_at=str(row["enqueued_at"]),
+        class_entered_at=str(row["class_entered_at"]),
+        last_selected_at=row["last_selected_at"],
+        selection_count=int(row["selection_count"] or 0),
+        selection_sequence=int(row["selection_sequence"] or 0),
+        next_retry_at=row["next_retry_at"],
+        claim_token=row["claim_token"],
+        claim_expires_at=row["claim_expires_at"],
+        last_generation_id=None if row["last_generation_id"] is None else int(row["last_generation_id"]),
+        last_outcome=row["last_outcome"],
+        last_error_code=row["last_error_code"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -3333,6 +3504,53 @@ def _require_public_userrecs_generation_status(row: sqlite3.Row, allowed: frozen
             f"cannot {action} public userrecs generation {row['generation_id']} "
             f"while status is {status!r}"
         )
+
+
+def _require_public_userrecs_claim(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    claim_token: str | None,
+    expected_revision: int | None,
+    action: str,
+) -> None:
+    """Fence orchestrated mutations to one live source claim and revision.
+
+    Legacy/direct DB callers may omit a token only while neither the source
+    queue nor generation is claimed. Once claimed, omission is fail-closed.
+    """
+    source_id = int(row["source_mal_anime_id"])
+    queue = conn.execute(
+        "SELECT claim_token, claim_expires_at, last_generation_id FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = ?",
+        (source_id,),
+    ).fetchone()
+    row_token = row["claim_token"] if "claim_token" in row.keys() else None
+    supplied = None if claim_token is None else str(claim_token).strip() or None
+    if supplied is None:
+        if row_token is not None or (queue is not None and queue["claim_token"] is not None):
+            raise RuntimeError(f"public userrecs claim fence rejected {action}: claim token required")
+        return
+    if row_token != supplied or queue is None or queue["claim_token"] != supplied:
+        raise RuntimeError(f"public userrecs claim fence rejected {action}: stale claim token")
+    if queue["last_generation_id"] is not None and int(queue["last_generation_id"]) != int(row["generation_id"]):
+        raise RuntimeError(f"public userrecs claim fence rejected {action}: generation identity changed")
+    expires = row["claim_expires_at"]
+    queue_expires = queue["claim_expires_at"]
+    live = conn.execute(
+        "SELECT datetime(?) > datetime('now') AND datetime(?) > datetime('now') AS live",
+        (expires, queue_expires),
+    ).fetchone()
+    if live is None or not bool(live["live"]):
+        raise RuntimeError(f"public userrecs claim fence rejected {action}: claim expired")
+    if expected_revision is not None and int(row["generation_revision"] or 0) != int(expected_revision):
+        raise RuntimeError(f"public userrecs claim fence rejected {action}: generation revision changed")
+
+
+def _bump_public_userrecs_generation_revision(conn: sqlite3.Connection, generation_id: int) -> None:
+    conn.execute(
+        "UPDATE mal_public_userrecs_crawl_generations SET generation_revision = generation_revision + 1 WHERE generation_id = ?",
+        (int(generation_id),),
+    )
 
 
 def get_mal_public_userrecs_generation(
@@ -3421,6 +3639,251 @@ def list_mal_public_userrecs_staged_pages(
     return [_public_userrecs_staged_page_from_row(row) for row in rows]
 
 
+def sync_mal_public_userrecs_source_queue(
+    db_path: Path,
+    *,
+    source_mal_anime_ids: Iterable[int],
+    due_classes: dict[int, str] | None = None,
+) -> list[MalPublicUserRecsSourceQueueRow]:
+    """Add positive seeds to the durable queue without resetting traversal age.
+
+    Ranking churn can update membership but cannot rewrite ``enqueued_at``,
+    ``class_entered_at``, or ``last_selected_at`` for an existing source.
+    """
+    source_ids = sorted({value for item in source_mal_anime_ids if (value := _coerce_mal_anime_id(item)) is not None})
+    if not source_ids:
+        return []
+    classes = due_classes or {}
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for source_id in source_ids:
+            requested = str(classes.get(source_id) or "never_started")
+            if requested not in _PUBLIC_USERRECS_QUEUE_CLASS_PRIORITY:
+                requested = "never_started"
+            existing = conn.execute(
+                "SELECT queue_class FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = ?",
+                (source_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO mal_public_userrecs_source_queue (source_mal_anime_id, queue_class)
+                    VALUES (?, ?)
+                    """,
+                    (source_id, requested),
+                )
+            else:
+                old_class = str(existing["queue_class"])
+                # Never demote a never-started source merely because current
+                # ranking/status reconstruction is incomplete. Other classes
+                # move only when their semantic state changes.
+                effective = old_class if old_class == "never_started" and requested != "quarantined" else requested
+                conn.execute(
+                    """
+                    UPDATE mal_public_userrecs_source_queue
+                    SET eligible = 1,
+                        queue_class = ?,
+                        class_entered_at = CASE WHEN queue_class <> ? THEN CURRENT_TIMESTAMP ELSE class_entered_at END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE source_mal_anime_id = ?
+                    """,
+                    (effective, effective, source_id),
+                )
+        placeholders = ", ".join("?" for _ in source_ids)
+        conn.execute(
+            f"UPDATE mal_public_userrecs_source_queue SET eligible = 0, updated_at = CURRENT_TIMESTAMP WHERE source_mal_anime_id NOT IN ({placeholders})",
+            source_ids,
+        )
+        rows = conn.execute(
+            f"SELECT * FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id IN ({placeholders})",
+            source_ids,
+        ).fetchall()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return [_public_userrecs_queue_from_row(row) for row in rows]
+
+
+def claim_mal_public_userrecs_sources(
+    db_path: Path,
+    *,
+    limit: int,
+    claim_token: str,
+    claim_seconds: int = PUBLIC_USERRECS_CLAIM_SECONDS,
+) -> list[MalPublicUserRecsSourceQueueRow]:
+    """CAS-claim sources in strict class order with durable oldest-first fairness.
+
+    If never-started work exists it consumes the full source capacity. Open
+    generations therefore cannot monopolize slots. Inside a class, never
+    selected rows precede least-recently selected rows, then oldest class age.
+    """
+    capacity = max(0, int(limit))
+    if capacity == 0:
+        return []
+    token = str(claim_token).strip()
+    if not token:
+        raise ValueError("claim_token is required")
+    seconds = max(1, int(claim_seconds))
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM mal_public_userrecs_source_queue
+            WHERE eligible = 1
+              AND queue_class <> 'fresh'
+              AND queue_class <> 'quarantined'
+              AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now'))
+              AND (claim_token IS NULL OR claim_expires_at IS NULL OR datetime(claim_expires_at) <= datetime('now'))
+            ORDER BY
+                CASE queue_class
+                    WHEN 'never_started' THEN 0
+                    WHEN 'resumable' THEN 1
+                    WHEN 'retry_due' THEN 2
+                    WHEN 'refresh_due' THEN 3
+                    ELSE 9
+                END,
+                selection_sequence ASC,
+                datetime(class_entered_at) ASC,
+                source_mal_anime_id ASC
+            LIMIT ?
+            """,
+            (capacity,),
+        ).fetchall()
+        selected_ids = [int(row["source_mal_anime_id"]) for row in rows]
+        if selected_ids:
+            max_sequence_row = conn.execute(
+                "SELECT COALESCE(MAX(selection_sequence), 0) AS value FROM mal_public_userrecs_source_queue"
+            ).fetchone()
+            next_sequence = int(max_sequence_row["value"] or 0)
+            placeholders = ", ".join("?" for _ in selected_ids)
+            for source_id in selected_ids:
+                next_sequence += 1
+                conn.execute(
+                    """
+                    UPDATE mal_public_userrecs_source_queue
+                    SET claim_token = ?, claim_expires_at = datetime('now', ?),
+                        last_selected_at = CURRENT_TIMESTAMP, selection_count = selection_count + 1,
+                        selection_sequence = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE source_mal_anime_id = ?
+                      AND (claim_token IS NULL OR claim_expires_at IS NULL OR datetime(claim_expires_at) <= datetime('now'))
+                    """,
+                    (token, f"+{seconds} seconds", next_sequence, source_id),
+                )
+            claimed = conn.execute(
+                f"SELECT * FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id IN ({placeholders}) AND claim_token = ?",
+                (*selected_ids, token),
+            ).fetchall()
+        else:
+            claimed = []
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    by_id = {int(row["source_mal_anime_id"]): row for row in claimed}
+    return [_public_userrecs_queue_from_row(by_id[source_id]) for source_id in selected_ids if source_id in by_id]
+
+
+def renew_mal_public_userrecs_source_claim(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    generation_id: int,
+    claim_token: str,
+    expected_revision: int,
+    claim_seconds: int = PUBLIC_USERRECS_CLAIM_SECONDS,
+) -> MalPublicUserRecsCrawlGeneration:
+    """Atomically renew a still-live claim at a crawl boundary."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        if int(row["source_mal_anime_id"]) != int(source_mal_anime_id):
+            raise RuntimeError("public userrecs claim fence rejected renewal: source identity changed")
+        _require_public_userrecs_claim(
+            conn, row, claim_token=claim_token, expected_revision=expected_revision, action="renewal"
+        )
+        modifier = f"+{max(1, int(claim_seconds))} seconds"
+        conn.execute(
+            "UPDATE mal_public_userrecs_source_queue SET claim_expires_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP WHERE source_mal_anime_id = ? AND claim_token = ?",
+            (modifier, int(source_mal_anime_id), str(claim_token)),
+        )
+        conn.execute(
+            "UPDATE mal_public_userrecs_crawl_generations SET claim_expires_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP WHERE generation_id = ? AND claim_token = ?",
+            (modifier, int(generation_id), str(claim_token)),
+        )
+        result = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(result)
+
+
+def release_mal_public_userrecs_source_claim(
+    db_path: Path,
+    *,
+    source_mal_anime_id: int,
+    claim_token: str,
+    queue_class: str,
+    outcome: str,
+    generation_id: int | None = None,
+    next_retry_at: str | None = None,
+    error_code: str | None = None,
+) -> bool:
+    if queue_class not in _PUBLIC_USERRECS_QUEUE_CLASS_PRIORITY:
+        raise ValueError("invalid public userrecs queue_class")
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if generation_id is not None:
+            generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+            _require_public_userrecs_claim(
+                conn, generation, claim_token=claim_token, expected_revision=None, action="claim release"
+            )
+        cursor = conn.execute(
+            """
+            UPDATE mal_public_userrecs_source_queue
+            SET queue_class = ?,
+                class_entered_at = CASE WHEN queue_class <> ? THEN CURRENT_TIMESTAMP ELSE class_entered_at END,
+                claim_token = NULL,
+                claim_expires_at = NULL,
+                next_retry_at = ?,
+                last_generation_id = COALESCE(?, last_generation_id),
+                last_outcome = ?,
+                last_error_code = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE source_mal_anime_id = ? AND claim_token = ?
+              AND datetime(claim_expires_at) > datetime('now')
+            """,
+            (
+                queue_class,
+                queue_class,
+                next_retry_at,
+                generation_id,
+                str(outcome)[:100],
+                None if error_code is None else str(error_code)[:80],
+                int(source_mal_anime_id),
+                str(claim_token),
+            ),
+        )
+        if cursor.rowcount == 1 and generation_id is not None:
+            conn.execute(
+                "UPDATE mal_public_userrecs_crawl_generations SET claim_token = NULL, claim_expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE generation_id = ? AND claim_token = ?",
+                (int(generation_id), str(claim_token)),
+            )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
 def create_or_get_active_mal_public_userrecs_generation(
     db_path: Path,
     *,
@@ -3428,6 +3891,7 @@ def create_or_get_active_mal_public_userrecs_generation(
     source_title: str | None = None,
     source_url: str | None = None,
     cursor_url: str | None = None,
+    claim_token: str | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
     """Return the one open public-userrecs crawl generation for a source, creating it if absent."""
     source_id = _coerce_mal_anime_id(source_mal_anime_id)
@@ -3452,10 +3916,10 @@ def create_or_get_active_mal_public_userrecs_generation(
             cursor = conn.execute(
                 """
                 INSERT INTO mal_public_userrecs_crawl_generations (
-                    source_mal_anime_id, source_title, source_url, cursor_url
-                ) VALUES (?, ?, ?, ?)
+                    source_mal_anime_id, source_title, source_url, cursor_url, generation_key, logic_version, attempt_count
+                ) VALUES (?, ?, ?, ?, lower(hex(randomblob(16))), ?, 1)
                 """,
-                (source_id, source_title, source_url, initial_cursor_url),
+                (source_id, source_title, source_url, initial_cursor_url, PUBLIC_USERRECS_LOGIC_VERSION),
             )
             generation_id = int(cursor.lastrowid)
             _record_public_userrecs_event(
@@ -3464,6 +3928,70 @@ def create_or_get_active_mal_public_userrecs_generation(
                 source_mal_anime_id=source_id,
                 event_type="begin",
                 page_url=initial_cursor_url,
+            )
+            row = _get_public_userrecs_generation_row(conn, generation_id)
+        if claim_token is not None:
+            normalized_claim_token = str(claim_token).strip()
+            if not normalized_claim_token:
+                raise ValueError("claim_token is required when binding a public userrecs generation")
+            queue = conn.execute(
+                "SELECT claim_token, claim_expires_at, last_generation_id FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = ?",
+                (source_id,),
+            ).fetchone()
+            live = None if queue is None else conn.execute(
+                "SELECT datetime(?) > datetime('now') AS live", (queue["claim_expires_at"],)
+            ).fetchone()
+            if queue is None or queue["claim_token"] != normalized_claim_token or live is None or not bool(live["live"]):
+                raise RuntimeError("public userrecs claim fence rejected generation bind")
+            generation_id = int(row["generation_id"])
+            previous_token = row["claim_token"]
+            if previous_token not in (None, normalized_claim_token):
+                generation_expired = conn.execute(
+                    "SELECT ? IS NOT NULL AND datetime(?) <= datetime('now') AS expired",
+                    (row["claim_expires_at"], row["claim_expires_at"]),
+                ).fetchone()
+                if generation_expired is None or not bool(generation_expired["expired"]):
+                    raise RuntimeError("public userrecs claim fence rejected generation bind: prior generation lease is still live")
+            expected_revision = int(row["generation_revision"] or 0)
+            rebound = conn.execute(
+                """
+                UPDATE mal_public_userrecs_crawl_generations
+                SET claim_token = ?, claim_expires_at = ?, generation_revision = generation_revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE generation_id = ? AND source_mal_anime_id = ?
+                  AND status IN ('active', 'paused', 'ready') AND generation_revision = ?
+                """,
+                (normalized_claim_token, queue["claim_expires_at"], generation_id, source_id, expected_revision),
+            )
+            if rebound.rowcount != 1:
+                raise RuntimeError("public userrecs claim fence rejected generation bind: generation revision changed")
+            queue_bound = conn.execute(
+                """
+                UPDATE mal_public_userrecs_source_queue
+                SET last_generation_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE source_mal_anime_id = ? AND claim_token = ?
+                  AND datetime(claim_expires_at) > datetime('now')
+                  AND (last_generation_id IS NULL OR last_generation_id = ?)
+                """,
+                (generation_id, source_id, normalized_claim_token, generation_id),
+            )
+            if queue_bound.rowcount != 1:
+                raise RuntimeError("public userrecs claim fence rejected generation bind: queue generation identity changed")
+            conn.execute(
+                """
+                INSERT INTO mal_public_userrecs_claim_events (
+                    generation_id, source_mal_anime_id, event_type, previous_claim_token,
+                    claim_token, generation_revision
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    generation_id,
+                    source_id,
+                    "rebind" if previous_token not in (None, normalized_claim_token) else "bind",
+                    previous_token,
+                    normalized_claim_token,
+                    expected_revision + 1,
+                ),
             )
             row = _get_public_userrecs_generation_row(conn, generation_id)
         conn.commit()
@@ -3547,6 +4075,9 @@ def replace_mal_public_userrecs_staged_page(
     next_url: str | None = None,
     edges: Iterable[dict[str, Any]] = (),
     fetched_at: str | None = None,
+    terminal_evidence: dict[str, Any] | None = None,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsStagedPage:
     """Replace one staged page and its edges without touching published recommendations."""
     if int(page_number) < 1:
@@ -3566,6 +4097,9 @@ def replace_mal_public_userrecs_staged_page(
             _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
             action="stage page for",
         )
+        _require_public_userrecs_claim(
+            conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="stage page"
+        )
         source_id = int(generation["source_mal_anime_id"])
         timestamp = fetched_at or str(conn.execute("SELECT CURRENT_TIMESTAMP AS now").fetchone()["now"])
         prepared_edges = _prepared_public_userrecs_staged_edges(
@@ -3576,6 +4110,22 @@ def replace_mal_public_userrecs_staged_page(
             page_url=normalized_page_url,
             fetched_at=timestamp,
         )
+        prepared_target_ids = {int(edge[3]) for edge in prepared_edges}
+        if prepared_target_ids:
+            placeholders = ", ".join("?" for _ in prepared_target_ids)
+            overlap = conn.execute(
+                f"""
+                SELECT target_mal_anime_id
+                FROM mal_public_userrecs_staged_edges
+                WHERE generation_id = ? AND page_number <> ?
+                  AND target_mal_anime_id IN ({placeholders})
+                ORDER BY target_mal_anime_id
+                """,
+                (int(generation_id), int(page_number), *sorted(prepared_target_ids)),
+            ).fetchall()
+            if overlap:
+                ids = [int(row["target_mal_anime_id"]) for row in overlap]
+                raise ValueError(f"staged public userrecs page overlaps prior generation pages: {ids[:10]!r}")
         conn.execute(
             """
             INSERT INTO mal_public_userrecs_staged_pages (
@@ -3659,7 +4209,14 @@ def replace_mal_public_userrecs_staged_page(
                 staged_edge_count = ?,
                 last_page_url = ?,
                 last_page_fingerprint = ?,
+                terminal_evidence_json = ?,
                 last_error = NULL,
+                staged_revision = staged_revision + 1,
+                validated_staged_revision = NULL,
+                validation_fingerprint = NULL,
+                first_page_revalidated_at = NULL,
+                boundary_revalidated_at = NULL,
+                generation_revision = generation_revision + 1,
                 updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ?
             """,
@@ -3669,6 +4226,7 @@ def replace_mal_public_userrecs_staged_page(
                 int(counts["edges"] or 0),
                 final_page["page_url"],
                 final_page["page_fingerprint"],
+                json.dumps(terminal_evidence if isinstance(terminal_evidence, dict) else {}, sort_keys=True),
                 int(generation_id),
             ),
         )
@@ -3703,6 +4261,8 @@ def pause_mal_public_userrecs_generation(
     generation_id: int,
     cursor_url: str | None,
     error: str | None = None,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
     conn = connect(db_path)
     try:
@@ -3713,10 +4273,11 @@ def pause_mal_public_userrecs_generation(
             _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
             action="pause",
         )
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="pause")
         conn.execute(
             """
             UPDATE mal_public_userrecs_crawl_generations
-            SET status = 'paused', cursor_url = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = 'paused', cursor_url = ?, last_error = ?, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ?
             """,
             (cursor_url, None if error is None else str(error).strip()[:1000] or None, int(generation_id)),
@@ -3744,6 +4305,8 @@ def resume_mal_public_userrecs_generation(
     *,
     generation_id: int,
     cursor_url: str | None | object = _UNSET,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
     conn = connect(db_path)
     try:
@@ -3754,11 +4317,13 @@ def resume_mal_public_userrecs_generation(
             _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
             action="resume",
         )
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="resume")
         if cursor_url is _UNSET:
             conn.execute(
                 """
                 UPDATE mal_public_userrecs_crawl_generations
-                SET status = 'active', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                SET status = 'active', last_error = NULL, attempt_count = attempt_count + 1,
+                    next_retry_at = NULL, retry_class = NULL, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
                 WHERE generation_id = ?
                 """,
                 (int(generation_id),),
@@ -3768,7 +4333,9 @@ def resume_mal_public_userrecs_generation(
             conn.execute(
                 """
                 UPDATE mal_public_userrecs_crawl_generations
-                SET status = 'active', cursor_url = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                SET status = 'active', cursor_url = ?, last_error = NULL,
+                    attempt_count = attempt_count + 1, next_retry_at = NULL, retry_class = NULL,
+                    generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
                 WHERE generation_id = ?
                 """,
                 (cursor_url, int(generation_id)),
@@ -3788,6 +4355,78 @@ def resume_mal_public_userrecs_generation(
         raise
     finally:
         conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def record_mal_public_userrecs_revalidation(
+    db_path: Path,
+    *,
+    generation_id: int,
+    checked_boundary: bool,
+    validation_fingerprint: str | None = None,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
+) -> MalPublicUserRecsCrawlGeneration:
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="record revalidation")
+        pages, edges = _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=False)
+        bound_fingerprint = _public_userrecs_staged_validation_fingerprint(pages, edges)
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET first_page_revalidated_at = CURRENT_TIMESTAMP,
+                boundary_revalidated_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE boundary_revalidated_at END,
+                validated_staged_revision = staged_revision,
+                validation_fingerprint = ?,
+                generation_revision = generation_revision + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ? AND status IN ('active', 'paused', 'ready')
+            """,
+            (1 if checked_boundary else 0, bound_fingerprint, int(generation_id)),
+        )
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    return _public_userrecs_generation_from_row(row)
+
+
+def schedule_mal_public_userrecs_generation_retry(
+    db_path: Path,
+    *,
+    generation_id: int,
+    retry_class: str,
+    next_retry_at: str,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
+) -> MalPublicUserRecsCrawlGeneration:
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="schedule retry")
+        source_id = int(generation["source_mal_anime_id"])
+        conn.execute(
+            """
+            UPDATE mal_public_userrecs_crawl_generations
+            SET retry_class = ?, next_retry_at = ?, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE generation_id = ? AND status IN ('active', 'paused')
+            """,
+            (str(retry_class)[:80], str(next_retry_at), int(generation_id)),
+        )
+        queue_cursor = conn.execute(
+            """
+            UPDATE mal_public_userrecs_source_queue
+            SET queue_class = 'retry_due', class_entered_at = CASE WHEN queue_class <> 'retry_due' THEN CURRENT_TIMESTAMP ELSE class_entered_at END,
+                next_retry_at = ?, last_generation_id = ?, last_outcome = 'retryable_failure',
+                last_error_code = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE source_mal_anime_id = ? AND (? IS NULL OR claim_token = ?)
+            """,
+            (str(next_retry_at), int(generation_id), str(retry_class)[:80], source_id, claim_token, claim_token),
+        )
+        if claim_token is not None and queue_cursor.rowcount != 1:
+            raise RuntimeError("public userrecs claim fence rejected retry queue transition")
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
     return _public_userrecs_generation_from_row(row)
 
 
@@ -3813,6 +4452,21 @@ def _public_userrecs_staged_edges(conn: sqlite3.Connection, generation_id: int) 
         """,
         (int(generation_id),),
     ).fetchall()
+
+
+def _public_userrecs_staged_validation_fingerprint(
+    pages: list[sqlite3.Row], edges: list[sqlite3.Row]
+) -> str:
+    digest = __import__("hashlib").sha256()
+    for page in pages:
+        digest.update(
+            f"{int(page['page_number'])}:{page['page_url']}:{page['page_fingerprint']}:{page['next_url'] or ''}\n".encode()
+        )
+    for edge in edges:
+        digest.update(
+            f"{int(edge['page_number'])}:{int(edge['target_mal_anime_id'])}:{edge['num_recommendations']}:{edge['raw_json']}:{edge['provenance_json']}\n".encode()
+        )
+    return digest.hexdigest()
 
 
 def _assert_public_userrecs_generation_coherent(
@@ -3866,6 +4520,17 @@ def _assert_public_userrecs_generation_coherent(
             raise ValueError("public userrecs generation still has a persisted next-page cursor")
         if last_page["next_url"] is not None:
             raise ValueError("public userrecs final staged page still has a next_url")
+        terminal_evidence = _load_json_value(generation["terminal_evidence_json"], {})
+        terminal_evidence = terminal_evidence if isinstance(terminal_evidence, dict) else {}
+        if not edges and not (
+            bool(terminal_evidence.get("document_complete"))
+            and bool(terminal_evidence.get("recommendation_surface"))
+            and bool(terminal_evidence.get("next_links_consistent"))
+            and bool(terminal_evidence.get("explicit_empty"))
+            and int(terminal_evidence.get("recommendation_row_count") or 0) == 0
+            and int(terminal_evidence.get("next_candidate_count") or 0) == 0
+        ):
+            raise ValueError("empty public userrecs replacement lacks strong terminal-empty proof")
     return pages, edges
 
 
@@ -3873,6 +4538,8 @@ def mark_mal_public_userrecs_generation_ready(
     db_path: Path,
     *,
     generation_id: int,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
     """Mark a terminal coherent staged crawl ready for guarded publication."""
     conn = connect(db_path)
@@ -3884,11 +4551,12 @@ def mark_mal_public_userrecs_generation_ready(
             _PUBLIC_USERRECS_MUTABLE_GENERATION_STATUSES,
             action="mark ready",
         )
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="mark ready")
         _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
         conn.execute(
             """
             UPDATE mal_public_userrecs_crawl_generations
-            SET status = 'ready', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            SET status = 'ready', completed_at = CURRENT_TIMESTAMP, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ?
             """,
             (int(generation_id),),
@@ -3914,6 +4582,8 @@ def discard_mal_public_userrecs_generation(
     *,
     generation_id: int,
     reason: str | None = None,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
     conn = connect(db_path)
     try:
@@ -3924,11 +4594,12 @@ def discard_mal_public_userrecs_generation(
             _PUBLIC_USERRECS_OPEN_GENERATION_STATUSES,
             action="discard",
         )
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="discard")
         normalized_reason = None if reason is None else str(reason).strip()[:1000] or None
         conn.execute(
             """
             UPDATE mal_public_userrecs_crawl_generations
-            SET status = 'discarded', discarded_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = 'discarded', discarded_at = CURRENT_TIMESTAMP, last_error = ?, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ?
             """,
             (normalized_reason, int(generation_id)),
@@ -3956,6 +4627,8 @@ def restart_mal_public_userrecs_generation_after_drift(
     generation_id: int,
     reason: str | None = "public userrecs pagination drift detected",
     cursor_url: str | None | object = _UNSET,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
     """Discard an open generation after drift and start a fresh one for the same source."""
     conn = connect(db_path)
@@ -3967,12 +4640,51 @@ def restart_mal_public_userrecs_generation_after_drift(
             _PUBLIC_USERRECS_OPEN_GENERATION_STATUSES,
             action="restart after drift",
         )
+        _require_public_userrecs_claim(conn, old, claim_token=claim_token, expected_revision=expected_revision, action="restart")
         source_id = int(old["source_mal_anime_id"])
+        restart_count = int(old["restart_count"] or 0) + 1
         normalized_reason = None if reason is None else str(reason).strip()[:1000] or None
+        if restart_count > PUBLIC_USERRECS_MAX_DRIFT_RESTARTS:
+            conn.execute(
+                """
+                UPDATE mal_public_userrecs_crawl_generations
+                SET status = 'failed',
+                    quarantined_at = CURRENT_TIMESTAMP,
+                    quarantine_reason = ?,
+                    restart_count = ?,
+                    drift_count = drift_count + 1,
+                    last_error = ?,
+                    generation_revision = generation_revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE generation_id = ?
+                """,
+                (normalized_reason, restart_count, normalized_reason, int(generation_id)),
+            )
+            conn.execute(
+                """
+                UPDATE mal_public_userrecs_source_queue
+                SET queue_class = 'quarantined', class_entered_at = CURRENT_TIMESTAMP,
+                    claim_token = NULL, claim_expires_at = NULL,
+                    last_outcome = 'quarantined_drift_livelock', last_error_code = 'pagination_drift',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE source_mal_anime_id = ?
+                """,
+                (source_id,),
+            )
+            _record_public_userrecs_event(
+                conn,
+                generation_id=int(generation_id),
+                source_mal_anime_id=source_id,
+                event_type="fail",
+                error=normalized_reason,
+            )
+            row = _get_public_userrecs_generation_row(conn, int(generation_id))
+            conn.commit()
+            return _public_userrecs_generation_from_row(row)
         conn.execute(
             """
             UPDATE mal_public_userrecs_crawl_generations
-            SET status = 'discarded', discarded_at = CURRENT_TIMESTAMP, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = 'discarded', discarded_at = CURRENT_TIMESTAMP, last_error = ?, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ?
             """,
             (normalized_reason, int(generation_id)),
@@ -3988,12 +4700,30 @@ def restart_mal_public_userrecs_generation_after_drift(
         cursor = conn.execute(
             """
             INSERT INTO mal_public_userrecs_crawl_generations (
-                source_mal_anime_id, source_title, source_url, cursor_url
-            ) VALUES (?, ?, ?, ?)
+                source_mal_anime_id, source_title, source_url, cursor_url,
+                generation_key, logic_version, restart_count, drift_count, claim_token, claim_expires_at
+            ) VALUES (?, ?, ?, ?, lower(hex(randomblob(16))), ?, ?, ?, ?, ?)
             """,
-            (source_id, old["source_title"], old["source_url"], new_cursor_url),
+            (
+                source_id,
+                old["source_title"],
+                old["source_url"],
+                new_cursor_url,
+                PUBLIC_USERRECS_LOGIC_VERSION,
+                restart_count,
+                int(old["drift_count"] or 0) + 1,
+                claim_token,
+                old["claim_expires_at"] if claim_token is not None else None,
+            ),
         )
         new_generation_id = int(cursor.lastrowid)
+        if claim_token is not None:
+            changed = conn.execute(
+                "UPDATE mal_public_userrecs_source_queue SET last_generation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE source_mal_anime_id = ? AND claim_token = ?",
+                (new_generation_id, source_id, str(claim_token)),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("public userrecs claim fence rejected restart queue transition")
         _record_public_userrecs_event(
             conn,
             generation_id=new_generation_id,
@@ -4082,6 +4812,8 @@ def publish_mal_public_userrecs_generation(
     db_path: Path,
     *,
     generation_id: int,
+    claim_token: str | None = None,
+    expected_revision: int | None = None,
 ) -> MalPublicUserRecsPublicationResult:
     """Atomically publish one terminal coherent staged public-userrecs generation."""
     conn = connect(db_path)
@@ -4093,9 +4825,27 @@ def publish_mal_public_userrecs_generation(
             frozenset({"ready"}),
             action="publish",
         )
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="publish")
         if generation["completed_at"] is None:
             raise ValueError("public userrecs generation is ready but lacks completed_at")
         pages, staged_edges = _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
+        duplicate = conn.execute(
+            """
+            SELECT target_mal_anime_id, COUNT(DISTINCT page_number) AS page_count
+            FROM mal_public_userrecs_staged_edges WHERE generation_id = ?
+            GROUP BY target_mal_anime_id HAVING COUNT(DISTINCT page_number) > 1 LIMIT 1
+            """,
+            (int(generation_id),),
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError("public userrecs publication rejected duplicate target across staged pages")
+        if claim_token is not None and (
+            generation["validated_staged_revision"] is None
+            or int(generation["validated_staged_revision"]) != int(generation["staged_revision"])
+        ):
+            raise ValueError("public userrecs publication requires final validation for exact staged revision")
+        if claim_token is not None and _public_userrecs_staged_validation_fingerprint(pages, staged_edges) != str(generation["validation_fingerprint"]):
+            raise ValueError("public userrecs staged snapshot changed after final validation")
         source_id = int(generation["source_mal_anime_id"])
         source_url = generation["source_url"] or pages[0]["page_url"]
         edges = _aggregate_public_userrecs_publication_edges(
@@ -4179,7 +4929,7 @@ def publish_mal_public_userrecs_generation(
             conn,
             """
             UPDATE mal_public_userrecs_crawl_generations
-            SET status = 'published', published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            SET status = 'published', published_at = CURRENT_TIMESTAMP, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ? AND status = 'ready'
             """,
             (int(generation_id),),
@@ -4213,6 +4963,7 @@ _PUBLIC_USERRECS_DIAGNOSTIC_TABLES: frozenset[str] = frozenset(
         "mal_public_userrecs_staged_pages",
         "mal_public_userrecs_staged_edges",
         "mal_public_userrecs_crawl_events",
+        "mal_public_userrecs_source_queue",
     }
 )
 _PUBLIC_USERRECS_DIAGNOSTIC_STATUSES: frozenset[str] = frozenset({"ok", "degraded", "unknown"})
@@ -4299,6 +5050,17 @@ def unknown_public_userrecs_diagnostics(*, reason: str, status: str = "unknown")
             "fresh_ratio": None,
             "total": 0,
             "semantics": "complete public-userrecs harvest sources only",
+        },
+        "queue": {
+            "counts_by_class": {},
+            "oldest_never_started_at": None,
+            "oldest_open_at": None,
+            "last_selected_at": None,
+            "max_selection_sequence": 0,
+            "fairness_lag_seconds": None,
+            "claimed": 0,
+            "retry_scheduled": 0,
+            "quarantined": 0,
         },
         "open_generations": {
             "active": 0,
@@ -4588,6 +5350,21 @@ def get_public_userrecs_diagnostics(
                 LIMIT 1
                 """
             ).fetchone()
+            queue_rows = conn.execute(
+                """
+                SELECT queue_class, COUNT(*) AS count,
+                       MIN(CASE WHEN queue_class = 'never_started' THEN class_entered_at END) AS oldest_never_started_at,
+                       MIN(CASE WHEN queue_class = 'resumable' THEN class_entered_at END) AS oldest_open_at,
+                       MAX(last_selected_at) AS last_selected_at,
+                       MAX(selection_sequence) AS max_selection_sequence,
+                       SUM(CASE WHEN claim_token IS NOT NULL AND datetime(claim_expires_at) > datetime('now') THEN 1 ELSE 0 END) AS claimed,
+                       SUM(CASE WHEN next_retry_at IS NOT NULL THEN 1 ELSE 0 END) AS retry_scheduled,
+                       SUM(CASE WHEN queue_class = 'quarantined' THEN 1 ELSE 0 END) AS quarantined
+                FROM mal_public_userrecs_source_queue
+                WHERE eligible = 1
+                GROUP BY queue_class
+                """
+            ).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
             return unknown_public_userrecs_diagnostics(reason="public_userrecs_diagnostic_schema_absent", status="unknown")
@@ -4650,6 +5427,21 @@ def get_public_userrecs_diagnostics(
         status = "ok" if not reason_codes else "degraded"
     if not reason_codes:
         reason_codes = ["ok"]
+    queue_counts = {str(row["queue_class"]): _safe_nonnegative_int(row["count"]) for row in queue_rows}
+    queue_oldest_never = next((row["oldest_never_started_at"] for row in queue_rows if row["oldest_never_started_at"]), None)
+    queue_oldest_open = next((row["oldest_open_at"] for row in queue_rows if row["oldest_open_at"]), None)
+    queue_last_selected = max((str(row["last_selected_at"]) for row in queue_rows if row["last_selected_at"]), default=None)
+    queue_max_selection_sequence = max(
+        (_safe_nonnegative_int(row["max_selection_sequence"]) for row in queue_rows), default=0
+    )
+    fairness_lag_seconds = None
+    if queue_oldest_never:
+        parsed_oldest = _utc_iso_from_db_timestamp(queue_oldest_never)
+        if parsed_oldest:
+            try:
+                fairness_lag_seconds = max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(parsed_oldest.replace("Z", "+00:00"))).total_seconds()))
+            except ValueError:
+                fairness_lag_seconds = None
     return {
         "status": status,
         "reason_codes": reason_codes,
@@ -4667,6 +5459,19 @@ def get_public_userrecs_diagnostics(
             "fresh_ratio": _safe_ratio(coverage_counts["fresh"], positive_seed_count),
             "total": positive_seed_count,
             "semantics": "complete public-userrecs harvest sources only",
+        },
+        "queue": {
+            "counts_by_class": queue_counts,
+            "oldest_never_started_at": _utc_iso_from_db_timestamp(queue_oldest_never),
+            "oldest_open_at": _utc_iso_from_db_timestamp(queue_oldest_open),
+            "last_selected_at": _utc_iso_from_db_timestamp(queue_last_selected),
+            "max_selection_sequence": queue_max_selection_sequence,
+            "fairness_lag_seconds": fairness_lag_seconds,
+            "claimed": sum(_safe_nonnegative_int(row["claimed"]) for row in queue_rows),
+            "retry_scheduled": sum(_safe_nonnegative_int(row["retry_scheduled"]) for row in queue_rows),
+            "quarantined": sum(_safe_nonnegative_int(row["quarantined"]) for row in queue_rows),
+            "priority": ["never_started", "resumable", "retry_due", "refresh_due"],
+            "fairness": "monotonic selection sequence then oldest class entry within strict class priority",
         },
         "open_generations": open_counts,
         "hourly_throughput": {
@@ -6978,3 +7783,921 @@ def record_provider_enriched_detail_failure(db_path: Path, *, provider: str, pro
                 next_retry_at=excluded.next_retry_at
         """, (provider, provider_series_id, logic_version, json.dumps({"error": error}), fetched_at, expires_at, next_retry_at))
         conn.commit()
+
+
+def _mal_user_traversal_generation_from_row(row: sqlite3.Row) -> MalUserAnimeListTraversalGeneration:
+    return MalUserAnimeListTraversalGeneration(
+        refresh_run_id=str(row["refresh_run_id"]), generation=int(row["generation"]), fetched_at=str(row["fetched_at"]),
+        account_key=str(row["account_key"]), account_id=int(row["account_id"]), account_name=str(row["account_name"]),
+        query_identity=str(row["query_identity"]), query=json.loads(row["query_json"] or "{}"),
+        claim_token=row["claim_token"], claim_expires_at=row["claim_expires_at"], revision=int(row["revision"] or 0),
+        requests_attempted=int(row["requests_attempted"] or 0), requests_succeeded=int(row["requests_succeeded"] or 0),
+        requests_failed=int(row["requests_failed"] or 0), restart_count=int(row["restart_count"] or 0),
+        drift_count=int(row["drift_count"] or 0), quarantined_at=row["quarantined_at"],
+        publication_epoch=int(row["publication_epoch"] or 0), identity_assertion_nonce=row["identity_assertion_nonce"],
+    )
+
+
+def _mal_user_traversal_partition_from_row(row: sqlite3.Row) -> MalUserAnimeListTraversalPartition:
+    return MalUserAnimeListTraversalPartition(
+        generation=int(row["generation"]), partition_key=str(row["partition_key"]), requested_status=row["requested_status"],
+        ordinal=int(row["ordinal"]), initial_url=str(row["initial_url"]), next_url=row["next_url"],
+        page_sequence=int(row["page_sequence"]), item_count=int(row["item_count"]), terminal=bool(row["terminal"]),
+        terminal_explicit=bool(row["terminal_explicit"]), empty_proven=bool(row["empty_proven"]),
+        first_page_fingerprint=row["first_page_fingerprint"], final_page_url=row["final_page_url"],
+        final_page_fingerprint=row["final_page_fingerprint"], page1_validated_at=row["page1_validated_at"],
+        boundary_validated_at=row["boundary_validated_at"], attempt_count=int(row["attempt_count"]),
+        retry_count=int(row["retry_count"]), requests_succeeded=int(row["requests_succeeded"]),
+        requests_failed=int(row["requests_failed"]), next_retry_at=row["next_retry_at"], retry_class=row["retry_class"],
+        fairness_sequence=int(row["fairness_sequence"]), first_started_at=row["first_started_at"], terminal_at=row["terminal_at"],
+    )
+
+
+def _mal_user_list_partition_class(row: sqlite3.Row) -> str:
+    if bool(row["terminal"]):
+        return "terminal"
+    if row["retry_class"] is not None:
+        return "retry_due"
+    if int(row["page_sequence"] or 0) > 0:
+        return "resumable"
+    return "never_started"
+
+
+def claim_or_create_mal_user_anime_list_traversal(
+    db_path: Path, *, account_id: int, account_name: str, query_identity: str, query: dict[str, Any],
+    partitions: Iterable[dict[str, Any]], claim_token: str, fetched_at: str,
+    claim_seconds: int = MAL_USER_LIST_CLAIM_SECONDS, explicit_reinitialize_quarantined: bool = False,
+) -> tuple[MalUserAnimeListTraversalGeneration, list[MalUserAnimeListTraversalPartition]]:
+    """Resume the exact account/query generation or create it, fencing by an expiring lease."""
+    token = str(claim_token).strip()
+    if not token:
+        raise ValueError("claim_token is required")
+    account_id = int(account_id)
+    if account_id <= 0 or not str(account_name).strip():
+        raise ValueError("authenticated MAL account identity is incomplete")
+    account_key = f"mal:{account_id}"
+    query_text = json.dumps(query, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    requested = list(partitions)
+    if not requested:
+        raise ValueError("at least one MAL list partition is required")
+    modifier = f"+{max(1, int(claim_seconds))} seconds"
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        quarantined = conn.execute(
+            """SELECT generation FROM mal_user_anime_list_refresh_generations
+               WHERE account_key=? AND query_identity=?
+                 AND (quarantined_at IS NOT NULL OR quarantine_reason IS NOT NULL)
+               ORDER BY generation DESC LIMIT 1""",
+            (account_key, str(query_identity)),
+        ).fetchone()
+        if quarantined is not None and not explicit_reinitialize_quarantined:
+            raise MalUserAnimeListRefreshConflictError(
+                "quarantined MAL list generation is terminal; explicit safe reinitialization is required"
+            )
+        row = conn.execute(
+            """SELECT * FROM mal_user_anime_list_refresh_generations
+               WHERE account_key=? AND query_identity=? AND status='active'
+                 AND quarantined_at IS NULL AND quarantine_reason IS NULL""",
+            (account_key, str(query_identity)),
+        ).fetchone()
+        if row is None:
+            run_id = f"mal-list-{str(query_identity)[:16]}-{uuid.uuid4()}"
+            cursor = conn.execute(
+                """INSERT INTO mal_user_anime_list_refresh_generations
+                   (refresh_run_id,status,fetched_at,account_key,account_id,account_name,query_identity,query_json,logic_version,
+                    claim_token,claim_expires_at,revision)
+                   VALUES (?,'active',?,?,?,?,?,?,?, ?,datetime('now',?),1)""",
+                (run_id, str(fetched_at), account_key, account_id, str(account_name), str(query_identity), query_text,
+                 MAL_USER_LIST_PAGINATION_LOGIC_VERSION, token, modifier),
+            )
+            generation = int(cursor.lastrowid)
+            for item in requested:
+                conn.execute(
+                    """INSERT INTO mal_user_anime_list_refresh_partitions
+                       (generation,partition_key,requested_status,ordinal,initial_url,next_url)
+                       VALUES (?,?,?,?,?,?)""",
+                    (generation, str(item["partition_key"]), item.get("requested_status"), int(item["ordinal"]),
+                     str(item["initial_url"]), str(item["initial_url"])),
+                )
+            row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (generation,)).fetchone()
+        else:
+            if int(row["account_id"] or 0) != account_id or str(row["account_name"] or "") != str(account_name):
+                raise MalUserAnimeListRefreshConflictError("MAL account identity changed for active list generation")
+            if str(row["query_json"]) != query_text or str(row["logic_version"]) != MAL_USER_LIST_PAGINATION_LOGIC_VERSION:
+                raise MalUserAnimeListRefreshConflictError("MAL list query/logic identity changed for active generation")
+            if row["claim_token"] not in (None, token):
+                live = conn.execute("SELECT datetime(?) > datetime('now') AS live", (row["claim_expires_at"],)).fetchone()
+                if live is not None and bool(live["live"]):
+                    raise MalUserAnimeListRefreshConflictError("MAL list generation is claimed by another live worker")
+            changed = conn.execute(
+                """UPDATE mal_user_anime_list_refresh_generations
+                   SET claim_token=?, claim_expires_at=datetime('now',?), revision=revision+1, updated_at=CURRENT_TIMESTAMP
+                   WHERE generation=? AND revision=? AND status='active'""",
+                (token, modifier, int(row["generation"]), int(row["revision"])),
+            )
+            if changed.rowcount != 1:
+                raise MalUserAnimeListRefreshConflictError("MAL list generation revision changed during claim")
+            row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(row["generation"]),)).fetchone()
+        authority = conn.execute(
+            "SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (account_key,)
+        ).fetchone()
+        if authority is None:
+            epoch = 1
+            conn.execute(
+                """INSERT INTO mal_user_anime_list_account_authority
+                   (account_key,account_id,account_name,publication_epoch,current_generation)
+                   VALUES (?,?,?,?,?)""",
+                (account_key, account_id, str(account_name), epoch, int(row["generation"])),
+            )
+        else:
+            if int(authority["account_id"]) != account_id or str(authority["account_name"]) != str(account_name):
+                raise MalUserAnimeListRefreshConflictError("MAL account authority identity changed")
+            epoch = int(authority["publication_epoch"])
+            if int(authority["current_generation"]) > int(row["generation"]):
+                raise MalUserAnimeListRefreshConflictError(
+                    "older MAL list generation cannot retake the account current-generation fence"
+                )
+            conn.execute(
+                "UPDATE mal_user_anime_list_account_authority SET current_generation=?,updated_at=CURRENT_TIMESTAMP WHERE account_key=?",
+                (int(row["generation"]), account_key),
+            )
+        conn.execute(
+            "UPDATE mal_user_anime_list_refresh_generations SET publication_epoch=? WHERE generation=?",
+            (epoch, int(row["generation"])),
+        )
+        row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(row["generation"]),)).fetchone()
+        partition_rows = conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal",
+            (int(row["generation"]),),
+        ).fetchall()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(row), [_mal_user_traversal_partition_from_row(item) for item in partition_rows]
+
+
+def get_mal_user_anime_list_traversal(
+    db_path: Path, *, generation: int,
+) -> tuple[MalUserAnimeListTraversalGeneration, list[MalUserAnimeListTraversalPartition]]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        if row is None or row["account_id"] is None:
+            raise ValueError("unknown durable MAL list traversal generation")
+        partitions = conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal", (int(generation),)
+        ).fetchall()
+    return _mal_user_traversal_generation_from_row(row), [_mal_user_traversal_partition_from_row(item) for item in partitions]
+
+
+def select_mal_user_anime_list_partition_work(
+    db_path: Path, *, generation: int, claim_token: str,
+) -> tuple[MalUserAnimeListTraversalGeneration, MalUserAnimeListTraversalPartition, str, str] | None:
+    """Select one fair work unit: page1 validation, boundary validation, or cursor fetch."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, owner, claim_token=claim_token, expected_revision=None)
+        if owner["quarantined_at"] is not None or owner["quarantine_reason"] is not None:
+            raise MalUserAnimeListRefreshConflictError("quarantined MAL list generation has no selectable work")
+        row = conn.execute(
+            """SELECT * FROM mal_user_anime_list_refresh_partitions
+               WHERE generation=? AND (next_retry_at IS NULL OR datetime(next_retry_at)<=datetime('now'))
+                 AND (terminal=0 OR page1_validated_at IS NULL OR boundary_validated_at IS NULL OR EXISTS (
+                     SELECT 1 FROM mal_user_anime_list_staged_pages p
+                     WHERE p.generation=mal_user_anime_list_refresh_partitions.generation
+                       AND p.partition_key=mal_user_anime_list_refresh_partitions.partition_key
+                       AND p.validated_at IS NULL
+                 ))
+               ORDER BY
+                 CASE
+                   WHEN page_sequence=0 AND retry_class IS NULL THEN 0
+                   WHEN page_sequence>0 AND retry_class IS NULL THEN 1
+                   WHEN retry_class IS NOT NULL THEN 2
+                   ELSE 3
+                 END,
+                 fairness_sequence ASC, ordinal ASC
+               LIMIT 1""",
+            (int(generation),),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        if int(row["page_sequence"]) == 0:
+            work_kind, url = "page", str(row["initial_url"])
+        elif not bool(row["terminal"]) and row["next_url"]:
+            work_kind, url = "page", str(row["next_url"])
+        elif row["page1_validated_at"] is None:
+            work_kind, url = "validate_page1", str(row["initial_url"])
+        elif (interior := conn.execute(
+            """SELECT page_url FROM mal_user_anime_list_staged_pages
+               WHERE generation=? AND partition_key=? AND page_sequence>1
+                 AND page_sequence<? AND validated_at IS NULL
+               ORDER BY page_sequence LIMIT 1""",
+            (int(generation), str(row["partition_key"]), int(row["page_sequence"])),
+        ).fetchone()) is not None:
+            work_kind, url = "validate_interior", str(interior["page_url"])
+        elif row["boundary_validated_at"] is None:
+            work_kind, url = "validate_boundary", str(row["final_page_url"])
+        else:
+            raise RuntimeError("MAL list traversal partition has no coherent next work unit")
+        sequence = int(conn.execute("SELECT COALESCE(MAX(fairness_sequence),0)+1 AS n FROM mal_user_anime_list_refresh_partitions WHERE generation=?", (int(generation),)).fetchone()["n"])
+        changed = conn.execute(
+            """UPDATE mal_user_anime_list_refresh_partitions
+               SET attempt_count=attempt_count+1, fairness_sequence=?, first_started_at=COALESCE(first_started_at,CURRENT_TIMESTAMP),
+                   queue_class=CASE
+                       WHEN retry_class IS NOT NULL THEN 'retry_due'
+                       WHEN page_sequence>0 THEN 'resumable'
+                       ELSE 'never_started'
+                   END,
+                   updated_at=CURRENT_TIMESTAMP WHERE generation=? AND partition_key=?""",
+            (sequence, int(generation), str(row["partition_key"])),
+        )
+        if changed.rowcount != 1:
+            raise MalUserAnimeListRefreshConflictError("MAL list partition changed during work selection")
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations
+               SET requests_attempted=requests_attempted+1, fairness_sequence=?, revision=revision+1,
+                   claim_expires_at=datetime('now',?), updated_at=CURRENT_TIMESTAMP
+               WHERE generation=? AND claim_token=?""",
+            (sequence, f"+{MAL_USER_LIST_CLAIM_SECONDS} seconds", int(generation), str(claim_token)),
+        )
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        selected = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? AND partition_key=?", (int(generation), str(row["partition_key"]))).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(owner), _mal_user_traversal_partition_from_row(selected), work_kind, url
+
+
+def _require_mal_user_list_traversal_claim(
+    conn: sqlite3.Connection, row: sqlite3.Row | None, *, claim_token: str, expected_revision: int | None,
+) -> None:
+    if row is None or str(row["status"]) != "active":
+        raise MalUserAnimeListRefreshConflictError("MAL list generation is not active")
+    if row["quarantined_at"] is not None or row["quarantine_reason"] is not None:
+        raise MalUserAnimeListRefreshConflictError("quarantined MAL list generation is terminal until explicit reinitialization")
+    if row["claim_token"] != str(claim_token):
+        raise MalUserAnimeListRefreshConflictError("stale MAL list worker claim token")
+    live = conn.execute("SELECT datetime(?) > datetime('now') AS live", (row["claim_expires_at"],)).fetchone()
+    if live is None or not bool(live["live"]):
+        raise MalUserAnimeListRefreshConflictError("MAL list worker claim expired")
+    if expected_revision is not None and int(row["revision"]) != int(expected_revision):
+        raise MalUserAnimeListRefreshConflictError("stale MAL list generation revision")
+
+
+def record_mal_user_anime_list_request_failure(
+    db_path: Path, *, generation: int, partition_key: str, claim_token: str, expected_revision: int,
+    retry_class: str, error: str, next_retry_at: str | None, quarantine: bool = False,
+) -> MalUserAnimeListTraversalGeneration:
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, owner, claim_token=claim_token, expected_revision=expected_revision)
+        partition_changed = conn.execute(
+            """UPDATE mal_user_anime_list_refresh_partitions
+               SET requests_failed=requests_failed+1,retry_count=retry_count+1,retry_class=?,next_retry_at=?,last_error=?,
+                   queue_class=CASE WHEN ? THEN 'quarantined' ELSE 'retry_due' END,updated_at=CURRENT_TIMESTAMP
+               WHERE generation=? AND partition_key=?""",
+            (str(retry_class), next_retry_at, _bounded_mal_user_list_refresh_error(error), int(quarantine), int(generation), str(partition_key)),
+        )
+        if partition_changed.rowcount != 1:
+            raise MalUserAnimeListRefreshConflictError("MAL list request failure referenced a missing partition")
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations
+               SET requests_failed=requests_failed+1, revision=revision+1,
+                   status=CASE WHEN ? THEN 'failed' ELSE status END,
+                   completed_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE completed_at END,
+                   quarantined_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE quarantined_at END,
+                   quarantine_reason=CASE WHEN ? THEN ? ELSE quarantine_reason END,
+                   claim_token=CASE WHEN ? THEN NULL ELSE claim_token END,
+                   claim_expires_at=CASE WHEN ? THEN NULL ELSE claim_expires_at END,
+                   error=?, updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
+            (int(quarantine), int(quarantine), int(quarantine), int(quarantine), str(retry_class), int(quarantine), int(quarantine),
+             _bounded_mal_user_list_refresh_error(error), int(generation)),
+        )
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(owner)
+
+
+def checkpoint_mal_user_anime_list_page(
+    db_path: Path, *, generation: int, partition_key: str, claim_token: str, expected_revision: int,
+    page_url: str, next_url: str | None, items: list[dict[str, Any]], fingerprint: str, anchor: dict[str, Any],
+    terminal_explicit: bool, empty_proven: bool, fetched_at: str,
+) -> tuple[MalUserAnimeListTraversalGeneration, MalUserAnimeListTraversalPartition]:
+    """Atomically stage parsed rows and advance the opaque cursor."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, owner, claim_token=claim_token, expected_revision=expected_revision)
+        partition = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? AND partition_key=?", (int(generation), str(partition_key))).fetchone()
+        if partition is None or bool(partition["terminal"]):
+            raise MalUserAnimeListRefreshConflictError("MAL list partition is missing or terminal")
+        expected_url = partition["initial_url"] if int(partition["page_sequence"]) == 0 else partition["next_url"]
+        if str(expected_url) != str(page_url):
+            raise MalUserAnimeListRefreshConflictError("MAL list cursor changed before checkpoint")
+        query = parse_qs(urlparse(str(page_url)).query, keep_blank_values=True)
+        offset_text = query.get("offset", ["0"])[0]
+        limit_text = query.get("limit", [None])[0]
+        if not str(offset_text).isdigit() or not str(limit_text).isdigit() or int(limit_text) < 1:
+            raise ValueError("MAL list page URL lacks a valid offset/page size")
+        page_offset = int(offset_text)
+        expected_page_size = int(limit_text)
+        if next_url is not None:
+            if len(items) != expected_page_size:
+                raise ValueError("MAL list non-terminal page must contain exactly the expected page size")
+            next_query = parse_qs(urlparse(str(next_url)).query, keep_blank_values=True)
+            next_offset_text = next_query.get("offset", [None])[0]
+            if not str(next_offset_text).isdigit() or int(next_offset_text) != page_offset + expected_page_size:
+                raise ValueError("MAL list next cursor offset does not equal current offset plus full page size")
+        page_sequence = int(partition["page_sequence"]) + 1
+        ids = [int((item.get("node") or {}).get("id")) for item in items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate MAL anime id within page")
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            duplicate = conn.execute(
+                f"SELECT mal_anime_id FROM mal_user_anime_list_staged_rows WHERE generation=? AND mal_anime_id IN ({placeholders}) LIMIT 1",
+                (int(generation), *ids),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError(f"duplicate MAL anime id across staged pages: {int(duplicate['mal_anime_id'])}")
+        conn.execute(
+            """INSERT INTO mal_user_anime_list_staged_pages
+               (generation,partition_key,page_sequence,page_url,page_offset,expected_page_size,next_url,item_count,page_fingerprint,anchor_json,terminal_explicit,fetched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (int(generation), str(partition_key), page_sequence, str(page_url), page_offset, expected_page_size, next_url, len(items), str(fingerprint),
+             json.dumps(anchor, sort_keys=True), int(terminal_explicit), str(fetched_at)),
+        )
+        for order, item in enumerate(items):
+            item_status = _normalize_mal_user_list_status((item.get("list_status") or {}).get("status"))
+            if item_status is None:
+                raise ValueError("MAL list staged row lacks a supported status")
+            if partition["requested_status"] is not None and item_status != str(partition["requested_status"]):
+                raise ValueError("MAL list staged row status conflicts with its persisted partition")
+            conn.execute(
+                """INSERT INTO mal_user_anime_list_staged_rows
+                   (generation,partition_key,page_sequence,item_order,mal_anime_id,mal_status,item_json) VALUES (?,?,?,?,?,?,?)""",
+                (int(generation), str(partition_key), page_sequence, order, ids[order], item_status,
+                 json.dumps(item, ensure_ascii=False, sort_keys=True)),
+            )
+        terminal = next_url is None and terminal_explicit
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_partitions
+               SET next_url=?,page_sequence=?,item_count=item_count+?,terminal=?,terminal_explicit=?,empty_proven=?,
+                   first_page_fingerprint=COALESCE(first_page_fingerprint,?),
+                   first_page_anchor_json=CASE WHEN first_page_fingerprint IS NULL THEN ? ELSE first_page_anchor_json END,
+                   final_page_url=?,final_page_fingerprint=?,final_page_anchor_json=?,
+                   page1_validated_at=CASE WHEN page_sequence=0 THEN NULL ELSE page1_validated_at END,
+                   boundary_validated_at=NULL,requests_succeeded=requests_succeeded+1,
+                   retry_class=NULL,next_retry_at=NULL,last_error=NULL,
+                   queue_class=CASE WHEN ? THEN 'terminal' ELSE 'resumable' END,
+                   terminal_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,updated_at=CURRENT_TIMESTAMP
+               WHERE generation=? AND partition_key=?""",
+            (next_url, page_sequence, len(items), int(terminal), int(terminal_explicit), int(empty_proven), str(fingerprint),
+             json.dumps(anchor, sort_keys=True), str(page_url), str(fingerprint), json.dumps(anchor, sort_keys=True),
+             int(terminal), int(terminal), int(generation), str(partition_key)),
+        )
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations
+               SET pages=pages+1,items=items+?,requests_succeeded=requests_succeeded+1,revision=revision+1,
+                   staged_revision=staged_revision+1,validated_staged_revision=NULL,
+                   validated_at=NULL,validation_fingerprint=NULL,updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
+            (len(items), int(generation)),
+        )
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        partition = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? AND partition_key=?", (int(generation), str(partition_key))).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(owner), _mal_user_traversal_partition_from_row(partition)
+
+
+def checkpoint_mal_user_anime_list_revalidation(
+    db_path: Path, *, generation: int, partition_key: str, claim_token: str, expected_revision: int,
+    kind: str, page_url: str, fingerprint: str, anchor: dict[str, Any],
+) -> tuple[MalUserAnimeListTraversalGeneration, MalUserAnimeListTraversalPartition]:
+    if kind not in {"validate_page1", "validate_interior", "validate_boundary"}:
+        raise ValueError("invalid MAL list revalidation kind")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, owner, claim_token=claim_token, expected_revision=expected_revision)
+        partition = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? AND partition_key=?", (int(generation), str(partition_key))).fetchone()
+        if partition is None or not bool(partition["terminal"]):
+            raise MalUserAnimeListRefreshConflictError("MAL list partition is missing or not terminal during revalidation")
+        staged_page = None
+        if kind == "validate_interior":
+            staged_page = conn.execute(
+                "SELECT * FROM mal_user_anime_list_staged_pages WHERE generation=? AND partition_key=? AND page_url=? AND page_sequence>1 AND page_sequence<?",
+                (int(generation), str(partition_key), str(page_url), int(partition["page_sequence"])),
+            ).fetchone()
+            if staged_page is None:
+                raise MalUserAnimeListRefreshConflictError("MAL list interior page is missing during revalidation")
+        expected_url = staged_page["page_url"] if staged_page is not None else partition["initial_url"] if kind == "validate_page1" else partition["final_page_url"]
+        expected_fingerprint = staged_page["page_fingerprint"] if staged_page is not None else partition["first_page_fingerprint"] if kind == "validate_page1" else partition["final_page_fingerprint"]
+        expected_anchor_json = staged_page["anchor_json"] if staged_page is not None else partition["first_page_anchor_json"] if kind == "validate_page1" else partition["final_page_anchor_json"]
+        if str(page_url) != str(expected_url) or str(fingerprint) != str(expected_fingerprint) or json.dumps(anchor, sort_keys=True) != json.dumps(json.loads(expected_anchor_json or "{}"), sort_keys=True):
+            raise ValueError(f"MAL list snapshot drift during {kind}")
+        if kind != "validate_interior":
+            if kind == "validate_page1" and int(partition["page_sequence"]) == 1:
+                conn.execute(
+                    "UPDATE mal_user_anime_list_refresh_partitions SET page1_validated_at=CURRENT_TIMESTAMP,boundary_validated_at=CURRENT_TIMESTAMP,requests_succeeded=requests_succeeded+1,updated_at=CURRENT_TIMESTAMP WHERE generation=? AND partition_key=?",
+                    (int(generation), str(partition_key)),
+                )
+            else:
+                field = "page1_validated_at" if kind == "validate_page1" else "boundary_validated_at"
+                conn.execute(
+                    f"UPDATE mal_user_anime_list_refresh_partitions SET {field}=CURRENT_TIMESTAMP,requests_succeeded=requests_succeeded+1,updated_at=CURRENT_TIMESTAMP WHERE generation=? AND partition_key=?",
+                    (int(generation), str(partition_key)),
+                )
+        else:
+            conn.execute(
+                "UPDATE mal_user_anime_list_refresh_partitions SET requests_succeeded=requests_succeeded+1,updated_at=CURRENT_TIMESTAMP WHERE generation=? AND partition_key=?",
+                (int(generation), str(partition_key)),
+            )
+        # Bind validation to the exact stored page revision. For an interior
+        # page this is set by its own revalidation work item.
+        if kind == "validate_page1":
+            page_sequence = 1
+        elif kind == "validate_interior":
+            page_sequence = int(staged_page["page_sequence"])
+        else:
+            page_sequence = int(partition["page_sequence"])
+        validated = conn.execute(
+            "UPDATE mal_user_anime_list_staged_pages SET validated_at=CURRENT_TIMESTAMP WHERE generation=? AND partition_key=? AND page_sequence=? AND page_url=? AND page_fingerprint=?",
+            (int(generation), str(partition_key), page_sequence, str(page_url), str(fingerprint)),
+        )
+        if validated.rowcount != 1:
+            raise MalUserAnimeListRefreshConflictError("MAL list staged page disappeared during revalidation")
+        conn.execute(
+            "UPDATE mal_user_anime_list_refresh_generations SET requests_succeeded=requests_succeeded+1,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=?",
+            (int(generation),),
+        )
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        partition = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? AND partition_key=?", (int(generation), str(partition_key))).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(owner), _mal_user_traversal_partition_from_row(partition)
+
+
+def restart_or_quarantine_mal_user_anime_list_traversal(
+    db_path: Path, *, generation: int, claim_token: str, expected_revision: int, reason: str,
+) -> MalUserAnimeListTraversalGeneration:
+    """Preserve failed history and create a fresh same-identity generation, bounded by restart limit."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, old, claim_token=claim_token, expected_revision=expected_revision)
+        restart_count = int(old["restart_count"] or 0) + 1
+        if restart_count > MAL_USER_LIST_MAX_DRIFT_RESTARTS:
+            conn.execute(
+                """UPDATE mal_user_anime_list_refresh_generations SET status='failed',completed_at=CURRENT_TIMESTAMP,
+                   restart_count=?,drift_count=drift_count+1,quarantined_at=CURRENT_TIMESTAMP,quarantine_reason=?,error=?,
+                   claim_token=NULL,claim_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
+                (restart_count, _bounded_mal_user_list_refresh_error(reason), _bounded_mal_user_list_refresh_error(reason), int(generation)),
+            )
+            row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        else:
+            partitions = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal", (int(generation),)).fetchall()
+            conn.execute(
+                """UPDATE mal_user_anime_list_refresh_generations SET status='failed',completed_at=CURRENT_TIMESTAMP,
+                   restart_count=?,drift_count=drift_count+1,error=?,claim_token=NULL,claim_expires_at=NULL,
+                   revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
+                (restart_count, _bounded_mal_user_list_refresh_error(reason), int(generation)),
+            )
+            run_id = f"{old['refresh_run_id']}-r{restart_count}"
+            cursor = conn.execute(
+                """INSERT INTO mal_user_anime_list_refresh_generations
+                   (refresh_run_id,status,fetched_at,account_key,account_id,account_name,query_identity,query_json,logic_version,
+                    claim_token,claim_expires_at,revision,restart_count,drift_count)
+                   VALUES (?,'active',?,?,?,?,?,?,?,?,datetime('now',?),1,?,?)""",
+                (run_id, old["fetched_at"], old["account_key"], old["account_id"], old["account_name"], old["query_identity"],
+                 old["query_json"], old["logic_version"], str(claim_token), f"+{MAL_USER_LIST_CLAIM_SECONDS} seconds",
+                 restart_count, int(old["drift_count"] or 0)+1),
+            )
+            new_id = int(cursor.lastrowid)
+            for item in partitions:
+                conn.execute(
+                    """INSERT INTO mal_user_anime_list_refresh_partitions
+                       (generation,partition_key,requested_status,ordinal,initial_url,next_url)
+                       VALUES (?,?,?,?,?,?)""",
+                    (new_id,item["partition_key"],item["requested_status"],item["ordinal"],item["initial_url"],item["initial_url"]),
+                )
+            row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (new_id,)).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(row)
+
+
+def persist_mal_user_anime_list_identity_assertion(
+    db_path: Path, *, generation: int, claim_token: str, expected_revision: int,
+    account_id: int, account_name: str, nonce: str,
+) -> MalUserAnimeListTraversalGeneration:
+    """Persist a one-use local assertion for an identity check performed outside SQLite."""
+    assertion_nonce = str(nonce).strip()
+    if not assertion_nonce:
+        raise ValueError("identity assertion nonce is required")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)
+        ).fetchone()
+        _require_mal_user_list_traversal_claim(
+            conn, owner, claim_token=claim_token, expected_revision=expected_revision
+        )
+        authority = conn.execute(
+            "SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (str(owner["account_key"]),)
+        ).fetchone()
+        if (
+            authority is None
+            or int(authority["current_generation"]) != int(generation)
+            or int(authority["publication_epoch"]) != int(owner["publication_epoch"])
+            or int(owner["account_id"]) != int(account_id)
+            or str(owner["account_name"]) != str(account_name)
+        ):
+            raise MalUserAnimeListRefreshConflictError("MAL identity assertion failed account publication fence")
+        next_revision = int(owner["revision"]) + 1
+        changed = conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations
+               SET identity_assertion_nonce=?,identity_asserted_at=CURRENT_TIMESTAMP,
+                   identity_asserted_revision=?,identity_assertion_consumed_at=NULL,
+                   revision=?,updated_at=CURRENT_TIMESTAMP
+               WHERE generation=? AND revision=?""",
+            (assertion_nonce, next_revision, next_revision, int(generation), int(expected_revision)),
+        )
+        if changed.rowcount != 1:
+            raise MalUserAnimeListRefreshConflictError("MAL identity assertion revision changed")
+        owner = conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)
+        ).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(owner)
+
+
+def _mal_user_list_exact_storage_digest(
+    conn: sqlite3.Connection, owner: sqlite3.Row, partitions: list[sqlite3.Row],
+    pages: list[sqlite3.Row], rows: list[sqlite3.Row], *, revision: int, validated_at: str,
+) -> str:
+    """Hash exact SQLite text bytes plus all publication-relevant typed state."""
+    digest = hashlib.sha256()
+
+    def emit(label: str, value: Any) -> None:
+        raw = value if isinstance(value, bytes) else str(value).encode("utf-8", "surrogatepass")
+        if not isinstance(raw, bytes):
+            raw = raw.encode("utf-8", "surrogatepass")
+        digest.update(label.encode("ascii") + b"\0" + len(raw).to_bytes(8, "big") + raw)
+
+    for name in (
+        "generation", "refresh_run_id", "account_key", "account_id", "account_name", "query_identity",
+        "query_json", "logic_version", "publication_epoch", "staged_revision", "pages", "items",
+        "identity_assertion_nonce", "identity_asserted_at",
+    ):
+        emit(f"generation.{name}", owner[name])
+    emit("generation.publish_revision", revision)
+    emit("generation.identity_asserted_revision", revision)
+    emit("generation.validated_at", validated_at)
+    for partition in partitions:
+        for name in (
+            "partition_key", "requested_status", "ordinal", "initial_url", "next_url", "page_sequence",
+            "item_count", "terminal", "terminal_explicit", "empty_proven", "first_page_fingerprint",
+            "first_page_anchor_json", "final_page_url", "final_page_fingerprint", "final_page_anchor_json",
+            "page1_validated_at", "boundary_validated_at", "terminal_at", "requests_succeeded",
+            "requests_failed", "attempt_count", "retry_count",
+        ):
+            emit(f"partition.{name}", partition[name])
+    for page in pages:
+        for name in (
+            "partition_key", "page_sequence", "page_url", "page_offset", "expected_page_size", "next_url",
+            "item_count", "page_fingerprint", "anchor_json", "terminal_explicit", "fetched_at", "validated_at",
+        ):
+            emit(f"page.{name}", page[name])
+    for row in rows:
+        for name in (
+            "partition_key", "page_sequence", "item_order", "mal_anime_id", "mal_status", "item_json",
+        ):
+            emit(f"row.{name}", row[name])
+    emit("aggregate.partition_count", len(partitions))
+    emit("aggregate.page_count", len(pages))
+    emit("aggregate.row_count", len(rows))
+    emit("aggregate.page_item_count", sum(int(page["item_count"]) for page in pages))
+    emit("aggregate.partition_item_count", sum(int(partition["item_count"]) for partition in partitions))
+    return digest.hexdigest()
+
+
+def load_validated_mal_user_anime_list_staging(
+    db_path: Path, *, generation: int, claim_token: str, expected_revision: int,
+) -> tuple[MalUserAnimeListTraversalGeneration, list[dict[str, Any]], dict[str, Any]]:
+    """Final generation-wide validation under the publication claim."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, owner, claim_token=claim_token, expected_revision=expected_revision)
+        partitions = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal", (int(generation),)).fetchall()
+        if owner["quarantined_at"] is not None:
+            raise ValueError("quarantined MAL list generation is not publishable")
+        if not partitions or any(not bool(row["terminal"]) or not bool(row["terminal_explicit"]) or row["page1_validated_at"] is None or row["boundary_validated_at"] is None for row in partitions):
+            raise ValueError("MAL list generation lacks validated terminal proof for every requested partition")
+        pages = conn.execute("SELECT * FROM mal_user_anime_list_staged_pages WHERE generation=? ORDER BY partition_key,page_sequence", (int(generation),)).fetchall()
+        if not pages or any(row["validated_at"] is None for row in pages):
+            raise ValueError("MAL list generation lacks current validation for every staged page")
+        authority = conn.execute(
+            "SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (str(owner["account_key"]),)
+        ).fetchone()
+        if (
+            authority is None
+            or int(authority["current_generation"]) != int(generation)
+            or int(authority["publication_epoch"]) != int(owner["publication_epoch"])
+            or owner["identity_assertion_nonce"] is None
+            or owner["identity_asserted_at"] is None
+            or owner["identity_assertion_consumed_at"] is not None
+            or int(owner["identity_asserted_revision"] or -1) != int(owner["revision"])
+        ):
+            raise ValueError("MAL list generation lacks a current one-use identity assertion under the account fence")
+        rows = conn.execute("SELECT * FROM mal_user_anime_list_staged_rows WHERE generation=? ORDER BY partition_key,page_sequence,item_order", (int(generation),)).fetchall()
+        try:
+            items = [json.loads(row["item_json"]) for row in rows]
+        except json.JSONDecodeError as exc:
+            raise ValueError("MAL list staged row contains malformed JSON") from exc
+        page_counts = {(str(page["partition_key"]), int(page["page_sequence"])): int(page["item_count"]) for page in pages}
+        actual_counts: dict[tuple[str, int], int] = {}
+        for row in rows:
+            key = (str(row["partition_key"]), int(row["page_sequence"]))
+            actual_counts[key] = actual_counts.get(key, 0) + 1
+        if any(actual_counts.get(key, 0) != count for key, count in page_counts.items()):
+            raise ValueError("MAL list staged page/item counts no longer match")
+        if sum(page_counts.values()) != len(rows) or sum(int(row["item_count"]) for row in partitions) != len(rows):
+            raise ValueError("MAL list aggregate staged counts no longer match")
+        partition_status = {str(row["partition_key"]): row["requested_status"] for row in partitions}
+        for row in rows:
+            expected_status = partition_status[str(row["partition_key"])]
+            if expected_status is not None and str(row["mal_status"]) != str(expected_status):
+                raise ValueError("MAL list staged row status escaped its persisted partition")
+            parsed_status = _normalize_mal_user_list_status((json.loads(row["item_json"]).get("list_status") or {}).get("status"))
+            if parsed_status != str(row["mal_status"]):
+                raise ValueError("MAL list staged row status column and exact JSON bytes disagree")
+        if not items and any(not bool(row["empty_proven"]) for row in partitions):
+            raise ValueError("empty MAL list generation lacks strong empty proof")
+        validated_revision = int(owner["revision"]) + 1
+        validated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        validation_fingerprint = _mal_user_list_exact_storage_digest(
+            conn, owner, partitions, pages, rows, revision=validated_revision, validated_at=validated_at
+        )
+        proof = {
+            "authenticated_account_id": int(owner["account_id"]), "authenticated_account_name": str(owner["account_name"]),
+            "query_identity": str(owner["query_identity"]), "all_partitions_terminal": True,
+            "partition_count": len(partitions), "item_count": len(items), "explicit_empty": not items,
+            "pagination_unambiguous": True, "final_validation": True,
+        }
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations
+               SET validated_at=?,validation_fingerprint=?,terminal_empty_proof_json=?,
+                   validated_staged_revision=staged_revision,revision=?,identity_asserted_revision=?,updated_at=CURRENT_TIMESTAMP
+               WHERE generation=?""",
+            (validated_at,validation_fingerprint,json.dumps(proof,sort_keys=True),validated_revision,validated_revision,int(generation)),
+        )
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(owner), items, proof
+
+
+def publish_mal_user_anime_list_staging(
+    db_path: Path, *, generation: int, claim_token: str, expected_revision: int, delete_absent: bool,
+) -> MalUserAnimeListRefreshSummary:
+    """Atomically publish exact validated staging and prune only from strong complete proof."""
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn, owner, claim_token=claim_token, expected_revision=expected_revision)
+        if owner["validated_at"] is None or owner["validation_fingerprint"] is None:
+            raise ValueError("MAL list generation has not passed final validation")
+        if owner["quarantined_at"] is not None:
+            raise ValueError("quarantined MAL list generation is not publishable")
+        if owner["validated_staged_revision"] is None or int(owner["validated_staged_revision"]) != int(owner["staged_revision"]):
+            raise ValueError("MAL list publication validation is stale for the staged revision")
+        authority = conn.execute(
+            "SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (str(owner["account_key"]),)
+        ).fetchone()
+        if (
+            authority is None
+            or int(authority["current_generation"]) != int(generation)
+            or int(authority["publication_epoch"]) != int(owner["publication_epoch"])
+            or int(authority["account_id"]) != int(owner["account_id"])
+            or str(authority["account_name"]) != str(owner["account_name"])
+            or owner["identity_assertion_nonce"] is None
+            or owner["identity_assertion_consumed_at"] is not None
+            or int(owner["identity_asserted_revision"] or -1) != int(owner["revision"])
+        ):
+            raise MalUserAnimeListRefreshConflictError("MAL list publication account/identity assertion fence rejected")
+        partitions = conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal", (int(generation),)
+        ).fetchall()
+        if not partitions or any(
+            not bool(row["terminal"])
+            or not bool(row["terminal_explicit"])
+            or row["page1_validated_at"] is None
+            or row["boundary_validated_at"] is None
+            for row in partitions
+        ):
+            raise ValueError("MAL list publication lost terminal validation")
+        pages = conn.execute(
+            "SELECT * FROM mal_user_anime_list_staged_pages WHERE generation=? ORDER BY partition_key,page_sequence",
+            (int(generation),),
+        ).fetchall()
+        staged = conn.execute(
+            "SELECT * FROM mal_user_anime_list_staged_rows WHERE generation=? ORDER BY partition_key,page_sequence,item_order",
+            (int(generation),),
+        ).fetchall()
+        try:
+            items = [json.loads(row["item_json"]) for row in staged]
+        except json.JSONDecodeError as exc:
+            raise ValueError("MAL list staged row contains malformed JSON") from exc
+        exact_digest = _mal_user_list_exact_storage_digest(
+            conn, owner, partitions, pages, staged, revision=int(owner["revision"]), validated_at=str(owner["validated_at"])
+        )
+        if exact_digest != str(owner["validation_fingerprint"]):
+            raise ValueError("MAL list exact staged storage/state changed after final validation")
+        newer = conn.execute(
+            "SELECT 1 FROM mal_user_anime_list_refresh_generations WHERE account_key=? AND generation>? AND status IN ('active','completed') LIMIT 1",
+            (str(owner["account_key"]), int(generation)),
+        ).fetchone()
+        fence = conn.execute(
+            "SELECT generation FROM mal_user_anime_list_publication_fence WHERE account_key=?",
+            (str(owner["account_key"]),),
+        ).fetchone()
+        if newer is not None or (fence is not None and int(fence["generation"]) >= int(generation)):
+            raise MalUserAnimeListRefreshConflictError("MAL list generation is not the current authoritative publication candidate")
+        prepared = [_prepare_mal_user_list_cache_item(item, refresh_run_id=str(owner["refresh_run_id"]), generation=int(generation), fetched_at=str(owner["fetched_at"])) for item in items]
+        prepared = [row for row in prepared if row is not None]
+        if len(prepared) != len(items):
+            raise ValueError("validated MAL list staging contains an unpublishable item")
+        if prepared:
+            conn.executemany(
+                """INSERT INTO mal_user_anime_list_cache
+                   (mal_anime_id,title,list_status,user_score,num_episodes_watched,start_date,finish_date,list_updated_at,
+                    priority,is_rewatching,num_times_rewatched,rewatch_value,tag_count,has_comments,node_json,list_status_json,
+                    raw_json,refresh_run_id,refresh_generation,fetched_at,last_seen_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(mal_anime_id) DO UPDATE SET title=excluded.title,list_status=excluded.list_status,user_score=excluded.user_score,
+                    num_episodes_watched=excluded.num_episodes_watched,start_date=excluded.start_date,finish_date=excluded.finish_date,
+                    list_updated_at=excluded.list_updated_at,priority=excluded.priority,is_rewatching=excluded.is_rewatching,
+                    num_times_rewatched=excluded.num_times_rewatched,rewatch_value=excluded.rewatch_value,tag_count=excluded.tag_count,
+                    has_comments=excluded.has_comments,node_json=excluded.node_json,list_status_json=excluded.list_status_json,
+                    raw_json=excluded.raw_json,refresh_run_id=excluded.refresh_run_id,refresh_generation=excluded.refresh_generation,
+                    fetched_at=excluded.fetched_at,last_seen_at=excluded.last_seen_at,updated_at=CURRENT_TIMESTAMP""",
+                prepared,
+            )
+        pruned = 0
+        requested_statuses = [row["requested_status"] for row in partitions]
+        is_canonical_all = len(requested_statuses) == 1 and requested_statuses[0] is None
+        if delete_absent and not is_canonical_all and any(status is None for status in requested_statuses):
+            raise ValueError("invalid delete_absent/publication scope combination")
+        if delete_absent and is_canonical_all:
+            pruned = conn.execute(
+                "DELETE FROM mal_user_anime_list_cache WHERE refresh_generation<>?", (int(generation),)
+            ).rowcount
+        elif delete_absent:
+            normalized_scope = sorted({str(status) for status in requested_statuses if status is not None})
+            if not normalized_scope or any(status not in _ALLOWED_MAL_USER_LIST_STATUSES for status in normalized_scope):
+                raise ValueError("invalid delete_absent/publication scope combination")
+            placeholders = ",".join("?" for _ in normalized_scope)
+            pruned = conn.execute(
+                f"""DELETE FROM mal_user_anime_list_cache
+                    WHERE refresh_generation<>? AND list_status IN ({placeholders})""",
+                (int(generation), *normalized_scope),
+            ).rowcount
+        preserved = conn.execute("SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation<>?", (int(generation),)).fetchone()["n"]
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations SET status='completed',completed_at=CURRENT_TIMESTAMP,
+               upserted=?,pruned=?,preserved_absent=?,claim_token=NULL,claim_expires_at=NULL,
+               identity_assertion_consumed_at=CURRENT_TIMESTAMP,revision=revision+1,updated_at=CURRENT_TIMESTAMP
+               WHERE generation=? AND status='active'""",
+            (len(prepared),int(pruned or 0),int(preserved or 0),int(generation)),
+        )
+        conn.execute(
+            """INSERT INTO mal_user_anime_list_publication_fence(account_key,generation,query_identity)
+               VALUES (?,?,?)
+               ON CONFLICT(account_key) DO UPDATE SET generation=excluded.generation,
+                   query_identity=excluded.query_identity,published_at=CURRENT_TIMESTAMP
+               WHERE excluded.generation>mal_user_anime_list_publication_fence.generation""",
+            (str(owner["account_key"]), int(generation), str(owner["query_identity"])),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        # A publication failure must preserve LKG/staging rollback while not
+        # stranding the generation behind a live lease. A later worker can
+        # reclaim, revalidate, and retry after the underlying fault is fixed.
+        recovery = connect(db_path)
+        try:
+            recovery.execute("BEGIN IMMEDIATE")
+            recovery.execute(
+                """UPDATE mal_user_anime_list_refresh_generations
+                   SET claim_token=NULL,claim_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP
+                   WHERE generation=? AND status='active' AND claim_token=? AND quarantined_at IS NULL""",
+                (int(generation), str(claim_token)),
+            )
+            recovery.commit()
+        except BaseException:
+            recovery.rollback()
+        finally:
+            recovery.close()
+        raise
+    finally:
+        conn.close()
+    by_status, scored, unscored, preference_counts = _summarize_prepared_mal_user_list_rows(prepared)
+    return MalUserAnimeListRefreshSummary(status="ok",refresh_run_id=str(owner["refresh_run_id"]),generation=int(generation),
+        pages=int(owner["pages"]),items=len(prepared),upserted=len(prepared),pruned=int(pruned or 0),preserved_absent=int(preserved or 0),
+        scored=scored,unscored=unscored,preference_counts=preference_counts,by_status=by_status,partial=False)
+
+
+def release_mal_user_anime_list_traversal_claim(
+    db_path: Path, *, generation: int, claim_token: str, expected_revision: int,
+) -> bool:
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
+        _require_mal_user_list_traversal_claim(conn,row,claim_token=claim_token,expected_revision=expected_revision)
+        changed = conn.execute(
+            "UPDATE mal_user_anime_list_refresh_generations SET claim_token=NULL,claim_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=? AND claim_token=? AND revision=?",
+            (int(generation),str(claim_token),int(expected_revision)),
+        )
+        conn.commit()
+    return changed.rowcount == 1
+
+
+def get_mal_user_anime_list_refresh_diagnostics(db_path: Path) -> dict[str, Any]:
+    with connect(db_path) as conn:
+        generation = conn.execute(
+            "SELECT * FROM mal_user_anime_list_refresh_generations WHERE account_id IS NOT NULL ORDER BY generation DESC LIMIT 1"
+        ).fetchone()
+        if generation is None:
+            return {"status":"unknown","generation":None,"queue_classes":{},"requests":{"attempted":0,"succeeded":0,"failed":0}}
+        parts = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal",(int(generation["generation"]),)).fetchall()
+    now = datetime.now(timezone.utc)
+    def age(value: Any) -> int | None:
+        if not value: return None
+        try: return max(0,int((now-datetime.fromisoformat(str(value).replace("Z","+00:00")).replace(tzinfo=timezone.utc if datetime.fromisoformat(str(value).replace("Z","+00:00")).tzinfo is None else datetime.fromisoformat(str(value).replace("Z","+00:00")).tzinfo)).total_seconds()))
+        except ValueError: return None
+    classes = {"never_started":0,"resumable":0,"retry_due":0,"terminal":0}
+    for row in parts:
+        key = _mal_user_list_partition_class(row)
+        classes[key]+=1
+    never = [age(row["created_at"]) for row in parts if int(row["page_sequence"])==0]
+    resumable = [age(row["updated_at"]) for row in parts if int(row["page_sequence"])>0 and not row["terminal"]]
+    return {
+        "status":str(generation["status"]),"generation":int(generation["generation"]),"account_key":generation["account_key"],
+        "query_identity":generation["query_identity"],"logic_version":generation["logic_version"],"revision":int(generation["revision"]),
+        "claimed":bool(generation["claim_token"]),"claim_expires_at":generation["claim_expires_at"],"queue_classes":classes,
+        "oldest_never_started_age_seconds":max((v for v in never if v is not None),default=None),
+        "oldest_resumable_age_seconds":max((v for v in resumable if v is not None),default=None),
+        "fairness_sequence":int(generation["fairness_sequence"]),
+        "requests":{"attempted":int(generation["requests_attempted"]),"succeeded":int(generation["requests_succeeded"]),"failed":int(generation["requests_failed"])},
+        "restart_count":int(generation["restart_count"]),"drift_count":int(generation["drift_count"]),
+        "quarantined_at":generation["quarantined_at"],"quarantine_reason":generation["quarantine_reason"],
+        "validated_at":generation["validated_at"],"terminal_empty_proof":json.loads(generation["terminal_empty_proof_json"] or "{}"),
+        "partitions":[{"status":row["requested_status"],"queue_class":_mal_user_list_partition_class(row),"page_sequence":int(row["page_sequence"]),"cursor_present":bool(row["next_url"]),
+            "terminal":bool(row["terminal"]),"empty_proven":bool(row["empty_proven"]),"next_retry_at":row["next_retry_at"],
+            "retry_class":row["retry_class"],"fairness_lag":int(generation["fairness_sequence"])-int(row["fairness_sequence"])} for row in parts],
+    }

@@ -84,6 +84,9 @@ class PublicMalRecommendationEdge:
 class ParsedPublicUserRecommendationsPage:
     edges: list[PublicMalRecommendationEdge]
     next_url: str | None
+    explicit_empty: bool = False
+    document_complete: bool = False
+    terminal_evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -95,6 +98,9 @@ class PublicUserRecommendationsPageFetchResult:
     page_fingerprint: str
     anchor: dict[str, Any]
     edges: list[PublicMalRecommendationEdge]
+    explicit_empty: bool = False
+    document_complete: bool = False
+    terminal_evidence: dict[str, Any] = field(default_factory=dict)
 
     def edge_payloads(self, *, source_url: str, page_count: int) -> list[dict[str, Any]]:
         return [edge.as_edge_payload(source_url=source_url, page_count=page_count) for edge in self.edges]
@@ -173,16 +179,39 @@ class _UserRecommendationsHTMLParser(HTMLParser):
         self._anchors: list[_Anchor] = []
         self._surface_text_captures: list[_SurfaceTextCapture] = []
         self._saw_userrecs_surface = False
+        self._saw_explicit_empty = False
+        self._saw_html_start = False
+        self._saw_html_end = False
+        self._saw_body_start = False
+        self._saw_body_end = False
+        self._recommendation_row_count = 0
 
     @property
     def saw_recommendation_surface(self) -> bool:
         return self._saw_userrecs_surface
 
+    @property
+    def saw_explicit_empty(self) -> bool:
+        return self._saw_explicit_empty
+
+    @property
+    def document_complete(self) -> bool:
+        return self._saw_html_start and self._saw_html_end and self._saw_body_start and self._saw_body_end
+
+    @property
+    def recommendation_row_count(self) -> int:
+        return self._recommendation_row_count
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_dict = {name.lower(): (value or "") for name, value in attrs}
         lowered = tag.lower()
+        if lowered == "html":
+            self._saw_html_start = True
+        elif lowered == "body":
+            self._saw_body_start = True
         if lowered == "tr":
             self._blocks.append(_RecommendationBlock())
+            self._recommendation_row_count += 1
         elif lowered == "a":
             self._anchors.append(
                 _Anchor(
@@ -210,6 +239,10 @@ class _UserRecommendationsHTMLParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
+        if lowered == "html":
+            self._saw_html_end = True
+        elif lowered == "body":
+            self._saw_body_end = True
         if lowered == "a" and self._anchors:
             anchor = self._anchors.pop()
             text = " ".join("".join(anchor.text_parts).split()).strip()
@@ -230,6 +263,15 @@ class _UserRecommendationsHTMLParser(HTMLParser):
             text = " ".join("".join(capture.text_parts).split()).strip()
             if _looks_like_userrecs_page_surface(capture, text):
                 self._saw_userrecs_surface = True
+            attrs = f"{capture.class_name} {capture.element_id} {capture.role} {capture.aria_label}".casefold()
+            dedicated_empty = (
+                "userrecs-empty" in attrs
+                or "recommendations-empty" in attrs
+                or "empty-state" in attrs
+                or "no-recommendations" in attrs
+            )
+            if dedicated_empty and _NO_USER_RECOMMENDATIONS_EMPTY_STATE_RE.search(text):
+                self._saw_explicit_empty = True
 
     def handle_data(self, data: str) -> None:
         if self._anchors:
@@ -383,13 +425,15 @@ def _looks_like_userrecs_page_surface(capture: _SurfaceTextCapture, text: str) -
     normalized = _normalized_surface_text(text)
     if not normalized:
         return False
-    if _NO_USER_RECOMMENDATIONS_EMPTY_STATE_RE.search(text):
-        return True
-
     class_tokens = _attr_tokens(capture.class_name)
     attr_blob = " ".join(
         [capture.class_name, capture.element_id, capture.role, capture.aria_label]
     ).casefold()
+    if _NO_USER_RECOMMENDATIONS_EMPTY_STATE_RE.search(text) and any(
+        marker in attr_blob
+        for marker in ("userrecs-empty", "recommendations-empty", "empty-state", "no-recommendations")
+    ):
+        return True
     if capture.tag in {"h1", "h2", "h3"} and normalized in _USER_RECS_HEADING_TEXTS:
         if normalized != "recommendations":
             return True
@@ -522,7 +566,7 @@ def parse_public_user_recommendations_page(
     except Exception as exc:  # HTMLParser can surface malformed entity edge cases.
         raise PublicMalUserRecommendationsError(f"malformed public MAL userrecs HTML: {exc}") from exc
 
-    validated_next: str | None = None
+    validated_candidates: list[str] = []
     if parser.next_hrefs:
         for href in parser.next_hrefs:
             candidate = validate_public_user_recs_url(
@@ -530,13 +574,37 @@ def parse_public_user_recommendations_page(
                 public_base_url=public_base_url,
                 source_mal_anime_id=source_mal_anime_id,
             )
-            validated_next = candidate
-            break
+            validated_candidates.append(candidate)
+    distinct_next = list(dict.fromkeys(validated_candidates))
+    if len(distinct_next) > 1:
+        raise PublicMalUserRecommendationsError("public MAL userrecs page advertised conflicting next links")
+    validated_next = distinct_next[0] if distinct_next else None
 
     edges = _dedupe_edges(parser.edges)
     if not parser.saw_recommendation_surface:
         raise PublicMalUserRecommendationsError("public MAL userrecs HTML did not contain a recognizable recommendation surface")
-    return ParsedPublicUserRecommendationsPage(edges=edges, next_url=validated_next)
+    if not parser.document_complete:
+        raise PublicMalUserRecommendationsError("public MAL userrecs HTML document was incomplete or truncated")
+    if validated_next is None and not edges and not parser.saw_explicit_empty:
+        raise PublicMalUserRecommendationsError(
+            "public MAL userrecs terminal empty state lacked dedicated structural evidence; manual review required"
+        )
+    terminal_evidence = {
+        "document_complete": parser.document_complete,
+        "recommendation_surface": parser.saw_recommendation_surface,
+        "recommendation_row_count": parser.recommendation_row_count,
+        "next_candidate_count": len(parser.next_hrefs),
+        "next_links_consistent": len(distinct_next) <= 1,
+        "explicit_empty": bool(parser.saw_explicit_empty and not edges and validated_next is None),
+        "terminal": validated_next is None,
+    }
+    return ParsedPublicUserRecommendationsPage(
+        edges=edges,
+        next_url=validated_next,
+        explicit_empty=bool(parser.saw_explicit_empty and not edges and validated_next is None),
+        document_complete=parser.document_complete,
+        terminal_evidence=terminal_evidence,
+    )
 
 
 class PublicMalUserRecommendationsClient:
@@ -645,6 +713,7 @@ class PublicMalUserRecommendationsClient:
         *,
         page_url: str,
         max_body_bytes: int = DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
+        max_attempts: int | None = None,
     ) -> PublicUserRecommendationsPageFetchResult:
         """Fetch and parse exactly one validated public MAL /userrecs page.
 
@@ -662,6 +731,7 @@ class PublicMalUserRecommendationsClient:
             validated_url,
             source_mal_anime_id=int(source_mal_anime_id),
             max_body_bytes=normalized_max_body,
+            max_attempts=max_attempts,
         )
         parsed = parse_public_user_recommendations_page(
             html,
@@ -681,6 +751,9 @@ class PublicMalUserRecommendationsClient:
             ),
             anchor=public_user_recs_page_anchor(parsed.edges),
             edges=parsed.edges,
+            explicit_empty=parsed.explicit_empty,
+            document_complete=parsed.document_complete,
+            terminal_evidence=parsed.terminal_evidence,
         )
 
     def _is_timeout_error(self, exc: BaseException) -> bool:
@@ -694,14 +767,28 @@ class PublicMalUserRecommendationsClient:
             return "timed out" in reason_text or "timeout" in reason_text
         return False
 
-    def _fetch_html(self, url: str, *, source_mal_anime_id: int, max_body_bytes: int) -> tuple[str, str]:
+    def _fetch_html(
+        self,
+        url: str,
+        *,
+        source_mal_anime_id: int,
+        max_body_bytes: int,
+        max_attempts: int | None = None,
+    ) -> tuple[str, str]:
         current_url = validate_public_user_recs_url(
             url,
             public_base_url=self.config.mal.public_base_url,
             source_mal_anime_id=source_mal_anime_id,
         )
         redirects = 0
-        attempts = max(1, int(self.config.mal.retry_max_attempts))
+        # Direct/legacy harvests retain configured retry behavior. Durable
+        # orchestrators pass max_attempts=1 because they charge each invocation
+        # as one hard request-attempt budget unit.
+        attempts = (
+            max(1, int(max_attempts))
+            if max_attempts is not None
+            else max(1, int(self.config.mal.retry_max_attempts))
+        )
         while True:
             for attempt in range(1, attempts + 1):
                 request = Request(

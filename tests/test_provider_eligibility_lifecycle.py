@@ -189,7 +189,7 @@ class ProviderEligibilityLifecycleTests(unittest.TestCase):
 
         old_path = Path(self.temp_dir.name) / "v19.sqlite3"
         try:
-            db.MIGRATIONS = original[:-1]
+            db.MIGRATIONS = original[: db.MIGRATION_FILENAMES.index(db.PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION)]
             bootstrap_database(old_path)
         finally:
             db.MIGRATIONS = original

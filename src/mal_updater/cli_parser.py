@@ -416,7 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="MAL list status to refresh (repeatable); default/all fetches every status and prunes absent rows only after a complete run",
     )
     mal_list_refresh.add_argument("--page-size", type=int, default=100, help="MAL page size, clamped by the client to 1-100")
-    mal_list_refresh.add_argument("--max-pages", type=int, default=3, help="Positive maximum pages to fetch before preserving existing cache as partial (default: 3)")
+    mal_list_refresh.add_argument("--max-pages", type=int, default=3, help="Maximum MAL network attempts across fair status partitions; 0 is a hard no-network/no-mutation diagnostic run (default: 3)")
     mal_list_refresh.add_argument("--complete", action="store_true", help="Opt in to pruning absent rows, but only if MAL pagination reaches a terminal page within --max-pages")
     mal_list_refresh.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
     recommend_refresh = subparsers.add_parser(

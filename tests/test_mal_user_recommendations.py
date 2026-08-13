@@ -139,24 +139,41 @@ class PublicMalUserRecommendationsParserTests(unittest.TestCase):
                 public_base_url=PUBLIC_BASE_URL,
             )
 
-    def test_parser_ignores_out_of_origin_target_anime_links(self) -> None:
-        parsed = parse_public_user_recommendations_page(
-            _page(
-                [
-                    """
-                    <tr class="borderClass">
-                      <td><a href="https://evil.example/anime/2/Two">Two</a></td>
-                      <td>Recommended by <a href="/profile/private2">private2</a>.</td>
-                    </tr>
-                    """
-                ]
-            ),
-            source_mal_anime_id=1,
-            page_url=SOURCE_URL,
-            public_base_url=PUBLIC_BASE_URL,
-        )
+        with self.assertRaises(PublicMalUserRecommendationsError):
+            parse_public_user_recommendations_page(
+                _page([_block(2, "Two")], next_href="/anime/1/Cowboy_Bebop/userrecs?p=2")
+                + '<a rel="next" href="https://evil.example/anime/1/Cowboy_Bebop/userrecs?p=2">Next</a>',
+                source_mal_anime_id=1,
+                page_url=SOURCE_URL,
+                public_base_url=PUBLIC_BASE_URL,
+            )
 
-        self.assertEqual([], parsed.edges)
+        with self.assertRaisesRegex(PublicMalUserRecommendationsError, "conflicting next links"):
+            parse_public_user_recommendations_page(
+                _page([_block(2, "Two")], next_href="/anime/1/Cowboy_Bebop/userrecs?p=2")
+                + '<a rel="next" href="/anime/1/Cowboy_Bebop/userrecs?p=3">Next</a>',
+                source_mal_anime_id=1,
+                page_url=SOURCE_URL,
+                public_base_url=PUBLIC_BASE_URL,
+            )
+
+    def test_parser_ignores_out_of_origin_target_anime_links(self) -> None:
+        with self.assertRaisesRegex(PublicMalUserRecommendationsError, "terminal empty state"):
+            parse_public_user_recommendations_page(
+                _page(
+                    [
+                        """
+                        <tr class="borderClass">
+                          <td><a href="https://evil.example/anime/2/Two">Two</a></td>
+                          <td>Recommended by <a href="/profile/private2">private2</a>.</td>
+                        </tr>
+                        """
+                    ]
+                ),
+                source_mal_anime_id=1,
+                page_url=SOURCE_URL,
+                public_base_url=PUBLIC_BASE_URL,
+            )
 
     def test_validate_public_user_recs_url_requires_myanimelist_https_same_origin_and_path(self) -> None:
         self.assertEqual(
@@ -244,7 +261,7 @@ class PublicMalUserRecommendationsParserTests(unittest.TestCase):
                   <div class="floatRightHeader"><a href="/myrecommendations.php?go=make&amp;aid=1">Make a recommendation</a></div>
                   <h2 class="h2_overwrite">Recommendations</h2>
                 </div>
-                <div class="borderClass"><p>No recommendations have been made for this title yet.</p></div>
+                <div class="userrecs-empty empty-state"><p>No recommendations have been made for this title yet.</p></div>
               </div>
             </body></html>
             """,
@@ -255,6 +272,20 @@ class PublicMalUserRecommendationsParserTests(unittest.TestCase):
 
         self.assertEqual([], parsed.edges)
         self.assertIsNone(parsed.next_url)
+        self.assertTrue(parsed.explicit_empty)
+
+    def test_ordinary_empty_text_and_truncated_terminal_markup_fail_closed(self) -> None:
+        with self.assertRaisesRegex(PublicMalUserRecommendationsError, "dedicated structural evidence"):
+            parse_public_user_recommendations_page(
+                "<html><body><h2 class='h2_overwrite'>Recommendations</h2>"
+                "<p>No recommendations have been made for this title yet.</p></body></html>",
+                source_mal_anime_id=1, page_url=SOURCE_URL, public_base_url=PUBLIC_BASE_URL,
+            )
+        with self.assertRaisesRegex(PublicMalUserRecommendationsError, "incomplete or truncated"):
+            parse_public_user_recommendations_page(
+                "<html><body><h2 class='h2_overwrite'>Recommendations</h2><table>" + _block(2, "Two"),
+                source_mal_anime_id=1, page_url=SOURCE_URL, public_base_url=PUBLIC_BASE_URL,
+            )
 
 
 class PublicMalUserRecommendationsClientTests(unittest.TestCase):

@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +13,7 @@ from mal_updater.db import (
     MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     bootstrap_database,
+    claim_mal_public_userrecs_sources,
     connect,
     create_or_get_active_mal_public_userrecs_generation,
     discard_mal_public_userrecs_generation,
@@ -24,7 +26,11 @@ from mal_updater.db import (
     replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     restart_mal_public_userrecs_generation_after_drift,
+    release_mal_public_userrecs_source_claim,
+    renew_mal_public_userrecs_source_claim,
     resume_mal_public_userrecs_generation,
+    sync_mal_public_userrecs_source_queue,
+    schedule_mal_public_userrecs_generation_retry,
 )
 
 
@@ -132,6 +138,348 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
                     """,
                     (SOURCE_URL,),
                 )
+
+    def test_durable_queue_strict_class_priority_fairness_and_claim_cas(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path,
+            source_mal_anime_ids=[1, 2, 3, 4],
+            due_classes={1: "resumable", 2: "never_started", 3: "never_started", 4: "refresh_due"},
+        )
+        first = claim_mal_public_userrecs_sources(self.db_path, limit=2, claim_token="worker-a")
+        self.assertEqual([2, 3], [row.source_mal_anime_id for row in first])
+        self.assertEqual(["never_started", "never_started"], [row.queue_class for row in first])
+        concurrent = claim_mal_public_userrecs_sources(self.db_path, limit=2, claim_token="worker-b")
+        self.assertEqual([1, 4], [row.source_mal_anime_id for row in concurrent])
+        self.assertTrue({row.source_mal_anime_id for row in first}.isdisjoint(
+            {row.source_mal_anime_id for row in concurrent}
+        ))
+        for row in concurrent:
+            self.assertTrue(release_mal_public_userrecs_source_claim(
+                self.db_path,
+                source_mal_anime_id=row.source_mal_anime_id,
+                claim_token="worker-b",
+                queue_class=row.queue_class,
+                outcome="deferred",
+            ))
+
+        for row in first:
+            self.assertTrue(release_mal_public_userrecs_source_claim(
+                self.db_path,
+                source_mal_anime_id=row.source_mal_anime_id,
+                claim_token="worker-a",
+                queue_class="resumable",
+                outcome="paused",
+            ))
+        second = claim_mal_public_userrecs_sources(self.db_path, limit=1, claim_token="worker-b")
+        self.assertEqual([2], [row.source_mal_anime_id for row in second])
+
+    def test_empty_publish_requires_explicit_terminal_evidence(self) -> None:
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path,
+            source_mal_anime_id=1,
+            source_url=SOURCE_URL,
+        )
+        replace_mal_public_userrecs_staged_page(
+            self.db_path,
+            generation_id=generation.generation_id,
+            page_number=1,
+            page_url=SOURCE_URL,
+            page_fingerprint="empty",
+            next_url=None,
+            edges=[],
+        )
+        with self.assertRaisesRegex(ValueError, "terminal-empty proof"):
+            mark_mal_public_userrecs_generation_ready(self.db_path, generation_id=generation.generation_id)
+
+        replace_mal_public_userrecs_staged_page(
+            self.db_path,
+            generation_id=generation.generation_id,
+            page_number=1,
+            page_url=SOURCE_URL,
+            page_fingerprint="empty",
+            next_url=None,
+            edges=[],
+            terminal_evidence={
+                "terminal": True, "explicit_empty": True, "document_complete": True,
+                "recommendation_surface": True, "recommendation_row_count": 0,
+                "next_candidate_count": 0, "next_links_consistent": True,
+            },
+        )
+        ready = mark_mal_public_userrecs_generation_ready(self.db_path, generation_id=generation.generation_id)
+        self.assertTrue(ready.terminal_evidence["explicit_empty"])
+
+    def test_fast_same_class_claims_rotate_by_monotonic_sequence(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1, 2, 3],
+            due_classes={1: "resumable", 2: "resumable", 3: "resumable"},
+        )
+        selected: list[int] = []
+        sequences: list[int] = []
+        for index in range(4):
+            token = f"fast-{index}"
+            row = claim_mal_public_userrecs_sources(
+                self.db_path, limit=1, claim_token=token, claim_seconds=60
+            )[0]
+            selected.append(row.source_mal_anime_id)
+            sequences.append(row.selection_sequence)
+            self.assertTrue(release_mal_public_userrecs_source_claim(
+                self.db_path, source_mal_anime_id=row.source_mal_anime_id,
+                claim_token=token, queue_class="resumable", outcome="fast_rotation",
+            ))
+        self.assertEqual([1, 2, 3, 1], selected)
+        self.assertEqual(sorted(sequences), sequences)
+        self.assertEqual(4, len(set(sequences)))
+
+    def test_repeated_drift_is_bounded_and_quarantines_without_new_generation(self) -> None:
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL
+        )
+        for index in range(db.PUBLIC_USERRECS_MAX_DRIFT_RESTARTS):
+            generation = restart_mal_public_userrecs_generation_after_drift(
+                self.db_path, generation_id=generation.generation_id, reason=f"drift-{index}"
+            )
+            self.assertIsNone(generation.quarantined_at)
+        quarantined = restart_mal_public_userrecs_generation_after_drift(
+            self.db_path, generation_id=generation.generation_id, reason="drift-livelock"
+        )
+        self.assertEqual("failed", quarantined.status)
+        self.assertIsNotNone(quarantined.quarantined_at)
+        self.assertEqual("drift-livelock", quarantined.quarantine_reason)
+        self.assertIsNone(get_active_mal_public_userrecs_generation(self.db_path, source_mal_anime_id=1))
+
+    def test_claim_fence_rejects_expired_and_stale_worker_mutations(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1], due_classes={1: "never_started"}
+        )
+        claimed = claim_mal_public_userrecs_sources(
+            self.db_path, limit=1, claim_token="worker-a", claim_seconds=60
+        )[0]
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token="worker-a"
+        )
+        renewed = renew_mal_public_userrecs_source_claim(
+            self.db_path, source_mal_anime_id=1, generation_id=generation.generation_id,
+            claim_token="worker-a", expected_revision=generation.generation_revision, claim_seconds=60,
+        )
+        replace_mal_public_userrecs_staged_page(
+            self.db_path, generation_id=renewed.generation_id, page_number=1,
+            page_url=SOURCE_URL, page_fingerprint="fp", next_url=PAGE2_URL,
+            edges=[_edge(10, "Ten", 1)], claim_token="worker-a",
+            expected_revision=renewed.generation_revision,
+        )
+        current = get_mal_public_userrecs_generation(self.db_path, generation_id=generation.generation_id)
+        with self.assertRaisesRegex(RuntimeError, "stale claim token"):
+            pause_mal_public_userrecs_generation(
+                self.db_path, generation_id=generation.generation_id, cursor_url=PAGE2_URL,
+                claim_token="worker-b", expected_revision=current.generation_revision,
+            )
+        with connect(self.db_path) as conn:
+            conn.execute("UPDATE mal_public_userrecs_source_queue SET claim_expires_at = '2000-01-01' WHERE source_mal_anime_id = 1")
+            conn.execute("UPDATE mal_public_userrecs_crawl_generations SET claim_expires_at = '2000-01-01' WHERE generation_id = ?", (generation.generation_id,))
+            conn.commit()
+        with self.assertRaisesRegex(RuntimeError, "claim expired"):
+            pause_mal_public_userrecs_generation(
+                self.db_path, generation_id=generation.generation_id, cursor_url=PAGE2_URL,
+                claim_token="worker-a", expected_revision=current.generation_revision,
+            )
+        self.assertEqual("active", get_mal_public_userrecs_generation(
+            self.db_path, generation_id=generation.generation_id
+        ).status)
+
+    def test_expired_generation_lease_rebinds_to_reclaimer_and_fences_old_worker(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1], due_classes={1: "never_started"}
+        )
+        claim_mal_public_userrecs_sources(
+            self.db_path, limit=1, claim_token="worker-a", claim_seconds=60
+        )
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_title="Seed",
+            source_url=SOURCE_URL, claim_token="worker-a",
+        )
+        paused = pause_mal_public_userrecs_generation(
+            self.db_path, generation_id=generation.generation_id, cursor_url=SOURCE_URL,
+            claim_token="worker-a", expected_revision=generation.generation_revision,
+        )
+        identity = (
+            paused.generation_id, paused.source_mal_anime_id, paused.source_title,
+            paused.source_url, paused.status, paused.generation_key, paused.staged_revision,
+        )
+        with connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE mal_public_userrecs_source_queue SET claim_expires_at = '2000-01-01' WHERE source_mal_anime_id = 1"
+            )
+            conn.execute(
+                "UPDATE mal_public_userrecs_crawl_generations SET claim_expires_at = '2000-01-01' WHERE generation_id = ?",
+                (generation.generation_id,),
+            )
+            conn.commit()
+
+        reclaimed = claim_mal_public_userrecs_sources(
+            self.db_path, limit=1, claim_token="worker-b", claim_seconds=60
+        )
+        self.assertEqual([1], [row.source_mal_anime_id for row in reclaimed])
+        rebound = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_title="ignored",
+            source_url=PAGE2_URL, claim_token="worker-b",
+        )
+        self.assertEqual(identity, (
+            rebound.generation_id, rebound.source_mal_anime_id, rebound.source_title,
+            rebound.source_url, rebound.status, rebound.generation_key, rebound.staged_revision,
+        ))
+        self.assertEqual(paused.generation_revision + 1, rebound.generation_revision)
+        resumed = resume_mal_public_userrecs_generation(
+            self.db_path, generation_id=rebound.generation_id, claim_token="worker-b",
+            expected_revision=rebound.generation_revision,
+        )
+        progressed = replace_mal_public_userrecs_staged_page(
+            self.db_path, generation_id=resumed.generation_id, page_number=1,
+            page_url=SOURCE_URL, page_fingerprint="reclaimed", next_url=None,
+            edges=[_edge(10, "Ten", 1)], claim_token="worker-b",
+            expected_revision=resumed.generation_revision,
+        )
+        self.assertEqual(1, progressed.edge_count)
+        with self.assertRaisesRegex(RuntimeError, "stale claim token"):
+            pause_mal_public_userrecs_generation(
+                self.db_path, generation_id=generation.generation_id, cursor_url=PAGE2_URL,
+                claim_token="worker-a", expected_revision=paused.generation_revision,
+            )
+        with self.assertRaisesRegex(RuntimeError, "stale claim token"):
+            release_mal_public_userrecs_source_claim(
+                self.db_path, source_mal_anime_id=1, claim_token="worker-a",
+                queue_class="resumable", outcome="stale-release",
+                generation_id=generation.generation_id,
+            )
+        current = get_mal_public_userrecs_generation(
+            self.db_path, generation_id=generation.generation_id
+        )
+        ready = mark_mal_public_userrecs_generation_ready(
+            self.db_path, generation_id=generation.generation_id,
+            claim_token="worker-b", expected_revision=current.generation_revision,
+        )
+        with self.assertRaisesRegex(RuntimeError, "stale claim token"):
+            publish_mal_public_userrecs_generation(
+                self.db_path, generation_id=generation.generation_id,
+                claim_token="worker-a", expected_revision=ready.generation_revision,
+            )
+        with connect(self.db_path) as conn:
+            event_types = [str(row["event_type"]) for row in conn.execute(
+                "SELECT event_type FROM mal_public_userrecs_claim_events WHERE generation_id = ? ORDER BY id",
+                (generation.generation_id,),
+            )]
+            open_count = int(conn.execute(
+                "SELECT COUNT(*) AS count FROM mal_public_userrecs_crawl_generations WHERE source_mal_anime_id = 1 AND status IN ('active', 'paused', 'ready')"
+            ).fetchone()["count"])
+        self.assertIn("rebind", event_types)
+        self.assertEqual(1, open_count)
+
+    def test_live_generation_lease_denies_premature_takeover(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1], due_classes={1: "never_started"}
+        )
+        claim_mal_public_userrecs_sources(
+            self.db_path, limit=1, claim_token="worker-a", claim_seconds=60
+        )
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token="worker-a"
+        )
+        with connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE mal_public_userrecs_source_queue SET claim_token = 'worker-b', claim_expires_at = datetime('now', '+60 seconds') WHERE source_mal_anime_id = 1"
+            )
+            conn.commit()
+        with self.assertRaisesRegex(RuntimeError, "prior generation lease is still live"):
+            create_or_get_active_mal_public_userrecs_generation(
+                self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token="worker-b"
+            )
+        current = get_mal_public_userrecs_generation(self.db_path, generation_id=generation.generation_id)
+        self.assertEqual("worker-a", current.claim_token)
+        self.assertEqual(generation.generation_revision, current.generation_revision)
+
+    def test_two_direct_reclaimers_cannot_both_claim_and_bind_generation(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1], due_classes={1: "never_started"}
+        )
+        claim_mal_public_userrecs_sources(self.db_path, limit=1, claim_token="worker-a", claim_seconds=60)
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token="worker-a"
+        )
+        with connect(self.db_path) as conn:
+            conn.execute("UPDATE mal_public_userrecs_source_queue SET claim_expires_at = '2000-01-01' WHERE source_mal_anime_id = 1")
+            conn.execute(
+                "UPDATE mal_public_userrecs_crawl_generations SET claim_expires_at = '2000-01-01' WHERE generation_id = ?",
+                (generation.generation_id,),
+            )
+            conn.commit()
+
+        def reclaim(token: str) -> tuple[str, bool]:
+            claimed = claim_mal_public_userrecs_sources(
+                self.db_path, limit=1, claim_token=token, claim_seconds=60
+            )
+            if not claimed:
+                return token, False
+            rebound = create_or_get_active_mal_public_userrecs_generation(
+                self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token=token
+            )
+            return token, rebound.claim_token == token
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(reclaim, ("worker-b", "worker-c")))
+        winners = [token for token, bound in results if bound]
+        self.assertEqual(1, len(winners))
+        current = get_mal_public_userrecs_generation(self.db_path, generation_id=generation.generation_id)
+        self.assertEqual(winners[0], current.claim_token)
+        with connect(self.db_path) as conn:
+            open_count = int(conn.execute(
+                "SELECT COUNT(*) AS count FROM mal_public_userrecs_crawl_generations WHERE source_mal_anime_id = 1 AND status IN ('active', 'paused', 'ready')"
+            ).fetchone()["count"])
+        self.assertEqual(1, open_count)
+
+    def test_retry_schedule_updates_generation_and_queue_atomically(self) -> None:
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1], due_classes={1: "never_started"}
+        )
+        claim_mal_public_userrecs_sources(self.db_path, limit=1, claim_token="worker", claim_seconds=60)
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token="worker"
+        )
+        paused = pause_mal_public_userrecs_generation(
+            self.db_path, generation_id=generation.generation_id, cursor_url=SOURCE_URL,
+            claim_token="worker", expected_revision=generation.generation_revision,
+        )
+        retry_at = "2999-01-01T00:00:00Z"
+        scheduled = schedule_mal_public_userrecs_generation_retry(
+            self.db_path, generation_id=generation.generation_id,
+            retry_class="transient_fetch_failure", next_retry_at=retry_at,
+            claim_token="worker", expected_revision=paused.generation_revision,
+        )
+        with connect(self.db_path) as conn:
+            queue = conn.execute("SELECT * FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = 1").fetchone()
+        self.assertEqual(retry_at, scheduled.next_retry_at)
+        self.assertEqual("retry_due", queue["queue_class"])
+        self.assertEqual(retry_at, queue["next_retry_at"])
+        self.assertEqual("transient_fetch_failure", queue["last_error_code"])
+
+    def test_nonadjacent_page_overlap_is_rejected(self) -> None:
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL
+        )
+        replace_mal_public_userrecs_staged_page(
+            self.db_path, generation_id=generation.generation_id, page_number=1,
+            page_url=SOURCE_URL, page_fingerprint="one", next_url=PAGE2_URL,
+            edges=[_edge(10, "Ten", 1)],
+        )
+        replace_mal_public_userrecs_staged_page(
+            self.db_path, generation_id=generation.generation_id, page_number=2,
+            page_url=PAGE2_URL, page_fingerprint="two", next_url=PAGE3_URL,
+            edges=[_edge(20, "Twenty", 1, page_url=PAGE2_URL)],
+        )
+        with self.assertRaisesRegex(ValueError, "overlaps prior generation pages"):
+            replace_mal_public_userrecs_staged_page(
+                self.db_path, generation_id=generation.generation_id, page_number=3,
+                page_url=PAGE3_URL, page_fingerprint="three", next_url=None,
+                edges=[_edge(10, "Ten again", 2, page_url=PAGE3_URL)],
+            )
 
     def test_page_replacement_and_pause_resume_cursor_persistence(self) -> None:
         generation = create_or_get_active_mal_public_userrecs_generation(
@@ -472,7 +820,7 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
             page_url=PAGE2_URL,
             page_fingerprint="fp-2",
             next_url=None,
-            edges=[_edge(10, "Ten later", 5, page_url=PAGE2_URL), _edge(30, "Thirty", 1, page_url=PAGE2_URL)],
+            edges=[_edge(11, "Eleven later", 5, page_url=PAGE2_URL), _edge(30, "Thirty", 1, page_url=PAGE2_URL)],
             fetched_at=FETCHED_AT,
         )
         ready = mark_mal_public_userrecs_generation_ready(self.db_path, generation_id=generation.generation_id)
@@ -480,11 +828,11 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
 
         result = publish_mal_public_userrecs_generation(self.db_path, generation_id=generation.generation_id)
 
-        self.assertEqual(3, result.published_edge_count)
+        self.assertEqual(4, result.published_edge_count)
         rows = self._published_rows()
-        self.assertEqual([10, 20, 30], [int(row["target_mal_anime_id"]) for row in rows])
+        self.assertEqual([10, 11, 20, 30], [int(row["target_mal_anime_id"]) for row in rows])
         counts = {int(row["target_mal_anime_id"]): int(row["num_recommendations"]) for row in rows}
-        self.assertEqual({10: 5, 20: 8, 30: 1}, counts)
+        self.assertEqual({10: 2, 11: 5, 20: 8, 30: 1}, counts)
         self.assertTrue(all(row["harvest_source"] == MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS for row in rows))
         self.assertTrue(all(int(row["complete_harvest"]) == 1 for row in rows))
         provenance = json.loads(rows[0]["provenance_json"])
@@ -492,7 +840,7 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
         self.assertEqual(generation.generation_id, provenance["generation_id"])
         status = self._harvest_status()
         self.assertEqual("fetched", status["status"])
-        self.assertEqual(3, status["num_edges"])
+        self.assertEqual(4, status["num_edges"])
         self.assertEqual(MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS, status["source_type"])
         self.assertEqual(1, status["is_complete"])
         self.assertEqual(2, status["pages_fetched"])

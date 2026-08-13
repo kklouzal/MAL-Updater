@@ -80,3 +80,11 @@ The historical user-systemd CLI path remains for advanced/manual installs from a
 ## Release/support policy
 
 MAL-Updater remains alpha software. Version 0.2.9 finishes the recommendation dashboard title/provider-proof polish without changing provider/MAL behavior; version 0.2.8 introduced the broader dashboard presentation improvements. Provider/MAL authentication, conservative MAL-write controls, and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+
+### Complete public MAL user recommendations
+
+`recommend-refresh-full-userrecs` uses a durable strict-priority source queue and staged generations, with monotonic selection-sequence fairness and token/revision-fenced expiring claims. `max_pages` counts actual network attempts, including final revalidation of every staged page; orchestrated calls disable inner retries and zero returns before queue or generation mutation. Drift, truncation, unsafe/conflicting pagination, cross-page overlap, stale claims, or insufficient validation budget preserve last-known-good edges. Empty publication requires dedicated structural MAL empty-state proof plus final validation. See `references/OPERATIONS.md`.
+
+### Durable MAL user-list refresh
+
+`mal-list-refresh` persists an account/query generation and a fair per-status traversal queue. Every parsed page, staged row set, opaque same-origin cursor, ordered fingerprint, and anchor commits atomically. Bounded runs resume the exact cursor; they publish/prune only after every requested partition has explicit terminal proof and page-1/final-boundary revalidation. MAL exposes offset/rank-relative pagination, not immutable snapshot tokens, so concurrent insertion/deletion/reorder is detected and failed closed rather than silently accepted; repeated drift is quarantined and the published list remains last-known-good. `--max-pages 0` performs no network call and no refresh-state mutation.

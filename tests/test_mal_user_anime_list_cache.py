@@ -62,6 +62,9 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         with connect(self.db_path) as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_cache)")}
             lifecycle_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_refresh_generations)")}
+            page_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_staged_pages)")}
+            staged_row_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_staged_rows)")}
+            authority_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_account_authority)")}
             indexes = {row["name"] for row in conn.execute("PRAGMA index_list(mal_user_anime_list_cache)")}
             lifecycle_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(mal_user_anime_list_refresh_generations)")}
             migrations = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
@@ -97,11 +100,16 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         self.assertIn("status", lifecycle_columns)
         self.assertIn("fetched_at", lifecycle_columns)
         self.assertIn("completed_at", lifecycle_columns)
+        self.assertTrue({"publication_epoch", "identity_assertion_nonce", "identity_asserted_revision"} <= lifecycle_columns)
+        self.assertTrue({"page_offset", "expected_page_size", "validated_at"} <= page_columns)
+        self.assertIn("mal_status", staged_row_columns)
+        self.assertTrue({"publication_epoch", "current_generation"} <= authority_columns)
         self.assertIn("idx_mal_user_anime_list_refresh_generations_status", lifecycle_indexes)
         self.assertIn("uq_mal_user_anime_list_refresh_generations_active", lifecycle_indexes)
         self.assertIn("007_mal_user_anime_list_cache.sql", migrations)
         self.assertIn("011_mal_user_anime_list_preference_fields.sql", migrations)
         self.assertIn("019_mal_user_anime_list_refresh_generations.sql", migrations)
+        self.assertIn("022_mal_user_list_durable_pagination.sql", migrations)
 
         db_path = Path(self.temp_dir.name) / "upgrade.sqlite3"
         with connect(db_path) as conn:
@@ -644,52 +652,284 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
         self.assertEqual("Current", rows[1].title)
 
     def test_top_level_refresh_superseded_after_collection_returns_controlled_failure(self) -> None:
-        project_root = Path(self.temp_dir.name) / "refresh-project"
-        config = load_config(project_root)
+        config = load_config(Path(self.temp_dir.name) / "refresh-project")
         bootstrap_database(config.db_path)
-        replace_mal_user_anime_list_cache_generation(
-            config.db_path,
-            items=[_list_item(90, "Old", "completed", score=8)],
-            refresh_run_id="old",
-            fetched_at="2026-07-19T00:00:00Z",
-            prune_absent=True,
-        )
-
-        def superseding_pages(**_: object):
-            yield {"data": [_list_item(100, "Must Not Land", "watching", score=7)], "paging": {}}
-            begin_mal_user_anime_list_cache_refresh(
-                config.db_path,
-                refresh_run_id="overlapping-new-owner",
-                fetched_at="2026-07-19T02:00:00Z",
-            )
-
-        with patch(
-            "mal_updater.recommendation_metadata.MalClient.iter_my_anime_list_pages",
-            side_effect=superseding_pages,
+        with patch("mal_updater.recommendation_metadata.MalClient.get_my_user", return_value={"id": 7, "name": "owner"}), patch(
+            "mal_updater.recommendation_metadata.MalClient.get_my_anime_list_page_url", side_effect=RuntimeError("unrelated ownership mutation")
         ):
-            summary = refresh_mal_user_anime_list_cache(config, max_pages=3, prune_on_complete=True)
-
-        self.assertEqual("failed", summary.status)
-        self.assertTrue(summary.partial)
-        self.assertEqual(1, summary.pages)
-        self.assertEqual(1, summary.items)
-        self.assertIn("terminal (failed)", summary.error or "")
-        self.assertEqual([90], [row.mal_anime_id for row in list_mal_user_anime_list_cache(config.db_path)])
-        lifecycle = _refresh_lifecycle_row(config.db_path, summary.generation)
-        self.assertIsNotNone(lifecycle)
-        assert lifecycle is not None
-        self.assertEqual("failed", lifecycle["status"])
-        self.assertEqual("superseded by a newer MAL user anime list refresh", lifecycle["error"])
+            with self.assertRaisesRegex(RuntimeError, "unrelated ownership"):
+                refresh_mal_user_anime_list_cache(config, max_pages=3, prune_on_complete=True)
 
     def test_top_level_refresh_does_not_swallow_unrelated_runtime_error(self) -> None:
         config = load_config(Path(self.temp_dir.name) / "runtime-error-project")
         bootstrap_database(config.db_path)
-        with patch(
-            "mal_updater.recommendation_metadata.MalClient.iter_my_anime_list_pages",
+        with patch("mal_updater.recommendation_metadata.MalClient.get_my_user", return_value={"id": 7, "name": "owner"}), patch(
+            "mal_updater.recommendation_metadata.MalClient.get_my_anime_list_page_url",
             side_effect=RuntimeError("unrelated bug"),
         ):
             with self.assertRaisesRegex(RuntimeError, "unrelated bug"):
                 refresh_mal_user_anime_list_cache(config, max_pages=3)
+
+
+class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "durable.sqlite3"
+        bootstrap_database(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def partitions() -> list[dict]:
+        return [
+            {"partition_key": "completed", "requested_status": "completed", "ordinal": 0,
+             "initial_url": "https://api.myanimelist.net/v2/users/@me/animelist?limit=100&fields=x&status=completed"},
+            {"partition_key": "watching", "requested_status": "watching", "ordinal": 1,
+             "initial_url": "https://api.myanimelist.net/v2/users/@me/animelist?limit=100&fields=x&status=watching"},
+        ]
+
+    def claim(self, token: str = "worker"):
+        from mal_updater.db import claim_or_create_mal_user_anime_list_traversal
+        return claim_or_create_mal_user_anime_list_traversal(
+            self.db_path, account_id=7, account_name="owner", query_identity="query", query={"statuses":["completed","watching"]},
+            partitions=self.partitions(), claim_token=token, fetched_at="2026-08-13T00:00:00Z", claim_seconds=60,
+        )
+
+    @staticmethod
+    def validated_generation(db_path: Path, statuses: list[str | None], token: str = "worker"):
+        from mal_updater.db import (
+            checkpoint_mal_user_anime_list_page,
+            checkpoint_mal_user_anime_list_revalidation,
+            claim_or_create_mal_user_anime_list_traversal,
+            load_validated_mal_user_anime_list_staging,
+            persist_mal_user_anime_list_identity_assertion,
+            select_mal_user_anime_list_partition_work,
+        )
+        names = ["all" if status is None else status for status in statuses]
+        partitions = [
+            {
+                "partition_key": name,
+                "requested_status": status,
+                "ordinal": ordinal,
+                "initial_url": (
+                    "https://api.myanimelist.net/v2/users/@me/animelist?limit=100&fields=x"
+                    + ("" if status is None else f"&status={status}")
+                ),
+            }
+            for ordinal, (name, status) in enumerate(zip(names, statuses, strict=True))
+        ]
+        generation, _ = claim_or_create_mal_user_anime_list_traversal(
+            db_path, account_id=7, account_name="owner", query_identity="direct-"+"-".join(names),
+            query={"statuses": statuses, "page_size": 100}, partitions=partitions, claim_token=token,
+            fetched_at="2026-08-13T00:00:00Z", claim_seconds=60,
+        )
+        for ordinal, status in enumerate(statuses):
+            generation, partition, kind, url = select_mal_user_anime_list_partition_work(
+                db_path, generation=generation.generation, claim_token=token
+            )
+            assert kind == "page"
+            item_status = "watching" if status is None else status
+            item = _list_item(1000 + ordinal, f"New {ordinal}", item_status)
+            fingerprint = f"fingerprint-{ordinal}"
+            anchor = {"partition": partition.partition_key, "ordinal": ordinal}
+            generation, _ = checkpoint_mal_user_anime_list_page(
+                db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token=token, expected_revision=generation.revision, page_url=url, next_url=None,
+                items=[item], fingerprint=fingerprint, anchor=anchor, terminal_explicit=True,
+                empty_proven=False, fetched_at=f"2026-08-13T00:00:0{ordinal + 1}Z",
+            )
+        for _ in statuses:
+            generation, partition, kind, url = select_mal_user_anime_list_partition_work(
+                db_path, generation=generation.generation, claim_token=token
+            )
+            assert kind == "validate_page1"
+            ordinal = names.index(partition.partition_key)
+            generation, _ = checkpoint_mal_user_anime_list_revalidation(
+                db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token=token, expected_revision=generation.revision, kind=kind, page_url=url,
+                fingerprint=f"fingerprint-{ordinal}",
+                anchor={"partition": partition.partition_key, "ordinal": ordinal},
+            )
+        generation = persist_mal_user_anime_list_identity_assertion(
+            db_path, generation=generation.generation, claim_token=token,
+            expected_revision=generation.revision, account_id=7, account_name="owner", nonce="nonce-"+token,
+        )
+        generation, _, _ = load_validated_mal_user_anime_list_staging(
+            db_path, generation=generation.generation, claim_token=token, expected_revision=generation.revision,
+        )
+        return generation
+
+    def test_fair_never_started_rotation_and_partial_resume_cursor(self) -> None:
+        from mal_updater.db import select_mal_user_anime_list_partition_work, checkpoint_mal_user_anime_list_page
+        generation, _ = self.claim()
+        generation, completed, kind, url = select_mal_user_anime_list_partition_work(self.db_path, generation=generation.generation, claim_token="worker")
+        self.assertEqual(("completed", "page"), (completed.partition_key, kind))
+        full_page = [_list_item(index, f"Item {index}", "completed") for index in range(1, 101)]
+        generation, _ = checkpoint_mal_user_anime_list_page(
+            self.db_path, generation=generation.generation, partition_key="completed", claim_token="worker", expected_revision=generation.revision,
+            page_url=url, next_url=url+"&offset=100", items=full_page, fingerprint="a", anchor={"a":1},
+            terminal_explicit=False, empty_proven=False, fetched_at="2026-08-13T00:00:01Z")
+        generation, watching, kind, _ = select_mal_user_anime_list_partition_work(self.db_path, generation=generation.generation, claim_token="worker")
+        self.assertEqual(("watching", "page"), (watching.partition_key, kind))
+
+    def test_checkpoint_is_atomic_and_nonadjacent_duplicate_rolls_back(self) -> None:
+        from mal_updater.db import select_mal_user_anime_list_partition_work, checkpoint_mal_user_anime_list_page
+        generation, _ = self.claim()
+        generation, partition, _, url = select_mal_user_anime_list_partition_work(self.db_path, generation=generation.generation, claim_token="worker")
+        with self.assertRaisesRegex(ValueError, "within page"):
+            checkpoint_mal_user_anime_list_page(self.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token="worker", expected_revision=generation.revision, page_url=url, next_url=None,
+                items=[_list_item(1,"One","completed"),_list_item(1,"Again","completed")], fingerprint="x",anchor={},
+                terminal_explicit=True,empty_proven=False,fetched_at="2026-08-13T00:00:01Z")
+        with connect(self.db_path) as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) n FROM mal_user_anime_list_staged_pages").fetchone()["n"])
+
+    def test_stale_revision_and_expired_worker_handoff(self) -> None:
+        from mal_updater.db import select_mal_user_anime_list_partition_work, claim_or_create_mal_user_anime_list_traversal
+        generation, _ = self.claim("first")
+        generation2, _, _, _ = select_mal_user_anime_list_partition_work(self.db_path, generation=generation.generation, claim_token="first")
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "revision"):
+            from mal_updater.db import release_mal_user_anime_list_traversal_claim
+            release_mal_user_anime_list_traversal_claim(self.db_path,generation=generation.generation,claim_token="first",expected_revision=generation.revision)
+        with connect(self.db_path) as conn:
+            conn.execute("UPDATE mal_user_anime_list_refresh_generations SET claim_expires_at='2000-01-01' WHERE generation=?",(generation2.generation,))
+        reclaimed, _ = claim_or_create_mal_user_anime_list_traversal(self.db_path,account_id=7,account_name="owner",query_identity="query",
+            query={"statuses":["completed","watching"]},partitions=self.partitions(),claim_token="second",fetched_at="2026-08-13T00:00:00Z")
+        self.assertEqual("second", reclaimed.claim_token)
+
+    def test_quarantined_generation_cannot_be_reclaimed_or_selected(self) -> None:
+        from mal_updater.db import (
+            claim_or_create_mal_user_anime_list_traversal,
+            record_mal_user_anime_list_request_failure,
+            select_mal_user_anime_list_partition_work,
+        )
+        generation, _ = self.claim("first")
+        generation, partition, _, _ = select_mal_user_anime_list_partition_work(
+            self.db_path, generation=generation.generation, claim_token="first"
+        )
+        generation = record_mal_user_anime_list_request_failure(
+            self.db_path, generation=generation.generation, partition_key=partition.partition_key,
+            claim_token="first", expected_revision=generation.revision, retry_class="auth_or_contract",
+            error="identity contract failed", next_retry_at=None, quarantine=True,
+        )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "explicit safe reinitialization"):
+            claim_or_create_mal_user_anime_list_traversal(
+                self.db_path, account_id=7, account_name="owner", query_identity="query",
+                query={"statuses":["completed","watching"]}, partitions=self.partitions(),
+                claim_token="second", fetched_at="2026-08-13T00:01:00Z",
+            )
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "not active|quarantined"):
+            select_mal_user_anime_list_partition_work(
+                self.db_path, generation=generation.generation, claim_token="first"
+            )
+
+    def test_short_nonterminal_page_and_bad_next_offset_reject_atomically(self) -> None:
+        from mal_updater.db import checkpoint_mal_user_anime_list_page, select_mal_user_anime_list_partition_work
+        generation, _ = self.claim()
+        generation, partition, _, url = select_mal_user_anime_list_partition_work(
+            self.db_path, generation=generation.generation, claim_token="worker"
+        )
+        with self.assertRaisesRegex(ValueError, "exactly the expected page size"):
+            checkpoint_mal_user_anime_list_page(
+                self.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token="worker", expected_revision=generation.revision, page_url=url,
+                next_url=url+"&offset=100", items=[_list_item(1,"One","completed")],
+                fingerprint="short", anchor={}, terminal_explicit=False, empty_proven=False,
+                fetched_at="2026-08-13T00:00:01Z",
+            )
+        full = [_list_item(index, f"Item {index}", "completed") for index in range(1, 101)]
+        with self.assertRaisesRegex(ValueError, "current offset plus full page size"):
+            checkpoint_mal_user_anime_list_page(
+                self.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token="worker", expected_revision=generation.revision, page_url=url,
+                next_url=url+"&offset=99", items=full, fingerprint="bad-offset", anchor={},
+                terminal_explicit=False, empty_proven=False, fetched_at="2026-08-13T00:00:01Z",
+            )
+        with connect(self.db_path) as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) n FROM mal_user_anime_list_staged_pages").fetchone()["n"])
+
+    def test_empty_publication_requires_strong_validation_and_preserves_lkg_on_failure(self) -> None:
+        replace_mal_user_anime_list_cache_generation(self.db_path,items=[_list_item(99,"LKG","completed")],refresh_run_id="lkg",fetched_at="2026-08-12T00:00:00Z",prune_absent=True)
+        generation, _ = self.claim()
+        from mal_updater.db import load_validated_mal_user_anime_list_staging
+        with self.assertRaisesRegex(ValueError,"validated terminal proof"):
+            load_validated_mal_user_anime_list_staging(self.db_path,generation=generation.generation,claim_token="worker",expected_revision=generation.revision)
+        self.assertEqual([99],[row.mal_anime_id for row in list_mal_user_anime_list_cache(self.db_path)])
+
+    def test_direct_db_subset_publication_prunes_only_exact_persisted_status_scope(self) -> None:
+        from mal_updater.db import publish_mal_user_anime_list_staging
+        replace_mal_user_anime_list_cache_generation(
+            self.db_path,
+            items=[
+                _list_item(1,"Old completed","completed"),
+                _list_item(2,"Watching","watching"),
+                _list_item(3,"Future","dropped"),
+            ],
+            refresh_run_id="scope-lkg",fetched_at="2026-08-12T00:00:00Z",prune_absent=True,
+        )
+        generation = self.validated_generation(self.db_path, ["completed"])
+        summary = publish_mal_user_anime_list_staging(
+            self.db_path, generation=generation.generation, claim_token="worker",
+            expected_revision=generation.revision, delete_absent=True,
+        )
+        self.assertEqual(1, summary.pruned)
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT mal_anime_id,list_status FROM mal_user_anime_list_cache ORDER BY mal_anime_id"
+            ).fetchall()
+        self.assertEqual([(2,"watching"),(3,"dropped"),(1000,"completed")], [tuple(row) for row in rows])
+
+    def test_exact_publication_digest_rejects_post_validation_tampering_matrix_and_releases_claim(self) -> None:
+        from mal_updater.db import publish_mal_user_anime_list_staging
+        mutations = {
+            "row_json_serialization": "UPDATE mal_user_anime_list_staged_rows SET item_json=item_json||' ' WHERE generation=?",
+            "row_status": "UPDATE mal_user_anime_list_staged_rows SET mal_status='watching' WHERE generation=?",
+            "page_url": "UPDATE mal_user_anime_list_staged_pages SET page_url=page_url||'&tampered=1' WHERE generation=?",
+            "page_next_marker": "UPDATE mal_user_anime_list_staged_pages SET next_url=page_url WHERE generation=?",
+            "page_count": "UPDATE mal_user_anime_list_staged_pages SET item_count=item_count+1 WHERE generation=?",
+            "page_fingerprint": "UPDATE mal_user_anime_list_staged_pages SET page_fingerprint='tampered' WHERE generation=?",
+            "page_anchor": "UPDATE mal_user_anime_list_staged_pages SET anchor_json='{}' WHERE generation=?",
+            "page_validation_timestamp": "UPDATE mal_user_anime_list_staged_pages SET validated_at='2000-01-01' WHERE generation=?",
+            "partition_cursor": "UPDATE mal_user_anime_list_refresh_partitions SET next_url=initial_url WHERE generation=?",
+            "partition_counter": "UPDATE mal_user_anime_list_refresh_partitions SET item_count=item_count+1 WHERE generation=?",
+            "partition_terminal_marker": "UPDATE mal_user_anime_list_refresh_partitions SET terminal=0 WHERE generation=?",
+            "generation_query_bytes": "UPDATE mal_user_anime_list_refresh_generations SET query_json=query_json||' ' WHERE generation=?",
+            "generation_epoch": "UPDATE mal_user_anime_list_refresh_generations SET publication_epoch=publication_epoch+1 WHERE generation=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "tamper.sqlite3"
+                bootstrap_database(db_path)
+                replace_mal_user_anime_list_cache_generation(
+                    db_path,items=[_list_item(9,"LKG","watching")],refresh_run_id="lkg",
+                    fetched_at="2026-08-12T00:00:00Z",prune_absent=True,
+                )
+                generation = self.validated_generation(db_path, ["completed"])
+                with connect(db_path) as conn:
+                    conn.execute(statement, (generation.generation,))
+                    conn.commit()
+                with self.assertRaises((ValueError, MalUserAnimeListRefreshConflictError)):
+                    publish_mal_user_anime_list_staging(
+                        db_path, generation=generation.generation, claim_token="worker",
+                        expected_revision=generation.revision, delete_absent=True,
+                    )
+                self.assertEqual([9], [row.mal_anime_id for row in list_mal_user_anime_list_cache(db_path)])
+                with connect(db_path) as conn:
+                    owner = conn.execute(
+                        "SELECT status,claim_token,claim_expires_at FROM mal_user_anime_list_refresh_generations WHERE generation=?",
+                        (generation.generation,),
+                    ).fetchone()
+                self.assertEqual(("active",None,None), tuple(owner))
+
+    def test_migration_backfills_and_preserves_complete_history(self) -> None:
+        replace_mal_user_anime_list_cache_generation(self.db_path,items=[_list_item(5,"Five","completed")],refresh_run_id="old",fetched_at="2026-08-10T00:00:00Z",prune_absent=True)
+        with connect(self.db_path) as conn:
+            row=conn.execute("SELECT account_key,query_identity,logic_version FROM mal_user_anime_list_refresh_generations WHERE refresh_run_id='old'").fetchone()
+        self.assertEqual("legacy",row["account_key"])
+        self.assertEqual("legacy",row["query_identity"])
+        self.assertEqual("mal-user-list-pagination-v2",row["logic_version"])
+        self.assertEqual([5],[item.mal_anime_id for item in list_mal_user_anime_list_cache(self.db_path)])
 
 
 if __name__ == "__main__":

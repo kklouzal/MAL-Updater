@@ -135,7 +135,7 @@ sync_apply = 8  # built-in default shown explicitly here; positive values bound 
 recommend_metadata_refresh = 3
 recommend_metadata_discovery_targets = 5
 recommend_full_harvest = 2  # positive source-title batch size; 0 disables daemon lane rather than becoming unbounded
-recommend_full_harvest_pages = 3  # advertised same-origin public userrecs pages per source per run; unfinished coherent generations pause/resume before terminal atomic publish
+recommend_full_harvest_pages = 3  # advertised same-origin pages/source/run; 0 means fetch none (not unlimited); resume revalidates page 1/boundary before atomic terminal publish
 recommend_provider_eligibility_candidates = 2  # per provider per hourly lane; 0 disables the daemon lane rather than becoming unbounded
 recommend_provider_eligibility_search_results = 5
 recommend_provider_eligibility_queries_per_candidate = 1
@@ -212,3 +212,7 @@ crunchyroll_password = "crunchyroll_password.txt"
 hidive_username = "hidive_username.txt"
 hidive_password = "hidive_password.txt"
 openclaw_hook_token = "openclaw_hook_token.txt"
+
+# MAL list refresh execution budget is configured under the existing
+# [service.execute_limits] mal_list_refresh_pages key. It counts every network
+# attempt (continuation and validation); 0 is a hard no-network/no-mutation run.

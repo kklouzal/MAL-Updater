@@ -754,7 +754,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual([921], [item["mal_anime_id"] for item in summary.selected_candidates])
         self.assertEqual("uncovered", summary.selected_candidates[0]["selection_class"])
 
-    def test_limit_two_reserves_one_due_and_one_uncovered_slot(self):
+    def test_limit_two_uses_all_capacity_for_uncovered_before_due_refresh(self):
         self._insert_meta(922, english="Overdue Refresh")
         self._insert_meta(923, english="Uncovered First")
         self._insert_meta(924, english="Uncovered Second")
@@ -776,10 +776,10 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             now=datetime(2026, 2, 2, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(["expired_refresh_due", "uncovered"], [
+        self.assertEqual(["uncovered", "uncovered"], [
             item["selection_class"] for item in summary.selected_candidates
         ])
-        self.assertEqual([922, 923], [item["mal_anime_id"] for item in summary.selected_candidates])
+        self.assertEqual([923, 924], [item["mal_anime_id"] for item in summary.selected_candidates])
 
     def test_effective_refresh_horizon_covers_capacity_traversal_with_margin(self):
         self.config.service.provider_eligibility_refresh_every_seconds = 3600

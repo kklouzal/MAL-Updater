@@ -25,6 +25,9 @@ class MalListRefreshCliTests(unittest.TestCase):
         self.assertTrue(args.complete)
         self.assertEqual("summary", args.format)
 
+        args = parser.parse_args(["mal-list-refresh", "--max-pages", "0"])
+        self.assertEqual(0, args.max_pages)
+
     def test_command_reports_partial_without_treating_it_as_complete_or_failed_process(self) -> None:
         summary = MalUserAnimeListRefreshSummary(
             status="partial",
@@ -52,6 +55,14 @@ class MalListRefreshCliTests(unittest.TestCase):
         self.assertEqual("partial", payload["status"])
         self.assertTrue(payload["partial"])
         self.assertEqual(3, payload["pages"])
+
+    def test_command_preserves_zero_budget_for_hard_no_network_contract(self) -> None:
+        summary = MalUserAnimeListRefreshSummary(status="partial", refresh_run_id="", generation=0, partial=True)
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "mal_updater.cli.refresh_mal_user_anime_list_cache", return_value=summary,
+        ) as refresh, patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(0, _cmd_mal_list_refresh(Path(tmp), ["all"], 100, 0, False, "json"))
+        self.assertEqual(0, refresh.call_args.kwargs["max_pages"])
 
     def test_command_summary_output_includes_counts(self) -> None:
         summary = MalUserAnimeListRefreshSummary(

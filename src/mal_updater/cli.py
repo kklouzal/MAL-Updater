@@ -3077,7 +3077,7 @@ def _cmd_mal_list_refresh(
         config,
         statuses=statuses or ["all"],
         page_size=page_size,
-        max_pages=_normalize_limit(max_pages),
+        max_pages=max(0, int(max_pages)),
         prune_on_complete=complete,
     )
     if output_format == "summary":

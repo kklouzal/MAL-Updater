@@ -41,6 +41,8 @@ class MigrationCatalogTests(unittest.TestCase):
                 "018_provider_title_search_cache_full_key.sql",
                 "019_mal_user_anime_list_refresh_generations.sql",
                 "020_provider_eligibility_refresh_lifecycle.sql",
+                "021_public_userrecs_durable_queue_and_snapshot_guards.sql",
+                "022_mal_user_list_durable_pagination.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -89,6 +91,8 @@ class MigrationCatalogTests(unittest.TestCase):
                     "018_provider_title_search_cache_full_key.sql",
                     "019_mal_user_anime_list_refresh_generations.sql",
                     "020_provider_eligibility_refresh_lifecycle.sql",
+                    "021_public_userrecs_durable_queue_and_snapshot_guards.sql",
+                    "022_mal_user_list_durable_pagination.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -116,6 +120,8 @@ class MigrationCatalogTests(unittest.TestCase):
                     "018_provider_title_search_cache_full_key.sql",
                     "019_mal_user_anime_list_refresh_generations.sql",
                     "020_provider_eligibility_refresh_lifecycle.sql",
+                    "021_public_userrecs_durable_queue_and_snapshot_guards.sql",
+                    "022_mal_user_list_durable_pagination.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -454,6 +460,12 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertTrue({"generation_id", "page_number", "target_mal_anime_id", "target_title", "num_recommendations"} <= userrecs_edge_columns)
                 userrecs_event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_public_userrecs_crawl_events)")}
                 self.assertTrue({"generation_id", "source_mal_anime_id", "event_type", "page_number", "page_url", "error"} <= userrecs_event_columns)
+                mal_list_generation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_refresh_generations)")}
+                self.assertTrue({"publication_epoch", "identity_assertion_nonce", "identity_asserted_revision"} <= mal_list_generation_columns)
+                mal_list_page_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_staged_pages)")}
+                self.assertTrue({"page_offset", "expected_page_size", "validated_at"} <= mal_list_page_columns)
+                mal_list_row_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mal_user_anime_list_staged_rows)")}
+                self.assertIn("mal_status", mal_list_row_columns)
                 watchlist_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_watchlist)")}
                 self.assertTrue({"list_id", "list_name", "list_kind", "provider_item_id", "provider_item_type", "position"} <= watchlist_columns)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])

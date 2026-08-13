@@ -1895,12 +1895,12 @@ _DUE_SELECTION_CLASSES = frozenset({
 
 _SELECTION_CLASS_PRIORITY = {
     "force_refresh": 0,
-    "mapping_refresh_due": 1,
-    "failed_retry_due": 2,
-    "expired_refresh_due": 3,
-    "stale_refresh_due": 4,
-    "logic_refresh_due": 5,
-    "uncovered": 6,
+    "uncovered": 1,
+    "mapping_refresh_due": 2,
+    "failed_retry_due": 3,
+    "expired_refresh_due": 4,
+    "stale_refresh_due": 5,
+    "logic_refresh_due": 6,
 }
 
 
@@ -2151,14 +2151,10 @@ def _select_provider_enrichment_candidates(
         [candidate for candidate in ranked if candidate.selection_class != "uncovered"],
         key=due_order_key,
     )
-    selected: list[ProviderEnrichmentCandidate] = []
-    # With the configured capacity of two, reserve one slot for each class so
-    # continuous initial coverage cannot starve persisted due work (and vice versa).
-    if limit >= 2 and uncovered and due:
-        selected.extend((due.pop(0), uncovered.pop(0)))
-    combined = due + uncovered
-    selected.extend(candidate for candidate in combined if candidate not in selected)
-    selected = selected[:limit]
+    # Strict uncovered-first: refresh work receives no reserved slot while
+    # eligible never-covered candidates can fill capacity. Retry/safety
+    # backoff remains enforced before candidates reach either list.
+    selected = (uncovered + due)[:limit]
     if cursor_rank is None and cursor_mal_id is not None:
         provider_state["cursor_missing"] = True
     if cursor_rank is not None and any(candidate.rank <= cursor_rank for candidate in selected):

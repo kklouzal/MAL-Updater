@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import hashlib
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .config import AppConfig, load_mal_secrets
 from .db import (
@@ -15,12 +17,20 @@ from .db import (
     MalPublicUserRecsCrawlGeneration,
     MalUserAnimeListRefreshConflictError,
     MalUserAnimeListRefreshSummary,
+    MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
     abort_mal_user_anime_list_cache_refresh,
     begin_mal_user_anime_list_cache_refresh,
     connect,
+    count_mal_user_anime_list_cache,
     create_or_get_active_mal_public_userrecs_generation,
+    claim_mal_public_userrecs_sources,
+    claim_or_create_mal_user_anime_list_traversal,
+    checkpoint_mal_user_anime_list_page,
+    checkpoint_mal_user_anime_list_revalidation,
     finish_mal_user_anime_list_cache_refresh,
     get_active_mal_public_userrecs_generation,
+    get_mal_user_anime_list_refresh_diagnostics,
+    get_mal_user_anime_list_traversal,
     get_mal_anime_metadata_map,
     list_active_mal_public_userrecs_generations,
     list_mal_public_userrecs_staged_pages,
@@ -29,15 +39,27 @@ from .db import (
     list_series_mappings,
     mark_mal_public_userrecs_generation_ready,
     pause_mal_public_userrecs_generation,
+    persist_mal_user_anime_list_identity_assertion,
     publish_mal_public_userrecs_generation,
+    publish_mal_user_anime_list_staging,
+    release_mal_public_userrecs_source_claim,
     record_mal_recommendation_harvest_attempt_error,
+    record_mal_user_anime_list_request_failure,
     record_mal_recommendation_harvest_failure,
+    record_mal_public_userrecs_revalidation,
+    renew_mal_public_userrecs_source_claim,
     replace_mal_anime_relations,
+    restart_or_quarantine_mal_user_anime_list_traversal,
     replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
     restart_mal_public_userrecs_generation_after_drift,
     resume_mal_public_userrecs_generation,
+    schedule_mal_public_userrecs_generation_retry,
+    sync_mal_public_userrecs_source_queue,
+    load_validated_mal_user_anime_list_staging,
+    release_mal_user_anime_list_traversal_claim,
+    select_mal_user_anime_list_partition_work,
 )
 from .mal_client import MalApiError, MalClient
 from .periodic_evidence_lifecycle import periodic_evidence_is_due
@@ -248,6 +270,12 @@ class FullUserRecommendationHarvestSummary:
     harvested_sources: list[dict[str, Any]] = field(default_factory=list)
     paused_sources: list[dict[str, Any]] = field(default_factory=list)
     restarted_sources: list[dict[str, Any]] = field(default_factory=list)
+    queue_counts: dict[str, int] = field(default_factory=dict)
+    selected_classes: list[str] = field(default_factory=list)
+    quarantined_sources: list[dict[str, Any]] = field(default_factory=list)
+    fetch_attempted: int = 0
+    fetch_succeeded: int = 0
+    fetch_failed: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -267,12 +295,23 @@ class FullUserRecommendationHarvestSummary:
             "harvested_sources": list(self.harvested_sources),
             "paused_sources": list(self.paused_sources),
             "restarted_sources": list(self.restarted_sources),
+            "quarantined": len(self.quarantined_sources),
+            "quarantined_sources": list(self.quarantined_sources),
+            "queue_counts": dict(self.queue_counts),
+            "selected_classes": list(self.selected_classes),
+            "fetch_attempted": self.fetch_attempted,
+            "fetch_succeeded": self.fetch_succeeded,
+            "fetch_failed": self.fetch_failed,
             "semantics": {
                 "source": "public_mal_userrecs_html",
-                "complete_when_no_next_link": True,
-                "max_pages": "per-source per-run page budget; unfinished staged generations pause and resume without publishing",
+                "complete_when_no_next_link": False,
+                "max_pages": "per-source per-run network-request budget including continuation and final page-1/boundary revalidation; zero performs no fetch",
+                "terminal_requires": "complete recognized userrecs document, unambiguous validated pagination, coherent staged chain, and final snapshot validation",
                 "partial_failure_preserves_existing_edges": True,
                 "staged_pages_publish_atomically": True,
+                "source_priority": ["never_started", "resumable", "retry_due", "refresh_due"],
+                "fairness": "durable collision-free monotonic selection sequence inside each strict class; never-started consumes capacity before open or refresh work",
+                "concurrency": "durable expiring source claims fence every orchestrated generation mutation by token, source/generation identity, and revision",
                 "retained_fields": ["target_mal_anime_id", "target_title", "num_recommendations"],
                 "privacy": "recommendation prose and usernames are not persisted",
             },
@@ -537,6 +576,129 @@ def _normalized_user_list_statuses(statuses: list[str] | tuple[str, ...] | None)
     return normalized or [None]
 
 
+def _mal_user_list_query_identity(*, statuses: list[str | None], page_size: int) -> tuple[str, dict[str, Any]]:
+    query = {
+        "statuses": ["all" if value is None else value for value in statuses],
+        "page_size": min(max(int(page_size), 1), 100),
+        "fields": MAL_USER_LIST_FIELDS,
+        "logic_version": MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
+    }
+    encoded = __import__("json").dumps(query, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest(), query
+
+
+def _mal_user_list_initial_url(config: AppConfig, *, status: str | None, page_size: int) -> str:
+    query: dict[str, Any] = {"limit": min(max(int(page_size), 1), 100), "fields": MAL_USER_LIST_FIELDS}
+    if status is not None:
+        query["status"] = status
+    return f"{config.mal.base_url}/users/@me/animelist?{urlencode(query)}"
+
+
+def _validate_mal_user_list_cursor(
+    config: AppConfig, *, url: str, expected_status: str | None, page_size: int,
+    expected_offset: int | None = None,
+) -> str:
+    parsed = urlparse(str(url))
+    base = urlparse(config.mal.base_url)
+    if parsed.scheme != "https" or parsed.scheme != base.scheme or parsed.netloc != base.netloc or parsed.username or parsed.password:
+        raise ValueError("MAL anime-list next cursor is foreign or not HTTPS")
+    base_path = base.path.rstrip("/")
+    expected_path = f"{base_path}/users/@me/animelist" if base_path else "/users/@me/animelist"
+    if parsed.path != expected_path or parsed.fragment:
+        raise ValueError("MAL anime-list next cursor has a conflicting path/fragment")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - {"limit", "fields", "status", "offset", "ranking_type", "nsfw"}:
+        raise ValueError("MAL anime-list next cursor has unexpected query keys")
+    for key, values in query.items():
+        if len(values) != 1:
+            raise ValueError(f"MAL anime-list next cursor repeats {key}")
+    if query.get("limit", [None])[0] != str(min(max(int(page_size), 1), 100)):
+        raise ValueError("MAL anime-list next cursor changes page limit")
+    if query.get("fields", [None])[0] != MAL_USER_LIST_FIELDS:
+        raise ValueError("MAL anime-list next cursor changes requested fields")
+    actual_status = query.get("status", [None])[0]
+    if actual_status != expected_status:
+        raise ValueError("MAL anime-list next cursor changes status partition")
+    offset = query.get("offset", ["0"])[0]
+    if not str(offset).isdigit():
+        raise ValueError("MAL anime-list next cursor has a malformed offset")
+    if expected_offset is not None and int(offset) != int(expected_offset):
+        raise ValueError("MAL anime-list next cursor skips, repeats, or moves backward across the expected offset boundary")
+    return str(url)
+
+
+def _parse_mal_user_list_payload(
+    config: AppConfig, *, payload: dict[str, Any], page_url: str, expected_status: str | None,
+    page_size: int, account_id: int, account_name: str,
+) -> tuple[list[dict[str, Any]], str | None, str, dict[str, Any], bool, bool]:
+    if not isinstance(payload, dict) or set(payload) - {"data", "paging"}:
+        raise ValueError("MAL anime-list response document is malformed or has unexpected top-level fields")
+    if "data" not in payload or "paging" not in payload or not isinstance(payload["data"], list) or not isinstance(payload["paging"], dict):
+        raise ValueError("MAL anime-list response lacks complete data/paging structure")
+    paging = payload["paging"]
+    if set(paging) - {"previous", "next"}:
+        raise ValueError("MAL anime-list paging object has unexpected fields")
+    if "next" not in paging:
+        raise ValueError("MAL anime-list response is ambiguous because paging.next is missing")
+    next_raw = paging["next"]
+    if next_raw is not None and (not isinstance(next_raw, str) or not next_raw.strip()):
+        raise ValueError("MAL anime-list paging.next is malformed")
+    items: list[dict[str, Any]] = []
+    ordered: list[tuple[int, int | None, str | None]] = []
+    for raw in payload["data"]:
+        if not isinstance(raw, dict) or not isinstance(raw.get("node"), dict) or not isinstance(raw.get("list_status"), dict):
+            raise ValueError("MAL anime-list data row is structurally incomplete")
+        node = raw["node"]
+        list_status = raw["list_status"]
+        anime_id = node.get("id")
+        title = node.get("title")
+        status = list_status.get("status")
+        if isinstance(anime_id, bool) or not isinstance(anime_id, int) or anime_id <= 0 or not isinstance(title, str) or not title.strip():
+            raise ValueError("MAL anime-list data row lacks valid anime identity")
+        if expected_status is not None and status != expected_status:
+            raise ValueError("MAL anime-list response row conflicts with requested status partition")
+        if status not in MAL_USER_LIST_SUPPRESSION_STATUSES:
+            raise ValueError("MAL anime-list response row has unsupported status")
+        rank = raw.get("ranking", {}).get("rank") if isinstance(raw.get("ranking"), dict) else None
+        if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0):
+            raise ValueError("MAL anime-list response row has malformed rank")
+        ordered.append((anime_id, rank, list_status.get("updated_at") if isinstance(list_status.get("updated_at"), str) else None))
+        items.append(raw)
+    ids = [item[0] for item in ordered]
+    if len(ids) != len(set(ids)):
+        raise ValueError("MAL anime-list page repeats an anime id")
+    current_query = parse_qs(urlparse(page_url).query, keep_blank_values=True)
+    current_offset_text = current_query.get("offset", ["0"])[0]
+    if not str(current_offset_text).isdigit():
+        raise ValueError("MAL anime-list current page has a malformed offset")
+    current_offset = int(current_offset_text)
+    # MAL's offset is the index of the next range. A non-terminal page must be
+    # full; otherwise the server's offset contract is ambiguous and publishing
+    # would risk a skipped interior range.
+    expected_page_size = min(max(int(page_size), 1), 100)
+    if next_raw is not None and len(items) != expected_page_size:
+        raise ValueError(
+            "MAL anime-list non-terminal page was short; expected exactly "
+            f"{expected_page_size} distinct valid rows, got {len(items)}"
+        )
+    next_url = None if next_raw is None else _validate_mal_user_list_cursor(
+        config,
+        url=next_raw.strip(),
+        expected_status=expected_status,
+        page_size=page_size,
+        expected_offset=current_offset + expected_page_size,
+    )
+    canonical = __import__("json").dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    anchor = {
+        "account_id": account_id, "account_name": account_name, "status": expected_status,
+        "page_url": page_url, "next_url": next_url, "row_count": len(items), "first": ordered[:2], "last": ordered[-2:],
+    }
+    terminal_explicit = next_url is None
+    empty_proven = terminal_explicit and not items
+    return items, next_url, fingerprint, anchor, terminal_explicit, empty_proven
+
+
 def refresh_mal_user_anime_list_cache(
     config: AppConfig,
     *,
@@ -545,135 +707,160 @@ def refresh_mal_user_anime_list_cache(
     max_pages: int | None = 25,
     prune_on_complete: bool = False,
 ) -> MalUserAnimeListRefreshSummary:
-    """Refresh the official read-only MAL @me anime list cache generation-safely.
-
-    Bounded partial page runs upsert seen rows and retain all older rows; failures
-    do not alter the existing cache. Absent rows are pruned only when the caller
-    explicitly opts in and MAL pagination reaches a terminal page.
-    """
-    max_pages = 25 if max_pages is None or max_pages <= 0 else int(max_pages)
+    """Durably refresh MAL @me with fair partition rotation and fail-closed publication."""
+    normalized_max_pages = 25 if max_pages is None else max(0, int(max_pages))
     normalized_statuses = _normalized_user_list_statuses(statuses)
-    all_statuses = normalized_statuses == [None]
-    refresh_run_id = str(uuid.uuid4())
-    fetched_at = _now_iso()
-    refresh = begin_mal_user_anime_list_cache_refresh(
-        config.db_path,
-        refresh_run_id=refresh_run_id,
-        fetched_at=fetched_at,
-    )
-    client = MalClient(config, load_mal_secrets(config))
-    collected: list[dict[str, Any]] = []
-    by_status: Counter[str] = Counter()
-    scored = 0
-    unscored = 0
-    pages = 0
-    last_payload: dict[str, Any] | None = None
-
-    def conflict_summary(exc: MalUserAnimeListRefreshConflictError) -> MalUserAnimeListRefreshSummary:
+    if normalized_max_pages == 0:
+        # Hard zero-network/no-mutation contract; diagnostics read only.
+        diagnostics = get_mal_user_anime_list_refresh_diagnostics(config.db_path)
         return MalUserAnimeListRefreshSummary(
-            status="failed",
-            refresh_run_id=refresh.refresh_run_id,
-            generation=refresh.generation,
-            pages=pages,
-            items=len(collected),
-            scored=scored,
-            unscored=unscored,
-            by_status=dict(by_status),
-            partial=True,
-            error=str(exc),
+            status="partial", refresh_run_id="", generation=0, partial=True,
+            error="max_pages=0: no MAL request or refresh-state mutation performed", traversal=diagnostics,
         )
-
+    client = MalClient(config, load_mal_secrets(config))
+    attempts = 1  # Account identity is a budgeted network attempt.
     try:
-        for index, status in enumerate(normalized_statuses):
-            status_pages = 0
-            remaining_pages = max(max_pages - pages, 0)
-            if remaining_pages <= 0:
-                break
-            for payload in client.iter_my_anime_list_pages(
-                status=status,
-                limit=page_size,
-                fields=MAL_USER_LIST_FIELDS,
-                max_pages=remaining_pages,
-            ):
-                pages += 1
-                status_pages += 1
-                last_payload = payload
-                data = payload.get("data") if isinstance(payload, dict) else None
-                if not isinstance(data, list):
-                    continue
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    collected.append(item)
-                    list_status = item.get("list_status") if isinstance(item.get("list_status"), dict) else {}
-                    status_value = list_status.get("status")
-                    if isinstance(status_value, str) and status_value.strip():
-                        by_status[status_value.strip().lower()] += 1
-                    score = list_status.get("score")
-                    if isinstance(score, int) and score > 0:
-                        scored += 1
-                    else:
-                        unscored += 1
-            reached_budget_before_terminal = pages >= max_pages and _payload_has_next_page(last_payload)
-            statuses_left_unfetched = pages >= max_pages and index < len(normalized_statuses) - 1
-            if reached_budget_before_terminal or statuses_left_unfetched:
-                summary = finish_mal_user_anime_list_cache_refresh(
-                    config.db_path,
-                    items=collected,
-                    refresh_run_id=refresh.refresh_run_id,
-                    generation=refresh.generation,
-                    fetched_at=refresh.fetched_at,
-                    proven_complete=False,
-                    delete_absent=False,
-                )
-                summary.status = "partial"
-                summary.pages = pages
-                summary.scored = scored
-                summary.unscored = unscored
-                summary.by_status = dict(by_status)
-                summary.partial = True
-                summary.error = "max_pages reached before MAL anime list pagination completed; seen rows upserted and absent rows retained"
-                summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(config.db_path)
-                return summary
-    except MalUserAnimeListRefreshConflictError as exc:
-        return conflict_summary(exc)
-    except (MalApiError, TimeoutError, ValueError) as exc:
+        account = client.get_my_user(max_attempts=1)
+    except (MalApiError, TimeoutError) as exc:
+        return MalUserAnimeListRefreshSummary(
+            status="failed", refresh_run_id="", generation=0, pages=attempts, partial=True,
+            error=str(exc), traversal=get_mal_user_anime_list_refresh_diagnostics(config.db_path),
+        )
+    account_id = account.get("id") if isinstance(account, dict) else None
+    account_name = account.get("name") if isinstance(account, dict) else None
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0 or not isinstance(account_name, str) or not account_name.strip():
+        raise MalApiError("authenticated MAL account response is incomplete")
+    query_identity, query = _mal_user_list_query_identity(statuses=normalized_statuses, page_size=page_size)
+    partitions = [
+        {
+            "partition_key": "all" if status is None else status,
+            "requested_status": status,
+            "ordinal": ordinal,
+            "initial_url": _mal_user_list_initial_url(config, status=status, page_size=page_size),
+        }
+        for ordinal, status in enumerate(normalized_statuses)
+    ]
+    token = str(uuid.uuid4())
+    generation, _ = claim_or_create_mal_user_anime_list_traversal(
+        config.db_path, account_id=account_id, account_name=account_name, query_identity=query_identity,
+        query=query, partitions=partitions, claim_token=token, fetched_at=_now_iso(),
+    )
+    failure: str | None = None
+    while attempts < normalized_max_pages:
+        selected = select_mal_user_anime_list_partition_work(
+            config.db_path, generation=generation.generation, claim_token=token
+        )
+        if selected is None:
+            break
+        generation, partition, work_kind, page_url = selected
+        attempts += 1  # persisted before invocation by selection.
         try:
-            summary = abort_mal_user_anime_list_cache_refresh(
-                config.db_path,
-                refresh_run_id=refresh.refresh_run_id,
-                generation=refresh.generation,
-                error=str(exc),
+            payload = client.get_my_anime_list_page_url(page_url)
+            parsed = _parse_mal_user_list_payload(
+                config, payload=payload, page_url=page_url, expected_status=partition.requested_status,
+                page_size=page_size, account_id=account_id, account_name=account_name,
             )
-        except MalUserAnimeListRefreshConflictError as conflict:
-            return conflict_summary(conflict)
-        summary.status = "failed"
-        summary.pages = pages
-        summary.items = len(collected)
-        summary.scored = scored
-        summary.unscored = unscored
-        summary.by_status = dict(by_status)
-        summary.partial = True
-        return summary
-    try:
-        summary = finish_mal_user_anime_list_cache_refresh(
-            config.db_path,
-            items=collected,
-            refresh_run_id=refresh.refresh_run_id,
-            generation=refresh.generation,
-            fetched_at=refresh.fetched_at,
-            proven_complete=True,
-            delete_absent=bool(all_statuses and prune_on_complete),
+            items, next_url, fingerprint, anchor, terminal_explicit, empty_proven = parsed
+            if work_kind == "page":
+                generation, _ = checkpoint_mal_user_anime_list_page(
+                    config.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                    claim_token=token, expected_revision=generation.revision, page_url=page_url, next_url=next_url,
+                    items=items, fingerprint=fingerprint, anchor=anchor, terminal_explicit=terminal_explicit,
+                    empty_proven=empty_proven, fetched_at=_now_iso(),
+                )
+            else:
+                generation, _ = checkpoint_mal_user_anime_list_revalidation(
+                    config.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                    claim_token=token, expected_revision=generation.revision, kind=work_kind,
+                    page_url=page_url, fingerprint=fingerprint, anchor=anchor,
+                )
+        except (MalApiError, TimeoutError) as exc:
+            retry_class = "auth_or_contract" if "HTTP 401" in str(exc) or "HTTP 403" in str(exc) else "ordinary_retry"
+            quarantine = retry_class == "auth_or_contract"
+            generation = record_mal_user_anime_list_request_failure(
+                config.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token=token, expected_revision=generation.revision, retry_class=retry_class, error=str(exc),
+                next_retry_at=None if quarantine else (datetime.now(timezone.utc)+timedelta(minutes=15)).replace(microsecond=0).isoformat().replace("+00:00","Z"),
+                quarantine=quarantine,
+            )
+            failure = str(exc)
+            break
+        except ValueError as exc:
+            generation = record_mal_user_anime_list_request_failure(
+                config.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token=token, expected_revision=generation.revision, retry_class="snapshot_drift_or_contract",
+                error=str(exc), next_retry_at=None,
+            )
+            generation = restart_or_quarantine_mal_user_anime_list_traversal(
+                config.db_path, generation=generation.generation, claim_token=token,
+                expected_revision=generation.revision, reason=str(exc),
+            )
+            failure = str(exc)
+            break
+    # Bind publication to the authenticated account. The initial identity
+    # response is stable evidence only for a no-page run; after any list call,
+    # revalidate under the same hard request budget before publication.
+    if failure is None:
+        generation, identity_partitions = get_mal_user_anime_list_traversal(
+            config.db_path, generation=generation.generation
         )
-    except MalUserAnimeListRefreshConflictError as exc:
-        return conflict_summary(exc)
-    summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(config.db_path)
-    summary.pages = pages
-    summary.scored = scored
-    summary.unscored = unscored
-    summary.by_status = dict(by_status)
-    return summary
-
+        complete = bool(identity_partitions) and all(
+            part.terminal and part.terminal_explicit and part.page1_validated_at and part.boundary_validated_at
+            for part in identity_partitions
+        )
+        if complete and attempts < normalized_max_pages:
+            attempts += 1
+            try:
+                current_account = client.get_my_user(max_attempts=1)
+                if current_account.get("id") != account_id or current_account.get("name") != account_name:
+                    raise ValueError("authenticated MAL account identity changed before publication")
+                generation = persist_mal_user_anime_list_identity_assertion(
+                    config.db_path, generation=generation.generation, claim_token=token,
+                    expected_revision=generation.revision, account_id=account_id,
+                    account_name=account_name, nonce=str(uuid.uuid4()),
+                )
+            except (MalApiError, TimeoutError, ValueError) as exc:
+                failure = str(exc)
+        elif complete:
+            failure = "request budget exhausted before authenticated account identity revalidation"
+    generation, current_partitions = get_mal_user_anime_list_traversal(config.db_path, generation=generation.generation)
+    all_validated = bool(current_partitions) and all(
+        part.terminal and part.terminal_explicit and part.page1_validated_at and part.boundary_validated_at
+        for part in current_partitions
+    )
+    identity_confirmed = failure is None
+    if all_validated and identity_confirmed:
+        try:
+            generation, _items, _proof = load_validated_mal_user_anime_list_staging(
+                config.db_path, generation=generation.generation, claim_token=token, expected_revision=generation.revision,
+            )
+            summary = publish_mal_user_anime_list_staging(
+                config.db_path, generation=generation.generation, claim_token=token, expected_revision=generation.revision,
+                delete_absent=bool(normalized_statuses == [None] and prune_on_complete),
+            )
+            summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(config.db_path)
+            summary.traversal = get_mal_user_anime_list_refresh_diagnostics(config.db_path)
+            return summary
+        except (ValueError, MalUserAnimeListRefreshConflictError, __import__("json").JSONDecodeError) as exc:
+            failure = str(exc)
+    # Final validation is a distinct budgeted boundary: if all page requests used
+    # the budget, publication waits for a later invocation and LKG remains intact.
+    if generation.quarantined_at is None and generation.claim_token == token:
+        try:
+            release_mal_user_anime_list_traversal_claim(
+                config.db_path, generation=generation.generation, claim_token=token, expected_revision=generation.revision,
+            )
+        except MalUserAnimeListRefreshConflictError:
+            pass
+    diagnostics = get_mal_user_anime_list_refresh_diagnostics(config.db_path)
+    return MalUserAnimeListRefreshSummary(
+        status="failed" if generation.quarantined_at else "partial",
+        refresh_run_id=generation.refresh_run_id, generation=generation.generation,
+        pages=max(0, generation.requests_attempted), items=sum(part.item_count for part in current_partitions),
+        preserved_absent=count_mal_user_anime_list_cache(config.db_path), partial=True,
+        error=failure or "network budget exhausted before final validated publication; published MAL list LKG preserved",
+        traversal=diagnostics,
+    )
 
 def _full_harvest_status_rows(db_path: Path, source_ids: set[int]) -> dict[int, dict[str, Any]]:
     if not source_ids:
@@ -804,7 +991,82 @@ def _public_userrecs_fetched_page_drift_reason(
         last = pages[-1]
         if generation.cursor_url != last.next_url:
             return "stored cursor_url changed before staging fetched page"
+        previous_ids: set[int] = set()
+        for page in pages:
+            previous_ids.update(int(value) for value in (page.anchor.get("target_mal_anime_ids") or []))
+        fetched_ids = set((getattr(fetched_page, "anchor", {}) or {}).get("target_mal_anime_ids") or [])
+        overlap = sorted(previous_ids & fetched_ids)
+        if overlap:
+            return f"fetched page overlaps a prior staged page target: {overlap[:10]!r}"
     return None
+
+
+def _public_userrecs_revalidate_generation(
+    config: AppConfig,
+    *,
+    generation: MalPublicUserRecsCrawlGeneration,
+    client: Any,
+    max_body_bytes: int,
+    remaining_requests: int,
+    claim_token: str,
+    fetch_counts: dict[str, int],
+) -> tuple[str | None, int, MalPublicUserRecsCrawlGeneration]:
+    """Re-read every staged page because MAL exposes no immutable snapshot token."""
+    pages = list_mal_public_userrecs_staged_pages(config.db_path, generation_id=generation.generation_id)
+    if not pages:
+        return None, 0, generation
+    checks = pages
+    if remaining_requests < len(checks):
+        return "max_pages cannot cover required final snapshot validation", 0, generation
+    fetched_count = 0
+    validation_parts: list[str] = []
+    for staged in checks:
+        generation = renew_mal_public_userrecs_source_claim(
+            config.db_path,
+            source_mal_anime_id=generation.source_mal_anime_id,
+            generation_id=generation.generation_id,
+            claim_token=claim_token,
+            expected_revision=generation.generation_revision,
+        )
+        try:
+            # The budget is an attempt budget, not a successful-response
+            # counter. Charge it before entering code that may raise.
+            fetched_count += 1
+            fetch_counts["attempted"] += 1
+            try:
+                fetch_kwargs = {"page_url": staged.page_url, "max_body_bytes": max_body_bytes}
+                if isinstance(client, PublicMalUserRecommendationsClient):
+                    fetched = client.fetch_page(
+                        generation.source_mal_anime_id,
+                        page_url=staged.page_url,
+                        max_body_bytes=max_body_bytes,
+                        max_attempts=1,
+                    )
+                else:
+                    fetched = client.fetch_page(generation.source_mal_anime_id, **fetch_kwargs)
+            except BaseException:
+                fetch_counts["failed"] += 1
+                raise
+        except (PublicMalUserRecommendationsError, TimeoutError, ValueError) as exc:
+            return f"snapshot revalidation failed at page {staged.page_number}: {exc}", fetched_count, generation
+        fetch_counts["succeeded"] += 1
+        if fetched.final_url != staged.page_url:
+            return f"snapshot revalidation final URL drifted at page {staged.page_number}", fetched_count, generation
+        if fetched.page_fingerprint != staged.page_fingerprint:
+            return f"snapshot revalidation fingerprint/anchor drift at page {staged.page_number}", fetched_count, generation
+        if fetched.next_url != staged.next_url:
+            return f"snapshot revalidation next-link drift at page {staged.page_number}", fetched_count, generation
+        validation_parts.append(f"{staged.page_number}:{fetched.page_fingerprint}:{fetched.next_url or ''}")
+    validation_fingerprint = hashlib.sha256("|".join(validation_parts).encode()).hexdigest()
+    generation = record_mal_public_userrecs_revalidation(
+        config.db_path,
+        generation_id=generation.generation_id,
+        checked_boundary=True,
+        validation_fingerprint=validation_fingerprint,
+        claim_token=claim_token,
+        expected_revision=generation.generation_revision,
+    )
+    return None, fetched_count, generation
 
 
 def _public_userrecs_pause_source(
@@ -813,6 +1075,7 @@ def _public_userrecs_pause_source(
     generation: MalPublicUserRecsCrawlGeneration,
     cursor_url: str | None,
     error: str | None,
+    claim_token: str,
 ) -> MalPublicUserRecsCrawlGeneration:
     if generation.status in {"active", "paused"}:
         return pause_mal_public_userrecs_generation(
@@ -820,6 +1083,8 @@ def _public_userrecs_pause_source(
             generation_id=generation.generation_id,
             cursor_url=cursor_url,
             error=error,
+            claim_token=claim_token,
+            expected_revision=generation.generation_revision,
         )
     return generation
 
@@ -843,63 +1108,93 @@ def refresh_full_user_recommendation_harvest(
     after a terminal page proves that the staged generation is coherent.
     """
     stale_after_days = max(1, int(stale_after_days))
-    normalized_max_pages = max(1, int(max_pages))
+    normalized_max_pages = max(0, int(max_pages))
     normalized_max_body_bytes = max(1024, int(max_body_bytes))
+    # Hard zero means no attributable database mutation at all. Do not merge
+    # metadata, synchronize/claim the queue, or advance fairness/outcomes.
+    if normalized_max_pages == 0:
+        positive_entries = list_mal_user_anime_list_cache(
+            config.db_path, statuses=MAL_USER_LIST_POSITIVE_SEED_STATUSES
+        )
+        return FullUserRecommendationHarvestSummary(
+            status="partial" if positive_entries else "ok",
+            seed_count=len(positive_entries), considered=0, harvested=0, failed=0,
+            skipped_fresh=0, total_edges=0, forced=bool(force_refresh),
+            stale_after_days=stale_after_days, max_pages=0,
+            paused_sources=[
+                {"mal_anime_id": int(entry.mal_anime_id), "reason": "zero_request_budget"}
+                for entry in positive_entries
+            ],
+        )
     merge_mal_user_anime_list_cache_into_metadata(config.db_path)
     positive_entries = list_mal_user_anime_list_cache(config.db_path, statuses=MAL_USER_LIST_POSITIVE_SEED_STATUSES)
     source_ids = {int(entry.mal_anime_id) for entry in positive_entries}
     status_rows = _full_harvest_status_rows(config.db_path, source_ids)
-    ranked_entries = sorted(
-        positive_entries,
-        key=lambda entry: _full_harvest_rank_key(entry, status_rows.get(int(entry.mal_anime_id)), stale_after_days=stale_after_days),
+    entries_by_source = {int(entry.mal_anime_id): entry for entry in positive_entries}
+    open_generations = {
+        int(generation.source_mal_anime_id): generation
+        for generation in list_active_mal_public_userrecs_generations(config.db_path, source_mal_anime_ids=source_ids)
+    }
+    due_classes: dict[int, str] = {}
+    for source_id in sorted(source_ids):
+        status = _full_harvest_candidate_status(status_rows.get(source_id), stale_after_days=stale_after_days, source_mal_anime_id=source_id)
+        if source_id in open_generations and open_generations[source_id].retry_class:
+            due_classes[source_id] = "retry_due"
+        elif source_id in open_generations:
+            due_classes[source_id] = "resumable"
+        elif status == "unharvested":
+            due_classes[source_id] = "never_started"
+        elif status == "failed":
+            due_classes[source_id] = "retry_due"
+        elif status == "stale" or force_refresh:
+            due_classes[source_id] = "refresh_due"
+        else:
+            due_classes[source_id] = "fresh"
+    queue_rows = sync_mal_public_userrecs_source_queue(
+        config.db_path,
+        source_mal_anime_ids=source_ids,
+        due_classes=due_classes,
     )
-    open_generations = list_active_mal_public_userrecs_generations(config.db_path, source_mal_anime_ids=source_ids)
-    open_source_ids = [int(generation.source_mal_anime_id) for generation in open_generations]
-    open_source_id_set = set(open_source_ids)
-    ranked_by_source = {int(entry.mal_anime_id): entry for entry in ranked_entries}
-
-    active_entries = [ranked_by_source[source_id] for source_id in open_source_ids if source_id in ranked_by_source]
-    due_entries = [
-        entry
-        for entry in ranked_entries
-        if int(entry.mal_anime_id) not in open_source_id_set
-        and (
-            force_refresh
-            or _full_harvest_candidate_status(
-                status_rows.get(int(entry.mal_anime_id)),
-                stale_after_days=stale_after_days,
-                source_mal_anime_id=int(entry.mal_anime_id),
-            )
-            != "fresh"
-        )
-    ]
-    skipped_fresh = len(ranked_entries) - len(active_entries) - len(due_entries)
-    selected_entries = [*active_entries, *due_entries]
-    if limit is not None and limit > 0:
-        selected_entries = selected_entries[: int(limit)]
-
+    queue_counts = dict(Counter(row.queue_class for row in queue_rows if row.eligible))
+    skipped_fresh = queue_counts.get("fresh", 0)
+    capacity = len(source_ids) if limit is None else max(0, int(limit))
+    claim_token = uuid.uuid4().hex
+    claimed_rows = claim_mal_public_userrecs_sources(
+        config.db_path,
+        limit=capacity,
+        claim_token=claim_token,
+    )
+    selected_entries = [entries_by_source[row.source_mal_anime_id] for row in claimed_rows if row.source_mal_anime_id in entries_by_source]
+    selected_classes = [row.queue_class for row in claimed_rows if row.source_mal_anime_id in entries_by_source]
     harvest_client = client or PublicMalUserRecommendationsClient(config)
     failures: list[FullUserRecommendationHarvestFailure] = []
     harvested_sources: list[dict[str, Any]] = []
     paused_sources: list[dict[str, Any]] = []
     restarted_sources: list[dict[str, Any]] = []
+    quarantined_sources: list[dict[str, Any]] = []
     harvested = 0
     total_edges = 0
+    fetch_counts = {"attempted": 0, "succeeded": 0, "failed": 0}
 
     for entry in selected_entries:
         source_id = int(entry.mal_anime_id)
         source_title = entry.title
         source_url = _full_userrecs_start_url(config, source_mal_anime_id=source_id, source_title=source_title)
         pages_this_run = 0
-        generation = get_active_mal_public_userrecs_generation(config.db_path, source_mal_anime_id=source_id)
-        if generation is None:
-            generation = create_or_get_active_mal_public_userrecs_generation(
-                config.db_path,
-                source_mal_anime_id=source_id,
-                source_title=source_title,
-                source_url=source_url,
-                cursor_url=source_url,
-            )
+        generation = create_or_get_active_mal_public_userrecs_generation(
+            config.db_path,
+            source_mal_anime_id=source_id,
+            source_title=source_title,
+            source_url=source_url,
+            cursor_url=source_url,
+            claim_token=claim_token,
+        )
+
+        queue_outcome = "resumable"
+        queue_class = "resumable"
+        queue_retry_at: str | None = None
+        queue_error_code: str | None = None
+        resume_revalidated = False
 
         while True:
             drift_reason = _public_userrecs_generation_drift_reason(config.db_path, generation=generation)
@@ -909,7 +1204,19 @@ def refresh_full_user_recommendation_harvest(
                     generation_id=generation.generation_id,
                     reason=drift_reason,
                     cursor_url=source_url,
+                    claim_token=claim_token,
+                    expected_revision=generation.generation_revision,
                 )
+                if generation.quarantined_at is not None:
+                    quarantined_sources.append({
+                        "mal_anime_id": source_id,
+                        "generation_id": generation.generation_id,
+                        "reason": generation.quarantine_reason or drift_reason,
+                    })
+                    queue_outcome = "quarantined_drift_livelock"
+                    queue_class = "quarantined"
+                    queue_error_code = "pagination_drift"
+                    break
                 restarted_sources.append(
                     {
                         "mal_anime_id": source_id,
@@ -925,6 +1232,7 @@ def refresh_full_user_recommendation_harvest(
                         generation=generation,
                         cursor_url=generation.cursor_url or source_url,
                         error="drift restart deferred until next run because max_pages was reached",
+                        claim_token=claim_token,
                     )
                     paused_sources.append(
                         {
@@ -940,8 +1248,53 @@ def refresh_full_user_recommendation_harvest(
                 continue
 
             if generation.status == "ready":
+                if generation.pages_fetched > 0 and not resume_revalidated:
+                    drift_reason, checked_pages, generation = _public_userrecs_revalidate_generation(
+                        config,
+                        generation=generation,
+                        client=harvest_client,
+                        max_body_bytes=normalized_max_body_bytes,
+                        remaining_requests=normalized_max_pages - pages_this_run,
+                        claim_token=claim_token,
+                        fetch_counts=fetch_counts,
+                    )
+                    pages_this_run += checked_pages
+                    resume_revalidated = True
+                    if drift_reason is not None:
+                        if drift_reason.startswith("max_pages cannot cover"):
+                            paused = _public_userrecs_pause_source(
+                                config, generation=generation, cursor_url=generation.cursor_url,
+                                error=drift_reason, claim_token=claim_token,
+                            )
+                            paused_sources.append({
+                                "mal_anime_id": source_id, "title": source_title,
+                                "generation_id": paused.generation_id,
+                                "pages_fetched": paused.pages_fetched, "cursor_url": paused.cursor_url,
+                                "reason": "final_validation_budget",
+                            })
+                            queue_outcome = "paused_final_validation_budget"
+                            break
+                        generation = restart_mal_public_userrecs_generation_after_drift(
+                            config.db_path,
+                            generation_id=generation.generation_id,
+                            reason=drift_reason,
+                            cursor_url=source_url,
+                            claim_token=claim_token,
+                            expected_revision=generation.generation_revision,
+                        )
+                        restarted_sources.append({
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": generation.generation_id,
+                            "reason": drift_reason,
+                            "cursor_url": generation.cursor_url,
+                        })
+                        continue
                 try:
-                    publication = publish_mal_public_userrecs_generation(config.db_path, generation_id=generation.generation_id)
+                    publication = publish_mal_public_userrecs_generation(
+                        config.db_path, generation_id=generation.generation_id,
+                        claim_token=claim_token, expected_revision=generation.generation_revision,
+                    )
                 except (PublicMalUserRecommendationsError, TimeoutError, ValueError, RuntimeError) as exc:
                     error = str(exc)
                     record_mal_recommendation_harvest_failure(
@@ -975,14 +1328,60 @@ def refresh_full_user_recommendation_harvest(
                         "generation_id": publication.generation_id,
                     }
                 )
+                queue_outcome = "published"
+                queue_class = "fresh"
                 break
 
             if generation.status == "paused":
-                generation = resume_mal_public_userrecs_generation(config.db_path, generation_id=generation.generation_id)
+                if generation.pages_fetched > 0 and not resume_revalidated:
+                    drift_reason, checked_pages, generation = _public_userrecs_revalidate_generation(
+                        config,
+                        generation=generation,
+                        client=harvest_client,
+                        max_body_bytes=normalized_max_body_bytes,
+                        remaining_requests=normalized_max_pages - pages_this_run,
+                        claim_token=claim_token,
+                        fetch_counts=fetch_counts,
+                    )
+                    pages_this_run += checked_pages
+                    resume_revalidated = True
+                    if drift_reason is not None:
+                        if drift_reason.startswith("max_pages cannot cover"):
+                            paused_sources.append({
+                                "mal_anime_id": source_id, "title": source_title,
+                                "generation_id": generation.generation_id,
+                                "pages_fetched": generation.pages_fetched, "cursor_url": generation.cursor_url,
+                                "reason": "resume_validation_budget",
+                            })
+                            queue_outcome = "paused_resume_validation_budget"
+                            break
+                        generation = restart_mal_public_userrecs_generation_after_drift(
+                            config.db_path,
+                            generation_id=generation.generation_id,
+                            reason=drift_reason,
+                            cursor_url=source_url,
+                            claim_token=claim_token,
+                            expected_revision=generation.generation_revision,
+                        )
+                        restarted_sources.append({
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": generation.generation_id,
+                            "reason": drift_reason,
+                            "cursor_url": generation.cursor_url,
+                        })
+                        continue
+                generation = resume_mal_public_userrecs_generation(
+                    config.db_path, generation_id=generation.generation_id,
+                    claim_token=claim_token, expected_revision=generation.generation_revision,
+                )
 
             if generation.cursor_url is None:
                 try:
-                    generation = mark_mal_public_userrecs_generation_ready(config.db_path, generation_id=generation.generation_id)
+                    generation = mark_mal_public_userrecs_generation_ready(
+                        config.db_path, generation_id=generation.generation_id,
+                        claim_token=claim_token, expected_revision=generation.generation_revision,
+                    )
                     continue
                 except ValueError as exc:
                     error = str(exc)
@@ -991,6 +1390,7 @@ def refresh_full_user_recommendation_harvest(
                         generation=generation,
                         cursor_url=generation.cursor_url,
                         error=error,
+                        claim_token=claim_token,
                     )
                     record_mal_recommendation_harvest_failure(
                         config.db_path,
@@ -1019,6 +1419,7 @@ def refresh_full_user_recommendation_harvest(
                     generation=generation,
                     cursor_url=generation.cursor_url,
                     error="max_pages reached; staged generation paused with next-page cursor",
+                    claim_token=claim_token,
                 )
                 paused_sources.append(
                     {
@@ -1030,6 +1431,7 @@ def refresh_full_user_recommendation_harvest(
                         "reason": "max_pages",
                     }
                 )
+                queue_outcome = "paused_page_budget"
                 break
 
             try:
@@ -1045,6 +1447,8 @@ def refresh_full_user_recommendation_harvest(
                     generation_id=generation.generation_id,
                     reason=drift_reason,
                     cursor_url=source_url,
+                    claim_token=claim_token,
+                    expected_revision=generation.generation_revision,
                 )
                 restarted_sources.append(
                     {
@@ -1055,12 +1459,23 @@ def refresh_full_user_recommendation_harvest(
                         "cursor_url": generation.cursor_url,
                     }
                 )
+                if generation.quarantined_at is not None:
+                    quarantined_sources.append({
+                        "mal_anime_id": source_id,
+                        "generation_id": generation.generation_id,
+                        "reason": generation.quarantine_reason or drift_reason,
+                    })
+                    queue_outcome = "quarantined_drift_livelock"
+                    queue_class = "quarantined"
+                    queue_error_code = "pagination_drift"
+                    break
                 if pages_this_run >= normalized_max_pages:
                     paused = _public_userrecs_pause_source(
                         config,
                         generation=generation,
                         cursor_url=generation.cursor_url or source_url,
                         error="drift restart deferred until next run because max_pages was reached",
+                        claim_token=claim_token,
                     )
                     paused_sources.append(
                         {
@@ -1075,11 +1490,27 @@ def refresh_full_user_recommendation_harvest(
                     break
                 continue
             try:
-                fetched_page = harvest_client.fetch_page(
-                    source_id,
-                    page_url=cursor_url,
-                    max_body_bytes=normalized_max_body_bytes,
+                generation = renew_mal_public_userrecs_source_claim(
+                    config.db_path, source_mal_anime_id=source_id,
+                    generation_id=generation.generation_id, claim_token=claim_token,
+                    expected_revision=generation.generation_revision,
                 )
+                pages_this_run += 1
+                fetch_counts["attempted"] += 1
+                try:
+                    fetch_kwargs = {"page_url": cursor_url, "max_body_bytes": normalized_max_body_bytes}
+                    if isinstance(harvest_client, PublicMalUserRecommendationsClient):
+                        fetched_page = harvest_client.fetch_page(
+                            source_id,
+                            page_url=cursor_url,
+                            max_body_bytes=normalized_max_body_bytes,
+                            max_attempts=1,
+                        )
+                    else:
+                        fetched_page = harvest_client.fetch_page(source_id, **fetch_kwargs)
+                except BaseException:
+                    fetch_counts["failed"] += 1
+                    raise
             except (PublicMalUserRecommendationsError, TimeoutError, ValueError) as exc:
                 error = str(exc)
                 generation = _public_userrecs_pause_source(
@@ -1087,6 +1518,7 @@ def refresh_full_user_recommendation_harvest(
                     generation=generation,
                     cursor_url=cursor_url,
                     error=error,
+                    claim_token=claim_token,
                 )
                 record_mal_recommendation_harvest_attempt_error(
                     config.db_path,
@@ -1107,7 +1539,24 @@ def refresh_full_user_recommendation_harvest(
                         paused=True,
                     )
                 )
+                queue_outcome = "retryable_failure"
+                queue_class = "retry_due"
+                queue_error_code = "fetch_failure"
+                retry_delay_seconds = min(24 * 60 * 60, 15 * 60 * (2 ** min(generation.attempt_count, 6)))
+                queue_retry_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds)
+                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                generation = schedule_mal_public_userrecs_generation_retry(
+                    config.db_path,
+                    generation_id=generation.generation_id,
+                    retry_class="transient_fetch_failure",
+                    next_retry_at=queue_retry_at,
+                    claim_token=claim_token,
+                    expected_revision=generation.generation_revision,
+                )
                 break
+
+            fetch_counts["succeeded"] += 1
 
             fetched_drift_reason = _public_userrecs_fetched_page_drift_reason(
                 config.db_path,
@@ -1115,12 +1564,13 @@ def refresh_full_user_recommendation_harvest(
                 fetched_page=fetched_page,
             )
             if fetched_drift_reason is not None:
-                pages_this_run += 1
                 generation = restart_mal_public_userrecs_generation_after_drift(
                     config.db_path,
                     generation_id=generation.generation_id,
                     reason=fetched_drift_reason,
                     cursor_url=source_url,
+                    claim_token=claim_token,
+                    expected_revision=generation.generation_revision,
                 )
                 restarted_sources.append(
                     {
@@ -1131,12 +1581,23 @@ def refresh_full_user_recommendation_harvest(
                         "cursor_url": generation.cursor_url,
                     }
                 )
+                if generation.quarantined_at is not None:
+                    quarantined_sources.append({
+                        "mal_anime_id": source_id,
+                        "generation_id": generation.generation_id,
+                        "reason": generation.quarantine_reason or fetched_drift_reason,
+                    })
+                    queue_outcome = "quarantined_drift_livelock"
+                    queue_class = "quarantined"
+                    queue_error_code = "pagination_drift"
+                    break
                 if pages_this_run >= normalized_max_pages:
                     paused = _public_userrecs_pause_source(
                         config,
                         generation=generation,
                         cursor_url=generation.cursor_url or source_url,
                         error="drift restart deferred until next run because max_pages was reached",
+                        claim_token=claim_token,
                     )
                     paused_sources.append(
                         {
@@ -1165,10 +1626,21 @@ def refresh_full_user_recommendation_harvest(
                 anchor=fetched_page.anchor,
                 next_url=fetched_page.next_url,
                 edges=edge_payloads,
+                terminal_evidence={
+                    **(getattr(fetched_page, "terminal_evidence", {}) or {}),
+                    "page_number": page_number,
+                    "page_fingerprint": fetched_page.page_fingerprint,
+                },
+                claim_token=claim_token,
+                expected_revision=generation.generation_revision,
             )
-            pages_this_run += 1
-            generation = get_active_mal_public_userrecs_generation(config.db_path, source_mal_anime_id=source_id)
-            if generation is None:
+            # Publication always performs a separate final page-1/boundary
+            # validation; staging is never treated as equivalent proof.
+            resume_revalidated = False
+            current_generation = get_active_mal_public_userrecs_generation(
+                config.db_path, source_mal_anime_id=source_id
+            )
+            if current_generation is None:
                 failures.append(
                     FullUserRecommendationHarvestFailure(
                         mal_anime_id=source_id,
@@ -1179,10 +1651,14 @@ def refresh_full_user_recommendation_harvest(
                     )
                 )
                 break
+            generation = current_generation
 
             if fetched_page.next_url is None:
                 try:
-                    generation = mark_mal_public_userrecs_generation_ready(config.db_path, generation_id=generation.generation_id)
+                    generation = mark_mal_public_userrecs_generation_ready(
+                        config.db_path, generation_id=generation.generation_id,
+                        claim_token=claim_token, expected_revision=generation.generation_revision,
+                    )
                     continue
                 except ValueError as exc:
                     error = str(exc)
@@ -1191,6 +1667,7 @@ def refresh_full_user_recommendation_harvest(
                         generation=generation,
                         cursor_url=generation.cursor_url,
                         error=error,
+                        claim_token=claim_token,
                     )
                     record_mal_recommendation_harvest_failure(
                         config.db_path,
@@ -1219,6 +1696,7 @@ def refresh_full_user_recommendation_harvest(
                     generation=generation,
                     cursor_url=fetched_page.next_url,
                     error="max_pages reached; staged generation paused with next-page cursor",
+                    claim_token=claim_token,
                 )
                 paused_sources.append(
                     {
@@ -1230,7 +1708,20 @@ def refresh_full_user_recommendation_harvest(
                         "reason": "max_pages",
                     }
                 )
+                queue_outcome = "paused_page_budget"
                 break
+
+        if queue_class != "quarantined":
+            release_mal_public_userrecs_source_claim(
+                config.db_path,
+                source_mal_anime_id=source_id,
+                claim_token=claim_token,
+                queue_class=queue_class,
+                outcome=queue_outcome,
+                generation_id=generation.generation_id,
+                next_retry_at=queue_retry_at,
+                error_code=queue_error_code,
+            )
 
     if failures and (harvested or paused_sources):
         status = "partial"
@@ -1255,6 +1746,12 @@ def refresh_full_user_recommendation_harvest(
         harvested_sources=harvested_sources,
         paused_sources=paused_sources,
         restarted_sources=restarted_sources,
+        queue_counts=queue_counts,
+        selected_classes=selected_classes,
+        quarantined_sources=quarantined_sources,
+        fetch_attempted=fetch_counts["attempted"],
+        fetch_succeeded=fetch_counts["succeeded"],
+        fetch_failed=fetch_counts["failed"],
     )
 
 def refresh_recommendation_metadata(
@@ -1326,7 +1823,7 @@ def refresh_recommendation_metadata(
         original_get_anime_details = client.get_anime_details
         def _forced_get_anime_details(anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:
             return original_get_anime_details(anime_id, fields=fields, force_refresh=True)
-        client.get_anime_details = _forced_get_anime_details  # type: ignore[method-assign]
+        client.get_anime_details = _forced_get_anime_details  # type: ignore[assignment]
     refreshed = 0
     harvested_edge_count = 0
     failures: list[MetadataRefreshFailure] = []

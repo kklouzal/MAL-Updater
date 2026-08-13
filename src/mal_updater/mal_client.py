@@ -166,12 +166,17 @@ class MalClient:
         operation: str,
         url: str,
         method: str,
+        max_attempts: int | None = None,
     ) -> _T:
         # Only read-only requests are retryable. OAuth authorization codes and
         # rotating refresh tokens may have been consumed even when a POST times
         # out or returns a transient upstream error.
         safe_to_retry = method.upper() == "GET"
-        attempts = max(1, int(self.config.mal.retry_max_attempts)) if safe_to_retry else 1
+        attempts = (
+            max(1, int(max_attempts))
+            if max_attempts is not None
+            else max(1, int(self.config.mal.retry_max_attempts)) if safe_to_retry else 1
+        )
         last_exc: BaseException | None = None
         for attempt in range(1, attempts + 1):
             self._pace_request()
@@ -262,7 +267,12 @@ class MalClient:
         payload = urlencode(form).encode("utf-8")
         return self._post_form(self.config.mal.token_url, payload)
 
-    def get_my_user(self, access_token: str | None = None) -> dict[str, Any]:
+    def get_my_user(
+        self,
+        access_token: str | None = None,
+        *,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any]:
         token = access_token or self.secrets.access_token
         if not token:
             raise MalApiError("MAL access_token is not configured")
@@ -273,6 +283,7 @@ class MalClient:
                 "Accept": "application/json",
             },
             error_context="MAL API GET /users/@me failed",
+            max_attempts=max_attempts,
         )
 
     def search_anime(self, query: str, *, limit: int = 5, fields: str = "id,title,alternative_titles,media_type,status,num_episodes", force_refresh: bool = False) -> dict[str, Any]:
@@ -369,6 +380,18 @@ class MalClient:
         return response
 
 
+    def get_my_anime_list_page_url(self, url: str) -> dict[str, Any]:
+        """Fetch one prevalidated opaque anime-list cursor URL."""
+        path = _path_query_from_mal_api_url(url, self.config.mal.base_url) if str(url).startswith("http") else str(url)
+        if not path.startswith("/users/@me/animelist?"):
+            raise MalApiError("MAL anime-list cursor path/query is invalid")
+        return self._get_json(
+            path,
+            headers=self._build_auth_headers(require_user=True),
+            error_context="MAL API GET /users/@me/animelist failed",
+            max_attempts=1,
+        )
+
     def iter_my_anime_list_pages(
         self,
         *,
@@ -393,7 +416,7 @@ class MalClient:
         query = {"limit": normalized_limit, "fields": fields}
         if normalized_status:
             query["status"] = normalized_status
-        next_path = f"/users/@me/animelist?{urlencode(query)}"
+        next_path: str | None = f"/users/@me/animelist?{urlencode(query)}"
         pages = 0
         while next_path and pages < normalized_max_pages:
             pages += 1
@@ -463,7 +486,14 @@ class MalClient:
         except URLError as exc:
             raise MalApiError(f"{error_context}: network error") from exc
 
-    def _get_json(self, path_or_url: str, *, headers: dict[str, str], error_context: str) -> dict[str, Any]:
+    def _get_json(
+        self,
+        path_or_url: str,
+        *,
+        headers: dict[str, str],
+        error_context: str,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any]:
         url = path_or_url if path_or_url.startswith("http") else f"{self.config.mal.base_url}{path_or_url}"
         request = Request(url, headers=headers, method="GET")
         try:
@@ -473,7 +503,9 @@ class MalClient:
                     record_api_request_event("mal", "get_json", url=url, method="GET", outcome="ok", status_code=getattr(response, "status", None), config=self.config)
                     return result
 
-            return self._request_with_timeout_retry(error_context, _send, operation="get_json", url=url, method="GET")
+            return self._request_with_timeout_retry(
+                error_context, _send, operation="get_json", url=url, method="GET", max_attempts=max_attempts
+            )
         except HTTPError as exc:
             _read_http_error_detail(exc)
             raise MalApiError(f"{error_context}: HTTP {exc.code}") from exc
