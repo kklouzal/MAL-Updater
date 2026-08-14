@@ -131,6 +131,10 @@ class HidiveSession:
                 timeout_seconds=timeout_seconds,
             )
 
+    def load_profile(self, *, timeout_seconds: float | None = None) -> tuple[str | None, str | None]:
+        """Prove the current token's account through the normal refresh-aware GET path."""
+        return _profile_identity(self.json_get("/user/profile", timeout_seconds=timeout_seconds))
+
     def refresh_tokens(self, *, timeout_seconds: float | None = None) -> None:
         try:
             payload = _hidive_json_request(
@@ -387,8 +391,16 @@ def _hidive_json_request(
         raise HidiveAuthError(f"HIDIVE {method} {path} did not return JSON") from exc
 
 
+def _profile_identity(payload: Any) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, None
+    account_id = payload.get("id")
+    account_name = payload.get("displayName") or payload.get("username") or payload.get("email")
+    return str(account_id) if account_id is not None else None, str(account_name) if account_name is not None else None
+
+
 def _load_profile(config: AppConfig, authorisation_token: str, *, timeout_seconds: float) -> tuple[str | None, str | None]:
-    payload = _hidive_json_request(
+    return _profile_identity(_hidive_json_request(
         config,
         "GET",
         "/user/profile",
@@ -404,12 +416,7 @@ def _load_profile(config: AppConfig, authorisation_token: str, *, timeout_second
             "Authorization": f"Bearer {authorisation_token}",
         },
         timeout_seconds=timeout_seconds,
-    )
-    if not isinstance(payload, dict):
-        return None, None
-    account_id = payload.get("id")
-    account_name = payload.get("displayName") or payload.get("username") or payload.get("email")
-    return str(account_id) if account_id is not None else None, str(account_name) if account_name is not None else None
+    ))
 
 
 def hidive_login_with_credentials(
@@ -536,13 +543,25 @@ def start_hidive_session(
         account_id = bootstrap.account_id
         account_name = bootstrap.account_name
     else:
+        session = HidiveSession(
+            config=config,
+            profile=profile,
+            state_paths=state_paths,
+            token=HidiveTokenSet(
+                authorisation_token=authorisation_token,
+                refresh_token=refresh_token,
+            ),
+        )
         # Always prove the cached token's account before account-scoped boundary
-        # use.  A stale session hint is diagnostic only, never authority.
-        account_id, account_name = _load_profile(
-            config,
-            authorisation_token,
+        # use.  Route that proof through HidiveSession so expired/nearly-expired
+        # tokens refresh first and a definitive profile 401 gets one refresh and
+        # one retry under the same bounded credential-rebootstrap policy as all
+        # other authenticated GETs.  A stale session hint is diagnostic only.
+        account_id, account_name = session.load_profile(
             timeout_seconds=timeout_seconds or config.request_timeout_seconds,
         )
+        session.token.account_id = account_id
+        session.token.account_name = account_name
         _write_session_state(
             state_paths=state_paths,
             profile=profile,
@@ -552,6 +571,7 @@ def start_hidive_session(
             success=True,
             phase="ready",
         )
+        return session
     return HidiveSession(
         config=config,
         profile=profile,

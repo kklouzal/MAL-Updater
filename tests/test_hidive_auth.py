@@ -20,6 +20,7 @@ from mal_updater.hidive_auth import (
     hidive_login_with_credentials,
     load_hidive_credentials,
     resolve_hidive_state_paths,
+    start_hidive_session,
 )
 
 
@@ -34,6 +35,12 @@ class _FakeResponse:
 
 
 class HidiveAuthTests(unittest.TestCase):
+    def _write_cached_tokens(self, root: Path, access_token: str = "cached-access", refresh_token: str = "cached-refresh") -> None:
+        paths = resolve_hidive_state_paths(load_config(root))
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.access_token_path.write_text(access_token + "\n", encoding="utf-8")
+        paths.refresh_token_path.write_text(refresh_token + "\n", encoding="utf-8")
+
     def test_session_state_preserves_prior_account_and_redacts_provider_body(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             config = load_config(Path(td))
@@ -366,6 +373,140 @@ class HidiveAuthTests(unittest.TestCase):
             self.assertEqual(session.token.authorisation_token, "credential-access")
             self.assertEqual(session.token.refresh_token, "credential-refresh")
             self.assertTrue(session.credential_rebootstrap_attempted)
+
+    def test_cached_expired_access_token_refreshes_before_profile_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(root)
+            expired_access = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjEwMCwic3ViIjoiYWNjdC00MiJ9.signature"
+            self._write_cached_tokens(root, expired_access, "valid-refresh")
+            calls: list[tuple[str, str, str | None]] = []
+
+            def fake_request(config, method, path, *, headers, params=None, json_body=None, timeout_seconds=None):
+                calls.append((method, path, headers.get("Authorization")))
+                if path == "/token/refresh":
+                    return {"authorisationToken": "fresh-access", "refreshToken": "fresh-refresh"}
+                if path == "/user/profile":
+                    return {"id": "acct-42", "displayName": "verified-user"}
+                self.fail(f"unexpected HIDIVE request: {method} {path}")
+
+            with patch("mal_updater.hidive_auth._hidive_json_request", side_effect=fake_request), patch(
+                "mal_updater.hidive_auth.hidive_login_with_credentials"
+            ) as login:
+                session = start_hidive_session(config)
+
+            self.assertEqual(
+                calls,
+                [
+                    ("POST", "/token/refresh", f"Bearer {expired_access}"),
+                    ("GET", "/user/profile", "Bearer fresh-access"),
+                ],
+            )
+            login.assert_not_called()
+            self.assertEqual("acct-42", session.token.account_id)
+            self.assertEqual("fresh-access\n", session.state_paths.access_token_path.read_text(encoding="utf-8"))
+            self.assertEqual("fresh-refresh\n", session.state_paths.refresh_token_path.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, session.state_paths.access_token_path.stat().st_mode & 0o777)
+            self.assertEqual(0o600, session.state_paths.refresh_token_path.stat().st_mode & 0o777)
+
+    def test_cached_profile_401_refreshes_then_retries_profile_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(root)
+            self._write_cached_tokens(root)
+            calls: list[tuple[str, str, str | None]] = []
+
+            def fake_request(config, method, path, *, headers, params=None, json_body=None, timeout_seconds=None):
+                calls.append((method, path, headers.get("Authorization")))
+                if path == "/user/profile" and len(calls) == 1:
+                    raise HidiveAuthError("HIDIVE GET /user/profile failed: HTTP 401 (authentication/authorization rejected)")
+                if path == "/token/refresh":
+                    return {"authorisationToken": "fresh-access", "refreshToken": "fresh-refresh"}
+                return {"id": "acct-42", "displayName": "verified-user"}
+
+            with patch("mal_updater.hidive_auth._hidive_json_request", side_effect=fake_request):
+                session = start_hidive_session(config)
+
+            self.assertEqual(
+                calls,
+                [
+                    ("GET", "/user/profile", "Bearer cached-access"),
+                    ("POST", "/token/refresh", "Bearer cached-access"),
+                    ("GET", "/user/profile", "Bearer fresh-access"),
+                ],
+            )
+            self.assertEqual("acct-42", session.token.account_id)
+
+    def test_invalid_cached_refresh_uses_one_credential_rebootstrap_then_verifies_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(root)
+            self._write_cached_tokens(root)
+            calls: list[tuple[str, str, str | None]] = []
+
+            def fake_request(config, method, path, *, headers, params=None, json_body=None, timeout_seconds=None):
+                calls.append((method, path, headers.get("Authorization")))
+                if path == "/user/profile" and len(calls) == 1:
+                    raise HidiveAuthError("HIDIVE GET /user/profile failed: HTTP 401 (authentication/authorization rejected)")
+                if path == "/token/refresh":
+                    raise HidiveAuthError("HIDIVE POST /token/refresh failed: HTTP 401 (authentication/authorization rejected)")
+                return {"id": "acct-new", "displayName": "verified-user"}
+
+            bootstrap = type("Bootstrap", (), {
+                "authorisation_token": "credential-access",
+                "refresh_token": "credential-refresh",
+                "account_id": "acct-new",
+                "account_name": "verified-user",
+            })()
+            with patch("mal_updater.hidive_auth._hidive_json_request", side_effect=fake_request), patch(
+                "mal_updater.hidive_auth.hidive_login_with_credentials", return_value=bootstrap
+            ) as login:
+                session = start_hidive_session(config)
+
+            login.assert_called_once_with(
+                config,
+                profile="default",
+                timeout_seconds=config.request_timeout_seconds,
+                verify_account=True,
+            )
+            self.assertEqual(
+                calls,
+                [
+                    ("GET", "/user/profile", "Bearer cached-access"),
+                    ("POST", "/token/refresh", "Bearer cached-access"),
+                    ("GET", "/user/profile", "Bearer credential-access"),
+                ],
+            )
+            self.assertTrue(session.credential_rebootstrap_attempted)
+            self.assertEqual("acct-new", session.token.account_id)
+
+    def test_cached_auth_recovery_is_bounded_when_profile_remains_unauthorized(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(root)
+            self._write_cached_tokens(root)
+            calls: list[str] = []
+
+            def fake_request(config, method, path, *, headers, params=None, json_body=None, timeout_seconds=None):
+                calls.append(path)
+                if path == "/token/refresh":
+                    raise HidiveAuthError("HIDIVE POST /token/refresh failed: HTTP 401 (authentication/authorization rejected)")
+                raise HidiveAuthError("HIDIVE GET /user/profile failed: HTTP 401 (authentication/authorization rejected)")
+
+            bootstrap = type("Bootstrap", (), {
+                "authorisation_token": "credential-access",
+                "refresh_token": "credential-refresh",
+                "account_id": "acct-new",
+                "account_name": "verified-user",
+            })()
+            with patch("mal_updater.hidive_auth._hidive_json_request", side_effect=fake_request), patch(
+                "mal_updater.hidive_auth.hidive_login_with_credentials", return_value=bootstrap
+            ) as login:
+                with self.assertRaisesRegex(HidiveAuthError, "HTTP 401"):
+                    start_hidive_session(config)
+
+            self.assertEqual(["/user/profile", "/token/refresh", "/user/profile"], calls)
+            login.assert_called_once()
 
 
 if __name__ == "__main__":
