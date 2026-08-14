@@ -25,6 +25,8 @@ MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION = "019_mal_user_anime_list_ref
 PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION = "020_provider_eligibility_refresh_lifecycle.sql"
 PUBLIC_USERRECS_DURABLE_QUEUE_MIGRATION = "021_public_userrecs_durable_queue_and_snapshot_guards.sql"
 MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION = "022_mal_user_list_durable_pagination.sql"
+PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION = "023_public_userrecs_incremental_validation.sql"
+PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION = "025_provider_watchlist_current_membership.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -50,6 +52,9 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION,
     PUBLIC_USERRECS_DURABLE_QUEUE_MIGRATION,
     MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION,
+    PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION,
+    "024_public_userrecs_final_anchor_validation.sql",
+    PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -365,6 +370,10 @@ class MalPublicUserRecsCrawlGeneration:
     staged_revision: int = 0
     validated_staged_revision: int | None = None
     validation_fingerprint: str | None = None
+    validation_page_number: int = 0
+    validation_revision: int | None = None
+    final_anchor_step: int = 0
+    final_anchor_revision: int | None = None
 
     @property
     def terminal_evidence(self) -> dict[str, Any]:
@@ -3403,6 +3412,10 @@ def _public_userrecs_generation_from_row(row: sqlite3.Row) -> MalPublicUserRecsC
             else int(row["validated_staged_revision"])
         ),
         validation_fingerprint=row["validation_fingerprint"] if "validation_fingerprint" in keys else None,
+        validation_page_number=int(row["validation_page_number"] or 0) if "validation_page_number" in keys else 0,
+        validation_revision=(None if "validation_revision" not in keys or row["validation_revision"] is None else int(row["validation_revision"])),
+        final_anchor_step=int(row["final_anchor_step"] or 0) if "final_anchor_step" in keys else 0,
+        final_anchor_revision=(None if "final_anchor_revision" not in keys or row["final_anchor_revision"] is None else int(row["final_anchor_revision"])),
     )
 
 
@@ -3665,6 +3678,15 @@ def sync_mal_public_userrecs_source_queue(
                 "SELECT queue_class FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = ?",
                 (source_id,),
             ).fetchone()
+            latest = conn.execute(
+                """SELECT quarantined_at, quarantine_reason
+                   FROM mal_public_userrecs_crawl_generations
+                   WHERE source_mal_anime_id = ?
+                   ORDER BY generation_id DESC LIMIT 1""",
+                (source_id,),
+            ).fetchone()
+            if latest is not None and (latest["quarantined_at"] is not None or latest["quarantine_reason"] is not None):
+                requested = "quarantined"
             if existing is None:
                 conn.execute(
                     """
@@ -3678,7 +3700,7 @@ def sync_mal_public_userrecs_source_queue(
                 # Never demote a never-started source merely because current
                 # ranking/status reconstruction is incomplete. Other classes
                 # move only when their semantic state changes.
-                effective = old_class if old_class == "never_started" and requested != "quarantined" else requested
+                effective = old_class if old_class in {"never_started", "quarantined"} and requested != "quarantined" else requested
                 conn.execute(
                     """
                     UPDATE mal_public_userrecs_source_queue
@@ -3913,6 +3935,17 @@ def create_or_get_active_mal_public_userrecs_generation(
             (source_id,),
         ).fetchone()
         if row is None:
+            quarantined = conn.execute(
+                """SELECT generation_id FROM mal_public_userrecs_crawl_generations
+                   WHERE source_mal_anime_id = ?
+                     AND (quarantined_at IS NOT NULL OR quarantine_reason IS NOT NULL)
+                   ORDER BY generation_id DESC LIMIT 1""",
+                (source_id,),
+            ).fetchone()
+            if quarantined is not None:
+                raise RuntimeError(
+                    "quarantined public userrecs source is terminal; explicit audited reinitialization is required"
+                )
             cursor = conn.execute(
                 """
                 INSERT INTO mal_public_userrecs_crawl_generations (
@@ -3994,6 +4027,54 @@ def create_or_get_active_mal_public_userrecs_generation(
                 ),
             )
             row = _get_public_userrecs_generation_row(conn, generation_id)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _public_userrecs_generation_from_row(row)
+
+
+def reinitialize_mal_public_userrecs_source(
+    db_path: Path, *, source_mal_anime_id: int, source_url: str, operator_reason: str,
+) -> MalPublicUserRecsCrawlGeneration:
+    """Explicitly clear a source quarantine while retaining all history and published LKG."""
+    source_id = _coerce_mal_anime_id(source_mal_anime_id)
+    reason = str(operator_reason).strip()
+    if source_id is None or not reason:
+        raise ValueError("source_mal_anime_id and operator_reason are required")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute(
+            """SELECT * FROM mal_public_userrecs_crawl_generations
+               WHERE source_mal_anime_id=? ORDER BY generation_id DESC LIMIT 1""", (source_id,),
+        ).fetchone()
+        if old is None or (old["quarantined_at"] is None and old["quarantine_reason"] is None):
+            raise RuntimeError("latest public userrecs generation is not quarantined")
+        if old["claim_token"] is not None:
+            live = conn.execute("SELECT datetime(?) > datetime('now') AS live", (old["claim_expires_at"],)).fetchone()
+            if live is not None and bool(live["live"]):
+                raise RuntimeError("quarantined public userrecs generation still has a live claim")
+        cursor = conn.execute(
+            """INSERT INTO mal_public_userrecs_crawl_generations
+               (source_mal_anime_id,source_title,source_url,cursor_url,generation_key,logic_version,attempt_count)
+               VALUES (?,?,?,?,lower(hex(randomblob(16))),?,1)""",
+            (source_id, old["source_title"], str(source_url), str(source_url), PUBLIC_USERRECS_LOGIC_VERSION),
+        )
+        generation_id = int(cursor.lastrowid)
+        conn.execute(
+            """INSERT INTO mal_public_userrecs_source_queue(source_mal_anime_id,queue_class,last_generation_id,last_outcome,last_error_code)
+               VALUES (?,'resumable',?,'explicit_reinitialize',NULL)
+               ON CONFLICT(source_mal_anime_id) DO UPDATE SET eligible=1,queue_class='resumable',
+                 class_entered_at=CURRENT_TIMESTAMP,claim_token=NULL,claim_expires_at=NULL,next_retry_at=NULL,
+                 last_generation_id=excluded.last_generation_id,last_outcome='explicit_reinitialize',last_error_code=NULL,
+                 updated_at=CURRENT_TIMESTAMP""", (source_id, generation_id),
+        )
+        _record_public_userrecs_event(conn, generation_id=generation_id, source_mal_anime_id=source_id,
+                                      event_type="begin", page_url=str(source_url), error=f"operator reinitialize: {reason[:900]}")
+        row = _get_public_userrecs_generation_row(conn, generation_id)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -4214,6 +4295,10 @@ def replace_mal_public_userrecs_staged_page(
                 staged_revision = staged_revision + 1,
                 validated_staged_revision = NULL,
                 validation_fingerprint = NULL,
+                validation_page_number = 0,
+                validation_revision = NULL,
+                final_anchor_step = 0,
+                final_anchor_revision = NULL,
                 first_page_revalidated_at = NULL,
                 boundary_revalidated_at = NULL,
                 generation_revision = generation_revision + 1,
@@ -4364,27 +4449,74 @@ def record_mal_public_userrecs_revalidation(
     generation_id: int,
     checked_boundary: bool,
     validation_fingerprint: str | None = None,
+    validated_page_number: int | None = None,
     claim_token: str | None = None,
     expected_revision: int | None = None,
 ) -> MalPublicUserRecsCrawlGeneration:
+    """Checkpoint bounded snapshot validation, bound to the staged revision."""
     with connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         generation = _get_public_userrecs_generation_row(conn, int(generation_id))
         _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="record revalidation")
         pages, edges = _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=False)
         bound_fingerprint = _public_userrecs_staged_validation_fingerprint(pages, edges)
+        page_number = len(pages) if validated_page_number is None else int(validated_page_number)
+        if page_number < 1 or page_number > len(pages):
+            raise ValueError("public userrecs validation page is outside the staged generation")
+        prior_page = int(generation["validation_page_number"] or 0)
+        prior_revision = generation["validation_revision"]
+        staged_revision = int(generation["staged_revision"] or 0)
+        if prior_page and (prior_revision is None or int(prior_revision) != staged_revision):
+            raise RuntimeError("public userrecs incremental validation revision is stale")
+        if page_number != prior_page + 1:
+            raise RuntimeError("public userrecs incremental validation cursor is non-contiguous")
+        complete = page_number == len(pages)
         conn.execute(
-            """
-            UPDATE mal_public_userrecs_crawl_generations
-            SET first_page_revalidated_at = CURRENT_TIMESTAMP,
-                boundary_revalidated_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE boundary_revalidated_at END,
-                validated_staged_revision = staged_revision,
-                validation_fingerprint = ?,
-                generation_revision = generation_revision + 1,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE generation_id = ? AND status IN ('active', 'paused', 'ready')
-            """,
-            (1 if checked_boundary else 0, bound_fingerprint, int(generation_id)),
+            """UPDATE mal_public_userrecs_crawl_generations
+               SET first_page_revalidated_at=CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE first_page_revalidated_at END,
+                   boundary_revalidated_at=CASE WHEN ? AND ? THEN CURRENT_TIMESTAMP ELSE boundary_revalidated_at END,
+                   validation_page_number=?, validation_revision=staged_revision,
+                   validated_staged_revision=CASE WHEN ? THEN staged_revision ELSE NULL END,
+                   validation_fingerprint=CASE WHEN ? THEN ? ELSE NULL END,
+                   generation_revision=generation_revision+1, updated_at=CURRENT_TIMESTAMP
+               WHERE generation_id=? AND status IN ('active','paused','ready')""",
+            (page_number, int(bool(checked_boundary)), int(complete), page_number, int(complete), int(complete), bound_fingerprint, int(generation_id)),
+        )
+        row = _get_public_userrecs_generation_row(conn, int(generation_id))
+        conn.commit()
+    return _public_userrecs_generation_from_row(row)
+
+
+def record_mal_public_userrecs_final_anchor(
+    db_path: Path, *, generation_id: int, anchor_step: int, claim_token: str,
+    expected_revision: int,
+) -> MalPublicUserRecsCrawlGeneration:
+    """Checkpoint final page-1/terminal anchors for the exact fully validated staged revision."""
+    step = int(anchor_step)
+    if step not in {1, 2}:
+        raise ValueError("public userrecs final anchor step must be 1 or 2")
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = _get_public_userrecs_generation_row(conn, int(generation_id))
+        _require_public_userrecs_claim(conn, generation, claim_token=claim_token,
+                                       expected_revision=expected_revision, action="record final anchor")
+        pages, edges = _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
+        staged_revision = int(generation["staged_revision"] or 0)
+        if generation["validated_staged_revision"] is None or int(generation["validated_staged_revision"]) != staged_revision:
+            raise RuntimeError("public userrecs final anchors require fully validated staged revision")
+        prior = int(generation["final_anchor_step"] or 0)
+        prior_revision = generation["final_anchor_revision"]
+        if prior and (prior_revision is None or int(prior_revision) != staged_revision):
+            raise RuntimeError("public userrecs final anchor cursor is stale")
+        expected_step = 1 if prior == 0 else 2
+        if step != expected_step:
+            raise RuntimeError("public userrecs final anchor cursor is non-contiguous")
+        conn.execute(
+            """UPDATE mal_public_userrecs_crawl_generations
+               SET final_anchor_step=?,final_anchor_revision=staged_revision,
+                   validation_fingerprint=?,generation_revision=generation_revision+1,updated_at=CURRENT_TIMESTAMP
+               WHERE generation_id=?""",
+            (step, _public_userrecs_staged_validation_fingerprint(pages, edges), int(generation_id)),
         )
         row = _get_public_userrecs_generation_row(conn, int(generation_id))
         conn.commit()
@@ -4552,14 +4684,19 @@ def mark_mal_public_userrecs_generation_ready(
             action="mark ready",
         )
         _require_public_userrecs_claim(conn, generation, claim_token=claim_token, expected_revision=expected_revision, action="mark ready")
-        _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
+        pages, edges = _assert_public_userrecs_generation_coherent(conn, generation, require_terminal=True)
+        validation_fingerprint = _public_userrecs_staged_validation_fingerprint(pages, edges)
         conn.execute(
             """
             UPDATE mal_public_userrecs_crawl_generations
-            SET status = 'ready', completed_at = CURRENT_TIMESTAMP, generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
+            SET status = 'ready', completed_at = CURRENT_TIMESTAMP,
+                validated_staged_revision = staged_revision,
+                validation_fingerprint = ?, validation_revision = staged_revision,
+                validation_page_number = pages_fetched,
+                generation_revision = generation_revision + 1, updated_at = CURRENT_TIMESTAMP
             WHERE generation_id = ?
             """,
-            (int(generation_id),),
+            (validation_fingerprint, int(generation_id)),
         )
         _record_public_userrecs_event(
             conn,
@@ -4846,6 +4983,12 @@ def publish_mal_public_userrecs_generation(
             raise ValueError("public userrecs publication requires final validation for exact staged revision")
         if claim_token is not None and _public_userrecs_staged_validation_fingerprint(pages, staged_edges) != str(generation["validation_fingerprint"]):
             raise ValueError("public userrecs staged snapshot changed after final validation")
+        if claim_token is not None and (
+            int(generation["final_anchor_step"] or 0) != 2
+            or generation["final_anchor_revision"] is None
+            or int(generation["final_anchor_revision"]) != int(generation["staged_revision"])
+        ):
+            raise ValueError("public userrecs publication requires final page-1 and terminal anchors")
         source_id = int(generation["source_mal_anime_id"])
         source_url = generation["source_url"] or pages[0]["page_url"]
         edges = _aggregate_public_userrecs_publication_edges(
@@ -5033,7 +5176,7 @@ def unknown_public_userrecs_diagnostics(*, reason: str, status: str = "unknown")
         "status": normalized_status,
         "reason_codes": reason_codes,
         "policy": {
-            "authorized_source_titles_per_hour": 2,
+            "authorized_source_titles_per_hour": 3,
             "configured_source_titles_per_hour": None,
             "configured_source_titles_per_hour_source": "unknown",
             "max_pages_per_source_per_run": None,
@@ -5105,7 +5248,7 @@ def unknown_public_userrecs_diagnostics(*, reason: str, status: str = "unknown")
             "completion_eta_detail": {"eta_hours": None, "reason_code": "unknown_pages_per_source"},
         },
         "sustainability": {
-            "authorized_source_titles_per_hour": 2,
+            "authorized_source_titles_per_hour": 3,
             "configured_source_titles_per_hour": None,
             "sources_started_last_hour": 0,
             "within_authorized_rate": None,
@@ -5121,7 +5264,7 @@ def get_public_userrecs_diagnostics(
     configured_source_titles_per_hour: int | None = None,
     max_pages_per_source_per_run: int | None = None,
     stale_after_days: int = 45,
-    authorized_source_titles_per_hour: int = 2,
+    authorized_source_titles_per_hour: int = 3,
 ) -> dict[str, Any]:
     """Return read-only public MAL userrecs crawl diagnostics for dashboards.
 
@@ -5533,6 +5676,7 @@ def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: 
                 FROM mal_series_mapping m
                 LEFT JOIN provider_watchlist w
                     ON w.provider = m.provider AND w.provider_series_id = m.provider_series_id
+                   AND w.is_active = 1
                 LEFT JOIN provider_episode_progress p
                     ON p.provider = m.provider AND p.provider_series_id = m.provider_series_id
                 GROUP BY m.mal_anime_id
@@ -7938,6 +8082,71 @@ def claim_or_create_mal_user_anime_list_traversal(
     finally:
         conn.close()
     return _mal_user_traversal_generation_from_row(row), [_mal_user_traversal_partition_from_row(item) for item in partition_rows]
+
+
+def reinitialize_mal_user_anime_list_traversal(
+    db_path: Path, *, account_id: int, account_name: str, query_identity: str,
+    query: dict[str, Any], partitions: Iterable[dict[str, Any]], operator_reason: str, fetched_at: str,
+) -> MalUserAnimeListTraversalGeneration:
+    """Explicitly replace the latest exact-identity quarantine without touching published LKG/history."""
+    reason = str(operator_reason).strip()
+    account_id = int(account_id)
+    account_name = str(account_name).strip()
+    if account_id <= 0 or not account_name or not reason:
+        raise ValueError("exact account identity and operator_reason are required")
+    account_key = f"mal:{account_id}"
+    query_text = json.dumps(query, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    requested = list(partitions)
+    if not requested:
+        raise ValueError("at least one MAL list partition is required")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute(
+            """SELECT * FROM mal_user_anime_list_refresh_generations
+               WHERE account_key=? AND query_identity=? ORDER BY generation DESC LIMIT 1""",
+            (account_key, str(query_identity)),
+        ).fetchone()
+        if old is None or (old["quarantined_at"] is None and old["quarantine_reason"] is None):
+            raise MalUserAnimeListRefreshConflictError("latest exact account/query generation is not quarantined")
+        if int(old["account_id"] or 0) != account_id or str(old["account_name"] or "") != account_name:
+            raise MalUserAnimeListRefreshConflictError("MAL account provenance does not match quarantined generation")
+        if str(old["query_json"]) != query_text or str(old["logic_version"]) != MAL_USER_LIST_PAGINATION_LOGIC_VERSION:
+            raise MalUserAnimeListRefreshConflictError("MAL query provenance does not match quarantined generation")
+        authority = conn.execute("SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (account_key,)).fetchone()
+        if authority is None or int(authority["account_id"]) != account_id or str(authority["account_name"]) != account_name:
+            raise MalUserAnimeListRefreshConflictError("MAL account authority provenance is absent or changed")
+        run_id = f"mal-list-{str(query_identity)[:16]}-reinit-{uuid.uuid4()}"
+        cursor = conn.execute(
+            """INSERT INTO mal_user_anime_list_refresh_generations
+               (refresh_run_id,status,fetched_at,account_key,account_id,account_name,query_identity,query_json,logic_version,
+                revision,error,publication_epoch)
+               VALUES (?,'active',?,?,?,?,?,?,?,1,?,?)""",
+            (run_id, str(fetched_at), account_key, account_id, account_name, str(query_identity), query_text,
+             MAL_USER_LIST_PAGINATION_LOGIC_VERSION, f"explicit operator reinitialize: {reason[:900]}",
+             int(authority["publication_epoch"])),
+        )
+        generation = int(cursor.lastrowid)
+        for item in requested:
+            conn.execute(
+                """INSERT INTO mal_user_anime_list_refresh_partitions
+                   (generation,partition_key,requested_status,ordinal,initial_url,next_url)
+                   VALUES (?,?,?,?,?,?)""",
+                (generation, str(item["partition_key"]), item.get("requested_status"), int(item["ordinal"]),
+                 str(item["initial_url"]), str(item["initial_url"])),
+            )
+        conn.execute(
+            "UPDATE mal_user_anime_list_account_authority SET current_generation=?,updated_at=CURRENT_TIMESTAMP WHERE account_key=?",
+            (generation, account_key),
+        )
+        row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (generation,)).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return _mal_user_traversal_generation_from_row(row)
 
 
 def get_mal_user_anime_list_traversal(

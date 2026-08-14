@@ -2205,7 +2205,7 @@ def _safe_metadata_ratio(numerator: int, denominator: int) -> float | None:
 def _provider_enrichment_policy(config: AppConfig) -> dict[str, Any]:
     candidate_limit = config.service.execute_limit_for("recommend_provider_eligibility_candidates")
     if candidate_limit is None:
-        candidate_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_provider_eligibility_candidates", 4)
+        candidate_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_provider_eligibility_candidates", 5)
     search_limit = config.service.execute_limit_for("recommend_provider_eligibility_search_results")
     if search_limit is None:
         search_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_provider_eligibility_search_results", 5)

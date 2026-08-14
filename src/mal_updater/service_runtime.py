@@ -61,12 +61,12 @@ _FAILURE_BACKOFF_MIN_SECONDS = 300
 _AUTO_PROJECTED_REQUEST_PERCENTILE = 0.9
 _AUTO_PROJECTED_REQUEST_BURST_MIN_HISTORY = 4
 _AUTO_PROJECTED_REQUEST_BURST_RATIO = 2.0
-_MAL_USER_LIST_REFRESH_MAX_PAGES = 3
+_MAL_USER_LIST_REFRESH_MAX_PAGES = 10
 _MAL_USER_LIST_INITIAL_DELAY_SECONDS = 15 * 60
 _RECOMMENDATION_FULL_HARVEST_INITIAL_DELAY_SECONDS = 75 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_INITIAL_DELAY_SECONDS = 45 * 60
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_STAGGER_SECONDS = 15 * 60
-_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 2
+_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT = 5
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT = 5
 _RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE = 1
 _SERVICE_STATE_MAX_BYTES = 8 * 1024 * 1024
@@ -1982,15 +1982,11 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             # Manual `apply-sync --limit 0` retains its explicit full-scan
             # meaning. In unattended service config, zero is a hard disable so
             # it can never normalize into unbounded writes.
-            task_state.update(
-                {
-                    "last_status": "disabled",
-                    "execution_state": "idle",
-                    "last_skip_reason": "execute_limit_zero",
-                }
-            )
+            already_disabled = task_state.get("last_status") == "disabled" and task_state.get("last_skip_reason") == "execute_limit_zero"
+            task_state.update({"last_status": "disabled", "execution_state": "idle", "last_skip_reason": "execute_limit_zero"})
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
-            results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
+            if not already_disabled and float(task_state.get("last_run_epoch", 0)) <= 0:
+                results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
             continue
         if spec.name == "recommend_full_harvest" and (config.service.execute_limit_for("recommend_full_harvest") or 0) <= 0:
             # Manual CLI --limit 0 means "all due". In the daemon's cold public

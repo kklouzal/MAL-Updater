@@ -1211,8 +1211,8 @@ def _dashboard_config_from_db_path(db_path: Path) -> Any | None:
 
 
 def _public_userrecs_policy_kwargs_from_db_path(db_path: Path) -> dict[str, int]:
-    source_titles_per_hour = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 2))
-    max_pages_per_source_per_run = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 3))
+    source_titles_per_hour = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 3))
+    max_pages_per_source_per_run = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 10))
     stale_after_days = int(DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS)
     config = _dashboard_config_from_db_path(db_path)
     if config is not None and getattr(config, "service", None) is not None:

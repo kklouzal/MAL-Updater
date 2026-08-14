@@ -26,6 +26,7 @@ from mal_updater.db import (
     replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     restart_mal_public_userrecs_generation_after_drift,
+    reinitialize_mal_public_userrecs_source,
     release_mal_public_userrecs_source_claim,
     renew_mal_public_userrecs_source_claim,
     resume_mal_public_userrecs_generation,
@@ -246,6 +247,22 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
         self.assertIsNotNone(quarantined.quarantined_at)
         self.assertEqual("drift-livelock", quarantined.quarantine_reason)
         self.assertIsNone(get_active_mal_public_userrecs_generation(self.db_path, source_mal_anime_id=1))
+        sync_mal_public_userrecs_source_queue(
+            self.db_path, source_mal_anime_ids=[1], due_classes={1: "never_started"}
+        )
+        self.assertEqual([], claim_mal_public_userrecs_sources(
+            self.db_path, limit=1, claim_token="must-not-unquarantine"
+        ))
+        with self.assertRaisesRegex(RuntimeError, "explicit audited reinitialization"):
+            create_or_get_active_mal_public_userrecs_generation(
+                self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL
+            )
+        fresh = reinitialize_mal_public_userrecs_source(
+            self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL,
+            operator_reason="reviewed upstream pagination and approved restart",
+        )
+        self.assertEqual("active", fresh.status)
+        self.assertNotEqual(quarantined.generation_id, fresh.generation_id)
 
     def test_claim_fence_rejects_expired_and_stale_worker_mutations(self) -> None:
         sync_mal_public_userrecs_source_queue(
@@ -943,15 +960,15 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
 
         snapshot = get_public_userrecs_diagnostics(
             self.db_path,
-            configured_source_titles_per_hour=2,
-            max_pages_per_source_per_run=3,
+            configured_source_titles_per_hour=3,
+            max_pages_per_source_per_run=10,
             stale_after_days=45,
         )
 
         self.assertEqual("degraded", snapshot["status"])
-        self.assertEqual(2, snapshot["policy"]["authorized_source_titles_per_hour"])
-        self.assertEqual(2, snapshot["policy"]["configured_source_titles_per_hour"])
-        self.assertEqual(3, snapshot["policy"]["max_pages_per_source_per_run"])
+        self.assertEqual(3, snapshot["policy"]["authorized_source_titles_per_hour"])
+        self.assertEqual(3, snapshot["policy"]["configured_source_titles_per_hour"])
+        self.assertEqual(10, snapshot["policy"]["max_pages_per_source_per_run"])
         self.assertEqual(45, snapshot["policy"]["stale_horizon_days"])
         self.assertEqual(2, snapshot["positive_seed_count"])
         self.assertEqual(1, snapshot["coverage"]["complete"])

@@ -632,7 +632,7 @@ class FullUserRecommendationHarvestResumableTests(unittest.TestCase):
         self.assertEqual("ok", second.status)
         self.assertEqual(1, second.harvested)
         self.assertEqual(0, second.failed)
-        self.assertEqual([(1, page1), (1, page2), (1, page1), (1, page2)], second_client.requested)
+        self.assertEqual([(1, page1), (1, page2), (1, page2), (1, page1)], second_client.requested)
         self.assertIsNone(get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1))
         self.assertEqual({10: 3, 20: 5}, self._published_targets())
         status = self._harvest_status()
@@ -1001,6 +1001,101 @@ class FullUserRecommendationHarvestResumableTests(unittest.TestCase):
                         "UPDATE mal_public_userrecs_source_queue SET queue_class = 'refresh_due', claim_token = NULL, claim_expires_at = NULL, last_generation_id = NULL, next_retry_at = NULL WHERE source_mal_anime_id = 1"
                     )
                     conn.commit()
+
+    def test_many_iteration_page_one_budget_eventually_validates_and_publishes(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        urls = [self._source_url(1, "Seed 1")]
+        urls.extend(f"{urls[0]}?p={number}" for number in range(2, 7))
+        pages = {}
+        for index, url in enumerate(urls):
+            pages[(1, url)] = _public_userrecs_page_result(
+                source_id=1, page_url=url,
+                next_url=urls[index + 1] if index + 1 < len(urls) else None,
+                targets=[(100 + index, f"Target {index}", index + 1)],
+            )
+        client = _FakePublicUserRecsClient(pages)
+        summaries = []
+        for _ in range(60):
+            summary = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+            summaries.append(summary)
+            if summary.harvested:
+                break
+        self.assertLessEqual(len(summaries), sum(range(1, len(urls) + 1)) + len(urls) + 2)
+        self.assertEqual(1, summaries[-1].harvested)
+        self.assertEqual(set(range(100, 106)), set(self._published_targets()))
+        self.assertIsNone(get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1))
+
+    def test_many_iteration_default_ten_budget_crosses_staging_validation_boundary(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        urls = [self._source_url(1, "Seed 1")]
+        urls.extend(f"{urls[0]}?p={number}" for number in range(2, 13))
+        pages = {
+            (1, url): _public_userrecs_page_result(
+                source_id=1, page_url=url,
+                next_url=urls[index + 1] if index + 1 < len(urls) else None,
+                targets=[(200 + index, f"Target {index}", index + 1)],
+            )
+            for index, url in enumerate(urls)
+        }
+        client = _FakePublicUserRecsClient(pages)
+        for iteration in range(10):
+            summary = refresh_full_user_recommendation_harvest(self.config, max_pages=10, client=client)
+            if summary.harvested:
+                break
+        self.assertLess(iteration, 9)
+        self.assertEqual(1, summary.harvested)
+        self.assertEqual(set(range(200, 212)), set(self._published_targets()))
+
+    def test_incremental_validation_cursor_survives_claim_reclaim(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2, page3 = f"{page1}?p=2", f"{page1}?p=3"
+        pages = {
+            (1, page1): _public_userrecs_page_result(source_id=1, page_url=page1, next_url=page2, targets=[(10,"Ten",1)]),
+            (1, page2): _public_userrecs_page_result(source_id=1, page_url=page2, next_url=page3, targets=[(20,"Twenty",2)]),
+            (1, page3): _public_userrecs_page_result(source_id=1, page_url=page3, next_url=None, targets=[(30,"Thirty",3)]),
+        }
+        client = _FakePublicUserRecsClient(pages)
+        for _ in range(4):
+            refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+        active = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        self.assertIsNotNone(active)
+        self.assertEqual(1, active.validation_page_number)
+        with connect(self.config.db_path) as conn:
+            conn.execute("UPDATE mal_public_userrecs_source_queue SET claim_expires_at='2000-01-01' WHERE source_mal_anime_id=1")
+            conn.execute("UPDATE mal_public_userrecs_crawl_generations SET claim_expires_at='2000-01-01' WHERE generation_id=?", (active.generation_id,))
+            conn.commit()
+        for _ in range(12):
+            summary = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+            if summary.harvested:
+                break
+        self.assertEqual(1, summary.harvested)
+        self.assertEqual({10:1,20:2,30:3}, self._published_targets())
+
+    def test_page_one_drift_after_incremental_validation_rejects_publication(self) -> None:
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        page2 = f"{page1}?p=2"
+        stable1 = _public_userrecs_page_result(source_id=1, page_url=page1, next_url=page2, targets=[(10,"Ten",1)])
+        pages = {
+            (1, page1): stable1,
+            (1, page2): _public_userrecs_page_result(source_id=1, page_url=page2, next_url=None, targets=[(20,"Twenty",2)]),
+        }
+        client = _FakePublicUserRecsClient(pages)
+        for _ in range(4):
+            refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+        active = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        while active is not None and active.final_anchor_step < 1:
+            refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+            active = get_active_mal_public_userrecs_generation(self.config.db_path, source_mal_anime_id=1)
+        # Page 1 was already incrementally validated; mutate it before the final terminal anchor.
+        client.pages[(1, page1)] = _public_userrecs_page_result(
+            source_id=1, page_url=page1, next_url=page2, targets=[(99,"Drifted",9)]
+        )
+        summary = refresh_full_user_recommendation_harvest(self.config, max_pages=1, client=client)
+        self.assertEqual(0, summary.harvested)
+        self.assertEqual({}, self._published_targets())
+        self.assertTrue(summary.restarted_sources or summary.quarantined_sources)
 
 
 if __name__ == "__main__":

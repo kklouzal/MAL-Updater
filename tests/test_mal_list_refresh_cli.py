@@ -16,7 +16,7 @@ class MalListRefreshCliTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["mal-list-refresh"])
 
-        self.assertEqual(3, args.max_pages)
+        self.assertEqual(10, args.max_pages)
         self.assertFalse(args.complete)
         self.assertEqual("json", args.format)
 

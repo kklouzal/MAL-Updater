@@ -365,6 +365,52 @@ class IngestionTests(unittest.TestCase):
             with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
                 self.assertEqual(conn.execute("SELECT mode FROM sync_runs").fetchone()[0], "full_refresh")
 
+    def test_complete_watchlist_generation_deactivates_absent_but_partial_does_not(self) -> None:
+        def complete_payload(series_id: str, account: str = "acct-1") -> dict:
+            payload = sample_snapshot()
+            payload["account_id_hint"] = account
+            payload["series"][0]["provider_series_id"] = series_id
+            payload["progress"] = []
+            payload["watchlist"][0]["provider_series_id"] = series_id
+            payload["raw"] = {
+                "partial": False, "sync_boundary_refresh_kind": "explicit_full_refresh",
+                "watchlist_start": 0, "watchlist_partial": False,
+            }
+            return payload
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            ingest_snapshot_payload(complete_payload("series-x"), config, mode="full_refresh")
+            partial = complete_payload("series-y")
+            partial["raw"]["partial"] = True
+            partial["raw"]["watchlist_partial"] = True
+            ingest_snapshot_payload(partial, config, mode="hot")
+            with sqlite3.connect(config.db_path) as conn:
+                self.assertEqual(1, conn.execute("SELECT is_active FROM provider_watchlist WHERE provider_series_id='series-x'").fetchone()[0])
+            ingest_snapshot_payload(complete_payload("series-y"), config, mode="full_refresh")
+            with sqlite3.connect(config.db_path) as conn:
+                states = dict(conn.execute("SELECT provider_series_id, is_active FROM provider_watchlist"))
+            self.assertEqual({"series-x": 0, "series-y": 1}, states)
+
+    def test_account_mismatch_cannot_deactivate_existing_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            first = sample_snapshot()
+            first["account_id_hint"] = "acct-a"
+            first["raw"] = {"partial": False, "sync_boundary_refresh_kind": "explicit_full_refresh", "watchlist_start": 0, "watchlist_partial": False}
+            ingest_snapshot_payload(first, config, mode="full_refresh")
+            second = sample_snapshot()
+            second["account_id_hint"] = "acct-b"
+            second["watchlist"] = []
+            second["raw"] = dict(first["raw"])
+            ingest_snapshot_payload(second, config, mode="full_refresh")
+            with sqlite3.connect(config.db_path) as conn:
+                self.assertEqual(1, conn.execute("SELECT is_active FROM provider_watchlist").fetchone()[0])
+
     def test_provider_fetch_snapshot_ingest_records_full_refresh_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

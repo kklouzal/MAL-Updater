@@ -13,7 +13,7 @@ from unittest.mock import patch
 from mal_updater.config import ensure_directories, load_config
 from mal_updater.openclaw_delivery import OpenClawRecommendationDeliveryResult
 from mal_updater.request_tracking import begin_api_request_context, end_api_request_context, estimate_budget_recovery_seconds, estimate_budget_recovery_seconds_for_ratio, record_api_request_event
-from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, _save_state, _task_execution_signature, effective_niceness_policy, run_pending_tasks, run_service_loop
+from mal_updater.service_runtime import TaskSpec, _ProcessLease, _apply_sync_command, _budget_gate, _mal_list_refresh_command, _projected_request_count, _recommendation_full_harvest_command, _recommendation_metadata_refresh_command, _run_subprocess, _save_state, _task_execution_signature, effective_niceness_policy, run_pending_tasks, run_service_loop
 
 
 class ServiceRuntimeLeaseTests(unittest.TestCase):
@@ -152,6 +152,7 @@ class ServiceRuntimeFullRefreshCadenceTests(unittest.TestCase):
         self.config = load_config(self.project_root)
         ensure_directories(self.config)
         self.config.service.sync_every_seconds = 0
+        self.config.service.task_execute_limits["sync_apply"] = 8
         self.config.service.health_every_seconds = 3600
         self.config.service.mal_refresh_every_seconds = 3600
         self.config.service.full_refresh_every_seconds = 86400
@@ -724,6 +725,19 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             _recommendation_metadata_refresh_command(self.config),
         )
 
+    def test_mal_list_refresh_default_command_and_signature_use_ten_attempts(self) -> None:
+        self.assertEqual(
+            [sys.executable, "-m", "mal_updater.cli", "mal-list-refresh", "--max-pages", "10"],
+            _mal_list_refresh_command(self.config),
+        )
+        self.assertEqual(
+            "mal_list_refresh:max_pages=10",
+            _task_execution_signature(
+                self.config,
+                TaskSpec("mal_list_refresh", self.config.service.mal_list_refresh_every_seconds, budget_provider="mal"),
+            ),
+        )
+
     def test_recommendation_full_harvest_default_cadence_command_and_policy_are_bounded(self) -> None:
         self.assertEqual(3600, self.config.service.recommendation_full_harvest_every_seconds)
 
@@ -734,22 +748,22 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
                 "mal_updater.cli",
                 "recommend-refresh-full-userrecs",
                 "--limit",
-                "2",
+                "3",
                 "--stale-after-days",
                 "120",
                 "--max-pages",
-                "3",
+                "10",
             ],
             _recommendation_full_harvest_command(self.config),
         )
         policy = effective_niceness_policy(self.config)
         self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
         self.assertEqual(120, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
-        self.assertEqual(2, policy["execute_limits"]["recommend_full_harvest"])
-        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
+        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertEqual(10, policy["execute_limits"]["recommend_full_harvest_pages"])
         self.assertIn("recommend_full_harvest", policy["task_policies"])
         self.assertEqual(
-            "recommend_full_harvest:limit=2:stale_after_days=120:max_pages=3",
+            "recommend_full_harvest:limit=3:stale_after_days=120:max_pages=10",
             _task_execution_signature(
                 self.config,
                 TaskSpec(
@@ -1205,10 +1219,10 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
 
         self.assertTrue(allowed, reason)
         self.assertIsNone(reason)
-        self.assertEqual(16, usage["task_limit"])
+        self.assertEqual(40, usage["task_limit"])
         self.assertEqual(0.95, usage["critical_ratio"])
-        self.assertEqual(12, usage["projected_request_count"])
-        self.assertEqual(12, usage["projected_request_total"])
+        self.assertEqual(30, usage["projected_request_count"])
+        self.assertEqual(30, usage["projected_request_total"])
         self.assertAlmostEqual(0.75, usage["projected_ratio"])
         self.assertEqual("configured", usage["projected_request_source"])
         self.assertEqual(0, usage["task_request_count"])
@@ -1232,14 +1246,14 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         allowed, reason, usage = _budget_gate(self.config, spec, {}, fetch_mode=None)
 
         self.assertFalse(allowed)
-        self.assertIn("mal_budget_projected_critical", reason or "")
-        self.assertEqual(16, usage["task_limit"])
+        self.assertIn("mal_budget_projected_warn", reason or "")
+        self.assertEqual(40, usage["task_limit"])
         self.assertEqual(4, usage["task_request_count"])
         self.assertEqual(4, usage["global_request_count"])
-        self.assertEqual(12, usage["projected_request_count"])
-        self.assertEqual(16, usage["projected_request_total"])
-        self.assertAlmostEqual(1.0, usage["projected_ratio"])
-        self.assertEqual("critical", usage["backoff_level"])
+        self.assertEqual(30, usage["projected_request_count"])
+        self.assertEqual(34, usage["projected_request_total"])
+        self.assertAlmostEqual(0.85, usage["projected_ratio"])
+        self.assertEqual("warn", usage["backoff_level"])
 
     def test_run_pending_tasks_records_budget_backoff_and_skips_rechecks_until_expiry(self) -> None:
         self._write_request_events("crunchyroll", [50, 100, 200])
@@ -1331,6 +1345,7 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual("provider_floor", sync_state["budget_backoff_cooldown_source"])
 
     def test_run_pending_tasks_uses_task_specific_budget_limit_and_warn_floor(self) -> None:
+        self.config.service.task_execute_limits["sync_apply"] = 8
         self._write_request_events("mal", [2810, 2820, 2830, 2840])
         self.config.service.mal_hourly_limit = 120
         self.config.service.task_hourly_limits["sync_apply"] = 5

@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .config import AppConfig
+from .persistence import atomic_write_json
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
@@ -24,6 +25,10 @@ HISTORY_BOUNDARY_MARKER_LIMIT = 25
 CONTINUE_BOUNDARY_MARKER_LIMIT = 25
 FAVOURITE_BOUNDARY_MARKER_LIMIT = 25
 INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
+HIDIVE_HISTORY_PAGE_LIMIT = 1000
+HIDIVE_FAVOURITE_PAGE_LIMIT = 1000
+HIDIVE_CUSTOM_WATCHLIST_COLLECTION_PAGE_LIMIT = 1000
+HIDIVE_CUSTOM_WATCHLIST_DETAIL_PAGE_LIMIT = 1000
 HIDIVE_CUSTOM_WATCHLIST_RPP = 25
 
 
@@ -225,8 +230,7 @@ def _write_sync_boundary(
         "continue_watching": {"marker_limit": CONTINUE_BOUNDARY_MARKER_LIMIT, "retained_count": len(continue_markers), "first_seen": continue_markers},
         "favourites": {"marker_limit": FAVOURITE_BOUNDARY_MARKER_LIMIT, "retained_count": len(favourite_markers), "first_seen": favourite_markers, "backfill_seen": favourite_backfill_markers, "backfill_retained_count": len(favourite_backfill_markers)},
     }
-    state_paths.sync_boundary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    state_paths.sync_boundary_path.chmod(0o600)
+    atomic_write_json(state_paths.sync_boundary_path, payload, indent=2)
 
 
 def _normalize_hidive_watch_progress(raw_progress: Any, duration_seconds: int | None) -> tuple[int | None, float | None]:
@@ -316,7 +320,7 @@ def _fetch_history_items(
     history_markers: set[str] | None = None,
     backfill_markers: set[str] | None = None,
     max_pages: int | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool, list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool, bool, list[dict[str, Any]]]:
     page = 1
     size = 100
     items: list[dict[str, Any]] = []
@@ -330,6 +334,14 @@ def _fetch_history_items(
     front_boundary_seen = not history_markers
     backfill_cursor_seen = not backfill_markers
     while True:
+        if pages_fetched >= HIDIVE_HISTORY_PAGE_LIMIT:
+            stopped_early = True
+            diagnostics.append(_diagnostic(
+                "history_page_guard_hit", surface="history",
+                detail=f"HIDIVE history exceeded page guard ({HIDIVE_HISTORY_PAGE_LIMIT})",
+                pages_fetched=pages_fetched,
+            ))
+            break
         payload = session.json_get("/customer/history/vod", params={"size": size, "page": page})
         pages_fetched += 1
         if not isinstance(payload, dict):
@@ -374,10 +386,27 @@ def _fetch_history_items(
             if front_boundary_seen:
                 backfill_exhausted = True
             break
+        if history_markers and front_boundary_seen:
+            break
         if max_pages is not None and pages_fetched >= max_pages:
+            stopped_early = True
+            diagnostics.append(_diagnostic(
+                "history_page_cap_hit", surface="history",
+                detail="HIDIVE history stopped at the configured page cap",
+                pages_fetched=pages_fetched,
+            ))
             break
         page += 1
-    return items, backfill_items, pages_fetched, backfill_pages_fetched, stopped_early, backfill_exhausted, diagnostics
+    return (
+        items,
+        backfill_items,
+        pages_fetched,
+        backfill_pages_fetched,
+        stopped_early,
+        backfill_exhausted,
+        front_boundary_seen,
+        diagnostics,
+    )
 
 
 def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
@@ -452,7 +481,11 @@ def _fetch_favourite_items(
     backfill_exhausted = False
     front_boundary_seen = not favourite_markers
     backfill_cursor_seen = not backfill_markers
+    seen_pages: set[str] = set()
     while True:
+        if pages_fetched >= HIDIVE_FAVOURITE_PAGE_LIMIT:
+            stopped_early = True
+            break
         payload = session.json_get("/favourite/vods", params={"size": size, "page": page})
         pages_fetched += 1
         if not isinstance(payload, dict):
@@ -462,6 +495,11 @@ def _fetch_favourite_items(
         if not isinstance(events, list):
             raise HidiveSnapshotError("HIDIVE favourites payload did not include an events/vods list")
         batch = [item for item in events if isinstance(item, dict)]
+        page_fingerprint = _page_fingerprint(batch, _favourite_item_fingerprint)
+        if page_fingerprint in seen_pages:
+            stopped_early = True
+            break
+        seen_pages.add(page_fingerprint)
         items.extend(batch)
         batch_markers = {marker for item in batch if (marker := _favourite_item_fingerprint(item))}
         if not front_boundary_seen and favourite_markers and favourite_markers.intersection(batch_markers):
@@ -645,6 +683,12 @@ def _fetch_custom_watchlist_collection(session: HidiveSession) -> tuple[list[dic
     seen_page_fingerprints: dict[str, int] = {}
     seen_cursors: set[str] = set()
     while True:
+        if pages_fetched >= HIDIVE_CUSTOM_WATCHLIST_COLLECTION_PAGE_LIMIT:
+            diagnostics.append(_diagnostic(
+                "custom_watchlist_collection_page_guard_hit", surface="watchlists",
+                detail=f"HIDIVE custom watchlist collection exceeded page guard ({HIDIVE_CUSTOM_WATCHLIST_COLLECTION_PAGE_LIMIT})",
+            ))
+            return items, pages_fetched, diagnostics, True
         payload = session.json_get("/api/v3/user/watchlist", params=params)
         pages_fetched += 1
         if not isinstance(payload, dict):
@@ -718,6 +762,13 @@ def _fetch_custom_watchlist_detail(
     seen_page_fingerprints: dict[str, int] = {}
     seen_cursors: set[str] = set()
     while True:
+        if pages_fetched >= HIDIVE_CUSTOM_WATCHLIST_DETAIL_PAGE_LIMIT:
+            diagnostics.append(_diagnostic(
+                "custom_watchlist_detail_page_guard_hit", surface="watchlists",
+                detail=f"HIDIVE custom watchlist detail exceeded page guard ({HIDIVE_CUSTOM_WATCHLIST_DETAIL_PAGE_LIMIT})",
+                list_id=_custom_watchlist_list_id(detail_payload),
+            ))
+            return detail_payload, content_items, pages_fetched, diagnostics, True
         payload = session.json_get(path, params=params)
         pages_fetched += 1
         if not isinstance(payload, dict):
@@ -853,20 +904,32 @@ def fetch_snapshot(
 ) -> HidiveFetchResult:
     try:
         session = start_hidive_session(config, profile=profile, timeout_seconds=timeout_seconds)
-        boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
-        if boundary and boundary.account_id_hint and session.token.account_id and boundary.account_id_hint != session.token.account_id:
-            boundary = None
+        loaded_boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
+        boundary = loaded_boundary
+        boundary_account_status = "not_requested" if not use_incremental_boundary else "missing"
+        if loaded_boundary is not None:
+            if not session.token.account_id:
+                boundary = None
+                boundary_account_status = "current_account_unproven"
+            elif not loaded_boundary.account_id_hint:
+                boundary = None
+                boundary_account_status = "boundary_account_unproven"
+            elif loaded_boundary.account_id_hint != session.token.account_id:
+                boundary = None
+                boundary_account_status = "account_mismatch"
+            else:
+                boundary_account_status = "account_match"
         # HIDIVE's hot path intentionally limits history to the first page and skips
         # account-scope continue/favourites surfaces.  Only use that abbreviated
         # mode once we have a matching local boundary; first-run or account-swapped
         # snapshots need a bounded account refresh so normal provider use is not
         # reduced to page-1 history forever.
         hot_mode = use_incremental_boundary and boundary is not None
-        history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted, history_diagnostics = _fetch_history_items(
+        history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted, history_boundary_reached, history_diagnostics = _fetch_history_items(
             session,
             history_markers=set(boundary.history_markers) if boundary else None,
             backfill_markers=set(boundary.history_backfill_markers) if boundary else None,
-            max_pages=1 if hot_mode else None,
+            max_pages=None,
         )
         if hot_mode:
             continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(
@@ -907,7 +970,15 @@ def fetch_snapshot(
     diagnostics = [*history_diagnostics, *(continue_metadata.get("diagnostics") if isinstance(continue_metadata.get("diagnostics"), list) else []), *custom_watchlist_diagnostics]
     history_non_advancing_detected = any(item.get("code") == "history_pagination_non_advancing" for item in diagnostics if isinstance(item, dict))
     continue_partial = continue_metadata.get("partial") is True
-    partial = bool(hot_mode or history_non_advancing_detected or continue_partial or custom_watchlist_partial)
+    history_boundary_complete = not hot_mode or history_boundary_reached
+    partial = bool(
+        history_non_advancing_detected
+        or history_stopped_early
+        or continue_partial
+        or custom_watchlist_partial
+        or favourite_stopped_early
+        or (hot_mode and not history_boundary_complete)
+    )
 
     generated_at = _now_string()
     snapshot = ProviderSnapshot(
@@ -927,6 +998,7 @@ def fetch_snapshot(
             "history_non_advancing_detected": history_non_advancing_detected,
             "history_backfill_pages_fetched": history_backfill_pages_fetched,
             "history_backfill_exhausted": history_backfill_exhausted,
+            "history_boundary_complete": history_boundary_complete,
             "continue_count": len(continue_items),
             "continue_stopped_early": continue_stopped_early,
             "continue_pages_fetched": continue_metadata.get("pages_fetched"),
@@ -948,6 +1020,8 @@ def fetch_snapshot(
             "custom_watchlist_skipped_unknown_content_count": custom_watchlist_metadata.get("skipped_unknown_content_count", 0),
             "custom_watchlist_duplicate_within_list_count": custom_watchlist_metadata.get("duplicate_within_list_count", 0),
             "sync_boundary_present": boundary is not None,
+            "sync_boundary_loaded": loaded_boundary is not None,
+            "sync_boundary_account_status": boundary_account_status,
             "sync_boundary_mode": "hot" if hot_mode else "full_refresh",
             "hot_surface_only": hot_mode,
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
@@ -964,18 +1038,19 @@ def fetch_snapshot(
             },
         },
     )
-    _write_sync_boundary(
-        state_paths=session.state_paths,
-        generated_at=generated_at,
-        account_id_hint=session.token.account_id,
-        history_items=history_items,
-        continue_items=continue_items,
-        favourite_items=favourite_items,
-        history_backfill_items=[] if history_backfill_exhausted else history_backfill_items,
-        favourite_backfill_items=[] if favourite_backfill_exhausted else favourite_backfill_items,
-        favourite_markers_override=boundary.favourite_markers if hot_mode and boundary else None,
-        favourite_backfill_markers_override=boundary.favourite_backfill_markers if hot_mode and boundary else None,
-    )
+    if not partial and session.token.account_id:
+        _write_sync_boundary(
+            state_paths=session.state_paths,
+            generated_at=generated_at,
+            account_id_hint=session.token.account_id,
+            history_items=history_items,
+            continue_items=continue_items,
+            favourite_items=favourite_items,
+            history_backfill_items=[] if history_backfill_exhausted else history_backfill_items,
+            favourite_backfill_items=[] if favourite_backfill_exhausted else favourite_backfill_items,
+            favourite_markers_override=boundary.favourite_markers if hot_mode and boundary else None,
+            favourite_backfill_markers_override=boundary.favourite_backfill_markers if hot_mode and boundary else None,
+        )
     return HidiveFetchResult(
         snapshot=snapshot,
         history_count=len(history_items),

@@ -97,6 +97,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "mal-auth-login",
     "mal-auth-url",
     "mal-list-refresh",
+    "mal-list-reinitialize",
     "mal-refresh",
     "mal-whoami",
     "map-series",
@@ -111,6 +112,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "recommend-maintain",
     "recommend-refresh-full-userrecs",
     "recommend-refresh-metadata",
+    "recommend-reinitialize-full-userrecs",
     "recommend-snapshots",
     "refresh-mapping-review-queue",
     "reopen-review-queue",
@@ -387,7 +389,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(52, len(actual_commands))
+        self.assertEqual(54, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",
@@ -397,6 +399,8 @@ class ProviderCliTests(unittest.TestCase):
             "recommend-dashboard": "sortable local HTML recommendation dashboard",
             "dashboard-serve": "live local HTTP dashboard",
             "recommend-refresh-full-userrecs": "per-source per-run",
+            "recommend-reinitialize-full-userrecs": "quarantined public-userrecs source",
+            "mal-list-reinitialize": "quarantined exact MAL account/query traversal",
             "runtime-retention-audit": "retention inventory audit",
         }.items():
             with self.subTest(command=command):
@@ -419,8 +423,13 @@ class ProviderCliTests(unittest.TestCase):
         self.assertFalse(push_args.dry_run)
         self.assertTrue(parser.parse_args(["push-recommendations-webhook", "--dry-run"]).dry_run)
 
+        full_userrecs_args = parser.parse_args(["recommend-refresh-full-userrecs"])
+        self.assertEqual(10, full_userrecs_args.max_pages)
+        provider_eligibility_args = parser.parse_args(["recommend-enrich-provider-availability"])
+        self.assertEqual(5, provider_eligibility_args.limit)
+
         enrich_args = parser.parse_args(["recommend-enrich-provider-availability"])
-        self.assertEqual(2, enrich_args.limit)
+        self.assertEqual(5, enrich_args.limit)
 
         command_parsers = _command_parsers()
         command_help = _command_help_map()

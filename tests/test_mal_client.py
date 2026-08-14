@@ -271,6 +271,36 @@ class MalClientTests(unittest.TestCase):
 
             send.assert_not_called()
 
+    def test_anime_detail_accepts_legitimate_nullable_optional_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config))
+            payload = {
+                "id": 53590,
+                "title": "Example",
+                "start_season": None,
+                "broadcast": None,
+                "my_list_status": None,
+            }
+            with patch.object(client, "_get_json", return_value=payload):
+                actual = client.get_anime_details(
+                    53590,
+                    fields="id,title,start_season,broadcast,my_list_status",
+                    force_refresh=True,
+                )
+            self.assertEqual(payload, actual)
+
+    def test_anime_detail_rejects_missing_or_malformed_requested_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config))
+            with patch.object(client, "_get_json", return_value={"id": 53590, "title": "Example"}):
+                with self.assertRaisesRegex(MalApiError, "lacks requested fields"):
+                    client.get_anime_details(53590, fields="id,title,broadcast", force_refresh=True)
+            with patch.object(client, "_get_json", return_value={"id": 53590, "title": "Example", "recommendations": None}):
+                with self.assertRaisesRegex(MalApiError, "malformed recommendations"):
+                    client.get_anime_details(53590, fields="id,title,recommendations", force_refresh=True)
+
     def test_update_my_list_status_requires_nonblank_access_token_before_side_effects(self) -> None:
         for access_token in (None, "", " \t\n"):
             with self.subTest(access_token=access_token):
@@ -533,6 +563,41 @@ class MalClientTests(unittest.TestCase):
                     with patch("mal_updater.mal_client.urlopen", fake_urlopen):
                         with self.assertRaises(MalApiError):
                             list(client.iter_my_anime_list_pages(max_pages=2))
+
+    def test_search_and_detail_contract_failures_do_not_replace_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            config.db_path.parent.mkdir(parents=True, exist_ok=True)
+            client = MalClient(config, self._secrets(config))
+            with patch.object(client, "_get_json", return_value={}):
+                with self.assertRaisesRegex(MalApiError, "typed data list"):
+                    client.search_anime("valid", force_refresh=True)
+                with self.assertRaisesRegex(MalApiError, "identity"):
+                    client.get_anime_details(7, fields="id,title,related_anime", force_refresh=True)
+            from mal_updater.db import get_mal_anime_search_cache, get_mal_anime_detail_cache
+            self.assertIsNone(get_mal_anime_detail_cache(config.db_path, mal_anime_id=7, fields_key="id,related_anime,title", logic_version="mal-detail-v1"))
+
+    def test_detail_requires_matching_id_title_and_requested_container_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config))
+            malformed = {"id": 8, "title": "Wrong", "related_anime": []}
+            with patch.object(client, "_get_json", return_value=malformed):
+                with self.assertRaisesRegex(MalApiError, "identity"):
+                    client.get_anime_details(7, fields="id,title,related_anime", force_refresh=True)
+            malformed = {"id": 7, "title": "Seven", "related_anime": {}}
+            with patch.object(client, "_get_json", return_value=malformed):
+                with self.assertRaisesRegex(MalApiError, "malformed related_anime"):
+                    client.get_anime_details(7, fields="id,title,related_anime", force_refresh=True)
+
+    def test_generic_list_iterator_rejects_repeated_and_backward_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config, access_token="token"))
+            repeated = f"{config.mal.base_url}/users/@me/animelist?limit=100&fields=list_status%2Cnum_episodes%2Cmedia_type%2Cstatus"
+            with patch.object(client, "_get_json", return_value={"data": [], "paging": {"next": repeated}}):
+                with self.assertRaisesRegex(MalApiError, "repeated"):
+                    list(client.iter_my_anime_list_pages(max_pages=2))
 
 
 if __name__ == "__main__":

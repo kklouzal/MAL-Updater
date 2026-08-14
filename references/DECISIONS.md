@@ -634,6 +634,16 @@ Also treat a material execution-posture change (for example historical full-pass
 - a single oversized historical apply run should not be able to trap the daemon in near-permanent projected-budget skips once the intended unattended posture becomes smaller and more conservative
 - keeping the bounded batch size explicit and configurable preserves explainability while still allowing hosts with stronger evidence to tune the lane differently later
 
+## 2026-08-14 - Fail-closed unattended `sync_apply` default
+
+### Decision
+Change the shipped `service.task_execute_limits.sync_apply` default from `8` to `0`. Fresh installs and configs that omit this key cannot execute unattended MAL writes; operators must explicitly opt in with a positive bounded value. Manual CLI `--limit 0` retains its separate explicit full-scan semantics.
+
+### Why
+- absence of an operator decision must not authorize unattended remote writes
+- scheduler zero already has fail-closed skip semantics, so the safer default uses an existing tested control rather than adding a second enable flag
+- keeping request-budget defaults available preserves coherent behavior after an explicit positive opt-in
+
 ## 2026-04-10 - Discovery neutral-seed weighting posture
 
 ### Decision

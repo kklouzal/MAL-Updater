@@ -823,6 +823,14 @@ class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
             select_mal_user_anime_list_partition_work(
                 self.db_path, generation=generation.generation, claim_token="first"
             )
+        from mal_updater.db import reinitialize_mal_user_anime_list_traversal
+        fresh = reinitialize_mal_user_anime_list_traversal(
+            self.db_path, account_id=7, account_name="owner", query_identity="query",
+            query={"statuses":["completed","watching"]}, partitions=self.partitions(),
+            operator_reason="operator verified account and query", fetched_at="2026-08-13T00:02:00Z",
+        )
+        self.assertGreater(fresh.generation, generation.generation)
+        self.assertIsNone(fresh.quarantined_at)
 
     def test_short_nonterminal_page_and_bad_next_offset_reject_atomically(self) -> None:
         from mal_updater.db import checkpoint_mal_user_anime_list_page, select_mal_user_anime_list_partition_work

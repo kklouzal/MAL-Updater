@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import uuid
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ from .db import (
     record_mal_user_anime_list_request_failure,
     record_mal_recommendation_harvest_failure,
     record_mal_public_userrecs_revalidation,
+    record_mal_public_userrecs_final_anchor,
     renew_mal_public_userrecs_source_claim,
     replace_mal_anime_relations,
     restart_or_quarantine_mal_user_anime_list_traversal,
@@ -409,6 +411,7 @@ def _load_mapped_seed_states(
             FROM mal_series_mapping m
             LEFT JOIN provider_watchlist w
                 ON w.provider = m.provider AND w.provider_series_id = m.provider_series_id
+               AND w.is_active = 1
             LEFT JOIN provider_episode_progress p
                 ON p.provider = m.provider AND p.provider_series_id = m.provider_series_id
             WHERE m.mal_anime_id IN ({placeholders})
@@ -688,7 +691,16 @@ def _parse_mal_user_list_payload(
         page_size=page_size,
         expected_offset=current_offset + expected_page_size,
     )
-    canonical = __import__("json").dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+    # Bind revalidation to every canonical response byte that publication can
+    # retain, as well as the opaque page/cursor identity.  updated_at alone is
+    # not an adequate change token: score, progress, tags, dates, preference
+    # flags, node metadata, and other retained fields may change independently.
+    canonical = json.dumps(
+        {"page_url": page_url, "next_url": next_url, "items": items},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     anchor = {
         "account_id": account_id, "account_name": account_name, "status": expected_status,
@@ -1011,16 +1023,23 @@ def _public_userrecs_revalidate_generation(
     claim_token: str,
     fetch_counts: dict[str, int],
 ) -> tuple[str | None, int, MalPublicUserRecsCrawlGeneration]:
-    """Re-read every staged page because MAL exposes no immutable snapshot token."""
+    """Incrementally re-read staged pages under a persisted revision-bound cursor."""
     pages = list_mal_public_userrecs_staged_pages(config.db_path, generation_id=generation.generation_id)
     if not pages:
         return None, 0, generation
-    checks = pages
-    if remaining_requests < len(checks):
-        return "max_pages cannot cover required final snapshot validation", 0, generation
+    cursor = int(generation.validation_page_number or 0)
+    validation_revision = generation.validation_revision
+    if cursor and (validation_revision is None or int(validation_revision) != int(generation.staged_revision)):
+        return "snapshot revalidation cursor is stale for staged revision", 0, generation
+    if cursor < 0 or cursor > len(pages):
+        return "snapshot revalidation cursor is outside staged page range", 0, generation
+    if cursor == len(pages):
+        return None, 0, generation
+    budget = max(0, int(remaining_requests))
+    if budget == 0:
+        return "max_pages cannot cover remaining final snapshot validation", 0, generation
     fetched_count = 0
-    validation_parts: list[str] = []
-    for staged in checks:
+    for staged in pages[cursor:cursor + budget]:
         generation = renew_mal_public_userrecs_source_claim(
             config.db_path,
             source_mal_anime_id=generation.source_mal_anime_id,
@@ -1029,18 +1048,14 @@ def _public_userrecs_revalidate_generation(
             expected_revision=generation.generation_revision,
         )
         try:
-            # The budget is an attempt budget, not a successful-response
-            # counter. Charge it before entering code that may raise.
             fetched_count += 1
             fetch_counts["attempted"] += 1
             try:
                 fetch_kwargs = {"page_url": staged.page_url, "max_body_bytes": max_body_bytes}
                 if isinstance(client, PublicMalUserRecommendationsClient):
                     fetched = client.fetch_page(
-                        generation.source_mal_anime_id,
-                        page_url=staged.page_url,
-                        max_body_bytes=max_body_bytes,
-                        max_attempts=1,
+                        generation.source_mal_anime_id, page_url=staged.page_url,
+                        max_body_bytes=max_body_bytes, max_attempts=1,
                     )
                 else:
                     fetched = client.fetch_page(generation.source_mal_anime_id, **fetch_kwargs)
@@ -1056,16 +1071,80 @@ def _public_userrecs_revalidate_generation(
             return f"snapshot revalidation fingerprint/anchor drift at page {staged.page_number}", fetched_count, generation
         if fetched.next_url != staged.next_url:
             return f"snapshot revalidation next-link drift at page {staged.page_number}", fetched_count, generation
-        validation_parts.append(f"{staged.page_number}:{fetched.page_fingerprint}:{fetched.next_url or ''}")
-    validation_fingerprint = hashlib.sha256("|".join(validation_parts).encode()).hexdigest()
-    generation = record_mal_public_userrecs_revalidation(
-        config.db_path,
-        generation_id=generation.generation_id,
-        checked_boundary=True,
-        validation_fingerprint=validation_fingerprint,
-        claim_token=claim_token,
-        expected_revision=generation.generation_revision,
-    )
+        generation = record_mal_public_userrecs_revalidation(
+            config.db_path, generation_id=generation.generation_id,
+            checked_boundary=int(staged.page_number) == len(pages),
+            validated_page_number=int(staged.page_number), claim_token=claim_token,
+            expected_revision=generation.generation_revision,
+        )
+        # The last full-chain validation request is also the terminal anchor.
+        # For a one-page snapshot it proves both anchors with the same response.
+        if (int(staged.page_number) == len(pages) and generation.cursor_url is None
+                and staged.next_url is None and int(generation.final_anchor_step or 0) == 0):
+            generation = record_mal_public_userrecs_final_anchor(
+                config.db_path, generation_id=generation.generation_id, anchor_step=1,
+                claim_token=claim_token, expected_revision=generation.generation_revision,
+            )
+            if len(pages) == 1:
+                generation = record_mal_public_userrecs_final_anchor(
+                    config.db_path, generation_id=generation.generation_id, anchor_step=2,
+                    claim_token=claim_token, expected_revision=generation.generation_revision,
+                )
+    if int(generation.validation_page_number or 0) < len(pages):
+        return "max_pages cannot cover remaining final snapshot validation", fetched_count, generation
+    return None, fetched_count, generation
+
+
+def _public_userrecs_validate_final_anchors(
+    config: AppConfig, *, generation: MalPublicUserRecsCrawlGeneration, client: Any,
+    max_body_bytes: int, remaining_requests: int, claim_token: str, fetch_counts: dict[str, int],
+) -> tuple[str | None, int, MalPublicUserRecsCrawlGeneration]:
+    """Re-read page 1 then terminal page immediately before publication, durably across runs."""
+    pages = list_mal_public_userrecs_staged_pages(config.db_path, generation_id=generation.generation_id)
+    if not pages:
+        return "final anchor validation found no staged pages", 0, generation
+    if generation.final_anchor_step and generation.final_anchor_revision != generation.staged_revision:
+        return "final anchor validation cursor is stale for staged revision", 0, generation
+    # Step 1 is terminal (normally reused from full-chain validation); step 2
+    # is page 1, making the last request before publication catch late drift.
+    anchors = [pages[-1], pages[0]]
+    budget = max(0, int(remaining_requests))
+    fetched_count = 0
+    for step in range(int(generation.final_anchor_step or 0), 2):
+        if fetched_count >= budget:
+            return "max_pages cannot cover remaining final anchor validation", fetched_count, generation
+        staged = anchors[step]
+        generation = renew_mal_public_userrecs_source_claim(
+            config.db_path, source_mal_anime_id=generation.source_mal_anime_id,
+            generation_id=generation.generation_id, claim_token=claim_token,
+            expected_revision=generation.generation_revision,
+        )
+        fetched_count += 1
+        fetch_counts["attempted"] += 1
+        try:
+            if isinstance(client, PublicMalUserRecommendationsClient):
+                fetched = client.fetch_page(generation.source_mal_anime_id, page_url=staged.page_url,
+                                            max_body_bytes=max_body_bytes, max_attempts=1)
+            else:
+                fetched = client.fetch_page(generation.source_mal_anime_id, page_url=staged.page_url,
+                                            max_body_bytes=max_body_bytes)
+        except (PublicMalUserRecommendationsError, TimeoutError, ValueError) as exc:
+            fetch_counts["failed"] += 1
+            return f"final anchor validation failed at page {staged.page_number}: {exc}", fetched_count, generation
+        fetch_counts["succeeded"] += 1
+        if (fetched.final_url != staged.page_url or fetched.page_fingerprint != staged.page_fingerprint
+                or fetched.next_url != staged.next_url):
+            return f"final anchor drift at page {staged.page_number}", fetched_count, generation
+        generation = record_mal_public_userrecs_final_anchor(
+            config.db_path, generation_id=generation.generation_id, anchor_step=step + 1,
+            claim_token=claim_token, expected_revision=generation.generation_revision,
+        )
+        if len(pages) == 1 and step == 0:
+            generation = record_mal_public_userrecs_final_anchor(
+                config.db_path, generation_id=generation.generation_id, anchor_step=2,
+                claim_token=claim_token, expected_revision=generation.generation_revision,
+            )
+            break
     return None, fetched_count, generation
 
 
@@ -1176,62 +1255,286 @@ def refresh_full_user_recommendation_harvest(
     total_edges = 0
     fetch_counts = {"attempted": 0, "succeeded": 0, "failed": 0}
 
-    for entry in selected_entries:
-        source_id = int(entry.mal_anime_id)
-        source_title = entry.title
-        source_url = _full_userrecs_start_url(config, source_mal_anime_id=source_id, source_title=source_title)
-        pages_this_run = 0
-        generation = create_or_get_active_mal_public_userrecs_generation(
-            config.db_path,
-            source_mal_anime_id=source_id,
-            source_title=source_title,
-            source_url=source_url,
-            cursor_url=source_url,
-            claim_token=claim_token,
-        )
+    try:
+        for entry in selected_entries:
+            source_id = int(entry.mal_anime_id)
+            source_title = entry.title
+            source_url = _full_userrecs_start_url(config, source_mal_anime_id=source_id, source_title=source_title)
+            pages_this_run = 0
+            generation = create_or_get_active_mal_public_userrecs_generation(
+                config.db_path,
+                source_mal_anime_id=source_id,
+                source_title=source_title,
+                source_url=source_url,
+                cursor_url=source_url,
+                claim_token=claim_token,
+            )
 
-        queue_outcome = "resumable"
-        queue_class = "resumable"
-        queue_retry_at: str | None = None
-        queue_error_code: str | None = None
-        resume_revalidated = False
+            queue_outcome = "resumable"
+            queue_class = "resumable"
+            queue_retry_at: str | None = None
+            queue_error_code: str | None = None
+            resume_revalidated = False
 
-        while True:
-            drift_reason = _public_userrecs_generation_drift_reason(config.db_path, generation=generation)
-            if drift_reason is not None:
-                generation = restart_mal_public_userrecs_generation_after_drift(
-                    config.db_path,
-                    generation_id=generation.generation_id,
-                    reason=drift_reason,
-                    cursor_url=source_url,
-                    claim_token=claim_token,
-                    expected_revision=generation.generation_revision,
-                )
-                if generation.quarantined_at is not None:
-                    quarantined_sources.append({
-                        "mal_anime_id": source_id,
-                        "generation_id": generation.generation_id,
-                        "reason": generation.quarantine_reason or drift_reason,
-                    })
-                    queue_outcome = "quarantined_drift_livelock"
-                    queue_class = "quarantined"
-                    queue_error_code = "pagination_drift"
+            while True:
+                drift_reason = _public_userrecs_generation_drift_reason(config.db_path, generation=generation)
+                if drift_reason is not None:
+                    generation = restart_mal_public_userrecs_generation_after_drift(
+                        config.db_path,
+                        generation_id=generation.generation_id,
+                        reason=drift_reason,
+                        cursor_url=source_url,
+                        claim_token=claim_token,
+                        expected_revision=generation.generation_revision,
+                    )
+                    if generation.quarantined_at is not None:
+                        quarantined_sources.append({
+                            "mal_anime_id": source_id,
+                            "generation_id": generation.generation_id,
+                            "reason": generation.quarantine_reason or drift_reason,
+                        })
+                        queue_outcome = "quarantined_drift_livelock"
+                        queue_class = "quarantined"
+                        queue_error_code = "pagination_drift"
+                        break
+                    restarted_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": generation.generation_id,
+                            "reason": drift_reason,
+                            "cursor_url": generation.cursor_url,
+                        }
+                    )
+                    if pages_this_run >= normalized_max_pages:
+                        paused = _public_userrecs_pause_source(
+                            config,
+                            generation=generation,
+                            cursor_url=generation.cursor_url or source_url,
+                            error="drift restart deferred until next run because max_pages was reached",
+                            claim_token=claim_token,
+                        )
+                        paused_sources.append(
+                            {
+                                "mal_anime_id": source_id,
+                                "title": source_title,
+                                "generation_id": paused.generation_id,
+                                "pages_fetched": paused.pages_fetched,
+                                "cursor_url": paused.cursor_url,
+                                "reason": "max_pages",
+                            }
+                        )
+                        break
+                    continue
+
+                if generation.status == "ready":
+                    if generation.pages_fetched > 0 and not resume_revalidated:
+                        drift_reason, checked_pages, generation = _public_userrecs_revalidate_generation(
+                            config,
+                            generation=generation,
+                            client=harvest_client,
+                            max_body_bytes=normalized_max_body_bytes,
+                            remaining_requests=normalized_max_pages - pages_this_run,
+                            claim_token=claim_token,
+                            fetch_counts=fetch_counts,
+                        )
+                        pages_this_run += checked_pages
+                        resume_revalidated = True
+                        if drift_reason is not None:
+                            if drift_reason.startswith("max_pages cannot cover"):
+                                paused = _public_userrecs_pause_source(
+                                    config, generation=generation, cursor_url=generation.cursor_url,
+                                    error=drift_reason, claim_token=claim_token,
+                                )
+                                paused_sources.append({
+                                    "mal_anime_id": source_id, "title": source_title,
+                                    "generation_id": paused.generation_id,
+                                    "pages_fetched": paused.pages_fetched, "cursor_url": paused.cursor_url,
+                                    "reason": "final_validation_budget",
+                                })
+                                queue_outcome = "paused_final_validation_budget"
+                                break
+                            generation = restart_mal_public_userrecs_generation_after_drift(
+                                config.db_path,
+                                generation_id=generation.generation_id,
+                                reason=drift_reason,
+                                cursor_url=source_url,
+                                claim_token=claim_token,
+                                expected_revision=generation.generation_revision,
+                            )
+                            restarted_sources.append({
+                                "mal_anime_id": source_id,
+                                "title": source_title,
+                                "generation_id": generation.generation_id,
+                                "reason": drift_reason,
+                                "cursor_url": generation.cursor_url,
+                            })
+                            continue
+                    drift_reason, checked_pages, generation = _public_userrecs_validate_final_anchors(
+                        config, generation=generation, client=harvest_client,
+                        max_body_bytes=normalized_max_body_bytes,
+                        remaining_requests=normalized_max_pages - pages_this_run,
+                        claim_token=claim_token, fetch_counts=fetch_counts,
+                    )
+                    pages_this_run += checked_pages
+                    if drift_reason is not None:
+                        if drift_reason.startswith("max_pages cannot cover"):
+                            paused_sources.append({
+                                "mal_anime_id": source_id, "title": source_title,
+                                "generation_id": generation.generation_id,
+                                "pages_fetched": generation.pages_fetched, "cursor_url": generation.cursor_url,
+                                "reason": "final_anchor_budget",
+                            })
+                            queue_outcome = "paused_final_anchor_budget"
+                            break
+                        generation = restart_mal_public_userrecs_generation_after_drift(
+                            config.db_path, generation_id=generation.generation_id, reason=drift_reason,
+                            cursor_url=source_url, claim_token=claim_token,
+                            expected_revision=generation.generation_revision,
+                        )
+                        if generation.quarantined_at is not None:
+                            quarantined_sources.append({"mal_anime_id": source_id,
+                                "generation_id": generation.generation_id,
+                                "reason": generation.quarantine_reason or drift_reason})
+                            queue_outcome, queue_class, queue_error_code = (
+                                "quarantined_drift_livelock", "quarantined", "pagination_drift"
+                            )
+                            break
+                        restarted_sources.append({
+                            "mal_anime_id": source_id, "title": source_title,
+                            "generation_id": generation.generation_id, "reason": drift_reason,
+                            "cursor_url": generation.cursor_url,
+                        })
+                        continue
+                    try:
+                        publication = publish_mal_public_userrecs_generation(
+                            config.db_path, generation_id=generation.generation_id,
+                            claim_token=claim_token, expected_revision=generation.generation_revision,
+                        )
+                    except (PublicMalUserRecommendationsError, TimeoutError, ValueError, RuntimeError) as exc:
+                        error = str(exc)
+                        record_mal_recommendation_harvest_failure(
+                            config.db_path,
+                            source_mal_anime_id=source_id,
+                            source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                            error=error,
+                            pages_fetched=generation.pages_fetched,
+                            source_url=generation.source_url or source_url,
+                        )
+                        failures.append(
+                            FullUserRecommendationHarvestFailure(
+                                mal_anime_id=source_id,
+                                title=source_title,
+                                error=error,
+                                pages_fetched=generation.pages_fetched,
+                                source_url=generation.source_url or source_url,
+                                generation_id=generation.generation_id,
+                            )
+                        )
+                        break
+                    harvested += 1
+                    total_edges += publication.published_edge_count
+                    harvested_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "edge_count": publication.published_edge_count,
+                            "pages_fetched": publication.pages_fetched,
+                            "source_url": generation.source_url or source_url,
+                            "generation_id": publication.generation_id,
+                        }
+                    )
+                    queue_outcome = "published"
+                    queue_class = "fresh"
                     break
-                restarted_sources.append(
-                    {
-                        "mal_anime_id": source_id,
-                        "title": source_title,
-                        "generation_id": generation.generation_id,
-                        "reason": drift_reason,
-                        "cursor_url": generation.cursor_url,
-                    }
-                )
+
+                if generation.status == "paused":
+                    if generation.pages_fetched > 0 and not resume_revalidated:
+                        drift_reason, checked_pages, generation = _public_userrecs_revalidate_generation(
+                            config,
+                            generation=generation,
+                            client=harvest_client,
+                            max_body_bytes=normalized_max_body_bytes,
+                            remaining_requests=normalized_max_pages - pages_this_run,
+                            claim_token=claim_token,
+                            fetch_counts=fetch_counts,
+                        )
+                        pages_this_run += checked_pages
+                        resume_revalidated = True
+                        if drift_reason is not None:
+                            if drift_reason.startswith("max_pages cannot cover"):
+                                paused_sources.append({
+                                    "mal_anime_id": source_id, "title": source_title,
+                                    "generation_id": generation.generation_id,
+                                    "pages_fetched": generation.pages_fetched, "cursor_url": generation.cursor_url,
+                                    "reason": "resume_validation_budget",
+                                })
+                                queue_outcome = "paused_resume_validation_budget"
+                                break
+                            generation = restart_mal_public_userrecs_generation_after_drift(
+                                config.db_path,
+                                generation_id=generation.generation_id,
+                                reason=drift_reason,
+                                cursor_url=source_url,
+                                claim_token=claim_token,
+                                expected_revision=generation.generation_revision,
+                            )
+                            restarted_sources.append({
+                                "mal_anime_id": source_id,
+                                "title": source_title,
+                                "generation_id": generation.generation_id,
+                                "reason": drift_reason,
+                                "cursor_url": generation.cursor_url,
+                            })
+                            continue
+                    generation = resume_mal_public_userrecs_generation(
+                        config.db_path, generation_id=generation.generation_id,
+                        claim_token=claim_token, expected_revision=generation.generation_revision,
+                    )
+
+                if generation.cursor_url is None:
+                    try:
+                        generation = mark_mal_public_userrecs_generation_ready(
+                            config.db_path, generation_id=generation.generation_id,
+                            claim_token=claim_token, expected_revision=generation.generation_revision,
+                        )
+                        continue
+                    except ValueError as exc:
+                        error = str(exc)
+                        generation = _public_userrecs_pause_source(
+                            config,
+                            generation=generation,
+                            cursor_url=generation.cursor_url,
+                            error=error,
+                            claim_token=claim_token,
+                        )
+                        record_mal_recommendation_harvest_failure(
+                            config.db_path,
+                            source_mal_anime_id=source_id,
+                            source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                            error=error,
+                            pages_fetched=generation.pages_fetched,
+                            source_url=generation.source_url or source_url,
+                        )
+                        failures.append(
+                            FullUserRecommendationHarvestFailure(
+                                mal_anime_id=source_id,
+                                title=source_title,
+                                error=error,
+                                pages_fetched=generation.pages_fetched,
+                                source_url=generation.source_url or source_url,
+                                generation_id=generation.generation_id,
+                                paused=True,
+                            )
+                        )
+                        break
+
                 if pages_this_run >= normalized_max_pages:
                     paused = _public_userrecs_pause_source(
                         config,
                         generation=generation,
-                        cursor_url=generation.cursor_url or source_url,
-                        error="drift restart deferred until next run because max_pages was reached",
+                        cursor_url=generation.cursor_url,
+                        error="max_pages reached; staged generation paused with next-page cursor",
                         claim_token=claim_token,
                     )
                     paused_sources.append(
@@ -1244,432 +1547,96 @@ def refresh_full_user_recommendation_harvest(
                             "reason": "max_pages",
                         }
                     )
+                    queue_outcome = "paused_page_budget"
                     break
-                continue
 
-            if generation.status == "ready":
-                if generation.pages_fetched > 0 and not resume_revalidated:
-                    drift_reason, checked_pages, generation = _public_userrecs_revalidate_generation(
-                        config,
-                        generation=generation,
-                        client=harvest_client,
-                        max_body_bytes=normalized_max_body_bytes,
-                        remaining_requests=normalized_max_pages - pages_this_run,
-                        claim_token=claim_token,
-                        fetch_counts=fetch_counts,
-                    )
-                    pages_this_run += checked_pages
-                    resume_revalidated = True
-                    if drift_reason is not None:
-                        if drift_reason.startswith("max_pages cannot cover"):
-                            paused = _public_userrecs_pause_source(
-                                config, generation=generation, cursor_url=generation.cursor_url,
-                                error=drift_reason, claim_token=claim_token,
-                            )
-                            paused_sources.append({
-                                "mal_anime_id": source_id, "title": source_title,
-                                "generation_id": paused.generation_id,
-                                "pages_fetched": paused.pages_fetched, "cursor_url": paused.cursor_url,
-                                "reason": "final_validation_budget",
-                            })
-                            queue_outcome = "paused_final_validation_budget"
-                            break
-                        generation = restart_mal_public_userrecs_generation_after_drift(
-                            config.db_path,
-                            generation_id=generation.generation_id,
-                            reason=drift_reason,
-                            cursor_url=source_url,
-                            claim_token=claim_token,
-                            expected_revision=generation.generation_revision,
-                        )
-                        restarted_sources.append({
-                            "mal_anime_id": source_id,
-                            "title": source_title,
-                            "generation_id": generation.generation_id,
-                            "reason": drift_reason,
-                            "cursor_url": generation.cursor_url,
-                        })
-                        continue
                 try:
-                    publication = publish_mal_public_userrecs_generation(
-                        config.db_path, generation_id=generation.generation_id,
-                        claim_token=claim_token, expected_revision=generation.generation_revision,
-                    )
-                except (PublicMalUserRecommendationsError, TimeoutError, ValueError, RuntimeError) as exc:
-                    error = str(exc)
-                    record_mal_recommendation_harvest_failure(
-                        config.db_path,
+                    cursor_url = validate_public_user_recs_url(
+                        generation.cursor_url,
+                        public_base_url=config.mal.public_base_url,
                         source_mal_anime_id=source_id,
-                        source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
-                        error=error,
-                        pages_fetched=generation.pages_fetched,
-                        source_url=generation.source_url or source_url,
                     )
-                    failures.append(
-                        FullUserRecommendationHarvestFailure(
-                            mal_anime_id=source_id,
-                            title=source_title,
-                            error=error,
-                            pages_fetched=generation.pages_fetched,
-                            source_url=generation.source_url or source_url,
-                            generation_id=generation.generation_id,
-                        )
-                    )
-                    break
-                harvested += 1
-                total_edges += publication.published_edge_count
-                harvested_sources.append(
-                    {
-                        "mal_anime_id": source_id,
-                        "title": source_title,
-                        "edge_count": publication.published_edge_count,
-                        "pages_fetched": publication.pages_fetched,
-                        "source_url": generation.source_url or source_url,
-                        "generation_id": publication.generation_id,
-                    }
-                )
-                queue_outcome = "published"
-                queue_class = "fresh"
-                break
-
-            if generation.status == "paused":
-                if generation.pages_fetched > 0 and not resume_revalidated:
-                    drift_reason, checked_pages, generation = _public_userrecs_revalidate_generation(
-                        config,
-                        generation=generation,
-                        client=harvest_client,
-                        max_body_bytes=normalized_max_body_bytes,
-                        remaining_requests=normalized_max_pages - pages_this_run,
-                        claim_token=claim_token,
-                        fetch_counts=fetch_counts,
-                    )
-                    pages_this_run += checked_pages
-                    resume_revalidated = True
-                    if drift_reason is not None:
-                        if drift_reason.startswith("max_pages cannot cover"):
-                            paused_sources.append({
-                                "mal_anime_id": source_id, "title": source_title,
-                                "generation_id": generation.generation_id,
-                                "pages_fetched": generation.pages_fetched, "cursor_url": generation.cursor_url,
-                                "reason": "resume_validation_budget",
-                            })
-                            queue_outcome = "paused_resume_validation_budget"
-                            break
-                        generation = restart_mal_public_userrecs_generation_after_drift(
-                            config.db_path,
-                            generation_id=generation.generation_id,
-                            reason=drift_reason,
-                            cursor_url=source_url,
-                            claim_token=claim_token,
-                            expected_revision=generation.generation_revision,
-                        )
-                        restarted_sources.append({
-                            "mal_anime_id": source_id,
-                            "title": source_title,
-                            "generation_id": generation.generation_id,
-                            "reason": drift_reason,
-                            "cursor_url": generation.cursor_url,
-                        })
-                        continue
-                generation = resume_mal_public_userrecs_generation(
-                    config.db_path, generation_id=generation.generation_id,
-                    claim_token=claim_token, expected_revision=generation.generation_revision,
-                )
-
-            if generation.cursor_url is None:
-                try:
-                    generation = mark_mal_public_userrecs_generation_ready(
-                        config.db_path, generation_id=generation.generation_id,
-                        claim_token=claim_token, expected_revision=generation.generation_revision,
-                    )
-                    continue
-                except ValueError as exc:
-                    error = str(exc)
-                    generation = _public_userrecs_pause_source(
-                        config,
-                        generation=generation,
-                        cursor_url=generation.cursor_url,
-                        error=error,
-                        claim_token=claim_token,
-                    )
-                    record_mal_recommendation_harvest_failure(
+                except PublicMalUserRecommendationsError as exc:
+                    drift_reason = f"stored cursor URL failed validation: {exc}"
+                    generation = restart_mal_public_userrecs_generation_after_drift(
                         config.db_path,
-                        source_mal_anime_id=source_id,
-                        source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
-                        error=error,
-                        pages_fetched=generation.pages_fetched,
-                        source_url=generation.source_url or source_url,
-                    )
-                    failures.append(
-                        FullUserRecommendationHarvestFailure(
-                            mal_anime_id=source_id,
-                            title=source_title,
-                            error=error,
-                            pages_fetched=generation.pages_fetched,
-                            source_url=generation.source_url or source_url,
-                            generation_id=generation.generation_id,
-                            paused=True,
-                        )
-                    )
-                    break
-
-            if pages_this_run >= normalized_max_pages:
-                paused = _public_userrecs_pause_source(
-                    config,
-                    generation=generation,
-                    cursor_url=generation.cursor_url,
-                    error="max_pages reached; staged generation paused with next-page cursor",
-                    claim_token=claim_token,
-                )
-                paused_sources.append(
-                    {
-                        "mal_anime_id": source_id,
-                        "title": source_title,
-                        "generation_id": paused.generation_id,
-                        "pages_fetched": paused.pages_fetched,
-                        "cursor_url": paused.cursor_url,
-                        "reason": "max_pages",
-                    }
-                )
-                queue_outcome = "paused_page_budget"
-                break
-
-            try:
-                cursor_url = validate_public_user_recs_url(
-                    generation.cursor_url,
-                    public_base_url=config.mal.public_base_url,
-                    source_mal_anime_id=source_id,
-                )
-            except PublicMalUserRecommendationsError as exc:
-                drift_reason = f"stored cursor URL failed validation: {exc}"
-                generation = restart_mal_public_userrecs_generation_after_drift(
-                    config.db_path,
-                    generation_id=generation.generation_id,
-                    reason=drift_reason,
-                    cursor_url=source_url,
-                    claim_token=claim_token,
-                    expected_revision=generation.generation_revision,
-                )
-                restarted_sources.append(
-                    {
-                        "mal_anime_id": source_id,
-                        "title": source_title,
-                        "generation_id": generation.generation_id,
-                        "reason": drift_reason,
-                        "cursor_url": generation.cursor_url,
-                    }
-                )
-                if generation.quarantined_at is not None:
-                    quarantined_sources.append({
-                        "mal_anime_id": source_id,
-                        "generation_id": generation.generation_id,
-                        "reason": generation.quarantine_reason or drift_reason,
-                    })
-                    queue_outcome = "quarantined_drift_livelock"
-                    queue_class = "quarantined"
-                    queue_error_code = "pagination_drift"
-                    break
-                if pages_this_run >= normalized_max_pages:
-                    paused = _public_userrecs_pause_source(
-                        config,
-                        generation=generation,
-                        cursor_url=generation.cursor_url or source_url,
-                        error="drift restart deferred until next run because max_pages was reached",
-                        claim_token=claim_token,
-                    )
-                    paused_sources.append(
-                        {
-                            "mal_anime_id": source_id,
-                            "title": source_title,
-                            "generation_id": paused.generation_id,
-                            "pages_fetched": paused.pages_fetched,
-                            "cursor_url": paused.cursor_url,
-                            "reason": "drift_restart",
-                        }
-                    )
-                    break
-                continue
-            try:
-                generation = renew_mal_public_userrecs_source_claim(
-                    config.db_path, source_mal_anime_id=source_id,
-                    generation_id=generation.generation_id, claim_token=claim_token,
-                    expected_revision=generation.generation_revision,
-                )
-                pages_this_run += 1
-                fetch_counts["attempted"] += 1
-                try:
-                    fetch_kwargs = {"page_url": cursor_url, "max_body_bytes": normalized_max_body_bytes}
-                    if isinstance(harvest_client, PublicMalUserRecommendationsClient):
-                        fetched_page = harvest_client.fetch_page(
-                            source_id,
-                            page_url=cursor_url,
-                            max_body_bytes=normalized_max_body_bytes,
-                            max_attempts=1,
-                        )
-                    else:
-                        fetched_page = harvest_client.fetch_page(source_id, **fetch_kwargs)
-                except BaseException:
-                    fetch_counts["failed"] += 1
-                    raise
-            except (PublicMalUserRecommendationsError, TimeoutError, ValueError) as exc:
-                error = str(exc)
-                generation = _public_userrecs_pause_source(
-                    config,
-                    generation=generation,
-                    cursor_url=cursor_url,
-                    error=error,
-                    claim_token=claim_token,
-                )
-                record_mal_recommendation_harvest_attempt_error(
-                    config.db_path,
-                    source_mal_anime_id=source_id,
-                    source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
-                    error=error,
-                    pages_fetched=generation.pages_fetched,
-                    source_url=generation.source_url or source_url,
-                )
-                failures.append(
-                    FullUserRecommendationHarvestFailure(
-                        mal_anime_id=source_id,
-                        title=source_title,
-                        error=error,
-                        pages_fetched=generation.pages_fetched,
-                        source_url=generation.source_url or source_url,
                         generation_id=generation.generation_id,
-                        paused=True,
-                    )
-                )
-                queue_outcome = "retryable_failure"
-                queue_class = "retry_due"
-                queue_error_code = "fetch_failure"
-                retry_delay_seconds = min(24 * 60 * 60, 15 * 60 * (2 ** min(generation.attempt_count, 6)))
-                queue_retry_at = (
-                    datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds)
-                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                generation = schedule_mal_public_userrecs_generation_retry(
-                    config.db_path,
-                    generation_id=generation.generation_id,
-                    retry_class="transient_fetch_failure",
-                    next_retry_at=queue_retry_at,
-                    claim_token=claim_token,
-                    expected_revision=generation.generation_revision,
-                )
-                break
-
-            fetch_counts["succeeded"] += 1
-
-            fetched_drift_reason = _public_userrecs_fetched_page_drift_reason(
-                config.db_path,
-                generation=generation,
-                fetched_page=fetched_page,
-            )
-            if fetched_drift_reason is not None:
-                generation = restart_mal_public_userrecs_generation_after_drift(
-                    config.db_path,
-                    generation_id=generation.generation_id,
-                    reason=fetched_drift_reason,
-                    cursor_url=source_url,
-                    claim_token=claim_token,
-                    expected_revision=generation.generation_revision,
-                )
-                restarted_sources.append(
-                    {
-                        "mal_anime_id": source_id,
-                        "title": source_title,
-                        "generation_id": generation.generation_id,
-                        "reason": fetched_drift_reason,
-                        "cursor_url": generation.cursor_url,
-                    }
-                )
-                if generation.quarantined_at is not None:
-                    quarantined_sources.append({
-                        "mal_anime_id": source_id,
-                        "generation_id": generation.generation_id,
-                        "reason": generation.quarantine_reason or fetched_drift_reason,
-                    })
-                    queue_outcome = "quarantined_drift_livelock"
-                    queue_class = "quarantined"
-                    queue_error_code = "pagination_drift"
-                    break
-                if pages_this_run >= normalized_max_pages:
-                    paused = _public_userrecs_pause_source(
-                        config,
-                        generation=generation,
-                        cursor_url=generation.cursor_url or source_url,
-                        error="drift restart deferred until next run because max_pages was reached",
+                        reason=drift_reason,
+                        cursor_url=source_url,
                         claim_token=claim_token,
+                        expected_revision=generation.generation_revision,
                     )
-                    paused_sources.append(
+                    restarted_sources.append(
                         {
                             "mal_anime_id": source_id,
                             "title": source_title,
-                            "generation_id": paused.generation_id,
-                            "pages_fetched": paused.pages_fetched,
-                            "cursor_url": paused.cursor_url,
-                            "reason": "drift_restart",
+                            "generation_id": generation.generation_id,
+                            "reason": drift_reason,
+                            "cursor_url": generation.cursor_url,
                         }
                     )
-                    break
-                continue
-
-            page_number = generation.pages_fetched + 1
-            edge_payloads = fetched_page.edge_payloads(
-                source_url=generation.source_url or source_url,
-                page_count=page_number,
-            )
-            replace_mal_public_userrecs_staged_page(
-                config.db_path,
-                generation_id=generation.generation_id,
-                page_number=page_number,
-                page_url=fetched_page.final_url,
-                page_fingerprint=fetched_page.page_fingerprint,
-                anchor=fetched_page.anchor,
-                next_url=fetched_page.next_url,
-                edges=edge_payloads,
-                terminal_evidence={
-                    **(getattr(fetched_page, "terminal_evidence", {}) or {}),
-                    "page_number": page_number,
-                    "page_fingerprint": fetched_page.page_fingerprint,
-                },
-                claim_token=claim_token,
-                expected_revision=generation.generation_revision,
-            )
-            # Publication always performs a separate final page-1/boundary
-            # validation; staging is never treated as equivalent proof.
-            resume_revalidated = False
-            current_generation = get_active_mal_public_userrecs_generation(
-                config.db_path, source_mal_anime_id=source_id
-            )
-            if current_generation is None:
-                failures.append(
-                    FullUserRecommendationHarvestFailure(
-                        mal_anime_id=source_id,
-                        title=source_title,
-                        error="public userrecs generation disappeared after staging",
-                        pages_fetched=page_number,
-                        source_url=source_url,
-                    )
-                )
-                break
-            generation = current_generation
-
-            if fetched_page.next_url is None:
-                try:
-                    generation = mark_mal_public_userrecs_generation_ready(
-                        config.db_path, generation_id=generation.generation_id,
-                        claim_token=claim_token, expected_revision=generation.generation_revision,
-                    )
+                    if generation.quarantined_at is not None:
+                        quarantined_sources.append({
+                            "mal_anime_id": source_id,
+                            "generation_id": generation.generation_id,
+                            "reason": generation.quarantine_reason or drift_reason,
+                        })
+                        queue_outcome = "quarantined_drift_livelock"
+                        queue_class = "quarantined"
+                        queue_error_code = "pagination_drift"
+                        break
+                    if pages_this_run >= normalized_max_pages:
+                        paused = _public_userrecs_pause_source(
+                            config,
+                            generation=generation,
+                            cursor_url=generation.cursor_url or source_url,
+                            error="drift restart deferred until next run because max_pages was reached",
+                            claim_token=claim_token,
+                        )
+                        paused_sources.append(
+                            {
+                                "mal_anime_id": source_id,
+                                "title": source_title,
+                                "generation_id": paused.generation_id,
+                                "pages_fetched": paused.pages_fetched,
+                                "cursor_url": paused.cursor_url,
+                                "reason": "drift_restart",
+                            }
+                        )
+                        break
                     continue
-                except ValueError as exc:
+                try:
+                    generation = renew_mal_public_userrecs_source_claim(
+                        config.db_path, source_mal_anime_id=source_id,
+                        generation_id=generation.generation_id, claim_token=claim_token,
+                        expected_revision=generation.generation_revision,
+                    )
+                    pages_this_run += 1
+                    fetch_counts["attempted"] += 1
+                    try:
+                        fetch_kwargs = {"page_url": cursor_url, "max_body_bytes": normalized_max_body_bytes}
+                        if isinstance(harvest_client, PublicMalUserRecommendationsClient):
+                            fetched_page = harvest_client.fetch_page(
+                                source_id,
+                                page_url=cursor_url,
+                                max_body_bytes=normalized_max_body_bytes,
+                                max_attempts=1,
+                            )
+                        else:
+                            fetched_page = harvest_client.fetch_page(source_id, **fetch_kwargs)
+                    except BaseException:
+                        fetch_counts["failed"] += 1
+                        raise
+                except (PublicMalUserRecommendationsError, TimeoutError, ValueError) as exc:
                     error = str(exc)
                     generation = _public_userrecs_pause_source(
                         config,
                         generation=generation,
-                        cursor_url=generation.cursor_url,
+                        cursor_url=cursor_url,
                         error=error,
                         claim_token=claim_token,
                     )
-                    record_mal_recommendation_harvest_failure(
+                    record_mal_recommendation_harvest_attempt_error(
                         config.db_path,
                         source_mal_anime_id=source_id,
                         source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
@@ -1688,40 +1655,202 @@ def refresh_full_user_recommendation_harvest(
                             paused=True,
                         )
                     )
+                    queue_outcome = "retryable_failure"
+                    queue_class = "retry_due"
+                    queue_error_code = "fetch_failure"
+                    retry_delay_seconds = min(24 * 60 * 60, 15 * 60 * (2 ** min(generation.attempt_count, 6)))
+                    queue_retry_at = (
+                        datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds)
+                    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    generation = schedule_mal_public_userrecs_generation_retry(
+                        config.db_path,
+                        generation_id=generation.generation_id,
+                        retry_class="transient_fetch_failure",
+                        next_retry_at=queue_retry_at,
+                        claim_token=claim_token,
+                        expected_revision=generation.generation_revision,
+                    )
                     break
 
-            if pages_this_run >= normalized_max_pages:
-                paused = _public_userrecs_pause_source(
-                    config,
-                    generation=generation,
-                    cursor_url=fetched_page.next_url,
-                    error="max_pages reached; staged generation paused with next-page cursor",
-                    claim_token=claim_token,
-                )
-                paused_sources.append(
-                    {
-                        "mal_anime_id": source_id,
-                        "title": source_title,
-                        "generation_id": paused.generation_id,
-                        "pages_fetched": paused.pages_fetched,
-                        "cursor_url": paused.cursor_url,
-                        "reason": "max_pages",
-                    }
-                )
-                queue_outcome = "paused_page_budget"
-                break
+                fetch_counts["succeeded"] += 1
 
-        if queue_class != "quarantined":
-            release_mal_public_userrecs_source_claim(
-                config.db_path,
-                source_mal_anime_id=source_id,
-                claim_token=claim_token,
-                queue_class=queue_class,
-                outcome=queue_outcome,
-                generation_id=generation.generation_id,
-                next_retry_at=queue_retry_at,
-                error_code=queue_error_code,
-            )
+                fetched_drift_reason = _public_userrecs_fetched_page_drift_reason(
+                    config.db_path,
+                    generation=generation,
+                    fetched_page=fetched_page,
+                )
+                if fetched_drift_reason is not None:
+                    generation = restart_mal_public_userrecs_generation_after_drift(
+                        config.db_path,
+                        generation_id=generation.generation_id,
+                        reason=fetched_drift_reason,
+                        cursor_url=source_url,
+                        claim_token=claim_token,
+                        expected_revision=generation.generation_revision,
+                    )
+                    restarted_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": generation.generation_id,
+                            "reason": fetched_drift_reason,
+                            "cursor_url": generation.cursor_url,
+                        }
+                    )
+                    if generation.quarantined_at is not None:
+                        quarantined_sources.append({
+                            "mal_anime_id": source_id,
+                            "generation_id": generation.generation_id,
+                            "reason": generation.quarantine_reason or fetched_drift_reason,
+                        })
+                        queue_outcome = "quarantined_drift_livelock"
+                        queue_class = "quarantined"
+                        queue_error_code = "pagination_drift"
+                        break
+                    if pages_this_run >= normalized_max_pages:
+                        paused = _public_userrecs_pause_source(
+                            config,
+                            generation=generation,
+                            cursor_url=generation.cursor_url or source_url,
+                            error="drift restart deferred until next run because max_pages was reached",
+                            claim_token=claim_token,
+                        )
+                        paused_sources.append(
+                            {
+                                "mal_anime_id": source_id,
+                                "title": source_title,
+                                "generation_id": paused.generation_id,
+                                "pages_fetched": paused.pages_fetched,
+                                "cursor_url": paused.cursor_url,
+                                "reason": "drift_restart",
+                            }
+                        )
+                        break
+                    continue
+
+                page_number = generation.pages_fetched + 1
+                edge_payloads = fetched_page.edge_payloads(
+                    source_url=generation.source_url or source_url,
+                    page_count=page_number,
+                )
+                replace_mal_public_userrecs_staged_page(
+                    config.db_path,
+                    generation_id=generation.generation_id,
+                    page_number=page_number,
+                    page_url=fetched_page.final_url,
+                    page_fingerprint=fetched_page.page_fingerprint,
+                    anchor=fetched_page.anchor,
+                    next_url=fetched_page.next_url,
+                    edges=edge_payloads,
+                    terminal_evidence={
+                        **(getattr(fetched_page, "terminal_evidence", {}) or {}),
+                        "page_number": page_number,
+                        "page_fingerprint": fetched_page.page_fingerprint,
+                    },
+                    claim_token=claim_token,
+                    expected_revision=generation.generation_revision,
+                )
+                # Publication always performs a separate final page-1/boundary
+                # validation; staging is never treated as equivalent proof.
+                resume_revalidated = False
+                current_generation = get_active_mal_public_userrecs_generation(
+                    config.db_path, source_mal_anime_id=source_id
+                )
+                if current_generation is None:
+                    failures.append(
+                        FullUserRecommendationHarvestFailure(
+                            mal_anime_id=source_id,
+                            title=source_title,
+                            error="public userrecs generation disappeared after staging",
+                            pages_fetched=page_number,
+                            source_url=source_url,
+                        )
+                    )
+                    break
+                generation = current_generation
+
+                if fetched_page.next_url is None:
+                    try:
+                        generation = mark_mal_public_userrecs_generation_ready(
+                            config.db_path, generation_id=generation.generation_id,
+                            claim_token=claim_token, expected_revision=generation.generation_revision,
+                        )
+                        continue
+                    except ValueError as exc:
+                        error = str(exc)
+                        generation = _public_userrecs_pause_source(
+                            config,
+                            generation=generation,
+                            cursor_url=generation.cursor_url,
+                            error=error,
+                            claim_token=claim_token,
+                        )
+                        record_mal_recommendation_harvest_failure(
+                            config.db_path,
+                            source_mal_anime_id=source_id,
+                            source_type=MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+                            error=error,
+                            pages_fetched=generation.pages_fetched,
+                            source_url=generation.source_url or source_url,
+                        )
+                        failures.append(
+                            FullUserRecommendationHarvestFailure(
+                                mal_anime_id=source_id,
+                                title=source_title,
+                                error=error,
+                                pages_fetched=generation.pages_fetched,
+                                source_url=generation.source_url or source_url,
+                                generation_id=generation.generation_id,
+                                paused=True,
+                            )
+                        )
+                        break
+
+                if pages_this_run >= normalized_max_pages:
+                    paused = _public_userrecs_pause_source(
+                        config,
+                        generation=generation,
+                        cursor_url=fetched_page.next_url,
+                        error="max_pages reached; staged generation paused with next-page cursor",
+                        claim_token=claim_token,
+                    )
+                    paused_sources.append(
+                        {
+                            "mal_anime_id": source_id,
+                            "title": source_title,
+                            "generation_id": paused.generation_id,
+                            "pages_fetched": paused.pages_fetched,
+                            "cursor_url": paused.cursor_url,
+                            "reason": "max_pages",
+                        }
+                    )
+                    queue_outcome = "paused_page_budget"
+                    break
+
+            if queue_class != "quarantined":
+                release_mal_public_userrecs_source_claim(
+                    config.db_path,
+                    source_mal_anime_id=source_id,
+                    claim_token=claim_token,
+                    queue_class=queue_class,
+                    outcome=queue_outcome,
+                    generation_id=generation.generation_id,
+                    next_retry_at=queue_retry_at,
+                    error_code=queue_error_code,
+                )
+    finally:
+        # A source claim must never be stranded by an unexpected parser, DB,
+        # or orchestration exception. Normal per-source releases make these
+        # idempotent no-ops; this path is recovery fencing only.
+        for claimed in claimed_rows:
+            try:
+                release_mal_public_userrecs_source_claim(
+                    config.db_path, source_mal_anime_id=claimed.source_mal_anime_id,
+                    claim_token=claim_token, queue_class="resumable",
+                    outcome="unexpected_exception_recovery",
+                )
+            except (RuntimeError, ValueError):
+                pass
 
     if failures and (harvested or paused_sources):
         status = "partial"

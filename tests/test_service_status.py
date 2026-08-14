@@ -424,6 +424,64 @@ class ServiceStatusTests(unittest.TestCase):
         self.assertGreaterEqual(task["running_duration_seconds"], 0)
         self.assertIn("execution_state_elapsed_seconds", task)
 
+    def test_doctor_service_marks_timed_out_persisted_running_state_stale(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps({"tasks": {"sync_fetch_crunchyroll": {
+                "execution_state": "running",
+                "running_started_epoch": datetime.now(timezone.utc).timestamp() - 121,
+                "running_timeout_seconds": 120,
+            }}}), encoding="utf-8"
+        )
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr="")):
+            task = doctor_service(self.config)["task_state"]["sync_fetch_crunchyroll"]
+        self.assertEqual("stale_running_state", task["execution_state"])
+        self.assertEqual("running_timeout_elapsed", task["execution_state_reason"])
+        self.assertEqual(0, task["execution_state_remaining_seconds"])
+
+    def test_doctor_service_marks_running_state_stale_when_task_lease_released(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps({"tasks": {"sync_fetch_crunchyroll": {
+                "execution_state": "running",
+                "running_started_epoch": datetime.now(timezone.utc).timestamp(),
+                "running_timeout_seconds": 1200,
+            }}}), encoding="utf-8"
+        )
+        lease_path = self.config.service_leases_dir / "task-sync_fetch_crunchyroll.json"
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({"status": "released"}), encoding="utf-8")
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr="")):
+            task = doctor_service(self.config)["task_state"]["sync_fetch_crunchyroll"]
+        self.assertEqual("stale_running_state", task["execution_state"])
+        self.assertEqual("task_lease_released", task["execution_state_reason"])
+
+    def test_doctor_service_does_not_treat_unknown_future_lease_status_as_released(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps({"tasks": {"sync_fetch_crunchyroll": {
+                "execution_state": "running",
+                "running_started_epoch": datetime.now(timezone.utc).timestamp(),
+                "running_timeout_seconds": 1200,
+            }}}), encoding="utf-8"
+        )
+        lease_path = self.config.service_leases_dir / "task-sync_fetch_crunchyroll.json"
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({"status": "handoff_pending"}), encoding="utf-8")
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr="")):
+            task = doctor_service(self.config)["task_state"]["sync_fetch_crunchyroll"]
+        self.assertEqual("running", task["execution_state"])
+        self.assertEqual("subprocess_active", task["execution_state_reason"])
+
+    def test_doctor_service_does_not_treat_absent_lease_as_released_before_timeout(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps({"tasks": {"sync_fetch_crunchyroll": {
+                "execution_state": "running",
+                "running_started_epoch": datetime.now(timezone.utc).timestamp(),
+                "running_timeout_seconds": 1200,
+            }}}), encoding="utf-8"
+        )
+        with patch("mal_updater.service_manager._run", return_value=Mock(returncode=1, stdout="", stderr="")):
+            task = doctor_service(self.config)["task_state"]["sync_fetch_crunchyroll"]
+        self.assertEqual("running", task["execution_state"])
+
     def test_service_status_raw_prints_running_subprocess_fields(self) -> None:
         self.config.service_state_path.write_text(
             json.dumps(

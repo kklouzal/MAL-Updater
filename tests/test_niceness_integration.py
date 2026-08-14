@@ -13,6 +13,7 @@ from mal_updater.service_runtime import (
     _budget_gate,
     _provider_eligibility_command,
     _provider_fetch_command,
+    _task_execution_signature,
     _task_specs,
     effective_niceness_policy,
     run_pending_tasks,
@@ -52,9 +53,17 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
 
         command = _provider_eligibility_command(self.config, "crunchyroll")
         self.assertEqual("crunchyroll", command[command.index("--provider") + 1])
-        self.assertEqual("2", command[command.index("--limit") + 1])
+        self.assertEqual("5", command[command.index("--limit") + 1])
         self.assertEqual("5", command[command.index("--search-limit") + 1])
         self.assertEqual("1", command[command.index("--queries-per-candidate") + 1])
+        self.assertEqual(5, effective_niceness_policy(self.config)["execute_limits"]["recommend_provider_eligibility_candidates"])
+        self.assertIn(
+            "--limit 5 --search-limit 5 --queries-per-candidate 1",
+            _task_execution_signature(
+                self.config,
+                TaskSpec("recommend_provider_eligibility_crunchyroll", 3600, budget_provider="crunchyroll"),
+            ),
+        )
 
     def test_cold_policy_is_weekly_page_bounded_for_crunchyroll_and_manual_for_hidive(self) -> None:
         policy = effective_niceness_policy(self.config)
@@ -65,11 +74,11 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual(28, eligibility["projected_requests"])
         self.assertEqual(43200, eligibility["auth_failure_backoff_floor_seconds"])
         harvest_policy = policy["task_policies"]["recommend_full_harvest"]
-        self.assertEqual(16, harvest_policy["task_hourly_limit"])
-        self.assertEqual(12, harvest_policy["projected_requests"])
+        self.assertEqual(40, harvest_policy["task_hourly_limit"])
+        self.assertEqual(30, harvest_policy["projected_requests"])
         self.assertEqual(3600, policy["cadences"]["recommendation_full_harvest_seconds"])
-        self.assertEqual(2, policy["execute_limits"]["recommend_full_harvest"])
-        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest_pages"])
+        self.assertEqual(3, policy["execute_limits"]["recommend_full_harvest"])
+        self.assertEqual(10, policy["execute_limits"]["recommend_full_harvest_pages"])
         self.assertEqual(120, policy["cache_horizons_days"]["recommendation_full_userrecs_harvest"])
         self.assertEqual(10, policy["cold_refresh_bounds"]["crunchyroll_max_history_pages"])
         self.assertEqual(2, policy["cold_refresh_bounds"]["crunchyroll_max_watchlist_pages"])
@@ -112,6 +121,8 @@ class FinalNicenessIntegrationTests(unittest.TestCase):
         self.assertEqual("task", usage["budget_scope"])
 
     def test_three_day_scheduler_timeline_has_stable_counts_and_projected_bounds(self) -> None:
+        # Timeline deliberately exercises the opt-in apply lane; shipped config is zero.
+        self.config.service.task_execute_limits["sync_apply"] = 8
         calls: list[tuple[str, list[str]]] = []
 
         def fake_run(_config, args, *, label):

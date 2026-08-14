@@ -260,16 +260,41 @@ def _current_planned_fetch_summary(config: AppConfig, task_name: str, task_state
     return summary
 
 
-def _derive_task_execution_state(task_state: dict[str, Any], *, now: datetime) -> dict[str, Any] | None:
+def _task_lease_is_released(config: AppConfig, task_name: str) -> bool:
+    """Only trust the explicit terminal lease state as release evidence.
+
+    Unknown/future status values and unreadable or absent leases are not proof
+    that a persisted running task has stopped; its timeout remains the
+    fail-safe stale-state boundary.
+    """
+    lease, _error = _read_json(config.service_leases_dir / f"task-{task_name}.json")
+    return isinstance(lease, dict) and lease.get("status") == "released"
+
+
+def _derive_task_execution_state(
+    task_state: dict[str, Any], *, now: datetime, config: AppConfig | None = None, task_name: str | None = None
+) -> dict[str, Any] | None:
     if isinstance(task_state.get("running_started_epoch"), (int, float)):
+        started_epoch = float(task_state["running_started_epoch"])
+        elapsed = max(0, int(now.timestamp() - started_epoch))
+        timeout_seconds = task_state.get("running_timeout_seconds")
+        timed_out = isinstance(timeout_seconds, (int, float)) and elapsed > int(timeout_seconds)
+        lease_released = bool(config is not None and task_name and _task_lease_is_released(config, task_name))
+        if timed_out or lease_released:
+            payload: dict[str, Any] = {
+                "execution_state": "stale_running_state",
+                "execution_state_reason": "running_timeout_elapsed" if timed_out else "task_lease_released",
+                "execution_state_elapsed_seconds": elapsed,
+                "restart_required": False,
+            }
+            if isinstance(timeout_seconds, (int, float)):
+                payload["execution_state_remaining_seconds"] = 0
+            return payload
         payload: dict[str, Any] = {
             "execution_state": "running",
             "execution_state_reason": "subprocess_active",
         }
-        timeout_seconds = task_state.get("running_timeout_seconds")
         if isinstance(timeout_seconds, (int, float)):
-            started_epoch = float(task_state["running_started_epoch"])
-            elapsed = max(0, int(now.timestamp() - started_epoch))
             payload["execution_state_elapsed_seconds"] = elapsed
             payload["execution_state_remaining_seconds"] = max(0, int(timeout_seconds) - elapsed)
         return payload
@@ -414,7 +439,7 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
     failure_backoff_until = _parse_iso_timestamp(value.get("failure_backoff_until"))
     if failure_backoff_until is not None:
         summary["failure_backoff_remaining_seconds"] = max(0, int((failure_backoff_until - now_dt).total_seconds()))
-    execution_state = _derive_task_execution_state(value, now=now_dt)
+    execution_state = _derive_task_execution_state(value, now=now_dt, config=config, task_name=task_name)
     if execution_state is not None:
         summary.update(execution_state)
     summary.update(_current_planned_fetch_summary(config, task_name, value))

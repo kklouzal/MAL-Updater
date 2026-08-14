@@ -366,7 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_maintain.add_argument("--discovery-target-limit", type=int, default=25, help="Discovery target anime metadata rows to hydrate this cycle")
     recommend_maintain.add_argument("--recommendation-limit", type=int, default=100, help="Recommendation rows to persist in the snapshot")
     recommend_maintain.add_argument("--mapping-limit", type=int, default=25, help="Provider rows to inspect in exact-approved-only sync dry-run review")
-    recommend_maintain.add_argument("--mal-list-max-pages", type=int, default=3, help="Official MAL @me anime-list pages to refresh before retaining older rows as a bounded partial cycle")
+    recommend_maintain.add_argument("--mal-list-max-pages", type=int, default=10, help="Official MAL @me anime-list pages to refresh before retaining older rows as a bounded partial cycle")
     recommend_maintain.add_argument("--provider-max-history-pages", type=int, default=None, help="Crunchyroll chunk budget for history pages; partial chunks stay incremental")
     recommend_maintain.add_argument("--provider-max-watchlist-pages", type=int, default=None, help="Crunchyroll chunk budget for watchlist pages; partial chunks stay incremental")
     recommend_maintain.add_argument("--skip-provider-refresh", action="store_true", help="Skip provider snapshot refresh for this cycle")
@@ -416,9 +416,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="MAL list status to refresh (repeatable); default/all fetches every status and prunes absent rows only after a complete run",
     )
     mal_list_refresh.add_argument("--page-size", type=int, default=100, help="MAL page size, clamped by the client to 1-100")
-    mal_list_refresh.add_argument("--max-pages", type=int, default=3, help="Maximum MAL network attempts across fair status partitions; 0 is a hard no-network/no-mutation diagnostic run (default: 3)")
+    mal_list_refresh.add_argument("--max-pages", type=int, default=10, help="Maximum MAL network attempts across fair status partitions; 0 is a hard no-network/no-mutation diagnostic run (default: 10)")
     mal_list_refresh.add_argument("--complete", action="store_true", help="Opt in to pruning absent rows, but only if MAL pagination reaches a terminal page within --max-pages")
     mal_list_refresh.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
+    mal_list_reinitialize = subparsers.add_parser(
+        "mal-list-reinitialize", help="Explicitly reinitialize one quarantined exact MAL account/query traversal",
+    )
+    mal_list_reinitialize.add_argument("--status", action="append", choices=["all", "completed", "watching", "on_hold", "dropped", "plan_to_watch"], default=None)
+    mal_list_reinitialize.add_argument("--page-size", type=int, default=100)
+    mal_list_reinitialize.add_argument("--reason", required=True, help="Audited operator reason; this is the explicit quarantine-reset intent")
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",
         help="Refresh paced MAL metadata/relation cache for mapped anime; provider lookups remain title-specific only",
@@ -443,14 +449,20 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_full_userrecs.add_argument("--limit", type=int, default=0, help="How many positive MAL list source titles to harvest this run (use 0 for all due sources)")
     recommend_full_userrecs.add_argument("--force-refresh", action="store_true", help="Refresh due and fresh complete public userrecs rows without letting official-detail top-10 data overwrite them")
     recommend_full_userrecs.add_argument("--stale-after-days", type=int, default=45, help="Refresh complete public userrecs rows older than this many days (default: 45)")
-    recommend_full_userrecs.add_argument("--max-pages", type=int, default=3, metavar="PAGES_PER_SOURCE_PER_RUN", help="Per-source per-run same-origin userrecs page budget before pausing the staged generation with its next-page cursor")
+    recommend_full_userrecs.add_argument("--max-pages", type=int, default=10, metavar="PAGES_PER_SOURCE_PER_RUN", help="Per-source per-run same-origin userrecs network-attempt budget before pausing the staged generation with its next-page cursor (default: 10)")
     recommend_full_userrecs.add_argument("--max-body-mb", type=float, default=4.0, help="Maximum HTML body size per public MAL userrecs page before preserving existing edges as failed")
     recommend_full_userrecs.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
+    userrecs_reinitialize = subparsers.add_parser(
+        "recommend-reinitialize-full-userrecs", help="Explicitly reinitialize one quarantined public-userrecs source",
+    )
+    userrecs_reinitialize.add_argument("--source-mal-anime-id", type=int, required=True)
+    userrecs_reinitialize.add_argument("--source-url", required=True, help="Exact same-origin MAL /userrecs URL for the specified source")
+    userrecs_reinitialize.add_argument("--reason", required=True, help="Audited operator reason; this is the explicit quarantine-reset intent")
     recommend_enrich = subparsers.add_parser(
         "recommend-enrich-provider-availability",
         help="Use bounded provider title search to enrich recommendation availability cache",
     )
-    recommend_enrich.add_argument("--limit", type=int, default=2, help="Maximum recommendation candidates to inspect per provider (default: 2)")
+    recommend_enrich.add_argument("--limit", type=int, default=5, help="Maximum recommendation candidates to inspect per provider (default: 5)")
     recommend_enrich.add_argument("--provider", choices=list(list_provider_slugs()), help="Provider slug to query; defaults to all registered providers")
     recommend_enrich.add_argument("--search-limit", type=int, default=5, help="Maximum provider search results per query")
     recommend_enrich.add_argument(

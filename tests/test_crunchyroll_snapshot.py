@@ -935,6 +935,94 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertEqual(session_state["crunchyroll_phase"], "python_live_snapshot_partial")
             self.assertEqual(session_state["last_error"], "partial snapshot; sync boundary not advanced")
 
+    def test_progress_is_deduplicated_by_episode_using_latest_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            older = self._history_entry(1, played_at="2026-01-01T00:00:00Z")
+            newer = self._history_entry(1, played_at="2026-02-01T00:00:00Z")
+
+            def fake_get(url, *, params=None, phase=None):
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123"}
+                if url.endswith("/watch-history"):
+                    return {"total": 2, "data": [older, newer]}
+                if url.endswith("/watchlist"):
+                    return {"total": 0, "data": []}
+                raise AssertionError(url)
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                result = _fetch_snapshot_once(session, use_incremental_boundary=False)
+            self.assertEqual(len(result.snapshot.progress), 1)
+            self.assertEqual(result.snapshot.progress[0].last_watched_at, "2026-02-01T00:00:00Z")
+
+    def test_automatic_bootstrap_chunk_resumes_across_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            requested_pages: list[int] = []
+
+            def fake_get(url, *, params=None, phase=None):
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123"}
+                if url.endswith("/watch-history"):
+                    page = int(params["page"])
+                    requested_pages.append(page)
+                    start = (page - 1) * 100
+                    return {"total": 250, "data": [self._history_entry(start + i) for i in range(100 if page < 3 else 50)]}
+                if url.endswith("/watchlist"):
+                    return {"total": 0, "data": []}
+                raise AssertionError(url)
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                first = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                second = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                third = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+            self.assertTrue(first.snapshot.raw["partial"])
+            self.assertTrue(second.snapshot.raw["partial"])
+            self.assertFalse(third.snapshot.raw["partial"])
+            self.assertEqual(requested_pages, [1, 2, 3, 1])
+            self.assertTrue(third.snapshot.raw["bootstrap_generation_validated"])
+            self.assertEqual(third.snapshot.raw["bootstrap_staged_history_count"], 250)
+            self.assertFalse((session.state_paths.root / "snapshot_bootstrap_resume.json").exists())
+            self.assertTrue(session.state_paths.sync_boundary_path.exists())
+
+    def test_automatic_bootstrap_page_one_drift_restarts_without_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            page_one_calls = 0
+
+            def fake_get(url, *, params=None, phase=None):
+                nonlocal page_one_calls
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123"}
+                if url.endswith("/watch-history"):
+                    page = int(params["page"])
+                    if page == 1:
+                        page_one_calls += 1
+                    start = (page - 1) * 100
+                    # The completion recheck sees a newly inserted front item.
+                    drift = 1000 if page == 1 and page_one_calls > 1 else 0
+                    return {"total": 150 + (1 if drift else 0), "data": [self._history_entry(drift + start + i) for i in range(100 if page == 1 else 50)]}
+                if url.endswith("/watchlist"):
+                    return {"total": 0, "data": []}
+                raise AssertionError(url)
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                first = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                second = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+            self.assertTrue(first.snapshot.raw["partial"])
+            self.assertTrue(second.snapshot.raw["partial"])
+            self.assertTrue(second.snapshot.raw["bootstrap_drift_detected"])
+            self.assertFalse(session.state_paths.sync_boundary_path.exists())
+            resume = json.loads((session.state_paths.root / "snapshot_bootstrap_resume.json").read_text())
+            self.assertEqual(1, resume["history_next_page"])
+            self.assertEqual([], resume["history_entries"])
+
 
 if __name__ == "__main__":
     unittest.main()

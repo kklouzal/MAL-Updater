@@ -225,6 +225,7 @@ def load_provider_series_states(
         LEFT JOIN (
             SELECT provider, provider_series_id, MIN(status) AS watchlist_status
             FROM provider_watchlist
+            WHERE is_active = 1
             GROUP BY provider, provider_series_id
         ) w ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
         WHERE s.account_observed_at IS NOT NULL

@@ -99,6 +99,40 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual("original", path.read_text(encoding="utf-8"))
         self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
 
+    def test_atomic_fsync_failure_before_replace_preserves_original(self) -> None:
+        path = self.root / "state.json"
+        path.write_text("original", encoding="utf-8")
+
+        with patch("mal_updater.persistence.os.fsync", side_effect=OSError(5, "simulated interruption")):
+            with self.assertRaises(PersistentWriteError):
+                atomic_write_text(path, "replacement")
+
+        self.assertEqual("original", path.read_text(encoding="utf-8"))
+        self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
+
+    def test_atomic_write_replaces_symlink_without_following_it(self) -> None:
+        referent = self.root / "referent.json"
+        referent.write_text("sensitive", encoding="utf-8")
+        path = self.root / "state.json"
+        path.symlink_to(referent)
+
+        atomic_write_text(path, "replacement")
+
+        self.assertFalse(path.is_symlink())
+        self.assertEqual("replacement", path.read_text(encoding="utf-8"))
+        self.assertEqual("sensitive", referent.read_text(encoding="utf-8"))
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+
+    def test_atomic_write_refuses_to_replace_directory_target(self) -> None:
+        path = self.root / "state.json"
+        path.mkdir()
+
+        with self.assertRaises(PersistentWriteError):
+            atomic_write_text(path, "replacement")
+
+        self.assertTrue(path.is_dir())
+        self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
+
 
 if __name__ == "__main__":
     unittest.main()

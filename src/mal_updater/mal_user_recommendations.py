@@ -18,7 +18,7 @@ from .mal_client import MalApiError, _read_http_error_detail
 from .provider_niceness import ProviderRequestGate, retry_delay_seconds
 from .request_tracking import record_api_request_event
 
-DEFAULT_PUBLIC_USER_RECS_MAX_PAGES = 3
+DEFAULT_PUBLIC_USER_RECS_MAX_PAGES = 10
 DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES = 4 * 1024 * 1024
 DEFAULT_PUBLIC_USER_RECS_MAX_REDIRECTS = 2
 PUBLIC_USER_RECS_USER_AGENT = (

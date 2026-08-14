@@ -51,6 +51,58 @@ MAL_ANIME_SEARCH_QUERY_MAX_CHARS = 64
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 
 
+def _validate_anime_search_response(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+        raise MalApiError("MAL anime search response lacks a typed data list")
+    paging = response.get("paging")
+    if paging is not None and not isinstance(paging, dict):
+        raise MalApiError("MAL anime search response has malformed paging")
+    for item in response["data"]:
+        node = item.get("node") if isinstance(item, dict) else None
+        if (
+            not isinstance(node, dict)
+            or isinstance(node.get("id"), bool)
+            or not isinstance(node.get("id"), int)
+            or int(node["id"]) <= 0
+            or not isinstance(node.get("title"), str)
+            or not node["title"].strip()
+        ):
+            raise MalApiError("MAL anime search response contains an invalid node")
+    return response
+
+
+def _validate_anime_detail_response(response: Any, *, anime_id: int, fields: set[str]) -> dict[str, Any]:
+    if not isinstance(response, dict) or response.get("id") != int(anime_id):
+        raise MalApiError("MAL anime detail response identity does not match the request")
+    if not isinstance(response.get("title"), str) or not response["title"].strip():
+        raise MalApiError("MAL anime detail response lacks a usable title")
+    missing = {field for field in fields if field not in response}
+    if missing:
+        raise MalApiError(f"MAL anime detail response lacks requested fields: {sorted(missing)!r}")
+    container_types = {
+        "alternative_titles": dict,
+        "start_season": dict,
+        "broadcast": dict,
+        "related_anime": list,
+        "recommendations": list,
+        "my_list_status": dict,
+    }
+    nullable_containers = {"start_season", "broadcast", "my_list_status"}
+    for field, expected_type in container_types.items():
+        value = response.get(field)
+        if field in fields and value is None and field in nullable_containers:
+            continue
+        if field in fields and not isinstance(value, expected_type):
+            raise MalApiError(f"MAL anime detail response has malformed {field}")
+    for field in ("related_anime", "recommendations"):
+        if field in fields:
+            for item in response[field]:
+                node = item.get("node") if isinstance(item, dict) else None
+                if not isinstance(node, dict) or not isinstance(node.get("id"), int) or int(node["id"]) <= 0:
+                    raise MalApiError(f"MAL anime detail response has malformed {field} node")
+    return response
+
+
 def _same_mal_api_origin(url: str, base_url: str) -> bool:
     parsed = urlparse(url)
     base = urlparse(base_url)
@@ -322,6 +374,7 @@ class MalClient:
             headers=self._build_auth_headers(require_user=False),
             error_context=f"MAL API anime search failed for query={sanitized_query!r}",
         )
+        response = _validate_anime_search_response(response)
         negative = not bool(response.get("data"))
         ttl_days = self.config.mal.search_negative_cache_ttl_days if negative else self.config.mal.search_cache_ttl_days
         if cache_available:
@@ -372,6 +425,7 @@ class MalClient:
             headers=self._build_auth_headers(require_user=require_user),
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
+        response = _validate_anime_detail_response(response, anime_id=int(anime_id), fields=set(fields_key.split(",")))
         ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
         if cache_available:
             upsert_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
@@ -418,7 +472,17 @@ class MalClient:
             query["status"] = normalized_status
         next_path: str | None = f"/users/@me/animelist?{urlencode(query)}"
         pages = 0
+        visited: set[str] = set()
+        previous_offset = -1
         while next_path and pages < normalized_max_pages:
+            if next_path in visited:
+                raise MalApiError("MAL API pagination cursor repeated")
+            visited.add(next_path)
+            current_query = __import__("urllib.parse", fromlist=["parse_qs"]).parse_qs(urlparse(next_path).query)
+            current_offset_text = current_query.get("offset", ["0"])[0]
+            if not str(current_offset_text).isdigit() or int(current_offset_text) <= previous_offset:
+                raise MalApiError("MAL API pagination cursor is non-monotonic")
+            previous_offset = int(current_offset_text)
             pages += 1
             payload = self._get_json(
                 next_path,

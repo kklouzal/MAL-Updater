@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from .contracts import ProviderSnapshot
+from .persistence import atomic_write_json
 
 
 def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:
@@ -22,6 +22,5 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:
 
 
 def write_snapshot_file(path: Path, snapshot: ProviderSnapshot) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(snapshot_to_dict(snapshot), indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, snapshot_to_dict(snapshot), indent=2)
     return path

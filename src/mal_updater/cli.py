@@ -50,6 +50,8 @@ from .db import (
     get_provider_stale_row_counts,
     get_provider_stale_row_last_seen_ranges,
     get_provider_stale_row_linkage,
+    reinitialize_mal_public_userrecs_source,
+    reinitialize_mal_user_anime_list_traversal,
     insert_recommendation_snapshot_rows,
     list_latest_recommendation_snapshot_rows,
     list_provider_stale_row_samples,
@@ -71,7 +73,11 @@ from .recommendation_dashboard import (
     write_recommendation_dashboard,
 )
 from .recommendation_enrichment import enrich_discovery_provider_availability
-from .recommendation_metadata import refresh_full_user_recommendation_harvest, refresh_mal_user_anime_list_cache, refresh_recommendation_metadata
+from .recommendation_metadata import (
+    _mal_user_list_initial_url, _mal_user_list_query_identity, _normalized_user_list_statuses,
+    refresh_full_user_recommendation_harvest, refresh_mal_user_anime_list_cache, refresh_recommendation_metadata,
+)
+from .mal_user_recommendations import validate_public_user_recs_url
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
@@ -3106,6 +3112,45 @@ def _cmd_mal_list_refresh(
     return 0 if summary.status in {"ok", "partial"} else 1
 
 
+def _cmd_mal_list_reinitialize(project_root: Path | None, statuses: list[str] | None,
+                                page_size: int, reason: str) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    client = MalClient(config, load_mal_secrets(config))
+    account = client.get_my_user(max_attempts=1)
+    account_id, account_name = account.get("id"), account.get("name")
+    normalized = _normalized_user_list_statuses(statuses or ["all"])
+    query_identity, query = _mal_user_list_query_identity(statuses=normalized, page_size=page_size)
+    partitions = [{"partition_key": "all" if status is None else status, "requested_status": status,
+                   "ordinal": ordinal, "initial_url": _mal_user_list_initial_url(config, status=status, page_size=page_size)}
+                  for ordinal, status in enumerate(normalized)]
+    generation = reinitialize_mal_user_anime_list_traversal(
+        config.db_path, account_id=account_id, account_name=account_name,
+        query_identity=query_identity, query=query, partitions=partitions,
+        operator_reason=reason, fetched_at=datetime.now(timezone.utc).isoformat(),
+    )
+    print(json.dumps({"status": "reinitialized", "generation": generation.generation,
+                      "account_key": generation.account_key, "query_identity": generation.query_identity}, indent=2))
+    return 0
+
+
+def _cmd_recommend_reinitialize_full_userrecs(project_root: Path | None, source_mal_anime_id: int,
+                                               source_url: str, reason: str) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    validated_url = validate_public_user_recs_url(source_url, public_base_url=config.mal.public_base_url,
+                                                   source_mal_anime_id=source_mal_anime_id)
+    generation = reinitialize_mal_public_userrecs_source(
+        config.db_path, source_mal_anime_id=source_mal_anime_id,
+        source_url=validated_url, operator_reason=reason,
+    )
+    print(json.dumps({"status": "reinitialized", "source_mal_anime_id": source_mal_anime_id,
+                      "generation_id": generation.generation_id, "source_url": validated_url}, indent=2))
+    return 0
+
+
 def _cmd_recommend_refresh_metadata(
     project_root: Path | None,
     limit: int,
@@ -3538,6 +3583,8 @@ def _dispatch(parser, args) -> int:
         return _cmd_dashboard_serve(args.project_root, args.host, args.port, args.limit)
     if args.command == "mal-list-refresh":
         return _cmd_mal_list_refresh(args.project_root, args.status, args.page_size, args.max_pages, args.complete, args.format)
+    if args.command == "mal-list-reinitialize":
+        return _cmd_mal_list_reinitialize(args.project_root, args.status, args.page_size, args.reason)
     if args.command == "recommend-refresh-metadata":
         return _cmd_recommend_refresh_metadata(
             args.project_root,
@@ -3555,6 +3602,10 @@ def _dispatch(parser, args) -> int:
             args.max_pages,
             args.max_body_mb,
             args.format,
+        )
+    if args.command == "recommend-reinitialize-full-userrecs":
+        return _cmd_recommend_reinitialize_full_userrecs(
+            args.project_root, args.source_mal_anime_id, args.source_url, args.reason,
         )
     if args.command == "recommend-enrich-provider-availability":
         return _cmd_recommend_enrich_provider_availability(

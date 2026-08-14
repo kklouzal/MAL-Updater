@@ -34,6 +34,23 @@ class _FakeResponse:
 
 
 class HidiveAuthTests(unittest.TestCase):
+    def test_session_state_preserves_prior_account_and_redacts_provider_body(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            paths = resolve_hidive_state_paths(config)
+            hidive_auth._write_session_state(
+                state_paths=paths, profile="default", account_id="acct-1", account_name="user",
+                last_error=None, success=True, phase="ready",
+            )
+            hidive_auth._write_session_state(
+                state_paths=paths, profile="default", account_id=None, account_name=None,
+                last_error="HIDIVE GET /private failed: HTTP 403: secret provider body",
+                success=False, phase="auth_failed",
+            )
+            payload = json.loads(paths.session_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["last_account_id_hint"], "acct-1")
+            self.assertEqual(payload["last_error"], "HIDIVE GET /private failed: HTTP 403: <redacted>")
+
     def test_json_request_rejects_untrusted_absolute_urls_before_request(self) -> None:
         rejected_urls = [
             "https://attacker.example/api/v2/page",
@@ -196,7 +213,7 @@ class HidiveAuthTests(unittest.TestCase):
                         "last_login_success_at": None,
                         "last_account_id_hint": None,
                         "last_account_name_hint": None,
-                        "last_error": "HIDIVE POST /login failed: HTTP 401: bad credentials",
+                        "last_error": "HIDIVE POST /login failed: HTTP 401: <redacted>",
                         "hidive_phase": "auth_failed",
                     },
                     indent=2,

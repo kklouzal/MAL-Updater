@@ -122,21 +122,21 @@ critical_ratio = 0.95
 hidive = 72  # built-in default shown explicitly here; override only when this host needs a different HIDIVE budget
 
 [service.task_hourly_limits]
-mal_list_refresh = 6  # task cap and MAL provider-global cap are both enforced
+mal_list_refresh = 14  # admits the 10-attempt cold projection below the 0.8 warning gate; MAL's global 120/hour cap and learned-history gate still apply
 sync_apply = 48  # additional task-scoped cap; provider-global MAL cap is still enforced, and legacy unattributed events are conservatively included
 recommend_metadata_refresh = 12
-recommend_full_harvest = 16  # task cap and MAL provider-global cap are both enforced
+recommend_full_harvest = 40  # admits the 3-source x 10-attempt seed below the 0.8 warning gate; MAL's global 120/hour cap and learned-history gate still apply
 recommend_provider_eligibility_crunchyroll = 72  # local safety budget, not an external provider-limit claim
 recommend_provider_eligibility_hidive = 32
 
 [service.task_execute_limits]
-mal_list_refresh_pages = 3
-sync_apply = 8  # built-in default shown explicitly here; positive values bound unattended writes, while 0 disables this scheduler lane (manual CLI --limit 0 keeps its explicit full-scan meaning)
+mal_list_refresh_pages = 10  # official read-only MAL @me pagination attempt budget; partial runs preserve rows/cursors and never force pruning
+sync_apply = 0  # shipped fail-closed default: explicit positive opt-in is required for unattended writes (manual CLI --limit 0 keeps its explicit full-scan meaning)
 recommend_metadata_refresh = 3
 recommend_metadata_discovery_targets = 5
-recommend_full_harvest = 2  # positive source-title batch size; 0 disables daemon lane rather than becoming unbounded
-recommend_full_harvest_pages = 3  # advertised same-origin pages/source/run; 0 means fetch none (not unlimited); resume revalidates page 1/boundary before atomic terminal publish
-recommend_provider_eligibility_candidates = 2  # per provider per hourly lane; 0 disables the daemon lane rather than becoming unbounded
+recommend_full_harvest = 3  # positive source-title batch size; 0 disables daemon lane rather than becoming unbounded
+recommend_full_harvest_pages = 10  # network attempts/source/run, including continuation and final revalidation; resume pauses fail-closed when this is insufficient
+recommend_provider_eligibility_candidates = 5  # per provider per hourly lane; 0 disables the daemon lane rather than becoming unbounded
 recommend_provider_eligibility_search_results = 5
 recommend_provider_eligibility_queries_per_candidate = 1
 recommendation_snapshot = 100
@@ -144,10 +144,10 @@ push_recommendations_webhook = 20  # optional daemon push batch size for recomme
 
 [service.task_projected_request_counts]
 mal_refresh = 1  # built-in default shown explicitly here; fresh installs now seed unattended MAL token refresh with a small non-zero request-cost estimate, but learned history can replace the seed once real runs exist
-mal_list_refresh = 3
-sync_apply = 8  # built-in default shown explicitly here; keep this aligned with the unattended apply batch posture unless this host has strong evidence for a different per-run MAL request cost
+mal_list_refresh = 10  # conservative cold-start projection matching the 10-attempt execution budget; learned history may replace it
+sync_apply = 8  # request-cost seed used only after an explicit positive execute-limit opt-in; learned history may replace it
 recommend_metadata_refresh = 8
-recommend_full_harvest = 12
+recommend_full_harvest = 30  # conservative cold-start projection: 3 sources x the 10-attempt per-source budget; learned history may replace it
 recommend_provider_eligibility_crunchyroll = 28
 recommend_provider_eligibility_hidive = 8
 sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds

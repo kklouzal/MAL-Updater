@@ -43,6 +43,9 @@ class MigrationCatalogTests(unittest.TestCase):
                 "020_provider_eligibility_refresh_lifecycle.sql",
                 "021_public_userrecs_durable_queue_and_snapshot_guards.sql",
                 "022_mal_user_list_durable_pagination.sql",
+                "023_public_userrecs_incremental_validation.sql",
+                "024_public_userrecs_final_anchor_validation.sql",
+                "025_provider_watchlist_current_membership.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -93,6 +96,9 @@ class MigrationCatalogTests(unittest.TestCase):
                     "020_provider_eligibility_refresh_lifecycle.sql",
                     "021_public_userrecs_durable_queue_and_snapshot_guards.sql",
                     "022_mal_user_list_durable_pagination.sql",
+                    "023_public_userrecs_incremental_validation.sql",
+                    "024_public_userrecs_final_anchor_validation.sql",
+                    "025_provider_watchlist_current_membership.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -122,6 +128,9 @@ class MigrationCatalogTests(unittest.TestCase):
                     "020_provider_eligibility_refresh_lifecycle.sql",
                     "021_public_userrecs_durable_queue_and_snapshot_guards.sql",
                     "022_mal_user_list_durable_pagination.sql",
+                    "023_public_userrecs_incremental_validation.sql",
+                    "024_public_userrecs_final_anchor_validation.sql",
+                    "025_provider_watchlist_current_membership.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -147,6 +156,55 @@ class MigrationCatalogTests(unittest.TestCase):
                 root_file.read_text(encoding="utf-8"),
                 migration.read_text(encoding="utf-8"),
             )
+
+    def test_023_to_current_upgrade_applies_024_and_025_once_with_exact_constraints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "023-upgrade.sqlite3"
+            original = db.MIGRATIONS
+            first_024 = db.MIGRATION_FILENAMES.index("024_public_userrecs_final_anchor_validation.sql")
+            try:
+                db.MIGRATIONS = original[:first_024]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            bootstrap_database(db_path)
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                generation_columns = {
+                    row["name"]: row for row in conn.execute("PRAGMA table_info(mal_public_userrecs_crawl_generations)")
+                }
+                watchlist_columns = {
+                    row["name"]: row for row in conn.execute("PRAGMA table_info(provider_watchlist)")
+                }
+                generation_sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='mal_public_userrecs_crawl_generations'"
+                ).fetchone()["sql"]
+                watchlist_sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_watchlist'"
+                ).fetchone()["sql"]
+                indexes = {row["name"] for row in conn.execute("PRAGMA index_list(provider_watchlist)")}
+                markers = {
+                    row["version"]: row["n"]
+                    for row in conn.execute(
+                        "SELECT version, COUNT(*) AS n FROM schema_migrations WHERE version IN (?, ?) GROUP BY version",
+                        ("024_public_userrecs_final_anchor_validation.sql", "025_provider_watchlist_current_membership.sql"),
+                    )
+                }
+                quick_check = conn.execute("PRAGMA quick_check").fetchone()[0]
+
+        self.assertEqual(1, generation_columns["final_anchor_step"]["notnull"])
+        self.assertEqual("0", generation_columns["final_anchor_step"]["dflt_value"])
+        self.assertIn("final_anchor_step BETWEEN 0 AND 2", generation_sql)
+        self.assertEqual(1, watchlist_columns["is_active"]["notnull"])
+        self.assertEqual("1", watchlist_columns["is_active"]["dflt_value"])
+        self.assertIn("is_active IN (0, 1)", watchlist_sql)
+        self.assertTrue({"idx_provider_watchlist_active_series", "idx_provider_watchlist_account_generation"} <= indexes)
+        self.assertEqual({
+            "024_public_userrecs_final_anchor_validation.sql": 1,
+            "025_provider_watchlist_current_membership.sql": 1,
+        }, markers)
+        self.assertEqual("ok", quick_check)
 
     def test_provider_title_search_cache_uses_full_semantic_primary_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -468,6 +526,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 self.assertIn("mal_status", mal_list_row_columns)
                 watchlist_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_watchlist)")}
                 self.assertTrue({"list_id", "list_name", "list_kind", "provider_item_id", "provider_item_type", "position"} <= watchlist_columns)
+                self.assertTrue({"is_active", "membership_generation", "account_id_hint", "deactivated_at"} <= watchlist_columns)
                 self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
 
             bootstrap_database(db_path)

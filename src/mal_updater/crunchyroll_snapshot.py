@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - dependency/install health chec
     curl_requests = None
 
 from .auth import write_secret_file
+from .persistence import atomic_write_json
 from .config import AppConfig, _read_secret_file
 from .request_tracking import record_api_request_event
 from .provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
@@ -58,6 +59,9 @@ SYNC_BOUNDARY_SCHEMA_VERSION = 1
 HISTORY_BOUNDARY_MARKER_LIMIT = 200
 WATCHLIST_BOUNDARY_MARKER_LIMIT = 200
 INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
+HOT_HISTORY_CATCHUP_PAGE_LIMIT = 100
+BOOTSTRAP_RESUME_MAX_AGE_DAYS = 14
+BOOTSTRAP_DRIFT_QUARANTINE_LIMIT = 3
 CRUNCHYROLL_HISTORY_PAGE_LIMIT = 1000
 CRUNCHYROLL_WATCHLIST_PAGE_LIMIT = 1000
 
@@ -322,8 +326,7 @@ def _write_session_state(
         "last_error": last_error,
         "crunchyroll_phase": phase,
     }
-    state_paths.session_state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    state_paths.session_state_path.chmod(0o600)
+    atomic_write_json(state_paths.session_state_path, payload, indent=2)
 
 
 def _read_device_id(state_paths: CrunchyrollStatePaths) -> str:
@@ -658,6 +661,21 @@ def _dedupe_series(series_items: list[SeriesRef]) -> list[SeriesRef]:
     return list(by_id.values())
 
 
+def _dedupe_progress(progress_items: list[EpisodeProgress]) -> list[EpisodeProgress]:
+    """Choose the newest trustworthy observation for each episode."""
+    by_id: dict[str, EpisodeProgress] = {}
+    for item in progress_items:
+        previous = by_id.get(item.provider_episode_id)
+        if previous is None:
+            by_id[item.provider_episode_id] = item
+            continue
+        item_key = (item.last_watched_at or "", item.playback_position_ms or -1)
+        previous_key = (previous.last_watched_at or "", previous.playback_position_ms or -1)
+        if item_key >= previous_key:
+            by_id[item.provider_episode_id] = item
+    return list(by_id.values())
+
+
 def _history_entry_fingerprint(entry: dict[str, Any]) -> str | None:
     panel = entry.get("panel")
     if not isinstance(panel, dict):
@@ -753,10 +771,12 @@ def _write_sync_boundary(
     watchlist_entries: list[dict[str, Any]],
     history_backfill_entries: list[dict[str, Any]] | None = None,
     watchlist_backfill_entries: list[dict[str, Any]] | None = None,
+    history_markers_override: list[str] | None = None,
+    watchlist_markers_override: list[str] | None = None,
 ) -> None:
     state_paths.root.mkdir(parents=True, exist_ok=True)
-    history_markers = _unique_fingerprints(history_entries, _history_entry_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
-    watchlist_markers = _unique_fingerprints(watchlist_entries, _watchlist_entry_fingerprint, WATCHLIST_BOUNDARY_MARKER_LIMIT)
+    history_markers = list(history_markers_override or _unique_fingerprints(history_entries, _history_entry_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT))[:HISTORY_BOUNDARY_MARKER_LIMIT]
+    watchlist_markers = list(watchlist_markers_override or _unique_fingerprints(watchlist_entries, _watchlist_entry_fingerprint, WATCHLIST_BOUNDARY_MARKER_LIMIT))[:WATCHLIST_BOUNDARY_MARKER_LIMIT]
     history_backfill_markers = _unique_fingerprints(history_backfill_entries or [], _history_entry_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
     watchlist_backfill_markers = _unique_fingerprints(watchlist_backfill_entries or [], _watchlist_entry_fingerprint, WATCHLIST_BOUNDARY_MARKER_LIMIT)
     payload = {
@@ -778,8 +798,40 @@ def _write_sync_boundary(
             "backfill_retained_count": len(watchlist_backfill_markers),
         },
     }
-    state_paths.sync_boundary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    state_paths.sync_boundary_path.chmod(0o600)
+    atomic_write_json(state_paths.sync_boundary_path, payload, indent=2)
+
+
+def _bootstrap_resume_path(state_paths: CrunchyrollStatePaths) -> Path:
+    return state_paths.root / "snapshot_bootstrap_resume.json"
+
+
+def _load_bootstrap_resume(
+    state_paths: CrunchyrollStatePaths, *, account_id: str, locale: str
+) -> dict[str, Any] | None:
+    path = _bootstrap_resume_path(state_paths)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    if payload.get("account_id_hint") != account_id or payload.get("locale") != locale:
+        return None
+    try:
+        updated_at = datetime.fromisoformat(str(payload.get("updated_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if (datetime.now(timezone.utc) - updated_at).total_seconds() > BOOTSTRAP_RESUME_MAX_AGE_DAYS * 86400:
+        return None
+    return payload
+
+
+def _write_bootstrap_resume(state_paths: CrunchyrollStatePaths, payload: dict[str, Any]) -> None:
+    atomic_write_json(_bootstrap_resume_path(state_paths), payload, indent=2)
+
+
+def _page_fingerprint(entries: list[dict[str, Any]], fingerprint_func) -> str:
+    return json.dumps([fingerprint_func(item) or repr(item) for item in entries], sort_keys=True)
 
 
 def _token_from_bootstrap(result: CrunchyrollBootstrapResult) -> CrunchyrollAccessToken:
@@ -883,6 +935,42 @@ def _fetch_snapshot_once(
 
     hot_mode = requested_incremental_boundary and boundary is not None
     sync_boundary_bootstrap = requested_incremental_boundary and not hot_mode
+    automatic_bootstrap_chunk = sync_boundary_bootstrap and (
+        max_history_pages is not None or max_watchlist_pages is not None
+    ) and history_start_page == 1 and watchlist_start == 0
+    bootstrap_resume = (
+        _load_bootstrap_resume(
+            session.state_paths, account_id=account_id, locale=config.crunchyroll.locale
+        )
+        if automatic_bootstrap_chunk
+        else None
+    )
+    resume_history_markers: list[str] = []
+    resume_watchlist_markers: list[str] = []
+    staged_history_entries: list[dict[str, Any]] = []
+    staged_watchlist_entries: list[dict[str, Any]] = []
+    bootstrap_history_page1_fingerprint: str | None = None
+    bootstrap_watchlist_page1_fingerprint: str | None = None
+    bootstrap_history_total: int | None = None
+    bootstrap_watchlist_total: int | None = None
+    bootstrap_drift_count = 0
+    if bootstrap_resume is not None:
+        if bootstrap_resume.get("quarantined") is True:
+            raise CrunchyrollSnapshotError(
+                "Crunchyroll bootstrap traversal is quarantined after repeated page-1/count drift; "
+                "run an explicit full refresh or remove the non-secret bootstrap resume state after review"
+            )
+        history_start_page = max(1, int(bootstrap_resume.get("history_next_page") or 1))
+        watchlist_start = max(0, int(bootstrap_resume.get("watchlist_next_start") or 0))
+        resume_history_markers = [str(item) for item in bootstrap_resume.get("history_first_markers", []) if item]
+        resume_watchlist_markers = [str(item) for item in bootstrap_resume.get("watchlist_first_markers", []) if item]
+        staged_history_entries = [item for item in bootstrap_resume.get("history_entries", []) if isinstance(item, dict)]
+        staged_watchlist_entries = [item for item in bootstrap_resume.get("watchlist_entries", []) if isinstance(item, dict)]
+        bootstrap_history_page1_fingerprint = bootstrap_resume.get("history_page1_fingerprint")
+        bootstrap_watchlist_page1_fingerprint = bootstrap_resume.get("watchlist_page1_fingerprint")
+        bootstrap_history_total = bootstrap_resume.get("history_total") if isinstance(bootstrap_resume.get("history_total"), int) else None
+        bootstrap_watchlist_total = bootstrap_resume.get("watchlist_total") if isinstance(bootstrap_resume.get("watchlist_total"), int) else None
+        bootstrap_drift_count = max(0, int(bootstrap_resume.get("drift_count") or 0))
     sync_boundary_refresh_kind = (
         "hot"
         if hot_mode
@@ -902,6 +990,9 @@ def _fetch_snapshot_once(
     history_front_boundary_seen = not history_markers
     history_backfill_cursor_seen = not history_backfill_markers
     history_partial = False
+    history_boundary_complete = not hot_mode
+    history_guard_or_duplicate = False
+    seen_history_pages: set[str] = set()
     next_history_page: int | None = None
     page = max(1, history_start_page)
     while True:
@@ -921,10 +1012,22 @@ def _fetch_snapshot_once(
         if not isinstance(data, list):
             raise CrunchyrollSnapshotError("Crunchyroll watch-history response did not include a data list")
         batch = [item for item in data if isinstance(item, dict)]
+        batch_fingerprint = json.dumps(
+            [_history_entry_fingerprint(item) or repr(item) for item in batch],
+            sort_keys=True,
+        )
+        if hot_mode and batch and batch_fingerprint in seen_history_pages:
+            history_partial = True
+            history_stopped_early = True
+            history_guard_or_duplicate = True
+            break
+        if batch:
+            seen_history_pages.add(batch_fingerprint)
         history_entries.extend(batch)
         batch_markers = {_history_entry_fingerprint(item) for item in batch}
         if not history_front_boundary_seen and history_markers.intersection(batch_markers):
             history_front_boundary_seen = True
+            history_boundary_complete = True
         elif history_front_boundary_seen and not history_backfill_cursor_seen and history_backfill_markers.intersection(batch_markers):
             history_backfill_cursor_seen = True
         elif history_front_boundary_seen and history_backfill_cursor_seen and use_incremental_boundary and boundary:
@@ -934,6 +1037,9 @@ def _fetch_snapshot_once(
                 history_stopped_early = True
                 break
         total = history_payload.get("total")
+        if automatic_bootstrap_chunk and page == 1:
+            bootstrap_history_page1_fingerprint = batch_fingerprint
+            bootstrap_history_total = total if isinstance(total, int) else None
         if len(batch) < 100:
             if history_front_boundary_seen:
                 history_backfill_exhausted = True
@@ -942,7 +1048,12 @@ def _fetch_snapshot_once(
             if history_front_boundary_seen:
                 history_backfill_exhausted = True
             break
-        if hot_mode:
+        if hot_mode and history_front_boundary_seen:
+            break
+        if hot_mode and not history_front_boundary_seen and history_pages_fetched >= HOT_HISTORY_CATCHUP_PAGE_LIMIT:
+            history_partial = True
+            history_stopped_early = True
+            history_guard_or_duplicate = True
             break
         if max_history_pages is not None and history_pages_fetched >= max_history_pages:
             history_partial = True
@@ -996,6 +1107,9 @@ def _fetch_snapshot_once(
         total = watchlist_payload.get("total")
         if isinstance(total, int):
             watchlist_total = total
+        if automatic_bootstrap_chunk and watchlist_start == 0:
+            bootstrap_watchlist_page1_fingerprint = _page_fingerprint(batch, _watchlist_entry_fingerprint)
+            bootstrap_watchlist_total = total if isinstance(total, int) else None
         if not batch:
             if watchlist_front_boundary_seen:
                 watchlist_backfill_exhausted = True
@@ -1015,12 +1129,44 @@ def _fetch_snapshot_once(
             next_watchlist_start = watchlist_start
             break
 
-    progress = [item for item in (_progress_from_history_entry(entry) for entry in history_entries) if item is not None]
-    history_series = [item for item in (_series_from_panel(entry.get("panel")) for entry in history_entries if isinstance(entry.get("panel"), dict)) if item is not None]
+    bootstrap_generation_validated = not automatic_bootstrap_chunk
+    bootstrap_drift_detected = False
+    if automatic_bootstrap_chunk and not (history_partial or watchlist_partial):
+        history_url = f"https://www.crunchyroll.com/content/v2/{account_id}/watch-history"
+        history_recheck = session.authorized_json_get(
+            history_url, params={"page": 1, "page_size": 100, "locale": config.crunchyroll.locale},
+            phase="watch-history bootstrap page-1 revalidation",
+        )
+        watchlist_url = f"https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist"
+        watchlist_recheck = session.authorized_json_get(
+            watchlist_url, params={"locale": config.crunchyroll.locale, "n": 100, "start": 0},
+            phase="watchlist bootstrap page-1 revalidation",
+        )
+        history_recheck_data = history_recheck.get("data") if isinstance(history_recheck, dict) else None
+        watchlist_recheck_data = watchlist_recheck.get("data") if isinstance(watchlist_recheck, dict) else None
+        history_recheck_batch = [item for item in history_recheck_data if isinstance(item, dict)] if isinstance(history_recheck_data, list) else []
+        watchlist_recheck_batch = [item for item in watchlist_recheck_data if isinstance(item, dict)] if isinstance(watchlist_recheck_data, list) else []
+        bootstrap_generation_validated = bool(
+            isinstance(history_recheck_data, list)
+            and isinstance(watchlist_recheck_data, list)
+            and _page_fingerprint(history_recheck_batch, _history_entry_fingerprint) == bootstrap_history_page1_fingerprint
+            and _page_fingerprint(watchlist_recheck_batch, _watchlist_entry_fingerprint) == bootstrap_watchlist_page1_fingerprint
+            and (bootstrap_history_total is None or history_recheck.get("total") == bootstrap_history_total)
+            and (bootstrap_watchlist_total is None or watchlist_recheck.get("total") == bootstrap_watchlist_total)
+        )
+        bootstrap_drift_detected = not bootstrap_generation_validated
+        if bootstrap_drift_detected:
+            history_partial = True
+            watchlist_partial = True
+
+    all_history_entries = staged_history_entries + history_entries
+    all_watchlist_data = staged_watchlist_entries + watchlist_data
+    progress = _dedupe_progress([item for item in (_progress_from_history_entry(entry) for entry in all_history_entries) if item is not None])
+    history_series = [item for item in (_series_from_panel(entry.get("panel")) for entry in all_history_entries if isinstance(entry.get("panel"), dict)) if item is not None]
 
     watchlist_series: list[SeriesRef] = []
     watchlist_entries: list[WatchlistEntry] = []
-    for entry in watchlist_data:
+    for entry in all_watchlist_data:
         if not isinstance(entry, dict):
             continue
         series_ref, watchlist_entry = _watchlist_from_entry(entry)
@@ -1058,6 +1204,11 @@ def _fetch_snapshot_once(
             "bootstrap_full_refresh": sync_boundary_bootstrap,
             "sync_boundary_bootstrap_complete": sync_boundary_bootstrap and not (history_partial or watchlist_partial),
             "bootstrap_full_refresh_complete": sync_boundary_bootstrap and not (history_partial or watchlist_partial),
+            "bootstrap_generation_validated": bootstrap_generation_validated,
+            "bootstrap_drift_detected": bootstrap_drift_detected,
+            "bootstrap_drift_count": bootstrap_drift_count + (1 if bootstrap_drift_detected else 0),
+            "bootstrap_staged_history_count": len(all_history_entries),
+            "bootstrap_staged_watchlist_count": len(all_watchlist_data),
             "sync_boundary_usable": boundary is not None,
             "sync_boundary_load_status": sync_boundary_load_status,
             "sync_boundary_loaded_account_id_hint": loaded_boundary.account_id_hint if loaded_boundary is not None else None,
@@ -1075,6 +1226,8 @@ def _fetch_snapshot_once(
             "history_partial": history_partial,
             "history_next_page": next_history_page,
             "history_stopped_early": history_stopped_early,
+            "history_boundary_complete": history_boundary_complete,
+            "history_guard_or_duplicate": history_guard_or_duplicate,
             "history_backfill_pages_fetched": history_backfill_pages_fetched,
             "history_backfill_exhausted": history_backfill_exhausted,
             "history_boundary_marker_count": len(history_markers),
@@ -1097,17 +1250,48 @@ def _fetch_snapshot_once(
             "auth_source": session.auth_source,
         },
     )
-    is_partial = history_partial or watchlist_partial
+    is_partial = history_partial or watchlist_partial or (hot_mode and not history_boundary_complete)
+    if automatic_bootstrap_chunk:
+        if not resume_history_markers:
+            resume_history_markers = _unique_fingerprints(history_entries, _history_entry_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
+        if not resume_watchlist_markers:
+            resume_watchlist_markers = _unique_fingerprints(watchlist_data, _watchlist_entry_fingerprint, WATCHLIST_BOUNDARY_MARKER_LIMIT)
+        if is_partial:
+            next_drift_count = bootstrap_drift_count + (1 if bootstrap_drift_detected else 0)
+            reset_for_drift = bootstrap_drift_detected
+            _write_bootstrap_resume(session.state_paths, {
+                "schema_version": 1,
+                "account_id_hint": account_id,
+                "locale": config.crunchyroll.locale,
+                "history_next_page": 1 if reset_for_drift else (next_history_page or history_start_page),
+                "watchlist_next_start": 0 if reset_for_drift else (next_watchlist_start if next_watchlist_start is not None else watchlist_start),
+                "history_first_markers": [] if reset_for_drift else resume_history_markers,
+                "watchlist_first_markers": [] if reset_for_drift else resume_watchlist_markers,
+                "history_page1_fingerprint": None if reset_for_drift else bootstrap_history_page1_fingerprint,
+                "watchlist_page1_fingerprint": None if reset_for_drift else bootstrap_watchlist_page1_fingerprint,
+                "history_total": None if reset_for_drift else bootstrap_history_total,
+                "watchlist_total": None if reset_for_drift else bootstrap_watchlist_total,
+                "history_entries": [] if reset_for_drift else all_history_entries,
+                "watchlist_entries": [] if reset_for_drift else all_watchlist_data,
+                "drift_count": next_drift_count,
+                "quarantined": next_drift_count >= BOOTSTRAP_DRIFT_QUARANTINE_LIMIT,
+                "last_diagnostic": "page-1-or-total-drift" if reset_for_drift else "chunk-incomplete",
+                "updated_at": generated_at,
+            })
     if not is_partial:
         _write_sync_boundary(
             state_paths=session.state_paths,
             generated_at=generated_at,
             account_id_hint=account_id,
-            history_entries=history_entries,
-            watchlist_entries=watchlist_data,
+            history_entries=all_history_entries,
+            watchlist_entries=all_watchlist_data,
             history_backfill_entries=[] if history_backfill_exhausted else history_backfill_entries,
             watchlist_backfill_entries=[] if watchlist_backfill_exhausted else watchlist_backfill_entries,
+            history_markers_override=resume_history_markers or None,
+            watchlist_markers_override=resume_watchlist_markers or None,
         )
+        if automatic_bootstrap_chunk:
+            _bootstrap_resume_path(session.state_paths).unlink(missing_ok=True)
     _write_session_state(
         state_paths=session.state_paths,
         profile=session.profile,

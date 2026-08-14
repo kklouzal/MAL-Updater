@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mal_updater.config import AppConfig, ensure_directories
+from mal_updater.cli import build_parser
 from mal_updater.service_runtime import _provider_fetch_command, _task_specs, maintenance_cycle_plan, run_maintenance_cycle
 
 
@@ -59,13 +60,17 @@ class RecommendMaintainTests(unittest.TestCase):
         self.assertEqual(provider_args[provider_args.index("--max-history-pages") + 1], "2")
         self.assertEqual(provider_args[provider_args.index("--max-watchlist-pages") + 1], "3")
         self.assertEqual(plan[1]["args"][-3:], ["--limit", "10", "--exact-approved-only"])
-        self.assertEqual(plan[2]["args"][-2:], ["--max-pages", "3"])
+        self.assertEqual(plan[2]["args"][-2:], ["--max-pages", "10"])
         self.assertEqual(
             plan[3]["args"][-6:],
-            ["--limit", "2", "--search-limit", "5", "--queries-per-candidate", "1"],
+            ["--limit", "5", "--search-limit", "5", "--queries-per-candidate", "1"],
         )
         self.assertIn("--persist-snapshot", plan[4]["args"])
         self.assertNotIn("recommend-refresh-metadata", [arg for step in plan for arg in step["args"]])
+
+    def test_cli_default_matches_effective_ten_page_mal_list_budget(self) -> None:
+        args = build_parser().parse_args(["recommend-maintain"])
+        self.assertEqual(10, args.mal_list_max_pages)
 
     def test_provider_fetch_command_caps_crunchyroll_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

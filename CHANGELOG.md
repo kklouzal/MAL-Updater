@@ -2,6 +2,25 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [Unreleased]
+
+### Added
+
+- Added durable final-anchor validation for resumable public MAL user-recommendation crawls (migration 024), including bounded progress when only one page may be fetched per invocation.
+- Added current-membership generations and account provenance for provider watchlists (migration 025), enabling conservative deactivation only after complete, account-proven full snapshots.
+- Added staged Crunchyroll cold-bootstrap recovery and quarantine/reset controls that preserve the last-known-good boundary.
+
+### Changed
+
+- Hardened provider session, boundary, and snapshot JSON writes through the shared restrictive atomic persistence implementation.
+- Aligned the secondary `recommend-maintain --mal-list-max-pages` default with the effective 10-page service budget.
+- Tightened stale-running diagnostics so only an explicit released lease or elapsed timeout is terminal evidence.
+- Expanded MAL/provider pacing, cache, ingestion, planner, migration, and validation coverage; nullable optional MAL detail containers remain accepted while missing/malformed requested fields fail closed.
+
+### Release status
+
+- These changes are unreleased and intentionally remain versioned as 0.2.9 in the dirty source tree. Existing 0.2.9 wheels, source archives, release bundles, and container images do **not** contain them; no publication or container-pin change is implied.
+
 ## [0.2.9] - 2026-08-12
 
 ### Changed

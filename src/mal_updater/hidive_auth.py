@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from .auth import write_secret_file
+from .persistence import atomic_write_json
 from .auth_utils import (
     current_utc_timestamp_z,
     login_session_timestamps,
@@ -31,6 +32,7 @@ DEFAULT_HIDIVE_PASSWORD_FILE = "hidive_password.txt"
 HIDIVE_REFRESH_WINDOW_SECONDS = 90
 _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 _ALLOWED_ABSOLUTE_HIDIVE_HOST = "dce-frontoffice.imggaming.com"
+HIDIVE_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class HidiveAuthError(RuntimeError):
@@ -265,18 +267,40 @@ def _write_session_state(
     phase: str,
 ) -> None:
     state_paths.root.mkdir(parents=True, exist_ok=True)
+    prior: dict[str, Any] = {}
+    try:
+        loaded = json.loads(state_paths.session_state_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            prior = loaded
+    except (OSError, ValueError, TypeError):
+        pass
+    # A failed refresh or cached-token startup must not destroy the last proven
+    # account provenance.  It remains only a hint until /user/profile proves it.
+    preserved_account_id = account_id or prior.get("last_account_id_hint")
+    preserved_account_name = account_name or prior.get("last_account_name_hint")
     payload = {
         "profile": profile,
         "authorisation_token_present": state_paths.access_token_path.exists(),
         "refresh_token_present": state_paths.refresh_token_path.exists(),
         **login_session_timestamps(success, now_string=_now_string),
-        "last_account_id_hint": account_id,
-        "last_account_name_hint": account_name,
-        "last_error": last_error,
+        "last_account_id_hint": preserved_account_id,
+        "last_account_name_hint": preserved_account_name,
+        "last_error": _redact_hidive_error(last_error),
         "hidive_phase": phase,
     }
-    state_paths.session_state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.chmod(state_paths.session_state_path, 0o600)
+    atomic_write_json(state_paths.session_state_path, payload, indent=2)
+
+
+def _redact_hidive_error(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # Persist status/path diagnostics, never arbitrary provider response bodies.
+    marker = value.find(": HTTP ")
+    if marker >= 0:
+        status_end = value.find(":", marker + 2)
+        if status_end >= 0:
+            return value[:status_end] + ": <redacted>"
+    return value[:800]
 
 
 def _hidive_json_request(
@@ -346,9 +370,17 @@ def _hidive_json_request(
         break
 
     assert response is not None
+    content = getattr(response, "content", None)
+    if content is None:
+        content = str(getattr(response, "text", "")).encode("utf-8")
+    if len(content) > HIDIVE_MAX_RESPONSE_BYTES:
+        raise HidiveAuthError(
+            f"HIDIVE {method} {path} response exceeded decoded-body guard ({HIDIVE_MAX_RESPONSE_BYTES} bytes)"
+        )
     if response.status_code >= 400:
-        detail = response.text.strip()[:800]
-        raise HidiveAuthError(f"HIDIVE {method} {path} failed: HTTP {response.status_code}: {detail}")
+        # Bodies can echo identifiers or tokens; keep them out of errors/state.
+        auth_kind = " (authentication/authorization rejected)" if response.status_code in {401, 403} else ""
+        raise HidiveAuthError(f"HIDIVE {method} {path} failed: HTTP {response.status_code}{auth_kind}")
     try:
         return response.json()
     except ValueError as exc:
@@ -504,8 +536,22 @@ def start_hidive_session(
         account_id = bootstrap.account_id
         account_name = bootstrap.account_name
     else:
-        account_id = None
-        account_name = None
+        # Always prove the cached token's account before account-scoped boundary
+        # use.  A stale session hint is diagnostic only, never authority.
+        account_id, account_name = _load_profile(
+            config,
+            authorisation_token,
+            timeout_seconds=timeout_seconds or config.request_timeout_seconds,
+        )
+        _write_session_state(
+            state_paths=state_paths,
+            profile=profile,
+            account_id=account_id,
+            account_name=account_name,
+            last_error=None,
+            success=True,
+            phase="ready",
+        )
     return HidiveSession(
         config=config,
         profile=profile,

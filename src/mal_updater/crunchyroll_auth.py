@@ -14,6 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - dependency/install health chec
     curl_requests = None
 
 from .auth import write_secret_file
+from .persistence import atomic_write_json
 from .auth_utils import current_utc_timestamp_z, login_session_timestamps
 from .config import AppConfig, _read_secret_file, _resolve_secret_path
 from .request_tracking import record_api_request_event
@@ -134,8 +135,7 @@ def _write_session_state(
         "last_error": last_error,
         "crunchyroll_phase": "ready" if success else "auth_failed",
     }
-    state_paths.session_state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.chmod(state_paths.session_state_path, 0o600)
+    atomic_write_json(state_paths.session_state_path, payload, indent=2)
 
 
 def _request_pacer(config: AppConfig | None, pacer: Any | None) -> Any | None:

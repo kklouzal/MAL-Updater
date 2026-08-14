@@ -120,30 +120,33 @@ DEFAULT_SERVICE_PROVIDER_HOURLY_LIMITS = {
     "hidive": 72,
 }
 DEFAULT_SERVICE_TASK_HOURLY_LIMITS = {
-    "mal_list_refresh": 6,
+    # Ten projected attempts stay below the 0.8 warning gate with headroom.
+    "mal_list_refresh": 14,
     "sync_apply": 48,
     "recommend_metadata_refresh": 12,
-    "recommend_full_harvest": 16,
+    # Three sources can each consume the full 10-attempt userrecs budget.
+    # Forty preserves headroom below the 0.8 warning gate on a cold start.
+    "recommend_full_harvest": 40,
     "recommend_provider_eligibility_crunchyroll": 72,
     "recommend_provider_eligibility_hidive": 32,
 }
 DEFAULT_SERVICE_TASK_PROJECTED_REQUEST_COUNTS = {
     "mal_refresh": 1,
-    "mal_list_refresh": 3,
+    "mal_list_refresh": 10,
     "sync_apply": 8,
     "recommend_metadata_refresh": 8,
-    "recommend_full_harvest": 12,
+    "recommend_full_harvest": 30,
     "recommend_provider_eligibility_crunchyroll": 28,
     "recommend_provider_eligibility_hidive": 8,
 }
 DEFAULT_SERVICE_TASK_EXECUTE_LIMITS = {
-    "mal_list_refresh_pages": 3,
-    "sync_apply": 8,
+    "mal_list_refresh_pages": 10,
+    "sync_apply": 0,
     "recommend_metadata_refresh": 3,
     "recommend_metadata_discovery_targets": 5,
-    "recommend_full_harvest": 2,
-    "recommend_full_harvest_pages": 3,
-    "recommend_provider_eligibility_candidates": 2,
+    "recommend_full_harvest": 3,
+    "recommend_full_harvest_pages": 10,
+    "recommend_provider_eligibility_candidates": 5,
     "recommend_provider_eligibility_search_results": 5,
     "recommend_provider_eligibility_queries_per_candidate": 1,
     "recommendation_snapshot": 100,

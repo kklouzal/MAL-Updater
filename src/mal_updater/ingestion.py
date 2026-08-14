@@ -47,8 +47,17 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ing
         try:
             _upsert_series(conn, provider, snapshot.series)
             _upsert_progress(conn, provider, snapshot.progress)
-            _upsert_watchlist(conn, provider, snapshot.watchlist)
+            account_id_hint = snapshot.account_id_hint.strip() if snapshot.account_id_hint else None
+            _upsert_watchlist(
+                conn, provider, snapshot.watchlist,
+                generation=sync_run_id, account_id_hint=account_id_hint,
+            )
+            membership_deactivation = _deactivate_absent_watchlist_memberships(
+                conn, provider=provider, generation=sync_run_id,
+                account_id_hint=account_id_hint, mode=mode, raw=snapshot.raw,
+            )
             diagnostics = _snapshot_diagnostics_from_raw(snapshot.raw)
+            diagnostics.append(membership_deactivation)
             summary = IngestionSummary(
                 provider=provider,
                 contract_version=contract_version,
@@ -223,7 +232,10 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
         )
 
 
-def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None:
+def _upsert_watchlist(
+    conn, provider: str, watchlist_entries: list[Any], *,
+    generation: int, account_id_hint: str | None,
+) -> None:
     for entry in watchlist_entries:
         list_id = entry.list_id or "default"
         provider_item_type = entry.provider_item_type or "series"
@@ -243,8 +255,12 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None
                 position,
                 raw_json,
                 first_seen_at,
-                last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                last_seen_at,
+                is_active,
+                membership_generation,
+                account_id_hint,
+                deactivated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, ?, ?, NULL)
             ON CONFLICT(provider, list_id, provider_series_id, provider_item_type, provider_item_id) DO UPDATE SET
                 added_at = excluded.added_at,
                 status = excluded.status,
@@ -252,7 +268,16 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None
                 list_kind = excluded.list_kind,
                 position = excluded.position,
                 raw_json = excluded.raw_json,
-                last_seen_at = CURRENT_TIMESTAMP
+                last_seen_at = CURRENT_TIMESTAMP,
+                is_active = 1,
+                membership_generation = excluded.membership_generation,
+                account_id_hint = CASE
+                    WHEN provider_watchlist.account_id_hint IS NULL
+                         OR provider_watchlist.account_id_hint = excluded.account_id_hint
+                    THEN excluded.account_id_hint
+                    ELSE provider_watchlist.account_id_hint
+                END,
+                deactivated_at = NULL
             """,
             (
                 provider,
@@ -266,5 +291,68 @@ def _upsert_watchlist(conn, provider: str, watchlist_entries: list[Any]) -> None
                 provider_item_type,
                 entry.position,
                 _entry_json(entry),
+                generation,
+                account_id_hint,
             ),
         )
+
+
+def _watchlist_snapshot_is_complete(
+    *, provider: str, mode: str, raw: dict[str, Any]
+) -> tuple[bool, str]:
+    if mode != "full_refresh":
+        return False, "not_full_refresh_mode"
+    if raw.get("partial") is not False:
+        return False, "snapshot_not_explicitly_complete"
+    if provider == "crunchyroll":
+        if raw.get("sync_boundary_refresh_kind") not in {"explicit_full_refresh", "bootstrap_full_refresh"}:
+            return False, "not_full_watchlist_traversal"
+        if int(raw.get("watchlist_start") or 0) != 0 or raw.get("watchlist_partial") is not False:
+            return False, "watchlist_traversal_incomplete"
+        if raw.get("sync_boundary_refresh_kind") == "bootstrap_full_refresh" and raw.get("sync_boundary_bootstrap_complete") is not True:
+            return False, "bootstrap_unvalidated"
+        if raw.get("bootstrap_generation_validated") is False:
+            return False, "bootstrap_generation_unvalidated"
+        return True, "complete_crunchyroll_watchlist"
+    if provider == "hidive":
+        supports = raw.get("supports") if isinstance(raw.get("supports"), dict) else {}
+        if raw.get("sync_boundary_mode") != "full_refresh" or supports.get("watchlists") is not True:
+            return False, "watchlist_surfaces_not_full"
+        if raw.get("custom_watchlist_partial") is not False or raw.get("favourite_stopped_early") is not False:
+            return False, "required_watchlist_surface_incomplete"
+        return True, "complete_hidive_watchlists"
+    return False, "provider_has_no_complete_watchlist_contract"
+
+
+def _deactivate_absent_watchlist_memberships(
+    conn, *, provider: str, generation: int, account_id_hint: str | None,
+    mode: str, raw: dict[str, Any],
+) -> dict[str, Any]:
+    complete, reason = _watchlist_snapshot_is_complete(provider=provider, mode=mode, raw=raw)
+    diagnostic: dict[str, Any] = {
+        "code": "watchlist_membership_generation", "surface": "watchlist",
+        "severity": "info", "generation": generation, "complete": complete,
+        "deactivated": 0, "reason": reason,
+    }
+    if not complete or not account_id_hint:
+        if complete and not account_id_hint:
+            diagnostic.update(complete=False, reason="account_identity_unproven", severity="warning")
+        return diagnostic
+    conflicting = conn.execute(
+        "SELECT 1 FROM provider_watchlist WHERE provider = ? AND account_id_hint IS NOT NULL AND account_id_hint <> ? LIMIT 1",
+        (provider, account_id_hint),
+    ).fetchone()
+    if conflicting is not None:
+        diagnostic.update(complete=False, reason="account_mismatch", severity="warning")
+        return diagnostic
+    cursor = conn.execute(
+        """
+        UPDATE provider_watchlist
+        SET is_active = 0, deactivated_at = CURRENT_TIMESTAMP
+        WHERE provider = ? AND account_id_hint = ? AND is_active = 1
+          AND (membership_generation IS NULL OR membership_generation <> ?)
+        """,
+        (provider, account_id_hint, generation),
+    )
+    diagnostic["deactivated"] = max(0, int(cursor.rowcount))
+    return diagnostic
