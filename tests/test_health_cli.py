@@ -94,6 +94,138 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("unhealthy", warning["health_posture"])
         self.assertEqual("history_pagination_non_advancing", warning["diagnostics"][0]["code"])
 
+    def test_hidive_documented_hot_surface_limits_are_operator_visible_and_automation_safe(self) -> None:
+        diagnostics = [
+            {
+                "code": "history_partial_unpageable",
+                "surface": "history",
+                "severity": "info",
+            },
+            {
+                "code": "continue_watching_partial_unpageable",
+                "surface": "continue_watching",
+                "severity": "info",
+            },
+            {
+                "code": "hidive_surface_authority",
+                "surface": "provider_snapshot",
+                "severity": "info",
+                "sync_boundary_mode": "hot",
+                "sync_boundary_account_status": "account_match",
+                "producer_authenticated": True,
+                "account_identity_proven": True,
+                "history_front_boundary_complete": True,
+                "history_full_complete": False,
+                "continue_complete": False,
+                "watchlist_complete": False,
+                "watchlist_authority_safe": True,
+            },
+        ]
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                ("hidive", "1.0", "hot", "completed", json.dumps({"diagnostics": diagnostics})),
+            )
+            conn.commit()
+
+        payload = build_health_report(
+            self.config, stale_hours=72, review_issue_type=None, review_worklist_limit=3,
+            mapping_coverage_threshold=0.8, maintenance_review_limit=25,
+        )
+
+        surface = payload["provider_surface_diagnostics"]
+        self.assertEqual("operator_visible", surface["health_posture"])
+        self.assertTrue(surface["automation_safe"])
+        warning = next(item for item in payload["warnings"] if item["code"] == "hidive_surface_diagnostics")
+        self.assertEqual("info", warning["severity"])
+        self.assertTrue(warning["automation_safe"])
+        self.assertNotIn("snapshot_partial", surface["codes"])
+
+    def test_hidive_surface_authority_matrix_fails_closed(self) -> None:
+        base = {
+            "code": "hidive_surface_authority",
+            "surface": "provider_snapshot",
+            "severity": "info",
+            "sync_boundary_mode": "hot",
+            "sync_boundary_account_status": "account_match",
+            "producer_authenticated": True,
+            "account_identity_proven": True,
+            "history_front_boundary_complete": True,
+            "history_full_complete": False,
+            "continue_complete": False,
+            "watchlist_authority_safe": True,
+        }
+        cases = {
+            "bootstrap": {"sync_boundary_mode": "full_refresh"},
+            "account_mismatch": {"sync_boundary_account_status": "account_mismatch"},
+            "missing_boundary_intersection": {"history_front_boundary_complete": False},
+            "incomplete_watchlist": {"watchlist_authority_safe": False},
+            "unexpected_pagination_regression": {},
+        }
+        for label, changes in cases.items():
+            with self.subTest(label=label):
+                authority = {**base, **changes}
+                diagnostics = [authority]
+                if label == "unexpected_pagination_regression":
+                    diagnostics.append({"code": "history_pagination_non_advancing", "surface": "history"})
+                summary = {"provider": "hidive", "diagnostics": diagnostics}
+                from mal_updater.health_report import _provider_surface_diagnostics_from_sync_run
+                posture = _provider_surface_diagnostics_from_sync_run(
+                    {"id": 1, "provider": "hidive", "mode": "hot", "summary": summary}
+                )
+                self.assertIsNotNone(posture)
+                self.assertEqual("unhealthy", posture["health_posture"])
+                self.assertFalse(posture["automation_safe"])
+
+        from mal_updater.health_report import _provider_surface_diagnostics_from_sync_run
+        legacy = _provider_surface_diagnostics_from_sync_run(
+            {
+                "id": 1,
+                "provider": "hidive",
+                "mode": "hot",
+                "summary": {"diagnostics": [{"code": "history_partial_unpageable", "surface": "history"}]},
+            }
+        )
+        self.assertEqual("unhealthy", legacy["health_posture"])
+        self.assertFalse(legacy["automation_safe"])
+
+    def test_non_hidive_diagnostics_do_not_enter_hidive_authority_matrix(self) -> None:
+        from mal_updater.health_report import _provider_surface_diagnostics_from_sync_run
+
+        crunchyroll = _provider_surface_diagnostics_from_sync_run(
+            {
+                "id": 1,
+                "provider": "crunchyroll",
+                "mode": "hot",
+                "summary": {"diagnostics": [{"code": "watchlist_membership_generation", "surface": "watchlist"}]},
+            }
+        )
+        self.assertIsNone(crunchyroll)
+
+    def test_health_uses_latest_hidive_diagnostics_when_newer_crunchyroll_run_succeeds(self) -> None:
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json) VALUES (?, ?, ?, ?, datetime('now', '-1 minute'), ?)",
+                ("hidive", "1.0", "full_refresh", "completed", json.dumps({"diagnostics": [{"code": "history_pagination_non_advancing", "surface": "history"}]})),
+            )
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, completed_at, summary_json) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+                ("crunchyroll", "1.0", "full_refresh", "completed", json.dumps({"diagnostics": [{"code": "watchlist_membership_generation", "surface": "watchlist"}]})),
+            )
+            conn.commit()
+
+        payload = build_health_report(
+            self.config, stale_hours=72, review_issue_type=None, review_worklist_limit=3,
+            mapping_coverage_threshold=0.8, maintenance_review_limit=25,
+        )
+        self.assertEqual("hidive", payload["provider_surface_diagnostics"]["provider"])
+        self.assertEqual(["history_pagination_non_advancing"], payload["provider_surface_diagnostics"]["codes"])
+        warning = next(item for item in payload["warnings"] if item["code"] == "hidive_surface_diagnostics")
+        self.assertEqual("unhealthy", warning["health_posture"])
+
     def _run_provider_stale_rows_raw(self, *args: str) -> tuple[int, str]:
         argv = [
             "mal-updater",
@@ -215,6 +347,13 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual({}, payload["mappings"]["by_source"])
         self.assertEqual(
             {
+                "persisted_provider_series_count": 0,
+                "catalog_only_series_count": 0,
+                "mapping_eligible_series_count": 0,
+                "eligible_approved_mapping_count": 0,
+                "eligible_unmapped_series_count": 0,
+                "eligible_approved_coverage_ratio": None,
+                "persisted_approved_mapping_count": 0,
                 "provider_series_count": 0,
                 "approved_mapping_count": 0,
                 "unmapped_series_count": 0,
@@ -1161,6 +1300,43 @@ class HealthCheckCliTests(unittest.TestCase):
         warning_codes = {warning["code"] for warning in payload["warnings"]}
         self.assertIn("approved_mapping_coverage_below_threshold", warning_codes)
         self.assertNotIn("latest_sync_run_partial_coverage", warning_codes)
+
+    def test_health_check_mapping_coverage_excludes_catalog_only_inventory(self) -> None:
+        with connect(self.config.db_path) as conn:
+            for provider, series_id, account_observed_at in (
+                ("crunchyroll", "account-approved", "CURRENT_TIMESTAMP"),
+                ("crunchyroll", "account-unmapped", "CURRENT_TIMESTAMP"),
+                ("crunchyroll", "catalog-only", "NULL"),
+                ("hidive", "account-approved", "CURRENT_TIMESTAMP"),
+                ("hidive", "catalog-only", "NULL"),
+            ):
+                conn.execute(
+                    f"INSERT INTO provider_series(provider, provider_series_id, title, raw_json, account_observed_at, catalog_observed_at) VALUES (?, ?, ?, '{{}}', {account_observed_at}, CURRENT_TIMESTAMP)",
+                    (provider, series_id, series_id),
+                )
+            for provider, series_id, mal_id in (
+                ("crunchyroll", "account-approved", 1001),
+                ("crunchyroll", "catalog-only", 1002),
+                ("hidive", "account-approved", 1003),
+            ):
+                conn.execute(
+                    "INSERT INTO mal_series_mapping(provider, provider_series_id, mal_anime_id, confidence, mapping_source, approved_by_user) VALUES (?, ?, ?, 1.0, 'user_exact', 1)",
+                    (provider, series_id, mal_id),
+                )
+            conn.commit()
+
+        _, payload = self._run_health_check("--mapping-coverage-threshold", "0.6")
+        coverage = payload["mappings"]["coverage"]
+
+        self.assertEqual(5, coverage["persisted_provider_series_count"])
+        self.assertEqual(2, coverage["catalog_only_series_count"])
+        self.assertEqual(3, coverage["mapping_eligible_series_count"])
+        self.assertEqual(2, coverage["eligible_approved_mapping_count"])
+        self.assertEqual(1, coverage["eligible_unmapped_series_count"])
+        self.assertEqual(0.6667, coverage["eligible_approved_coverage_ratio"])
+        self.assertEqual(3, coverage["persisted_approved_mapping_count"])
+        self.assertNotIn("approved_mapping_coverage_below_threshold", {item["code"] for item in payload["warnings"]})
+        self.assertNotIn("refresh_mapping_review_backlog", {item["reason_code"] for item in payload["maintenance"]["recommended_commands"]})
 
     def test_health_check_prefers_targeted_mapping_queue_refresh_before_full_backlog_rebuild(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")

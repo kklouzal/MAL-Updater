@@ -415,6 +415,23 @@ In other words, the remaining gap is now mostly **frontend route archaeology**, 
 4. **Pagination / volume**
    - measure history pagination depth and whether older watch events remain available for meaningful backfill
 
+## Health classification boundary
+
+Health reporting treats HIDIVE surface completeness independently rather than
+turning every known endpoint limitation into an automation failure.  A hot
+snapshot is operator-visible/info and automation-safe only when its persisted
+diagnostics prove all of the following: the boundary belongs to the current
+account, page 1 intersects the expected history marker, and the retained
+watchlist generation is authoritative.  In that state, the documented
+unpageable history and Continue Watching limitations remain visible, while a
+redundant generic `snapshot_partial` diagnostic is suppressed.
+
+Bootstrap/manual full-history inability to establish that boundary, an account
+mismatch, a missing expected boundary intersection, incomplete watchlist
+traversal, or any unexpected pagination/cursor regression remains
+warning/unhealthy and fail-closed.  Older ingested snapshots without explicit
+per-surface authority diagnostics are classified conservatively.
+
 ## Suggested provider architecture impact
 
 This reconnaissance supports the plan to refactor MAL-Updater into:

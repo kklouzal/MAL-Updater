@@ -51,6 +51,6 @@
 - recommendations / alerts
 - periodic health checks
 
-## Detached remediation-chain status
+## Release preparation status
 
-The original phase outline is historical. Current source work through the remediated chain is still review/landing/release pending; do not treat this detached source state as a pushed release or live deployment until the maintainer explicitly lands it.
+The original phase outline is historical. The current HIDIVE provenance, health, ingestion, mapping, and documentation changes are prepared for an authorized landing, but this working tree does not yet represent a committed, pushed, rebuilt, or deployed release.

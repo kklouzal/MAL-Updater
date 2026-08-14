@@ -77,7 +77,9 @@ Use this surface when the user wants:
 - mapping backlog state
 - next recommended mapping-review slice
 - grouped review worklists
-- mapping inventory / approved coverage context across all currently supported providers, with optional per-provider filtering via `--provider`
+- mapping inventory / approved coverage context across all currently supported providers, with optional per-provider filtering via `--provider`; health coverage splits persisted inventory from catalog-only discovery rows and uses only account-observed (`account_observed_at IS NOT NULL`) series as the mapping-eligible denominator
+- `health-check` mapping coverage exposes `persisted_provider_series_count`, `catalog_only_series_count`, `mapping_eligible_series_count`, eligible approved/unmapped counts, and `eligible_approved_coverage_ratio`; compatibility aliases remain in JSON, but `approved_mapping_count`, `unmapped_series_count`, and `approved_coverage_ratio` now follow the eligible population while `provider_series_count` remains total persisted inventory
+- strong/exact `ready_for_approval` candidates remain open `mapping_review` rows for a human decision; only the established deterministic aggregate/container classifications are omitted from the queue, and review construction never treats readiness as approval
 
 ## Guarded sync state / execution
 

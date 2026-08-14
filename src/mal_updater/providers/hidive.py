@@ -86,6 +86,7 @@ class HidiveProvider:
         )
         return ProviderFetchResult(
             snapshot=result.snapshot,
+            _ingestion_authority=getattr(result, "_ingestion_authority", None),
             metadata={
                 "provider": self.slug,
                 "history_count": result.history_count,

@@ -32,7 +32,6 @@ MAPPING_REVIEW_NO_QUEUE_DECISIONS = frozenset(
     {
         "preserved",
         "auto_approved",
-        "ready_for_approval",
         "auto_classified_bundle",
         AUTO_CLASSIFIED_PROVIDER_SHELL_DECISION,
         AUTO_CLASSIFIED_AGGREGATE_PROGRESS_DECISION,

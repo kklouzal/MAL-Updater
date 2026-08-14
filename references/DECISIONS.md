@@ -232,6 +232,10 @@ Keep `health-check` coverage/reporting aligned with the repo's multi-provider ru
 
 Aggregate provider counts and approved mapping coverage should span **all persisted source providers**, while latest-run partial-coverage warnings should still compare the latest ingest summary against that specific provider's cached totals.
 
+Coverage within that multi-provider inventory is provenance-aware: persisted catalog-only discovery rows are reported separately and are intentionally non-reviewable. The operational/planner denominator is the account-observed population (`provider_series.account_observed_at IS NOT NULL`), matching `load_provider_series_states`; threshold warnings and backlog rebuild recommendations use that eligible denominator rather than all persisted catalog inventory.
+
+Strong/exact candidates labeled `ready_for_approval` remain human-gated open `mapping_review` rows and are never approval-equivalent. Deterministically recognized aggregate/container shells retain their existing non-queue classification so operators are not asked to approve a child mapping onto a provider container.
+
 ### Why
 - Crunchyroll-only accounting can falsely read a mixed Crunchyroll + HIDIVE install as healthy when HIDIVE-side mapping residue is the real gap
 - coverage and backlog guidance should reflect the whole configured system, not whichever provider happened to be hard-coded earliest

@@ -32,6 +32,7 @@ from mal_updater.mapping import (
 )
 from mal_updater.sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
+    MappingReviewItem,
     SyncProposal,
     build_dry_run_sync_plan,
     build_mapping_review,
@@ -8201,6 +8202,35 @@ class DryRunPlannerTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].severity, "error")
         self.assertEqual(rows[0].payload["decision"], "needs_manual_match")
+
+    def test_persist_mapping_review_queue_keeps_ready_for_approval_human_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            bootstrap_database(config.db_path)
+            item = MappingReviewItem(
+                provider="hidive",
+                provider_series_id="season-2",
+                title="Example Show",
+                season_title="Example Show Season 2",
+                existing_mapping=None,
+                suggested_mal_anime_id=222,
+                suggested_mal_title="Example Show Season 2",
+                mapping_status="strong",
+                confidence=0.95,
+                decision="ready_for_approval",
+                reasons=["strong_exact_season_candidate"],
+            )
+
+            result = persist_mapping_review_queue(config, [item])
+            rows = list_review_queue_entries(config.db_path, status="open", issue_type="mapping_review")
+            mappings = list_series_mappings(config.db_path, provider="hidive")
+
+        self.assertEqual({"resolved": 0, "inserted": 1}, result)
+        self.assertEqual(["season-2"], [row.provider_series_id for row in rows])
+        self.assertEqual("ready_for_approval", rows[0].payload["decision"])
+        self.assertEqual([], mappings)
 
     def test_persist_sync_review_queue_keeps_review_and_skip_rows(self) -> None:
         with tempfile.TemporaryDirectory() as td:

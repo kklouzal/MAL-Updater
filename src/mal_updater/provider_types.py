@@ -23,6 +23,7 @@ class ProviderCapabilities:
 class ProviderFetchResult:
     snapshot: ProviderSnapshot
     metadata: dict[str, Any] = field(default_factory=dict)
+    _ingestion_authority: object | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)

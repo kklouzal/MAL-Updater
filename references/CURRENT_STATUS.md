@@ -3,7 +3,7 @@
 ## Repository / packaging state
 
 - The repo is treated as the canonical skill package (`SKILL.md` at repo root).
-- This status reflects the detached remediation chain in source form only; it does not claim a pushed branch, public release, deployment, or live integration until the maintainer reviews and lands it.
+- The current HIDIVE provenance, health, ingestion, mapping, and documentation changes are prepared for an authorized landing; this status does not yet claim a commit, push, rebuilt artifact, deployment, or live integration.
 - Runtime state is externalized to `.MAL-Updater/` by default instead of living under the repo tree.
 - The bootstrap/onboarding surface starts with `bootstrap-audit`, which now exposes provider readiness, per-provider operation-mode guidance/next-command hints, runtime-initialization readiness, user-daemon install/drift readiness, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts for partial-install edge cases, secrets-dir permission posture, blocking vs non-blocking onboarding counts, health-carried provider refresh plus mapping-review/backlog remediation, and explicit recommended commands for automation-friendly consumers.
 - Repo-owned systemd automation is committed as a portable `mal-updater.service` template and rendered at install time by `scripts/install_user_systemd_units.sh`.

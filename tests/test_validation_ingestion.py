@@ -14,8 +14,11 @@ from mal_updater.config import load_config
 from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from mal_updater.contracts.crunchyroll import CrunchyrollSnapshot as CrunchyrollSnapshotCompatAlias
 from mal_updater.db import bootstrap_database
-from mal_updater.ingestion import ingest_snapshot_payload
+from mal_updater.hidive_auth import HidiveSession, HidiveStatePaths, HidiveTokenSet
+from mal_updater.ingestion import ingest_provider_fetch_result, ingest_snapshot_payload
 from mal_updater.provider_types import ProviderFetchResult
+from mal_updater.providers.hidive import HidiveProvider
+import mal_updater.snapshot_authority as snapshot_authority
 from mal_updater.validation import SnapshotValidationError, validate_snapshot_payload
 
 
@@ -184,7 +187,59 @@ class _FakeProvider:
         raise AssertionError("write_snapshot_file should not be called without --out")
 
 
+class _FakeHidiveProvider:
+    slug = "hidive"
+    display_name = "Fake HIDIVE"
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def fetch_snapshot(self, config, **_: object) -> ProviderFetchResult:
+        return ProviderFetchResult(snapshot=validate_snapshot_payload(self.payload))
+
+    def write_snapshot_file(self, path: Path, snapshot: ProviderSnapshot) -> Path:
+        raise AssertionError("write_snapshot_file should not be called without --out")
+
+
 class IngestionTests(unittest.TestCase):
+    def _concrete_hidive_result(self, payload: dict, config) -> ProviderFetchResult:
+        state_root = config.state_dir / "hidive" / "default"
+        session = HidiveSession(
+            config=config,
+            profile="default",
+            state_paths=HidiveStatePaths(
+                root=state_root,
+                access_token_path=state_root / "authorisation_token.txt",
+                refresh_token_path=state_root / "refresh_token.txt",
+                session_state_path=state_root / "session.json",
+                sync_boundary_path=state_root / "sync_boundary.json",
+            ),
+            token=HidiveTokenSet(
+                authorisation_token="test-token",
+                refresh_token="test-refresh",
+                account_id=payload.get("account_id_hint"),
+            ),
+        )
+        empty_surfaces = [
+            {"vods": [], "page": 1, "totalPages": 1},
+            {"buckets": []},
+            {"events": [], "page": 1, "totalPages": 1},
+            {"watchlists": [], "pagingInfo": {"moreDataAvailable": False}},
+        ]
+        with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+            HidiveSession, "json_get", side_effect=empty_surfaces
+        ):
+            result = HidiveProvider().fetch_snapshot(config, full_refresh=True)
+        # Each test supplies the validated surface shape under examination, but
+        # authority itself comes only from the concrete HIDIVE provider/fetch path.
+        result.snapshot = validate_snapshot_payload(payload)
+        return result
+
+    def test_snapshot_authority_api_exposes_verification_but_no_issuer(self) -> None:
+        self.assertEqual(["has_hidive_snapshot_authority"], snapshot_authority.__all__)
+        self.assertTrue(callable(snapshot_authority.has_hidive_snapshot_authority))
+        self.assertFalse(any("issue" in name.lower() for name in dir(snapshot_authority)))
+
     def _provider_table_rows(self, db_path: Path) -> dict[str, list[tuple[object, ...]]]:
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
             return {
@@ -403,13 +458,242 @@ class IngestionTests(unittest.TestCase):
             first["account_id_hint"] = "acct-a"
             first["raw"] = {"partial": False, "sync_boundary_refresh_kind": "explicit_full_refresh", "watchlist_start": 0, "watchlist_partial": False}
             ingest_snapshot_payload(first, config, mode="full_refresh")
+            with sqlite3.connect(config.db_path) as conn:
+                before = conn.execute(
+                    "SELECT status, raw_json, last_seen_at, is_active, membership_generation, account_id_hint, deactivated_at FROM provider_watchlist"
+                ).fetchone()
             second = sample_snapshot()
             second["account_id_hint"] = "acct-b"
-            second["watchlist"] = []
+            second["watchlist"][0].update({"status": "planned", "list_name": "Hostile overwrite"})
             second["raw"] = dict(first["raw"])
-            ingest_snapshot_payload(second, config, mode="full_refresh")
+            summary = ingest_snapshot_payload(second, config, mode="full_refresh")
+            with sqlite3.connect(config.db_path) as conn:
+                after = conn.execute(
+                    "SELECT status, raw_json, last_seen_at, is_active, membership_generation, account_id_hint, deactivated_at FROM provider_watchlist"
+                ).fetchone()
+            self.assertEqual(before, after)
+            generation = next(item for item in summary.diagnostics or [] if item.get("code") == "watchlist_membership_generation")
+            self.assertEqual("account_mismatch", generation["reason"])
+            self.assertEqual(0, generation["upserted"])
+
+    def test_hidive_complete_watchlist_deactivates_independent_of_other_partial_surfaces(self) -> None:
+        def hidive_payload(series_id: str) -> dict:
+            payload = sample_snapshot()
+            payload["provider"] = "hidive"
+            payload["account_id_hint"] = "acct-hidive"
+            payload["series"][0]["provider_series_id"] = series_id
+            payload["progress"] = []
+            payload["watchlist"][0]["provider_series_id"] = series_id
+            payload["raw"] = {
+                "partial": True,
+                "snapshot_producer": "mal_updater.hidive_snapshot",
+                "surface_authority_schema_version": 1,
+                "sync_boundary_mode": "full_refresh",
+                "sync_boundary_refresh_kind": "explicit_full_refresh",
+                "hot_surface_only": False,
+                "supports": {"watchlists": True},
+                "history_full_complete": False,
+                "continue_complete": False,
+                "watchlist_complete": True,
+                "favourite_stopped_early": False,
+                "favourite_pages_fetched": 1,
+                "custom_watchlist_partial": False,
+                "custom_watchlist_collection_pages_fetched": 1,
+                "custom_watchlist_detail_pages_fetched": 0,
+                "surface_authority": {
+                    "history_full_complete": False,
+                    "continue_complete": False,
+                    "watchlist_complete": True,
+                    "account_identity_proven": True,
+                },
+            }
+            return payload
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            ingest_provider_fetch_result(
+                self._concrete_hidive_result(hidive_payload("series-old"), config), config, mode="full_refresh"
+            )
+            summary = ingest_provider_fetch_result(
+                self._concrete_hidive_result(hidive_payload("series-new"), config), config, mode="full_refresh"
+            )
+
+            with sqlite3.connect(config.db_path) as conn:
+                states = dict(conn.execute("SELECT provider_series_id, is_active FROM provider_watchlist"))
+            self.assertEqual({"series-old": 0, "series-new": 1}, states)
+            generation = next(item for item in summary.diagnostics or [] if item.get("code") == "watchlist_membership_generation")
+            self.assertTrue(generation["complete"])
+            self.assertEqual(1, generation["deactivated"])
+            self.assertEqual("complete_hidive_watchlists", generation["reason"])
+
+    def test_handcrafted_hidive_authority_boole_cannot_deactivate_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            first = sample_snapshot()
+            first["provider"] = "hidive"
+            first["account_id_hint"] = "acct-hidive"
+            ingest_snapshot_payload(first, config, mode="hot")
+
+            hostile = sample_snapshot()
+            hostile["provider"] = "hidive"
+            hostile["account_id_hint"] = "acct-hidive"
+            hostile["watchlist"] = []
+            hostile["raw"] = {
+                "partial": False,
+                "watchlist_complete": True,
+                "surface_authority": {"watchlist_complete": True, "account_identity_proven": True},
+                "sync_boundary_mode": "full_refresh",
+                "supports": {"watchlists": True},
+                "favourite_stopped_early": False,
+                "custom_watchlist_partial": False,
+            }
+            summary = ingest_snapshot_payload(hostile, config, mode="full_refresh")
+
             with sqlite3.connect(config.db_path) as conn:
                 self.assertEqual(1, conn.execute("SELECT is_active FROM provider_watchlist").fetchone()[0])
+            generation = next(item for item in summary.diagnostics or [] if item.get("code") == "watchlist_membership_generation")
+            self.assertFalse(generation["complete"])
+            self.assertEqual("producer_evidence_unproven", generation["reason"])
+
+            with self.assertRaises(TypeError):
+                ingest_snapshot_payload(  # type: ignore[call-arg]
+                    hostile,
+                    config,
+                    mode="full_refresh",
+                    trusted_snapshot_producer="mal_updater.hidive_snapshot",
+                )
+
+    def test_fake_hidive_provider_cannot_gain_deactivation_authority_through_fetch_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            initial = sample_snapshot()
+            initial.update(provider="hidive", account_id_hint="acct-hidive")
+            ingest_snapshot_payload(initial, config, mode="hot")
+
+            hostile = sample_snapshot()
+            hostile.update(provider="hidive", account_id_hint="acct-hidive", watchlist=[])
+            hostile["raw"] = {
+                "partial": False,
+                "snapshot_producer": "mal_updater.hidive_snapshot",
+                "surface_authority_schema_version": 1,
+                "sync_boundary_mode": "full_refresh",
+                "sync_boundary_refresh_kind": "explicit_full_refresh",
+                "hot_surface_only": False,
+                "supports": {"watchlists": True},
+                "watchlist_complete": True,
+                "favourite_stopped_early": False,
+                "favourite_pages_fetched": 1,
+                "custom_watchlist_partial": False,
+                "custom_watchlist_collection_pages_fetched": 1,
+                "custom_watchlist_detail_pages_fetched": 0,
+                "surface_authority": {"watchlist_complete": True, "account_identity_proven": True},
+            }
+            with patch("mal_updater.cli.get_provider", return_value=_FakeHidiveProvider(hostile)), contextlib.redirect_stdout(io.StringIO()):
+                exit_code = _cmd_provider_fetch_snapshot(
+                    root, "hidive", "default", None, ingest=True, full_refresh=True
+                )
+
+            self.assertEqual(0, exit_code)
+            with sqlite3.connect(config.db_path) as conn:
+                self.assertEqual(1, conn.execute("SELECT is_active FROM provider_watchlist").fetchone()[0])
+                summary = json.loads(conn.execute("SELECT summary_json FROM sync_runs ORDER BY id DESC LIMIT 1").fetchone()[0])
+            generation = next(item for item in summary["diagnostics"] if item.get("code") == "watchlist_membership_generation")
+            self.assertEqual("producer_evidence_unproven", generation["reason"])
+
+    def test_hidive_documented_hot_limits_suppress_generic_snapshot_partial_diagnostic(self) -> None:
+        payload = sample_snapshot()
+        payload["provider"] = "hidive"
+        payload["account_id_hint"] = "acct-hidive"
+        payload["raw"] = {
+            "partial": True,
+            "snapshot_producer": "mal_updater.hidive_snapshot",
+            "surface_authority_schema_version": 1,
+            "sync_boundary_mode": "hot",
+            "sync_boundary_account_status": "account_match",
+            "sync_boundary_usable": True,
+            "history_front_boundary_complete": True,
+            "history_full_complete": False,
+            "continue_complete": False,
+            "continue_partial": True,
+            "diagnostics": [
+                {"code": "history_partial_unpageable", "surface": "history", "severity": "info"},
+                {"code": "continue_watching_partial_unpageable", "surface": "continue_watching", "severity": "info"},
+            ],
+            "surface_authority": {
+                "history_front_boundary_complete": True,
+                "history_full_complete": False,
+                "continue_complete": False,
+                "watchlist_complete": False,
+                "account_identity_proven": True,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            summary = ingest_provider_fetch_result(
+                self._concrete_hidive_result(payload, config), config, mode="hot"
+            )
+
+        diagnostics = summary.diagnostics or []
+        codes = {item.get("code") for item in diagnostics}
+        self.assertIn("hidive_surface_authority", codes)
+        self.assertIn("history_partial_unpageable", codes)
+        self.assertIn("continue_watching_partial_unpageable", codes)
+        self.assertNotIn("snapshot_partial", codes)
+        authority = next(item for item in diagnostics if item.get("code") == "hidive_surface_authority")
+        self.assertTrue(authority["watchlist_authority_safe"])
+
+    def test_hidive_partial_suppression_requires_exact_authority_and_limitation_conjunction(self) -> None:
+        base = sample_snapshot()
+        base["provider"] = "hidive"
+        base["account_id_hint"] = "acct-hidive"
+        base["raw"] = {
+            "partial": True,
+            "snapshot_producer": "mal_updater.hidive_snapshot",
+            "surface_authority_schema_version": 1,
+            "sync_boundary_mode": "hot",
+            "sync_boundary_account_status": "account_match",
+            "sync_boundary_usable": True,
+            "history_front_boundary_complete": True,
+            "history_full_complete": False,
+            "continue_complete": False,
+            "continue_partial": True,
+            "diagnostics": [
+                {"code": "history_partial_unpageable", "surface": "history", "severity": "info"},
+                {"code": "continue_watching_partial_unpageable", "surface": "continue_watching", "severity": "info"},
+            ],
+            "surface_authority": {
+                "history_front_boundary_complete": True,
+                "history_full_complete": False,
+                "continue_complete": False,
+                "watchlist_complete": False,
+                "account_identity_proven": True,
+            },
+        }
+        cases = {
+            "omitted_diagnostic": lambda raw: raw["diagnostics"].pop(),
+            "contradictory_partial": lambda raw: raw.update(continue_partial=False),
+            "unknown_partial_code": lambda raw: raw["diagnostics"].append({"code": "unknown_partial", "surface": "history"}),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / ".MAL-Updater" / "config").mkdir(parents=True)
+                payload = json.loads(json.dumps(base))
+                mutate(payload["raw"])
+                config = load_config(root)
+                summary = ingest_provider_fetch_result(
+                    self._concrete_hidive_result(payload, config), config, mode="hot"
+                )
+                self.assertIn("snapshot_partial", {item.get("code") for item in summary.diagnostics or []})
 
     def test_provider_fetch_snapshot_ingest_records_full_refresh_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:

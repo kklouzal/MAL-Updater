@@ -7,6 +7,9 @@ from typing import Any
 
 from .config import AppConfig
 from .db import bootstrap_database, connect
+from .provider_snapshot import snapshot_to_dict
+from .provider_types import ProviderFetchResult
+from .snapshot_authority import has_hidive_snapshot_authority
 from .validation import validate_snapshot_payload
 
 
@@ -34,7 +37,37 @@ class IngestionSummary:
         return payload
 
 
-def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ingest_snapshot") -> IngestionSummary:
+def ingest_snapshot_payload(
+    payload: Any,
+    config: AppConfig,
+    *,
+    mode: str = "ingest_snapshot",
+) -> IngestionSummary:
+    return _ingest_snapshot_payload(payload, config, mode=mode)
+
+
+def ingest_provider_fetch_result(
+    result: ProviderFetchResult,
+    config: AppConfig,
+    *,
+    mode: str,
+) -> IngestionSummary:
+    """Ingest an in-process provider result, preserving internal producer authority."""
+    return _ingest_snapshot_payload(
+        snapshot_to_dict(result.snapshot),
+        config,
+        mode=mode,
+        hidive_producer_authenticated=has_hidive_snapshot_authority(result._ingestion_authority),
+    )
+
+
+def _ingest_snapshot_payload(
+    payload: Any,
+    config: AppConfig,
+    *,
+    mode: str,
+    hidive_producer_authenticated: bool = False,
+) -> IngestionSummary:
     snapshot = validate_snapshot_payload(payload)
     bootstrap_database(config.db_path)
 
@@ -48,15 +81,35 @@ def ingest_snapshot_payload(payload: Any, config: AppConfig, *, mode: str = "ing
             _upsert_series(conn, provider, snapshot.series)
             _upsert_progress(conn, provider, snapshot.progress)
             account_id_hint = snapshot.account_id_hint.strip() if snapshot.account_id_hint else None
-            _upsert_watchlist(
-                conn, provider, snapshot.watchlist,
-                generation=sync_run_id, account_id_hint=account_id_hint,
+            account_conflict = _watchlist_account_conflict(
+                conn, provider=provider, account_id_hint=account_id_hint,
             )
-            membership_deactivation = _deactivate_absent_watchlist_memberships(
-                conn, provider=provider, generation=sync_run_id,
-                account_id_hint=account_id_hint, mode=mode, raw=snapshot.raw,
+            if account_conflict:
+                membership_deactivation = {
+                    "code": "watchlist_membership_generation",
+                    "surface": "watchlist",
+                    "severity": "warning",
+                    "generation": sync_run_id,
+                    "complete": False,
+                    "deactivated": 0,
+                    "upserted": 0,
+                    "reason": "account_mismatch",
+                }
+            else:
+                _upsert_watchlist(
+                    conn, provider, snapshot.watchlist,
+                    generation=sync_run_id, account_id_hint=account_id_hint,
+                )
+                membership_deactivation = _deactivate_absent_watchlist_memberships(
+                    conn, provider=provider, generation=sync_run_id,
+                    account_id_hint=account_id_hint, mode=mode, raw=snapshot.raw,
+                    hidive_producer_authenticated=hidive_producer_authenticated,
+                )
+                membership_deactivation["upserted"] = len(snapshot.watchlist)
+            diagnostics = _snapshot_diagnostics_from_raw(
+                snapshot.raw,
+                hidive_producer_authenticated=hidive_producer_authenticated,
             )
-            diagnostics = _snapshot_diagnostics_from_raw(snapshot.raw)
             diagnostics.append(membership_deactivation)
             summary = IngestionSummary(
                 provider=provider,
@@ -114,7 +167,9 @@ def _entry_json(entry: Any) -> str:
     return json.dumps(asdict(entry), sort_keys=True)
 
 
-def _snapshot_diagnostics_from_raw(raw: dict[str, Any]) -> list[dict[str, Any]]:
+def _snapshot_diagnostics_from_raw(
+    raw: dict[str, Any], *, hidive_producer_authenticated: bool = False
+) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     raw_diagnostics = raw.get("diagnostics")
     if isinstance(raw_diagnostics, list):
@@ -125,7 +180,59 @@ def _snapshot_diagnostics_from_raw(raw: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(code, str) or not code:
                 continue
             diagnostics.append({key: value for key, value in item.items() if key != "sensitive"})
-    if raw.get("partial") is True:
+    raw_authority = raw.get("surface_authority")
+    authority: dict[str, Any] = raw_authority if isinstance(raw_authority, dict) else {}
+    producer_evidence = _hidive_producer_evidence(raw, authenticated=hidive_producer_authenticated)
+    hidive_authority_present = bool(authority) and isinstance(raw.get("sync_boundary_mode"), str)
+    hot_boundary_proven = False
+    if hidive_authority_present:
+        hot_boundary_proven = bool(
+            producer_evidence["producer_authenticated"]
+            and raw.get("sync_boundary_mode") == "hot"
+            and raw.get("sync_boundary_account_status") == "account_match"
+            and raw.get("sync_boundary_usable") is True
+            and authority.get("account_identity_proven") is True
+            and authority.get("history_front_boundary_complete") is True
+            and raw.get("history_front_boundary_complete") is True
+        )
+        diagnostics.append(
+            {
+                "code": "hidive_surface_authority",
+                "surface": "provider_snapshot",
+                "severity": "info",
+                "sync_boundary_mode": raw.get("sync_boundary_mode"),
+                "sync_boundary_account_status": raw.get("sync_boundary_account_status"),
+                "account_identity_proven": authority.get("account_identity_proven") is True,
+                "history_front_boundary_complete": authority.get("history_front_boundary_complete") is True,
+                "history_full_complete": authority.get("history_full_complete") is True,
+                "continue_complete": authority.get("continue_complete") is True,
+                "watchlist_complete": authority.get("watchlist_complete") is True,
+                "producer_authenticated": producer_evidence["producer_authenticated"],
+                # A hot snapshot deliberately reuses the account-bound watchlist
+                # generation instead of traversing it again.  That authority is
+                # safe only after the matching boundary and current history front
+                # marker are both proven.
+                "watchlist_authority_safe": authority.get("watchlist_complete") is True or hot_boundary_proven,
+            }
+        )
+    documented_partial_codes = {
+        str(item.get("code"))
+        for item in diagnostics
+        if isinstance(item, dict)
+    }
+    expected_partial_codes = {"history_partial_unpageable", "continue_watching_partial_unpageable"}
+    partial_fully_explained = bool(
+        hot_boundary_proven
+        and expected_partial_codes.issubset(documented_partial_codes)
+        and documented_partial_codes.issubset(expected_partial_codes | {"hidive_surface_authority"})
+        and raw.get("partial") is True
+        and raw.get("history_full_complete") is False
+        and raw.get("continue_complete") is False
+        and raw.get("continue_partial") is True
+        and authority.get("history_full_complete") is False
+        and authority.get("continue_complete") is False
+    )
+    if raw.get("partial") is True and not partial_fully_explained:
         diagnostics.append({"code": "snapshot_partial", "surface": "provider_snapshot", "severity": "warning"})
     if raw.get("history_non_advancing_detected") is True:
         diagnostics.append({"code": "history_pagination_non_advancing", "surface": "history", "severity": "warning"})
@@ -297,14 +404,46 @@ def _upsert_watchlist(
         )
 
 
+def _watchlist_account_conflict(conn, *, provider: str, account_id_hint: str | None) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM provider_watchlist
+        WHERE provider = ? AND account_id_hint IS NOT NULL
+          AND (? IS NULL OR account_id_hint <> ?)
+        LIMIT 1
+        """,
+        (provider, account_id_hint, account_id_hint),
+    ).fetchone()
+    return row is not None
+
+
+def _hidive_producer_evidence(
+    raw: dict[str, Any], *, authenticated: bool
+) -> dict[str, bool]:
+    # Producer identity is an internal object-identity capability carried only
+    # by an in-process concrete HIDIVE fetch result. JSON fields are corroborating
+    # contract evidence, never credentials.
+    return {
+        "producer_authenticated": bool(
+            authenticated
+            and raw.get("snapshot_producer") == "mal_updater.hidive_snapshot"
+            and raw.get("surface_authority_schema_version") == 1
+        )
+    }
+
+
 def _watchlist_snapshot_is_complete(
-    *, provider: str, mode: str, raw: dict[str, Any]
+    *,
+    provider: str,
+    mode: str,
+    raw: dict[str, Any],
+    hidive_producer_authenticated: bool = False,
 ) -> tuple[bool, str]:
-    if mode != "full_refresh":
-        return False, "not_full_refresh_mode"
-    if raw.get("partial") is not False:
-        return False, "snapshot_not_explicitly_complete"
     if provider == "crunchyroll":
+        if mode != "full_refresh":
+            return False, "not_full_refresh_mode"
+        if raw.get("partial") is not False:
+            return False, "snapshot_not_explicitly_complete"
         if raw.get("sync_boundary_refresh_kind") not in {"explicit_full_refresh", "bootstrap_full_refresh"}:
             return False, "not_full_watchlist_traversal"
         if int(raw.get("watchlist_start") or 0) != 0 or raw.get("watchlist_partial") is not False:
@@ -315,20 +454,55 @@ def _watchlist_snapshot_is_complete(
             return False, "bootstrap_generation_unvalidated"
         return True, "complete_crunchyroll_watchlist"
     if provider == "hidive":
-        supports = raw.get("supports") if isinstance(raw.get("supports"), dict) else {}
-        if raw.get("sync_boundary_mode") != "full_refresh" or supports.get("watchlists") is not True:
-            return False, "watchlist_surfaces_not_full"
-        if raw.get("custom_watchlist_partial") is not False or raw.get("favourite_stopped_early") is not False:
-            return False, "required_watchlist_surface_incomplete"
+        # Absence is destructive evidence.  Accept it only from this producer's
+        # explicit full/repair traversal contract, never from standalone booleans
+        # in imported JSON or from a hot snapshot reusing an older boundary.
+        raw_authority = raw.get("surface_authority")
+        authority: dict[str, Any] = raw_authority if isinstance(raw_authority, dict) else {}
+        evidence = _hidive_producer_evidence(raw, authenticated=hidive_producer_authenticated)
+        if not evidence["producer_authenticated"]:
+            return False, "producer_evidence_unproven"
+        if mode != "full_refresh":
+            return False, "not_full_refresh_mode"
+        if raw.get("sync_boundary_refresh_kind") not in {"explicit_full_refresh", "account_repair_full_refresh"}:
+            return False, "not_full_watchlist_traversal"
+        if raw.get("sync_boundary_mode") != "full_refresh" or raw.get("hot_surface_only") is not False:
+            return False, "hot_snapshot_not_authoritative"
+        raw_supports = raw.get("supports")
+        supports: dict[str, Any] = raw_supports if isinstance(raw_supports, dict) else {}
+        favourite_pages = raw.get("favourite_pages_fetched")
+        custom_collection_pages = raw.get("custom_watchlist_collection_pages_fetched")
+        custom_detail_pages = raw.get("custom_watchlist_detail_pages_fetched")
+        concrete_complete = bool(
+            supports.get("watchlists") is True
+            and raw.get("watchlist_complete") is True
+            and authority.get("watchlist_complete") is True
+            and authority.get("account_identity_proven") is True
+            and raw.get("favourite_stopped_early") is False
+            and raw.get("custom_watchlist_partial") is False
+            and isinstance(favourite_pages, int)
+            and favourite_pages >= 1
+            and isinstance(custom_collection_pages, int)
+            and custom_collection_pages >= 1
+            and isinstance(custom_detail_pages, int)
+            and custom_detail_pages >= 0
+        )
+        if not concrete_complete:
+            return False, "watchlist_traversal_evidence_incomplete_or_contradictory"
         return True, "complete_hidive_watchlists"
     return False, "provider_has_no_complete_watchlist_contract"
 
 
 def _deactivate_absent_watchlist_memberships(
     conn, *, provider: str, generation: int, account_id_hint: str | None,
-    mode: str, raw: dict[str, Any],
+    mode: str, raw: dict[str, Any], hidive_producer_authenticated: bool = False,
 ) -> dict[str, Any]:
-    complete, reason = _watchlist_snapshot_is_complete(provider=provider, mode=mode, raw=raw)
+    complete, reason = _watchlist_snapshot_is_complete(
+        provider=provider,
+        mode=mode,
+        raw=raw,
+        hidive_producer_authenticated=hidive_producer_authenticated,
+    )
     diagnostic: dict[str, Any] = {
         "code": "watchlist_membership_generation", "surface": "watchlist",
         "severity": "info", "generation": generation, "complete": complete,

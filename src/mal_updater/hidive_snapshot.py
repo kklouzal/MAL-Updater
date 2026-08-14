@@ -50,6 +50,7 @@ class HidiveFetchResult:
     continue_count: int
     favourite_count: int
     custom_watchlist_count: int = 0
+    _ingestion_authority: object | None = None
 
 
 def _now_string() -> str:
@@ -387,6 +388,23 @@ def _fetch_history_items(
                 backfill_exhausted = True
             break
         if history_markers and front_boundary_seen:
+            break
+        # Production forensics show that this endpoint ignores page numbers and
+        # repeats page 1.  Preserve explicit full-history incompleteness without
+        # issuing a known-useless second request.
+        if not history_markers:
+            stopped_early = True
+            diagnostics.append(
+                _diagnostic(
+                    "history_partial_unpageable",
+                    surface="history",
+                    severity="info",
+                    detail="HIDIVE history declares additional pages but ignores page-number pagination; retained verified page 1 only",
+                    pages_fetched=pages_fetched,
+                    declared_total_pages=total_pages,
+                    declared_total_results=_safe_int(payload.get("totalResults")),
+                )
+            )
             break
         if max_pages is not None and pages_fetched >= max_pages:
             stopped_early = True
@@ -895,7 +913,7 @@ def _dedupe_progress(entries: list[EpisodeProgress]) -> list[EpisodeProgress]:
     return list(by_id.values())
 
 
-def fetch_snapshot(
+def _fetch_snapshot(
     config: AppConfig,
     *,
     profile: str = "default",
@@ -904,7 +922,9 @@ def fetch_snapshot(
 ) -> HidiveFetchResult:
     try:
         session = start_hidive_session(config, profile=profile, timeout_seconds=timeout_seconds)
-        loaded_boundary = _load_sync_boundary(session.state_paths) if use_incremental_boundary else None
+        boundary_file_present = session.state_paths.sync_boundary_path.exists()
+        stored_boundary = _load_sync_boundary(session.state_paths)
+        loaded_boundary = stored_boundary if use_incremental_boundary else None
         boundary = loaded_boundary
         boundary_account_status = "not_requested" if not use_incremental_boundary else "missing"
         if loaded_boundary is not None:
@@ -970,14 +990,33 @@ def fetch_snapshot(
     diagnostics = [*history_diagnostics, *(continue_metadata.get("diagnostics") if isinstance(continue_metadata.get("diagnostics"), list) else []), *custom_watchlist_diagnostics]
     history_non_advancing_detected = any(item.get("code") == "history_pagination_non_advancing" for item in diagnostics if isinstance(item, dict))
     continue_partial = continue_metadata.get("partial") is True
-    history_boundary_complete = not hot_mode or history_boundary_reached
+    history_front_boundary_complete = history_boundary_reached
+    history_full_complete = not hot_mode and not history_stopped_early
+    continue_complete = not continue_partial
+    watchlist_complete = bool(
+        not hot_mode
+        and not favourite_stopped_early
+        and not custom_watchlist_partial
+    )
+    stored_boundary_account_mismatch = bool(
+        stored_boundary is not None
+        and stored_boundary.account_id_hint
+        and session.token.account_id
+        and stored_boundary.account_id_hint != session.token.account_id
+    )
+    boundary_rewrite_eligible = bool(
+        session.token.account_id
+        and history_front_boundary_complete
+        and watchlist_complete
+        and not stored_boundary_account_mismatch
+    )
     partial = bool(
         history_non_advancing_detected
         or history_stopped_early
         or continue_partial
         or custom_watchlist_partial
         or favourite_stopped_early
-        or (hot_mode and not history_boundary_complete)
+        or (hot_mode and not history_front_boundary_complete)
     )
 
     generated_at = _now_string()
@@ -992,17 +1031,25 @@ def fetch_snapshot(
         raw={
             "partial": partial,
             "diagnostics": diagnostics,
+            "snapshot_producer": "mal_updater.hidive_snapshot",
+            "surface_authority_schema_version": 1,
             "history_count": len(history_items),
             "history_pages_fetched": history_pages_fetched,
             "history_stopped_early": history_stopped_early,
             "history_non_advancing_detected": history_non_advancing_detected,
             "history_backfill_pages_fetched": history_backfill_pages_fetched,
             "history_backfill_exhausted": history_backfill_exhausted,
-            "history_boundary_complete": history_boundary_complete,
+            # Surface authority is intentionally split: HIDIVE's history endpoint
+            # may ignore page numbers, but a verified page 1 can still establish
+            # the safe incremental front boundary.
+            "history_boundary_complete": history_front_boundary_complete,
+            "history_front_boundary_complete": history_front_boundary_complete,
+            "history_full_complete": history_full_complete,
             "continue_count": len(continue_items),
             "continue_stopped_early": continue_stopped_early,
             "continue_pages_fetched": continue_metadata.get("pages_fetched"),
             "continue_partial": continue_partial,
+            "continue_complete": continue_complete,
             "continue_unpageable": continue_metadata.get("unpageable") is True,
             "continue_bucket_total_pages": continue_metadata.get("bucket_total_pages"),
             "continue_bucket_total_results": continue_metadata.get("bucket_total_results"),
@@ -1016,13 +1063,26 @@ def fetch_snapshot(
             "custom_watchlist_collection_pages_fetched": custom_watchlist_metadata.get("collection_pages_fetched"),
             "custom_watchlist_detail_pages_fetched": custom_watchlist_metadata.get("detail_pages_fetched"),
             "custom_watchlist_partial": custom_watchlist_partial,
+            "watchlist_complete": watchlist_complete,
             "custom_watchlist_lists": custom_watchlist_metadata.get("lists"),
             "custom_watchlist_skipped_unknown_content_count": custom_watchlist_metadata.get("skipped_unknown_content_count", 0),
             "custom_watchlist_duplicate_within_list_count": custom_watchlist_metadata.get("duplicate_within_list_count", 0),
-            "sync_boundary_present": boundary is not None,
+            # Compatibility: present means the state file exists, even when it
+            # is unusable.  Consumers needing trust should use usable/status.
+            "sync_boundary_present": boundary_file_present,
+            "sync_boundary_usable": boundary is not None,
             "sync_boundary_loaded": loaded_boundary is not None,
             "sync_boundary_account_status": boundary_account_status,
+            "sync_boundary_rewrite_eligible": boundary_rewrite_eligible,
+            "sync_boundary_rewrite_blocked_by_account_mismatch": stored_boundary_account_mismatch,
             "sync_boundary_mode": "hot" if hot_mode else "full_refresh",
+            "sync_boundary_refresh_kind": (
+                "hot_boundary_refresh"
+                if hot_mode
+                else "explicit_full_refresh"
+                if not use_incremental_boundary
+                else "account_repair_full_refresh"
+            ),
             "hot_surface_only": hot_mode,
             "sync_boundary_schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
             "sync_boundary_path": str(session.state_paths.sync_boundary_path),
@@ -1036,9 +1096,16 @@ def fetch_snapshot(
                 "continue_watching": True,
                 "watchlists": not hot_mode,
             },
+            "surface_authority": {
+                "history_front_boundary_complete": history_front_boundary_complete,
+                "history_full_complete": history_full_complete,
+                "continue_complete": continue_complete,
+                "watchlist_complete": watchlist_complete,
+                "account_identity_proven": bool(session.token.account_id),
+            },
         },
     )
-    if not partial and session.token.account_id:
+    if boundary_rewrite_eligible:
         _write_sync_boundary(
             state_paths=session.state_paths,
             generated_at=generated_at,
@@ -1058,6 +1125,25 @@ def fetch_snapshot(
         favourite_count=len(favourite_items),
         custom_watchlist_count=len(custom_watchlist_entries),
     )
+
+
+def _bind_fetch_authority(fetch_impl):
+    """Bind producer authority to this concrete fetch implementation only."""
+    authority = object()
+
+    def authoritative_fetch(*args, **kwargs) -> HidiveFetchResult:
+        result = fetch_impl(*args, **kwargs)
+        result._ingestion_authority = authority
+        return result
+
+    def accepts(candidate: Any) -> bool:
+        return candidate is authority
+
+    return authoritative_fetch, accepts
+
+
+fetch_snapshot, has_hidive_snapshot_authority = _bind_fetch_authority(_fetch_snapshot)
+del _bind_fetch_authority
 
 
 def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:

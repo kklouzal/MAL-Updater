@@ -237,30 +237,43 @@ def _classify_partial_sync_health_posture(
     }
 
 def _build_mapping_coverage_snapshot(
-    provider_counts: dict[str, object] | None,
+    provider_series_inventory: dict[str, object] | None,
     mapping_counts: dict[str, object] | None,
 ) -> dict[str, object] | None:
-    if not isinstance(provider_counts, dict) or not isinstance(mapping_counts, dict):
+    if not isinstance(provider_series_inventory, dict) or not isinstance(mapping_counts, dict):
         return None
-    provider_series_count = provider_counts.get("series")
-    approved_mapping_count = mapping_counts.get("approved")
+    persisted_series_count = provider_series_inventory.get("persisted_total")
+    catalog_only_series_count = provider_series_inventory.get("catalog_only")
+    eligible_series_count = provider_series_inventory.get("mapping_eligible")
+    eligible_approved_mapping_count = provider_series_inventory.get("eligible_mapping_approved")
+    persisted_approved_mapping_count = mapping_counts.get("approved")
     total_mapping_count = mapping_counts.get("total")
-    if not isinstance(provider_series_count, int) or provider_series_count < 0:
-        return None
-    if not isinstance(approved_mapping_count, int) or approved_mapping_count < 0:
-        return None
+    for value in (persisted_series_count, catalog_only_series_count, eligible_series_count, eligible_approved_mapping_count):
+        if not isinstance(value, int) or value < 0:
+            return None
+    if not isinstance(persisted_approved_mapping_count, int) or persisted_approved_mapping_count < 0:
+        persisted_approved_mapping_count = eligible_approved_mapping_count
     if not isinstance(total_mapping_count, int) or total_mapping_count < 0:
-        total_mapping_count = approved_mapping_count
+        total_mapping_count = persisted_approved_mapping_count
 
     coverage_ratio = None
-    if provider_series_count > 0:
-        coverage_ratio = round(min(1.0, approved_mapping_count / provider_series_count), 4)
+    if eligible_series_count > 0:
+        coverage_ratio = round(min(1.0, eligible_approved_mapping_count / eligible_series_count), 4)
 
     return {
-        "provider_series_count": provider_series_count,
-        "approved_mapping_count": approved_mapping_count,
-        "unmapped_series_count": max(0, provider_series_count - approved_mapping_count),
+        "persisted_provider_series_count": persisted_series_count,
+        "catalog_only_series_count": catalog_only_series_count,
+        "mapping_eligible_series_count": eligible_series_count,
+        "eligible_approved_mapping_count": eligible_approved_mapping_count,
+        "eligible_unmapped_series_count": max(0, eligible_series_count - eligible_approved_mapping_count),
+        "eligible_approved_coverage_ratio": coverage_ratio,
+        "persisted_approved_mapping_count": persisted_approved_mapping_count,
         "total_mapping_count": total_mapping_count,
+        # Compatibility aliases: provider_series_count remains persisted inventory;
+        # the other aliases now explicitly describe the operationally eligible population.
+        "provider_series_count": persisted_series_count,
+        "approved_mapping_count": eligible_approved_mapping_count,
+        "unmapped_series_count": max(0, eligible_series_count - eligible_approved_mapping_count),
         "approved_coverage_ratio": coverage_ratio,
     }
 
@@ -301,6 +314,8 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
     summary = sync_run.get("summary")
     if not isinstance(provider, str) or not provider or not isinstance(summary, dict):
         return None
+    if provider != "hidive":
+        return None
     diagnostics = summary.get("diagnostics")
     if not isinstance(diagnostics, list):
         return None
@@ -315,17 +330,48 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
     if not normalized:
         return None
     codes = {str(item.get("code")) for item in normalized}
+    authority_items = [item for item in normalized if item.get("code") == "hidive_surface_authority"]
+    authority = authority_items[-1] if authority_items else None
     blocking_codes = {
+        "snapshot_partial",
         "history_pagination_non_advancing",
+        "history_page_guard_hit",
+        "history_page_cap_hit",
         "custom_watchlist_partial",
+        "custom_watchlist_collection_page_guard_hit",
         "custom_watchlist_collection_pagination_non_advancing",
         "custom_watchlist_collection_cursor_non_advancing",
         "custom_watchlist_collection_missing_cursor",
+        "custom_watchlist_detail_page_guard_hit",
         "custom_watchlist_detail_pagination_non_advancing",
         "custom_watchlist_detail_cursor_non_advancing",
         "custom_watchlist_detail_missing_cursor",
     }
-    blocking = bool(codes.intersection(blocking_codes))
+    documented_limitations = {
+        "history_partial_unpageable",
+        "continue_watching_partial_unpageable",
+        "hidive_surface_authority",
+        "watchlist_membership_generation",
+    }
+    authority_safe = bool(
+        provider == "hidive"
+        and isinstance(authority, dict)
+        and authority.get("sync_boundary_mode") == "hot"
+        and authority.get("sync_boundary_account_status") == "account_match"
+        and authority.get("producer_authenticated") is True
+        and authority.get("account_identity_proven") is True
+        and authority.get("history_front_boundary_complete") is True
+        and authority.get("history_full_complete") is False
+        and authority.get("continue_complete") is False
+        and authority.get("watchlist_authority_safe") is True
+    )
+    expected_limitations = {"history_partial_unpageable", "continue_watching_partial_unpageable"}
+    only_documented_limitations = bool(
+        expected_limitations.issubset(codes)
+        and codes.issubset(documented_limitations)
+    )
+    automation_safe = authority_safe and only_documented_limitations
+    blocking = not automation_safe
     return {
         "provider": provider,
         "sync_run_id": sync_run.get("id"),
@@ -335,6 +381,12 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
         "severity": "warning" if blocking else "info",
         "health_posture": "unhealthy" if blocking else "operator_visible",
         "automation_safe": not blocking,
+        "authority": authority,
+        "rationale": (
+            "account_bound_hot_boundary_and_watchlist_authority_with_documented_unpageable_limits"
+            if automation_safe
+            else "surface_authority_missing_or_unproven_or_unexpected_partial_diagnostic"
+        ),
     }
 
 def _format_systemd_usec_timestamp(value: str) -> str | None:
@@ -561,8 +613,8 @@ def _build_health_maintenance_commands(
             requires_auth_interaction=False,
         )
 
-    coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
-    unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
+    coverage_ratio = mapping_coverage.get("eligible_approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
+    unmapped_series_count = mapping_coverage.get("eligible_unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (
         provider_ready.get(refresh_provider)
         and not isinstance(partial_sync_coverage, dict)
@@ -708,9 +760,9 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
         if isinstance(value, int):
             print(f"niceness_{name}={value}")
     if isinstance(mapping_coverage, dict):
-        approved_count = mapping_coverage.get("approved_mapping_count")
-        provider_series_count = mapping_coverage.get("provider_series_count")
-        coverage_ratio = mapping_coverage.get("approved_coverage_ratio")
+        approved_count = mapping_coverage.get("eligible_approved_mapping_count")
+        provider_series_count = mapping_coverage.get("mapping_eligible_series_count")
+        coverage_ratio = mapping_coverage.get("eligible_approved_coverage_ratio")
         if isinstance(approved_count, int) and isinstance(provider_series_count, int):
             if isinstance(coverage_ratio, float):
                 print(
@@ -866,8 +918,14 @@ def build_health_report(
         latest_provider_stale_row_counts,
         latest_provider_stale_row_samples,
     )
+    # HIDIVE's authority matrix is provider-specific.  A newer successful run
+    # from Crunchyroll (or another provider) must not inherit HIDIVE semantics,
+    # and must not hide the latest HIDIVE diagnostics either.
+    latest_hidive_completed_sync_run = get_latest_completed_sync_run(
+        config.db_path, provider="hidive"
+    )
     provider_surface_diagnostics = _provider_surface_diagnostics_from_sync_run(
-        latest_completed_sync_run if isinstance(latest_completed_sync_run, dict) else None
+        latest_hidive_completed_sync_run
     )
     if (
         isinstance(partial_sync_coverage, dict)
@@ -913,7 +971,7 @@ def build_health_report(
                 full_refresh_coverage["latest_incremental_sync_run_id"] = latest_sync_run.get("id")
                 partial_sync_coverage = full_refresh_coverage
     mapping_coverage = _build_mapping_coverage_snapshot(
-        snapshot.get("provider_counts") if isinstance(snapshot.get("provider_counts"), dict) else None,
+        snapshot.get("provider_series_inventory") if isinstance(snapshot.get("provider_series_inventory"), dict) else None,
         snapshot.get("mappings") if isinstance(snapshot.get("mappings"), dict) else None,
     )
     automation_installation = _build_automation_installation_status(config)
@@ -1029,12 +1087,18 @@ def build_health_report(
         warnings.append(
             {
                 "code": f"{provider_name}_surface_diagnostics" if isinstance(provider_name, str) and provider_name else "provider_surface_diagnostics",
-                "detail": f"Latest completed {provider_name or 'provider'} ingest reported non-authoritative or partial provider surfaces: {code_label}",
+                "detail": (
+                    f"Latest completed {provider_name or 'provider'} ingest reported provider-surface authority diagnostics: "
+                    f"{code_label}. Info/operator-visible means the expected documented limitation is safely bounded; "
+                    "warning/unhealthy means authority or completeness remains unproven."
+                ),
                 "severity": provider_surface_diagnostics.get("severity"),
                 "health_posture": provider_surface_diagnostics.get("health_posture"),
                 "automation_safe": provider_surface_diagnostics.get("automation_safe"),
                 "sync_run_id": provider_surface_diagnostics.get("sync_run_id"),
                 "mode": provider_surface_diagnostics.get("mode"),
+                "rationale": provider_surface_diagnostics.get("rationale"),
+                "authority": provider_surface_diagnostics.get("authority"),
                 "diagnostics": provider_surface_diagnostics.get("diagnostics"),
             }
         )
@@ -1061,8 +1125,8 @@ def build_health_report(
                 **mal_auth_failure,
             }
         )
-    coverage_ratio = mapping_coverage.get("approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
-    unmapped_series_count = mapping_coverage.get("unmapped_series_count") if isinstance(mapping_coverage, dict) else None
+    coverage_ratio = mapping_coverage.get("eligible_approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
+    unmapped_series_count = mapping_coverage.get("eligible_unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (
         not isinstance(partial_sync_coverage, dict)
         and isinstance(coverage_ratio, float)

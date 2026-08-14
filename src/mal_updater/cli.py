@@ -62,7 +62,7 @@ from .db import (
     update_review_queue_entry_statuses,
     upsert_series_mapping,
 )
-from .ingestion import ingest_snapshot_file, ingest_snapshot_payload
+from .ingestion import ingest_provider_fetch_result, ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, map_series, normalize_title
 from .recommendation_dashboard import (
@@ -83,6 +83,7 @@ from .service_manager import doctor_service, install_service, restart_service, s
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
 from . import service_systemd_status as _service_systemd_status
 from .service_units import SERVICE_UNIT_NAME, render_systemd_unit_template_file as _render_systemd_unit_template
+from .snapshot_authority import has_hidive_snapshot_authority
 from .sync_planner import (
     MAPPING_REVIEW_HEURISTICS_REVISION,
     MAPPING_REVIEW_NO_QUEUE_DECISIONS,
@@ -1042,7 +1043,10 @@ def _cmd_provider_fetch_snapshot(
                 f"Partial {provider.display_name} snapshot detected; ingesting as hot instead of marking a completed full refresh",
                 file=sys.stderr,
             )
-        summary = ingest_snapshot_payload(payload, config, mode=ingest_mode)
+        if has_hidive_snapshot_authority(result._ingestion_authority):
+            summary = ingest_provider_fetch_result(result, config, mode=ingest_mode)
+        else:
+            summary = ingest_snapshot_payload(payload, config, mode=ingest_mode)
         print(json.dumps(summary.as_dict(), indent=2))
         return 0
 

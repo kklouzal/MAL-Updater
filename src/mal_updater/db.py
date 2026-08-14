@@ -6007,6 +6007,27 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
                 "SELECT provider, COUNT(*) AS count FROM provider_series GROUP BY provider"
             ).fetchall()
         }
+        provider_series_provenance_rows = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS persisted_total,
+                SUM(CASE WHEN account_observed_at IS NULL THEN 1 ELSE 0 END) AS catalog_only,
+                SUM(CASE WHEN account_observed_at IS NOT NULL THEN 1 ELSE 0 END) AS mapping_eligible
+            FROM provider_series
+            """
+        ).fetchone()
+        eligible_mapping_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN m.approved_by_user = 1 THEN 1 ELSE 0 END) AS approved
+            FROM mal_series_mapping m
+            INNER JOIN provider_series s
+                ON s.provider = m.provider
+               AND s.provider_series_id = m.provider_series_id
+            WHERE s.account_observed_at IS NOT NULL
+            """
+        ).fetchone()
         provider_progress_counts = {
             str(row["provider"]): int(row["count"])
             for row in conn.execute(
@@ -6107,6 +6128,13 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
         "progress": sum(item["progress"] for item in provider_counts_by_provider.values()),
         "watchlist": sum(item["watchlist"] for item in provider_counts_by_provider.values()),
     }
+    provider_series_inventory = {
+        "persisted_total": int(provider_series_provenance_rows["persisted_total"] or 0),
+        "catalog_only": int(provider_series_provenance_rows["catalog_only"] or 0),
+        "mapping_eligible": int(provider_series_provenance_rows["mapping_eligible"] or 0),
+        "eligible_mapping_total": int(eligible_mapping_row["total"] or 0),
+        "eligible_mapping_approved": int(eligible_mapping_row["approved"] or 0),
+    }
     provider_freshness = {
         "series_last_seen_at": max(
             (item.get("series_last_seen_at") for item in provider_freshness_by_provider.values() if item.get("series_last_seen_at")),
@@ -6156,6 +6184,7 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
         "latest_sync_run": _sync_run_row_to_dict(latest_sync_run_row),
         "latest_completed_sync_run": _sync_run_row_to_dict(latest_completed_sync_run_row),
         "provider_counts": provider_counts,
+        "provider_series_inventory": provider_series_inventory,
         "provider_counts_by_provider": provider_counts_by_provider,
         "provider_freshness": provider_freshness,
         "provider_freshness_by_provider": provider_freshness_by_provider,

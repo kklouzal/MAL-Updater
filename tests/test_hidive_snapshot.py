@@ -10,6 +10,7 @@ from mal_updater.contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, 
 from mal_updater.hidive_auth import HidiveSession, HidiveStatePaths, HidiveTokenSet
 import mal_updater.hidive_snapshot as hidive_snapshot
 from mal_updater.hidive_snapshot import fetch_snapshot
+from mal_updater.snapshot_authority import has_hidive_snapshot_authority
 from mal_updater.provider_snapshot import snapshot_to_dict as shared_snapshot_to_dict
 from mal_updater.provider_snapshot import write_snapshot_file as shared_write_snapshot_file
 
@@ -178,7 +179,9 @@ class HidiveSnapshotTests(unittest.TestCase):
         self.assertEqual('Favorites', result.snapshot.watchlist[0].list_name)
         self.assertEqual({"history": True, "continue_watching": True, "watchlists": True}, result.snapshot.raw["supports"])
         self.assertFalse(result.snapshot.raw["sync_boundary_present"])
+        self.assertFalse(result.snapshot.raw["sync_boundary_usable"])
         self.assertEqual("full_refresh", result.snapshot.raw["sync_boundary_mode"])
+        self.assertTrue(has_hidive_snapshot_authority(result._ingestion_authority))
         self.assertEqual(str(session.state_paths.sync_boundary_path), result.snapshot.raw["sync_boundary_path"])
 
     def test_default_fetch_without_boundary_uses_account_refresh_surfaces(self) -> None:
@@ -322,6 +325,7 @@ class HidiveSnapshotTests(unittest.TestCase):
         self.assertTrue(result.snapshot.raw["continue_stopped_early"])
         self.assertFalse(result.snapshot.raw["favourite_stopped_early"])
         self.assertTrue(result.snapshot.raw["sync_boundary_present"])
+        self.assertTrue(result.snapshot.raw["sync_boundary_usable"])
         self.assertEqual("hot", result.snapshot.raw["sync_boundary_mode"])
         self.assertTrue(result.snapshot.raw["hot_surface_only"])
         self.assertEqual({"history": True, "continue_watching": True, "watchlists": False}, result.snapshot.raw["supports"])
@@ -333,7 +337,7 @@ class HidiveSnapshotTests(unittest.TestCase):
         self.assertEqual(0, result.snapshot.raw["favourite_pages_fetched"])
         self.assertEqual(2, mock_get.call_count)
 
-    def test_full_fetch_stops_on_non_advancing_history_page_fingerprint(self) -> None:
+    def test_full_fetch_keeps_explicit_incomplete_history_without_requesting_page_two(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / ".MAL-Updater" / "config").mkdir(parents=True)
@@ -366,17 +370,106 @@ class HidiveSnapshotTests(unittest.TestCase):
             with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
                 HidiveSession,
                 "json_get",
-                side_effect=[history_page, history_page, home_payload, favourites_payload, custom_collection_payload],
+                side_effect=[history_page, home_payload, favourites_payload, custom_collection_payload],
             ) as mock_get:
                 result = fetch_snapshot(load_config(root), use_incremental_boundary=False)
 
         self.assertEqual(1, result.history_count)
-        self.assertEqual(2, result.snapshot.raw["history_pages_fetched"])
+        self.assertEqual(1, result.snapshot.raw["history_pages_fetched"])
         self.assertTrue(result.snapshot.raw["history_stopped_early"])
-        self.assertTrue(result.snapshot.raw["history_non_advancing_detected"])
+        self.assertFalse(result.snapshot.raw["history_non_advancing_detected"])
+        self.assertFalse(result.snapshot.raw["history_full_complete"])
+        self.assertTrue(result.snapshot.raw["history_front_boundary_complete"])
         self.assertTrue(result.snapshot.raw["partial"])
-        self.assertIn("history_pagination_non_advancing", {item["code"] for item in result.snapshot.raw["diagnostics"]})
-        self.assertEqual(5, mock_get.call_count)
+        self.assertIn("history_partial_unpageable", {item["code"] for item in result.snapshot.raw["diagnostics"]})
+        self.assertEqual(4, mock_get.call_count)
+
+    def test_null_account_boundary_is_repaired_then_hot_run_stops_on_page_one(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            session.state_paths.root.mkdir(parents=True, exist_ok=True)
+            session.state_paths.sync_boundary_path.write_text(
+                '{"schema_version":1,"generated_at":"2026-03-20T00:00:00Z",'
+                '"account_id_hint":null,"history":{"first_seen":["old"]},'
+                '"continue_watching":{"first_seen":[]},"favourites":{"first_seen":[]}}\n',
+                encoding="utf-8",
+            )
+            history_page = {
+                "vods": [{
+                    "id": 1001, "title": "Episode 12", "duration": 1440,
+                    "watchedAt": 1770504571302,
+                    "episodeInformation": {"seasonNumber": 1, "episodeNumber": 12,
+                        "seasonTitle": "Season 1", "seriesInformation": {"id": 3560, "title": "Show"}},
+                }],
+                "page": 1, "totalPages": 77,
+            }
+            home_partial = {"buckets": [{
+                "name": "CONTINUE WATCHING", "page": 1, "resultsPerPage": 1,
+                "totalPages": 2, "totalResults": 2, "contentList": [],
+            }]}
+            favourites = {"events": [{"id": 5005, "title": "Favorite Show"}], "page": 1, "totalPages": 1}
+            custom = {"watchlists": [], "pagingInfo": {"moreDataAvailable": False}}
+
+            with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+                HidiveSession, "json_get",
+                side_effect=[history_page, home_partial, favourites, custom],
+            ):
+                repaired = fetch_snapshot(load_config(root))
+
+            boundary_payload = __import__("json").loads(session.state_paths.sync_boundary_path.read_text(encoding="utf-8"))
+            self.assertEqual("acct-123", boundary_payload["account_id_hint"])
+            self.assertEqual(["3560|1001|1770504571302"], boundary_payload["history"]["first_seen"])
+            self.assertTrue(repaired.snapshot.raw["partial"])
+            self.assertFalse(repaired.snapshot.raw["history_full_complete"])
+            self.assertFalse(repaired.snapshot.raw["continue_complete"])
+            self.assertTrue(repaired.snapshot.raw["watchlist_complete"])
+            self.assertTrue(repaired.snapshot.raw["sync_boundary_rewrite_eligible"])
+
+            with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+                HidiveSession, "json_get", side_effect=[history_page, home_partial],
+            ) as mock_get:
+                hot = fetch_snapshot(load_config(root))
+
+            self.assertEqual("hot", hot.snapshot.raw["sync_boundary_mode"])
+            self.assertTrue(hot.snapshot.raw["history_front_boundary_complete"])
+            self.assertFalse(hot.snapshot.raw["history_full_complete"])
+            self.assertFalse(hot.snapshot.raw["watchlist_complete"])
+            self.assertEqual(0, hot.snapshot.raw["favourite_pages_fetched"])
+            self.assertEqual(0, hot.snapshot.raw["custom_watchlist_collection_pages_fetched"])
+            self.assertEqual(2, mock_get.call_count)
+            self.assertEqual({"size": 100, "page": 1}, mock_get.call_args_list[0].kwargs["params"])
+
+    def test_account_mismatch_fences_boundary_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            session.state_paths.root.mkdir(parents=True, exist_ok=True)
+            original = (
+                '{"schema_version":1,"generated_at":"2026-03-20T00:00:00Z",'
+                '"account_id_hint":"other-account","history":{"first_seen":["other-marker"]},'
+                '"continue_watching":{"first_seen":[]},"favourites":{"first_seen":[]}}\n'
+            )
+            session.state_paths.sync_boundary_path.write_text(original, encoding="utf-8")
+            responses = [
+                {"vods": [], "page": 1, "totalPages": 1},
+                {"buckets": []},
+                {"events": [], "page": 1, "totalPages": 1},
+                {"watchlists": [], "pagingInfo": {"moreDataAvailable": False}},
+            ]
+            with patch("mal_updater.hidive_snapshot.start_hidive_session", return_value=session), patch.object(
+                HidiveSession, "json_get", side_effect=responses,
+            ):
+                result = fetch_snapshot(load_config(root))
+
+            self.assertTrue(result.snapshot.raw["sync_boundary_present"])
+            self.assertFalse(result.snapshot.raw["sync_boundary_usable"])
+            self.assertEqual("account_mismatch", result.snapshot.raw["sync_boundary_account_status"])
+            self.assertTrue(result.snapshot.raw["sync_boundary_rewrite_blocked_by_account_mismatch"])
+            self.assertFalse(result.snapshot.raw["sync_boundary_rewrite_eligible"])
+            self.assertEqual(original, session.state_paths.sync_boundary_path.read_text(encoding="utf-8"))
 
     def test_custom_watchlist_detail_paginates_with_zero_last_seen_and_preserves_cross_list_membership(self) -> None:
         with tempfile.TemporaryDirectory() as td:
