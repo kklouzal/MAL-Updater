@@ -220,11 +220,16 @@ def _snapshot_diagnostics_from_raw(
         for item in diagnostics
         if isinstance(item, dict)
     }
-    expected_partial_codes = {"history_partial_unpageable", "continue_watching_partial_unpageable"}
+    # A proven hot boundary can satisfy the history-front objective on page 1,
+    # so that concrete run does not emit history_partial_unpageable.  The
+    # history diagnostic is therefore allowed, not required; Continue Watching
+    # remains the actual partial contributor and must still be explicit.
+    expected_partial_codes = {"continue_watching_partial_unpageable"}
+    allowed_partial_codes = expected_partial_codes | {"history_partial_unpageable"}
     partial_fully_explained = bool(
         hot_boundary_proven
         and expected_partial_codes.issubset(documented_partial_codes)
-        and documented_partial_codes.issubset(expected_partial_codes | {"hidive_surface_authority"})
+        and documented_partial_codes.issubset(allowed_partial_codes | {"hidive_surface_authority"})
         and raw.get("partial") is True
         and raw.get("history_full_complete") is False
         and raw.get("continue_complete") is False

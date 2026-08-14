@@ -651,6 +651,48 @@ class IngestionTests(unittest.TestCase):
         authority = next(item for item in diagnostics if item.get("code") == "hidive_surface_authority")
         self.assertTrue(authority["watchlist_authority_safe"])
 
+    def test_hidive_completed_hot_history_boundary_does_not_require_history_partial_diagnostic(self) -> None:
+        payload = sample_snapshot()
+        payload["provider"] = "hidive"
+        payload["account_id_hint"] = "acct-hidive"
+        payload["raw"] = {
+            "partial": True,
+            "snapshot_producer": "mal_updater.hidive_snapshot",
+            "surface_authority_schema_version": 1,
+            "sync_boundary_mode": "hot",
+            "sync_boundary_account_status": "account_match",
+            "sync_boundary_usable": True,
+            "history_front_boundary_complete": True,
+            "history_full_complete": False,
+            "history_stopped_early": False,
+            "history_non_advancing_detected": False,
+            "continue_complete": False,
+            "continue_partial": True,
+            "diagnostics": [
+                {"code": "continue_watching_partial_unpageable", "surface": "continue_watching", "severity": "info"},
+            ],
+            "surface_authority": {
+                "history_front_boundary_complete": True,
+                "history_full_complete": False,
+                "continue_complete": False,
+                "watchlist_complete": False,
+                "account_identity_proven": True,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            summary = ingest_provider_fetch_result(
+                self._concrete_hidive_result(payload, config), config, mode="hot"
+            )
+
+        codes = {item.get("code") for item in summary.diagnostics or []}
+        self.assertIn("continue_watching_partial_unpageable", codes)
+        self.assertNotIn("history_partial_unpageable", codes)
+        self.assertNotIn("snapshot_partial", codes)
+
     def test_hidive_partial_suppression_requires_exact_authority_and_limitation_conjunction(self) -> None:
         base = sample_snapshot()
         base["provider"] = "hidive"

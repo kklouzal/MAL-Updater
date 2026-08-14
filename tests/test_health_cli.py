@@ -144,6 +144,69 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertTrue(warning["automation_safe"])
         self.assertNotIn("snapshot_partial", surface["codes"])
 
+    def test_hidive_completed_hot_history_boundary_without_history_partial_is_automation_safe(self) -> None:
+        diagnostics = [
+            {
+                "code": "continue_watching_partial_unpageable",
+                "surface": "continue_watching",
+                "severity": "info",
+            },
+            {
+                "code": "hidive_surface_authority",
+                "surface": "provider_snapshot",
+                "severity": "info",
+                "sync_boundary_mode": "hot",
+                "sync_boundary_account_status": "account_match",
+                "producer_authenticated": True,
+                "account_identity_proven": True,
+                "history_front_boundary_complete": True,
+                "history_full_complete": False,
+                "continue_complete": False,
+                "watchlist_complete": False,
+                "watchlist_authority_safe": True,
+            },
+            {
+                "code": "watchlist_membership_generation",
+                "surface": "watchlist",
+                "severity": "info",
+                "complete": False,
+                "reason": "not_full_refresh_mode",
+            },
+        ]
+        from mal_updater.health_report import _provider_surface_diagnostics_from_sync_run
+
+        posture = _provider_surface_diagnostics_from_sync_run(
+            {"id": 1689, "provider": "hidive", "mode": "hot", "summary": {"diagnostics": diagnostics}}
+        )
+
+        self.assertIsNotNone(posture)
+        self.assertEqual("operator_visible", posture["health_posture"])
+        self.assertTrue(posture["automation_safe"])
+
+    def test_hidive_hot_surface_still_requires_continue_limitation_diagnostic(self) -> None:
+        authority = {
+            "code": "hidive_surface_authority",
+            "surface": "provider_snapshot",
+            "severity": "info",
+            "sync_boundary_mode": "hot",
+            "sync_boundary_account_status": "account_match",
+            "producer_authenticated": True,
+            "account_identity_proven": True,
+            "history_front_boundary_complete": True,
+            "history_full_complete": False,
+            "continue_complete": False,
+            "watchlist_authority_safe": True,
+        }
+        from mal_updater.health_report import _provider_surface_diagnostics_from_sync_run
+
+        posture = _provider_surface_diagnostics_from_sync_run(
+            {"id": 1, "provider": "hidive", "mode": "hot", "summary": {"diagnostics": [authority]}}
+        )
+
+        self.assertIsNotNone(posture)
+        self.assertEqual("unhealthy", posture["health_posture"])
+        self.assertFalse(posture["automation_safe"])
+
     def test_hidive_surface_authority_matrix_fails_closed(self) -> None:
         base = {
             "code": "hidive_surface_authority",

@@ -365,7 +365,11 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
         and authority.get("continue_complete") is False
         and authority.get("watchlist_authority_safe") is True
     )
-    expected_limitations = {"history_partial_unpageable", "continue_watching_partial_unpageable"}
+    # A hot fetch that intersects its saved history marker has completed the
+    # bounded history-front objective and legitimately has no history-partial
+    # diagnostic.  Continue Watching is still concretely partial/unpageable and
+    # remains required; the known history limitation is allowed when emitted.
+    expected_limitations = {"continue_watching_partial_unpageable"}
     only_documented_limitations = bool(
         expected_limitations.issubset(codes)
         and codes.issubset(documented_limitations)
