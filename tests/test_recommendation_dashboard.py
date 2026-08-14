@@ -239,6 +239,10 @@ class RecommendationDashboardTests(unittest.TestCase):
         for hidden_label in ("English dub", "Provider progress", "MAL watch status"):
             self.assertNotIn(f">{hidden_label}<", html)
         self.assertNotIn('data-key="provider_evidence"', html)
+        self.assertNotIn('data-key="verification"', html)
+        self.assertNotIn('data-key="evidence_freshness"', html)
+        self.assertNotIn(">Identity/review/catalog<", html)
+        self.assertNotIn(">Evidence freshness/expiry<", html)
         self.assertIn('data-key="score" data-type="number" aria-sort="none"', html)
         self.assertIn('data-key="title" data-sort-value="The Great Show (A &lt;Great&gt; Show (English Dub))"', html)
         self.assertIn('<span class="title-text">The Great Show', html)
@@ -650,10 +654,10 @@ class RecommendationDashboardTests(unittest.TestCase):
             r'<span class="title-text">Actionable Candidate</span><div class="title-providers" aria-label="Provider proof"><a class="provider-link"',
         )
         self.assertNotIn(">English dub evidence<", html)
-        self.assertIn("identity approved_mapping", html)
-        self.assertIn("review verified", html)
-        self.assertIn("catalog present", html)
-        self.assertIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", html)
+        self.assertNotIn("identity approved_mapping", html)
+        self.assertNotIn("review verified", html)
+        self.assertNotIn("catalog present", html)
+        self.assertNotIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", html)
         self.assertIn("Recommended because two completed favorites strongly support it.", html)
         self.assertIn("total 88.5", html)
         self.assertIn("Seed Favorite (17 MAL votes, score 9, completed)", html)
@@ -696,8 +700,8 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertNotIn("Watchable now — verified provider+dub proof", html)
         self.assertIn("Crunchyroll (unverified)", html)
         self.assertNotIn("present (unverified)", html)
-        self.assertIn("review review-needed", html)
-        self.assertIn("catalog present", html)
+        self.assertNotIn("review review-needed", html)
+        self.assertNotIn("catalog present", html)
 
     def test_dashboard_strict_actionability_matches_shared_identity_locale_and_freshness_semantics(self) -> None:
         accepted = [
@@ -1457,7 +1461,11 @@ class RecommendationDashboardTests(unittest.TestCase):
     def test_live_dashboard_recommendation_table_combines_provider_with_title_and_omits_removed_columns(self) -> None:
         html = render_dynamic_dashboard_html()
 
-        self.assertIn("const headings = ['Priority', 'Title', 'Identity/review/catalog'", html)
+        self.assertIn("const headings = ['Priority', 'Title', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']", html)
+        self.assertNotIn("Identity/review/catalog", html)
+        self.assertNotIn("Freshness/expiry", html)
+        self.assertNotIn("r.verification || e.verification_label", html)
+        self.assertNotIn("r.evidence_freshness || e.evidence_freshness_label", html)
         self.assertNotIn("${titleLabel} / provider proof", html)
         self.assertIn('class="title-providers" aria-label="Provider proof"', html)
         self.assertIn('scope="row"', html)
@@ -1473,7 +1481,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         html = render_dynamic_dashboard_html()
 
         self.assertIn("table{border-collapse:collapse;width:100%;background:#161d24}", html)
-        self.assertIn(".table-scroll table{min-width:70rem}", html)
+        self.assertIn(".table-scroll table{min-width:54rem}", html)
         self.assertIn(".ordinary-table-scroll table{min-width:36rem}", html)
         self.assertNotIn("table{border-collapse:collapse;width:100%;min-width:70rem", html)
         self.assertIn(
