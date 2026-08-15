@@ -155,7 +155,7 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
             if path == "/api/status": self._send_json(_status_payload(config=config, daemon=daemon_ref[0], store=store)); return
             if path == "/api/settings": self._send_json(store.status()); return
             if path == "/settings": self._send_html(product_page()); return
-            if path in {"/", "/dashboard", "/api/dashboard"}: super().do_GET(); return
+            if path in {"/", "/dashboard", "/debug", "/api/dashboard"}: super().do_GET(); return
             self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
         def do_HEAD(self) -> None: self.do_GET()
         def do_POST(self) -> None:

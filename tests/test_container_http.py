@@ -33,7 +33,10 @@ class HttpTests(unittest.TestCase):
   for path in ('/','/dashboard'):
    with urllib.request.urlopen(self.base+path,timeout=5) as r:
     html=r.read().decode(); self.assertEqual('nosniff',r.headers['X-Content-Type-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
-   self.assertIn('MAL-Updater live dashboard',html); self.assertIn('/api/dashboard',html); self.assertIn('href="/settings"',html); self.assertNotIn('Trusted LAN control plane',html)
+   self.assertIn('MAL-Updater live dashboard',html); self.assertIn('/api/dashboard',html); self.assertIn('href="/debug"',html); self.assertIn('href="/settings"',html); self.assertNotIn('Trusted LAN control plane',html)
+  with urllib.request.urlopen(self.base+'/debug',timeout=5) as r:
+   debug_html=r.read().decode(); self.assertEqual('no-store',r.headers['Cache-Control']); self.assertEqual('DENY',r.headers['X-Frame-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
+  self.assertIn('MAL-Updater debug',debug_html); self.assertIn('Snapshot',debug_html); self.assertIn('Recent provider sync runs',debug_html); self.assertIn('href="/"',debug_html); self.assertIn('href="/settings"',debug_html)
   response,dashboard=self.get_json('/api/dashboard')
   self.assertIn('recommendations',dashboard); self.assertEqual('no-store',response.headers['Cache-Control']); self.assertEqual('DENY',response.headers['X-Frame-Options'])
   with urllib.request.urlopen(self.base+'/settings',timeout=5) as r: settings_html=r.read().decode()
@@ -68,6 +71,6 @@ class HttpTests(unittest.TestCase):
   for path in ('/api/daemon','/api/login','/api/logout','/api/password','/api/setup/claim'):
    error=self.http_error(urllib.request.Request(self.base+path,data=b'{}',headers={'Content-Type':'application/json','X-CSRF-Token':self.store.csrf_token},method='POST')); self.assertEqual(404,error.code)
  def test_trusted_host_validation_covers_pages_dashboard_api_and_oauth_callback(self):
-  for path in ('/','/dashboard','/api/dashboard','/settings','/api/csrf','/oauth/mal/callback?state=x&code=fake'):
+  for path in ('/','/dashboard','/debug','/api/dashboard','/settings','/api/csrf','/oauth/mal/callback?state=x&code=fake'):
    error=self.http_error(urllib.request.Request(self.base+path,headers={'Host':'public.example'})); self.assertEqual(400,error.code)
 if __name__=='__main__': unittest.main()

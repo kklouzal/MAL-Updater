@@ -15,7 +15,7 @@ from unittest.mock import patch
 from mal_updater.config import load_config
 from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows, replace_mal_recommendation_edges, upsert_mal_anime_metadata, upsert_recommendation_provider_eligibility_evidence
 from mal_updater.cli import build_parser, _cmd_recommend_snapshots
-from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_recommendation_dashboard, write_recommendation_dashboard
+from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_dynamic_debug_html, render_recommendation_dashboard, write_recommendation_dashboard
 from mal_updater.recommendations import Recommendation, build_recommendations
 
 
@@ -1478,7 +1478,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertNotIn("const progress = r =>", html)
 
     def test_live_dashboard_scopes_wide_tables_and_wraps_recent_sync_runs(self) -> None:
-        html = render_dynamic_dashboard_html()
+        html = render_dynamic_debug_html()
 
         self.assertIn("table{border-collapse:collapse;width:100%;background:#161d24}", html)
         self.assertIn(".table-scroll table{min-width:54rem}", html)
@@ -1502,22 +1502,45 @@ class RecommendationDashboardTests(unittest.TestCase):
             db_path = Path(temp_dir) / "state.db"
             bootstrap_database(db_path)
             html = render_dynamic_dashboard_html()
+            debug_html = render_dynamic_debug_html(settings_href="/settings")
             self.assertIn("/api/dashboard", html)
             self.assertIn("Recommendations", html)
             self.assertIn("Top watched seeds", html)
             self.assertIn("MAL vote", html)
-            self.assertIn("Public MAL userrecs crawl", html)
-            self.assertIn("Completion ETA", html)
-            self.assertIn("unknown_pages_per_source", html)
             self.assertIn("section_metadata", html)
             self.assertIn("Array.isArray(r.genres)", html)
             self.assertNotIn("(r.genres || []).join(', ')", html)
+            for moved_section in (
+                "Snapshot",
+                "Strict coverage",
+                "MAL harvest coverage",
+                "<h2>Providers</h2>",
+                "Review queue",
+                "Public MAL userrecs crawl",
+                "Crawl coverage",
+                "Backlog/open",
+                "Hourly throughput",
+                "Source-start ETA",
+                "Completion ETA",
+                "Recent provider sync runs",
+            ):
+                self.assertNotIn(moved_section, html)
+                self.assertIn(moved_section, debug_html)
+            self.assertIn('href="/debug">Debug</a>', html)
+            self.assertIn('href="/">Dashboard</a>', debug_html)
+            self.assertIn('href="/settings">Settings</a>', debug_html)
+            self.assertIn("Provider enrichment health", html)
+            self.assertIn("Indicators", html)
+            self.assertNotIn("providerEnrichmentSection(data.operational?.provider_enrichment)", debug_html)
+            self.assertNotIn("<h2>Indicators</h2>", debug_html)
+            self.assertIn("unknown_pages_per_source", debug_html)
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(db_path))
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 root = urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=5).read().decode("utf-8")
+                debug = urlopen(f"http://127.0.0.1:{server.server_port}/debug", timeout=5).read().decode("utf-8")
                 api = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard", timeout=5).read().decode("utf-8"))
                 override = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=3", timeout=5).read().decode("utf-8"))
                 invalid = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=not-an-int", timeout=5).read().decode("utf-8"))
@@ -1528,6 +1551,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
             self.assertIn("MAL-Updater live dashboard", root)
+            self.assertIn("MAL-Updater debug", debug)
             self.assertIn("snapshot", api)
             self.assertEqual(
                 {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
