@@ -16,7 +16,7 @@ from unittest.mock import patch
 from mal_updater.config import load_config
 from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows, replace_mal_recommendation_edges, upsert_mal_anime_metadata, upsert_recommendation_provider_eligibility_evidence
 from mal_updater.cli import build_parser, _cmd_recommend_snapshots
-from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_dynamic_debug_html, render_recommendation_dashboard, write_recommendation_dashboard
+from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, GENRE_AFFINITY_DEFAULT_LIMIT, aggregate_genre_affinity, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_dynamic_debug_html, render_recommendation_dashboard, write_recommendation_dashboard
 from mal_updater.recommendations import Recommendation, build_recommendations
 
 
@@ -92,6 +92,89 @@ def _query_only_connect_trap(write_actions: list[tuple[int, str | None, str | No
 
 
 class RecommendationDashboardTests(unittest.TestCase):
+
+    def test_genre_affinity_aggregates_limits_and_normalizes_watched_titles(self) -> None:
+        rows = [
+            {"list_status": "completed", "metadata_raw_json": {"genres": [{"name": "Action"}, {"name": "Comedy"}]}},
+            {"list_status": "watching", "metadata_raw_json": {"genres": [{"name": "Action"}, {"name": "Drama"}]}},
+            {"list_status": "completed", "metadata_raw_json": {"genres": [{"name": "Drama"}, {"name": "Drama"}]}},
+            {"list_status": "plan_to_watch", "metadata_raw_json": {"genres": [{"name": "Action"}]}},
+            {"list_status": "completed", "metadata_raw_json": {"genres": []}},
+        ]
+
+        model = aggregate_genre_affinity(rows, limit=2)
+
+        self.assertEqual(2, model["limit"])
+        self.assertEqual(3, model["available_genre_count"])
+        self.assertEqual(3, model["represented_title_count"])
+        self.assertEqual(
+            [
+                {"genre": "Action", "title_count": 2, "weighted_count": 1.5, "normalized": 100.0},
+                {"genre": "Drama", "title_count": 2, "weighted_count": 1.5, "normalized": 100.0},
+            ],
+            model["axes"],
+        )
+
+    def test_genre_affinity_empty_sparse_payload_is_explicit(self) -> None:
+        model = aggregate_genre_affinity([
+            {"list_status": "dropped", "metadata_raw_json": {"genres": [{"name": "Action"}]}},
+            {"list_status": "completed", "metadata_raw_json": "not-json"},
+        ])
+
+        self.assertEqual([], model["axes"])
+        self.assertEqual(GENRE_AFFINITY_DEFAULT_LIMIT, model["limit"])
+        self.assertEqual(0, model["available_genre_count"])
+        self.assertEqual(0, model["represented_title_count"])
+
+    def test_live_dashboard_payload_includes_genre_affinity_from_watched_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                for mal_id, status, genres in (
+                    (1, "completed", ["Action", "Adventure"]),
+                    (2, "watching", ["Action", "Comedy"]),
+                    (3, "on_hold", ["Adventure"]),
+                ):
+                    conn.execute(
+                        """
+                        INSERT INTO mal_user_anime_list_cache (
+                            mal_anime_id,title,list_status,user_score,num_episodes_watched,node_json,list_status_json,raw_json,
+                            refresh_run_id,refresh_generation,fetched_at,last_seen_at
+                        ) VALUES (?, ?, ?, NULL, NULL, '{}', '{}', '{}', 'test', 1, '2026-08-15T00:00:00Z', '2026-08-15T00:00:00Z')
+                        """,
+                        (mal_id, f"Title {mal_id}", status),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO mal_anime_metadata (mal_anime_id,title,raw_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (mal_id, f"Title {mal_id}", json.dumps({"genres": [{"name": genre} for genre in genres]})),
+                    )
+
+            payload = build_dashboard_payload(db_path)
+
+        self.assertEqual("genre_affinity", next(key for key in payload if key == "genre_affinity"))
+        self.assertEqual(
+            [
+                {"genre": "Action", "title_count": 2, "weighted_count": 1.5, "normalized": 100.0},
+                {"genre": "Adventure", "title_count": 1, "weighted_count": 1.0, "normalized": 66.7},
+                {"genre": "Comedy", "title_count": 1, "weighted_count": 0.5, "normalized": 33.3},
+            ],
+            payload["genre_affinity"]["axes"],
+        )
+
+    def test_live_dashboard_renders_genre_affinity_above_recommendations_with_accessible_detail(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn('function genreAffinitySection(model)', html)
+        self.assertIn('id="genre-affinity"', html)
+        self.assertIn('role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"', html)
+        self.assertIn('Exact values', html)
+        self.assertIn('Not enough completed/currently-watching titles with genre metadata', html)
+        self.assertLess(html.index('${genreAffinitySection(data.genre_affinity)}'), html.index('<section><h2>Recommendations</h2>'))
+
     def test_strict_actionability_shared_semantics_cover_identity_locales_failures_and_counts(self) -> None:
         accepted_cases = [
             ("approved_mapping", ["en"]),
@@ -399,7 +482,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 payload = build_dashboard_payload(db_path)
 
             self.assertEqual(
-                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                {"generated_at", "snapshot", "genre_affinity", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
                 set(payload),
             )
             self.assertTrue(any("No persisted recommendation snapshot" in item["message"] for item in payload["indicators"]))
@@ -447,7 +530,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertFalse(db_path.parent.exists())
             self.assertFalse(db_path.exists())
             self.assertEqual(
-                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                {"generated_at", "snapshot", "genre_affinity", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
                 set(payload),
             )
             self.assertEqual(
@@ -534,7 +617,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             payload = build_dashboard_payload(db_path)
 
             self.assertEqual(
-                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                {"generated_at", "snapshot", "genre_affinity", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
                 set(payload),
             )
             self.assertEqual(
@@ -1669,7 +1752,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertIn("Provider enrichment health", debug)
             self.assertIn("snapshot", api)
             self.assertEqual(
-                {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+                {"generated_at", "snapshot", "genre_affinity", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
                 set(api),
             )
             self.assertIn("sections", api["recommendations"])
@@ -1705,7 +1788,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             payload = build_dashboard_payload(db_path)
 
         self.assertEqual(
-            {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+            {"generated_at", "snapshot", "genre_affinity", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
             set(payload),
         )
         self.assertIsInstance(payload["indicators"], list)

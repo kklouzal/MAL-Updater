@@ -34,6 +34,8 @@ from .recommendation_enrichment import build_provider_enrichment_diagnostics, un
 DASHBOARD_MIN_RECOMMENDATION_LIMIT = 1
 DASHBOARD_MAX_RECOMMENDATION_LIMIT = 500
 DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT = 120
+GENRE_AFFINITY_DEFAULT_LIMIT = 10
+GENRE_AFFINITY_WATCHING_WEIGHT = 0.5
 STRICT_DISCOVERY_DIAGNOSTIC_COMMAND = "PYTHONPATH=src python3 -m mal_updater.cli recommend --include-dormant --limit 120"
 
 _PROVIDER_LABELS = {"crunchyroll": "Crunchyroll", "hidive": "HIDIVE", "mal": "MyAnimeList", "unknown": "Unknown"}
@@ -742,6 +744,7 @@ def _unavailable_dashboard_payload(*, limit: int, reason: str, db_path: Path | N
     return {
         "generated_at": _utc_now_z(),
         "snapshot": None,
+        "genre_affinity": aggregate_genre_affinity([]),
         "recommendations": {
             "mode": "strict_actionable",
             "strict_default": True,
@@ -1219,6 +1222,72 @@ def _dashboard_config(db_path: Path, config: AppConfig | None = None) -> AppConf
     return config
 
 
+def _genre_names(raw: Any) -> set[str]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return set()
+    if not isinstance(raw, dict) or not isinstance(raw.get("genres"), list):
+        return set()
+    names: set[str] = set()
+    for genre in raw["genres"]:
+        name = genre.get("name") if isinstance(genre, dict) else genre
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def aggregate_genre_affinity(rows: Iterable[Any], *, limit: int = GENRE_AFFINITY_DEFAULT_LIMIT) -> dict[str, Any]:
+    """Aggregate unique completed/watching MAL titles into a bounded chart model."""
+    aggregates: dict[str, dict[str, float | int | str]] = {}
+    represented_titles = 0
+    for row in rows:
+        status = str(row["list_status"] or "").strip().lower()
+        weight = 1.0 if status == "completed" else GENRE_AFFINITY_WATCHING_WEIGHT if status == "watching" else 0.0
+        genres = _genre_names(row["metadata_raw_json"])
+        if not weight or not genres:
+            continue
+        represented_titles += 1
+        for genre in genres:
+            item = aggregates.setdefault(genre, {"genre": genre, "title_count": 0, "weighted_count": 0.0})
+            item["title_count"] = int(item["title_count"]) + 1
+            item["weighted_count"] = float(item["weighted_count"]) + weight
+    ordered = sorted(aggregates.values(), key=lambda item: (-float(item["weighted_count"]), -int(item["title_count"]), str(item["genre"]).casefold()))
+    bounded = ordered[: max(1, int(limit))]
+    maximum = max((float(item["weighted_count"]) for item in bounded), default=0.0)
+    axes = [
+        {
+            **item,
+            "weighted_count": round(float(item["weighted_count"]), 2),
+            "normalized": round(float(item["weighted_count"]) / maximum * 100, 1) if maximum else 0.0,
+        }
+        for item in bounded
+    ]
+    return {
+        "axes": axes,
+        "available_genre_count": len(ordered),
+        "represented_title_count": represented_titles,
+        "limit": max(1, int(limit)),
+        "completed_weight": 1.0,
+        "watching_weight": GENRE_AFFINITY_WATCHING_WEIGHT,
+    }
+
+
+def _genre_affinity_from_local_state(db_path: Path) -> dict[str, Any]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT list.mal_anime_id, list.list_status, metadata.raw_json AS metadata_raw_json
+            FROM mal_user_anime_list_cache AS list
+            LEFT JOIN mal_anime_metadata AS metadata ON metadata.mal_anime_id = list.mal_anime_id
+            WHERE list.list_status IN ('completed', 'watching')
+            ORDER BY list.mal_anime_id
+            """
+        ).fetchall()
+    return aggregate_genre_affinity(rows)
+
+
 def _public_userrecs_policy_kwargs_from_db_path(db_path: Path, *, config: AppConfig | None = None) -> dict[str, int]:
     source_titles_per_hour = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 3))
     max_pages_per_source_per_run = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 10))
@@ -1449,6 +1518,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "snapshot": latest_snapshot,
+        "genre_affinity": _genre_affinity_from_local_state(db_path),
         "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "diagnostic_source_snapshot": diagnostic_source_snapshot, "limit": display_limit, "limit_scope": "per_section"},
         "coverage": coverage,
         "operational": operational,
@@ -1468,7 +1538,7 @@ def _render_dynamic_dashboard_page(
     template = """<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <title>__TITLE__</title><style>
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}th,td{padding:.55rem .6rem}}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.affinity-card{margin:1.25rem 0}.affinity-layout{display:grid;grid-template-columns:minmax(18rem,32rem) minmax(16rem,1fr);gap:1rem;align-items:center}.affinity-chart{display:block;width:100%;height:auto;max-height:32rem}.affinity-grid{fill:none;stroke:#435363;stroke-width:1}.affinity-axis{stroke:#435363;stroke-width:1}.affinity-area{fill:#4b9fff55;stroke:#8cc8ff;stroke-width:2}.affinity-point{fill:#b9f6ca;stroke:#101418;stroke-width:1.5}.affinity-details{columns:2;column-gap:1.5rem;margin:.5rem 0;padding-left:1.2rem}.affinity-details li{break-inside:avoid;margin:.25rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}.affinity-layout{grid-template-columns:1fr}.affinity-details{columns:1}th,td{padding:.55rem .6rem}}
 </style></head><body>__NAVIGATION__<h1>__TITLE__</h1><p class=\"muted\">__INTRO__ Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const countValue = value => {
@@ -1531,6 +1601,19 @@ function recommendationControls(data){
   const chips = selectedGenres.map(genre => `<span class=\"genre-chip\"><span>${esc(genre)}</span><button type=\"button\" class=\"genre-remove\" data-genre=\"${esc(genre)}\" aria-label=\"${esc(`Remove ${genre} genre filter`)}\">×</button></span>`).join('');
   return `<div class=\"recommendation-controls\" data-genre-control><div class=\"genre-filter\"><button type=\"button\" id=\"genre-menu-trigger\" class=\"genre-menu-trigger\" aria-haspopup=\"menu\" aria-controls=\"genre-menu\" aria-expanded=\"${genreMenuOpen}\">Add genre filter</button>${menu}</div><div class=\"genre-chips\" aria-label=\"Selected genre filters\">${chips || '<span class=\"muted\">All genres</span>'}</div><label><input id=\"show-hidden-titles\" type=\"checkbox\"${showHiddenTitles ? ' checked' : ''}> Show hidden titles</label></div>`;
 }
+function genreAffinitySection(model){
+  const axes = Array.isArray(model?.axes) ? model.axes : [];
+  if (axes.length < 3) return `<section id="genre-affinity" class="card affinity-card"><h2>Genre affinity</h2><p class="muted" role="status">Not enough completed/currently-watching titles with genre metadata to draw a radar chart.</p></section>`;
+  const center = 200, radius = 135;
+  const point = (index, scale = 1) => { const angle = -Math.PI / 2 + index * Math.PI * 2 / axes.length; return [center + Math.cos(angle) * radius * scale, center + Math.sin(angle) * radius * scale]; };
+  const polygon = scale => axes.map((_, index) => point(index, scale).join(',')).join(' ');
+  const grid = [0.25, 0.5, 0.75, 1].map(scale => `<polygon class="affinity-grid" points="${polygon(scale)}"/>`).join('');
+  const axisLines = axes.map((_, index) => { const [x,y] = point(index); return `<line class="affinity-axis" x1="${center}" y1="${center}" x2="${x}" y2="${y}"/>`; }).join('');
+  const values = axes.map((axis, index) => point(index, Number(axis.normalized || 0) / 100).join(',')).join(' ');
+  const points = axes.map((axis, index) => { const [x,y] = point(index, Number(axis.normalized || 0) / 100); const detail = `${axis.genre}: ${axis.title_count} titles, ${axis.weighted_count} weighted`; return `<circle class="affinity-point" cx="${x}" cy="${y}" r="5"><title>${esc(detail)}</title></circle>`; }).join('');
+  const details = axes.map(axis => `<li><strong>${esc(axis.genre)}</strong>: ${esc(axis.title_count)} title${axis.title_count === 1 ? '' : 's'} · ${esc(axis.weighted_count)} weighted · ${esc(axis.normalized)}%</li>`).join('');
+  return `<section id="genre-affinity" class="card affinity-card" aria-labelledby="genre-affinity-title"><h2 id="genre-affinity-title">Genre affinity</h2><p class="muted">Top ${esc(axes.length)} of ${esc(model.available_genre_count)} represented genres. Completed titles count 1; currently watching count ${esc(model.watching_weight)}. Values are normalized to the strongest displayed genre.</p><div class="affinity-layout"><svg class="affinity-chart" viewBox="0 0 400 400" role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"><title id="genre-affinity-svg-title">Genre affinity radar chart</title><desc id="genre-affinity-svg-desc">Normalized affinity for ${esc(axes.map(axis => axis.genre).join(', '))}. Exact values follow the chart.</desc>${grid}${axisLines}<polygon class="affinity-area" points="${values}"/>${points}</svg><div><h3>Exact values</h3><ol class="affinity-details">${details}</ol><p class="muted">${esc(model.represented_title_count)} unique watched titles contributed genre metadata.</p></div></div></section>`;
+}
 function renderDashboard(data){
   latestDashboardData = data;
   const state = data.recommendations?.coverage_state || {};
@@ -1542,7 +1625,7 @@ function renderDashboard(data){
     const description = name !== 'discovery_available_now' && meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : '';
     return `<h3>${esc(meta.label || name)} (${esc(visibleRows.length)})</h3>${description}${recTable(visibleRows, {...meta, enable_controls:true, hidden_titles:hiddenTitles})}`;
   }).join('') || recTable([], {enable_controls:true, hidden_titles:hiddenTitles});
-  document.getElementById('app').innerHTML = `${failureSection(data)}${mode}${emptyState(state)}<section><h2>Recommendations</h2>${recommendationControls(data)}${sectionHtml}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`;
+  document.getElementById('app').innerHTML = `${failureSection(data)}${mode}${emptyState(state)}${genreAffinitySection(data.genre_affinity)}<section><h2>Recommendations</h2>${recommendationControls(data)}${sectionHtml}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)} · <a href=\"/api/dashboard\">JSON</a></p>`;
   document.getElementById('genre-menu-trigger')?.addEventListener('click', () => { genreMenuOpen = !genreMenuOpen; renderDashboard(data); const focusTarget = genreMenuOpen ? document.querySelector('.genre-option') : document.getElementById('genre-menu-trigger'); focusTarget?.focus(); });
   document.querySelectorAll('.genre-option').forEach(button => button.addEventListener('click', () => { const genre = button.dataset.genre; if (genre && !selectedGenres.includes(genre)) selectedGenres = [...selectedGenres, genre]; genreMenuOpen = false; renderDashboard(data); document.getElementById('genre-menu-trigger')?.focus(); }));
   document.querySelectorAll('.genre-remove').forEach(button => button.addEventListener('click', () => { selectedGenres = selectedGenres.filter(genre => genre !== button.dataset.genre); renderDashboard(data); document.getElementById('genre-menu-trigger')?.focus(); }));
