@@ -1512,6 +1512,61 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertNotIn(f"<th>{heading}</th>", html)
         self.assertNotIn("const progress = r =>", html)
 
+    def test_live_dashboard_genre_filter_is_payload_derived_and_client_side(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn('for="genre-filter">Genre</label>', html)
+        self.assertIn('<option value="">All genres</option>', html)
+        self.assertIn("function dashboardGenres(data)", html)
+        self.assertIn("Object.values(data.recommendations?.sections || {}).flat()", html)
+        self.assertIn("rows.filter(r => Array.isArray(r.genres) && r.genres.includes(selectedGenre))", html)
+        self.assertIn("document.getElementById('genre-filter')?.addEventListener('change'", html)
+        self.assertNotIn("fetch('/api/dashboard?genre=", html)
+
+    def test_live_dashboard_hidden_titles_persist_and_compose_with_genre_filter(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn("localStorage.getItem(dismissedTitlesKey)", html)
+        self.assertIn("localStorage.setItem(dismissedTitlesKey", html)
+        self.assertIn('id="show-hidden-titles" type="checkbox"', html)
+        self.assertIn("showHiddenTitles ? genreRows : genreRows.filter", html)
+        self.assertIn("hiddenTitles.has(recommendationIdentity(r))", html)
+        self.assertIn("hiddenTitles.delete(identity)", html)
+        self.assertIn("hiddenTitles.add(identity)", html)
+        self.assertIn("hidden ? 'Unhide' : 'Hide'", html)
+        self.assertIn("hidden-recommendation", html)
+        self.assertIn("background:#29343d", html)
+        self.assertNotIn("background:#ff", html)
+
+    def test_live_dashboard_hidden_identity_prefers_mal_then_canonical_provider_then_safe_fallback(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        mal_identity = "if (r.mal_anime_id != null && String(r.mal_anime_id).trim()) return `mal:${String(r.mal_anime_id).trim()}`"
+        provider_identity = "if (r.provider && r.provider_series_id) return `provider:${String(r.provider).trim().toLowerCase()}:${String(r.provider_series_id).trim()}`"
+        fallback_identity = "return `fallback:${encodeURIComponent(`${r.kind || 'recommendation'}|${title}`)}`"
+        self.assertIn(mal_identity, html)
+        self.assertIn(provider_identity, html)
+        self.assertIn(fallback_identity, html)
+        self.assertLess(html.index(mal_identity), html.index(provider_identity))
+        self.assertLess(html.index(provider_identity), html.index(fallback_identity))
+        self.assertIn('data-recommendation-id="${esc(identity)}"', html)
+
+    def test_live_dashboard_removes_duplicate_watchable_copy_but_keeps_green_banner(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        duplicate = "Actionable discovery titles require fresh verified Crunchyroll or HIDIVE availability plus explicit English dub evidence."
+        self.assertNotIn(duplicate, html)
+        self.assertIn('<section class="banner good"><strong>Watchable now dashboard:</strong>', html)
+        self.assertIn("name !== 'discovery_available_now' && meta.description", html)
+
+    def test_debug_dashboard_does_not_enable_main_recommendation_controls(self) -> None:
+        debug_html = render_dynamic_debug_html()
+
+        self.assertNotIn('id="genre-filter"', debug_html)
+        self.assertNotIn('id="show-hidden-titles"', debug_html)
+        self.assertNotIn("localStorage.getItem", debug_html)
+        self.assertNotIn("renderDashboard(data)", debug_html)
+
     def test_live_dashboard_scopes_wide_tables_and_wraps_recent_sync_runs(self) -> None:
         html = render_dynamic_debug_html()
 
