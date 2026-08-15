@@ -1512,23 +1512,40 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertNotIn(f"<th>{heading}</th>", html)
         self.assertNotIn("const progress = r =>", html)
 
-    def test_live_dashboard_genre_filter_is_payload_derived_and_client_side(self) -> None:
+    def test_live_dashboard_multi_genre_filter_menu_is_payload_derived_and_client_side(self) -> None:
         html = render_dynamic_dashboard_html()
 
-        self.assertIn('for="genre-filter">Genre</label>', html)
-        self.assertIn('<option value="">All genres</option>', html)
+        self.assertIn('id="genre-menu-trigger"', html)
+        self.assertIn('aria-haspopup="menu"', html)
+        self.assertIn('aria-controls="genre-menu"', html)
+        self.assertIn('role="menu" aria-label="Available genres"', html)
+        self.assertIn('role="menuitem" class="genre-option"', html)
+        self.assertIn("Add genre filter", html)
         self.assertIn("function dashboardGenres(data)", html)
         self.assertIn("Object.values(data.recommendations?.sections || {}).flat()", html)
-        self.assertIn("rows.filter(r => Array.isArray(r.genres) && r.genres.includes(selectedGenre))", html)
-        self.assertIn("document.getElementById('genre-filter')?.addEventListener('change'", html)
+        self.assertIn("selectedGenres.every(genre => r.genres.includes(genre))", html)
+        self.assertIn("if (genre && !selectedGenres.includes(genre))", html)
+        self.assertIn("filter(genre => !selectedGenres.includes(genre))", html)
         self.assertNotIn("fetch('/api/dashboard?genre=", html)
 
-    def test_live_dashboard_hidden_titles_persist_and_compose_with_genre_filter(self) -> None:
+    def test_live_dashboard_multi_genre_chips_are_removable_and_dismissible(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn('class="genre-chip"', html)
+        self.assertIn('class="genre-remove"', html)
+        self.assertIn("Remove ${genre} genre filter", html)
+        self.assertIn("selectedGenres = selectedGenres.filter", html)
+        self.assertIn("event.key !== 'Escape'", html)
+        self.assertIn("event.target.closest('[data-genre-control]')", html)
+        self.assertIn("No recommendations match the current filters in this section.", html)
+
+    def test_live_dashboard_hidden_titles_persist_and_compose_with_multi_genre_filter(self) -> None:
         html = render_dynamic_dashboard_html()
 
         self.assertIn("localStorage.getItem(dismissedTitlesKey)", html)
         self.assertIn("localStorage.setItem(dismissedTitlesKey", html)
         self.assertIn('id="show-hidden-titles" type="checkbox"', html)
+        self.assertIn("selectedGenres.length ? rows.filter", html)
         self.assertIn("showHiddenTitles ? genreRows : genreRows.filter", html)
         self.assertIn("hiddenTitles.has(recommendationIdentity(r))", html)
         self.assertIn("hiddenTitles.delete(identity)", html)
@@ -1563,6 +1580,8 @@ class RecommendationDashboardTests(unittest.TestCase):
         debug_html = render_dynamic_debug_html()
 
         self.assertNotIn('id="genre-filter"', debug_html)
+        self.assertNotIn('id="genre-menu-trigger"', debug_html)
+        self.assertNotIn("let selectedGenres", debug_html)
         self.assertNotIn('id="show-hidden-titles"', debug_html)
         self.assertNotIn("localStorage.getItem", debug_html)
         self.assertNotIn("renderDashboard(data)", debug_html)
