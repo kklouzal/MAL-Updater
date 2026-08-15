@@ -172,6 +172,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn('id="genre-affinity"', html)
         self.assertIn('role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"', html)
         self.assertIn('Exact values', html)
+        self.assertNotIn('represented genres. Completed titles count', html)
         self.assertIn('Not enough completed/currently-watching titles with genre metadata', html)
         self.assertLess(html.index('${genreAffinitySection(data.genre_affinity)}'), html.index('<section><h2>Recommendations</h2>'))
 
