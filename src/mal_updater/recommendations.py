@@ -500,10 +500,6 @@ def _build_new_episode_recommendations(
             continue
         if state.completed_episode_count <= 0:
             continue
-        if any(state.completion_audit.get("completion_uncertain_by", {}).values()):
-            # Unknown HIDIVE history may show activity/recency, but it cannot
-            # manufacture the available/completed tail used by this recommender.
-            continue
         if state.max_episode_number is None:
             continue
 

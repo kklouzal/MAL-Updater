@@ -72,6 +72,100 @@ class HidiveProgressProvenanceTests(unittest.TestCase):
             self.assertEqual("skip", proposal.decision)
             self.assertIn("completion_unknown_history_membership=1", proposal.reasons)
 
+    def test_mixed_evidence_preserves_confirmed_completion_without_uncertain_tail_or_freshness(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = self._config(Path(td))
+            measured = {
+                "playback_position_ms": 1440000,
+                "completion_ratio": 1.0,
+                "progress_source_surface": "hidive_continue_watching",
+                "progress_observation_kind": "position",
+                "completion_assertion": "confirmed",
+            }
+            ingest_snapshot_payload(
+                self._payload(
+                    [
+                        self._progress(provider_episode_id="e1", episode_number=1, **measured),
+                        self._progress(provider_episode_id="e2", episode_number=2, **measured),
+                        self._progress(
+                            provider_episode_id="e3",
+                            episode_number=3,
+                            playback_position_ms=240000,
+                            completion_ratio=1 / 6,
+                            progress_source_surface="hidive_continue_watching",
+                            progress_observation_kind="position",
+                            completion_assertion="unknown",
+                            last_watched_at="2026-08-15T12:00:00Z",
+                        ),
+                        self._progress(provider_episode_id="history-tail", episode_number=99, last_watched_at="2026-08-17T00:00:00Z"),
+                    ]
+                ),
+                config,
+            )
+            with sqlite3.connect(config.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO provider_episode_progress (provider, provider_episode_id, provider_series_id, episode_number, playback_position_ms, duration_ms, completion_ratio, last_watched_at, raw_json) "
+                    "VALUES ('hidive','legacy-tail','s1',100,1440000,1440000,1.0,'2026-08-18T00:00:00Z','{}')"
+                )
+                conn.commit()
+
+            state = load_provider_series_states(config, provider="hidive")[0]
+            self.assertEqual(2, state.completed_episode_count)
+            self.assertEqual(2, state.max_completed_episode_number)
+            self.assertEqual(3, state.max_episode_number)
+            self.assertEqual("2026-08-15T12:00:00Z", state.last_watched_at)
+            self.assertEqual(1, state.completion_audit["completion_uncertain_by"]["completion_unknown_history_membership"])
+            self.assertEqual(1, state.completion_audit["completion_uncertain_by"]["legacy_unproven_hidive_synthetic_completion"])
+
+            recommendations = _build_new_episode_recommendations([state])
+            self.assertEqual(1, len(recommendations))
+            self.assertEqual(1, recommendations[0].context["contiguous_tail_gap"])
+            self.assertEqual("2026-08-15T12:00:00Z", recommendations[0].context["last_watched_at"])
+
+            partial = _plan_status_update(
+                state,
+                {"id": 123, "title": "Show", "num_episodes": 3, "my_list_status": {"status": "watching", "num_episodes_watched": 0}},
+                "mapped", 1.0, mapping_source="test", persisted_mapping_approved=True,
+            )
+            self.assertEqual("propose_update", partial.decision)
+            self.assertEqual({"status": "watching", "num_watched_episodes": 2}, partial.proposed_my_list_status)
+
+            completed = _plan_status_update(
+                state,
+                {"id": 123, "title": "Show", "num_episodes": 2, "my_list_status": {"status": "watching", "num_episodes_watched": 0}},
+                "mapped", 1.0, mapping_source="test", persisted_mapping_approved=True,
+            )
+            self.assertEqual("propose_update", completed.decision)
+            self.assertEqual("completed", completed.proposed_my_list_status["status"])
+            self.assertEqual(2, completed.proposed_my_list_status["num_watched_episodes"])
+
+    def test_uncertain_later_row_cannot_unlock_inferred_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = self._config(Path(td))
+            ingest_snapshot_payload(
+                self._payload(
+                    [
+                        self._progress(
+                            provider_episode_id="e1",
+                            episode_number=1,
+                            playback_position_ms=1296000,
+                            completion_ratio=0.9,
+                            progress_source_surface="hidive_continue_watching",
+                            progress_observation_kind="position",
+                            completion_assertion="unknown",
+                        ),
+                        self._progress(provider_episode_id="history-e2", episode_number=2, last_watched_at="2026-08-16T00:00:00Z"),
+                    ]
+                ),
+                config,
+            )
+
+            state = load_provider_series_states(config, provider="hidive")[0]
+            self.assertEqual(0, state.completed_episode_count)
+            self.assertIsNone(state.max_completed_episode_number)
+            self.assertEqual(1, state.max_episode_number)
+            self.assertEqual([], _build_new_episode_recommendations([state]))
+
     def test_migration_preserves_legacy_values_and_sets_nullable_provenance(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "db.sqlite3"

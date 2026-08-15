@@ -402,15 +402,18 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     }
 
     for row in rows:
-        if row.episode_number is not None:
-            max_episode_number = row.episode_number if max_episode_number is None else max(max_episode_number, row.episode_number)
-        if row.last_watched_at and (last_watched_at is None or row.last_watched_at > last_watched_at):
-            last_watched_at = row.last_watched_at
         if row.last_seen_at and (last_progress_seen_at is None or row.last_seen_at > last_progress_seen_at):
             last_progress_seen_at = row.last_seen_at
         uncertainty_reason = _completion_uncertainty_reason(row)
         if uncertainty_reason is not None:
             uncertain_reason_counts[uncertainty_reason] += 1
+        else:
+            # Completion-uncertain rows remain visible in activity/audit counts,
+            # but cannot extend a completion-dependent tail or its freshness.
+            if row.episode_number is not None:
+                max_episode_number = row.episode_number if max_episode_number is None else max(max_episode_number, row.episode_number)
+            if row.last_watched_at and (last_watched_at is None or row.last_watched_at > last_watched_at):
+                last_watched_at = row.last_watched_at
         completion_reason = _completion_reason(row, rows, config)
         if completion_reason is None:
             if len(incomplete_examples) < 5:
@@ -480,7 +483,8 @@ def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgress
         return None
 
     if any(
-        later.episode_number is not None
+        _completion_uncertainty_reason(later) is None
+        and later.episode_number is not None
         and later.episode_number > row.episode_number
         and later.last_watched_at is not None
         and later.last_watched_at > row.last_watched_at
@@ -1354,10 +1358,7 @@ def _plan_status_update(
     mal_anime_id = int(detail["id"])
     current_status = detail.get("my_list_status") or None
     num_episodes = detail.get("num_episodes")
-    has_completion_uncertainty = any(state.completion_audit.get("completion_uncertain_by", {}).values())
-    provider_watched_episodes = 0 if has_completion_uncertainty else max(
-        state.completed_episode_count, int(state.max_completed_episode_number or 0)
-    )
+    provider_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
     reasons: list[str] = [
         "merge_policy=missing_data_only",
         "completion_policy=ratio>=0.95_or_remaining<=120s_or_later_episode_progress_with_ratio>=0.85",
