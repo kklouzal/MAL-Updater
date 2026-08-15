@@ -1568,8 +1568,10 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertNotIn("providerEnrichmentSection(data.operational?.provider_enrichment)", html)
             self.assertIn("Provider enrichment health", debug_html)
             self.assertIn("providerEnrichmentSection(data.operational?.provider_enrichment)", debug_html)
-            self.assertIn("Indicators", html)
-            self.assertNotIn("<h2>Indicators</h2>", debug_html)
+            self.assertNotIn("<h2>Indicators</h2>", html)
+            self.assertIn("<h2>Indicators</h2>", debug_html)
+            self.assertIn("(data.indicators || []).map", debug_html)
+            self.assertIn("i.level === 'error' ? 'bad' : 'warn'", debug_html)
             self.assertIn("unknown_pages_per_source", debug_html)
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(db_path))
@@ -1607,6 +1609,33 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual(negative["recommendations"]["limit"], DASHBOARD_MIN_RECOMMENDATION_LIMIT)
             self.assertEqual(excessive["recommendations"]["limit"], DASHBOARD_MAX_RECOMMENDATION_LIMIT)
             self.assertTrue(any("No persisted recommendation snapshot" in item["message"] for item in api["indicators"]))
+
+    def test_main_dashboard_compacts_only_authoritative_failures(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertNotIn("<h2>Indicators</h2>", html)
+        self.assertIn("function failureSection(data)", html)
+        self.assertIn("filter(i => i.level === 'error')", html)
+        self.assertIn("data.coverage?.summary?.failed", html)
+        self.assertIn("if (!failures.length) return ''", html)
+        self.assertNotIn("No stale/partial/failure indicators.", html)
+        self.assertNotIn("Recommendation harvest coverage is stale, failed, or incomplete.", html)
+        self.assertIn('id="dashboard-failures" class="bad">Failures', html)
+        self.assertIn("Recommendation harvest failures: ${failedHarvests}.", html)
+
+    def test_dashboard_api_payload_contract_is_unchanged_by_presentation_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+
+            payload = build_dashboard_payload(db_path)
+
+        self.assertEqual(
+            {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
+            set(payload),
+        )
+        self.assertIsInstance(payload["indicators"], list)
+        self.assertTrue(any(item["level"] == "warning" for item in payload["indicators"]))
 
 
 if __name__ == "__main__":
