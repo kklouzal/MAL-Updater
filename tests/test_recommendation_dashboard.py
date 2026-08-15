@@ -1564,9 +1564,11 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertIn('href="/debug">Debug</a>', html)
             self.assertIn('href="/">Dashboard</a>', debug_html)
             self.assertIn('href="/settings">Settings</a>', debug_html)
-            self.assertIn("Provider enrichment health", html)
+            self.assertNotIn("Provider enrichment health", html)
+            self.assertNotIn("providerEnrichmentSection(data.operational?.provider_enrichment)", html)
+            self.assertIn("Provider enrichment health", debug_html)
+            self.assertIn("providerEnrichmentSection(data.operational?.provider_enrichment)", debug_html)
             self.assertIn("Indicators", html)
-            self.assertNotIn("providerEnrichmentSection(data.operational?.provider_enrichment)", debug_html)
             self.assertNotIn("<h2>Indicators</h2>", debug_html)
             self.assertIn("unknown_pages_per_source", debug_html)
 
@@ -1586,7 +1588,9 @@ class RecommendationDashboardTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
             self.assertIn("MAL-Updater live dashboard", root)
+            self.assertNotIn("Provider enrichment health", root)
             self.assertIn("MAL-Updater debug", debug)
+            self.assertIn("Provider enrichment health", debug)
             self.assertIn("snapshot", api)
             self.assertEqual(
                 {"generated_at", "snapshot", "recommendations", "coverage", "operational", "recent_sync_runs", "indicators"},
