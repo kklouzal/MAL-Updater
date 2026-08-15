@@ -86,7 +86,7 @@ def _default_connection_tester(config: AppConfig, kind: str, timeout: int) -> No
     raise ValueError("connection testing unavailable")
 
 def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[bytes] | None], store: ControlStore, *, oauth_exchange: Any = None, connection_tester: Any = None) -> type:
-    dashboard = make_dashboard_handler(config.db_path, settings_href="/settings")
+    dashboard = make_dashboard_handler(config.db_path, settings_href="/settings", config=config)
     test_connection = connection_tester or (lambda kind, timeout: _default_connection_tester(config, kind, timeout))
     class Handler(dashboard):
         server_version = "MAL-Updater"

@@ -39,6 +39,8 @@ class HttpTests(unittest.TestCase):
   self.assertIn('MAL-Updater debug',debug_html); self.assertIn('Snapshot',debug_html); self.assertIn('Recent provider sync runs',debug_html); self.assertIn('href="/"',debug_html); self.assertIn('href="/settings"',debug_html)
   response,dashboard=self.get_json('/api/dashboard')
   self.assertIn('recommendations',dashboard); self.assertEqual('no-store',response.headers['Cache-Control']); self.assertEqual('DENY',response.headers['X-Frame-Options'])
+  enrichment=dashboard['operational']['provider_enrichment']
+  self.assertNotIn('dashboard_config_unavailable',enrichment['reason_codes']); self.assertEqual(['no_configured_credentialed_providers'],enrichment['reason_codes'])
   with urllib.request.urlopen(self.base+'/settings',timeout=5) as r: settings_html=r.read().decode()
   self.assertIn('Trusted LAN control plane',settings_html); self.assertIn('aria-live',settings_html); self.assertIn('href="/"',settings_html); self.assertNotIn('Claim installation',settings_html); self.assertNotIn('Sign in',settings_html)
   self.assertNotIn('Enable automation',settings_html); self.assertNotIn('Disable automation',settings_html); self.assertNotIn('/api/daemon',settings_html)

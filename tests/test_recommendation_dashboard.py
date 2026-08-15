@@ -8,6 +8,7 @@ from urllib.request import urlopen
 from http.server import ThreadingHTTPServer
 import json
 import io
+import os
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -402,6 +403,40 @@ class RecommendationDashboardTests(unittest.TestCase):
                 set(payload),
             )
             self.assertTrue(any("No persisted recommendation snapshot" in item["message"] for item in payload["indicators"]))
+
+    def test_build_dashboard_payload_uses_supplied_container_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_root = Path(temp_dir) / "data"
+            with patch.dict(
+                os.environ,
+                {
+                    "MAL_UPDATER_RUNTIME_ROOT": str(runtime_root),
+                    "MAL_UPDATER_SETTINGS_PATH": str(runtime_root / "config" / "settings.toml"),
+                },
+                clear=False,
+            ):
+                config = load_config(Path(temp_dir))
+                config.db_path.parent.mkdir(parents=True, exist_ok=True)
+                bootstrap_database(config.db_path)
+
+                payload = build_dashboard_payload(config.db_path, config=config)
+
+            diagnostics = payload["operational"]["provider_enrichment"]
+            self.assertEqual(["no_configured_credentialed_providers"], diagnostics["reason_codes"])
+            self.assertNotIn("dashboard_config_unavailable", diagnostics["reason_codes"])
+
+    def test_build_dashboard_payload_rejects_mismatched_supplied_config_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            config = load_config(project_root)
+            db_path = project_root / "standalone.db"
+            bootstrap_database(db_path)
+
+            payload = build_dashboard_payload(db_path, config=config)
+
+            diagnostics = payload["operational"]["provider_enrichment"]
+            self.assertEqual("unknown", diagnostics["status"])
+            self.assertEqual(["dashboard_config_unavailable"], diagnostics["reason_codes"])
 
     def test_build_dashboard_payload_missing_database_is_read_only_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

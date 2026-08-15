@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
-from .config import DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS, load_config
+from .config import AppConfig, DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS, load_config
 from .crunchyroll_auth import load_crunchyroll_credentials
 from .db import (
     bootstrap_database,
@@ -1195,7 +1195,7 @@ def _project_root_from_db_path(db_path: Path) -> Path | None:
     return None
 
 
-def _dashboard_config_from_db_path(db_path: Path) -> Any | None:
+def _dashboard_config_from_db_path(db_path: Path) -> AppConfig | None:
     project_root = _project_root_from_db_path(db_path)
     if project_root is None:
         return None
@@ -1208,11 +1208,22 @@ def _dashboard_config_from_db_path(db_path: Path) -> Any | None:
     return config
 
 
-def _public_userrecs_policy_kwargs_from_db_path(db_path: Path) -> dict[str, int]:
+def _dashboard_config(db_path: Path, config: AppConfig | None = None) -> AppConfig | None:
+    if config is None:
+        return _dashboard_config_from_db_path(db_path)
+    try:
+        if config.db_path.resolve() != db_path.resolve():
+            return None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return config
+
+
+def _public_userrecs_policy_kwargs_from_db_path(db_path: Path, *, config: AppConfig | None = None) -> dict[str, int]:
     source_titles_per_hour = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest", 3))
     max_pages_per_source_per_run = int(DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("recommend_full_harvest_pages", 10))
     stale_after_days = int(DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS)
-    config = _dashboard_config_from_db_path(db_path)
+    config = _dashboard_config(db_path, config)
     if config is not None and getattr(config, "service", None) is not None:
         try:
             source_limit = config.service.execute_limit_for("recommend_full_harvest")
@@ -1231,8 +1242,8 @@ def _public_userrecs_policy_kwargs_from_db_path(db_path: Path) -> dict[str, int]
     }
 
 
-def _public_userrecs_diagnostics_for_dashboard(db_path: Path, *, reason: str | None = None) -> dict[str, Any]:
-    policy_kwargs = _public_userrecs_policy_kwargs_from_db_path(db_path)
+def _public_userrecs_diagnostics_for_dashboard(db_path: Path, *, reason: str | None = None, config: AppConfig | None = None) -> dict[str, Any]:
+    policy_kwargs = _public_userrecs_policy_kwargs_from_db_path(db_path, config=config)
     if reason is not None:
         payload = unknown_public_userrecs_diagnostics(reason=reason)
         payload["policy"].update(
@@ -1271,8 +1282,8 @@ def _dashboard_configured_provider_slugs(config: Any) -> list[str]:
     return providers
 
 
-def _provider_enrichment_diagnostics_for_dashboard(db_path: Path) -> dict[str, Any]:
-    config = _dashboard_config_from_db_path(db_path)
+def _provider_enrichment_diagnostics_for_dashboard(db_path: Path, *, config: AppConfig | None = None) -> dict[str, Any]:
+    config = _dashboard_config(db_path, config)
     if config is None:
         return unknown_provider_enrichment_diagnostics(reason="dashboard_config_unavailable")
     try:
@@ -1297,22 +1308,19 @@ def _local_diagnostic_unavailable_source(reason: str) -> dict[str, Any]:
     }
 
 
-def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int, config: AppConfig | None = None) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """Build current diagnostic discovery rows from local SQLite-backed state only.
 
     This intentionally uses the recommendation scorer over cached local state instead of any
     provider/MAL network calls, so page requests can expose discovery visibility without
     mutating strict persisted recommendation snapshots.
     """
-    project_root = _project_root_from_db_path(db_path)
-    if project_root is None:
+    resolved_config = _dashboard_config(db_path, config)
+    if resolved_config is None:
         return [], None
     try:
-        config = load_config(project_root)
-        if config.db_path.resolve() != db_path.resolve():
-            return [], None
         results = build_recommendations(
-            config,
+            resolved_config,
             limit=max(1, int(limit)),
             require_provider_availability=False,
             include_discovery_candidates_without_actionable_provider_evidence=True,
@@ -1341,7 +1349,7 @@ def _current_ranked_discovery_rows_from_local_state(db_path: Path, *, limit: int
     }
 
 
-def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14) -> dict[str, Any]:
+def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14, config: AppConfig | None = None) -> dict[str, Any]:
     """Return the current dashboard model directly from SQLite state."""
     display_limit = normalize_dashboard_limit(limit)
     unavailable_reason = _dashboard_schema_unavailable_reason(db_path)
@@ -1352,6 +1360,7 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
             db_path,
             display_limit=display_limit,
             stale_after_days=stale_after_days,
+            config=config,
         )
     except sqlite3.OperationalError as exc:
         if _is_schema_unavailable_error(exc):
@@ -1359,11 +1368,11 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
         raise
 
 
-def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_limit: int, stale_after_days: int) -> dict[str, Any]:
+def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_limit: int, stale_after_days: int, config: AppConfig | None = None) -> dict[str, Any]:
     operational = get_operational_snapshot(db_path)
-    operational["provider_enrichment"] = _provider_enrichment_diagnostics_for_dashboard(db_path)
+    operational["provider_enrichment"] = _provider_enrichment_diagnostics_for_dashboard(db_path, config=config)
     coverage = get_mal_recommendation_harvest_coverage(db_path, stale_after_days=stale_after_days)
-    coverage["public_userrecs"] = _public_userrecs_diagnostics_for_dashboard(db_path)
+    coverage["public_userrecs"] = _public_userrecs_diagnostics_for_dashboard(db_path, config=config)
     latest_snapshot = _latest_snapshot_summary(db_path)
     latest_run_id = latest_snapshot.get("run_id") if latest_snapshot else None
     latest_raw_rows = list_latest_recommendation_snapshot_rows(db_path, limit=None)
@@ -1372,7 +1381,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     latest_has_discovery = any(row.kind == "discovery_candidate" for row in latest_raw_rows)
     diagnostic_source_snapshot: dict[str, Any] | None = None
     if not latest_has_discovery:
-        current_rows, current_source = _current_ranked_discovery_rows_from_local_state(db_path, limit=display_limit)
+        current_rows, current_source = _current_ranked_discovery_rows_from_local_state(db_path, limit=display_limit, config=config)
         if current_rows:
             diagnostic_source_snapshot = current_source
             for row in current_rows:
@@ -1517,7 +1526,7 @@ def render_dynamic_debug_html(*, title: str = "MAL-Updater debug", settings_href
     return _render_dynamic_dashboard_page(page="debug", title=title, settings_href=settings_href)
 
 
-def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14, settings_href: str | None = None) -> type[BaseHTTPRequestHandler]:
+def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, stale_after_days: int = 14, settings_href: str | None = None, config: AppConfig | None = None) -> type[BaseHTTPRequestHandler]:
     default_limit = normalize_dashboard_limit(limit)
 
     class DashboardHandler(BaseHTTPRequestHandler):
@@ -1553,7 +1562,7 @@ def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECO
                 self._send_html(render_dynamic_debug_html(settings_href=settings_href))
                 return
             if parsed.path == "/api/dashboard":
-                self._send_json(build_dashboard_payload(db_path, limit=request_limit, stale_after_days=stale_after_days))
+                self._send_json(build_dashboard_payload(db_path, limit=request_limit, stale_after_days=stale_after_days, config=config))
                 return
             self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
 
