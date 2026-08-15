@@ -27,6 +27,7 @@ PUBLIC_USERRECS_DURABLE_QUEUE_MIGRATION = "021_public_userrecs_durable_queue_and
 MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION = "022_mal_user_list_durable_pagination.sql"
 PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION = "023_public_userrecs_incremental_validation.sql"
 PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION = "025_provider_watchlist_current_membership.sql"
+PROVIDER_EPISODE_PROGRESS_PROVENANCE_MIGRATION = "026_provider_episode_progress_provenance.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -55,6 +56,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION,
     "024_public_userrecs_final_anchor_validation.sql",
     PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION,
+    PROVIDER_EPISODE_PROGRESS_PROVENANCE_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -6040,6 +6042,19 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
                 "SELECT provider, COUNT(*) AS count FROM provider_watchlist GROUP BY provider"
             ).fetchall()
         }
+        hidive_progress_provenance_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN progress_observation_kind IN ('position', 'ratio', 'explicit_completed', 'inferred_later_episode') THEN 1 ELSE 0 END) AS confirmed_or_measured,
+                SUM(CASE WHEN progress_observation_kind = 'history_membership' OR (completion_assertion = 'unknown' AND progress_source_surface = 'hidive_history') THEN 1 ELSE 0 END) AS history_only_unknown,
+                SUM(CASE WHEN progress_source_surface IS NULL AND progress_observation_kind IS NULL
+                              AND completion_assertion IS NULL AND normalization_logic_version IS NULL
+                              AND completion_ratio = 1.0 AND duration_ms > 0
+                              AND playback_position_ms = duration_ms THEN 1 ELSE 0 END) AS legacy_unproven
+            FROM provider_episode_progress
+            WHERE provider = 'hidive'
+            """
+        ).fetchone()
         series_freshness_rows = conn.execute(
             "SELECT provider, MAX(last_seen_at) AS last_seen_at FROM provider_series GROUP BY provider"
         ).fetchall()
@@ -6186,6 +6201,11 @@ def get_operational_snapshot(db_path: Path) -> dict[str, Any]:
         "provider_counts": provider_counts,
         "provider_series_inventory": provider_series_inventory,
         "provider_counts_by_provider": provider_counts_by_provider,
+        "hidive_progress_provenance": {
+            "confirmed_or_measured": int(hidive_progress_provenance_row["confirmed_or_measured"] or 0),
+            "history_only_completion_unknown": int(hidive_progress_provenance_row["history_only_unknown"] or 0),
+            "legacy_unproven_synthetic_completion": int(hidive_progress_provenance_row["legacy_unproven"] or 0),
+        },
         "provider_freshness": provider_freshness,
         "provider_freshness_by_provider": provider_freshness_by_provider,
         "review_queue": review_counts,

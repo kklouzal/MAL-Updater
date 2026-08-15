@@ -37,6 +37,15 @@ PROGRESS_REQUIRED_KEYS = {
     "subtitle_locale",
     "rating",
 }
+PROGRESS_PROVENANCE_KEYS = {
+    "progress_source_surface",
+    "progress_observation_kind",
+    "completion_assertion",
+    "normalization_logic_version",
+}
+PROGRESS_ALLOWED_KEYS = PROGRESS_REQUIRED_KEYS | PROGRESS_PROVENANCE_KEYS
+PROGRESS_OBSERVATION_KINDS = {"position", "ratio", "history_membership", "explicit_completed", "inferred_later_episode"}
+COMPLETION_ASSERTIONS = {"confirmed", "inferred", "unknown"}
 WATCHLIST_REQUIRED_KEYS = {"provider_series_id", "added_at", "status"}
 WATCHLIST_ALLOWED_KEYS = WATCHLIST_REQUIRED_KEYS | {
     "list_id",
@@ -129,7 +138,7 @@ def _validate_series_item(item: Any, index: int) -> SeriesRef:
 def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     field = f"progress[{index}]"
     _expect_type(item, dict, field)
-    _expect_keys(item, required=PROGRESS_REQUIRED_KEYS, allowed=PROGRESS_REQUIRED_KEYS, field=field)
+    _expect_keys(item, required=PROGRESS_REQUIRED_KEYS, allowed=PROGRESS_ALLOWED_KEYS, field=field)
 
     _expect_type(item["provider_episode_id"], str, f"{field}.provider_episode_id")
     _expect_type(item["provider_series_id"], str, f"{field}.provider_series_id")
@@ -141,6 +150,21 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     _expect_optional_type(item["audio_locale"], str, f"{field}.audio_locale")
     _expect_optional_type(item["subtitle_locale"], str, f"{field}.subtitle_locale")
     _expect_optional_type(item["rating"], str, f"{field}.rating")
+    progress_source_surface = item.get("progress_source_surface")
+    progress_observation_kind = item.get("progress_observation_kind")
+    completion_assertion = item.get("completion_assertion")
+    normalization_logic_version = item.get("normalization_logic_version")
+    for value, name in (
+        (progress_source_surface, "progress_source_surface"),
+        (progress_observation_kind, "progress_observation_kind"),
+        (completion_assertion, "completion_assertion"),
+        (normalization_logic_version, "normalization_logic_version"),
+    ):
+        _expect_optional_type(value, str, f"{field}.{name}")
+    if progress_observation_kind is not None and progress_observation_kind not in PROGRESS_OBSERVATION_KINDS:
+        raise SnapshotValidationError(f"{field}.progress_observation_kind has unsupported value: {progress_observation_kind}")
+    if completion_assertion is not None and completion_assertion not in COMPLETION_ASSERTIONS:
+        raise SnapshotValidationError(f"{field}.completion_assertion has unsupported value: {completion_assertion}")
     last_watched_at = item["last_watched_at"]
     if last_watched_at is not None and not _is_iso_datetime(last_watched_at):
         raise SnapshotValidationError(f"{field}.last_watched_at must be an ISO-8601 datetime string")
@@ -157,6 +181,10 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
         audio_locale=item["audio_locale"],
         subtitle_locale=item["subtitle_locale"],
         rating=item["rating"],
+        progress_source_surface=progress_source_surface,
+        progress_observation_kind=progress_observation_kind,
+        completion_assertion=completion_assertion,
+        normalization_logic_version=normalization_logic_version,
     )
 
 

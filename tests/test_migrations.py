@@ -46,6 +46,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "023_public_userrecs_incremental_validation.sql",
                 "024_public_userrecs_final_anchor_validation.sql",
                 "025_provider_watchlist_current_membership.sql",
+                "026_provider_episode_progress_provenance.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -99,6 +100,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "023_public_userrecs_incremental_validation.sql",
                     "024_public_userrecs_final_anchor_validation.sql",
                     "025_provider_watchlist_current_membership.sql",
+                    "026_provider_episode_progress_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -131,6 +133,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "023_public_userrecs_incremental_validation.sql",
                     "024_public_userrecs_final_anchor_validation.sql",
                     "025_provider_watchlist_current_membership.sql",
+                    "026_provider_episode_progress_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )

@@ -278,13 +278,17 @@ def _history_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
         provider_series_id=str(provider_series_id),
         episode_number=_safe_int(episode_information.get("episodeNumber")),
         episode_title=str(item.get("title")) if item.get("title") is not None else None,
-        playback_position_ms=duration_ms,
+        playback_position_ms=None,
         duration_ms=duration_ms,
-        completion_ratio=1.0 if duration_ms else None,
+        completion_ratio=None,
         last_watched_at=_iso_from_epoch_ms(item.get("watchedAt")),
         audio_locale=None,
         subtitle_locale=None,
         rating=str(item.get("rating")) if item.get("rating") is not None else None,
+        progress_source_surface="hidive_history",
+        progress_observation_kind="history_membership",
+        completion_assertion="unknown",
+        normalization_logic_version="hidive_progress_v2",
     )
 
 
@@ -312,6 +316,10 @@ def _continue_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
         audio_locale=None,
         subtitle_locale=None,
         rating=str(item.get("rating")) if item.get("rating") is not None else None,
+        progress_source_surface="hidive_continue_watching",
+        progress_observation_kind="position" if playback_position_ms is not None else "ratio",
+        completion_assertion="confirmed" if watch_progress == 1.0 else "unknown",
+        normalization_logic_version="hidive_progress_v2",
     )
 
 
@@ -901,6 +909,16 @@ def _dedupe_series(entries: list[SeriesRef]) -> list[SeriesRef]:
     return list(by_id.values())
 
 
+def _progress_evidence_rank(entry: EpisodeProgress) -> int:
+    if entry.progress_observation_kind == "explicit_completed":
+        return 4
+    if entry.progress_observation_kind in {"position", "ratio", "inferred_later_episode"}:
+        return 3
+    if entry.progress_observation_kind == "history_membership":
+        return 1
+    return 2  # legacy payload: preserve compatibility without outranking measured evidence
+
+
 def _dedupe_progress(entries: list[EpisodeProgress]) -> list[EpisodeProgress]:
     by_id: dict[str, EpisodeProgress] = {}
     for entry in entries:
@@ -908,7 +926,9 @@ def _dedupe_progress(entries: list[EpisodeProgress]) -> list[EpisodeProgress]:
         if previous is None:
             by_id[entry.provider_episode_id] = entry
             continue
-        if (entry.last_watched_at or "") >= (previous.last_watched_at or ""):
+        candidate_key = (_progress_evidence_rank(entry), entry.last_watched_at or "")
+        previous_key = (_progress_evidence_rank(previous), previous.last_watched_at or "")
+        if candidate_key >= previous_key:
             by_id[entry.provider_episode_id] = entry
     return list(by_id.values())
 

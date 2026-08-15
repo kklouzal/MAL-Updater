@@ -25,6 +25,11 @@ class EpisodeProgress:
     audio_locale: str | None = None
     subtitle_locale: str | None = None
     rating: str | None = None
+    # Additive provider-neutral provenance. None denotes a legacy payload/row.
+    progress_source_surface: str | None = None
+    progress_observation_kind: str | None = None
+    completion_assertion: str | None = None
+    normalization_logic_version: str | None = None
 
 
 @dataclass(slots=True)

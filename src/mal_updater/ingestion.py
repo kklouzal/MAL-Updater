@@ -308,22 +308,83 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 audio_locale,
                 subtitle_locale,
                 rating,
+                progress_source_surface,
+                progress_observation_kind,
+                completion_assertion,
+                normalization_logic_version,
                 raw_json,
                 first_seen_at,
                 last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(provider, provider_episode_id) DO UPDATE SET
                 provider_series_id = excluded.provider_series_id,
                 episode_number = excluded.episode_number,
                 episode_title = excluded.episode_title,
-                playback_position_ms = excluded.playback_position_ms,
-                duration_ms = excluded.duration_ms,
-                completion_ratio = excluded.completion_ratio,
-                last_watched_at = excluded.last_watched_at,
-                audio_locale = excluded.audio_locale,
-                subtitle_locale = excluded.subtitle_locale,
-                rating = excluded.rating,
-                raw_json = excluded.raw_json,
+                playback_position_ms = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.playback_position_ms ELSE provider_episode_progress.playback_position_ms END,
+                duration_ms = COALESCE(excluded.duration_ms, provider_episode_progress.duration_ms),
+                completion_ratio = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.completion_ratio ELSE provider_episode_progress.completion_ratio END,
+                last_watched_at = CASE
+                    WHEN provider_episode_progress.last_watched_at IS NULL THEN excluded.last_watched_at
+                    WHEN excluded.last_watched_at IS NULL THEN provider_episode_progress.last_watched_at
+                    WHEN excluded.last_watched_at > provider_episode_progress.last_watched_at THEN excluded.last_watched_at
+                    ELSE provider_episode_progress.last_watched_at END,
+                audio_locale = COALESCE(excluded.audio_locale, provider_episode_progress.audio_locale),
+                subtitle_locale = COALESCE(excluded.subtitle_locale, provider_episode_progress.subtitle_locale),
+                rating = COALESCE(excluded.rating, provider_episode_progress.rating),
+                progress_source_surface = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.progress_source_surface ELSE provider_episode_progress.progress_source_surface END,
+                progress_observation_kind = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.progress_observation_kind ELSE provider_episode_progress.progress_observation_kind END,
+                completion_assertion = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.completion_assertion ELSE provider_episode_progress.completion_assertion END,
+                normalization_logic_version = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.normalization_logic_version ELSE provider_episode_progress.normalization_logic_version END,
+                raw_json = CASE WHEN
+                    CASE excluded.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    >= CASE provider_episode_progress.progress_observation_kind
+                        WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
+                        WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
+                    THEN excluded.raw_json ELSE provider_episode_progress.raw_json END,
                 last_seen_at = CURRENT_TIMESTAMP
             """,
             (
@@ -339,6 +400,10 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 entry.audio_locale,
                 entry.subtitle_locale,
                 entry.rating,
+                entry.progress_source_surface,
+                entry.progress_observation_kind,
+                entry.completion_assertion,
+                entry.normalization_logic_version,
                 _entry_json(entry),
             ),
         )

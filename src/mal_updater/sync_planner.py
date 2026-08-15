@@ -77,12 +77,17 @@ class ProviderSeriesState:
 
 @dataclass(slots=True)
 class EpisodeProgressState:
+    provider: str
     provider_episode_id: str
     episode_number: int | None
     completion_ratio: float | None
     playback_position_ms: int | None
     duration_ms: int | None
     last_watched_at: str | None
+    progress_source_surface: str | None = None
+    progress_observation_kind: str | None = None
+    completion_assertion: str | None = None
+    normalization_logic_version: str | None = None
     last_seen_at: str | None = None
 
 
@@ -239,6 +244,10 @@ def load_provider_series_states(
             playback_position_ms,
             duration_ms,
             last_watched_at,
+            progress_source_surface,
+            progress_observation_kind,
+            completion_assertion,
+            normalization_logic_version,
             last_seen_at
         FROM provider_episode_progress
         WHERE 1=1
@@ -287,12 +296,17 @@ def load_provider_series_states(
     for row in progress_rows:
         progress_by_series.setdefault((row["provider"], row["provider_series_id"]), []).append(
             EpisodeProgressState(
+                provider=row["provider"],
                 provider_episode_id=row["provider_episode_id"],
                 episode_number=row["episode_number"],
                 completion_ratio=row["completion_ratio"],
                 playback_position_ms=row["playback_position_ms"],
                 duration_ms=row["duration_ms"],
                 last_watched_at=row["last_watched_at"],
+                progress_source_surface=row["progress_source_surface"],
+                progress_observation_kind=row["progress_observation_kind"],
+                completion_assertion=row["completion_assertion"],
+                normalization_logic_version=row["normalization_logic_version"],
                 last_seen_at=row["last_seen_at"],
             )
         )
@@ -382,6 +396,10 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
         "later_episode_evidence": [],
     }
     incomplete_examples: list[str] = []
+    uncertain_reason_counts: dict[str, int] = {
+        "completion_unknown_history_membership": 0,
+        "legacy_unproven_hidive_synthetic_completion": 0,
+    }
 
     for row in rows:
         if row.episode_number is not None:
@@ -390,6 +408,9 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
             last_watched_at = row.last_watched_at
         if row.last_seen_at and (last_progress_seen_at is None or row.last_seen_at > last_progress_seen_at):
             last_progress_seen_at = row.last_seen_at
+        uncertainty_reason = _completion_uncertainty_reason(row)
+        if uncertainty_reason is not None:
+            uncertain_reason_counts[uncertainty_reason] += 1
         completion_reason = _completion_reason(row, rows, config)
         if completion_reason is None:
             if len(incomplete_examples) < 5:
@@ -418,11 +439,33 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
             "completed_by": completion_reason_counts,
             "completed_examples": completion_reason_examples,
             "incomplete_examples": incomplete_examples,
+            "completion_uncertain_by": uncertain_reason_counts,
         },
     }
 
 
+def _completion_uncertainty_reason(row: EpisodeProgressState) -> str | None:
+    if row.provider != "hidive":
+        return None
+    if row.progress_observation_kind == "history_membership" or row.completion_assertion == "unknown" and row.progress_source_surface == "hidive_history":
+        return "completion_unknown_history_membership"
+    if (
+        row.progress_source_surface is None
+        and row.progress_observation_kind is None
+        and row.completion_assertion is None
+        and row.normalization_logic_version is None
+        and row.completion_ratio == 1.0
+        and row.duration_ms is not None
+        and row.duration_ms > 0
+        and row.playback_position_ms == row.duration_ms
+    ):
+        return "legacy_unproven_hidive_synthetic_completion"
+    return None
+
+
 def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgressState], config: AppConfig) -> str | None:
+    if _completion_uncertainty_reason(row) is not None:
+        return None
     completion_ratio = row.completion_ratio
     if completion_ratio is not None and completion_ratio >= config.completion_threshold:
         return "ratio_threshold"
@@ -1311,7 +1354,10 @@ def _plan_status_update(
     mal_anime_id = int(detail["id"])
     current_status = detail.get("my_list_status") or None
     num_episodes = detail.get("num_episodes")
-    provider_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
+    has_completion_uncertainty = any(state.completion_audit.get("completion_uncertain_by", {}).values())
+    provider_watched_episodes = 0 if has_completion_uncertainty else max(
+        state.completed_episode_count, int(state.max_completed_episode_number or 0)
+    )
     reasons: list[str] = [
         "merge_policy=missing_data_only",
         "completion_policy=ratio>=0.95_or_remaining<=120s_or_later_episode_progress_with_ratio>=0.85",
@@ -1326,9 +1372,14 @@ def _plan_status_update(
                 f"ratio={state.completion_audit.get('completed_by', {}).get('ratio_threshold', 0)}",
                 f"credits={state.completion_audit.get('completed_by', {}).get('credits_window', 0)}",
                 f"follow_on={state.completion_audit.get('completed_by', {}).get('later_episode_evidence', 0)}",
+                f"history_unknown={state.completion_audit.get('completion_uncertain_by', {}).get('completion_unknown_history_membership', 0)}",
+                f"legacy_hidive_unproven={state.completion_audit.get('completion_uncertain_by', {}).get('legacy_unproven_hidive_synthetic_completion', 0)}",
             ]
         ),
     ]
+    for uncertainty_reason, count in state.completion_audit.get("completion_uncertain_by", {}).items():
+        if count:
+            reasons.append(f"{uncertainty_reason}={count}")
     if extra_reasons:
         reasons = list(extra_reasons) + reasons
 
