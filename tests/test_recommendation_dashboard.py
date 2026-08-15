@@ -171,10 +171,22 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn('function genreAffinitySection(model)', html)
         self.assertIn('id="genre-affinity"', html)
         self.assertIn('role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"', html)
+        self.assertIn('viewBox="0 0 480 440"', html)
+        self.assertIn('class="affinity-chart-wrap"', html)
+        self.assertIn('class="affinity-label"', html)
+        self.assertIn('text-anchor="${anchor}" dominant-baseline="${baseline}">${esc(axis.genre)}</text>', html)
+        self.assertIn("horizontal > 0.25 ? 'start' : horizontal < -0.25 ? 'end' : 'middle'", html)
         self.assertIn('Exact values', html)
         self.assertNotIn('represented genres. Completed titles count', html)
         self.assertIn('Not enough completed/currently-watching titles with genre metadata', html)
         self.assertLess(html.index('${genreAffinitySection(data.genre_affinity)}'), html.index('<section><h2>Recommendations</h2>'))
+
+    def test_live_dashboard_genre_axis_labels_escape_untrusted_names(self) -> None:
+        html = render_dynamic_dashboard_html()
+
+        self.assertIn('${esc(axis.genre)}</text>', html)
+        self.assertNotIn('${axis.genre}</text>', html)
+        self.assertIn('axes.length < 3', html)
 
     def test_strict_actionability_shared_semantics_cover_identity_locales_failures_and_counts(self) -> None:
         accepted_cases = [
