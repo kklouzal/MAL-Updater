@@ -11,6 +11,7 @@ from urllib.parse import quote
 from .config import AppConfig
 from .persistence import atomic_write_json
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from .fetch_provenance import FetchProvenance
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .hidive_auth import HidiveAuthError, HidiveSession, HidiveStatePaths, start_hidive_session
@@ -1048,6 +1049,24 @@ def _fetch_snapshot(
         series=_dedupe_series([*history_series, *continue_series, *favourite_series, *custom_series]),
         progress=_dedupe_progress([*history_progress, *continue_progress]),
         watchlist=watchlist_entries,
+        fetch_provenance=[
+            FetchProvenance(
+                surface="history", completeness="complete" if history_full_complete else "partial",
+                collected_count=len(history_items), pages_fetched=history_pages_fetched,
+                observed_at=generated_at, route="history",
+            ),
+            FetchProvenance(
+                surface="continue_watching", completeness="complete" if continue_complete else "partial",
+                collected_count=len(continue_items), pages_fetched=continue_metadata.get("pages_fetched"),
+                observed_at=generated_at, route="continue_watching",
+            ),
+            FetchProvenance(
+                surface="watchlist", completeness="complete" if watchlist_complete else "partial",
+                collected_count=len(watchlist_entries),
+                pages_fetched=favourite_pages_fetched + int(custom_watchlist_metadata.get("collection_pages_fetched") or 0),
+                observed_at=generated_at, route="watchlists",
+            ),
+        ],
         raw={
             "partial": partial,
             "diagnostics": diagnostics,

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from mal_updater.cli import _cmd_provider_fetch_snapshot
 from mal_updater.config import load_config
-from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, FetchProvenance, ProviderSnapshot, SeriesRef, WatchlistEntry
 from mal_updater.contracts.crunchyroll import CrunchyrollSnapshot as CrunchyrollSnapshotCompatAlias
 from mal_updater.db import bootstrap_database
 from mal_updater.hidive_auth import HidiveSession, HidiveStatePaths, HidiveTokenSet
@@ -79,6 +79,28 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(snapshot.watchlist[0].status, "watching")
         self.assertEqual(snapshot.watchlist[0].list_id, "favorites")
         self.assertEqual(snapshot.watchlist[0].list_kind, "system")
+        self.assertEqual([], snapshot.fetch_provenance)
+
+    def test_validate_complete_partial_and_unknown_fetch_provenance(self) -> None:
+        payload = sample_snapshot()
+        payload["fetch_provenance"] = [
+            {"surface": "watchlist", "completeness": "complete", "expected_total": 1,
+             "collected_count": 1, "pages_fetched": 1, "observed_at": "2026-03-14T21:00:00Z",
+             "route": "/watchlist", "profile": "default", "region": "US"},
+            {"surface": "history", "completeness": "partial", "expected_total": 10,
+             "collected_count": 5, "pages_fetched": 1},
+            {"surface": "ratings"},
+        ]
+        snapshot = validate_snapshot_payload(payload)
+        self.assertEqual(["complete", "partial", "unknown"], [item.completeness for item in snapshot.fetch_provenance])
+
+    def test_validate_rejects_false_complete_fetch_provenance(self) -> None:
+        payload = sample_snapshot()
+        payload["fetch_provenance"] = [
+            {"surface": "watchlist", "completeness": "complete", "expected_total": 2, "collected_count": 1}
+        ]
+        with self.assertRaisesRegex(SnapshotValidationError, "complete count must equal expected_total"):
+            validate_snapshot_payload(payload)
 
     def test_validate_snapshot_payload_rejects_invalid_ratio(self) -> None:
         payload = sample_snapshot()
@@ -202,6 +224,24 @@ class _FakeHidiveProvider:
 
 
 class IngestionTests(unittest.TestCase):
+    def test_ingestion_persists_fetch_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            payload = sample_snapshot()
+            payload["fetch_provenance"] = [
+                {"surface": "watchlist", "completeness": "partial", "expected_total": 2,
+                 "collected_count": 1, "pages_fetched": 1, "observed_at": "2026-03-14T21:00:00Z"}
+            ]
+            ingest_snapshot_payload(payload, config)
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                row = conn.execute(
+                    "SELECT completeness, expected_total, collected_count, pages_fetched "
+                    "FROM provider_fetch_provenance WHERE surface = 'watchlist'"
+                ).fetchone()
+            self.assertEqual(("partial", 2, 1, 1), row)
+
     def _concrete_hidive_result(self, payload: dict, config) -> ProviderFetchResult:
         state_root = config.state_dir / "hidive" / "default"
         session = HidiveSession(
@@ -448,6 +488,36 @@ class IngestionTests(unittest.TestCase):
             with sqlite3.connect(config.db_path) as conn:
                 states = dict(conn.execute("SELECT provider_series_id, is_active FROM provider_watchlist"))
             self.assertEqual({"series-x": 0, "series-y": 1}, states)
+
+    def test_explicit_partial_fetch_provenance_blocks_destructive_absence_inference(self) -> None:
+        def payload_for(series_id: str) -> dict:
+            payload = sample_snapshot()
+            payload["account_id_hint"] = "acct-1"
+            payload["series"][0]["provider_series_id"] = series_id
+            payload["progress"] = []
+            payload["watchlist"][0]["provider_series_id"] = series_id
+            payload["raw"] = {
+                "partial": False, "sync_boundary_refresh_kind": "explicit_full_refresh",
+                "watchlist_start": 0, "watchlist_partial": False,
+            }
+            return payload
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            ingest_snapshot_payload(payload_for("series-x"), config, mode="full_refresh")
+            partial = payload_for("series-y")
+            partial["fetch_provenance"] = [
+                {"surface": "watchlist", "completeness": "partial", "expected_total": 2,
+                 "collected_count": 1, "pages_fetched": 1}
+            ]
+            summary = ingest_snapshot_payload(partial, config, mode="full_refresh")
+            with sqlite3.connect(config.db_path) as conn:
+                states = dict(conn.execute("SELECT provider_series_id, is_active FROM provider_watchlist"))
+            self.assertEqual({"series-x": 1, "series-y": 1}, states)
+            diagnostic = next(item for item in summary.diagnostics or [] if item.get("code") == "watchlist_membership_generation")
+            self.assertEqual("watchlist_fetch_partial", diagnostic["reason"])
 
     def test_account_mismatch_cannot_deactivate_existing_membership(self) -> None:
         with tempfile.TemporaryDirectory() as td:

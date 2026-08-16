@@ -1,5 +1,6 @@
 from .provider import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from .crunchyroll import CrunchyrollSnapshot
+from ..fetch_provenance import FetchProvenance
 
 __all__ = [
     "ProviderSnapshot",
@@ -7,4 +8,5 @@ __all__ = [
     "EpisodeProgress",
     "SeriesRef",
     "WatchlistEntry",
+    "FetchProvenance",
 ]

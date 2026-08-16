@@ -9,7 +9,7 @@ from .persistence import atomic_write_json
 
 
 def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:
-    return {
+    payload = {
         "contract_version": snapshot.contract_version,
         "generated_at": snapshot.generated_at,
         "provider": snapshot.provider,
@@ -19,6 +19,9 @@ def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:
         "watchlist": [asdict(item) for item in snapshot.watchlist],
         "raw": snapshot.raw,
     }
+    if snapshot.fetch_provenance:
+        payload["fetch_provenance"] = [asdict(item) for item in snapshot.fetch_provenance]
+    return payload
 
 
 def write_snapshot_file(path: Path, snapshot: ProviderSnapshot) -> Path:

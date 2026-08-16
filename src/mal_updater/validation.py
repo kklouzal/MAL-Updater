@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
+from .fetch_provenance import COMPLETENESS_VALUES, FetchProvenance
 
 
 class SnapshotValidationError(ValueError):
@@ -22,7 +23,7 @@ SNAPSHOT_REQUIRED_KEYS = {
     "watchlist",
     "raw",
 }
-SNAPSHOT_ALLOWED_KEYS = SNAPSHOT_REQUIRED_KEYS | {"account_id_hint"}
+SNAPSHOT_ALLOWED_KEYS = SNAPSHOT_REQUIRED_KEYS | {"account_id_hint", "fetch_provenance"}
 SERIES_ALLOWED_KEYS = {"provider_series_id", "title", "season_title", "season_number"}
 PROGRESS_REQUIRED_KEYS = {
     "provider_episode_id",
@@ -247,6 +248,43 @@ def _validate_watchlist_item(item: Any, index: int) -> WatchlistEntry:
     )
 
 
+def _validate_fetch_provenance_item(item: Any, index: int) -> FetchProvenance:
+    field = f"fetch_provenance[{index}]"
+    _expect_type(item, dict, field)
+    allowed = {
+        "surface", "completeness", "expected_total", "collected_count", "pages_fetched",
+        "observed_at", "route", "profile", "region",
+    }
+    _expect_keys(item, required={"surface"}, allowed=allowed, field=field)
+    surface = item["surface"]
+    completeness = item.get("completeness", "unknown")
+    _expect_type(surface, str, f"{field}.surface")
+    _expect_type(completeness, str, f"{field}.completeness")
+    if not surface.strip():
+        raise SnapshotValidationError(f"{field}.surface must be a non-empty string")
+    if completeness not in COMPLETENESS_VALUES:
+        raise SnapshotValidationError(f"{field}.completeness has unsupported value: {completeness}")
+    for name in ("expected_total", "collected_count", "pages_fetched"):
+        _expect_non_negative_int(item.get(name), f"{field}.{name}")
+    observed_at = item.get("observed_at")
+    _expect_optional_type(observed_at, str, f"{field}.observed_at")
+    if observed_at is not None and not _is_iso_datetime(observed_at):
+        raise SnapshotValidationError(f"{field}.observed_at must be an ISO-8601 datetime string")
+    for name in ("route", "profile", "region"):
+        _expect_optional_type(item.get(name), str, f"{field}.{name}")
+    expected = item.get("expected_total")
+    collected = item.get("collected_count")
+    if completeness == "complete" and expected is not None and collected != expected:
+        raise SnapshotValidationError(f"{field} complete count must equal expected_total")
+    if completeness == "partial" and expected is not None and collected is not None and collected >= expected:
+        raise SnapshotValidationError(f"{field} partial count must be less than expected_total")
+    return FetchProvenance(
+        surface=surface.strip(), completeness=completeness, expected_total=expected,
+        collected_count=collected, pages_fetched=item.get("pages_fetched"), observed_at=observed_at,
+        route=item.get("route"), profile=item.get("profile"), region=item.get("region"),
+    )
+
+
 def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
     _expect_type(payload, dict, "snapshot")
     _expect_keys(payload, required=SNAPSHOT_REQUIRED_KEYS, allowed=SNAPSHOT_ALLOWED_KEYS, field="snapshot")
@@ -259,6 +297,7 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
     progress = payload["progress"]
     watchlist = payload["watchlist"]
     raw = payload["raw"]
+    fetch_provenance = payload.get("fetch_provenance", [])
 
     _expect_type(contract_version, str, "snapshot.contract_version")
     if contract_version != "1.0":
@@ -274,41 +313,48 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
     _expect_type(progress, list, "snapshot.progress")
     _expect_type(watchlist, list, "snapshot.watchlist")
     _expect_type(raw, dict, "snapshot.raw")
+    _expect_type(fetch_provenance, list, "snapshot.fetch_provenance")
 
     validated_series = [_validate_series_item(item, index) for index, item in enumerate(series)]
     validated_progress = [_validate_progress_item(item, index) for index, item in enumerate(progress)]
     validated_watchlist = [_validate_watchlist_item(item, index) for index, item in enumerate(watchlist)]
+    validated_fetch_provenance = [
+        _validate_fetch_provenance_item(item, index) for index, item in enumerate(fetch_provenance)
+    ]
+    surfaces = [item.surface for item in validated_fetch_provenance]
+    if len(surfaces) != len(set(surfaces)):
+        raise SnapshotValidationError("snapshot.fetch_provenance contains duplicate surfaces")
 
     known_series_ids: set[str] = set()
-    for index, item in enumerate(validated_series):
+    for index, series_item in enumerate(validated_series):
         _expect_unique_id(
-            item.provider_series_id,
+            series_item.provider_series_id,
             known_series_ids,
             field=f"series[{index}].provider_series_id",
             description="series id",
         )
 
     seen_episode_ids: set[str] = set()
-    for index, item in enumerate(validated_progress):
+    for index, progress_item in enumerate(validated_progress):
         _expect_unique_id(
-            item.provider_episode_id,
+            progress_item.provider_episode_id,
             seen_episode_ids,
             field=f"progress[{index}].provider_episode_id",
             description="episode id",
         )
         _expect_known_series_id(
-            item.provider_series_id,
+            progress_item.provider_series_id,
             known_series_ids,
             f"progress[{index}].provider_series_id",
         )
 
     seen_watchlist_memberships: set[tuple[str, str, str, str]] = set()
-    for index, item in enumerate(validated_watchlist):
+    for index, watchlist_item in enumerate(validated_watchlist):
         membership_key = (
-            item.list_id or "",
-            item.provider_series_id,
-            item.provider_item_type or "series",
-            item.provider_item_id or item.provider_series_id,
+            watchlist_item.list_id or "",
+            watchlist_item.provider_series_id,
+            watchlist_item.provider_item_type or "series",
+            watchlist_item.provider_item_id or watchlist_item.provider_series_id,
         )
         if membership_key in seen_watchlist_memberships:
             raise SnapshotValidationError(
@@ -317,7 +363,7 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
             )
         seen_watchlist_memberships.add(membership_key)
         _expect_known_series_id(
-            item.provider_series_id,
+            watchlist_item.provider_series_id,
             known_series_ids,
             f"watchlist[{index}].provider_series_id",
         )
@@ -331,6 +377,7 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
         progress=validated_progress,
         watchlist=validated_watchlist,
         raw=raw,
+        fetch_provenance=validated_fetch_provenance,
     )
 
 

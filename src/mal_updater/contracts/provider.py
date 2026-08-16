@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..fetch_provenance import FetchProvenance
+
 
 @dataclass(slots=True)
 class SeriesRef:
@@ -60,3 +62,5 @@ class ProviderSnapshot:
     progress: list[EpisodeProgress] = field(default_factory=list)
     watchlist: list[WatchlistEntry] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Additive in 1.0: absent/empty means legacy completeness is unknown.
+    fetch_provenance: list[FetchProvenance] = field(default_factory=list)

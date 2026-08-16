@@ -21,6 +21,7 @@ from .config import AppConfig, _read_secret_file
 from .request_tracking import record_api_request_event
 from .provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
 from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
+from .fetch_provenance import FetchProvenance
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .crunchyroll_auth import (
@@ -1184,6 +1185,18 @@ def _fetch_snapshot_once(
         series=_dedupe_series(history_series + watchlist_series),
         progress=progress,
         watchlist=watchlist_entries,
+        fetch_provenance=[
+            FetchProvenance(
+                surface="history", completeness="partial" if history_partial else "complete",
+                collected_count=len(history_entries), pages_fetched=history_pages_fetched,
+                observed_at=generated_at, route="history", profile=session.profile,
+            ),
+            FetchProvenance(
+                surface="watchlist", completeness="partial" if watchlist_partial else "complete",
+                collected_count=len(watchlist_entries), pages_fetched=watchlist_pages_fetched,
+                observed_at=generated_at, route="watchlist", profile=session.profile,
+            ),
+        ],
         raw={
             "status": "ok",
             "profile": session.profile,

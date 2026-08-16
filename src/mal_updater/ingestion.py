@@ -84,6 +84,10 @@ def _ingest_snapshot_payload(
             _upsert_progress(conn, provider, snapshot.progress)
             capture_provider_observations(conn, snapshot=snapshot, sync_run_id=sync_run_id)
             account_id_hint = snapshot.account_id_hint.strip() if snapshot.account_id_hint else None
+            _upsert_fetch_provenance(
+                conn, provider=provider, account_id_hint=account_id_hint,
+                entries=snapshot.fetch_provenance, sync_run_id=sync_run_id,
+            )
             account_conflict = _watchlist_account_conflict(
                 conn, provider=provider, account_id_hint=account_id_hint,
             )
@@ -106,6 +110,7 @@ def _ingest_snapshot_payload(
                 membership_deactivation = _deactivate_absent_watchlist_memberships(
                     conn, provider=provider, generation=sync_run_id,
                     account_id_hint=account_id_hint, mode=mode, raw=snapshot.raw,
+                    fetch_provenance=snapshot.fetch_provenance,
                     hidive_producer_authenticated=hidive_producer_authenticated,
                 )
                 membership_deactivation["upserted"] = len(snapshot.watchlist)
@@ -541,6 +546,37 @@ def _watchlist_account_conflict(conn, *, provider: str, account_id_hint: str | N
     return row is not None
 
 
+def _upsert_fetch_provenance(
+    conn, *, provider: str, account_id_hint: str | None, entries: list[Any], sync_run_id: int,
+) -> None:
+    for entry in entries:
+        conn.execute(
+            """
+            INSERT INTO provider_fetch_provenance (
+                provider, surface, account_id_hint, completeness, expected_total,
+                collected_count, pages_fetched, observed_at, route, profile, region,
+                sync_run_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(provider, surface, account_id_hint) DO UPDATE SET
+                completeness = excluded.completeness,
+                expected_total = excluded.expected_total,
+                collected_count = excluded.collected_count,
+                pages_fetched = excluded.pages_fetched,
+                observed_at = excluded.observed_at,
+                route = excluded.route,
+                profile = excluded.profile,
+                region = excluded.region,
+                sync_run_id = excluded.sync_run_id,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                provider, entry.surface, account_id_hint or "", entry.completeness,
+                entry.expected_total, entry.collected_count, entry.pages_fetched,
+                entry.observed_at, entry.route, entry.profile, entry.region, sync_run_id,
+            ),
+        )
+
+
 def _hidive_producer_evidence(
     raw: dict[str, Any], *, authenticated: bool
 ) -> dict[str, bool]:
@@ -561,8 +597,16 @@ def _watchlist_snapshot_is_complete(
     provider: str,
     mode: str,
     raw: dict[str, Any],
+    fetch_provenance: list[Any] | None = None,
     hidive_producer_authenticated: bool = False,
 ) -> tuple[bool, str]:
+    # New snapshots must not use provider-specific legacy booleans to override
+    # explicit partial/unknown surface evidence. Legacy snapshots remain valid.
+    watchlist_evidence = next(
+        (item for item in (fetch_provenance or []) if item.surface == "watchlist"), None
+    )
+    if watchlist_evidence is not None and not watchlist_evidence.complete:
+        return False, f"watchlist_fetch_{watchlist_evidence.completeness}"
     if provider == "crunchyroll":
         if mode != "full_refresh":
             return False, "not_full_refresh_mode"
@@ -620,11 +664,13 @@ def _watchlist_snapshot_is_complete(
 def _deactivate_absent_watchlist_memberships(
     conn, *, provider: str, generation: int, account_id_hint: str | None,
     mode: str, raw: dict[str, Any], hidive_producer_authenticated: bool = False,
+    fetch_provenance: list[Any] | None = None,
 ) -> dict[str, Any]:
     complete, reason = _watchlist_snapshot_is_complete(
         provider=provider,
         mode=mode,
         raw=raw,
+        fetch_provenance=fetch_provenance,
         hidive_producer_authenticated=hidive_producer_authenticated,
     )
     diagnostic: dict[str, Any] = {
