@@ -42,6 +42,9 @@ PROGRESS_PROVENANCE_KEYS = {
     "progress_observation_kind",
     "completion_assertion",
     "normalization_logic_version",
+    "observation_id",
+    "observed_at",
+    "effective_at",
 }
 PROGRESS_ALLOWED_KEYS = PROGRESS_REQUIRED_KEYS | PROGRESS_PROVENANCE_KEYS
 PROGRESS_OBSERVATION_KINDS = {"position", "ratio", "history_membership", "explicit_completed", "inferred_later_episode"}
@@ -154,11 +157,17 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     progress_observation_kind = item.get("progress_observation_kind")
     completion_assertion = item.get("completion_assertion")
     normalization_logic_version = item.get("normalization_logic_version")
+    observation_id = item.get("observation_id")
+    observed_at = item.get("observed_at")
+    effective_at = item.get("effective_at")
     for value, name in (
         (progress_source_surface, "progress_source_surface"),
         (progress_observation_kind, "progress_observation_kind"),
         (completion_assertion, "completion_assertion"),
         (normalization_logic_version, "normalization_logic_version"),
+        (observation_id, "observation_id"),
+        (observed_at, "observed_at"),
+        (effective_at, "effective_at"),
     ):
         _expect_optional_type(value, str, f"{field}.{name}")
     if progress_observation_kind is not None and progress_observation_kind not in PROGRESS_OBSERVATION_KINDS:
@@ -168,6 +177,9 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     last_watched_at = item["last_watched_at"]
     if last_watched_at is not None and not _is_iso_datetime(last_watched_at):
         raise SnapshotValidationError(f"{field}.last_watched_at must be an ISO-8601 datetime string")
+    for value, name in ((observed_at, "observed_at"), (effective_at, "effective_at")):
+        if value is not None and not _is_iso_datetime(value):
+            raise SnapshotValidationError(f"{field}.{name} must be an ISO-8601 datetime string")
 
     return EpisodeProgress(
         provider_episode_id=item["provider_episode_id"],
@@ -185,6 +197,9 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
         progress_observation_kind=progress_observation_kind,
         completion_assertion=completion_assertion,
         normalization_logic_version=normalization_logic_version,
+        observation_id=observation_id,
+        observed_at=observed_at,
+        effective_at=effective_at,
     )
 
 

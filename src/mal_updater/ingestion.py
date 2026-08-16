@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -293,8 +294,59 @@ def _upsert_series(conn, provider: str, series_entries: list[Any]) -> None:
         )
 
 
+def _observation_id(provider: str, entry: Any) -> str:
+    explicit = getattr(entry, "observation_id", None)
+    if explicit:
+        return str(explicit)
+    identity = {
+        "provider": provider,
+        "provider_episode_id": entry.provider_episode_id,
+        "provider_series_id": entry.provider_series_id,
+        "source_surface": entry.progress_source_surface,
+        "observation_kind": entry.progress_observation_kind,
+        "completion_assertion": entry.completion_assertion,
+        "effective_at": getattr(entry, "effective_at", None) or entry.last_watched_at,
+        "episode_number": entry.episode_number,
+        "playback_position_ms": entry.playback_position_ms,
+        "duration_ms": entry.duration_ms,
+        "completion_ratio": entry.completion_ratio,
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return f"provider-progress:{digest}"
+
+
+def _insert_progress_observation(conn, provider: str, entry: Any) -> None:
+    observed_at = getattr(entry, "observed_at", None) or entry.last_watched_at
+    if observed_at is None:
+        # Snapshot generated_at is not attached to individual legacy entries. The
+        # database time is the honest ingestion observation time in this case.
+        observed_at = conn.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')").fetchone()[0]
+    effective_at = getattr(entry, "effective_at", None) or entry.last_watched_at
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO provider_progress_observations (
+            observation_id, provider, provider_episode_id, provider_series_id,
+            source_surface, observation_kind, completion_assertion,
+            normalization_logic_version, observed_at, effective_at,
+            episode_number, episode_title, playback_position_ms, duration_ms,
+            completion_ratio, audio_locale, subtitle_locale, rating, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _observation_id(provider, entry), provider, entry.provider_episode_id,
+            entry.provider_series_id, entry.progress_source_surface,
+            entry.progress_observation_kind, entry.completion_assertion,
+            entry.normalization_logic_version, observed_at, effective_at,
+            entry.episode_number, entry.episode_title, entry.playback_position_ms,
+            entry.duration_ms, entry.completion_ratio, entry.audio_locale,
+            entry.subtitle_locale, entry.rating, _entry_json(entry),
+        ),
+    )
+
+
 def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
     for entry in progress_entries:
+        _insert_progress_observation(conn, provider, entry)
         conn.execute(
             """
             INSERT INTO provider_episode_progress (

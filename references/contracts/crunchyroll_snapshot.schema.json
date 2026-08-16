@@ -72,7 +72,20 @@
           "last_watched_at": { "type": ["string", "null"], "format": "date-time" },
           "audio_locale": { "type": ["string", "null"] },
           "subtitle_locale": { "type": ["string", "null"] },
-          "rating": { "type": ["string", "null"] }
+          "rating": { "type": ["string", "null"] },
+          "progress_source_surface": { "type": ["string", "null"] },
+          "progress_observation_kind": {
+            "type": ["string", "null"],
+            "enum": ["position", "ratio", "history_membership", "explicit_completed", "inferred_later_episode", null]
+          },
+          "completion_assertion": {
+            "type": ["string", "null"],
+            "enum": ["confirmed", "inferred", "unknown", null]
+          },
+          "normalization_logic_version": { "type": ["string", "null"] },
+          "observation_id": { "type": ["string", "null"] },
+          "observed_at": { "type": ["string", "null"], "format": "date-time" },
+          "effective_at": { "type": ["string", "null"], "format": "date-time" }
         }
       }
     },

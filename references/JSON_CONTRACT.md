@@ -23,7 +23,7 @@ PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider cru
 ## Snapshot semantics
 
 - `series`: deduplicated per-provider series/season records known from Crunchyroll data
-- `progress`: per-episode playback observations with timestamps, completion ratio, and raw timing needed for conservative completion inference
+- `progress`: per-episode playback observations with timestamps, completion ratio, and raw timing needed for conservative completion inference. Optional additive `observation_id`, `observed_at`, and `effective_at` fields preserve stable append-only observation identity and separate ingestion observation time from activity-effective time; legacy payloads remain valid when they omit them.
 - `watchlist`: explicit watchlist/library entries if Crunchyroll exposes them
 - `raw`: optional provider-specific passthrough/debug object
 

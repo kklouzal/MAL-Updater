@@ -50,6 +50,7 @@ from .db import (
     get_provider_stale_row_counts,
     get_provider_stale_row_last_seen_ranges,
     get_provider_stale_row_linkage,
+    get_watch_confirmation_coverage,
     reinitialize_mal_public_userrecs_source,
     reinitialize_mal_user_anime_list_traversal,
     insert_recommendation_snapshot_rows,
@@ -2100,6 +2101,8 @@ def _cmd_dry_run_sync(
         print(str(exc), file=sys.stderr)
         return 1
     payload: dict[str, object] = {"proposals": [proposal.as_dict() for proposal in proposals]}
+    if provider in {"all", "hidive"}:
+        payload["watch_confirmation_coverage"] = get_watch_confirmation_coverage(config.db_path, provider="hidive")
     if persist_queue:
         payload["review_queue"] = persist_sync_review_queue(config, proposals)
     print(json.dumps(payload, indent=2))

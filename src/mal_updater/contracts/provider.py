@@ -30,6 +30,10 @@ class EpisodeProgress:
     progress_observation_kind: str | None = None
     completion_assertion: str | None = None
     normalization_logic_version: str | None = None
+    # Stable append-only observation identity/times. Older payloads may omit all three.
+    observation_id: str | None = None
+    observed_at: str | None = None
+    effective_at: str | None = None
 
 
 @dataclass(slots=True)

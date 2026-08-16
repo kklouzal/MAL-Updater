@@ -29,6 +29,7 @@ PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION = "023_public_userrecs_incremen
 PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION = "025_provider_watchlist_current_membership.sql"
 PROVIDER_EPISODE_PROGRESS_PROVENANCE_MIGRATION = "026_provider_episode_progress_provenance.sql"
 EVALUATION_EVENTS_MIGRATION = "027_evaluation_events.sql"
+PROVIDER_PROGRESS_OBSERVATIONS_MIGRATION = "028_provider_progress_observations.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -59,6 +60,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION,
     PROVIDER_EPISODE_PROGRESS_PROVENANCE_MIGRATION,
     EVALUATION_EVENTS_MIGRATION,
+    PROVIDER_PROGRESS_OBSERVATIONS_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -1487,6 +1489,43 @@ def list_watch_confirmation_provenance(
     with connect(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
     return [_watch_confirmation_provenance_from_row(row) for row in rows]
+
+
+def get_watch_confirmation_coverage(db_path: Path, *, provider: str = "hidive") -> dict[str, Any]:
+    """Return a privacy-safe progress-series confirmation coverage invariant."""
+    with connect(db_path) as conn:
+        progress_rows = conn.execute(
+            """
+            SELECT DISTINCT provider_series_id
+            FROM provider_episode_progress
+            WHERE provider = ?
+            ORDER BY provider_series_id
+            """,
+            (provider,),
+        ).fetchall()
+        confirmation_rows = conn.execute(
+            """
+            SELECT DISTINCT provider_series_id
+            FROM watch_confirmation_provenance
+            WHERE provider = ?
+            ORDER BY provider_series_id
+            """,
+            (provider,),
+        ).fetchall()
+    progress_series = {str(row["provider_series_id"]) for row in progress_rows}
+    confirmation_series = {str(row["provider_series_id"]) for row in confirmation_rows}
+    missing = sorted(progress_series - confirmation_series)
+    return {
+        "provider": provider,
+        "progress_series_count": len(progress_series),
+        "confirmation_series_count": len(confirmation_series),
+        "missing_confirmation_series_count": len(missing),
+        "missing_confirmation_series_hashes": [
+            hashlib.sha256(f"{provider}:{provider_series_id}".encode("utf-8")).hexdigest()
+            for provider_series_id in missing
+        ],
+        "invariant_satisfied": not missing,
+    }
 
 
 def upsert_watch_confirmation_provenance(

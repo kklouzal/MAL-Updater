@@ -10,6 +10,7 @@ from .db import (
     MalUserAnimeListCacheEntry,
     PersistedSeriesMapping,
     connect,
+    get_watch_confirmation_coverage,
     get_mal_user_anime_list_cache,
     get_series_mapping,
     list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
@@ -209,6 +210,8 @@ def load_provider_series_states(
     limit: int | None = None,
     provider: str | None = None,
     provider_series_ids: list[str] | None = None,
+    *,
+    account_observed_only: bool = True,
 ) -> list[ProviderSeriesState]:
     if limit is not None and limit <= 0:
         limit = None
@@ -232,7 +235,7 @@ def load_provider_series_states(
             WHERE is_active = 1
             GROUP BY provider, provider_series_id
         ) w ON w.provider = s.provider AND w.provider_series_id = s.provider_series_id
-        WHERE s.account_observed_at IS NOT NULL
+        WHERE 1=1
     """
     progress_query = """
         SELECT
@@ -254,6 +257,8 @@ def load_provider_series_states(
     """
     series_params: list[object] = []
     progress_params: list[object] = []
+    if account_observed_only:
+        series_query += " AND s.account_observed_at IS NOT NULL"
     if provider:
         series_query += " AND s.provider = ?"
         progress_query += " AND provider = ?"
@@ -778,6 +783,11 @@ def _persist_watch_confirmation_provenance_snapshot(
         "last_progress_seen_at": state.last_progress_seen_at,
         "last_series_seen_at": state.last_series_seen_at,
         "completion_audit": completion_audit,
+        "diagnostic_reason_counts": {
+            key: int(value)
+            for key, value in (completion_audit.get("completion_uncertain_by") or {}).items()
+            if isinstance(key, str) and isinstance(value, int) and value > 0
+        },
     }
     upsert_watch_confirmation_provenance(
         config.db_path,
@@ -822,6 +832,72 @@ def _persist_watch_confirmation_provenance_snapshot(
     )
 
 
+def _materialize_hidive_dry_run_confirmations(
+    config: AppConfig,
+    planned_states: list[ProviderSeriesState],
+    proposals: list[SyncProposal],
+    details_by_series: dict[tuple[str, str], dict[str, Any] | None],
+) -> dict[str, Any]:
+    """Materialize all HIDIVE progress-series evidence after a completed plan."""
+    proposal_by_series = {
+        proposal.provider_series_id: proposal
+        for proposal in proposals
+        if proposal.provider == "hidive"
+    }
+    state_by_series = {
+        state.provider_series_id: state
+        for state in planned_states
+        if state.provider == "hidive" and state.progress_rows > 0
+    }
+    # A bounded plan may omit progress-bearing series. Fill only missing rows for
+    # those series, preserving any richer prior confirmation snapshot.
+    for state in load_provider_series_states(
+        config,
+        limit=None,
+        provider="hidive",
+        account_observed_only=False,
+    ):
+        if state.progress_rows <= 0:
+            continue
+        if state.provider_series_id not in state_by_series:
+            with connect(config.db_path) as conn:
+                already_materialized = conn.execute(
+                    "SELECT 1 FROM watch_confirmation_provenance WHERE provider='hidive' AND provider_series_id=?",
+                    (state.provider_series_id,),
+                ).fetchone()
+            if already_materialized is not None:
+                continue
+            persisted = get_series_mapping(config.db_path, "hidive", state.provider_series_id)
+            reasons = ["dry_run_confirmation_coverage_materialization", "not_evaluated_by_bounded_dry_run"]
+            proposal = SyncProposal(
+                provider="hidive",
+                provider_series_id=state.provider_series_id,
+                provider_title=state.title,
+                mapping_status="approved" if persisted and persisted.approved_by_user else "unreviewed",
+                confidence=float(persisted.confidence or 0.0) if persisted else 0.0,
+                mal_anime_id=persisted.mal_anime_id if persisted else None,
+                mal_title=None,
+                current_my_list_status=None,
+                proposed_my_list_status=None,
+                decision="review",
+                mapping_source=persisted.mapping_source if persisted else None,
+                persisted_mapping_approved=bool(persisted and persisted.approved_by_user),
+                completion_audit=state.completion_audit,
+                reasons=reasons,
+            )
+            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=reasons)
+        else:
+            proposal = proposal_by_series[state.provider_series_id]
+            _persist_watch_confirmation_provenance_snapshot(
+                config,
+                state,
+                proposal,
+                detail=details_by_series.get((state.provider, state.provider_series_id)),
+                mapping_reasons=proposal.reasons,
+            )
+    return get_watch_confirmation_coverage(config.db_path, provider="hidive")
+
+
 def build_dry_run_sync_plan(
     config: AppConfig,
     limit: int | None = 20,
@@ -833,6 +909,7 @@ def build_dry_run_sync_plan(
     states = load_provider_series_states(config, limit=limit, provider=provider)
     client = MalClient(config, load_mal_secrets(config))
     proposals: list[SyncProposal] = []
+    details_by_series: dict[tuple[str, str], dict[str, Any] | None] = {}
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
         if approved_mappings_only and not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
@@ -859,6 +936,7 @@ def build_dry_run_sync_plan(
                 provider=state.provider,
             )
             proposals.append(proposal)
+            details_by_series[(state.provider, state.provider_series_id)] = None
             continue
 
         mapping_status, confidence, chosen_anime_id, mapping_source, approved, mapping_reasons = _resolve_mapping_for_sync(
@@ -886,6 +964,7 @@ def build_dry_run_sync_plan(
                 provider=state.provider,
             )
             proposals.append(proposal)
+            details_by_series[(state.provider, state.provider_series_id)] = None
             continue
 
         try:
@@ -910,6 +989,7 @@ def build_dry_run_sync_plan(
                 provider=state.provider,
             )
             proposals.append(proposal)
+            details_by_series[(state.provider, state.provider_series_id)] = None
             continue
         proposal = _plan_status_update(
             state,
@@ -921,6 +1001,11 @@ def build_dry_run_sync_plan(
             extra_reasons=mapping_reasons,
         )
         proposals.append(proposal)
+        details_by_series[(state.provider, state.provider_series_id)] = detail
+    if provider in {None, "hidive"}:
+        coverage = _materialize_hidive_dry_run_confirmations(config, states, proposals, details_by_series)
+        if not coverage["invariant_satisfied"]:
+            raise RuntimeError("HIDIVE progress confirmation coverage invariant failed")
     return proposals
 
 

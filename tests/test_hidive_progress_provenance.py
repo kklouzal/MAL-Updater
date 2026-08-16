@@ -4,13 +4,21 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mal_updater.config import load_config
-from mal_updater.db import bootstrap_database
+from mal_updater.db import (
+    bootstrap_database,
+    connect,
+    get_watch_confirmation_coverage,
+    get_watch_confirmation_provenance,
+    upsert_series_mapping,
+)
 from mal_updater.hidive_snapshot import _dedupe_progress, _history_item_to_progress
 from mal_updater.ingestion import ingest_snapshot_payload
+from mal_updater.mal_client import MalApiError
 from mal_updater.recommendations import _build_new_episode_recommendations
-from mal_updater.sync_planner import _plan_status_update, load_provider_series_states
+from mal_updater.sync_planner import _plan_status_update, build_dry_run_sync_plan, load_provider_series_states
 
 
 class HidiveProgressProvenanceTests(unittest.TestCase):
@@ -52,6 +60,58 @@ class HidiveProgressProvenanceTests(unittest.TestCase):
         strong = EpisodeProgress(**{k: v for k, v in self._progress(playback_position_ms=600000, completion_ratio=.4, progress_source_surface="hidive_continue_watching", progress_observation_kind="position", last_watched_at="2026-08-15T00:00:00Z").items()})
         self.assertIs(_dedupe_progress([strong, weak])[0], strong)
 
+    def test_append_only_observations_preserve_fresh_history_beside_measured_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = self._config(Path(td))
+            measured = self._progress(
+                playback_position_ms=600000, completion_ratio=.4,
+                progress_source_surface="hidive_continue_watching",
+                progress_observation_kind="position",
+                last_watched_at="2026-08-15T00:00:00Z",
+            )
+            history = self._progress(
+                progress_source_surface="hidive_history",
+                progress_observation_kind="history_membership",
+                last_watched_at="2026-08-16T00:00:00Z",
+            )
+            ingest_snapshot_payload(self._payload([measured]), config)
+            ingest_snapshot_payload(self._payload([history]), config)
+            ingest_snapshot_payload(self._payload([history]), config)
+
+            with sqlite3.connect(config.db_path) as conn:
+                projection = conn.execute(
+                    "SELECT progress_observation_kind, playback_position_ms, completion_ratio "
+                    "FROM provider_episode_progress WHERE provider='hidive' AND provider_episode_id='e1'"
+                ).fetchone()
+                observations = conn.execute(
+                    "SELECT observation_id, observation_kind, observed_at, effective_at FROM provider_progress_observations "
+                    "WHERE provider='hidive' AND provider_episode_id='e1' ORDER BY effective_at"
+                ).fetchall()
+            self.assertEqual(("position", 600000, .4), projection)
+            self.assertEqual(2, len(observations))
+            self.assertEqual(2, len({row[0] for row in observations}))
+            self.assertEqual(["position", "history_membership"], [row[1] for row in observations])
+            self.assertEqual("2026-08-16T00:00:00Z", observations[1][2])
+            self.assertEqual("2026-08-16T00:00:00Z", observations[1][3])
+
+    def test_explicit_observation_identity_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = self._config(Path(td))
+            progress = self._progress(
+                observation_id="hidive:history:e1:2026-08-15",
+                observed_at="2026-08-15T01:00:00Z",
+                effective_at="2026-08-15T00:00:00Z",
+            )
+            ingest_snapshot_payload(self._payload([progress]), config)
+            ingest_snapshot_payload(self._payload([progress]), config)
+            with sqlite3.connect(config.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*), MIN(observed_at), MIN(effective_at) "
+                    "FROM provider_progress_observations WHERE observation_id=?",
+                    (progress["observation_id"],),
+                ).fetchone()
+            self.assertEqual((1, progress["observed_at"], progress["effective_at"]), row)
+
     def test_history_only_and_legacy_synthetic_rows_cannot_advance_completion(self):
         with tempfile.TemporaryDirectory() as td:
             config = self._config(Path(td))
@@ -71,6 +131,94 @@ class HidiveProgressProvenanceTests(unittest.TestCase):
             )
             self.assertEqual("skip", proposal.decision)
             self.assertIn("completion_unknown_history_membership=1", proposal.reasons)
+
+    def test_completed_bounded_dry_run_materializes_all_hidive_progress_series(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = self._config(Path(td))
+            ingest_snapshot_payload(self._payload([self._progress()]), config)
+            with connect(config.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO provider_series(provider,provider_series_id,title,raw_json) "
+                    "VALUES('hidive','s2','Second Show','{}')"
+                )
+                conn.execute(
+                    "INSERT INTO provider_episode_progress(provider,provider_episode_id,provider_series_id,"
+                    "episode_number,playback_position_ms,duration_ms,completion_ratio,last_watched_at,raw_json) "
+                    "VALUES('hidive','legacy-s2','s2',1,1440000,1440000,1.0,'2026-08-16T00:00:00Z','{}')"
+                )
+                conn.commit()
+
+            proposals = build_dry_run_sync_plan(
+                config,
+                provider="hidive",
+                limit=1,
+                approved_mappings_only=True,
+            )
+
+            self.assertEqual(1, len(proposals))
+            coverage = get_watch_confirmation_coverage(config.db_path, provider="hidive")
+            self.assertEqual(2, coverage["progress_series_count"])
+            self.assertEqual(0, coverage["missing_confirmation_series_count"])
+            self.assertTrue(coverage["invariant_satisfied"])
+            legacy = get_watch_confirmation_provenance(
+                config.db_path,
+                provider="hidive",
+                provider_series_id="s2",
+            )
+            self.assertIsNotNone(legacy)
+            assert legacy is not None
+            self.assertEqual(
+                1,
+                legacy.progress_audit["diagnostic_reason_counts"][
+                    "legacy_unproven_hidive_synthetic_completion"
+                ],
+            )
+            with connect(config.db_path) as conn:
+                projection = conn.execute(
+                    "SELECT playback_position_ms,completion_ratio,progress_observation_kind "
+                    "FROM provider_episode_progress WHERE provider_episode_id='legacy-s2'"
+                ).fetchone()
+            self.assertEqual((1440000, 1.0, None), tuple(projection))
+
+    def test_dry_run_materializes_hidive_confirmation_when_mal_detail_lookup_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = self._config(Path(td))
+            ingest_snapshot_payload(self._payload([self._progress()]), config)
+            upsert_series_mapping(
+                config.db_path,
+                provider="hidive",
+                provider_series_id="s1",
+                mal_anime_id=123,
+                confidence=1.0,
+                mapping_source="auto_exact",
+                approved_by_user=True,
+                notes="test",
+            )
+
+            with patch(
+                "mal_updater.sync_planner.MalClient.get_anime_details",
+                side_effect=MalApiError("detail unavailable"),
+            ):
+                proposals = build_dry_run_sync_plan(
+                    config,
+                    provider="hidive",
+                    approved_mappings_only=True,
+                )
+
+            self.assertEqual(1, len(proposals))
+            self.assertEqual("review", proposals[0].decision)
+            self.assertIn("mal_details_lookup_failed:detail unavailable", proposals[0].reasons)
+            confirmation = get_watch_confirmation_provenance(
+                config.db_path,
+                provider="hidive",
+                provider_series_id="s1",
+            )
+            self.assertIsNotNone(confirmation)
+            assert confirmation is not None
+            self.assertIn("mal_details_lookup_failed:detail unavailable", confirmation.decision_audit["reasons"])
+            coverage = get_watch_confirmation_coverage(config.db_path, provider="hidive")
+            self.assertEqual(0, coverage["missing_confirmation_series_count"])
+            self.assertTrue(coverage["invariant_satisfied"])
 
     def test_mixed_evidence_preserves_confirmed_completion_without_uncertain_tail_or_freshness(self):
         with tempfile.TemporaryDirectory() as td:
@@ -175,6 +323,8 @@ class HidiveProgressProvenanceTests(unittest.TestCase):
                 conn.execute("INSERT INTO provider_episode_progress(provider,provider_episode_id,provider_series_id,playback_position_ms,duration_ms,completion_ratio,raw_json) VALUES('hidive','e','s',10,20,.5,'{}')")
                 row = conn.execute("SELECT playback_position_ms,duration_ms,completion_ratio,progress_source_surface,progress_observation_kind,completion_assertion,normalization_logic_version FROM provider_episode_progress").fetchone()
             self.assertEqual((10, 20, .5, None, None, None, None), row)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM provider_progress_observations").fetchone()[0])
 
 
 if __name__ == "__main__":
