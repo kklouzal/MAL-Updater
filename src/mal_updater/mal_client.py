@@ -71,6 +71,26 @@ def _validate_anime_search_response(response: Any) -> dict[str, Any]:
     return response
 
 
+def _validate_anime_suggestions_response(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+        raise MalApiError("MAL anime suggestions response lacks a typed data list")
+    paging = response.get("paging")
+    if paging is not None and not isinstance(paging, dict):
+        raise MalApiError("MAL anime suggestions response has malformed paging")
+    for item in response["data"]:
+        node = item.get("node") if isinstance(item, dict) else None
+        if (
+            not isinstance(node, dict)
+            or isinstance(node.get("id"), bool)
+            or not isinstance(node.get("id"), int)
+            or int(node["id"]) <= 0
+            or not isinstance(node.get("title"), str)
+            or not node["title"].strip()
+        ):
+            raise MalApiError("MAL anime suggestions response contains an invalid node")
+    return response
+
+
 def _validate_anime_detail_response(response: Any, *, anime_id: int, fields: set[str]) -> dict[str, Any]:
     if not isinstance(response, dict) or response.get("id") != int(anime_id):
         raise MalApiError("MAL anime detail response identity does not match the request")
@@ -383,6 +403,28 @@ class MalClient:
                 status="negative" if negative else "ok", response=response, fetched_at=now_iso,
                 expires_at=(now + timedelta(days=max(0, ttl_days))).isoformat().replace("+00:00", "Z"))
         return response
+
+    def get_anime_suggestions(
+        self,
+        *,
+        limit: int = 100,
+        fields: str = (
+            "id,title,mean,num_scoring_users,num_list_users,popularity,rank,media_type,"
+            "status,num_episodes,rating,nsfw,start_season"
+        ),
+    ) -> dict[str, Any]:
+        """Fetch exactly one bounded OAuth-only suggestions page without caching it."""
+        normalized_limit = min(max(int(limit), 1), 100)
+        normalized_fields = ",".join(part.strip() for part in fields.split(",") if part.strip())
+        query: dict[str, int | str] = {"limit": normalized_limit}
+        if normalized_fields:
+            query["fields"] = normalized_fields
+        response = self._get_json(
+            f"/anime/suggestions?{urlencode(query)}",
+            headers=self._build_auth_headers(require_user=True),
+            error_context="MAL API anime suggestions shadow probe failed",
+        )
+        return _validate_anime_suggestions_response(response)
 
     def get_anime_details(
         self,

@@ -75,6 +75,40 @@ class MalClientTests(unittest.TestCase):
             refresh_token_path=config.secrets_dir / "mal_refresh_token.txt",
         )
 
+    def test_get_anime_suggestions_is_one_bounded_authenticated_get(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config, access_token="access"))
+            payload = {"data": [{"node": {"id": 123, "title": "Suggestion"}}], "paging": {"next": "ignored"}}
+            with patch.object(client, "_get_json", return_value=payload) as get_json:
+                self.assertEqual(payload, client.get_anime_suggestions(limit=1000, fields="id, title"))
+
+            url = get_json.call_args.args[0]
+            self.assertEqual("/anime/suggestions", urlparse(url).path)
+            self.assertEqual(["100"], parse_qs(urlparse(url).query)["limit"])
+            self.assertEqual(["id,title"], parse_qs(urlparse(url).query)["fields"])
+            self.assertEqual("Bearer access", get_json.call_args.kwargs["headers"]["Authorization"])
+            self.assertNotIn("offset", parse_qs(urlparse(url).query))
+
+    def test_get_anime_suggestions_requires_oauth_and_rejects_bad_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            no_oauth = MalClient(config, self._secrets(config))
+            with self.assertRaisesRegex(MalApiError, "access_token"):
+                no_oauth.get_anime_suggestions()
+
+            client = MalClient(config, self._secrets(config, access_token="access"))
+            malformed = (
+                {"data": {}},
+                {"data": [], "paging": []},
+                {"data": [{"node": {"id": "123", "title": "Bad"}}]},
+                {"data": [{"node": {"id": 123, "title": ""}}]},
+            )
+            for payload in malformed:
+                with self.subTest(payload=payload), patch.object(client, "_get_json", return_value=payload):
+                    with self.assertRaises(MalApiError):
+                        client.get_anime_suggestions()
+
     def test_token_exchange_and_refresh_failures_are_single_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))

@@ -78,7 +78,9 @@ from .recommendation_metadata import (
     _mal_user_list_initial_url, _mal_user_list_query_identity, _normalized_user_list_statuses,
     refresh_full_user_recommendation_harvest, refresh_mal_user_anime_list_cache, refresh_recommendation_metadata,
 )
+from .recommendation_shadow_audit import build_mal_suggestions_shadow_audit, load_shadow_cohorts
 from .mal_user_recommendations import validate_public_user_recs_url
+from .persistence import atomic_write_json
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
 from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
@@ -3051,6 +3053,21 @@ def _cmd_recommend_snapshots(project_root: Path | None, limit: int, output_forma
     return 0
 
 
+def _cmd_recommend_suggestions_audit(project_root: Path | None, limit: int, output: Path | None) -> int:
+    """Run the explicitly manual GET-only shadow lane without migrating local state."""
+    config = load_config(project_root)
+    normalized_limit = min(max(int(limit), 1), 100)
+    cohorts = load_shadow_cohorts(config.db_path)
+    suggestions = MalClient(config, load_mal_secrets(config)).get_anime_suggestions(limit=normalized_limit)
+    audit = build_mal_suggestions_shadow_audit(suggestions, cohorts, limit=normalized_limit)
+    if output is None:
+        print(json.dumps(audit, indent=2, sort_keys=True))
+    else:
+        atomic_write_json(output, audit, indent=2, sort_keys=True)
+        print(json.dumps({"status": "ok", "output": str(output), "schema_version": audit["schema_version"]}, indent=2))
+    return 0
+
+
 def _cmd_recommend_dashboard(project_root: Path | None, output: Path, limit: int, include_dormant: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -3650,6 +3667,8 @@ def _dispatch(parser, args) -> int:
         return _cmd_recommend(args.project_root, args.limit, args.flat, args.include_dormant, args.persist_snapshot)
     if args.command == "recommend-snapshots":
         return _cmd_recommend_snapshots(args.project_root, args.limit, args.output_format)
+    if args.command == "recommend-suggestions-audit":
+        return _cmd_recommend_suggestions_audit(args.project_root, args.limit, args.output)
     if args.command == "recommend-maintain":
         return _cmd_recommend_maintain(
             args.project_root,

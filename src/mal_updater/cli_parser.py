@@ -383,6 +383,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recommend_snapshots.add_argument("--limit", type=int, default=100, help="Maximum rows to emit from the latest run")
     recommend_snapshots.add_argument("--format", dest="output_format", default="json", choices=["json", "summary"], help="Output format: machine-readable JSON (default) or terse operator summary")
+    suggestions_audit = subparsers.add_parser(
+        "recommend-suggestions-audit",
+        help="Manually fetch one OAuth suggestions page and emit only a privacy-safe, non-persisting aggregate audit",
+    )
+    suggestions_audit.add_argument("--limit", type=int, default=100, help="First-page suggestion limit (clamped to 1-100)")
+    suggestions_audit.add_argument("--output", type=Path, default=None, help="Optional aggregate JSON artifact path (stdout by default)")
     recommend_maintain = subparsers.add_parser(
         "recommend-maintain",
         help="Run one unattended, write-conservative recommendation maintenance cycle",
