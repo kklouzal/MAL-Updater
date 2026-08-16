@@ -84,6 +84,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "bootstrap-audit",
     "crunchyroll-auth-login",
     "crunchyroll-fetch-snapshot",
+    "crunchyroll-recommendation-shadow-audit",
     "dashboard-serve",
     "dry-run-sync",
     "eval",
@@ -115,6 +116,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "recommend-refresh-metadata",
     "recommend-reinitialize-full-userrecs",
     "recommend-snapshots",
+    "recommend-suggestions-audit",
     "refresh-mapping-review-queue",
     "reopen-review-queue",
     "resolve-review-queue",
@@ -390,7 +392,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(55, len(actual_commands))
+        self.assertEqual(57, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",
@@ -403,6 +405,7 @@ class ProviderCliTests(unittest.TestCase):
             "recommend-reinitialize-full-userrecs": "quarantined public-userrecs source",
             "mal-list-reinitialize": "quarantined exact MAL account/query traversal",
             "runtime-retention-audit": "retention inventory audit",
+            "crunchyroll-recommendation-shadow-audit": "GET-only native recommendations/home-feed aggregate shadow audit",
         }.items():
             with self.subTest(command=command):
                 help_text = command_parsers[command].format_help()

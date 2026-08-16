@@ -389,6 +389,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     suggestions_audit.add_argument("--limit", type=int, default=100, help="First-page suggestion limit (clamped to 1-100)")
     suggestions_audit.add_argument("--output", type=Path, default=None, help="Optional aggregate JSON artifact path (stdout by default)")
+    crunchyroll_shadow_audit = subparsers.add_parser(
+        "crunchyroll-recommendation-shadow-audit",
+        help="Manually run the feature-gated GET-only native recommendations/home-feed aggregate shadow audit",
+    )
+    crunchyroll_shadow_audit.add_argument("--access-token-file", type=Path, required=True, help="Ephemeral mode-0600 access-token file")
+    crunchyroll_shadow_audit.add_argument("--account-id-file", type=Path, required=True, help="Ephemeral mode-0600 account-id file")
+    crunchyroll_shadow_audit.add_argument("--limit", type=int, default=25, help="Per-surface result bound (clamped to 1-25)")
+    crunchyroll_shadow_audit.add_argument("--output", type=Path, default=None, help="Optional privacy-safe aggregate JSON artifact path (stdout by default)")
     recommend_maintain = subparsers.add_parser(
         "recommend-maintain",
         help="Run one unattended, write-conservative recommendation maintenance cycle",

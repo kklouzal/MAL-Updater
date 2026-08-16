@@ -26,6 +26,11 @@ from .crunchyroll_auth import (
     resolve_crunchyroll_state_paths,
 )
 from .crunchyroll_snapshot import CrunchyrollSnapshotError
+from .crunchyroll_recommendation_shadow import (
+    load_access_context as load_crunchyroll_shadow_access_context,
+    render_json as render_crunchyroll_shadow_json,
+    run_shadow_audit as run_crunchyroll_recommendation_shadow_audit,
+)
 from .hidive_auth import HidiveAuthError, load_hidive_credentials, resolve_hidive_state_paths
 from .hidive_snapshot import HidiveSnapshotError
 from . import provider_snapshot
@@ -3068,6 +3073,35 @@ def _cmd_recommend_suggestions_audit(project_root: Path | None, limit: int, outp
     return 0
 
 
+def _cmd_crunchyroll_recommendation_shadow_audit(
+    project_root: Path | None,
+    access_token_file: Path,
+    account_id_file: Path,
+    limit: int,
+    output: Path | None,
+) -> int:
+    """Run the explicitly manual, feature-gated, non-persisting Crunchyroll shadow lane."""
+    config = load_config(project_root)
+    access_token, account_id = load_crunchyroll_shadow_access_context(access_token_file, account_id_file)
+    audit = run_crunchyroll_recommendation_shadow_audit(
+        config,
+        enabled=config.crunchyroll.recommendation_shadow_enabled,
+        access_token=access_token,
+        account_id=account_id,
+        limit=limit,
+    )
+    rendered = render_crunchyroll_shadow_json(audit)
+    if output is None:
+        print(rendered)
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.touch(mode=0o600, exist_ok=True)
+        output.chmod(0o600)
+        output.write_text(rendered + "\n", encoding="utf-8")
+        print(json.dumps({"status": "ok", "output": str(output), "schema_version": audit["schema_version"]}, indent=2))
+    return 0
+
+
 def _cmd_recommend_dashboard(project_root: Path | None, output: Path, limit: int, include_dormant: bool) -> int:
     config = load_config(project_root)
     ensure_directories(config)
@@ -3669,6 +3703,14 @@ def _dispatch(parser, args) -> int:
         return _cmd_recommend_snapshots(args.project_root, args.limit, args.output_format)
     if args.command == "recommend-suggestions-audit":
         return _cmd_recommend_suggestions_audit(args.project_root, args.limit, args.output)
+    if args.command == "crunchyroll-recommendation-shadow-audit":
+        return _cmd_crunchyroll_recommendation_shadow_audit(
+            args.project_root,
+            args.access_token_file,
+            args.account_id_file,
+            args.limit,
+            args.output,
+        )
     if args.command == "recommend-maintain":
         return _cmd_recommend_maintain(
             args.project_root,

@@ -51,6 +51,7 @@ DEFAULT_PROVIDER_DETAIL_CACHE_TTL_DAYS = 120
 DEFAULT_CRUNCHYROLL_LOCALE = "en-US"
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_SECONDS = 22.5
 DEFAULT_CRUNCHYROLL_REQUEST_SPACING_JITTER_SECONDS = 7.5
+DEFAULT_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED = False
 DEFAULT_HIDIVE_REQUEST_SPACING_SECONDS = 5.0
 DEFAULT_HIDIVE_REQUEST_SPACING_JITTER_SECONDS = 1.0
 DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS = 2
@@ -262,6 +263,7 @@ class CrunchyrollSettings:
     retry_backoff_base_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS
     retry_backoff_jitter_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS
     retry_after_cap_seconds: float = DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS
+    recommendation_shadow_enabled: bool = DEFAULT_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED
 
 
 @dataclass(slots=True)
@@ -935,6 +937,20 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
             retry_backoff_base_seconds=max(0.0, float(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_BACKOFF_BASE_SECONDS", _get_float(crunchyroll_section, "retry_backoff_base_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_BASE_SECONDS)))),
             retry_backoff_jitter_seconds=max(0.0, float(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_BACKOFF_JITTER_SECONDS", _get_float(crunchyroll_section, "retry_backoff_jitter_seconds", DEFAULT_PROVIDER_RETRY_BACKOFF_JITTER_SECONDS)))),
             retry_after_cap_seconds=max(0.0, float(os.getenv("MAL_UPDATER_CRUNCHYROLL_RETRY_AFTER_CAP_SECONDS", _get_float(crunchyroll_section, "retry_after_cap_seconds", DEFAULT_PROVIDER_RETRY_AFTER_CAP_SECONDS)))),
+            recommendation_shadow_enabled=_coerce_bool(
+                os.getenv(
+                    "MAL_UPDATER_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED",
+                    str(
+                        _get_bool(
+                            crunchyroll_section,
+                            "recommendation_shadow_enabled",
+                            DEFAULT_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED,
+                            section="crunchyroll",
+                        )
+                    ),
+                ),
+                label="environment variable MAL_UPDATER_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED",
+            ),
         ),
         hidive=HidiveSettings(
             request_spacing_seconds=max(0.0, float(os.getenv("MAL_UPDATER_HIDIVE_REQUEST_SPACING_SECONDS", _get_float(hidive_section, "request_spacing_seconds", DEFAULT_HIDIVE_REQUEST_SPACING_SECONDS)))),
