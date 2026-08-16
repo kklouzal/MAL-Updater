@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mal-updater.local/schemas/eval/candidate-v1.schema.json",
+  "title": "MAL-Updater replay candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "query_id", "user_id", "cutoff_at", "horizon_end_at", "objective", "item_id", "eligible", "eligibility_reasons", "sources", "features", "feature_version", "evidence_event_ids", "max_observed_at"],
+  "properties": {
+    "schema_version": {"const": "mal-eval-candidate/v1"},
+    "query_id": {"type": "string", "minLength": 1},
+    "user_id": {"type": "string", "minLength": 1},
+    "cutoff_at": {"type": "string", "format": "date-time"},
+    "horizon_end_at": {"type": "string", "format": "date-time"},
+    "objective": {"enum": ["discovery", "resume", "backlog", "new_season", "new_episode"]},
+    "item_id": {"type": "string", "minLength": 1},
+    "mal_anime_id": {"type": ["string", "null"]},
+    "provider_item_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "eligible": {"type": "boolean"},
+    "eligibility_reasons": {"type": "array", "items": {"type": "string"}},
+    "sources": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["source_type", "as_of", "evidence_event_ids"],
+        "properties": {
+          "source_type": {"enum": ["mal_recommendation_edge", "mal_relation", "mal_metadata", "mal_list_history", "provider_catalog", "provider_watch_history", "provider_watchlist", "seasonal_catalog", "heuristic"]},
+          "source_item_id": {"type": ["string", "null"]},
+          "target_item_id": {"type": ["string", "null"]},
+          "provider": {"type": ["string", "null"]},
+          "weight": {"type": ["number", "null"]},
+          "votes": {"type": ["integer", "null"], "minimum": 0},
+          "as_of": {"type": "string", "format": "date-time"},
+          "evidence_event_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true}
+        }
+      }
+    },
+    "availability": {"type": "array", "items": {"$ref": "#/$defs/assertion"}},
+    "english_dub": {"type": "array", "items": {"$ref": "#/$defs/assertion"}},
+    "features": {"type": "object", "additionalProperties": {"type": ["number", "string", "boolean", "null"]}},
+    "feature_version": {"type": "string", "minLength": 1},
+    "evidence_event_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true},
+    "max_observed_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "assertion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "state", "strength", "evidence_event_ids"],
+      "properties": {
+        "provider": {"type": "string"},
+        "state": {"enum": ["yes", "no", "unknown"]},
+        "strength": {"enum": ["explicit", "strong", "weak", "unknown"]},
+        "evidence_event_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    }
+  }
+}

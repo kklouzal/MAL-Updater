@@ -3293,7 +3293,87 @@ def _cmd_push_recommendations_webhook(
     return 0 if result.status in {"dry_run", "delivered", "no_recommendations"} else 1
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _write_jsonl(path: Path, rows) -> None:
+    from .persistence import atomic_write_bytes
+    data = "".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n" for row in rows).encode("utf-8")
+    atomic_write_bytes(path, data)
+
+
+def _cmd_eval(args) -> int:
+    from .evaluation.bundle import EvalConfigV1, evaluate as evaluate_rows, validate_bundle
+    from .evaluation.resume import ReplayQuery, ResumePolicy, evaluate_resume
+    from .persistence import atomic_write_json
+
+    if args.eval_command == "validate":
+        report = validate_bundle(args.bundle, exact_required=args.exact)
+        print(json.dumps({"valid": report.valid, "violations": report.violations, "record_counts": report.record_counts}, indent=2, sort_keys=True))
+        return 0 if report.valid else 3
+    if args.eval_command == "labels":
+        validation = validate_bundle(args.bundle, exact_required=False)
+        if not validation.valid:
+            print(json.dumps({"valid": False, "violations": validation.violations}, sort_keys=True), file=sys.stderr)
+            return 3
+        events = _read_jsonl(args.bundle / "events.jsonl")
+        candidates = _read_jsonl(args.bundle / "candidates.jsonl")
+        labels = []
+        for candidate in candidates:
+            cutoff = datetime.fromisoformat(candidate["cutoff_at"].replace("Z", "+00:00"))
+            horizon = datetime.fromisoformat(candidate["horizon_end_at"].replace("Z", "+00:00"))
+            matches = [event for event in events if event.get("entity", {}).get("entity_id") == candidate["item_id"]
+                       and cutoff < datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00")) <= horizon
+                       and cutoff < datetime.fromisoformat(event["observed_at"].replace("Z", "+00:00")) <= horizon]
+            labels.append({"schema_version": "mal-eval-label/v1", "query_id": candidate["query_id"], "item_id": candidate["item_id"],
+                           "binary_relevance": 1 if matches else 0, "graded_relevance": 2 if matches else 0,
+                           "label_state": "positive" if matches else "unobserved",
+                           "first_positive_at": min((row["occurred_at"] for row in matches), default=None),
+                           "outcome_event_ids": sorted({row["event_id"] for row in matches}), "observable_days": 30,
+                           "exposure_known": False, "reason_codes": ["provider_play_started"] if matches else ["insufficient_observability"]})
+        _write_jsonl(args.output, labels)
+        return 0
+    if args.eval_command == "score":
+        validation = validate_bundle(args.bundle, exact_required=False)
+        if not validation.valid:
+            print(json.dumps({"valid": False, "violations": validation.violations}, sort_keys=True), file=sys.stderr)
+            return 3
+        report = evaluate_rows(_read_jsonl(args.predictions), _read_jsonl(args.labels), config=EvalConfigV1()).payload
+        report["bootstrap"] = {"cluster": args.bootstrap_cluster, "replicates": args.bootstrap_replicates, "seed": args.seed,
+                               "status": "descriptive_only" if args.descriptive_only else "insufficient_week_clusters"}
+        report["watermark"] = "DESCRIPTIVE ONLY" if args.descriptive_only else None
+        atomic_write_json(args.output, report, indent=2, sort_keys=True)
+        return 0 if args.descriptive_only else 4
+    config = load_config(args.project_root)
+    try:
+        cutoff = datetime.fromisoformat(args.cutoff.replace("Z", "+00:00"))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if cutoff.tzinfo is None:
+        print("--cutoff must include a timezone", file=sys.stderr)
+        return 2
+    query = ReplayQuery(args.query_id, "local-default", cutoff.astimezone(timezone.utc), cutoff.astimezone(timezone.utc) + timedelta(days=30))
+    try:
+        report = evaluate_resume(config.db_path, query, ResumePolicy(
+            minimum_progress_ratio=args.minimum_progress_ratio,
+            minimum_progress_ms=args.minimum_progress_ms,
+            completion_ratio=args.completion_ratio,
+        ))
+    except (ValueError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.output:
+        atomic_write_json(args.output, report, indent=2, sort_keys=True)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def _dispatch(parser, args) -> int:
+    if args.command == "eval":
+        return _cmd_eval(args)
     if args.command == "init":
         return _cmd_init(args.project_root)
     if args.command == "status":

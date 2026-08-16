@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mal-updater.local/schemas/eval/manifest-v1.schema.json",
+  "title": "MAL-Updater temporal replay manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "bundle_id", "created_at", "reconstruction_quality", "time_range", "cutoffs", "objectives", "horizons", "files", "hash_algorithm"],
+  "properties": {
+    "schema_version": {"const": "mal-eval-manifest/v1"},
+    "bundle_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "reconstruction_quality": {"enum": ["exact", "snapshot_derived", "inexact"]},
+    "time_range": {"$ref": "#/$defs/timeRange"},
+    "cutoffs": {"type": "array", "minItems": 1, "items": {"type": "string", "format": "date-time"}, "uniqueItems": true},
+    "objectives": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/objective"}},
+    "horizons": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["discovery", "resume", "backlog", "new_season", "new_episode"],
+      "properties": {
+        "discovery": {"type": "string", "pattern": "^[1-9][0-9]*d$"},
+        "resume": {"type": "string", "pattern": "^[1-9][0-9]*d$"},
+        "backlog": {"type": "string", "pattern": "^[1-9][0-9]*d$"},
+        "new_season": {"type": "string", "pattern": "^[1-9][0-9]*d$"},
+        "new_episode": {"type": "string", "pattern": "^[1-9][0-9]*d$"}
+      }
+    },
+    "files": {"type": "object", "minProperties": 2, "additionalProperties": {"$ref": "#/$defs/file"}},
+    "hash_algorithm": {"const": "sha256"},
+    "generator": {"type": "object"},
+    "label_policy": {"type": "object"},
+    "redactions": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "objective": {"enum": ["discovery", "resume", "backlog", "new_season", "new_episode"]},
+    "timeRange": {
+      "type": "object", "additionalProperties": false, "required": ["from", "until"],
+      "properties": {"from": {"type": "string", "format": "date-time"}, "until": {"type": "string", "format": "date-time"}}
+    },
+    "file": {
+      "type": "object", "additionalProperties": false, "required": ["path", "sha256", "records"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "records": {"type": "integer", "minimum": 0}}
+    }
+  }
+}

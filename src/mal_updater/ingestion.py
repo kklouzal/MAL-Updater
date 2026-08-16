@@ -11,6 +11,7 @@ from .provider_snapshot import snapshot_to_dict
 from .provider_types import ProviderFetchResult
 from .snapshot_authority import has_hidive_snapshot_authority
 from .validation import validate_snapshot_payload
+from .evaluation.events import capture_provider_observations
 
 
 @dataclass(slots=True)
@@ -80,6 +81,7 @@ def _ingest_snapshot_payload(
         try:
             _upsert_series(conn, provider, snapshot.series)
             _upsert_progress(conn, provider, snapshot.progress)
+            capture_provider_observations(conn, snapshot=snapshot, sync_run_id=sync_run_id)
             account_id_hint = snapshot.account_id_hint.strip() if snapshot.account_id_hint else None
             account_conflict = _watchlist_account_conflict(
                 conn, provider=provider, account_id_hint=account_id_hint,

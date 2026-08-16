@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mal-updater.local/schemas/eval/prediction-v1.schema.json",
+  "title": "MAL-Updater replay prediction v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "query_id", "objective", "item_id", "rank", "score", "policy_id", "policy_version", "policy_artifact_sha256", "contributions"],
+  "properties": {
+    "schema_version": {"const": "mal-eval-prediction/v1"},
+    "query_id": {"type": "string", "minLength": 1},
+    "objective": {"enum": ["discovery", "resume", "backlog", "new_season", "new_episode"]},
+    "item_id": {"type": "string", "minLength": 1},
+    "rank": {"type": "integer", "minimum": 1},
+    "score": {"type": "number"},
+    "probability": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "policy_id": {"type": "string", "minLength": 1},
+    "policy_version": {"type": "string", "minLength": 1},
+    "policy_artifact_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "contributions": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["feature", "value", "source_event_ids"],
+        "properties": {
+          "feature": {"type": "string"},
+          "value": {"type": "number"},
+          "source_event_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        }
+      }
+    }
+  }
+}

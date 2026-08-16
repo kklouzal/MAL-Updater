@@ -28,6 +28,7 @@ MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION = "022_mal_user_list_durable_paginati
 PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION = "023_public_userrecs_incremental_validation.sql"
 PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION = "025_provider_watchlist_current_membership.sql"
 PROVIDER_EPISODE_PROGRESS_PROVENANCE_MIGRATION = "026_provider_episode_progress_provenance.sql"
+EVALUATION_EVENTS_MIGRATION = "027_evaluation_events.sql"
 
 MIGRATION_FILENAMES: tuple[str, ...] = (
     "001_initial.sql",
@@ -57,6 +58,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "024_public_userrecs_final_anchor_validation.sql",
     PROVIDER_WATCHLIST_CURRENT_MEMBERSHIP_MIGRATION,
     PROVIDER_EPISODE_PROGRESS_PROVENANCE_MIGRATION,
+    EVALUATION_EVENTS_MIGRATION,
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
