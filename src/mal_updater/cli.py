@@ -36,6 +36,7 @@ from .hidive_snapshot import HidiveSnapshotError
 from . import provider_snapshot
 from .provider_registry import get_provider, list_provider_slugs
 from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
+from .recommendation_decision_ledger import insert_recommendation_decision_ledger, stable_recommendation_item_identity
 from .redaction import sanitize_text
 from .runtime_retention_audit import (
     AuditCaps,
@@ -3012,13 +3013,13 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
     normalized_limit = _normalize_limit(limit)
     results = build_recommendations(
         config,
-        limit=normalized_limit if flat else 0,
+        limit=0,
         require_provider_availability=not include_dormant,
         include_discovery_candidates_without_actionable_provider_evidence=include_dormant,
     )
     payload: object
     if flat:
-        payload = [item.as_dict() for item in results]
+        payload = _snapshot_recommendation_rows(results, normalized_limit)
     else:
         payload = trim_grouped_recommendations(group_recommendations(results), normalized_limit)
     if persist_snapshot:
@@ -3030,6 +3031,24 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
             run_id=run_id,
             generated_at=generated_at,
         )
+    decision_run_id = f"recommend-decision-{uuid.uuid4()}"
+    decision_cutoff_at = datetime.now(timezone.utc).isoformat()
+    emitted_rows: list[dict[str, object]] = []
+    if flat:
+        emitted_rows = payload if isinstance(payload, list) else []
+    elif isinstance(payload, list):
+        for section in payload:
+            if isinstance(section, dict) and isinstance(section.get("items"), list):
+                emitted_rows.extend(row for row in section["items"] if isinstance(row, dict))
+    selected_item_identities_in_exposure_order = [stable_recommendation_item_identity(row) for row in emitted_rows]
+    insert_recommendation_decision_ledger(
+        config.db_path,
+        _snapshot_recommendation_rows(results, None),
+        run_id=decision_run_id,
+        cutoff_at=decision_cutoff_at,
+        output_limit=normalized_limit,
+        selected_item_identities_in_exposure_order=selected_item_identities_in_exposure_order,
+    )
     print(json.dumps(payload, indent=2))
     return 0
 
