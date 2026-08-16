@@ -117,14 +117,20 @@ def _home_candidates(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     candidates: list[dict[str, Any]] = []
     attribution: Counter[str] = Counter()
     for row in rows:
+        source_id_present = "source_media_id" in row
+        source_title_present = "source_media_title" in row
         source_id = row.get("source_media_id")
         source_title = row.get("source_media_title")
-        if source_id is not None or source_title is not None:
+        if not source_id_present and not source_title_present:
+            attribution["generic_rows"] += 1
+        elif source_id_present and source_title_present and source_id == "" and source_title == "":
+            attribution["generic_rows"] += 1
+        elif source_id_present and source_title_present:
             if not isinstance(source_id, str) or not source_id or not isinstance(source_title, str) or not source_title.strip():
                 raise CrunchyrollRecommendationShadowError("home_feed attribution schema drift")
             attribution["because_you_watched_rows"] += 1
         else:
-            attribution["generic_rows"] += 1
+            raise CrunchyrollRecommendationShadowError("home_feed attribution schema drift")
         values: list[Any] = [row]
         items = row.get("items")
         if items is not None:

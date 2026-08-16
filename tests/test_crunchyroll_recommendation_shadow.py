@@ -86,6 +86,21 @@ def test_aggregate_audit_has_provenance_novelty_attribution_and_no_rows() -> Non
         assert secret not in serialized
 
 
+def test_home_feed_empty_attribution_sentinels_are_generic() -> None:
+    payloads = _payloads()
+    payloads["home_feed"]["data"] = [
+        {
+            "source_media_id": "",
+            "source_media_title": "",
+            "items": [_panel("generic", "Generic")],
+        }
+    ]
+    audit = build_shadow_audit(payloads, {"history": set(), "watchlist": set()}, limit=25)
+    assert audit["because_you_watched_attribution"]["attributed_top_level_rows"] == 0
+    assert audit["because_you_watched_attribution"]["generic_top_level_rows"] == 1
+    assert artifact_contains_personal_rows(audit) is False
+
+
 def test_feature_gate_is_fail_closed(tmp_path: Path) -> None:
     db = tmp_path / "db.sqlite3"
     _database(db)
@@ -178,6 +193,20 @@ def test_no_mutation_capable_http_client_is_exposed(monkeypatch: pytest.MonkeyPa
         ({"native_recommendations": {"items": []}, "home_feed": {"data": []}}, "data list"),
         ({"native_recommendations": {"data": [{"id": "x", "title": "X", "type": "episode"}]}, "home_feed": {"data": []}}, "unexpected candidate type"),
         ({"native_recommendations": {"data": []}, "home_feed": {"data": [{"source_media_id": "x", "items": []}]}}, "attribution schema drift"),
+        (
+            {
+                "native_recommendations": {"data": []},
+                "home_feed": {"data": [{"source_media_id": "", "source_media_title": "ambiguous", "items": []}]},
+            },
+            "attribution schema drift",
+        ),
+        (
+            {
+                "native_recommendations": {"data": []},
+                "home_feed": {"data": [{"source_media_id": None, "source_media_title": None, "items": []}]},
+            },
+            "attribution schema drift",
+        ),
     ],
 )
 def test_schema_drift_fails_closed(payloads: dict, message: str) -> None:
