@@ -49,6 +49,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "026_provider_episode_progress_provenance.sql",
                 "027_evaluation_events.sql",
                 "028_provider_progress_observations.sql",
+                "029_provider_fetch_provenance.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -105,6 +106,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "026_provider_episode_progress_provenance.sql",
                     "027_evaluation_events.sql",
                     "028_provider_progress_observations.sql",
+                    "029_provider_fetch_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -140,6 +142,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "026_provider_episode_progress_provenance.sql",
                     "027_evaluation_events.sql",
                     "028_provider_progress_observations.sql",
+                    "029_provider_fetch_provenance.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
