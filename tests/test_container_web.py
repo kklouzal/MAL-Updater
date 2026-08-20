@@ -31,6 +31,29 @@ class ContainerWebTests(unittest.TestCase):
         self.store.save_secrets({"mal_client_id":"fake-client"}); status=self.store.status()
         self.assertTrue(status["secrets_present"]["mal_client_id"]); self.assertNotIn("fake-client",json.dumps(status)); self.assertNotIn("claimed",status); self.assertEqual(0o600,(self.config.secrets_dir/"mal_client_id.txt").stat().st_mode&0o777)
         with self.assertRaises(ValueError): self.store.save_settings({"arbitrary_toml":"evil"})
+        with self.assertRaises(ValueError): self.store.save_settings({"crunchyroll_enabled":True})
+
+    def test_provider_status_tracks_actual_credential_pairs_not_legacy_flags(self):
+        self.store.state_path.write_text('{"crunchyroll_enabled":false,"hidive_enabled":true}\n', encoding="utf-8")
+        self.store.save_secrets({
+            "crunchyroll_username":"user", "crunchyroll_password":"password",
+            "hidive_username":"user",
+        })
+        status = self.store.status()
+        self.assertTrue(status["providers"]["crunchyroll"]["scheduler_eligible"])
+        self.assertFalse(status["providers"]["hidive"]["scheduler_eligible"])
+        self.assertNotIn("crunchyroll_enabled", json.dumps(status))
+        self.assertNotIn('"user"', json.dumps(status))
+        self.assertNotIn('"password"', json.dumps(status))
+
+    def test_connection_results_are_process_session_only_and_secret_free(self):
+        self.store.record_connection_test("mal", ok=True, message="Connection succeeded")
+        status = self.store.status()
+        self.assertEqual(True, status["connection_tests"]["mal"]["ok"])
+        self.assertEqual("Connection succeeded", status["connection_tests"]["mal"]["message"])
+        self.assertIsInstance(status["connection_tests"]["mal"]["tested_at"], int)
+        self.assertEqual({}, ControlStore(self.config).status()["connection_tests"])
+        self.assertFalse(self.store.state_path.exists())
     def test_automation_gate_and_mocked_oauth_state(self):
         self.store.save_secrets({"mal_client_id":"fake-client"})
         self.assertEqual(["mal_oauth_tokens"], self.store.status()["automation_blockers"])

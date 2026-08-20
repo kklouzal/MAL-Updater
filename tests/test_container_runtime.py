@@ -7,7 +7,14 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from mal_updater.config import ensure_directories, load_config
-from mal_updater.container_runtime import SchedulerSupervisor, _status_payload, daemon_command, initialize_runtime
+from mal_updater.container_runtime import (
+    ConnectionTestError,
+    SchedulerSupervisor,
+    _default_connection_tester,
+    _status_payload,
+    daemon_command,
+    initialize_runtime,
+)
 from mal_updater.container_web import ControlStore
 from mal_updater.service_runtime import _task_specs
 
@@ -142,6 +149,40 @@ class ContainerRuntimeTests(unittest.TestCase):
         crunchyroll_only = {spec.name for spec in _task_specs(self.config)}
         self.assertIn("sync_fetch_crunchyroll", crunchyroll_only)
         self.assertNotIn("sync_fetch_hidive", crunchyroll_only)
+
+    def test_mal_connection_test_is_read_only_single_attempt_and_does_not_mutate_config(self) -> None:
+        self.store.save_secrets({"mal_client_id": "client"})
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access\n", encoding="utf-8")
+        original_timeout = self.config.request_timeout_seconds
+        with patch("mal_updater.container_runtime.MalClient") as client:
+            _default_connection_tester(self.config, "mal", 999)
+        self.assertEqual(original_timeout, self.config.request_timeout_seconds)
+        tested_config = client.call_args.args[0]
+        self.assertEqual(15, tested_config.request_timeout_seconds)
+        client.return_value.get_my_user.assert_called_once_with(max_attempts=1)
+
+    def test_provider_connection_tests_establish_and_verify_bounded_sessions(self) -> None:
+        crunchyroll_session = Mock()
+        crunchyroll_session.authorized_json_get.return_value = {"account_id": "safe"}
+        hidive_session = Mock()
+        with (
+            patch("mal_updater.container_runtime._build_request_pacer", return_value=Mock()),
+            patch("mal_updater.container_runtime._start_auth_session", return_value=crunchyroll_session) as crunchyroll,
+            patch("mal_updater.container_runtime.start_hidive_session", return_value=hidive_session) as hidive,
+        ):
+            _default_connection_tester(self.config, "crunchyroll", 10)
+            _default_connection_tester(self.config, "hidive", 10)
+        self.assertEqual(10, crunchyroll.call_args.kwargs["timeout_seconds"])
+        crunchyroll_session.authorized_json_get.assert_called_once()
+        hidive.assert_called_once_with(self.config, profile="default", timeout_seconds=10)
+
+    def test_connection_test_errors_do_not_expose_provider_exception_details(self) -> None:
+        self.store.save_secrets({"mal_client_id": "client"})
+        (self.config.secrets_dir / "mal_access_token.txt").write_text("access\n", encoding="utf-8")
+        with patch("mal_updater.container_runtime.MalClient", side_effect=RuntimeError("token=***")):
+            with self.assertRaisesRegex(ConnectionTestError, "^MAL connection failed$") as error:
+                _default_connection_tester(self.config, "mal", 10)
+        self.assertNotIn("secret-value", str(error.exception))
 
 
 if __name__ == "__main__":

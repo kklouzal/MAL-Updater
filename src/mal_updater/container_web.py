@@ -8,6 +8,8 @@ from urllib.parse import urlencode, urlparse
 
 from .auth import write_secret_file
 from .config import AppConfig, load_mal_secrets
+from .crunchyroll_auth import load_crunchyroll_credentials
+from .hidive_auth import load_hidive_credentials
 from .persistence import atomic_write_json, atomic_write_text
 
 MAX_BODY = 64 * 1024
@@ -52,13 +54,35 @@ class ControlStore:
         # is intentionally neither a credential nor persisted installation state.
         self.csrf_token = secrets.token_urlsafe(32)
         self.oauth: dict[str, dict[str, Any]] = {}
+        self.connection_results: dict[str, dict[str, Any]] = {}
         self.rate = RateLimiter()
         self.lock = threading.RLock()
+    def _secret_paths(self) -> dict[str, Path]:
+        mal = load_mal_secrets(self.config)
+        crunchyroll = load_crunchyroll_credentials(self.config)
+        hidive = load_hidive_credentials(self.config)
+        return {
+            "mal_client_id": mal.client_id_path,
+            "mal_client_secret": mal.client_secret_path,
+            "crunchyroll_username": crunchyroll.username_path,
+            "crunchyroll_password": crunchyroll.password_path,
+            "hidive_username": hidive.username_path,
+            "hidive_password": hidive.password_path,
+        }
     def status(self) -> dict[str, Any]:
         with self.lock:
-            state = _read_json(self.state_path)
-        present = {k: (self.config.secrets_dir / v).is_file() for k, v in self.SECRET_NAMES.items()}
+            connection_results = {kind: dict(result) for kind, result in self.connection_results.items()}
         mal = load_mal_secrets(self.config)
+        crunchyroll = load_crunchyroll_credentials(self.config)
+        hidive = load_hidive_credentials(self.config)
+        present = {
+            "mal_client_id": bool(mal.client_id),
+            "mal_client_secret": bool(mal.client_secret),
+            "crunchyroll_username": bool(crunchyroll.username),
+            "crunchyroll_password": bool(crunchyroll.password),
+            "hidive_username": bool(hidive.username),
+            "hidive_password": bool(hidive.password),
+        }
         complete = bool(mal.client_id) and bool(mal.access_token and mal.refresh_token)
         blockers = []
         if not mal.client_id:
@@ -74,18 +98,23 @@ class ControlStore:
             "mal_oauth_complete": bool(mal.access_token and mal.refresh_token),
             "secrets_present": present,
             "providers": {
-                "crunchyroll_enabled": bool(state.get("crunchyroll_enabled")),
-                "hidive_enabled": bool(state.get("hidive_enabled")),
+                "crunchyroll": {
+                    "scheduler_eligible": bool(crunchyroll.username and crunchyroll.password),
+                    "scheduling_basis": "credentials_present",
+                },
+                "hidive": {
+                    "scheduler_eligible": bool(hidive.username and hidive.password),
+                    "scheduling_basis": "credentials_present",
+                },
             },
+            "connection_tests": connection_results,
             "write_posture": "conservative; onboarding does not approve MAL writes",
         }
     def save_settings(self, data: dict[str, Any]) -> None:
-        allowed = {"crunchyroll_enabled", "hidive_enabled", "sync_every_seconds", "health_every_seconds"}
+        allowed = {"sync_every_seconds", "health_every_seconds"}
         if set(data) - allowed: raise ValueError("unknown setting")
         with self.lock:
             state = _read_json(self.state_path)
-            for key in ("crunchyroll_enabled", "hidive_enabled"):
-                if key in data and not isinstance(data[key], bool): raise ValueError("invalid setting")
             for key in ("sync_every_seconds", "health_every_seconds"):
                 if key in data and (isinstance(data[key], bool) or not isinstance(data[key], int) or not 60 <= data[key] <= 2592000): raise ValueError("invalid setting")
             state.update(data)
@@ -99,12 +128,21 @@ class ControlStore:
         if not isinstance(data, dict) or not isinstance(remove or [], list) or set(data) - set(self.SECRET_NAMES) or set(remove or []) - set(self.SECRET_NAMES): raise ValueError("unknown secret")
         if set(data) & set(remove or []): raise ValueError("secret cannot be replaced and removed together")
         with self.lock:
+            paths = self._secret_paths()
             for name, value in data.items():
                 if not isinstance(value, str) or not value.strip() or len(value.encode()) > 4096: raise ValueError("invalid secret")
-                write_secret_file(self.config.secrets_dir / self.SECRET_NAMES[name], value)
+                write_secret_file(paths[name], value)
             for name in remove or []:
-                (self.config.secrets_dir / self.SECRET_NAMES[name]).unlink(missing_ok=True)
+                paths[name].unlink(missing_ok=True)
         self.audit("secrets_changed", replaced=sorted(data), removed=sorted(remove or []))
+    def record_connection_test(self, kind: str, *, ok: bool, message: str) -> None:
+        if kind not in {"mal", "crunchyroll", "hidive"}: raise ValueError("unknown connection")
+        with self.lock:
+            self.connection_results[kind] = {
+                "ok": bool(ok),
+                "message": str(message),
+                "tested_at": int(time.time()),
+            }
     def begin_oauth(self, redirect_uri: str) -> dict[str, str]:
         parsed = urlparse(redirect_uri)
         if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.path != "/oauth/mal/callback" or parsed.query or parsed.fragment:

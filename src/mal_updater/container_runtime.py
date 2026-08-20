@@ -1,5 +1,6 @@
 from __future__ import annotations
 import base64, hmac, json, os, signal, subprocess, sys, threading, time
+from dataclasses import replace
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -12,9 +13,15 @@ from .auth import persist_token_response
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
 from .container_web import ControlStore, MAX_BODY
 from .container_ui import page as product_page
+from .crunchyroll_auth import CRUNCHYROLL_ME_URL
+from .crunchyroll_snapshot import _build_request_pacer, _start_auth_session
 from .db import bootstrap_database
-from .mal_client import TokenResponse
+from .hidive_auth import start_hidive_session
+from .mal_client import MalClient, TokenResponse
 from .recommendation_dashboard import make_dashboard_handler
+
+class ConnectionTestError(ValueError):
+    """A deliberately credential-free connection-test error safe for the API."""
 
 def initialize_runtime(project_root: Path | None = None) -> AppConfig:
     config = load_config(project_root); ensure_directories(config); bootstrap_database(config.db_path); return config
@@ -82,8 +89,35 @@ def _oauth_exchange(config: AppConfig, code: str, verifier: str, redirect_uri: s
     return TokenResponse(raw["access_token"], str(raw.get("token_type", "Bearer")), raw.get("expires_in"), raw.get("refresh_token"), raw.get("scope"), raw)
 
 def _default_connection_tester(config: AppConfig, kind: str, timeout: int) -> None:
-    del config, kind, timeout
-    raise ValueError("connection testing unavailable")
+    bounded_timeout = max(1, min(int(timeout), 15))
+    try:
+        if kind == "mal":
+            secrets = load_mal_secrets(config)
+            if not secrets.client_id or not secrets.access_token:
+                raise ConnectionTestError("MAL OAuth credentials are incomplete")
+            bounded_config = replace(config, request_timeout_seconds=bounded_timeout)
+            MalClient(bounded_config, secrets).get_my_user(max_attempts=1)
+            return
+        if kind == "crunchyroll":
+            session = _start_auth_session(
+                config,
+                profile="default",
+                timeout_seconds=bounded_timeout,
+                pacer=_build_request_pacer(config),
+            )
+            payload = session.authorized_json_get(CRUNCHYROLL_ME_URL, phase="connection-test")
+            if not isinstance(payload, dict):
+                raise ConnectionTestError("Crunchyroll connection returned an invalid account response")
+            return
+        if kind == "hidive":
+            start_hidive_session(config, profile="default", timeout_seconds=bounded_timeout)
+            return
+        raise ConnectionTestError("Unknown connection")
+    except ConnectionTestError:
+        raise
+    except Exception as exc:
+        display = {"mal": "MAL", "crunchyroll": "Crunchyroll", "hidive": "HIDIVE"}.get(kind, "Provider")
+        raise ConnectionTestError(f"{display} connection failed") from exc
 
 def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[bytes] | None], store: ControlStore, *, oauth_exchange: Any = None, connection_tester: Any = None) -> type:
     dashboard = make_dashboard_handler(config.db_path, settings_href="/settings", config=config)
@@ -172,8 +206,19 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
                     kind = str(data.get("kind", ""))
                     if kind not in {"mal", "crunchyroll", "hidive"}: raise ValueError("unknown connection")
                     if not store.rate.allow("connection-test:" + key): raise PermissionError("rate_limited")
-                    test_connection(kind, timeout=10)
-                    self._send_json({"ok": True, "kind": kind, "message": "Connection succeeded"}); return
+                    try:
+                        test_connection(kind, timeout=10)
+                    except ConnectionTestError as exc:
+                        store.record_connection_test(kind, ok=False, message=str(exc))
+                        raise
+                    except Exception as exc:
+                        display = {"mal": "MAL", "crunchyroll": "Crunchyroll", "hidive": "HIDIVE"}[kind]
+                        message = f"{display} connection failed"
+                        store.record_connection_test(kind, ok=False, message=message)
+                        raise ConnectionTestError(message) from exc
+                    message = "Connection succeeded"
+                    store.record_connection_test(kind, ok=True, message=message)
+                    self._send_json({"ok": True, "kind": kind, "message": message}); return
                 if path == "/api/oauth/mal/start":
                     scheme, host = self._origin(); self._send_json(store.begin_oauth(f"{scheme}://{host}/oauth/mal/callback")); return
                 self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
