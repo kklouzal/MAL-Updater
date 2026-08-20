@@ -324,6 +324,21 @@ class MalClientTests(unittest.TestCase):
                 )
             self.assertEqual(payload, actual)
 
+    def test_anime_detail_canonicalizes_omitted_requested_list_status_as_unlisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config, access_token="access-token"))
+            payload = {"id": 53590, "title": "Not Yet Listed", "num_episodes": 12}
+            with patch.object(client, "_get_json", return_value=payload):
+                actual = client.get_anime_details(
+                    53590,
+                    fields="id,title,num_episodes,my_list_status",
+                    force_refresh=True,
+                    require_user=True,
+                )
+            self.assertIsNone(actual["my_list_status"])
+            self.assertNotIn("my_list_status", payload)
+
     def test_anime_detail_rejects_missing_or_malformed_requested_contract_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))

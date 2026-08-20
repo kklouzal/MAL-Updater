@@ -107,19 +107,41 @@ class SyncExecutorStaleMalStateTests(unittest.TestCase):
             self.assertEqual("error", results[0].proposal_decision)
             self.assertIn("mal_live_state_revalidation_failed:live MAL read unavailable", results[0].reasons)
 
+    def test_live_apply_treats_nullable_unlisted_state_as_new_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = self._setup_sync(Path(td), provider_episode=10)
+            live = self._detail(None)
+            with patch.object(MalClient, "get_anime_details", return_value=live), patch.object(
+                MalClient,
+                "update_my_list_status",
+                return_value={"status": "watching", "num_episodes_watched": 10},
+            ) as update:
+                results = execute_approved_sync(config, limit=0, exact_approved_only=True, dry_run=False)
+
+            update.assert_called_once_with(
+                53590,
+                status="watching",
+                num_watched_episodes=10,
+                score=None,
+                start_date=None,
+                finish_date=None,
+            )
+            self.assertTrue(results[0].applied)
+            self.assertIn("executor_revalidated_live_mal_state", results[0].reasons)
+            self.assertIn("would_create_new_mal_entry", results[0].reasons)
+
     def test_live_apply_fails_closed_for_missing_or_malformed_user_state(self) -> None:
-        malformed_states = (
-            None,
-            "not-an-object",
-            {},
-            {"status": "watching"},
-            {"status": "unknown", "num_episodes_watched": 9},
-            {"status": "watching", "num_episodes_watched": "9"},
+        malformed_details = (
+            {key: value for key, value in self._detail(None).items() if key != "my_list_status"},
+            self._detail("not-an-object"),
+            self._detail({}),
+            self._detail({"status": "watching"}),
+            self._detail({"status": "unknown", "num_episodes_watched": 9}),
+            self._detail({"status": "watching", "num_episodes_watched": "9"}),
         )
-        for live_status in malformed_states:
-            with self.subTest(live_status=live_status), tempfile.TemporaryDirectory() as td:
+        for live in malformed_details:
+            with self.subTest(live=live), tempfile.TemporaryDirectory() as td:
                 config = self._setup_sync(Path(td), provider_episode=10)
-                live = self._detail(live_status)
                 with patch.object(MalClient, "get_anime_details", return_value=live), patch.object(
                     MalClient,
                     "update_my_list_status",

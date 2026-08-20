@@ -1305,7 +1305,11 @@ def _validated_live_mal_user_state(
         return None, "mal_live_detail_invalid:anime_id_mismatch_or_missing"
     if not isinstance(detail.get("title"), str) or not detail["title"].strip():
         return None, "mal_live_detail_invalid:title_missing_or_invalid"
-    if "my_list_status" not in detail or not isinstance(detail.get("my_list_status"), dict):
+    if "my_list_status" not in detail:
+        return None, "mal_live_detail_invalid:my_list_status_missing_or_invalid"
+    if detail["my_list_status"] is None:
+        return None, None
+    if not isinstance(detail["my_list_status"], dict):
         return None, "mal_live_detail_invalid:my_list_status_missing_or_invalid"
     status = detail["my_list_status"]
     list_status = status.get("status")

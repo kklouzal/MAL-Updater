@@ -91,11 +91,22 @@ def _validate_anime_suggestions_response(response: Any) -> dict[str, Any]:
     return response
 
 
-def _validate_anime_detail_response(response: Any, *, anime_id: int, fields: set[str]) -> dict[str, Any]:
+def _validate_anime_detail_response(
+    response: Any,
+    *,
+    anime_id: int,
+    fields: set[str],
+    authenticated_user: bool = False,
+) -> dict[str, Any]:
     if not isinstance(response, dict) or response.get("id") != int(anime_id):
         raise MalApiError("MAL anime detail response identity does not match the request")
     if not isinstance(response.get("title"), str) or not response["title"].strip():
         raise MalApiError("MAL anime detail response lacks a usable title")
+    # MAL omits this requested nullable field when the authenticated user has no
+    # list entry. Canonicalize that documented empty state without relaxing any
+    # other requested-field or container validation.
+    if authenticated_user and "my_list_status" in fields and "my_list_status" not in response:
+        response = {**response, "my_list_status": None}
     missing = {field for field in fields if field not in response}
     if missing:
         raise MalApiError(f"MAL anime detail response lacks requested fields: {sorted(missing)!r}")
@@ -467,7 +478,12 @@ class MalClient:
             headers=self._build_auth_headers(require_user=require_user),
             error_context=f"MAL API anime details failed for anime_id={anime_id}",
         )
-        response = _validate_anime_detail_response(response, anime_id=int(anime_id), fields=set(fields_key.split(",")))
+        response = _validate_anime_detail_response(
+            response,
+            anime_id=int(anime_id),
+            fields=set(fields_key.split(",")),
+            authenticated_user=require_user,
+        )
         ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
         if cache_available:
             upsert_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
