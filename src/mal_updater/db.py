@@ -1711,7 +1711,7 @@ class MalUserAnimeListRefreshConflictError(RuntimeError):
     """A cache refresh lost ownership of the current active generation."""
 
 
-MAL_USER_LIST_PAGINATION_LOGIC_VERSION = "mal-user-list-pagination-v2"
+MAL_USER_LIST_PAGINATION_LOGIC_VERSION = "mal-user-list-pagination-v3"
 MAL_USER_LIST_CLAIM_SECONDS = 15 * 60
 MAL_USER_LIST_MAX_DRIFT_RESTARTS = 2
 
@@ -8193,19 +8193,42 @@ def reinitialize_mal_user_anime_list_traversal(
     requested = list(partitions)
     if not requested:
         raise ValueError("at least one MAL list partition is required")
+    accepted_query_provenance = {
+        hashlib.sha256(query_text.encode("utf-8")).hexdigest(): (
+            query_text,
+            MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
+        )
+    }
+    if str(query.get("logic_version") or "") == MAL_USER_LIST_PAGINATION_LOGIC_VERSION:
+        legacy_query = dict(query)
+        legacy_query["logic_version"] = "mal-user-list-pagination-v2"
+        legacy_query_text = json.dumps(
+            legacy_query, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        accepted_query_provenance[hashlib.sha256(legacy_query_text.encode("utf-8")).hexdigest()] = (
+            legacy_query_text,
+            "mal-user-list-pagination-v2",
+        )
+    if str(query_identity) != hashlib.sha256(query_text.encode("utf-8")).hexdigest():
+        raise ValueError("query_identity does not match the canonical MAL list query")
+    identity_placeholders = ",".join("?" for _ in accepted_query_provenance)
     conn = connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         old = conn.execute(
-            """SELECT * FROM mal_user_anime_list_refresh_generations
-               WHERE account_key=? AND query_identity=? ORDER BY generation DESC LIMIT 1""",
-            (account_key, str(query_identity)),
+            f"""SELECT * FROM mal_user_anime_list_refresh_generations
+               WHERE account_key=? AND query_identity IN ({identity_placeholders}) ORDER BY generation DESC LIMIT 1""",
+            (account_key, *sorted(accepted_query_provenance)),
         ).fetchone()
         if old is None or (old["quarantined_at"] is None and old["quarantine_reason"] is None):
             raise MalUserAnimeListRefreshConflictError("latest exact account/query generation is not quarantined")
         if int(old["account_id"] or 0) != account_id or str(old["account_name"] or "") != account_name:
             raise MalUserAnimeListRefreshConflictError("MAL account provenance does not match quarantined generation")
-        if str(old["query_json"]) != query_text or str(old["logic_version"]) != MAL_USER_LIST_PAGINATION_LOGIC_VERSION:
+        expected_query_text, expected_logic_version = accepted_query_provenance[str(old["query_identity"])]
+        if (
+            str(old["query_json"]) != expected_query_text
+            or str(old["logic_version"]) != expected_logic_version
+        ):
             raise MalUserAnimeListRefreshConflictError("MAL query provenance does not match quarantined generation")
         authority = conn.execute("SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (account_key,)).fetchone()
         if authority is None or int(authority["account_id"]) != account_id or str(authority["account_name"]) != account_name:

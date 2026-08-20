@@ -38,6 +38,8 @@ from mal_updater.recommendation_metadata import (
     DETAIL_FIELDS,
     MAL_USER_LIST_FIELDS,
     MAL_USER_LIST_STATUS_PREFERENCE_FIELDS,
+    _mal_user_list_initial_url,
+    _parse_mal_user_list_payload,
     refresh_full_user_recommendation_harvest,
     refresh_mal_user_anime_list_cache,
     refresh_recommendation_metadata,
@@ -251,11 +253,120 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         }
 
     def test_mal_list_refresh_requests_official_preference_field_names(self) -> None:
-        from mal_updater.recommendation_metadata import _mal_user_list_initial_url
         url = _mal_user_list_initial_url(self.config, status=None, page_size=100)
         self.assertIn("fields=", url)
         for field in MAL_USER_LIST_STATUS_PREFERENCE_FIELDS:
             self.assertIn(field, MAL_USER_LIST_FIELDS)
+
+    def test_mal_list_parser_accepts_live_short_terminal_shape_and_canonicalizes_omitted_next(self) -> None:
+        page_url = _mal_user_list_initial_url(self.config, status=None, page_size=100) + "&offset=200"
+        items = [self._list_item(anime_id, f"Item {anime_id}", "completed") for anime_id in range(201, 286)]
+        omitted = _parse_mal_user_list_payload(
+            self.config,
+            payload={"data": items, "paging": {"previous": "https://api.myanimelist.net/previous"}},
+            page_url=page_url,
+            expected_status=None,
+            page_size=100,
+            account_id=7,
+            account_name="owner",
+        )
+        explicit_null = _parse_mal_user_list_payload(
+            self.config,
+            payload={"data": items, "paging": {"previous": "https://api.myanimelist.net/previous", "next": None}},
+            page_url=page_url,
+            expected_status=None,
+            page_size=100,
+            account_id=7,
+            account_name="owner",
+        )
+        self.assertEqual((None, True, False), (omitted[1], omitted[4], omitted[5]))
+        self.assertEqual(explicit_null[2:], omitted[2:])
+
+    def test_mal_list_parser_rejects_full_page_with_omitted_next(self) -> None:
+        page_url = _mal_user_list_initial_url(self.config, status=None, page_size=100)
+        items = [self._list_item(anime_id, f"Item {anime_id}", "completed") for anime_id in range(1, 101)]
+        with self.assertRaisesRegex(ValueError, "full page omits paging.next"):
+            _parse_mal_user_list_payload(
+                self.config,
+                payload={"data": items, "paging": {}},
+                page_url=page_url,
+                expected_status=None,
+                page_size=100,
+                account_id=7,
+                account_name="owner",
+            )
+
+    def test_mal_list_parser_accepts_empty_terminal_page_with_omitted_next(self) -> None:
+        parsed = _parse_mal_user_list_payload(
+            self.config,
+            payload={"data": [], "paging": {"previous": "https://api.myanimelist.net/previous"}},
+            page_url=_mal_user_list_initial_url(self.config, status=None, page_size=100),
+            expected_status=None,
+            page_size=100,
+            account_id=7,
+            account_name="owner",
+        )
+        self.assertEqual(([], None, True, True), (parsed[0], parsed[1], parsed[4], parsed[5]))
+
+    def test_mal_list_parser_rejects_malformed_present_next(self) -> None:
+        with self.assertRaisesRegex(ValueError, "paging.next is malformed"):
+            _parse_mal_user_list_payload(
+                self.config,
+                payload={"data": [], "paging": {"next": {"url": "not-a-string"}}},
+                page_url=_mal_user_list_initial_url(self.config, status=None, page_size=100),
+                expected_status=None,
+                page_size=100,
+                account_id=7,
+                account_name="owner",
+            )
+
+    def test_mal_list_refresh_traverses_and_publishes_live_100_100_85_shape(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.config.db_path,
+            items=[self._list_item(9999, "Old", "completed", score=8)],
+            refresh_run_id="old-live-shape",
+            fetched_at="2026-08-19T00:00:00Z",
+            prune_absent=True,
+        )
+        first_url = _mal_user_list_initial_url(self.config, status=None, page_size=100)
+        page2 = first_url + "&offset=100"
+        page3 = first_url + "&offset=200"
+        pages = {
+            first_url: {
+                "data": [self._list_item(anime_id, f"Item {anime_id}", "completed") for anime_id in range(1, 101)],
+                "paging": {"next": page2},
+            },
+            page2: {
+                "data": [self._list_item(anime_id, f"Item {anime_id}", "completed") for anime_id in range(101, 201)],
+                "paging": {"previous": first_url, "next": page3},
+            },
+            page3: {
+                "data": [self._list_item(anime_id, f"Item {anime_id}", "completed") for anime_id in range(201, 286)],
+                "paging": {"previous": page2},
+            },
+        }
+        requested: list[str] = []
+
+        def get_page(url: str) -> dict:
+            requested.append(url)
+            return pages[url]
+
+        with patch(
+            "mal_updater.recommendation_metadata.MalClient.get_my_user",
+            return_value={"id": 7, "name": "owner"},
+        ), patch(
+            "mal_updater.recommendation_metadata.MalClient.get_my_anime_list_page_url",
+            side_effect=get_page,
+        ):
+            summary = refresh_mal_user_anime_list_cache(
+                self.config, max_pages=8, prune_on_complete=True
+            )
+
+        self.assertEqual("ok", summary.status)
+        self.assertFalse(summary.partial)
+        self.assertEqual([first_url, page2, page3, first_url, page2, page3], requested)
+        self.assertEqual(285, len(list_mal_user_anime_list_cache(self.config.db_path)))
+        self.assertEqual("mal-user-list-pagination-v3", summary.traversal["logic_version"])
 
     def test_mal_list_refresh_terminal_complete_can_prune_absent_rows(self) -> None:
         replace_mal_user_anime_list_cache_generation(self.config.db_path,items=[self._list_item(90,"Old","completed",score=8)],refresh_run_id="old",fetched_at="2026-07-19T00:00:00Z",prune_absent=True)

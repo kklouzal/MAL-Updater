@@ -641,9 +641,8 @@ def _parse_mal_user_list_payload(
     paging = payload["paging"]
     if set(paging) - {"previous", "next"}:
         raise ValueError("MAL anime-list paging object has unexpected fields")
-    if "next" not in paging:
-        raise ValueError("MAL anime-list response is ambiguous because paging.next is missing")
-    next_raw = paging["next"]
+    next_present = "next" in paging
+    next_raw = paging.get("next")
     if next_raw is not None and (not isinstance(next_raw, str) or not next_raw.strip()):
         raise ValueError("MAL anime-list paging.next is malformed")
     items: list[dict[str, Any]] = []
@@ -679,6 +678,10 @@ def _parse_mal_user_list_payload(
     # full; otherwise the server's offset contract is ambiguous and publishing
     # would risk a skipped interior range.
     expected_page_size = min(max(int(page_size), 1), 100)
+    if not next_present and len(items) >= expected_page_size:
+        raise ValueError(
+            "MAL anime-list response is ambiguous because a full page omits paging.next"
+        )
     if next_raw is not None and len(items) != expected_page_size:
         raise ValueError(
             "MAL anime-list non-terminal page was short; expected exactly "
