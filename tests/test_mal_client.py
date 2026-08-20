@@ -12,7 +12,8 @@ from urllib.error import HTTPError
 from unittest.mock import patch
 
 from mal_updater.config import AppConfig, MalSecrets, MalSettings, DEFAULT_MAL_BASE_URL
-from mal_updater.mal_client import MalApiError, MalClient
+from mal_updater.db import bootstrap_database, upsert_mal_anime_detail_cache
+from mal_updater.mal_client import MAL_DETAIL_CACHE_LOGIC_VERSION, MalApiError, MalClient
 
 
 class _JsonResponse:
@@ -305,7 +306,7 @@ class MalClientTests(unittest.TestCase):
 
             send.assert_not_called()
 
-    def test_anime_detail_accepts_legitimate_nullable_optional_containers(self) -> None:
+    def test_public_anime_detail_leaves_omitted_user_state_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
             client = MalClient(config, self._secrets(config))
@@ -314,7 +315,6 @@ class MalClientTests(unittest.TestCase):
                 "title": "Example",
                 "start_season": None,
                 "broadcast": None,
-                "my_list_status": None,
             }
             with patch.object(client, "_get_json", return_value=payload):
                 actual = client.get_anime_details(
@@ -323,21 +323,75 @@ class MalClientTests(unittest.TestCase):
                     force_refresh=True,
                 )
             self.assertEqual(payload, actual)
+            self.assertNotIn("my_list_status", actual)
 
     def test_anime_detail_canonicalizes_omitted_requested_list_status_as_unlisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
             client = MalClient(config, self._secrets(config, access_token="access-token"))
-            payload = {"id": 53590, "title": "Not Yet Listed", "num_episodes": 12}
-            with patch.object(client, "_get_json", return_value=payload):
-                actual = client.get_anime_details(
-                    53590,
-                    fields="id,title,num_episodes,my_list_status",
-                    force_refresh=True,
-                    require_user=True,
+            for anime_id in (5114, 54918):
+                with self.subTest(anime_id=anime_id):
+                    payload = {"id": anime_id, "title": "Not Yet Listed", "num_episodes": 12}
+                    with patch.object(client, "_get_json", return_value=payload):
+                        actual = client.get_anime_details(
+                            anime_id,
+                            fields="id,title,num_episodes,my_list_status",
+                            force_refresh=True,
+                            require_user=True,
+                        )
+                    self.assertIsNone(actual["my_list_status"])
+                    self.assertNotIn("my_list_status", payload)
+
+    def test_anime_detail_canonicalizes_omitted_nullable_rank_but_rejects_malformed_present_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            client = MalClient(config, self._secrets(config))
+            with patch.object(client, "_get_json", return_value={"id": 54915, "title": "No Rank"}):
+                actual = client.get_anime_details(54915, fields="id,title,rank", force_refresh=True)
+            self.assertIsNone(actual["rank"])
+            for malformed in ("1", 0, -1, True, {}, []):
+                with self.subTest(malformed=malformed), patch.object(
+                    client, "_get_json", return_value={"id": 54915, "title": "Bad Rank", "rank": malformed}
+                ):
+                    with self.assertRaisesRegex(MalApiError, "malformed rank"):
+                        client.get_anime_details(54915, fields="id,title,rank", force_refresh=True)
+
+    def test_public_detail_cache_preserves_unknown_user_state_and_nullable_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            bootstrap_database(config.db_path)
+            client = MalClient(config, self._secrets(config))
+            payload = {"id": 54915, "title": "Public"}
+            with patch.object(client, "_get_json", return_value=payload) as get_json:
+                first = client.get_anime_details(
+                    54915, fields="id,title,rank,my_list_status", force_refresh=True
                 )
+                second = client.get_anime_details(54915, fields="id,title,rank,my_list_status")
+            get_json.assert_called_once()
+            for actual in (first, second):
+                self.assertIsNone(actual["rank"])
+                self.assertNotIn("my_list_status", actual)
+
+    def test_authenticated_detail_does_not_reuse_public_cache_without_user_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            bootstrap_database(config.db_path)
+            fields_key = "id,my_list_status,rank,title"
+            upsert_mal_anime_detail_cache(
+                config.db_path,
+                mal_anime_id=54915,
+                fields_key=fields_key,
+                logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION,
+                response={"id": 54915, "title": "Public", "rank": None},
+                fetched_at="2999-01-01T00:00:00Z",
+                expires_at="2999-01-02T00:00:00Z",
+            )
+            client = MalClient(config, self._secrets(config, access_token="***"))
+            with patch.object(client, "_get_json", return_value={"id": 54915, "title": "Authenticated"}) as get_json:
+                actual = client.get_anime_details(54915, fields="id,title,rank,my_list_status")
+            get_json.assert_called_once()
+            self.assertIsNone(actual["rank"])
             self.assertIsNone(actual["my_list_status"])
-            self.assertNotIn("my_list_status", payload)
 
     def test_anime_detail_rejects_missing_or_malformed_requested_contract_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,6 +403,16 @@ class MalClientTests(unittest.TestCase):
             with patch.object(client, "_get_json", return_value={"id": 53590, "title": "Example", "recommendations": None}):
                 with self.assertRaisesRegex(MalApiError, "malformed recommendations"):
                     client.get_anime_details(53590, fields="id,title,recommendations", force_refresh=True)
+            authenticated = MalClient(config, self._secrets(config, access_token="access"))
+            with patch.object(
+                authenticated,
+                "_get_json",
+                return_value={"id": 53590, "title": "Example", "my_list_status": "completed"},
+            ):
+                with self.assertRaisesRegex(MalApiError, "malformed my_list_status"):
+                    authenticated.get_anime_details(
+                        53590, fields="id,title,my_list_status", force_refresh=True
+                    )
 
     def test_update_my_list_status_requires_nonblank_access_token_before_side_effects(self) -> None:
         for access_token in (None, "", " \t\n"):
@@ -624,7 +688,7 @@ class MalClientTests(unittest.TestCase):
                 with self.assertRaisesRegex(MalApiError, "identity"):
                     client.get_anime_details(7, fields="id,title,related_anime", force_refresh=True)
             from mal_updater.db import get_mal_anime_search_cache, get_mal_anime_detail_cache
-            self.assertIsNone(get_mal_anime_detail_cache(config.db_path, mal_anime_id=7, fields_key="id,related_anime,title", logic_version="mal-detail-v1"))
+            self.assertIsNone(get_mal_anime_detail_cache(config.db_path, mal_anime_id=7, fields_key="id,related_anime,title", logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION))
 
     def test_detail_requires_matching_id_title_and_requested_container_types(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

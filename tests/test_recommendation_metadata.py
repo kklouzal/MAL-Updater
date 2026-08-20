@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mal_updater.config import load_config
+from mal_updater.config import MalSecrets, load_config
 from mal_updater.db import (
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     bootstrap_database,
@@ -350,6 +350,35 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         self.assertEqual(9, metadata.raw["my_list_status"]["score"])
         self.assertIn("Official MAL API v2", CHARACTER_VOICE_ACTOR_CAPABILITY_NOTE)
         self.assertIn("unofficial", CHARACTER_VOICE_ACTOR_CAPABILITY_NOTE)
+
+    def test_refresh_accepts_provider_omissions_for_nullable_rank_and_unlisted_user_state(self) -> None:
+        self._insert_series("seed-54915", title="Seed 54915")
+        self._map_series("seed-54915", 54915)
+        details = self._seed_detail(54915)
+        details.pop("rank")
+        details.pop("my_list_status")
+        secrets = MalSecrets(
+            client_id="client-id",
+            client_secret=None,
+            access_token="***",
+            refresh_token=None,
+            client_id_path=self.config.secrets_dir / "mal_client_id.txt",
+            client_secret_path=self.config.secrets_dir / "mal_client_secret.txt",
+            access_token_path=self.config.secrets_dir / "mal_access_token.txt",
+            refresh_token_path=self.config.secrets_dir / "mal_refresh_token.txt",
+        )
+
+        with patch("mal_updater.recommendation_metadata.load_mal_secrets", return_value=secrets), patch(
+            "mal_updater.mal_client.MalClient._get_json", return_value=details
+        ):
+            summary = refresh_recommendation_metadata(self.config)
+
+        self.assertEqual(1, summary.refreshed)
+        self.assertEqual([], summary.failures)
+        metadata = get_mal_anime_metadata_map(self.config.db_path)[54915]
+        self.assertIsNone(metadata.rank)
+        self.assertIsNone(metadata.raw["rank"])
+        self.assertIsNone(metadata.raw["my_list_status"])
 
     def test_refresh_order_prioritizes_unharvested_failed_stale_then_stale_metadata_then_fresh(self) -> None:
         setup = [

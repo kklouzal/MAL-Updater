@@ -45,10 +45,12 @@ _T = TypeVar("_T")
 _TIMEOUT_RETRY_ATTEMPTS = 2
 _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAL_SEARCH_CACHE_LOGIC_VERSION = "mal-search-v2"
-MAL_DETAIL_CACHE_LOGIC_VERSION = "mal-detail-v1"
+MAL_DETAIL_CACHE_LOGIC_VERSION = "mal-detail-v2"
 MAL_ANIME_SEARCH_QUERY_MAX_CHARS = 64
 
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
+_MAL_OPTIONAL_ANIME_DETAIL_FIELDS = frozenset({"rank"})
+_MAL_USER_SCOPED_ANIME_DETAIL_FIELDS = frozenset({"my_list_status"})
 
 
 def _validate_anime_search_response(response: Any) -> dict[str, Any]:
@@ -102,12 +104,26 @@ def _validate_anime_detail_response(
         raise MalApiError("MAL anime detail response identity does not match the request")
     if not isinstance(response.get("title"), str) or not response["title"].strip():
         raise MalApiError("MAL anime detail response lacks a usable title")
-    # MAL omits this requested nullable field when the authenticated user has no
-    # list entry. Canonicalize that documented empty state without relaxing any
-    # other requested-field or container validation.
+    # MAL omits this requested user-scoped field when the authenticated user has
+    # no list entry. Only an authenticated response can turn that omission into
+    # the definitive unlisted state; a client-ID-only response has no user-state
+    # authority and leaves it unknown/absent.
     if authenticated_user and "my_list_status" in fields and "my_list_status" not in response:
         response = {**response, "my_list_status": None}
-    missing = {field for field in fields if field not in response}
+    elif not authenticated_user and "my_list_status" in fields and "my_list_status" in response:
+        response = {key: value for key, value in response.items() if key != "my_list_status"}
+    # MAL also omits explicitly requested nullable catalog values when no value
+    # exists. Keep this allowlist narrow rather than accepting arbitrary missing
+    # requested fields.
+    for field in fields & _MAL_OPTIONAL_ANIME_DETAIL_FIELDS:
+        if field not in response:
+            response = {**response, field: None}
+    missing = {
+        field
+        for field in fields
+        if field not in response
+        and not (not authenticated_user and field in _MAL_USER_SCOPED_ANIME_DETAIL_FIELDS)
+    }
     if missing:
         raise MalApiError(f"MAL anime detail response lacks requested fields: {sorted(missing)!r}")
     container_types = {
@@ -125,6 +141,11 @@ def _validate_anime_detail_response(
             continue
         if field in fields and not isinstance(value, expected_type):
             raise MalApiError(f"MAL anime detail response has malformed {field}")
+    rank = response.get("rank")
+    if "rank" in fields and rank is not None and (
+        isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0
+    ):
+        raise MalApiError("MAL anime detail response has malformed rank")
     for field in ("related_anime", "recommendations"):
         if field in fields:
             for item in response[field]:
@@ -447,6 +468,8 @@ class MalClient:
         cache_ttl_days: int | None = None,
     ) -> dict[str, Any]:
         fields_key = ",".join(sorted({part.strip() for part in fields.split(",") if part.strip()}))
+        requested_fields = set(fields_key.split(","))
+        authenticated_user = bool(self.secrets.access_token and self.secrets.access_token.strip())
         now = datetime.now(timezone.utc).replace(microsecond=0)
         now_iso = now.isoformat().replace("+00:00", "Z")
         cache_available = self.config.db_path.parent.exists()
@@ -456,13 +479,37 @@ class MalClient:
             cached = get_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
                                                 logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION)
             if cached is None:
+                cache_required_fields = requested_fields - _MAL_OPTIONAL_ANIME_DETAIL_FIELDS
+                if not authenticated_user:
+                    cache_required_fields -= _MAL_USER_SCOPED_ANIME_DETAIL_FIELDS
                 cached = find_covering_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id),
-                    required_fields=set(fields_key.split(",")), logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now="")
+                    required_fields=cache_required_fields, logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION, now="")
             ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
+            validated_cached: dict[str, Any] | None = None
+            if cached is not None:
+                # A public cache entry cannot prove an authenticated user is
+                # unlisted. Authenticated live responses always canonicalize
+                # this key before being cached, so absence identifies an
+                # insufficient public entry and forces a user-scoped refresh.
+                lacks_authenticated_state = (
+                    authenticated_user
+                    and "my_list_status" in requested_fields
+                    and "my_list_status" not in cached.response
+                )
+                if not lacks_authenticated_state:
+                    try:
+                        validated_cached = _validate_anime_detail_response(
+                            cached.response,
+                            anime_id=int(anime_id),
+                            fields=requested_fields,
+                            authenticated_user=authenticated_user,
+                        )
+                    except MalApiError:
+                        validated_cached = None
             if (
                 cached is not None
+                and validated_cached is not None
                 and cached.status == "ok"
-                and all(field in cached.response for field in fields_key.split(","))
                 and not periodic_evidence_is_due(
                     successful_at=cached.fetched_at,
                     surface="mal_detail",
@@ -472,7 +519,7 @@ class MalClient:
                     jitter_days=min(15, ttl),
                 )
             ):
-                return cached.response
+                return validated_cached
         response = self._get_json(
             f"/anime/{anime_id}?{urlencode({'fields': fields})}",
             headers=self._build_auth_headers(require_user=require_user),
@@ -481,8 +528,8 @@ class MalClient:
         response = _validate_anime_detail_response(
             response,
             anime_id=int(anime_id),
-            fields=set(fields_key.split(",")),
-            authenticated_user=require_user,
+            fields=requested_fields,
+            authenticated_user=authenticated_user,
         )
         ttl = self.config.mal.detail_cache_ttl_days if cache_ttl_days is None else max(0, int(cache_ttl_days))
         if cache_available:
