@@ -351,11 +351,11 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         self.assertIn("Official MAL API v2", CHARACTER_VOICE_ACTOR_CAPABILITY_NOTE)
         self.assertIn("unofficial", CHARACTER_VOICE_ACTOR_CAPABILITY_NOTE)
 
-    def test_refresh_accepts_provider_omissions_for_nullable_rank_and_unlisted_user_state(self) -> None:
+    def test_refresh_accepts_observed_54915_omitted_broadcast_and_unlisted_user_state(self) -> None:
         self._insert_series("seed-54915", title="Seed 54915")
         self._map_series("seed-54915", 54915)
         details = self._seed_detail(54915)
-        details.pop("rank")
+        details.pop("broadcast")
         details.pop("my_list_status")
         secrets = MalSecrets(
             client_id="client-id",
@@ -376,8 +376,11 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         self.assertEqual(1, summary.refreshed)
         self.assertEqual([], summary.failures)
         metadata = get_mal_anime_metadata_map(self.config.db_path)[54915]
-        self.assertIsNone(metadata.rank)
-        self.assertIsNone(metadata.raw["rank"])
+        self.assertEqual(54915, metadata.rank)
+        self.assertIsNone(metadata.broadcast_day)
+        self.assertIsNone(metadata.broadcast_time)
+        self.assertIsNone(metadata.broadcast_timezone)
+        self.assertIsNone(metadata.raw["broadcast"])
         self.assertIsNone(metadata.raw["my_list_status"])
 
     def test_refresh_order_prioritizes_unharvested_failed_stale_then_stale_metadata_then_fresh(self) -> None:

@@ -49,7 +49,10 @@ MAL_DETAIL_CACHE_LOGIC_VERSION = "mal-detail-v2"
 MAL_ANIME_SEARCH_QUERY_MAX_CHARS = 64
 
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
-_MAL_OPTIONAL_ANIME_DETAIL_FIELDS = frozenset({"rank"})
+_MAL_OMISSIBLE_NULLABLE_ANIME_DETAIL_FIELDS = frozenset({"broadcast", "rank"})
+# Preserve the existing rank cache-coverage behavior. A cache response that did
+# not request broadcast cannot establish that MAL omitted a requested value.
+_MAL_COVERING_CACHE_OPTIONAL_ANIME_DETAIL_FIELDS = frozenset({"rank"})
 _MAL_USER_SCOPED_ANIME_DETAIL_FIELDS = frozenset({"my_list_status"})
 
 
@@ -113,9 +116,9 @@ def _validate_anime_detail_response(
     elif not authenticated_user and "my_list_status" in fields and "my_list_status" in response:
         response = {key: value for key, value in response.items() if key != "my_list_status"}
     # MAL also omits explicitly requested nullable catalog values when no value
-    # exists. Keep this allowlist narrow rather than accepting arbitrary missing
-    # requested fields.
-    for field in fields & _MAL_OPTIONAL_ANIME_DETAIL_FIELDS:
+    # exists, including observed/documented absent broadcast schedules. Keep this
+    # allowlist narrow rather than accepting arbitrary missing requested fields.
+    for field in fields & _MAL_OMISSIBLE_NULLABLE_ANIME_DETAIL_FIELDS:
         if field not in response:
             response = {**response, field: None}
     missing = {
@@ -479,7 +482,7 @@ class MalClient:
             cached = get_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id), fields_key=fields_key,
                                                 logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION)
             if cached is None:
-                cache_required_fields = requested_fields - _MAL_OPTIONAL_ANIME_DETAIL_FIELDS
+                cache_required_fields = requested_fields - _MAL_COVERING_CACHE_OPTIONAL_ANIME_DETAIL_FIELDS
                 if not authenticated_user:
                     cache_required_fields -= _MAL_USER_SCOPED_ANIME_DETAIL_FIELDS
                 cached = find_covering_mal_anime_detail_cache(self.config.db_path, mal_anime_id=int(anime_id),
