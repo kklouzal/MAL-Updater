@@ -64,6 +64,10 @@ _FRESH_DUBBED_EPISODE_WINDOW_DAYS = 21
 _DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED = 15
 _MAL_LIST_POSITIVE_DISCOVERY_SEED_STATUSES = frozenset({"completed", "watching", "on_hold"})
 _MAL_LIST_SUPPRESS_DISCOVERY_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
+_VERIFIED_PROVIDER_IDENTITY_KINDS = frozenset({
+    "provider_title_search_exact",
+    "provider_franchise_shell_child_match",
+})
 
 _SEASON_ORDER = {
     "winter": 0,
@@ -1418,6 +1422,30 @@ def _provider_availability_by_mal_id(
     return available
 
 
+def _provider_watch_history_by_verified_mal_id(
+    states: list[ProviderSeriesState],
+    *,
+    evidence_by_mal_id: dict[int, list[RecommendationProviderEligibilityEvidence]],
+) -> dict[int, list[tuple[ProviderSeriesState, RecommendationProviderEligibilityEvidence]]]:
+    state_by_key = {(state.provider, state.provider_series_id): state for state in states}
+    history: dict[int, list[tuple[ProviderSeriesState, RecommendationProviderEligibilityEvidence]]] = defaultdict(list)
+    for mal_anime_id, evidence_rows in evidence_by_mal_id.items():
+        for evidence in evidence_rows:
+            if (
+                evidence.identity_match_kind not in _VERIFIED_PROVIDER_IDENTITY_KINDS
+                or evidence.review_status != "verified"
+                or evidence.catalog_status != "present"
+                or evidence.verification_outcome != "positive"
+                or evidence.last_successful_positive_at is None
+                or evidence.invalidated_at is not None
+            ):
+                continue
+            state = state_by_key.get((evidence.provider, evidence.provider_series_id))
+            if state is not None:
+                history[int(mal_anime_id)].append((state, evidence))
+    return history
+
+
 def _provider_availability_by_title_alias(states: list[ProviderSeriesState]) -> dict[str, list[ProviderSeriesState]]:
     available: dict[str, list[ProviderSeriesState]] = defaultdict(list)
     for state in states:
@@ -1463,6 +1491,10 @@ def _candidate_suppression_evidence(
     metadata_by_id: dict[int, Any],
     mal_list_status_by_id: dict[int, str] | None = None,
     availability_by_mal_id: dict[int, list[ProviderSeriesState]],
+    watch_history_by_verified_mal_id: dict[
+        int,
+        list[tuple[ProviderSeriesState, RecommendationProviderEligibilityEvidence]],
+    ],
     availability_by_title_alias: dict[str, list[ProviderSeriesState]],
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
@@ -1481,32 +1513,48 @@ def _candidate_suppression_evidence(
                 evidence.append({"kind": "mal_list_progress", "mal_anime_id": target_id, "num_episodes_watched": watched_count})
 
     seen: set[tuple[str, str, str]] = set()
+
+    def append_provider_history(
+        match_kind: str,
+        state: ProviderSeriesState,
+        *,
+        verified_identity_kind: str | None = None,
+    ) -> None:
+        state_key = (match_kind, state.provider, state.provider_series_id)
+        if state_key in seen:
+            return
+        seen.add(state_key)
+        reason = _provider_state_completion_evidence(state)
+        if reason is None:
+            return
+        evidence.append(
+            {
+                "kind": "provider_watch_history",
+                "match_kind": match_kind,
+                "provider": state.provider,
+                "provider_series_id": state.provider_series_id,
+                "title": state.title,
+                "season_title": state.season_title,
+                "verified_identity_kind": verified_identity_kind or state.verified_identity_kind,
+                "watchlist_status": state.watchlist_status,
+                "completed_episode_count": state.completed_episode_count,
+                "max_completed_episode_number": state.max_completed_episode_number,
+                "reason": reason,
+            }
+        )
+
     for match_kind, matched_states in (
         ("mapped_mal", availability_by_mal_id.get(target_id, [])),
         ("title_alias", [state for alias in candidate_title_aliases for state in availability_by_title_alias.get(alias, [])]),
     ):
         for state in matched_states:
-            state_key = (match_kind, state.provider, state.provider_series_id)
-            if state_key in seen:
-                continue
-            seen.add(state_key)
-            reason = _provider_state_completion_evidence(state)
-            if reason is None:
-                continue
-            evidence.append(
-                {
-                    "kind": "provider_watch_history",
-                    "match_kind": match_kind,
-                    "provider": state.provider,
-                    "provider_series_id": state.provider_series_id,
-                    "title": state.title,
-                    "season_title": state.season_title,
-                    "watchlist_status": state.watchlist_status,
-                    "completed_episode_count": state.completed_episode_count,
-                    "max_completed_episode_number": state.max_completed_episode_number,
-                    "reason": reason,
-                }
-            )
+            append_provider_history(match_kind, state)
+    for state, verified_identity in watch_history_by_verified_mal_id.get(target_id, []):
+        append_provider_history(
+            "verified_provider_identity",
+            state,
+            verified_identity_kind=verified_identity.identity_match_kind,
+        )
     return evidence
 
 def _candidate_available_states(
@@ -1773,6 +1821,10 @@ def _build_discovery_recommendations(
         set(candidate_scores),
         actionable_only=True,
     )
+    watch_history_by_verified_mal_id = _provider_watch_history_by_verified_mal_id(
+        states,
+        evidence_by_mal_id=actionable_provider_evidence_by_mal_id,
+    )
     diagnostic_provider_evidence_by_mal_id = (
         _provider_eligibility_evidence_by_mal_id(
             config,
@@ -1798,6 +1850,7 @@ def _build_discovery_recommendations(
             metadata_by_id=metadata_by_id,
             mal_list_status_by_id=mal_list_status_by_id,
             availability_by_mal_id=availability_by_mal_id,
+            watch_history_by_verified_mal_id=watch_history_by_verified_mal_id,
             availability_by_title_alias=availability_by_title_alias,
         )
         if suppression_evidence:

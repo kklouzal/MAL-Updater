@@ -26,6 +26,7 @@ from mal_updater.db import (
 from mal_updater.mal_client import MalApiError
 from mal_updater.recommendation_metadata import refresh_recommendation_metadata
 from mal_updater.recommendations import Recommendation, build_recommendations, group_recommendations, trim_grouped_recommendations
+from mal_updater.sync_planner import load_provider_series_states
 
 
 class RecommendationTests(unittest.TestCase):
@@ -1493,6 +1494,111 @@ class RecommendationTests(unittest.TestCase):
         results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
 
         self.assertEqual([], results)
+
+    def test_discovery_candidate_suppresses_verified_aggregate_shell_child_with_progress_without_mapping(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed", watchlist_status="fully_watched")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._insert_series("GYW4MG9G6", title="Rascal Does Not Dream Series")
+        for episode_number in range(1, 14):
+            self._insert_progress(
+                "GYW4MG9G6",
+                f"rascal-episode-{episode_number}",
+                episode_number=episode_number,
+                completion_ratio=1.0,
+                last_watched_at="2026-08-16T01:00:00Z",
+            )
+        self._cache_metadata(37450, title="Rascal Does Not Dream of Bunny Girl Senpai", mean=8.2, popularity=150)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 37450, "target_title": "Rascal Does Not Dream of Bunny Girl Senpai", "num_recommendations": 12, "raw": {}}],
+            make_targets_available=False,
+        )
+        for mal_anime_id in (37450, 38329):
+            self._cache_provider_eligibility(
+                mal_anime_id,
+                provider_series_id="GYW4MG9G6",
+                provider_title="Rascal Does Not Dream Series",
+                identity_match_kind="provider_franchise_shell_child_match",
+            )
+
+        shell_state = next(state for state in load_provider_series_states(self.config) if state.provider_series_id == "GYW4MG9G6")
+        self.assertIsNone(shell_state.verified_mal_anime_id)
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([], results)
+        with connect(self.config.db_path) as conn:
+            mapping_count = conn.execute(
+                "SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'crunchyroll' AND provider_series_id = 'GYW4MG9G6'"
+            ).fetchone()[0]
+        self.assertEqual(0, mapping_count)
+
+    def test_discovery_candidate_keeps_verified_aggregate_shell_child_without_watch_history(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed", watchlist_status="fully_watched")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._insert_series("GYW4MG9G6", title="Rascal Does Not Dream Series")
+        self._cache_metadata(37450, title="Rascal Does Not Dream of Bunny Girl Senpai", mean=8.2, popularity=150)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 37450, "target_title": "Rascal Does Not Dream of Bunny Girl Senpai", "num_recommendations": 12, "raw": {}}],
+            make_targets_available=False,
+        )
+        for mal_anime_id in (37450, 38329):
+            self._cache_provider_eligibility(
+                mal_anime_id,
+                provider_series_id="GYW4MG9G6",
+                provider_title="Rascal Does Not Dream Series",
+                identity_match_kind="provider_franchise_shell_child_match",
+            )
+
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "discovery_candidate"]
+
+        self.assertEqual([37450], [item.context["mal_anime_id"] for item in results])
+        self.assertEqual("GYW4MG9G6", results[0].provider_series_id)
+        with connect(self.config.db_path) as conn:
+            mapping_count = conn.execute(
+                "SELECT COUNT(*) FROM mal_series_mapping WHERE provider = 'crunchyroll' AND provider_series_id = 'GYW4MG9G6'"
+            ).fetchone()[0]
+        self.assertEqual(0, mapping_count)
+
+    def test_discovery_candidate_keeps_unverified_shell_identity_despite_progress(self) -> None:
+        self._insert_series("dormant-seed", title="Dormant Seed", watchlist_status="fully_watched")
+        self._map_series("dormant-seed", 100)
+        self._cache_metadata(100, title="Dormant Seed")
+        self._insert_series("GYW4MG9G6", title="Rascal Does Not Dream Series")
+        self._insert_progress(
+            "GYW4MG9G6",
+            "rascal-episode-1",
+            episode_number=1,
+            completion_ratio=1.0,
+            last_watched_at="2026-08-16T01:00:00Z",
+        )
+        self._cache_metadata(37450, title="Rascal Does Not Dream of Bunny Girl Senpai", mean=8.2, popularity=150)
+        self._cache_recommendations(
+            100,
+            [{"target_mal_anime_id": 37450, "target_title": "Rascal Does Not Dream of Bunny Girl Senpai", "num_recommendations": 12, "raw": {}}],
+            make_targets_available=False,
+        )
+        self._cache_provider_eligibility(
+            37450,
+            provider_series_id="GYW4MG9G6",
+            provider_title="Rascal Does Not Dream Series",
+            identity_match_kind="provider_franchise_shell_child_match",
+            review_status="review-needed",
+        )
+
+        results = [
+            item
+            for item in build_recommendations(
+                self.config,
+                limit=0,
+                include_discovery_candidates_without_actionable_provider_evidence=True,
+            )
+            if item.kind == "discovery_candidate"
+        ]
+
+        self.assertEqual([37450], [item.context["mal_anime_id"] for item in results])
 
     def test_discovery_candidate_keeps_unwatched_new_season_provider_match_with_guard_context(self) -> None:
         self._insert_series("dormant-seed", title="Dormant Seed")
