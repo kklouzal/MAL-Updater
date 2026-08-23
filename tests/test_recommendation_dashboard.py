@@ -348,6 +348,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn('data-key="title" data-sort-value="The Great Show"', html)
         self.assertNotIn("The Great Show (A &lt;Great&gt; Show", html)
         self.assertIn('<span class="title-text">The Great Show', html)
+        self.assertIn('<div class="title-episodes">Episodes: 12</div>', html)
         self.assertRegex(
             html,
             r'<span class="title-text">The Great Show.*?</span><div class="title-providers" aria-label="Provider proof">.*?Crunchyroll.*?<br>.*?HIDIVE',
@@ -1598,13 +1599,15 @@ class RecommendationDashboardTests(unittest.TestCase):
         html = render_dynamic_dashboard_html()
 
         self.assertIn("const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'", html)
-        progress_headings = "['Priority', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']"
-        ordinary_headings = "['Priority', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']"
+        progress_headings = "['Pri', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']"
+        ordinary_headings = "['Pri', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']"
         self.assertIn(progress_headings, html)
         self.assertIn(ordinary_headings, html)
         self.assertNotIn("['Priority', 'Image', 'Title'", html)
         self.assertIn('<td>${esc(r.priority ?? r.score)}</td><th scope="row">', html)
-        self.assertIn('</div></th><td>${image}</td>${details}${action}</tr>', html)
+        self.assertIn('${episodeTotal}</th><td>${image}</td>${details}${action}</tr>', html)
+        self.assertIn("const episodeTotal = progressSection ? '' :", html)
+        self.assertIn('Episodes: ${esc(r.episode_total ?? \'?\')}', html)
         self.assertIn('class="recommendation-art"', html)
         self.assertIn('class="provider-star-rating"', html)
         self.assertIn('class="provider-maturity-rating"', html)
@@ -1803,7 +1806,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 provider_series_id="cr-multi-rating",
                 provider_title="Multi Rating Show",
                 provider_url="https://www.crunchyroll.com/series/cr-multi-rating",
-                source_evidence={"match": {"raw": {"star_rating": 4.8, "series_metadata": {"maturity_ratings": ["TV-14"]}}}},
+                source_evidence={"match": {"raw": {"star_rating": 4.8, "series_metadata": {"maturity_ratings": ["TV-14"], "episode_count": 24}}}},
                 fetched_at="2026-08-22T00:00:00Z",
                 expires_at="2099-01-01T00:00:00Z",
             )
@@ -1814,7 +1817,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 provider_series_id="hi-multi-rating",
                 provider_title="Multi Rating Show",
                 provider_url="https://www.hidive.com/season/hi-multi-rating",
-                source_evidence={"match": {"raw": {"user_rating": "4.3/5", "ratings": {"US": ["TV-MA"]}}}},
+                source_evidence={"match": {"raw": {"user_rating": "4.3/5", "ratings": {"US": ["TV-MA"]}, "series_metadata": {"episode_count": 24}}}},
                 fetched_at="2026-08-22T00:00:00Z",
                 expires_at="2099-01-01T00:00:00Z",
             )
@@ -1824,6 +1827,7 @@ class RecommendationDashboardTests(unittest.TestCase):
 
             self.assertEqual({"crunchyroll": "4.8", "hidive": "4.3/5"}, row["provider_star_ratings"])
             self.assertEqual({"crunchyroll": "TV-14", "hidive": "TV-MA"}, row["provider_maturity_ratings"])
+            self.assertEqual(24, row["episode_total"])
             self.assertEqual("https://www.crunchyroll.com/series/cr-multi-rating", badges["crunchyroll"]["url"])
             self.assertEqual("4.8", badges["crunchyroll"]["star_rating"])
             self.assertEqual("TV-14", badges["crunchyroll"]["maturity_rating"])
@@ -1912,6 +1916,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual("Berserk (2016)", row["display_title"])
             self.assertNotEqual("Berserk (2016) (Berserk)", row["display_title"])
             self.assertEqual("10/24", row["watched_progress"])
+            self.assertEqual(24, row["episode_total"])
 
     def test_live_dashboard_nested_operational_counts_render_without_object_stringification(self) -> None:
         html = render_dynamic_dashboard_html()
@@ -1929,7 +1934,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             debug_html = render_dynamic_debug_html(settings_href="/settings")
             self.assertIn('<link rel="icon" href="/favicon.svg" type="image/svg+xml">', html)
             self.assertIn('<link rel="icon" href="/favicon.svg" type="image/svg+xml">', debug_html)
-            self.assertIn("['Priority', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']", html)
+            self.assertIn("['Pri', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']", html)
             self.assertNotIn("Watched episodes / total episodes", html)
             self.assertIn("/api/dashboard", html)
             self.assertIn("Recommendations", html)

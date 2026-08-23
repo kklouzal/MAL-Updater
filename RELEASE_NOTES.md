@@ -4,6 +4,8 @@
 
 This alpha patch finishes the recommendation dashboard presentation polish. Static and live recommendation tables now use the concise `Title` heading, and provider proof buttons no longer repeat the provider-seen title beside each link. Accessible evidence links and the underlying provider/title evidence remain intact.
 
+Recommendation tables now abbreviate the priority heading to `Pri`. Ordinary recommendation/discovery title cells also show `Episodes: X` beneath provider rating and maturity metadata, using the same conservative provider-total-first denominator logic as progress calculation without exposing a watched numerator.
+
 Provider and MAL behavior is unchanged. Existing credential gates, pacing/backoff, ambiguity handling, stale-write reconciliation, and the unattended `sync_apply` limit of 8 remain in force. This release does not add provider or MAL writes.
 
 ## Install

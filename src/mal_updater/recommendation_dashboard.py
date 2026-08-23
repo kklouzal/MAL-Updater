@@ -569,14 +569,23 @@ def _reliable_provider_episode_total(context: dict[str, Any]) -> int | None:
     return None
 
 
+def _reliable_episode_total(context: dict[str, Any]) -> int | None:
+    provider_total = _reliable_provider_episode_total(context)
+    if provider_total is not None:
+        return provider_total
+    for key in ("mal_num_episodes", "num_episodes"):
+        mal_total = _episode_count(context.get(key))
+        if mal_total is not None:
+            return mal_total
+    return None
+
+
 def _watched_progress(context: dict[str, Any]) -> str:
     # Provider progress is the watched numerator for provider continuation rows.
     # MAL contributes only a trustworthy series total; using MAL watched here can
     # make provider recommendations display stale progress from a different source.
     provider_watched = _episode_count(context.get("completed_episode_count"), allow_zero=True)
-    provider_total = _reliable_provider_episode_total(context)
-    mal_total = _episode_count(context.get("mal_num_episodes"))
-    total = provider_total or mal_total
+    total = _reliable_episode_total(context)
     if provider_watched is not None and total is not None and provider_watched <= total:
         return f"{provider_watched}/{total}"
 
@@ -708,6 +717,7 @@ def _row(item: Recommendation) -> dict[str, Any]:
         "genres": ", ".join(str(value) for value in genres),
         "provider_progress": provider_progress,
         "watched_progress": _watched_progress(context),
+        "episode_total": _reliable_episode_total(context),
         "image_url": str(context.get("cover_image_url") or ""),
         "provider_star_ratings": provider_star_ratings,
         "provider_maturity_ratings": provider_maturity_ratings,
@@ -950,7 +960,14 @@ def _section_count_label(displayed: int, total: int) -> str:
     return str(total)
 
 
-def _recommendation_table(rows: list[dict[str, Any]], table_id: str, head_cells: str | None = None, *, title_label: str = "Title") -> str:
+def _recommendation_table(
+    rows: list[dict[str, Any]],
+    table_id: str,
+    head_cells: str | None = None,
+    *,
+    title_label: str = "Title",
+    progress_section: bool = False,
+) -> str:
     if head_cells is None:
         head_cells = _table_head_cells(title_label=title_label)
     body_rows = []
@@ -961,9 +978,10 @@ def _recommendation_table(rows: list[dict[str, Any]], table_id: str, head_cells:
             if key == "title":
                 providers = str(row.get("provider_evidence_html") or "")
                 provider_block = f'<div class="title-providers" aria-label="Provider proof">{providers}</div>' if providers else '<div class="title-providers muted">Provider proof unavailable</div>'
+                episode_block = "" if progress_section else f'<div class="title-episodes">Episodes: {escape(str(row.get("episode_total") or "?"))}</div>'
                 cell_parts.append(
                     f'<th scope="row" data-key="title" data-sort-value="{escape(str(value), quote=True)}">'
-                    f'<span class="title-text">{escape(str(value))}</span>{provider_block}</th>'
+                    f'<span class="title-text">{escape(str(value))}</span>{provider_block}{episode_block}</th>'
                 )
             else:
                 cell_parts.append(f'<td data-key="{escape(key)}">{escape(str(value))}</td>')
@@ -1032,7 +1050,12 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
                 description += '<p class="warn"><strong>Discovery only:</strong> these rows lack strict actionable provider+dub proof and are not watch-now eligible.</p>'
             count_label = _section_count_label(len(section_rows), total_rows)
             table_or_empty = (
-                _recommendation_table(section_rows, f"recommendations-{index}", title_label=meta.get("title_label", "Title"))
+                _recommendation_table(
+                    section_rows,
+                    f"recommendations-{index}",
+                    title_label=meta.get("title_label", "Title"),
+                    progress_section=meta.get("kind") in {"new_dubbed_episode", "resume_backlog"},
+                )
                 if section_rows
                 else '<p class="muted" role="status">No recommendations in this section.</p>'
             )
@@ -1065,7 +1088,7 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
     .sort-button {{ all: unset; display: flex; align-items: center; gap: .35rem; width: 100%; cursor: pointer; font-weight: 700; }}
     .sort-button:focus-visible {{ outline: 2px solid #8cc8ff; outline-offset: 3px; }}
     th[aria-sort="ascending"] .sort-indicator::after {{ content: "▲"; }} th[aria-sort="descending"] .sort-indicator::after {{ content: "▼"; }}
-    .title-text {{ display: block; }} .title-providers {{ display: block; margin-top: .45rem; font-size: .88rem; font-weight: 400; }}
+    .title-text {{ display: block; }} .title-providers {{ display: block; margin-top: .45rem; font-size: .88rem; font-weight: 400; }} .title-episodes {{ display: block; margin-top: .3rem; font-size: .88rem; font-weight: 400; color: #aebccc; }}
     .meta, .muted {{ color: #aebccc; }} .warn {{ color: #ffd37a; }} .good {{ color: #b9f6ca; }}
     .banner, .empty-state {{ background: #161d24; border: 1px solid #2b3642; border-radius: .6rem; padding: 1rem; }}
     .provider-badge {{ display: inline-block; border: 1px solid #4b9fff; border-radius: 999px; padding: .08rem .5rem; font-weight: 700; }}
@@ -1197,6 +1220,7 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
         payload["display_title"] = row.title
     payload["genres"] = genres if isinstance(genres, list) else []
     payload["watched_progress"] = _watched_progress(context)
+    payload["episode_total"] = _reliable_episode_total(context)
     payload["image_url"] = str(context.get("cover_image_url") or "")
     payload["provider_star_ratings"] = _provider_star_ratings(context, payload.get("provider"))
     payload["provider_maturity_ratings"] = _provider_maturity_ratings(context, payload.get("provider"))
@@ -1278,6 +1302,11 @@ def _provider_series_total(raw_json: Any) -> int | None:
     if not isinstance(raw_json, dict):
         return None
     candidates = [raw_json]
+    match = raw_json.get("match")
+    if isinstance(match, dict):
+        match_raw = match.get("raw")
+        if isinstance(match_raw, dict):
+            candidates.append(match_raw)
     nested_raw = raw_json.get("raw")
     if isinstance(nested_raw, dict):
         candidates.append(nested_raw)
@@ -1322,6 +1351,9 @@ def _overlay_provider_catalog_metadata(db_path: Path, rows: list[dict[str, Any]]
         current = evidence_by_key.get(key)
         if current is None or (not current.provider_url and item.provider_url):
             evidence_by_key[key] = item
+        evidence_total = _provider_series_total(item.source_evidence)
+        if evidence_total is not None:
+            series_totals.setdefault(key, evidence_total)
     for row in rows:
         badges = row.get("provider_badges") if isinstance(row.get("provider_badges"), list) else []
         primary_key = (str(row.get("provider") or "").strip().lower(), str(row.get("provider_series_id") or "").strip())
@@ -1335,11 +1367,16 @@ def _overlay_provider_catalog_metadata(db_path: Path, rows: list[dict[str, Any]]
             )
             if key in evidence_by_key and key not in row_keys
         )
-        if primary_key in series_totals:
+        associated_totals = [series_totals[key] for key in (primary_key, *row_keys) if key in series_totals]
+        reliable_provider_total = series_totals.get(primary_key)
+        if reliable_provider_total is None and associated_totals and len(set(associated_totals)) == 1:
+            reliable_provider_total = associated_totals[0]
+        if reliable_provider_total is not None:
             context = row.get("context") if isinstance(row.get("context"), dict) else {}
-            context["provider_series_episode_count"] = series_totals[primary_key]
+            context["provider_series_episode_count"] = reliable_provider_total
             row["context"] = context
             row["watched_progress"] = _watched_progress(context)
+            row["episode_total"] = _reliable_episode_total(context)
         provider_star_ratings = row.get("provider_star_ratings") if isinstance(row.get("provider_star_ratings"), dict) else {}
         provider_maturity_ratings = row.get("provider_maturity_ratings") if isinstance(row.get("provider_maturity_ratings"), dict) else {}
         for key in row_keys:
@@ -1824,7 +1861,7 @@ def _render_dynamic_dashboard_page(
     template = """<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\"><title>__TITLE__</title><style>
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.affinity-card{margin:1.25rem 0}.affinity-layout{display:grid;grid-template-columns:minmax(18rem,32rem) minmax(16rem,1fr);gap:1rem;align-items:center}.affinity-chart-wrap{max-width:32rem;overflow-x:auto}.affinity-chart{display:block;width:100%;min-width:28rem;height:auto}.affinity-grid{fill:none;stroke:#435363;stroke-width:1}.affinity-axis{stroke:#435363;stroke-width:1}.affinity-area{fill:#4b9fff55;stroke:#8cc8ff;stroke-width:2}.affinity-point{fill:#b9f6ca;stroke:#101418;stroke-width:1.5}.affinity-label{fill:#eef3f8;font-size:13px;font-weight:650}.affinity-details{columns:2;column-gap:1.5rem;margin:.5rem 0;padding-left:1.2rem}.affinity-details li{break-inside:avoid;margin:.25rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.provider-star-rating,.provider-maturity-rating{display:block;margin:.18rem 0;color:#ffd37a}.provider-maturity-rating{color:#aebccc;margin-bottom:.3rem}.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;border-radius:.4rem;background:#243140}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}.affinity-layout{grid-template-columns:1fr}.affinity-chart-wrap{max-width:100%}.affinity-chart{min-width:24rem}.affinity-details{columns:1}th,td{padding:.55rem .6rem}}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.affinity-card{margin:1.25rem 0}.affinity-layout{display:grid;grid-template-columns:minmax(18rem,32rem) minmax(16rem,1fr);gap:1rem;align-items:center}.affinity-chart-wrap{max-width:32rem;overflow-x:auto}.affinity-chart{display:block;width:100%;min-width:28rem;height:auto}.affinity-grid{fill:none;stroke:#435363;stroke-width:1}.affinity-axis{stroke:#435363;stroke-width:1}.affinity-area{fill:#4b9fff55;stroke:#8cc8ff;stroke-width:2}.affinity-point{fill:#b9f6ca;stroke:#101418;stroke-width:1.5}.affinity-label{fill:#eef3f8;font-size:13px;font-weight:650}.affinity-details{columns:2;column-gap:1.5rem;margin:.5rem 0;padding-left:1.2rem}.affinity-details li{break-inside:avoid;margin:.25rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.title-episodes{display:block;margin-top:.3rem;font-size:.88rem;font-weight:400;color:#aebccc}.provider-star-rating,.provider-maturity-rating{display:block;margin:.18rem 0;color:#ffd37a}.provider-maturity-rating{color:#aebccc;margin-bottom:.3rem}.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;border-radius:.4rem;background:#243140}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}.affinity-layout{grid-template-columns:1fr}.affinity-chart-wrap{max-width:100%}.affinity-chart{min-width:24rem}.affinity-details{columns:1}th,td{padding:.55rem .6rem}}
 </style></head><body>__NAVIGATION__<h1>__TITLE__</h1><p class=\"muted\">__INTRO__ Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const countValue = value => {
@@ -1847,7 +1884,7 @@ const recommendationIdentity = r => {
   const title = String(r.display_title || r.english_title || r.title || 'untitled').trim().toLowerCase().replace(/\\s+/g, ' ');
   return `fallback:${encodeURIComponent(`${r.kind || 'recommendation'}|${title}`)}`;
 };
-function recTable(rows, meta = {}){ const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class="warn"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; if(!rows?.length) return `${diag}<p class="muted" role="status">No recommendations match the current filters in this section.</p>`; const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'; const headings = progressSection ? ['Priority', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres'] : ['Priority', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']; if (meta.enable_controls) headings.push('Visibility'); const head = headings.map(label => `<th scope="col">${esc(label)}</th>`).join(''); const body = rows.map(r => { const e = r.evidence || {}; const identity = recommendationIdentity(r); const hidden = meta.hidden_titles?.has(identity); const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const hiddenClass = hidden ? ' hidden-recommendation' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class="diagnostic-label">discovery only · unverified</div>' : ''; const rawTitle = r.display_title || r.english_title || r.title || 'Untitled'; const title = esc(rawTitle); const image = r.image_url ? `<img class="recommendation-art" src="${esc(r.image_url)}" alt="${esc(`${rawTitle} cover art`)}" width="128" height="128" loading="lazy">` : '<span class="muted">No cover art available</span>'; const action = meta.enable_controls ? `<td><button type="button" class="row-visibility-button" data-recommendation-id="${esc(identity)}">${hidden ? 'Unhide' : 'Hide'}</button></td>` : ''; const details = progressSection ? `<td>${esc(r.watched_progress || '?/?')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${esc(genreText(r))}</td>` : `<td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td>`; return `<tr class="${diagnostic}${hiddenClass}" data-recommendation-id="${esc(identity)}"><td>${esc(r.priority ?? r.score)}</td><th scope="row">${diagnosticLabel}<span class="title-text">${title}</span><div class="title-providers" aria-label="Provider proof">${providerBadges(r)}</div></th><td>${image}</td>${details}${action}</tr>`; }).join(''); return `${diag}<div class="table-scroll" tabindex="0" role="region" aria-label="${esc(titleLabel)} recommendations table"><table><caption class="sr-only">${esc(titleLabel)} recommendations; provider proof appears below each title.</caption><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`; }
+function recTable(rows, meta = {}){ const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class="warn"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; if(!rows?.length) return `${diag}<p class="muted" role="status">No recommendations match the current filters in this section.</p>`; const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'; const headings = progressSection ? ['Pri', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres'] : ['Pri', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']; if (meta.enable_controls) headings.push('Visibility'); const head = headings.map(label => `<th scope="col">${esc(label)}</th>`).join(''); const body = rows.map(r => { const e = r.evidence || {}; const identity = recommendationIdentity(r); const hidden = meta.hidden_titles?.has(identity); const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const hiddenClass = hidden ? ' hidden-recommendation' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class="diagnostic-label">discovery only · unverified</div>' : ''; const rawTitle = r.display_title || r.english_title || r.title || 'Untitled'; const title = esc(rawTitle); const image = r.image_url ? `<img class="recommendation-art" src="${esc(r.image_url)}" alt="${esc(`${rawTitle} cover art`)}" width="128" height="128" loading="lazy">` : '<span class="muted">No cover art available</span>'; const action = meta.enable_controls ? `<td><button type="button" class="row-visibility-button" data-recommendation-id="${esc(identity)}">${hidden ? 'Unhide' : 'Hide'}</button></td>` : ''; const episodeTotal = progressSection ? '' : `<div class="title-episodes">Episodes: ${esc(r.episode_total ?? '?')}</div>`; const details = progressSection ? `<td>${esc(r.watched_progress || '?/?')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${esc(genreText(r))}</td>` : `<td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td>`; return `<tr class="${diagnostic}${hiddenClass}" data-recommendation-id="${esc(identity)}"><td>${esc(r.priority ?? r.score)}</td><th scope="row">${diagnosticLabel}<span class="title-text">${title}</span><div class="title-providers" aria-label="Provider proof">${providerBadges(r)}</div>${episodeTotal}</th><td>${image}</td>${details}${action}</tr>`; }).join(''); return `${diag}<div class="table-scroll" tabindex="0" role="region" aria-label="${esc(titleLabel)} recommendations table"><table><caption class="sr-only">${esc(titleLabel)} recommendations; provider proof appears below each title.</caption><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`; }
 __PAGE_HELPERS__
 function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
 async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); __PAGE_RENDER__ }
