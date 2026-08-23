@@ -1596,7 +1596,22 @@ class RecommendationDashboardTests(unittest.TestCase):
     def test_live_dashboard_recommendation_table_combines_provider_with_title_and_omits_removed_columns(self) -> None:
         html = render_dynamic_dashboard_html()
 
-        self.assertIn("const headings = ['Priority', 'Title', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']", html)
+        self.assertIn("const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'", html)
+        progress_headings = "['Priority', 'Title', 'Image', 'Watched episodes / total episodes', 'Why recommended', 'Genres']"
+        ordinary_headings = "['Priority', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']"
+        self.assertIn(progress_headings, html)
+        self.assertIn(ordinary_headings, html)
+        self.assertNotIn("['Priority', 'Image', 'Title'", html)
+        self.assertIn('<td>${esc(r.priority ?? r.score)}</td><th scope="row">', html)
+        self.assertIn('</div></th><td>${image}</td>${details}${action}</tr>', html)
+        self.assertIn('class="recommendation-art"', html)
+        self.assertIn('class="provider-rating"', html)
+        self.assertIn('alt="${esc(`${rawTitle} cover art`)}"', html)
+        self.assertNotIn('alt=""', html)
+        self.assertIn('No cover art available', html)
+        self.assertIn('.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;', html)
+        self.assertNotIn('object-fit:cover', html)
+        self.assertIn('${esc(provider)} rating: ${esc(b.rating)}', html)
         self.assertNotIn("Identity/review/catalog", html)
         self.assertNotIn("Freshness/expiry", html)
         self.assertNotIn("r.verification || e.verification_label", html)
@@ -1697,6 +1712,146 @@ class RecommendationDashboardTests(unittest.TestCase):
             'class=\"ordinary-table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Recent provider sync runs table\"',
             html,
         )
+
+    def test_dashboard_overlays_provider_art_rating_link_and_episode_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [{
+                    "kind": "new_dubbed_episode",
+                    "provider": "hidive",
+                    "provider_series_id": "hi-progress",
+                    "title": "Progress Show",
+                    "priority": 80,
+                    "context": {"completed_episode_count": 4, "max_episode_number": 6},
+                }],
+                run_id="run-progress",
+                generated_at="2026-08-22T00:00:00Z",
+            )
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=1234,
+                provider="hidive",
+                provider_series_id="hi-progress",
+                provider_title="Progress Show",
+                provider_url="https://www.hidive.com/season/progress-show",
+                source_evidence={
+                    "match": {
+                        "raw": {
+                            "smallCoverUrl": "https://example.test/progress.jpg",
+                            "ratings": {"US": ["TV-14"]},
+                        }
+                    }
+                },
+                fetched_at="2026-08-22T00:00:00Z",
+                expires_at="2099-01-01T00:00:00Z",
+            )
+
+            row = build_dashboard_payload(db_path)["recommendations"]["sections"]["new_dubbed_episode"][0]
+
+            self.assertEqual("4/6", row["watched_progress"])
+            self.assertEqual("https://example.test/progress.jpg", row["image_url"])
+            self.assertEqual({"hidive": "TV-14"}, row["provider_ratings"])
+            self.assertEqual("https://www.hidive.com/season/progress-show", row["provider_badges"][0]["url"])
+            self.assertEqual("TV-14", row["provider_badges"][0]["rating"])
+
+    def test_dashboard_keeps_provider_ratings_bound_to_each_stored_provider_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [{
+                    "kind": "discovery_candidate",
+                    "provider": "crunchyroll",
+                    "provider_series_id": "cr-multi-rating",
+                    "title": "Multi Rating Show",
+                    "priority": 80,
+                    "context": {
+                        "mal_anime_id": 4321,
+                        "provider_eligibility_evidence": [
+                            {
+                                **_verified_provider_evidence("crunchyroll", "cr-multi-rating", "Multi Rating Show"),
+                                "provider_url": "https://www.crunchyroll.com/series/cr-multi-rating",
+                            },
+                            {
+                                **_verified_provider_evidence("hidive", "hi-multi-rating", "Multi Rating Show", identity_match_kind="manual_verified"),
+                                "provider_url": "https://www.hidive.com/season/hi-multi-rating",
+                            },
+                        ],
+                    },
+                    "availability_providers": ["crunchyroll", "hidive"],
+                    "dub_signal": "present",
+                }],
+                run_id="run-multi-rating",
+                generated_at="2026-08-22T00:00:00Z",
+            )
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=4321,
+                provider="crunchyroll",
+                provider_series_id="cr-multi-rating",
+                provider_title="Multi Rating Show",
+                provider_url="https://www.crunchyroll.com/series/cr-multi-rating",
+                source_evidence={"match": {"raw": {"series_metadata": {"maturity_ratings": ["TV-14"]}}}},
+                fetched_at="2026-08-22T00:00:00Z",
+                expires_at="2099-01-01T00:00:00Z",
+            )
+            upsert_recommendation_provider_eligibility_evidence(
+                db_path,
+                mal_anime_id=4321,
+                provider="hidive",
+                provider_series_id="hi-multi-rating",
+                provider_title="Multi Rating Show",
+                provider_url="https://www.hidive.com/season/hi-multi-rating",
+                source_evidence={"match": {"raw": {"ratings": {"US": ["TV-MA"]}}}},
+                fetched_at="2026-08-22T00:00:00Z",
+                expires_at="2099-01-01T00:00:00Z",
+            )
+
+            row = build_dashboard_payload(db_path)["recommendations"]["sections"]["discovery_available_now"][0]
+            badges = {badge["provider"]: badge for badge in row["provider_badges"]}
+
+            self.assertEqual({"crunchyroll": "TV-14", "hidive": "TV-MA"}, row["provider_ratings"])
+            self.assertEqual("https://www.crunchyroll.com/series/cr-multi-rating", badges["crunchyroll"]["url"])
+            self.assertEqual("TV-14", badges["crunchyroll"]["rating"])
+            self.assertEqual("https://www.hidive.com/season/hi-multi-rating", badges["hidive"]["url"])
+            self.assertEqual("TV-MA", badges["hidive"]["rating"])
+
+    def test_dashboard_progress_is_unknown_without_cross_source_mixing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [
+                    {
+                        "kind": "new_dubbed_episode",
+                        "provider": "hidive",
+                        "provider_series_id": "provider-partial",
+                        "title": "Provider Partial",
+                        "priority": 80,
+                        "context": {"completed_episode_count": 4, "mal_num_episodes": 12},
+                    },
+                    {
+                        "kind": "resume_backlog",
+                        "provider": "crunchyroll",
+                        "provider_series_id": "unknown-progress",
+                        "title": "Unknown Progress",
+                        "priority": 70,
+                        "context": {},
+                    },
+                ],
+                run_id="run-unknown-progress",
+                generated_at="2026-08-22T00:00:00Z",
+            )
+
+            sections = build_dashboard_payload(db_path)["recommendations"]["sections"]
+
+            self.assertEqual("4/?", sections["new_dubbed_episode"][0]["watched_progress"])
+            self.assertEqual("?/?", sections["resume_backlog"][0]["watched_progress"])
 
     def test_live_dashboard_nested_operational_counts_render_without_object_stringification(self) -> None:
         html = render_dynamic_dashboard_html()

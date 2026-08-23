@@ -20,6 +20,7 @@ from .db import (
     get_public_userrecs_diagnostics,
     list_latest_recommendation_snapshot_rows,
     list_recommendation_provider_eligibility_evidence_for_mal_ids,
+    list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
     unknown_public_userrecs_diagnostics,
 )
 from .hidive_auth import load_hidive_credentials
@@ -282,6 +283,7 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
             "label": str(item.get("label") or _provider_label(item.get("provider"))),
             "url": str(item.get("provider_url") or ""),
             "title": str(item.get("provider_title") or ""),
+            "provider_series_id": str(item.get("provider_series_id") or ""),
         }
         for item in eligibility_details
         if item.get("provider")
@@ -436,7 +438,7 @@ def _mark_discovery_row_visibility(row: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(badge, dict):
                     continue
                 label = str(badge.get("label") or _provider_label(badge.get("provider")))
-                unverified_badges.append({**badge, "label": f"{label} (unverified)", "url": ""})
+                unverified_badges.append({**badge, "label": f"{label} (unverified)"})
             row["provider_badges"] = unverified_badges
             row["provider_evidence_html"] = _provider_evidence_html(unverified_badges)
             evidence = row.get("evidence")
@@ -532,6 +534,40 @@ def _number(value: Any) -> int | float | None:
     return None
 
 
+def _watched_progress(context: dict[str, Any]) -> str:
+    provider_watched = _number(context.get("completed_episode_count"))
+    provider_total = _number(context.get("max_episode_number"))
+    if provider_total is None:
+        provider_total = _number(context.get("available_episode_count"))
+    if provider_watched is not None or provider_total is not None:
+        watched, total = provider_watched, provider_total
+    else:
+        watched = _number(context.get("mal_num_episodes_watched"))
+        total = _number(context.get("mal_num_episodes"))
+    return f"{watched if watched is not None else '?'}/{total if total is not None else '?'}"
+
+
+def _provider_ratings(context: dict[str, Any], provider: Any) -> dict[str, str]:
+    stored = context.get("provider_ratings")
+    ratings = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in stored.items()
+        if str(key).strip() and value is not None and str(value).strip()
+    } if isinstance(stored, dict) else {}
+    provider_key = str(provider or "").strip().lower()
+    rating = str(context.get("provider_rating") or "").strip()
+    if provider_key and rating:
+        ratings.setdefault(provider_key, rating)
+    return ratings
+
+
+def _attach_provider_ratings(badges: list[dict[str, Any]], ratings: dict[str, str]) -> None:
+    for badge in badges:
+        provider = str(badge.get("provider") or "").strip().lower()
+        if provider in ratings and not badge.get("rating"):
+            badge["rating"] = ratings[provider]
+
+
 def _row(item: Recommendation) -> dict[str, Any]:
     context = item.context
     providers = item.available_providers()
@@ -551,9 +587,17 @@ def _row(item: Recommendation) -> dict[str, Any]:
         display_title = f"{english_title} ({item.season_title})"
     provider_evidence = _availability_evidence_details(context)
     provider_badges = [
-        {"provider": item.get("provider"), "label": item.get("label"), "url": item.get("provider_url") or "", "title": item.get("provider_title") or ""}
+        {
+            "provider": item.get("provider"),
+            "label": item.get("label"),
+            "url": item.get("provider_url") or "",
+            "title": item.get("provider_title") or "",
+            "provider_series_id": item.get("provider_series_id") or "",
+        }
         for item in provider_evidence
     ] or _provider_badges(providers)
+    provider_ratings = _provider_ratings(context, item.provider)
+    _attach_provider_ratings(provider_badges, provider_ratings)
     seed_details = _supporting_seed_details(context)
     identity_label = availability_details.get("availability_match_kind") or ", ".join(str(item.get("identity_match_kind")) for item in provider_evidence if item.get("identity_match_kind"))
     verification_label = "; ".join(
@@ -603,6 +647,9 @@ def _row(item: Recommendation) -> dict[str, Any]:
         "mal_popularity": mal_popularity if mal_popularity is not None else "",
         "genres": ", ".join(str(value) for value in genres),
         "provider_progress": provider_progress,
+        "watched_progress": _watched_progress(context),
+        "image_url": str(context.get("cover_image_url") or ""),
+        "provider_ratings": provider_ratings,
         "mal_watch_status": mal_status,
         "reasons": "; ".join(item.reasons),
         "kind": item.kind,
@@ -1087,8 +1134,12 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
     else:
         payload["display_title"] = row.title
     payload["genres"] = genres if isinstance(genres, list) else []
+    payload["watched_progress"] = _watched_progress(context)
+    payload["image_url"] = str(context.get("cover_image_url") or "")
+    payload["provider_ratings"] = _provider_ratings(context, payload.get("provider"))
     payload["evidence"] = _snapshot_evidence(payload)
     payload["provider_badges"] = payload["evidence"].get("provider_badges", [])
+    _attach_provider_ratings(payload["provider_badges"], payload["provider_ratings"])
     payload["provider_evidence"] = payload["evidence"].get("availability_provider_label", "")
     payload["english_dub_evidence"] = "present" if payload["evidence"].get("english_dub_present") else payload["evidence"].get("dub_status", "unknown")
     payload["verification"] = payload["evidence"].get("verification_label", "")
@@ -1106,6 +1157,112 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
     )
     payload["availability"] = availability
     return _mark_discovery_row_visibility(payload)
+
+
+def _provider_catalog_metadata(source_evidence: dict[str, Any]) -> tuple[str, str]:
+    match = source_evidence.get("match") if isinstance(source_evidence.get("match"), dict) else {}
+    raw = match.get("raw") if isinstance(match.get("raw"), dict) else source_evidence
+    if not isinstance(raw, dict):
+        return "", ""
+
+    image_url = ""
+    images = raw.get("images")
+    if isinstance(images, dict):
+        poster_groups = images.get("poster_tall")
+        if isinstance(poster_groups, list):
+            posters = [poster for group in poster_groups for poster in (group if isinstance(group, list) else [group]) if isinstance(poster, dict)]
+            preferred = next((poster for poster in posters if _number(poster.get("width")) == 120), None)
+            preferred = preferred or next((poster for poster in posters if (_number(poster.get("width")) or 0) >= 128), None)
+            preferred = preferred or (posters[0] if posters else None)
+            if preferred:
+                image_url = str(preferred.get("source") or "")
+    if not image_url:
+        image_url = str(raw.get("smallCoverUrl") or raw.get("coverUrl") or "")
+
+    ratings: list[str] = []
+    series_metadata = raw.get("series_metadata") if isinstance(raw.get("series_metadata"), dict) else {}
+    maturity = series_metadata.get("maturity_ratings")
+    if isinstance(maturity, list):
+        ratings.extend(str(value) for value in maturity if value)
+    regional_ratings = raw.get("ratings")
+    if isinstance(regional_ratings, dict):
+        preferred = regional_ratings.get("US")
+        values = preferred if isinstance(preferred, list) else [preferred]
+        ratings.extend(str(value) for value in values if value)
+    return image_url, ", ".join(dict.fromkeys(ratings))
+
+
+def _overlay_provider_catalog_metadata(db_path: Path, rows: list[dict[str, Any]]) -> None:
+    keys: set[tuple[str, str]] = set()
+    for row in rows:
+        if row.get("provider") and row.get("provider_series_id"):
+            keys.add((str(row["provider"]).strip().lower(), str(row["provider_series_id"]).strip()))
+        badges = row.get("provider_badges") if isinstance(row.get("provider_badges"), list) else []
+        keys.update(
+            (str(badge.get("provider") or "").strip().lower(), str(badge.get("provider_series_id") or "").strip())
+            for badge in badges
+            if isinstance(badge, dict) and badge.get("provider") and badge.get("provider_series_id")
+        )
+    if not keys:
+        return
+    evidence_by_key: dict[tuple[str, str], Any] = {}
+    for item in list_recommendation_provider_eligibility_evidence_for_provider_series_keys(db_path, keys):
+        key = (item.provider.lower(), item.provider_series_id)
+        current = evidence_by_key.get(key)
+        if current is None or (not current.provider_url and item.provider_url):
+            evidence_by_key[key] = item
+    for row in rows:
+        badges = row.get("provider_badges") if isinstance(row.get("provider_badges"), list) else []
+        primary_key = (str(row.get("provider") or "").strip().lower(), str(row.get("provider_series_id") or "").strip())
+        row_keys = [primary_key] if primary_key in evidence_by_key else []
+        row_keys.extend(
+            key
+            for key in (
+                (str(badge.get("provider") or "").strip().lower(), str(badge.get("provider_series_id") or "").strip())
+                for badge in badges
+                if isinstance(badge, dict)
+            )
+            if key in evidence_by_key and key not in row_keys
+        )
+        provider_ratings = row.get("provider_ratings") if isinstance(row.get("provider_ratings"), dict) else {}
+        for key in row_keys:
+            evidence = evidence_by_key[key]
+            image_url, provider_rating = _provider_catalog_metadata(evidence.source_evidence)
+            row["image_url"] = row.get("image_url") or image_url
+            if provider_rating:
+                provider_ratings.setdefault(evidence.provider, provider_rating)
+            matching_badge = next(
+                (
+                    badge
+                    for badge in badges
+                    if isinstance(badge, dict)
+                    and str(badge.get("provider") or "").strip().lower() == evidence.provider.lower()
+                    and (
+                        not badge.get("provider_series_id")
+                        or str(badge.get("provider_series_id")).strip() == evidence.provider_series_id
+                    )
+                ),
+                None,
+            )
+            if matching_badge is not None:
+                if provider_rating and not matching_badge.get("rating"):
+                    matching_badge["rating"] = provider_rating
+                if evidence.provider_url:
+                    matching_badge["url"] = evidence.provider_url
+                    matching_badge["title"] = matching_badge.get("title") or evidence.provider_title or row.get("title") or ""
+            elif evidence.provider_url:
+                badges.append(
+                    {
+                        "provider": evidence.provider,
+                        "label": _provider_label(evidence.provider),
+                        "url": evidence.provider_url,
+                        "title": evidence.provider_title or row.get("title") or "",
+                        "provider_series_id": evidence.provider_series_id,
+                        **({"rating": provider_rating} if provider_rating else {}),
+                    }
+                )
+        row["provider_ratings"] = provider_ratings
+        row["provider_badges"] = badges
 
 
 def _latest_snapshot_summary(db_path: Path) -> dict[str, Any] | None:
@@ -1452,6 +1609,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     latest_raw_rows = list_latest_recommendation_snapshot_rows(db_path, limit=None)
     rows = [_snapshot_row_to_dict(row) for row in latest_raw_rows]
     _overlay_current_eligibility_evidence(db_path, rows)
+    _overlay_provider_catalog_metadata(db_path, rows)
     latest_has_discovery = any(row.kind == "discovery_candidate" for row in latest_raw_rows)
     diagnostic_source_snapshot: dict[str, Any] | None = None
     if not latest_has_discovery:
@@ -1543,7 +1701,7 @@ def _render_dynamic_dashboard_page(
     template = """<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <title>__TITLE__</title><style>
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.affinity-card{margin:1.25rem 0}.affinity-layout{display:grid;grid-template-columns:minmax(18rem,32rem) minmax(16rem,1fr);gap:1rem;align-items:center}.affinity-chart-wrap{max-width:32rem;overflow-x:auto}.affinity-chart{display:block;width:100%;min-width:28rem;height:auto}.affinity-grid{fill:none;stroke:#435363;stroke-width:1}.affinity-axis{stroke:#435363;stroke-width:1}.affinity-area{fill:#4b9fff55;stroke:#8cc8ff;stroke-width:2}.affinity-point{fill:#b9f6ca;stroke:#101418;stroke-width:1.5}.affinity-label{fill:#eef3f8;font-size:13px;font-weight:650}.affinity-details{columns:2;column-gap:1.5rem;margin:.5rem 0;padding-left:1.2rem}.affinity-details li{break-inside:avoid;margin:.25rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}.affinity-layout{grid-template-columns:1fr}.affinity-chart-wrap{max-width:100%}.affinity-chart{min-width:24rem}.affinity-details{columns:1}th,td{padding:.55rem .6rem}}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.top-nav{float:right;margin:.5rem 0 1rem 1rem}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.affinity-card{margin:1.25rem 0}.affinity-layout{display:grid;grid-template-columns:minmax(18rem,32rem) minmax(16rem,1fr);gap:1rem;align-items:center}.affinity-chart-wrap{max-width:32rem;overflow-x:auto}.affinity-chart{display:block;width:100%;min-width:28rem;height:auto}.affinity-grid{fill:none;stroke:#435363;stroke-width:1}.affinity-axis{stroke:#435363;stroke-width:1}.affinity-area{fill:#4b9fff55;stroke:#8cc8ff;stroke-width:2}.affinity-point{fill:#b9f6ca;stroke:#101418;stroke-width:1.5}.affinity-label{fill:#eef3f8;font-size:13px;font-weight:650}.affinity-details{columns:2;column-gap:1.5rem;margin:.5rem 0;padding-left:1.2rem}.affinity-details li{break-inside:avoid;margin:.25rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.provider-rating{display:block;margin:.18rem 0 .3rem;color:#ffd37a}.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;border-radius:.4rem;background:#243140}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.card,.banner,.empty-state{padding:.8rem}.affinity-layout{grid-template-columns:1fr}.affinity-chart-wrap{max-width:100%}.affinity-chart{min-width:24rem}.affinity-details{columns:1}th,td{padding:.55rem .6rem}}
 </style></head><body>__NAVIGATION__<h1>__TITLE__</h1><p class=\"muted\">__INTRO__ Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
 const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const countValue = value => {
@@ -1556,7 +1714,7 @@ const countValue = value => {
   return esc(value);
 };
 const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${countValue(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
-const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const provider = b.label || b.provider; const label = `<span class=\"provider-badge\">${esc(provider)}</span>`; return b.url ? `<a class=\"provider-link\" href=\"${esc(b.url)}\" rel=\"noreferrer noopener\" aria-label=\"${esc(`Open ${provider} provider proof`)}\">${label}</a>` : label; }).join('<br>'); };
+const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const provider = b.label || b.provider; const badge = `<span class=\"provider-badge\">${esc(provider)}</span>`; const label = b.url ? `<a class=\"provider-link\" href=\"${esc(b.url)}\" rel=\"noreferrer noopener\" aria-label=\"${esc(`Open ${provider} provider proof`)}\">${badge}</a>` : badge; const rating = b.rating ? `<span class=\"provider-rating\">${esc(provider)} rating: ${esc(b.rating)}</span>` : ''; return `${label}${rating}`; }).join('<br>'); };
 const seedDetails = e => (e?.top_supporting_seeds || []).map(s => { const bits = []; if (s.num_recommendation_votes != null) bits.push(`${s.num_recommendation_votes} MAL vote${s.num_recommendation_votes === 1 ? '' : 's'}`); if (s.user_score != null) bits.push(`score ${s.user_score}`); if (s.status) bits.push(s.status); return `${esc(s.title || s.mal_anime_id || 'MAL seed')}${bits.length ? ` <span class=\"muted\">(${esc(bits.join(', '))})</span>` : ''}`; }).join('<br>') || esc(e?.compact_seeds || '');
 const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary || '');
 const genreText = r => Array.isArray(r.genres) ? r.genres.join(', ') : (r.genres ?? '');
@@ -1566,7 +1724,7 @@ const recommendationIdentity = r => {
   const title = String(r.display_title || r.english_title || r.title || 'untitled').trim().toLowerCase().replace(/\\s+/g, ' ');
   return `fallback:${encodeURIComponent(`${r.kind || 'recommendation'}|${title}`)}`;
 };
-function recTable(rows, meta = {}){ const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class=\"warn\"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; if(!rows?.length) return `${diag}<p class=\"muted\" role=\"status\">No recommendations match the current filters in this section.</p>`; const headings = ['Priority', 'Title', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']; if (meta.enable_controls) headings.push('Visibility'); const head = headings.map(label => `<th scope=\"col\">${esc(label)}</th>`).join(''); const body = rows.map(r => { const e = r.evidence || {}; const identity = recommendationIdentity(r); const hidden = meta.hidden_titles?.has(identity); const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const hiddenClass = hidden ? ' hidden-recommendation' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class=\"diagnostic-label\">discovery only · unverified</div>' : ''; const title = esc(r.display_title || r.english_title || r.title); const action = meta.enable_controls ? `<td><button type=\"button\" class=\"row-visibility-button\" data-recommendation-id=\"${esc(identity)}\">${hidden ? 'Unhide' : 'Hide'}</button></td>` : ''; return `<tr class=\"${diagnostic}${hiddenClass}\" data-recommendation-id=\"${esc(identity)}\"><td>${esc(r.priority ?? r.score)}</td><th scope=\"row\">${diagnosticLabel}<span class=\"title-text\">${title}</span><div class=\"title-providers\" aria-label=\"Provider proof\">${providerBadges(r)}</div></th><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td>${action}</tr>`; }).join(''); return `${diag}<div class=\"table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"${esc(titleLabel)} recommendations table\"><table><caption class=\"sr-only\">${esc(titleLabel)} recommendations; provider proof appears below each title.</caption><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`; }
+function recTable(rows, meta = {}){ const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class="warn"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; if(!rows?.length) return `${diag}<p class="muted" role="status">No recommendations match the current filters in this section.</p>`; const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'; const headings = progressSection ? ['Priority', 'Title', 'Image', 'Watched episodes / total episodes', 'Why recommended', 'Genres'] : ['Priority', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']; if (meta.enable_controls) headings.push('Visibility'); const head = headings.map(label => `<th scope="col">${esc(label)}</th>`).join(''); const body = rows.map(r => { const e = r.evidence || {}; const identity = recommendationIdentity(r); const hidden = meta.hidden_titles?.has(identity); const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const hiddenClass = hidden ? ' hidden-recommendation' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class="diagnostic-label">discovery only · unverified</div>' : ''; const rawTitle = r.display_title || r.english_title || r.title || 'Untitled'; const title = esc(rawTitle); const image = r.image_url ? `<img class="recommendation-art" src="${esc(r.image_url)}" alt="${esc(`${rawTitle} cover art`)}" width="128" height="128" loading="lazy">` : '<span class="muted">No cover art available</span>'; const action = meta.enable_controls ? `<td><button type="button" class="row-visibility-button" data-recommendation-id="${esc(identity)}">${hidden ? 'Unhide' : 'Hide'}</button></td>` : ''; const details = progressSection ? `<td>${esc(r.watched_progress || '?/?')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${esc(genreText(r))}</td>` : `<td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td>`; return `<tr class="${diagnostic}${hiddenClass}" data-recommendation-id="${esc(identity)}"><td>${esc(r.priority ?? r.score)}</td><th scope="row">${diagnosticLabel}<span class="title-text">${title}</span><div class="title-providers" aria-label="Provider proof">${providerBadges(r)}</div></th><td>${image}</td>${details}${action}</tr>`; }).join(''); return `${diag}<div class="table-scroll" tabindex="0" role="region" aria-label="${esc(titleLabel)} recommendations table"><table><caption class="sr-only">${esc(titleLabel)} recommendations; provider proof appears below each title.</caption><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`; }
 __PAGE_HELPERS__
 function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
 async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); __PAGE_RENDER__ }
