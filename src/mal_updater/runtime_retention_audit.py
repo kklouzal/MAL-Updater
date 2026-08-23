@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import stat
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ class RuntimeAuditConfig(Protocol):
     data_dir: Path
     state_dir: Path
     cache_dir: Path
+    service: "RuntimeAuditServiceConfig"
 
     @property
     def service_log_path(self) -> Path: ...
@@ -33,6 +35,13 @@ class RuntimeAuditConfig(Protocol):
 
     @property
     def health_latest_json_path(self) -> Path: ...
+
+
+class RuntimeAuditServiceConfig(Protocol):
+    health_every_seconds: int
+    health_history_retention_days: int
+    health_history_min_count: int
+    service_log_retained_generations: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +108,7 @@ FAMILY_DEFINITIONS: tuple[FamilyDefinition, ...] = (
         label="state logs",
         root_labels=("state_logs",),
         default_thresholds=WarningThresholds(file_count=50, total_bytes=256 * _BYTES_IN_MIB, oldest_days=45.0),
-        manual_policy="automatic_size_rotation_plus_manual_review",
+        manual_policy="automatic_health_history_retention_and_size_rotation_plus_manual_review",
     ),
     FamilyDefinition(
         name="request_events",
@@ -382,10 +391,31 @@ def _build_layout(config: RuntimeAuditConfig) -> dict[str, object]:
     }
 
 
-def _merged_thresholds(definition: FamilyDefinition, overrides: WarningThresholds) -> WarningThresholds:
+def _retained_health_history_file_count(config: RuntimeAuditConfig) -> int:
+    cadence_seconds = max(1, int(config.service.health_every_seconds))
+    retention_seconds = max(1, int(config.service.health_history_retention_days)) * 86_400
+    cadence_window_count = math.ceil(retention_seconds / cadence_seconds) + 1
+    return max(int(config.service.health_history_min_count), cadence_window_count)
+
+
+def _merged_thresholds(
+    definition: FamilyDefinition,
+    overrides: WarningThresholds,
+    config: RuntimeAuditConfig,
+) -> WarningThresholds:
     defaults = definition.default_thresholds
+    default_file_count = defaults.file_count
+    retained_health_history_count = _retained_health_history_file_count(config)
+    if definition.name == "health_snapshots":
+        # Allow the retained timestamped history plus the latest alias. The
+        # threshold comparison is inclusive, so warn at one file above that.
+        default_file_count = retained_health_history_count + 2
+    elif definition.name == "state_logs":
+        # Allow the matching retained health logs, active service log, and its
+        # configured bounded generations before warning on file count.
+        default_file_count = retained_health_history_count + int(config.service.service_log_retained_generations) + 2
     return WarningThresholds(
-        file_count=overrides.file_count if overrides.file_count is not None else defaults.file_count,
+        file_count=overrides.file_count if overrides.file_count is not None else default_file_count,
         total_bytes=overrides.total_bytes if overrides.total_bytes is not None else defaults.total_bytes,
         oldest_days=overrides.oldest_days if overrides.oldest_days is not None else defaults.oldest_days,
     )
@@ -599,6 +629,7 @@ def _family_review_candidates(
 def _scan_family(
     definition: FamilyDefinition,
     *,
+    config: RuntimeAuditConfig,
     root_paths: dict[str, Path],
     runtime_root: Path,
     options: AuditOptions,
@@ -624,7 +655,7 @@ def _scan_family(
             caps=options.caps,
         )
 
-    thresholds = _merged_thresholds(definition, options.warning_threshold_overrides)
+    thresholds = _merged_thresholds(definition, options.warning_threshold_overrides, config)
     review_candidates = _family_review_candidates(definition.name, summary, thresholds, definition, now=now)
     payload: dict[str, object] = {
         "label": definition.label,
@@ -682,6 +713,7 @@ def build_runtime_retention_audit_payload(config: RuntimeAuditConfig, options: A
     families = {
         definition.name: _scan_family(
             definition,
+            config=config,
             root_paths=root_paths,
             runtime_root=runtime_root,
             options=effective_options,

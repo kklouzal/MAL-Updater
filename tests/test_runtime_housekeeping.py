@@ -20,11 +20,23 @@ class RuntimeHousekeepingTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="mal-runtime-housekeeping-", dir="/tmp")
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
+        runtime_root = self.root / ".MAL-Updater"
+        self.env_patch = patch.dict(os.environ, {
+            "MAL_UPDATER_RUNTIME_ROOT": str(runtime_root),
+            "MAL_UPDATER_SETTINGS_PATH": str(runtime_root / "config" / "settings.toml"),
+        })
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         self.config = load_config(self.root)
         ensure_directories(self.config)
 
     def _health(self, stamp: str, payload: str = "{}") -> Path:
         path = self.config.health_latest_json_path.parent / f"health-check-{stamp}.json"
+        path.write_text(payload, encoding="utf-8")
+        return path
+
+    def _health_log(self, stamp: str, payload: str = "log") -> Path:
+        path = self.config.state_dir / "logs" / f"health-check-{stamp}.log"
         path.write_text(payload, encoding="utf-8")
         return path
 
@@ -49,6 +61,63 @@ class RuntimeHousekeepingTests(unittest.TestCase):
         self.assertEqual('{"latest":true}', self.config.health_latest_json_path.read_text(encoding="utf-8"))
         self.assertTrue(self._health("20260104T000000Z").exists())
         self.assertTrue(self._health("20260105T000000Z").exists())
+
+    def test_health_retention_binds_hourly_logs_without_touching_other_runtime_files(self) -> None:
+        self.config.service.health_history_retention_days = 30
+        self.config.service.health_history_min_count = 2
+        self.config.service.health_history_prune_batch_size = 2
+        old_logs = [self._health_log(stamp) for stamp in (
+            "20260101T000000Z",
+            "20260102T000000Z",
+            "20260103T000000Z",
+            "20260104T000000Z",
+            "20260105T000000Z",
+        )]
+        service_log = self.config.service_log_path
+        service_log.write_text("service", encoding="utf-8")
+        backup = self.config.state_dir / "logs" / "operator-backup.tar.gz"
+        backup.write_text("backup", encoding="utf-8")
+        now = datetime(2026, 8, 12, tzinfo=timezone.utc).timestamp()
+
+        first = prune_health_history(self.config, now=now).as_dict()
+        second = prune_health_history(self.config, now=now).as_dict()
+
+        self.assertEqual(2, first["log_deleted_count"])
+        self.assertEqual(1, second["log_deleted_count"])
+        self.assertFalse(old_logs[0].exists())
+        self.assertFalse(old_logs[1].exists())
+        self.assertFalse(old_logs[2].exists())
+        self.assertTrue(old_logs[3].exists())
+        self.assertTrue(old_logs[4].exists())
+        self.assertEqual("service", service_log.read_text(encoding="utf-8"))
+        self.assertEqual("backup", backup.read_text(encoding="utf-8"))
+
+    def test_health_log_retention_fails_closed_on_matching_symlink(self) -> None:
+        target = self.root / "external-health.log"
+        target.write_text("sentinel", encoding="utf-8")
+        (self.config.state_dir / "logs" / "health-check-20260101T000000Z.log").symlink_to(target)
+
+        report = prune_health_history(self.config, now=time.time()).as_dict()
+
+        self.assertEqual("blocked", report["status"])
+        self.assertEqual("unsafe_health_log_entry", report["reason"])
+        self.assertEqual("sentinel", target.read_text(encoding="utf-8"))
+
+    def test_health_logs_are_pruned_when_snapshot_directory_is_missing(self) -> None:
+        self.config.service.health_history_retention_days = 30
+        self.config.service.health_history_min_count = 1
+        old_log = self._health_log("20260101T000000Z")
+        newest_log = self._health_log("20260102T000000Z")
+        self.config.health_latest_json_path.parent.rmdir()
+
+        report = prune_health_history(
+            self.config,
+            now=datetime(2026, 8, 12, tzinfo=timezone.utc).timestamp(),
+        ).as_dict()
+
+        self.assertEqual("pruned", report["status"])
+        self.assertFalse(old_log.exists())
+        self.assertTrue(newest_log.exists())
 
     def test_health_retention_fails_closed_on_unsafe_name_or_symlink(self) -> None:
         latest = self.config.health_latest_json_path

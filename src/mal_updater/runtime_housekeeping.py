@@ -11,6 +11,7 @@ from typing import Any
 from .config import AppConfig
 
 _HEALTH_HISTORY_NAME = re.compile(r"^health-check-(\d{8}T\d{6}Z)\.json$")
+_HEALTH_LOG_NAME = re.compile(r"^health-check-(\d{8}T\d{6}Z)\.log$")
 _LATEST_HEALTH_NAME = "latest-health-check.json"
 
 
@@ -72,22 +73,27 @@ def prune_health_history(config: AppConfig, *, now: float | None = None) -> Hous
         "deleted_bytes": 0,
         "remaining_count": 0,
         "remaining_bytes": 0,
+        "snapshot_deleted_count": 0,
+        "snapshot_remaining_count": 0,
+        "log_deleted_count": 0,
+        "log_remaining_count": 0,
         "latest_preserved": True,
     }
     try:
         directory_stat = os.lstat(health_dir)
     except FileNotFoundError:
-        return HousekeepingReport({**base, "status": "no_change", "reason": "health_directory_missing"})
+        entries: list[os.DirEntry[str]] = []
     except OSError as exc:
         return HousekeepingReport({**base, "status": "blocked", "reason": "health_directory_stat_failed", "error_type": type(exc).__name__})
-    if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
-        return HousekeepingReport({**base, "status": "blocked", "reason": "unsafe_health_directory"})
+    else:
+        if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+            return HousekeepingReport({**base, "status": "blocked", "reason": "unsafe_health_directory"})
+        try:
+            entries = list(os.scandir(health_dir))
+        except OSError as exc:
+            return HousekeepingReport({**base, "status": "blocked", "reason": "health_directory_scan_failed", "error_type": type(exc).__name__})
 
-    candidates: list[tuple[float, str, Path, int]] = []
-    try:
-        entries = list(os.scandir(health_dir))
-    except OSError as exc:
-        return HousekeepingReport({**base, "status": "blocked", "reason": "health_directory_scan_failed", "error_type": type(exc).__name__})
+    snapshot_candidates: list[tuple[float, str, Path, int]] = []
     for entry in entries:
         if entry.name == _LATEST_HEALTH_NAME:
             try:
@@ -110,18 +116,66 @@ def prune_health_history(config: AppConfig, *, now: float | None = None) -> Hous
             timestamp = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
         except ValueError:
             return HousekeepingReport({**base, "status": "blocked", "reason": "unsafe_health_history_timestamp"})
-        candidates.append((timestamp, entry.name, Path(entry.path), max(0, int(entry_stat.st_size))))
+        snapshot_candidates.append((timestamp, entry.name, Path(entry.path), max(0, int(entry_stat.st_size))))
 
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    log_dir = config.state_dir / "logs"
+    try:
+        log_directory_stat = os.lstat(log_dir)
+    except FileNotFoundError:
+        log_entries: list[os.DirEntry[str]] = []
+    except OSError as exc:
+        return HousekeepingReport({**base, "status": "blocked", "reason": "health_log_directory_stat_failed", "error_type": type(exc).__name__})
+    else:
+        if stat.S_ISLNK(log_directory_stat.st_mode) or not stat.S_ISDIR(log_directory_stat.st_mode):
+            return HousekeepingReport({**base, "status": "blocked", "reason": "unsafe_health_log_directory"})
+        try:
+            log_entries = list(os.scandir(log_dir))
+        except OSError as exc:
+            return HousekeepingReport({**base, "status": "blocked", "reason": "health_log_directory_scan_failed", "error_type": type(exc).__name__})
+
+    log_candidates: list[tuple[float, str, Path, int]] = []
+    for entry in log_entries:
+        match = _HEALTH_LOG_NAME.fullmatch(entry.name)
+        if match is None:
+            continue
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            return HousekeepingReport({**base, "status": "blocked", "reason": "health_log_stat_failed", "error_type": type(exc).__name__})
+        if entry.is_symlink() or not stat.S_ISREG(entry_stat.st_mode):
+            return HousekeepingReport({**base, "status": "blocked", "reason": "unsafe_health_log_entry"})
+        try:
+            timestamp = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return HousekeepingReport({**base, "status": "blocked", "reason": "unsafe_health_log_timestamp"})
+        log_candidates.append((timestamp, entry.name, Path(entry.path), max(0, int(entry_stat.st_size))))
+
+    snapshot_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    log_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    candidates = [*snapshot_candidates, *log_candidates]
     base["scanned_count"] = len(candidates)
     base["scanned_bytes"] = sum(item[3] for item in candidates)
     cutoff = current - retention_days * 86_400
-    protected_names = {item[1] for item in candidates[:min_count]}
-    eligible = [item for item in reversed(candidates) if item[0] < cutoff and item[1] not in protected_names]
+    snapshot_protected_names = {item[1] for item in snapshot_candidates[:min_count]}
+    log_protected_names = {item[1] for item in log_candidates[:min_count]}
+    snapshot_eligible = [item for item in reversed(snapshot_candidates) if item[0] < cutoff and item[1] not in snapshot_protected_names]
+    log_eligible = [item for item in reversed(log_candidates) if item[0] < cutoff and item[1] not in log_protected_names]
+    # Preserve the configured per-run deletion bound while allowing both
+    # families to make progress when an old snapshot and log backlog coexist.
+    eligible: list[tuple[float, str, Path, int]] = []
+    for index in range(max(len(snapshot_eligible), len(log_eligible))):
+        if index < len(snapshot_eligible):
+            eligible.append(snapshot_eligible[index])
+        if index < len(log_eligible):
+            eligible.append(log_eligible[index])
     base["eligible_count"] = len(eligible)
     base["eligible_bytes"] = sum(item[3] for item in eligible)
     deleted: list[tuple[float, str, Path, int]] = []
+    snapshot_deleted: list[tuple[float, str, Path, int]] = []
+    log_deleted: list[tuple[float, str, Path, int]] = []
     for item in eligible[:batch_size]:
+        is_snapshot = item in snapshot_eligible
+        family = "snapshot" if is_snapshot else "log"
         try:
             item[2].unlink()
         except OSError as exc:
@@ -129,14 +183,17 @@ def prune_health_history(config: AppConfig, *, now: float | None = None) -> Hous
             return HousekeepingReport({
                 **base,
                 "status": "blocked",
-                "reason": "health_history_delete_failed",
+                "reason": f"health_{family}_delete_failed",
                 "error_type": type(exc).__name__,
                 "deleted_count": len(deleted),
                 "deleted_bytes": sum(candidate[3] for candidate in deleted),
+                "snapshot_deleted_count": len(snapshot_deleted),
+                "log_deleted_count": len(log_deleted),
                 "remaining_count": len(remaining),
                 "remaining_bytes": sum(candidate[3] for candidate in remaining),
             })
         deleted.append(item)
+        (snapshot_deleted if is_snapshot else log_deleted).append(item)
     remaining = [candidate for candidate in candidates if candidate not in deleted]
     return HousekeepingReport({
         **base,
@@ -145,6 +202,12 @@ def prune_health_history(config: AppConfig, *, now: float | None = None) -> Hous
         "deleted_bytes": sum(item[3] for item in deleted),
         "remaining_count": len(remaining),
         "remaining_bytes": sum(item[3] for item in remaining),
+        "snapshot_deleted_count": len(snapshot_deleted),
+        "snapshot_remaining_count": len(snapshot_candidates) - len(snapshot_deleted),
+        "snapshot_remaining_eligible_count": max(0, len(snapshot_eligible) - len(snapshot_deleted)),
+        "log_deleted_count": len(log_deleted),
+        "log_remaining_count": len(log_candidates) - len(log_deleted),
+        "log_remaining_eligible_count": max(0, len(log_eligible) - len(log_deleted)),
         "remaining_eligible_count": max(0, len(eligible) - len(deleted)),
     })
 

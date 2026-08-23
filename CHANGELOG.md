@@ -17,6 +17,11 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Tightened stale-running diagnostics so only an explicit released lease or elapsed timeout is terminal evidence.
 - Expanded MAL/provider pacing, cache, ingestion, planner, migration, and validation coverage; nullable optional MAL detail containers remain accepted while missing/malformed requested fields fail closed.
 
+### Fixed
+
+- Extended bounded health-history housekeeping to timestamped hourly health-check logs while preserving the configured recent floor and ignoring unrelated logs, backups, and runtime data.
+- Derived health snapshot/log file-count review thresholds from the configured health cadence and retention window instead of fixed limits below the normal 90-day hourly volume.
+
 ### Release status
 
 - These changes are unreleased and intentionally remain versioned as 0.2.9 in the dirty source tree. Existing 0.2.9 wheels, source archives, release bundles, and container images do **not** contain them; no publication or container-pin change is implied.

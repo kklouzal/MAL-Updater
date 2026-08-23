@@ -387,6 +387,47 @@ class RuntimeRetentionAuditTests(unittest.TestCase):
             self.assertNotIn("command", candidates[0])
             self.assertEqual(POLICY_MARKER, candidates[0]["policy"])
 
+    def test_health_file_count_thresholds_follow_configured_hourly_retention(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mal-runtime-audit-health-retention-", dir="/tmp") as td:
+            root = Path(td)
+            project_root = root / "repo"
+            workspace_root = root / "workspace"
+            runtime_root = project_root / ".MAL-Updater"
+            project_root.mkdir(parents=True)
+            workspace_root.mkdir(parents=True)
+            _create_expected_top_level(runtime_root)
+            config = _load_temp_config(project_root, workspace_root, runtime_root)
+            config.service.health_every_seconds = 60 * 60
+            config.service.health_history_retention_days = 90
+            config.service.health_history_min_count = 168
+            config.service.service_log_retained_generations = 5
+
+            payload = build_runtime_retention_audit_payload(config)
+
+            snapshots = payload["families"]["health_snapshots"]
+            logs = payload["families"]["state_logs"]
+            self.assertEqual(2163, snapshots["warning_thresholds"]["file_count"])
+            self.assertEqual(2168, logs["warning_thresholds"]["file_count"])
+
+    def test_explicit_file_count_override_still_applies_to_health_families(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mal-runtime-audit-health-override-", dir="/tmp") as td:
+            root = Path(td)
+            project_root = root / "repo"
+            workspace_root = root / "workspace"
+            runtime_root = project_root / ".MAL-Updater"
+            project_root.mkdir(parents=True)
+            workspace_root.mkdir(parents=True)
+            _create_expected_top_level(runtime_root)
+            config = _load_temp_config(project_root, workspace_root, runtime_root)
+
+            payload = build_runtime_retention_audit_payload(
+                config,
+                AuditOptions(warning_threshold_overrides=WarningThresholds(file_count=7)),
+            )
+
+            self.assertEqual(7, payload["families"]["health_snapshots"]["warning_thresholds"]["file_count"])
+            self.assertEqual(7, payload["families"]["state_logs"]["warning_thresholds"]["file_count"])
+
     def test_summary_output_is_stable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mal-runtime-audit-summary-", dir="/tmp") as td:
             root = Path(td)
