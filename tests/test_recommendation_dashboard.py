@@ -345,7 +345,8 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertNotIn(">Identity/review/catalog<", html)
         self.assertNotIn(">Evidence freshness/expiry<", html)
         self.assertIn('data-key="score" data-type="number" aria-sort="none"', html)
-        self.assertIn('data-key="title" data-sort-value="The Great Show (A &lt;Great&gt; Show (English Dub))"', html)
+        self.assertIn('data-key="title" data-sort-value="The Great Show"', html)
+        self.assertNotIn("The Great Show (A &lt;Great&gt; Show", html)
         self.assertIn('<span class="title-text">The Great Show', html)
         self.assertRegex(
             html,
@@ -1597,7 +1598,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         html = render_dynamic_dashboard_html()
 
         self.assertIn("const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'", html)
-        progress_headings = "['Priority', 'Title', 'Image', 'Watched episodes / total episodes', 'Why recommended', 'Genres']"
+        progress_headings = "['Priority', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']"
         ordinary_headings = "['Priority', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']"
         self.assertIn(progress_headings, html)
         self.assertIn(ordinary_headings, html)
@@ -1730,7 +1731,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                     "provider_series_id": "hi-progress",
                     "title": "Progress Show",
                     "priority": 80,
-                    "context": {"completed_episode_count": 4, "max_episode_number": 6},
+                    "context": {"completed_episode_count": 4, "provider_series_episode_count": 6, "max_episode_number": 5},
                 }],
                 run_id="run-progress",
                 generated_at="2026-08-22T00:00:00Z",
@@ -1830,7 +1831,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual("4.3/5", badges["hidive"]["star_rating"])
             self.assertEqual("TV-MA", badges["hidive"]["maturity_rating"])
 
-    def test_dashboard_progress_is_unknown_without_cross_source_mixing(self) -> None:
+    def test_dashboard_progress_uses_provider_completed_with_mal_total_and_rejects_observed_provider_max(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
             bootstrap_database(db_path)
@@ -1843,7 +1844,12 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "provider_series_id": "provider-partial",
                         "title": "Provider Partial",
                         "priority": 80,
-                        "context": {"completed_episode_count": 4, "mal_num_episodes": 12},
+                        "context": {
+                            "completed_episode_count": 4,
+                            "max_episode_number": 5,
+                            "mal_num_episodes_watched": 7,
+                            "mal_num_episodes": 12,
+                        },
                     },
                     {
                         "kind": "resume_backlog",
@@ -1851,7 +1857,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "provider_series_id": "unknown-progress",
                         "title": "Unknown Progress",
                         "priority": 70,
-                        "context": {},
+                        "context": {"completed_episode_count": 10, "max_episode_number": 11},
                     },
                 ],
                 run_id="run-unknown-progress",
@@ -1860,8 +1866,52 @@ class RecommendationDashboardTests(unittest.TestCase):
 
             sections = build_dashboard_payload(db_path)["recommendations"]["sections"]
 
-            self.assertEqual("4/?", sections["new_dubbed_episode"][0]["watched_progress"])
-            self.assertEqual("?/?", sections["resume_backlog"][0]["watched_progress"])
+            self.assertEqual("4/12", sections["new_dubbed_episode"][0]["watched_progress"])
+            self.assertEqual("10/?", sections["resume_backlog"][0]["watched_progress"])
+            self.assertNotEqual("10/11", sections["resume_backlog"][0]["watched_progress"])
+
+    def test_dashboard_uses_provider_catalog_series_total_and_cleans_snapshot_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_series (provider, provider_series_id, title, season_title, raw_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "crunchyroll",
+                        "live-shaped",
+                        "Berserk (2016)",
+                        "Berserk (English Dub)",
+                        json.dumps({"raw": {"series_metadata": {"episode_count": 24}}}),
+                    ),
+                )
+                conn.commit()
+            insert_recommendation_snapshot_rows(
+                db_path,
+                [{
+                    "kind": "resume_backlog",
+                    "provider": "crunchyroll",
+                    "provider_series_id": "live-shaped",
+                    "title": "Berserk",
+                    "priority": 70,
+                    "context": {
+                        "english_title": "Berserk (2016)",
+                        "completed_episode_count": 10,
+                        "max_episode_number": 11,
+                    },
+                }],
+                run_id="run-live-shaped",
+                generated_at="2026-08-22T00:00:00Z",
+            )
+
+            row = build_dashboard_payload(db_path)["recommendations"]["sections"]["resume_backlog"][0]
+
+            self.assertEqual("Berserk (2016)", row["display_title"])
+            self.assertNotEqual("Berserk (2016) (Berserk)", row["display_title"])
+            self.assertEqual("10/24", row["watched_progress"])
 
     def test_live_dashboard_nested_operational_counts_render_without_object_stringification(self) -> None:
         html = render_dynamic_dashboard_html()
@@ -1877,6 +1927,10 @@ class RecommendationDashboardTests(unittest.TestCase):
             bootstrap_database(db_path)
             html = render_dynamic_dashboard_html()
             debug_html = render_dynamic_debug_html(settings_href="/settings")
+            self.assertIn('<link rel="icon" href="/favicon.svg" type="image/svg+xml">', html)
+            self.assertIn('<link rel="icon" href="/favicon.svg" type="image/svg+xml">', debug_html)
+            self.assertIn("['Priority', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']", html)
+            self.assertNotIn("Watched episodes / total episodes", html)
             self.assertIn("/api/dashboard", html)
             self.assertIn("Recommendations", html)
             self.assertIn("Top watched seeds", html)
@@ -1919,6 +1973,9 @@ class RecommendationDashboardTests(unittest.TestCase):
             try:
                 root = urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=5).read().decode("utf-8")
                 debug = urlopen(f"http://127.0.0.1:{server.server_port}/debug", timeout=5).read().decode("utf-8")
+                with urlopen(f"http://127.0.0.1:{server.server_port}/favicon.svg", timeout=5) as response:
+                    favicon = response.read().decode("utf-8")
+                    favicon_type = response.headers["Content-Type"]
                 api = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard", timeout=5).read().decode("utf-8"))
                 override = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=3", timeout=5).read().decode("utf-8"))
                 invalid = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?limit=not-an-int", timeout=5).read().decode("utf-8"))
@@ -1931,6 +1988,8 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertIn("MAL-Updater live dashboard", root)
             self.assertNotIn("Provider enrichment health", root)
             self.assertIn("MAL-Updater debug", debug)
+            self.assertEqual("image/svg+xml", favicon_type)
+            self.assertIn("<svg", favicon)
             self.assertIn("Provider enrichment health", debug)
             self.assertIn("snapshot", api)
             self.assertEqual(

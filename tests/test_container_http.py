@@ -37,6 +37,9 @@ class HttpTests(unittest.TestCase):
   with urllib.request.urlopen(self.base+'/debug',timeout=5) as r:
    debug_html=r.read().decode(); self.assertEqual('no-store',r.headers['Cache-Control']); self.assertEqual('DENY',r.headers['X-Frame-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
   self.assertIn('MAL-Updater debug',debug_html); self.assertIn('<h2>Indicators</h2>',debug_html); self.assertIn('Snapshot',debug_html); self.assertIn('Provider enrichment health',debug_html); self.assertIn('Recent provider sync runs',debug_html); self.assertIn('href="/"',debug_html); self.assertIn('href="/settings"',debug_html)
+  with urllib.request.urlopen(self.base+'/favicon.svg',timeout=5) as r:
+   favicon=r.read().decode(); self.assertEqual('image/svg+xml',r.headers['Content-Type']); self.assertEqual('nosniff',r.headers['X-Content-Type-Options'])
+  self.assertIn('<svg',favicon)
   response,dashboard=self.get_json('/api/dashboard')
   self.assertIn('recommendations',dashboard); self.assertEqual('no-store',response.headers['Cache-Control']); self.assertEqual('DENY',response.headers['X-Frame-Options'])
   enrichment=dashboard['operational']['provider_enrichment']
