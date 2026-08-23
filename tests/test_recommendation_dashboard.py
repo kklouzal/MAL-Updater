@@ -1605,13 +1605,18 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn('<td>${esc(r.priority ?? r.score)}</td><th scope="row">', html)
         self.assertIn('</div></th><td>${image}</td>${details}${action}</tr>', html)
         self.assertIn('class="recommendation-art"', html)
-        self.assertIn('class="provider-rating"', html)
+        self.assertIn('class="provider-star-rating"', html)
+        self.assertIn('class="provider-maturity-rating"', html)
+        self.assertIn("b.star_rating", html)
+        self.assertIn("b.maturity_rating", html)
         self.assertIn('alt="${esc(`${rawTitle} cover art`)}"', html)
         self.assertNotIn('alt=""', html)
         self.assertIn('No cover art available', html)
         self.assertIn('.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;', html)
         self.assertNotIn('object-fit:cover', html)
-        self.assertIn('${esc(provider)} rating: ${esc(b.rating)}', html)
+        self.assertIn('${esc(provider)} user rating: ${esc(b.star_rating)}', html)
+        self.assertIn('Maturity: ${esc(b.maturity_rating)}', html)
+        self.assertNotIn("b.rating", html)
         self.assertNotIn("Identity/review/catalog", html)
         self.assertNotIn("Freshness/expiry", html)
         self.assertNotIn("r.verification || e.verification_label", html)
@@ -1713,7 +1718,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             html,
         )
 
-    def test_dashboard_overlays_provider_art_rating_link_and_episode_progress(self) -> None:
+    def test_dashboard_overlays_provider_art_maturity_link_and_episode_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
             bootstrap_database(db_path)
@@ -1753,11 +1758,13 @@ class RecommendationDashboardTests(unittest.TestCase):
 
             self.assertEqual("4/6", row["watched_progress"])
             self.assertEqual("https://example.test/progress.jpg", row["image_url"])
-            self.assertEqual({"hidive": "TV-14"}, row["provider_ratings"])
+            self.assertEqual({}, row["provider_star_ratings"])
+            self.assertEqual({"hidive": "TV-14"}, row["provider_maturity_ratings"])
             self.assertEqual("https://www.hidive.com/season/progress-show", row["provider_badges"][0]["url"])
-            self.assertEqual("TV-14", row["provider_badges"][0]["rating"])
+            self.assertEqual("TV-14", row["provider_badges"][0]["maturity_rating"])
+            self.assertNotIn("star_rating", row["provider_badges"][0])
 
-    def test_dashboard_keeps_provider_ratings_bound_to_each_stored_provider_link(self) -> None:
+    def test_dashboard_keeps_provider_star_and_maturity_ratings_bound_to_each_stored_provider_link(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
             bootstrap_database(db_path)
@@ -1795,7 +1802,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 provider_series_id="cr-multi-rating",
                 provider_title="Multi Rating Show",
                 provider_url="https://www.crunchyroll.com/series/cr-multi-rating",
-                source_evidence={"match": {"raw": {"series_metadata": {"maturity_ratings": ["TV-14"]}}}},
+                source_evidence={"match": {"raw": {"star_rating": 4.8, "series_metadata": {"maturity_ratings": ["TV-14"]}}}},
                 fetched_at="2026-08-22T00:00:00Z",
                 expires_at="2099-01-01T00:00:00Z",
             )
@@ -1806,7 +1813,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 provider_series_id="hi-multi-rating",
                 provider_title="Multi Rating Show",
                 provider_url="https://www.hidive.com/season/hi-multi-rating",
-                source_evidence={"match": {"raw": {"ratings": {"US": ["TV-MA"]}}}},
+                source_evidence={"match": {"raw": {"user_rating": "4.3/5", "ratings": {"US": ["TV-MA"]}}}},
                 fetched_at="2026-08-22T00:00:00Z",
                 expires_at="2099-01-01T00:00:00Z",
             )
@@ -1814,11 +1821,14 @@ class RecommendationDashboardTests(unittest.TestCase):
             row = build_dashboard_payload(db_path)["recommendations"]["sections"]["discovery_available_now"][0]
             badges = {badge["provider"]: badge for badge in row["provider_badges"]}
 
-            self.assertEqual({"crunchyroll": "TV-14", "hidive": "TV-MA"}, row["provider_ratings"])
+            self.assertEqual({"crunchyroll": "4.8", "hidive": "4.3/5"}, row["provider_star_ratings"])
+            self.assertEqual({"crunchyroll": "TV-14", "hidive": "TV-MA"}, row["provider_maturity_ratings"])
             self.assertEqual("https://www.crunchyroll.com/series/cr-multi-rating", badges["crunchyroll"]["url"])
-            self.assertEqual("TV-14", badges["crunchyroll"]["rating"])
+            self.assertEqual("4.8", badges["crunchyroll"]["star_rating"])
+            self.assertEqual("TV-14", badges["crunchyroll"]["maturity_rating"])
             self.assertEqual("https://www.hidive.com/season/hi-multi-rating", badges["hidive"]["url"])
-            self.assertEqual("TV-MA", badges["hidive"]["rating"])
+            self.assertEqual("4.3/5", badges["hidive"]["star_rating"])
+            self.assertEqual("TV-MA", badges["hidive"]["maturity_rating"])
 
     def test_dashboard_progress_is_unknown_without_cross_source_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
