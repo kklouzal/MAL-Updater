@@ -1952,32 +1952,6 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
         last_run = float(task_state.get("last_run_epoch", 0))
         planned_fetch_mode, planned_full_refresh_reasons, health_request = _planned_fetch_mode(config, spec, task_state, now=now)
         health_requested_run = isinstance(health_request, dict)
-        if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) > 0:
-            required_providers = _available_source_providers(config)
-            missing_fresh_fetches = [
-                provider for provider in required_providers if provider not in provider_fetch_success_this_cycle
-            ]
-            if missing_fresh_fetches:
-                task_state.update(
-                    {
-                        "last_status": "skipped",
-                        "execution_state": "idle",
-                        "last_skip_reason": "same_cycle_provider_fetch_required",
-                        "same_cycle_provider_fetch_required": required_providers,
-                        "same_cycle_provider_fetch_missing": missing_fresh_fetches,
-                    }
-                )
-                _set_task_next_due(task_state, base_epoch=now, every_seconds=min(60, max(5, int(spec.every_seconds))))
-                results.append(
-                    {
-                        "task": spec.name,
-                        "status": "skipped",
-                        "reason": "same_cycle_provider_fetch_required",
-                        "required_providers": required_providers,
-                        "missing_providers": missing_fresh_fetches,
-                    }
-                )
-                continue
         if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) <= 0:
             # Manual `apply-sync --limit 0` retains its explicit full-scan
             # meaning. In unattended service config, zero is a hard disable so
@@ -2021,6 +1995,32 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
         if now - last_run < spec.every_seconds and not health_requested_run:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
+        if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) > 0:
+            required_providers = _available_source_providers(config)
+            missing_fresh_fetches = [
+                provider for provider in required_providers if provider not in provider_fetch_success_this_cycle
+            ]
+            if missing_fresh_fetches:
+                task_state.update(
+                    {
+                        "last_status": "skipped",
+                        "execution_state": "idle",
+                        "last_skip_reason": "same_cycle_provider_fetch_required",
+                        "same_cycle_provider_fetch_required": required_providers,
+                        "same_cycle_provider_fetch_missing": missing_fresh_fetches,
+                    }
+                )
+                _set_task_next_due(task_state, base_epoch=now, every_seconds=min(60, max(5, int(spec.every_seconds))))
+                results.append(
+                    {
+                        "task": spec.name,
+                        "status": "skipped",
+                        "reason": "same_cycle_provider_fetch_required",
+                        "required_providers": required_providers,
+                        "missing_providers": missing_fresh_fetches,
+                    }
+                )
+                continue
         _maybe_reset_task_projection_state_for_signature(config, spec, task_state, fetch_mode=planned_fetch_mode)
         backoff_until_epoch = float(task_state.get("budget_backoff_until_epoch", 0))
         if backoff_until_epoch > now:

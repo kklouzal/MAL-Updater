@@ -618,7 +618,35 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             _apply_sync_command(self.config),
         )
 
-    def test_enabled_sync_apply_requires_successful_same_cycle_provider_fetch(self) -> None:
+    def test_successful_not_due_sync_apply_preserves_status_and_cadence(self) -> None:
+        self.config.service.sync_every_seconds = 3600
+        self.config.service.task_execute_limits["sync_apply"] = 2
+        last_run = time.time() - 60
+        self.config.service_state_path.write_text(
+            json.dumps({"started_at": "2026-03-20T20:00:00Z", "tasks": {
+                "sync_apply": {
+                    "last_run_epoch": last_run,
+                    "last_run_at": "2026-03-20T20:00:00Z",
+                    "last_status": "ok",
+                },
+            }}), encoding="utf-8",
+        )
+
+        with patch(
+            "mal_updater.service_runtime._task_specs",
+            return_value=[TaskSpec("sync_apply", 3600, "mal")],
+        ), patch("mal_updater.service_runtime._run_subprocess") as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        self.assertFalse(any(item["task"] == "sync_apply" for item in result["results"]))
+        run_subprocess.assert_not_called()
+        apply_state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_apply"]
+        self.assertEqual("ok", apply_state["last_status"])
+        self.assertEqual(last_run, apply_state["last_run_epoch"])
+        self.assertEqual(last_run + 3600, apply_state["next_due_epoch"])
+        self.assertNotIn("last_skip_reason", apply_state)
+
+    def test_due_sync_apply_is_skipped_when_required_provider_fetch_fails(self) -> None:
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
         self.config.service.mal_refresh_every_seconds = 3600
@@ -648,6 +676,45 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
         self.assertEqual("same_cycle_provider_fetch_required", apply_result["reason"])
         self.assertEqual(["crunchyroll"], apply_result["missing_providers"])
         self.assertFalse(any(call.kwargs.get("label") == "sync_apply" for call in run_subprocess.call_args_list))
+
+    def test_due_sync_apply_runs_after_required_provider_fetch_succeeds(self) -> None:
+        self.config.service.sync_every_seconds = 60
+        self.config.service.task_execute_limits["sync_apply"] = 2
+        self.config.service_state_path.write_text(
+            json.dumps({"started_at": "2026-03-20T20:00:00Z", "tasks": {
+                "sync_fetch_crunchyroll": {"last_run_epoch": 0},
+                "sync_apply": {"last_run_epoch": 0},
+            }}), encoding="utf-8",
+        )
+
+        with patch(
+            "mal_updater.service_runtime._task_specs",
+            return_value=[
+                TaskSpec("sync_fetch_crunchyroll", 60, "crunchyroll"),
+                TaskSpec("sync_apply", 60, "mal"),
+            ],
+        ), patch(
+            "mal_updater.service_runtime._budget_gate",
+            side_effect=[
+                (True, None, {"provider": "crunchyroll"}),
+                (True, None, {"provider": "mal"}),
+            ],
+        ), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            side_effect=[
+                {"status": "ok", "label": "sync_fetch_crunchyroll", "returncode": 0, "stdout": "", "stderr": ""},
+                {"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+            ],
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual("ok", apply_result["status"])
+        self.assertEqual(2, apply_result["apply_limit"])
+        self.assertEqual(
+            ["sync_fetch_crunchyroll", "sync_apply"],
+            [call.kwargs.get("label") for call in run_subprocess.call_args_list],
+        )
 
     def test_zero_sync_apply_limit_disables_unattended_execution(self) -> None:
         self.config.service.sync_every_seconds = 0
