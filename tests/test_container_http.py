@@ -48,12 +48,32 @@ class HttpTests(unittest.TestCase):
   self.assertIn('Trusted LAN control plane',settings_html); self.assertIn('aria-live',settings_html); self.assertIn('href="/"',settings_html); self.assertNotIn('Claim installation',settings_html); self.assertNotIn('Sign in',settings_html)
   self.assertNotIn('Enable automation',settings_html); self.assertNotIn('Disable automation',settings_html); self.assertNotIn('/api/daemon',settings_html)
   self.assertIn("api('/api/status')",settings_html)
+  self.assertIn('id="settingsForm"',settings_html); self.assertIn('Operational limits',settings_html); self.assertIn('Restart required',settings_html)
+  self.assertIn("api('/api/settings',values)",settings_html); self.assertIn("input.type='number'",settings_html)
  def test_mutations_use_bootstrap_csrf(self):
   _,settings=self.get_json('/api/settings'); self.assertNotIn('claimed',settings)
   _,csrf_payload=self.get_json('/api/csrf'); csrf=csrf_payload['csrf_token']
   _,j=post(self.base+'/api/connections/test',{'kind':'mal'},csrf,self.base)
   self.assertEqual('Connection succeeded',j['message']); self.assertNotIn('mock ok',json.dumps(j)); self.assertEqual([('mal',10)],self.calls)
   self.assertFalse((self.config.secrets_dir/'container_auth.json').exists())
+ def test_settings_api_returns_effective_values_and_saves_allowlisted_limits(self):
+  _,before=self.get_json('/api/settings')
+  self.assertEqual(180,before['settings']['service']['crunchyroll_hourly_limit'])
+  self.assertTrue(any(item['path']=='service.task_execute_limits.sync_apply' for item in before['settings_schema']))
+  self.assertNotIn('settings_path',json.dumps(before)); self.assertNotIn('client_secret =',json.dumps(before))
+  _,saved=post(self.base+'/api/settings',{
+   'service.crunchyroll_hourly_limit':77,
+   'service.task_execute_limits.sync_apply':3,
+   'hidive.request_spacing_seconds':6.5,
+  },self.store.csrf_token,self.base)
+  self.assertEqual(77,saved['settings']['service']['crunchyroll_hourly_limit'])
+  self.assertEqual(3,saved['settings']['service']['task_execute_limits']['sync_apply'])
+  self.assertEqual(6.5,saved['settings']['hidive']['request_spacing_seconds'])
+  self.assertTrue(saved['restart_required'])
+  persisted=load_config(ROOT)
+  self.assertEqual(77,persisted.service.crunchyroll_hourly_limit); self.assertEqual(3,persisted.service.task_execute_limits['sync_apply'])
+  bad=self.http_error(urllib.request.Request(self.base+'/api/settings',data=b'{"service.mal_hourly_limit":true}',headers={'Content-Type':'application/json','X-CSRF-Token':self.store.csrf_token},method='POST'))
+  self.assertEqual(400,bad.code)
  def test_readiness_requires_mal_setup_and_running_scheduler(self):
   error=self.http_error(self.base+'/readyz'); self.assertEqual(503,error.code)
   self.store.save_secrets({'mal_client_id':'fake-client'})

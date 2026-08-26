@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, tempfile, unittest
+import json, math, os, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 from mal_updater.config import ensure_directories, load_config
@@ -32,6 +32,62 @@ class ContainerWebTests(unittest.TestCase):
         self.assertTrue(status["secrets_present"]["mal_client_id"]); self.assertNotIn("fake-client",json.dumps(status)); self.assertNotIn("claimed",status); self.assertEqual(0o600,(self.config.secrets_dir/"mal_client_id.txt").stat().st_mode&0o777)
         with self.assertRaises(ValueError): self.store.save_settings({"arbitrary_toml":"evil"})
         with self.assertRaises(ValueError): self.store.save_settings({"crunchyroll_enabled":True})
+
+    def test_settings_roundtrip_preserves_unrelated_toml_and_reports_restart(self):
+        self.config.settings_path.write_text(
+            '# operator preface\nrequest_timeout_seconds = 20.0  # keep timeout note\n\n'
+            '[service]\ncrunchyroll_hourly_limit = 180  # keep budget note\n\n'
+            '[unrelated]\nlabel = "DO-NOT-LEAK-OR-CLOBBER"\n',
+            encoding="utf-8",
+        )
+        self.store.save_settings({
+            "request_timeout_seconds": 12.5,
+            "service": {
+                "crunchyroll_hourly_limit": 91,
+                "provider_hourly_limits": {"hidive": 33},
+                "task_execute_limits": {
+                    "sync_apply": 4,
+                    "recommend_provider_eligibility_search_results": 7,
+                },
+            },
+            "mal.request_spacing_seconds": 1.25,
+        })
+        text = self.config.settings_path.read_text(encoding="utf-8")
+        self.assertIn("# operator preface", text)
+        self.assertIn("request_timeout_seconds = 12.5  # keep timeout note", text)
+        self.assertIn("crunchyroll_hourly_limit = 91  # keep budget note", text)
+        self.assertIn('[unrelated]\nlabel = "DO-NOT-LEAK-OR-CLOBBER"', text)
+        self.assertIn("[service.provider_hourly_limits]\nhidive = 33", text)
+        loaded = load_config(self.config.project_root)
+        self.assertEqual(12.5, loaded.request_timeout_seconds)
+        self.assertEqual(91, loaded.service.crunchyroll_hourly_limit)
+        self.assertEqual(33, loaded.service.provider_hourly_limits["hidive"])
+        self.assertEqual(4, loaded.service.task_execute_limits["sync_apply"])
+        self.assertEqual(7, loaded.service.task_execute_limits["recommend_provider_eligibility_search_results"])
+        self.assertEqual(1.25, loaded.mal.request_spacing_seconds)
+        status = self.store.status()
+        self.assertEqual(91, status["settings"]["service"]["crunchyroll_hourly_limit"])
+        self.assertTrue(status["restart_required"])
+        self.assertNotIn("DO-NOT-LEAK-OR-CLOBBER", json.dumps(status))
+        self.assertNotIn(str(self.config.settings_path), json.dumps(status))
+
+    def test_settings_reject_types_ranges_nonfinite_and_unsafe_threshold_pair(self):
+        self.config.settings_path.write_text("[service]\nwarn_ratio = 0.8\ncritical_ratio = 0.95\n", encoding="utf-8")
+        original = self.config.settings_path.read_text(encoding="utf-8")
+        rejected = (
+            {"service.mal_hourly_limit": True},
+            {"service.mal_hourly_limit": 1.5},
+            {"service.mal_hourly_limit": -1},
+            {"service.mal_hourly_limit": 100_001},
+            {"mal.retry_max_attempts": 0},
+            {"request_timeout_seconds": math.inf},
+            {"service.unknown": 2},
+            {"service.warn_ratio": 0.96},
+        )
+        for payload in rejected:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.store.save_settings(payload)
+            self.assertEqual(original, self.config.settings_path.read_text(encoding="utf-8"))
 
     def test_provider_status_tracks_actual_credential_pairs_not_legacy_flags(self):
         self.store.state_path.write_text('{"crunchyroll_enabled":false,"hidive_enabled":true}\n', encoding="utf-8")
