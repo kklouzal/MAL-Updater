@@ -20,4 +20,4 @@ tomli==2.4.1; python_version < "3.11"
 pytest==9.1.1
 coverage==7.15.4
 ruff==0.16.2
-mypy==2.3.0
+mypy==2.3.1
