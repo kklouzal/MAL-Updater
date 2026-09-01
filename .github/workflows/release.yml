@@ -48,7 +48,7 @@ jobs:
           tar -czf "mal-updater-${GITHUB_REF_NAME}.tar.gz" release-bundle
           (cd dist && sha256sum *) > SHA256SUMS
           sha256sum "mal-updater-${GITHUB_REF_NAME}.tar.gz" >> SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'mal-updater-*.tar.gz'
       - uses: softprops/action-gh-release@v2
