@@ -9,7 +9,7 @@
 # Build backend / build frontend used by isolated package builds.
 setuptools==83.0.0
 wheel==0.47.0
-build==1.5.0
+build==1.6.0
 
 # Runtime direct dependencies constrained for CI and wheel smoke installs.
 requests==2.34.2
