@@ -1677,7 +1677,9 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn("hidden ? 'Unhide' : 'Hide'", html)
         self.assertIn("hidden-recommendation", html)
         self.assertIn("background:#29343d", html)
-        self.assertNotIn("background:#ff", html)
+        screen_css = html.split("@media print", 1)[0]
+        self.assertNotIn("hidden-recommendation:nth-child(even){background:#ff", screen_css)
+        self.assertNotIn("hidden-recommendation:hover{background:#ff", screen_css)
 
     def test_live_dashboard_hidden_identity_prefers_mal_then_canonical_provider_then_safe_fallback(self) -> None:
         html = render_dynamic_dashboard_html()
@@ -1925,6 +1927,42 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn("typeof value === 'object'", html)
         self.assertIn("${countValue(v)}", html)
         self.assertNotIn("${esc(v)}</div>", html)
+
+    def test_live_dashboard_pdf_export_uses_browser_print_with_intentional_print_layout(self) -> None:
+        html = render_dynamic_dashboard_html(settings_href="/settings")
+        debug_html = render_dynamic_debug_html(settings_href="/settings")
+
+        self.assertIn('<button type="button" id="export-pdf" class="export-pdf-button"', html)
+        self.assertIn('aria-label="Export dashboard as PDF using the browser print dialog"', html)
+        self.assertIn('title="Open the browser print dialog to save this dashboard as a PDF">Export PDF</button>', html)
+        self.assertIn('Dashboard report · Exported <time id="export-timestamp">when printed</time>', html)
+        self.assertIn('View: <span id="export-filter-summary">All genres · Hidden titles excluded</span>', html)
+        self.assertIn("function updateExportMetadata()", html)
+        self.assertIn("new Date().toISOString()", html)
+        self.assertIn("Genres: ${selectedGenres.join(', ')}", html)
+        self.assertIn("Hidden titles ${showHiddenTitles ? 'shown' : 'excluded'}", html)
+        self.assertIn("window.addEventListener('beforeprint', updateExportMetadata)", html)
+        self.assertIn("window.print();", html)
+        self.assertIn("@media print", html)
+        print_css = html.split("@media print", 1)[1].split("</style>", 1)[0]
+        self.assertIn("@page{size:landscape", print_css)
+        self.assertIn(".report-actions,.screen-intro,.recommendation-controls,.dashboard-interactive-only,.screen-only{display:none!important}", print_css)
+        self.assertIn("h2,h3{break-after:avoid}", print_css)
+        self.assertIn(".table-scroll{break-inside:avoid}", print_css)
+        self.assertIn("thead{display:table-header-group;break-inside:avoid;break-after:avoid}", print_css)
+        self.assertIn("tbody tr:first-child{break-before:avoid}", print_css)
+        self.assertIn(
+            "tbody tr,tbody tr:nth-child(even),tbody tr:hover,.table-scroll tbody tr.hidden-recommendation,"
+            ".table-scroll tbody tr.hidden-recommendation:nth-child(even),.table-scroll tbody tr.hidden-recommendation:hover"
+            "{background:#fff!important;color:#111!important}",
+            print_css,
+        )
+        self.assertIn("table-layout:fixed", print_css)
+        self.assertIn("overflow-wrap:anywhere", print_css)
+        self.assertIn('class="dashboard-interactive-only"', html)
+        self.assertNotIn("/api/pdf", html)
+        self.assertNotIn('id="export-pdf"', debug_html)
+        self.assertNotIn("window.print();", debug_html)
 
     def test_live_dashboard_html_and_json_handler(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

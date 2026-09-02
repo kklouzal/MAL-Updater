@@ -6,6 +6,7 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Added
 
+- Added an accessible **Export PDF** control to the live dashboard using the browser print/save-to-PDF flow, with print-only report timing and a readable presentation that omits navigation and interactive filtering/visibility controls.
 - Added bounded operational-limit controls to the trusted-LAN Settings page for hourly request budgets, per-run and pagination bounds, request pacing/retries, and learned-budget thresholds/backoff. Settings saves are strictly numeric/allowlisted, preserve unrelated TOML content and comments, and explicitly require a scheduler/container restart to apply.
 - Added durable final-anchor validation for resumable public MAL user-recommendation crawls (migration 024), including bounded progress when only one page may be fetched per invocation.
 - Added current-membership generations and account provenance for provider watchlists (migration 025), enabling conservative deactivation only after complete, account-proven full snapshots.

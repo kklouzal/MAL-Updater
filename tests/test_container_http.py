@@ -33,10 +33,10 @@ class HttpTests(unittest.TestCase):
   for path in ('/','/dashboard'):
    with urllib.request.urlopen(self.base+path,timeout=5) as r:
     html=r.read().decode(); self.assertEqual('nosniff',r.headers['X-Content-Type-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
-   self.assertIn('MAL-Updater live dashboard',html); self.assertIn('/api/dashboard',html); self.assertIn('href="/debug"',html); self.assertIn('href="/settings"',html); self.assertIn('id="genre-menu-trigger"',html); self.assertIn('Add genre filter',html); self.assertNotIn('<h2>Indicators</h2>',html); self.assertNotIn('Provider enrichment health',html); self.assertNotIn('Trusted LAN control plane',html)
+   self.assertIn('MAL-Updater live dashboard',html); self.assertIn('/api/dashboard',html); self.assertIn('href="/debug"',html); self.assertIn('href="/settings"',html); self.assertIn('id="export-pdf"',html); self.assertIn('window.print();',html); self.assertIn('@media print',html); self.assertIn('id="genre-menu-trigger"',html); self.assertIn('Add genre filter',html); self.assertNotIn('<h2>Indicators</h2>',html); self.assertNotIn('Provider enrichment health',html); self.assertNotIn('Trusted LAN control plane',html)
   with urllib.request.urlopen(self.base+'/debug',timeout=5) as r:
    debug_html=r.read().decode(); self.assertEqual('no-store',r.headers['Cache-Control']); self.assertEqual('DENY',r.headers['X-Frame-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
-  self.assertIn('MAL-Updater debug',debug_html); self.assertIn('<h2>Indicators</h2>',debug_html); self.assertIn('Snapshot',debug_html); self.assertIn('Provider enrichment health',debug_html); self.assertIn('Recent provider sync runs',debug_html); self.assertIn('href="/"',debug_html); self.assertIn('href="/settings"',debug_html)
+  self.assertIn('MAL-Updater debug',debug_html); self.assertIn('<h2>Indicators</h2>',debug_html); self.assertIn('Snapshot',debug_html); self.assertIn('Provider enrichment health',debug_html); self.assertIn('Recent provider sync runs',debug_html); self.assertIn('href="/"',debug_html); self.assertIn('href="/settings"',debug_html); self.assertNotIn('id="export-pdf"',debug_html)
   with urllib.request.urlopen(self.base+'/favicon.svg',timeout=5) as r:
    favicon=r.read().decode(); self.assertEqual('image/svg+xml',r.headers['Content-Type']); self.assertEqual('nosniff',r.headers['X-Content-Type-Options'])
   self.assertIn('<svg',favicon)

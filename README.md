@@ -15,7 +15,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
+Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Use **Export PDF** to open the browser print dialog, then choose the browser's **Save as PDF** destination to share the currently displayed dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
 
 The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.9`. For local development builds use:
 
