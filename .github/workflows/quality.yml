@@ -22,7 +22,7 @@ jobs:
       PIP_CONSTRAINT: ${{ github.workspace }}/constraints/ci.txt
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
