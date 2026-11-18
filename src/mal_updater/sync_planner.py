@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +15,7 @@ from .db import (
     get_series_mapping,
     list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
     reconcile_mal_user_state_after_write,
+    replace_mal_anime_relations,
     replace_review_queue_entries,
     upsert_series_mapping,
     upsert_watch_confirmation_provenance,
@@ -1063,6 +1064,7 @@ def build_dry_run_sync_plan(
     states = load_provider_series_states(config, limit=limit, provider=provider, split_seasons=True)
     client = MalClient(config, load_mal_secrets(config))
     proposals: list[SyncProposal] = []
+    proposal_states: list[ProviderSeriesState] = []
     # Keyed per provider series for confirmation provenance, which records the
     # most recently watched season (rank 0) of a season-split series.
     details_by_series: dict[tuple[str, str], dict[str, Any] | None] = {}
@@ -1094,6 +1096,7 @@ def build_dry_run_sync_plan(
                 provider_season_key=state.provider_season_key,
             )
             proposals.append(proposal)
+            proposal_states.append(state)
             if state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = None
             continue
@@ -1133,6 +1136,7 @@ def build_dry_run_sync_plan(
                 provider_season_key=state.provider_season_key,
             )
             proposals.append(proposal)
+            proposal_states.append(state)
             if state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = None
             continue
@@ -1160,23 +1164,43 @@ def build_dry_run_sync_plan(
                 provider_season_key=state.provider_season_key,
             )
             proposals.append(proposal)
+            proposal_states.append(state)
             if state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = None
             continue
-        proposal = _plan_status_update(
-            state,
-            detail,
-            mapping_status,
-            confidence,
-            mapping_source=mapping_source,
-            persisted_mapping_approved=approved,
-            extra_reasons=mapping_reasons,
+        units = (
+            _split_cour_units(
+                config,
+                client,
+                state,
+                _ApplyTarget(chosen_anime_id, mapping_source, confidence, mapping_reasons),
+                first_detail=detail if isinstance(detail, dict) else None,
+            )
+            if approved
+            else [(state, _ApplyTarget(chosen_anime_id, mapping_source, confidence, mapping_reasons))]
         )
-        proposals.append(proposal)
-        if state.season_unit_rank == 0:
-            details_by_series[(state.provider, state.provider_series_id)] = detail
+        for unit_state, unit_target in units:
+            assert unit_target.mal_anime_id is not None
+            unit_detail = detail
+            if unit_target.mal_anime_id != chosen_anime_id:
+                unit_detail, _ = _cached_detail(client, unit_target.mal_anime_id)
+                if unit_detail is None:
+                    continue
+            proposal = _plan_status_update(
+                unit_state,
+                unit_detail,
+                mapping_status,
+                confidence,
+                mapping_source=mapping_source,
+                persisted_mapping_approved=approved,
+                extra_reasons=unit_target.reasons,
+            )
+            proposals.append(proposal)
+            proposal_states.append(unit_state)
+            if unit_state.season_unit_rank == 0:
+                details_by_series[(state.provider, state.provider_series_id)] = unit_detail
     if provider in {None, "hidive"}:
-        coverage = _materialize_hidive_dry_run_confirmations(config, states, proposals, details_by_series)
+        coverage = _materialize_hidive_dry_run_confirmations(config, proposal_states, proposals, details_by_series)
         if not coverage["invariant_satisfied"]:
             raise RuntimeError("HIDIVE progress confirmation coverage invariant failed")
     return proposals
@@ -1201,7 +1225,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.1"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.2"
 SEASON_MAPPING_RETRY_SECONDS = 7 * 24 * 60 * 60
 _MAL_SYNC_DETAIL_FIELDS = "id,title,num_episodes,media_type,status,my_list_status,alternative_titles"
 
@@ -1212,6 +1236,66 @@ class _ApplyTarget:
     mapping_source: str | None
     confidence: float
     reasons: list[str]
+
+
+_SPLIT_COUR_MEDIA_TYPES = frozenset({"tv", "ona"})
+
+
+def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -> int | None:
+    """Return the single direct MAL sequel of an entry (relations cached locally)."""
+    with connect(config.db_path) as conn:
+        rows = conn.execute(
+            "SELECT related_mal_anime_id, relation_type FROM mal_anime_relations WHERE mal_anime_id = ?",
+            (int(mal_anime_id),),
+        ).fetchall()
+    if not rows:
+        try:
+            detail = client.get_anime_details(int(mal_anime_id), fields="id,related_anime")
+        except MalApiError:
+            return None
+        related = detail.get("related_anime") if isinstance(detail, dict) else None
+        relations = [
+            {
+                "related_mal_anime_id": int(entry["node"]["id"]),
+                "relation_type": str(entry["relation_type"]),
+                "relation_type_formatted": entry.get("relation_type_formatted"),
+                "related_title": entry["node"].get("title"),
+                "raw": entry,
+            }
+            for entry in related or []
+            if isinstance(entry, dict)
+            and isinstance(entry.get("node"), dict)
+            and isinstance(entry["node"].get("id"), int)
+            and isinstance(entry.get("relation_type"), str)
+        ]
+        if not relations:
+            return None
+        replace_mal_anime_relations(config.db_path, mal_anime_id=int(mal_anime_id), relations=relations)
+        rows = [(item["related_mal_anime_id"], item["relation_type"]) for item in relations]
+    sequels = {int(row[0]) for row in rows if row[1] == "sequel"}
+    return next(iter(sequels)) if len(sequels) == 1 else None
+
+
+def _split_cour_first_part(
+    config: AppConfig, client: MalClient, state: ProviderSeriesState, candidates: list[Any]
+) -> Any | None:
+    """Pick Part 1 when a provider season spans a MAL entry and its direct sequel.
+
+    Providers often publish a split-cour season as one season (e.g. 30
+    episodes) while MAL lists Part 1 and Part 2. Accept the first part only when
+    the top two candidates are prequel/sequel of each other, both are TV/ONA,
+    and the season's episode evidence exceeds Part 1 but fits both parts.
+    """
+    top = [candidate for candidate in candidates[:2] if candidate.media_type in _SPLIT_COUR_MEDIA_TYPES]
+    if len(top) != 2 or any(not candidate.num_episodes for candidate in top):
+        return None
+    evidence = max(int(state.max_episode_number or 0), state.completed_episode_count)
+    for first, second in (top, top[::-1]):
+        if _direct_sequel_id(config, client, first.mal_anime_id) != second.mal_anime_id:
+            continue
+        if int(first.num_episodes) < evidence <= int(first.num_episodes) + int(second.num_episodes):
+            return first
+    return None
 
 
 def _resolve_season_target(
@@ -1255,7 +1339,12 @@ def _resolve_season_target(
         {"mal_anime_id": candidate.mal_anime_id, "title": candidate.title, "media_type": candidate.media_type}
         for candidate in result.candidates[:5]
     ]
-    if should_auto_approve_mapping(result) and chosen is not None:
+    split_first = None
+    if not should_auto_approve_mapping(result):
+        split_first = _split_cour_first_part(config, client, state, list(result.candidates))
+        if split_first is not None:
+            chosen = split_first
+    if (split_first is not None or should_auto_approve_mapping(result)) and chosen is not None:
         upsert_provider_season_mapping(
             config.db_path,
             provider=state.provider,
@@ -1267,9 +1356,13 @@ def _resolve_season_target(
             season_title=state.season_title,
             season_number=state.season_number,
             resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
-            detail={"rationale": list(result.rationale), "candidates": candidates},
+            detail={
+                "rationale": list(result.rationale) + (["split_cour_first_part"] if split_first is not None else []),
+                "candidates": candidates,
+            },
         )
-        return _ApplyTarget(chosen.mal_anime_id, "auto_exact", float(result.confidence), ["season_mapping=auto_exact", season_label])
+        reasons = ["season_mapping=auto_exact", season_label] + (["season_mapping_split_cour_first_part"] if split_first is not None else [])
+        return _ApplyTarget(chosen.mal_anime_id, "auto_exact", float(result.confidence), reasons)
     upsert_provider_season_mapping(
         config.db_path,
         provider=state.provider,
@@ -1335,7 +1428,23 @@ def execute_approved_sync(
     # None or a non-positive limit means unbounded (the CLI maps --limit 0 to a
     # full scan; the service disables a zero limit before calling).
     live_budget = None if limit is None or int(limit) <= 0 else int(limit)
-    deferred = 0
+
+    def preview_result(state: ProviderSeriesState, target: _ApplyTarget, preview: SyncProposal, extra: list[str]) -> ApplyResult:
+        return ApplyResult(
+            provider=state.provider,
+            provider_series_id=state.provider_series_id,
+            provider_season_key=state.provider_season_key,
+            mal_anime_id=int(target.mal_anime_id or 0),
+            mal_title=preview.mal_title,
+            applied=False,
+            proposal_decision=preview.decision,
+            requested_status=preview.proposed_my_list_status,
+            response_status=preview.current_my_list_status,
+            reasons=preview.reasons + extra,
+        )
+
+    # Phase 1: plan every unit from cached MAL state (no write budget used).
+    candidates: list[tuple[ProviderSeriesState, _ApplyTarget, SyncProposal | None, list[str], dict[str, Any] | None]] = []
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
         if persisted is None or not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
@@ -1360,63 +1469,58 @@ def execute_approved_sync(
             continue
         if exact_approved_only and target.mapping_source not in EXACT_APPROVED_MAPPING_SOURCES:
             continue
-        base_reasons = base_reasons + target.reasons
-        lookup_error: MalApiError | None = None
-        try:
-            cached_detail = client.get_anime_details(target.mal_anime_id, fields=_MAL_SYNC_DETAIL_FIELDS)
-        except MalApiError as exc:
-            cached_detail = None
-            lookup_error = exc
-        if isinstance(cached_detail, dict) and (
-            "my_list_status" not in cached_detail
-            or _validated_live_mal_user_state(cached_detail, expected_anime_id=target.mal_anime_id)[1] is not None
-        ):
-            # Unusable cached shape: only the authoritative live read decides.
-            cached_detail = None
-        if isinstance(cached_detail, dict):
-            preview = _plan_status_update(
-                state,
-                cached_detail,
-                mapping_status="approved",
-                confidence=target.confidence,
-                mapping_source=target.mapping_source,
-                persisted_mapping_approved=True,
-                extra_reasons=base_reasons,
-            )
+        target = _ApplyTarget(target.mal_anime_id, target.mapping_source, target.confidence, base_reasons + target.reasons)
+        first_detail, first_lookup_reasons = _cached_detail(client, target.mal_anime_id)
+        for unit_state, unit_target in _split_cour_units(config, client, state, target, first_detail=first_detail):
+            if unit_target.mal_anime_id == target.mal_anime_id:
+                unit_detail, lookup_reasons = first_detail, first_lookup_reasons
+            else:
+                assert unit_target.mal_anime_id is not None
+                unit_detail, lookup_reasons = _cached_detail(client, unit_target.mal_anime_id)
+            preview = _preview_from_detail(unit_state, unit_target, unit_detail)
+            candidates.append((unit_state, unit_target, preview, lookup_reasons, unit_detail))
+
+    # Phase 2: several provider units can map to one MAL entry (a long
+    # MAL entry split into provider seasons, or a split-cour overflow); only
+    # the most advanced proposal per entry proceeds.
+    best_by_mal: dict[int, int] = {}
+    for index, (_, unit_target, preview, _, _) in enumerate(candidates):
+        if preview is None or preview.decision != "propose_update":
+            continue
+        mal_id = int(unit_target.mal_anime_id or 0)
+        current_best = best_by_mal.get(mal_id)
+        if current_best is None or _proposal_rank(preview) > _proposal_rank(candidates[current_best][2]):
+            best_by_mal[mal_id] = index
+
+    deferred = 0
+    for index, (state, target, preview, lookup_reasons, cached_detail) in enumerate(candidates):
+        if preview is not None:
+            if preview.decision == "propose_update" and best_by_mal.get(int(target.mal_anime_id or 0)) != index:
+                results.append(preview_result(state, target, preview, ["superseded_by_more_advanced_unit_for_same_mal_entry"]))
+                continue
             if preview.decision != "propose_update" and not dry_run:
                 _persist_watch_confirmation_provenance_snapshot(
                     config, state, preview, detail=cached_detail, mapping_reasons=preview.reasons
                 )
             if preview.decision != "propose_update" or dry_run:
                 results.append(
-                    ApplyResult(
-                        provider=state.provider,
-                        provider_series_id=state.provider_series_id,
-                        provider_season_key=state.provider_season_key,
-                        mal_anime_id=target.mal_anime_id,
-                        mal_title=preview.mal_title,
-                        applied=False,
-                        proposal_decision=preview.decision,
-                        requested_status=preview.proposed_my_list_status,
-                        response_status=preview.current_my_list_status,
-                        reasons=preview.reasons + (["executor_dry_run"] if dry_run and preview.decision == "propose_update" else []),
-                    )
+                    preview_result(state, target, preview, ["executor_dry_run"] if dry_run and preview.decision == "propose_update" else [])
                 )
                 continue
         elif dry_run:
-            reasons = base_reasons + ([f"mal_details_lookup_failed:{lookup_error}"] if lookup_error else ["mal_cached_detail_unusable"])
+            error = any(reason.startswith("mal_details_lookup_failed:") for reason in lookup_reasons)
             results.append(
                 ApplyResult(
                     provider=state.provider,
                     provider_series_id=state.provider_series_id,
                     provider_season_key=state.provider_season_key,
-                    mal_anime_id=target.mal_anime_id,
+                    mal_anime_id=int(target.mal_anime_id or 0),
                     mal_title=None,
                     applied=False,
-                    proposal_decision="error" if lookup_error else "review",
+                    proposal_decision="error" if error else "review",
                     requested_status=None,
                     response_status=None,
-                    reasons=reasons,
+                    reasons=target.reasons + (lookup_reasons or ["mal_cached_detail_unusable"]),
                 )
             )
             continue
@@ -1425,15 +1529,7 @@ def execute_approved_sync(
             continue
         if live_budget is not None:
             live_budget -= 1
-        results.append(
-            _revalidate_and_apply(
-                config,
-                client,
-                state,
-                target,
-                base_reasons=base_reasons,
-            )
-        )
+        results.append(_revalidate_and_apply(config, client, state, target, base_reasons=target.reasons))
     if deferred:
         results.append(
             ApplyResult(
@@ -1449,6 +1545,105 @@ def execute_approved_sync(
             )
         )
     return results
+
+
+_STATUS_RANK = {"plan_to_watch": 0, "watching": 1, "on_hold": 1, "dropped": 1, "completed": 2}
+
+
+def _proposal_rank(proposal: SyncProposal | None) -> tuple[int, int]:
+    requested = (proposal.proposed_my_list_status if proposal else None) or {}
+    return (_STATUS_RANK.get(str(requested.get("status")), 0), int(requested.get("num_watched_episodes") or 0))
+
+
+def _cached_detail(client: MalClient, mal_anime_id: int) -> tuple[dict[str, Any] | None, list[str]]:
+    try:
+        detail = client.get_anime_details(mal_anime_id, fields=_MAL_SYNC_DETAIL_FIELDS)
+    except MalApiError as exc:
+        return None, [f"mal_details_lookup_failed:{exc}"]
+    if not isinstance(detail, dict) or "my_list_status" not in detail:
+        return None, []
+    if _validated_live_mal_user_state(detail, expected_anime_id=mal_anime_id)[1] is not None:
+        # Unusable cached shape: only the authoritative live read decides.
+        return None, []
+    return detail, []
+
+
+def _preview_from_detail(
+    state: ProviderSeriesState, target: _ApplyTarget, detail: dict[str, Any] | None
+) -> SyncProposal | None:
+    if detail is None:
+        return None
+    return _plan_status_update(
+        state,
+        detail,
+        mapping_status="approved",
+        confidence=target.confidence,
+        mapping_source=target.mapping_source,
+        persisted_mapping_approved=True,
+        extra_reasons=target.reasons,
+    )
+
+
+def _split_cour_units(
+    config: AppConfig,
+    client: MalClient,
+    state: ProviderSeriesState,
+    target: _ApplyTarget,
+    *,
+    first_detail: dict[str, Any] | None = None,
+) -> list[tuple[ProviderSeriesState, _ApplyTarget]]:
+    """Split one provider unit across a MAL entry and its direct sequel.
+
+    Applies when the unit's completed episodes are contiguous 1..N, N exceeds
+    the entry's episode count, and the entry's single direct TV/ONA sequel
+    holds the remainder (MAL Part 1 / Part 2 of one provider season).
+    """
+    assert target.mal_anime_id is not None
+    detail = first_detail if first_detail is not None else _cached_detail(client, target.mal_anime_id)[0]
+    first_count = _coerce_detail_int((detail or {}).get("num_episodes"))
+    completed = state.completed_episode_count
+    max_completed = int(state.max_completed_episode_number or 0)
+    if (
+        not first_count
+        or completed <= first_count
+        or completed != max_completed
+        or state.min_episode_number not in (None, 1)
+    ):
+        return [(state, target)]
+    sequel_id = _direct_sequel_id(config, client, target.mal_anime_id)
+    if sequel_id is None:
+        return [(state, target)]
+    sequel_detail, _ = _cached_detail(client, sequel_id)
+    sequel_count = _coerce_detail_int((sequel_detail or {}).get("num_episodes"))
+    if (
+        sequel_detail is None
+        or str(sequel_detail.get("media_type") or "") not in _SPLIT_COUR_MEDIA_TYPES
+        or not sequel_count
+        or max_completed > first_count + sequel_count
+    ):
+        return [(state, target)]
+    max_episode = int(state.max_episode_number or max_completed)
+    first_state = replace(
+        state,
+        completed_episode_count=first_count,
+        max_completed_episode_number=first_count,
+        max_episode_number=min(max_episode, first_count),
+        min_episode_number=1,
+    )
+    second_state = replace(
+        state,
+        completed_episode_count=max_completed - first_count,
+        max_completed_episode_number=max_completed - first_count,
+        max_episode_number=max(0, max_episode - first_count),
+        min_episode_number=1,
+        # Provenance is one row per provider series; the first part keeps it.
+        season_unit_rank=state.season_unit_rank + 1000,
+    )
+    split_reason = f"split_cour_overflow first_mal={target.mal_anime_id} sequel_mal={sequel_id} first_episodes={first_count}"
+    return [
+        (first_state, _ApplyTarget(target.mal_anime_id, target.mapping_source, target.confidence, target.reasons + [split_reason])),
+        (second_state, _ApplyTarget(sequel_id, target.mapping_source, target.confidence, target.reasons + [split_reason])),
+    ]
 
 
 def _revalidate_and_apply(

@@ -258,6 +258,86 @@ class SeasonSplitExecutorTests(unittest.TestCase):
         # Season 2 was watched last (rank 0); its own MAL entry and size are recorded.
         self.assertEqual((200, 24), (recorded.mal_anime_id, recorded.mal_num_episodes))
 
+    def test_split_cour_season_overflows_into_the_mal_sequel(self) -> None:
+        # Production case: one provider season of 20 episodes is MAL Part 1 (12)
+        # plus Part 2; previously it went to review as "exceeds MAL count".
+        from mal_updater.db import replace_mal_anime_relations
+
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 21)]
+        self._ingest([("cr-1", "Example Show")], progress)
+        self._map_series("cr-1", 100)
+        replace_mal_anime_relations(
+            self.config.db_path,
+            mal_anime_id=100,
+            relations=[{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}],
+        )
+        with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            results = execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+
+        writes = {call.args[0]: call.kwargs for call in update.call_args_list}
+        self.assertEqual(("completed", 12), (writes[100]["status"], writes[100]["num_watched_episodes"]))
+        self.assertEqual(("watching", 8), (writes[200]["status"], writes[200]["num_watched_episodes"]))
+        self.assertTrue(all(any(r.startswith("split_cour_overflow") for r in result.reasons) for result in results))
+
+    def test_seasons_sharing_one_mal_entry_write_only_the_most_advanced(self) -> None:
+        # Production case: a 103-episode MAL entry published as several provider
+        # seasons (continuous numbering) must not get competing writes.
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 13)]
+        progress += [self._progress("cr-1", "S2", n, season_number=2, watched_at=f"2026-03-05T00:{n - 12:02d}:00Z") for n in range(13, 21)]
+        self._ingest([("cr-1", "Long Show")], progress)
+        self._map_series("cr-1", 500)
+        for key, season in (("S1", 1), ("S2", 2)):
+            upsert_provider_season_mapping(
+                self.config.db_path, provider="crunchyroll", provider_series_id="cr-1", provider_season_key=key,
+                mal_anime_id=500, mapping_source="auto_exact", confidence=1.0,
+                season_title=f"Season {season}", season_number=season, resolver_version="test",
+            )
+
+        def details(anime_id, **_kwargs):
+            return {"id": anime_id, "title": "Long Show", "num_episodes": 103, "media_type": "tv",
+                    "status": "finished_airing", "my_list_status": None, "alternative_titles": {}}
+
+        with patch.object(MalClient, "get_anime_details", side_effect=details), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            results = execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+
+        self.assertEqual([(500, 20)], [(call.args[0], call.kwargs["num_watched_episodes"]) for call in update.call_args_list])
+        self.assertTrue(any("superseded_by_more_advanced_unit_for_same_mal_entry" in r.reasons for r in results))
+
+    def test_ambiguous_part_one_and_part_two_candidates_resolve_to_part_one(self) -> None:
+        from mal_updater.db import replace_mal_anime_relations
+        from mal_updater.mapping import MappingCandidate
+        from mal_updater.sync_planner import _split_cour_first_part
+
+        def candidate(mal_id: int, episodes: int, media_type: str = "tv") -> MappingCandidate:
+            return MappingCandidate(mal_id, f"T{mal_id}", [], media_type, "finished_airing", episodes, 0.9, "q", [], {})
+
+        replace_mal_anime_relations(
+            self.config.db_path,
+            mal_anime_id=11,
+            relations=[{"related_mal_anime_id": 12, "relation_type": "sequel", "raw": {"node": {"id": 12}}}],
+        )
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 24)]
+        progress += [self._progress("cr-1", "S2", 1, season_number=2, watched_at="2026-03-09T00:00:00Z")]
+        self._ingest([("cr-1", "Example Show")], progress)
+        state = next(s for s in load_provider_series_states(self.config, split_seasons=True) if s.provider_season_key == "S1")
+        from mal_updater.config import load_mal_secrets
+
+        client = MalClient(self.config, load_mal_secrets(self.config))  # relations are local; no request is made
+        # Candidate order from the engine may put Part 2 first.
+        chosen = _split_cour_first_part(self.config, client, state, [candidate(12, 12), candidate(11, 11)])
+        self.assertEqual(11, chosen.mal_anime_id)
+        # Evidence that fits Part 1 alone is not a split.
+        from dataclasses import replace
+
+        short = replace(state, max_episode_number=10, completed_episode_count=10)
+        self.assertIsNone(_split_cour_first_part(self.config, client, short, [candidate(11, 11), candidate(12, 12)]))
+        # A movie candidate is never a split-cour part.
+        self.assertIsNone(_split_cour_first_part(self.config, client, state, [candidate(11, 11), candidate(12, 12, "movie")]))
+
     def test_unresolved_season_is_reviewed_and_never_written(self) -> None:
         progress = [self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-03-01T00:00:00Z")]
         progress += [self._progress("cr-1", "S2", 1, season_number=2, watched_at="2026-03-02T00:00:00Z")]
