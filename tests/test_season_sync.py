@@ -94,9 +94,11 @@ class ProviderWatchedEpisodesTests(unittest.TestCase):
 
     def test_first_episode_of_continuously_numbered_season_never_completes_it(self) -> None:
         # Season 2 numbered 13-25 on a 13-episode MAL entry: episode 13 is its first episode.
-        watched, _info, review = _provider_watched_episodes(self._state(count=1, max_completed=13, min_number=13), 13)
-        self.assertEqual(13, watched)
-        self.assertTrue(review and review.startswith("provider_completion_rests_on_unobserved_episodes"))
+        # Only the observed episode is counted (right under either reading).
+        watched, info, review = _provider_watched_episodes(self._state(count=1, max_completed=13, min_number=13), 13)
+        self.assertEqual(1, watched)
+        self.assertIsNone(review)
+        self.assertTrue(info and info.startswith("provider_completion_rests_on_unobserved_episodes_counted_observed"))
 
     def test_completion_allowed_when_mal_already_records_the_lower_episodes(self) -> None:
         state = self._state(count=1, max_completed=13, min_number=13)
@@ -283,6 +285,27 @@ class SeasonSplitExecutorTests(unittest.TestCase):
         # The unit's last watch was a Part 2 episode, so Part 1's finish date is unknown.
         self.assertIsNone(writes[100]["finish_date"])
         self.assertTrue(all(any(r.startswith("split_cour_overflow") for r in result.reasons) for result in results))
+
+    def test_split_cour_assigns_each_completed_episode_to_its_part_despite_a_gap(self) -> None:
+        # Production cases (Dead Mount Death Play, Re:Zero S2): one unfinished
+        # episode used to keep the whole season in review.
+        from mal_updater.db import replace_mal_anime_relations
+
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 21)]
+        progress[4]["completion_ratio"] = 0.3  # episode 5 unfinished
+        self._ingest([("cr-1", "Example Show")], progress)
+        self._map_series("cr-1", 100)
+        replace_mal_anime_relations(
+            self.config.db_path,
+            mal_anime_id=100,
+            relations=[{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}],
+        )
+        with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list}
+        self.assertEqual({100: ("completed", 12), 200: ("watching", 8)}, writes)
 
     def test_single_episode_past_mal_count_is_not_treated_as_part_two(self) -> None:
         # Production case: a 13-episode provider season whose MAL entry has 12
@@ -524,6 +547,47 @@ class SeasonSplitExecutorTests(unittest.TestCase):
             execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
         writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list}
         self.assertEqual({100: ("completed", 12), 200: ("watching", 8)}, writes)
+
+    def _strong_result(self, mal_id: int, episodes: int):
+        from mal_updater.mapping import MappingCandidate, MappingResult
+
+        candidate = MappingCandidate(mal_id, f"T{mal_id}", [], "tv", "finished_airing", episodes, 0.9, "q", [], {})
+        return MappingResult(series=None, status="strong", confidence=0.9, chosen_candidate=candidate, candidates=[candidate], rationale=[])
+
+    def _resolve_s2(self, relations_from_anchor: list[dict]):
+        from mal_updater.config import load_mal_secrets
+        from mal_updater.db import replace_mal_anime_relations
+        from mal_updater.sync_planner import _resolve_season_target
+
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 13)]
+        progress += [self._progress("cr-1", "S2", n, season_number=2, watched_at=f"2026-03-05T00:{n:02d}:00Z") for n in range(1, 13)]
+        self._ingest([("cr-1", "Example Show")], progress)
+        self._map_series("cr-1", 100)
+        replace_mal_anime_relations(self.config.db_path, mal_anime_id=100, relations=relations_from_anchor)
+        replace_mal_anime_relations(
+            self.config.db_path, mal_anime_id=200,
+            relations=[{"related_mal_anime_id": 100, "relation_type": "prequel", "raw": {"node": {"id": 100}}}],
+        )
+        state = next(s for s in load_provider_series_states(self.config, split_seasons=True) if s.provider_season_key == "S2")
+        with patch("mal_updater.sync_planner.map_series", return_value=self._strong_result(200, 12)), patch(
+            "mal_updater.sync_planner.should_auto_approve_mapping", return_value=False
+        ), patch.object(MalClient, "get_anime_details", side_effect=AssertionError("relations are local")):
+            return _resolve_season_target(self.config, MalClient(self.config, load_mal_secrets(self.config)), state, search_budget=[1])
+
+    def test_strong_season_match_accepted_when_franchise_and_episode_count_agree(self) -> None:
+        target = self._resolve_s2([{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}])
+        self.assertEqual(200, target.mal_anime_id)
+        self.assertIn("season_mapping_accepted_by=franchise_episode_count_corroborated", target.reasons)
+
+    def test_strong_season_match_outside_the_franchise_stays_unresolved(self) -> None:
+        from mal_updater.db import replace_mal_anime_relations
+
+        replace_mal_anime_relations(
+            self.config.db_path, mal_anime_id=999,
+            relations=[{"related_mal_anime_id": 100, "relation_type": "prequel", "raw": {"node": {"id": 100}}}],
+        )
+        target = self._resolve_s2([{"related_mal_anime_id": 999, "relation_type": "sequel", "raw": {"node": {"id": 999}}}])
+        self.assertIsNone(target.mal_anime_id)
 
     def test_unresolved_season_is_reviewed_and_never_written(self) -> None:
         progress = [self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-03-01T00:00:00Z")]

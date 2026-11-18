@@ -96,6 +96,8 @@ class ProviderSeriesState:
     # same MAL entry (the entry spans seasons), "ordinal" when it maps to a
     # different one; None when unknown.
     numbering_hint: str | None = None
+    completed_episode_numbers: tuple[int, ...] = ()
+    ordinal_completed_episode_numbers: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -451,6 +453,8 @@ def load_provider_series_states(
                         ordinal_max_completed_episode_number=ordinal_summary["max_completed_episode_number"] if ordinal_summary else None,
                         ordinal_max_episode_number=ordinal_summary["max_episode_number"] if ordinal_summary else None,
                         ordinal_min_episode_number=ordinal_summary["min_episode_number"] if ordinal_summary else None,
+                        completed_episode_numbers=summary["completed_episode_numbers"],
+                        ordinal_completed_episode_numbers=ordinal_summary["completed_episode_numbers"] if ordinal_summary else None,
                     ),
                 )
             )
@@ -553,6 +557,7 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
         "min_episode_number": min_episode_number,
         "completed_episode_count": completed_episode_count,
         "completed_unnumbered_count": len(completed_episode_ids_without_number),
+        "completed_episode_numbers": tuple(sorted(completed_episode_numbers)),
         "max_completed_episode_number": max_completed_episode_number,
         "last_watched_at": last_watched_at,
         "last_progress_seen_at": last_progress_seen_at,
@@ -1279,7 +1284,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.3"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.4"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1307,8 +1312,8 @@ def _catalog_detail(client: MalClient, mal_anime_id: int) -> dict[str, Any] | No
     return detail if isinstance(detail, dict) else None
 
 
-def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -> int | None:
-    """Return the single direct MAL sequel of an entry (relations cached locally)."""
+def _relation_rows(config: AppConfig, client: MalClient, mal_anime_id: int) -> list[tuple[int, str]]:
+    """Return (related id, relation type) for an entry, fetching once if unknown."""
     with connect(config.db_path) as conn:
         rows = conn.execute(
             "SELECT related_mal_anime_id, relation_type FROM mal_anime_relations WHERE mal_anime_id = ?",
@@ -1318,14 +1323,69 @@ def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -
         try:
             detail = client.get_anime_details(int(mal_anime_id), fields="id,related_anime")
         except MalApiError:
-            return None
+            return []
         relations = mal_anime_relations_from_related(detail.get("related_anime") if isinstance(detail, dict) else None)
         if not relations:
-            return None
+            return []
         replace_mal_anime_relations(config.db_path, mal_anime_id=int(mal_anime_id), relations=relations)
         rows = [(item["related_mal_anime_id"], item["relation_type"]) for item in relations]
-    sequels = {int(row[0]) for row in rows if row[1] == "sequel"}
+    return [(int(row[0]), str(row[1])) for row in rows]
+
+
+def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -> int | None:
+    """Return the single direct MAL sequel of an entry (relations cached locally)."""
+    sequels = {related for related, kind in _relation_rows(config, client, mal_anime_id) if kind == "sequel"}
     return next(iter(sequels)) if len(sequels) == 1 else None
+
+
+_FRANCHISE_MAX_HOPS = 12
+
+
+def _in_mal_franchise(config: AppConfig, client: MalClient, anchor_id: int, candidate_id: int) -> bool:
+    """Whether candidate is reachable from anchor through prequel/sequel links."""
+    frontier, seen = [int(anchor_id)], {int(anchor_id)}
+    for _ in range(_FRANCHISE_MAX_HOPS):
+        if candidate_id in seen:
+            return True
+        next_frontier: list[int] = []
+        for mal_id in frontier:
+            for related, kind in _relation_rows(config, client, mal_id):
+                if kind in ("sequel", "prequel") and related not in seen:
+                    seen.add(related)
+                    next_frontier.append(related)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return candidate_id in seen
+
+
+def _franchise_count_corroborated_candidate(
+    config: AppConfig, client: MalClient, state: ProviderSeriesState, result: Any
+) -> Any | None:
+    """Accept the matcher's top candidate when independent evidence agrees.
+
+    Title wording often keeps a correct season match below auto-approval
+    ("strong"). The top candidate is accepted when it is a TV/ONA entry in
+    the same MAL franchise as the series' approved mapping and its episode
+    count equals the number of episodes completed in this season (positions
+    1..N, i.e. the season was watched through).
+    """
+    candidate = result.chosen_candidate or (result.candidates[0] if result.candidates else None)
+    if candidate is None or candidate.media_type not in _SPLIT_COUR_MEDIA_TYPES or not candidate.num_episodes:
+        return None
+    view = _numbering_view(state, None)
+    if (
+        view.min_episode_number not in (None, 1)
+        or view.completed_episode_count != int(candidate.num_episodes)
+        or int(view.max_completed_episode_number or 0) != int(candidate.num_episodes)
+    ):
+        return None
+    anchor = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
+    if anchor is None or not anchor.approved_by_user:
+        return None
+    if not _in_mal_franchise(config, client, anchor.mal_anime_id, int(candidate.mal_anime_id)):
+        return None
+    return candidate
 
 
 def _split_cour_first_part(
@@ -1415,11 +1475,25 @@ def _resolve_season_target(
     if auxiliary_season and chosen is not None and chosen.media_type == "tv":
         chosen = None
     split_first = None
+    corroborated = None
     if chosen is not None and not should_auto_approve_mapping(result):
         split_first = _split_cour_first_part(config, client, state, list(result.candidates))
         if split_first is not None:
             chosen = split_first
-    if chosen is not None and (split_first is not None or should_auto_approve_mapping(result)):
+        else:
+            corroborated = _franchise_count_corroborated_candidate(config, client, state, result)
+            if corroborated is not None:
+                chosen = corroborated
+    accepted_by = (
+        "split_cour_first_part"
+        if split_first is not None
+        else "franchise_episode_count_corroborated"
+        if corroborated is not None
+        else "mapping_engine_auto_approval"
+        if should_auto_approve_mapping(result)
+        else None
+    )
+    if chosen is not None and accepted_by is not None:
         upsert_provider_season_mapping(
             config.db_path,
             provider=state.provider,
@@ -1431,12 +1505,9 @@ def _resolve_season_target(
             season_title=state.season_title,
             season_number=state.season_number,
             resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
-            detail={
-                "rationale": list(result.rationale) + (["split_cour_first_part"] if split_first is not None else []),
-                "candidates": candidates,
-            },
+            detail={"rationale": list(result.rationale), "accepted_by": accepted_by, "candidates": candidates},
         )
-        reasons = ["season_mapping=auto_exact", season_label] + (["season_mapping_split_cour_first_part"] if split_first is not None else [])
+        reasons = ["season_mapping=auto_exact", season_label, f"season_mapping_accepted_by={accepted_by}"]
         return _ApplyTarget(chosen.mal_anime_id, "auto_exact", float(result.confidence), reasons)
     upsert_provider_season_mapping(
         config.db_path,
@@ -1679,9 +1750,11 @@ def _split_cour_units(
 ) -> list[tuple[ProviderSeriesState, _ApplyTarget]]:
     """Split one provider unit across a MAL entry and its direct sequel.
 
-    Applies when the unit's completed episodes are contiguous 1..N, N exceeds
-    the entry's episode count, and the entry's single direct TV/ONA sequel
-    holds the remainder (MAL Part 1 / Part 2 of one provider season).
+    Applies when the unit is numbered from 1, at least two completed episodes
+    lie past the entry's episode count, and the entry's single direct TV/ONA
+    sequel can hold them (MAL Part 1 / Part 2 of one provider season). Each
+    completed episode goes to the part it belongs to, so a skipped or
+    unfinished episode does not block the split.
     """
     assert target.mal_anime_id is not None
     # Only catalog fields (episode count, media type) are needed here, so the
@@ -1689,16 +1762,18 @@ def _split_cour_units(
     detail = first_detail if first_detail is not None else _catalog_detail(client, target.mal_anime_id)
     first_count = _coerce_detail_int((detail or {}).get("num_episodes"))
     state = _numbering_view(state, first_count)
-    completed = state.completed_episode_count
-    max_completed = int(state.max_completed_episode_number or 0)
+    numbers = state.completed_episode_numbers
+    if not numbers:
+        return [(state, target)]
+    first_numbers = [number for number in numbers if first_count and number <= first_count]
+    second_numbers = [number - int(first_count or 0) for number in numbers if first_count and number > first_count]
     if (
         not first_count
-        or completed != max_completed
         or state.min_episode_number not in (None, 1)
         # A single episode past MAL's count is far more often an extra the
         # provider numbers into the season (MAL lists it as an OVA) than a
         # Part 2; such a unit stays in review until more of Part 2 is watched.
-        or completed - first_count < _SPLIT_COUR_MIN_OVERFLOW
+        or len(second_numbers) < _SPLIT_COUR_MIN_OVERFLOW
     ):
         return [(state, target)]
     sequel_id = _direct_sequel_id(config, client, target.mal_anime_id)
@@ -1710,33 +1785,47 @@ def _split_cour_units(
         sequel_detail is None
         or str(sequel_detail.get("media_type") or "") not in _SPLIT_COUR_MEDIA_TYPES
         or not sequel_count
-        or max_completed > first_count + sequel_count
+        or max(second_numbers) > sequel_count
     ):
         return [(state, target)]
-    max_episode = int(state.max_episode_number or max_completed)
-    first_state = replace(
-        state,
-        completed_episode_count=first_count,
-        max_completed_episode_number=first_count,
-        max_episode_number=min(max_episode, first_count),
-        min_episode_number=1,
-        # The unit's last watch may be a Part 2 episode; Part 1's finish date
-        # is unknown, so it is not filled.
-        last_watched_at=None,
-    )
-    second_state = replace(
-        state,
-        completed_episode_count=max_completed - first_count,
-        max_completed_episode_number=max_completed - first_count,
-        max_episode_number=max(0, max_episode - first_count),
-        min_episode_number=1,
-        # Provenance is one row per provider series; the first part keeps it.
-        season_unit_rank=state.season_unit_rank + 1000,
+    max_episode = int(state.max_episode_number or max(numbers))
+    units: list[tuple[ProviderSeriesState, int]] = []
+    if first_numbers:
+        units.append(
+            (
+                replace(
+                    state,
+                    completed_episode_count=len(first_numbers),
+                    max_completed_episode_number=max(first_numbers),
+                    max_episode_number=min(max_episode, first_count),
+                    min_episode_number=1,
+                    completed_episode_numbers=tuple(first_numbers),
+                    # The unit's last watch may be a Part 2 episode; Part 1's
+                    # finish date is unknown, so it is not filled.
+                    last_watched_at=None,
+                ),
+                target.mal_anime_id,
+            )
+        )
+    units.append(
+        (
+            replace(
+                state,
+                completed_episode_count=len(second_numbers),
+                max_completed_episode_number=max(second_numbers),
+                max_episode_number=max(0, max_episode - first_count),
+                min_episode_number=1,
+                completed_episode_numbers=tuple(second_numbers),
+                # Provenance is one row per provider series; the first part keeps it.
+                season_unit_rank=state.season_unit_rank + (1000 if first_numbers else 0),
+            ),
+            sequel_id,
+        )
     )
     split_reason = f"split_cour_overflow first_mal={target.mal_anime_id} sequel_mal={sequel_id} first_episodes={first_count}"
     return [
-        (first_state, _ApplyTarget(target.mal_anime_id, target.mapping_source, target.confidence, target.reasons + [split_reason])),
-        (second_state, _ApplyTarget(sequel_id, target.mapping_source, target.confidence, target.reasons + [split_reason])),
+        (unit_state, _ApplyTarget(mal_id, target.mapping_source, target.confidence, target.reasons + [split_reason]))
+        for unit_state, mal_id in units
     ]
 
 
@@ -2376,10 +2465,12 @@ def _numbering_view(
         max_completed_episode_number=state.ordinal_max_completed_episode_number,
         max_episode_number=state.ordinal_max_episode_number,
         min_episode_number=state.ordinal_min_episode_number,
+        completed_episode_numbers=state.ordinal_completed_episode_numbers or (),
         ordinal_completed_episode_count=None,
         ordinal_max_completed_episode_number=None,
         ordinal_max_episode_number=None,
         ordinal_min_episode_number=None,
+        ordinal_completed_episode_numbers=None,
     )
 
 
@@ -2411,11 +2502,13 @@ def _provider_watched_episodes(
             # observed number. With numbering that continues from an earlier
             # season (season 2 = 13-25 on a 13-episode MAL entry) episode 13
             # is the first episode, not the last, so do not claim completion
-            # unless MAL already records the episodes before it.
-            return watched, None, (
-                f"provider_completion_rests_on_unobserved_episodes min_episode={min_number} "
+            # unless MAL already records the episodes before it. The distinct
+            # count of observed completed episodes is right under either
+            # reading, so that is what is written.
+            return count, (
+                f"provider_completion_rests_on_unobserved_episodes_counted_observed min_episode={min_number} "
                 f"max_completed_episode={max_number} completed={count} mal_num_episodes={mal_num_episodes}"
-            )
+            ), None
         return watched, None, None
     if count > mal_num_episodes:
         return mal_num_episodes, None, (
