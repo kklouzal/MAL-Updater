@@ -33,6 +33,16 @@ class SeasonCatalogParsingTests(unittest.TestCase):
         self.assertEqual("original_air", entry.date_kind)
         self.assertTrue(entry.complete)
 
+    def test_crunchyroll_episode_zero_prologue_is_not_counted(self) -> None:
+        # Mushoku Tensei season 2: episode "0" aired a week before episode 1.
+        payload = {"total": 3, "data": [
+            {"episode": "0", "episode_number": 0, "episode_air_date": "2023-07-03T00:00:00+09:00"},
+            {"episode": "1", "episode_number": 1, "episode_air_date": "2023-07-10T00:00:00+09:00"},
+            {"episode": "2", "episode_number": 2, "episode_air_date": "2023-07-17T00:00:00+09:00"},
+        ]}
+        entry = _season_catalog_from_episodes("G6N", payload)
+        self.assertEqual((2, "2023-07-10", 1), (entry.numbered_episode_count, entry.first_date, entry.first_episode_number))
+
     def test_hidive_pages_use_provider_publish_dates(self) -> None:
         pages = [{"title": "Season 1", "episodeCount": 2, "episodes": [
             {"episodeInformation": {"episodeNumber": 1}, "publishedDate": "2024-01-25T23:10:31Z"},

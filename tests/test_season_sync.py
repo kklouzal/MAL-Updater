@@ -986,6 +986,25 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         stored = get_provider_season_mapping(self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="SX")
         self.assertEqual(SEASON_MAPPING_RESOLVER_VERSION, stored.resolver_version)
 
+    def test_unrelated_search_hit_does_not_block_a_franchise_date_match(self) -> None:
+        # Production case (HIDIVE Last Boss Queen S1): the title search also
+        # returned an unrelated 12-episode 2020 show, which looked like an
+        # earlier same-length sibling.
+        self._seed("hidive", "Season 1", relations={100: [(500, "sequel")], 500: [(100, "prequel")]})
+        entries = {100: ("tv", 12, "2023-07-07", "2023-09-22"), 500: ("tv", 12, "2026-04-07", "2026-06-23"),
+                   777: ("tv", 12, "2020-04-05", "2020-06-21")}
+        target = self._resolve("hidive", {"kind": "provider_publish", "first": "2024-01-25", "last": "2024-08-15"}, entries,
+                               engine_choice=777)
+        self.assertEqual(100, target.mal_anime_id)
+
+    def test_batch_dated_dub_catalog_falls_back_to_a_unique_episode_count(self) -> None:
+        # Production case (The Promised Neverland): every dub episode dated
+        # 2022-03-01; season 1 has 12 episodes and season 2 has 11.
+        self._seed("crunchyroll", "Season 1", relations={100: [(200, "sequel")], 200: [(100, "prequel")]})
+        entries = {100: ("tv", 12, "2019-01-11", "2019-03-29"), 200: ("tv", 11, "2021-01-08", "2021-03-26")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-03-01", "last": "2022-03-01", "count": 12}, entries)
+        self.assertEqual(100, target.mal_anime_id)
+
     def test_ova_season_matches_its_side_story_ova_entry(self) -> None:
         self._seed("crunchyroll", "OVA Season 1", relations={100: [(700, "side_story")], 700: []})
         entries = {100: ("tv", 24, "2018-10-02", "2019-03-19"), 700: ("ova", 5, "2019-07-09", "2020-11-27")}
@@ -1000,14 +1019,15 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
                    900: ("ona", 24, "2022-07-17", "2023-10-01")}
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-07-14", "last": "2023-09-28", "count": 24}, entries)
         self.assertEqual(100, target.mal_anime_id)
-        # When the TV entry cannot be confirmed (no sequel link, watched past
-        # its count) the same-week ONA is still not taken.
+        # Without a sequel link (and watched past its count) the start date still
+        # identifies the TV entry; the same-week ONA is never taken, and the
+        # planner reviews the overflow.
         self.temp_dir.cleanup()
         self.setUp()
         self._seed("crunchyroll", "Season 2", relations={100: [(900, "side_story")], 900: []})
         entries[100] = ("tv", 10, "2022-07-14", "2022-09-29")
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-07-14", "last": "2023-09-28", "count": 24}, entries)
-        self.assertIsNone(target.mal_anime_id)
+        self.assertEqual(100, target.mal_anime_id)
 
     def test_batch_dated_catalog_does_not_veto_a_title_match(self) -> None:
         # A dub catalog dated by its release (all episodes one day) is not a broadcast window.

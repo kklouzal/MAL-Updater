@@ -633,7 +633,9 @@ def _season_catalog_from_episodes(season_key: str, payload: Any) -> ProviderSeas
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return None
     episodes = [item for item in payload["data"] if isinstance(item, dict)]
-    numbered = [item for item in episodes if str(item.get("episode") or "").isdigit()]
+    # Episode "0" (a prologue such as Mushoku Tensei's "Guardian Fitz") airs
+    # ahead of the season and is a separate MAL entry; it is not an episode.
+    numbered = [item for item in episodes if str(item.get("episode") or "").isdigit() and int(str(item["episode"])) >= 1]
     dated = numbered or episodes
     air_dates = sorted(str(item["episode_air_date"])[:10] for item in dated if item.get("episode_air_date"))
     total = payload.get("total")

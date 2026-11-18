@@ -41,6 +41,7 @@ def _season_catalog_from_pages(season_key: str, pages: list[dict[str, Any]]) -> 
         episode
         for episode in episodes
         if isinstance((episode.get("episodeInformation") or {}).get("episodeNumber"), int)
+        and episode["episodeInformation"]["episodeNumber"] >= 1
     ]
     dated = numbered or episodes
     dates = sorted(str(episode["publishedDate"])[:10] for episode in dated if episode.get("publishedDate"))
