@@ -29,6 +29,11 @@ from mal_updater.recommendations import Recommendation, build_recommendations, g
 from mal_updater.sync_planner import load_provider_series_states
 
 
+def _iso_days_ago(days: int) -> str:
+    """UTC ISO timestamp *days* before now, so seed-staleness bands stay stable as real time passes."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 class RecommendationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1279,14 +1284,14 @@ class RecommendationTests(unittest.TestCase):
             season_title="Seed A (English Dub)",
             watchlist_status="fully_watched",
         )
-        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
+        self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at=_iso_days_ago(61))
         self._insert_series(
             "seed-b",
             title="Seed B",
             season_title="Seed B (English Dub)",
             watchlist_status="fully_watched",
         )
-        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-02T01:00:00Z")
+        self._insert_progress("seed-b", "seed-b-1", episode_number=1, completion_ratio=1.0, last_watched_at=_iso_days_ago(60))
         self._map_series("seed-a", 100)
         self._map_series("seed-b", 200)
         self._cache_metadata(100, title="Seed A")
@@ -1776,12 +1781,12 @@ class RecommendationTests(unittest.TestCase):
 
     def test_discovery_candidate_stale_heavy_multi_seed_support_counts_less_like_fresh_consensus(self) -> None:
         seed_specs = (
-            ("fresh-a", "Fresh Seed A", 100, "2026-03-01T01:00:00Z"),
-            ("fresh-b", "Fresh Seed B", 200, "2026-03-02T01:00:00Z"),
-            ("fresh-c", "Fresh Seed C", 250, "2026-03-03T01:00:00Z"),
-            ("stale-a", "Stale Seed A", 300, "2024-01-01T01:00:00Z"),
-            ("stale-b", "Stale Seed B", 350, "2024-01-02T01:00:00Z"),
-            ("fresh-d", "Fresh Seed D", 360, "2026-03-04T01:00:00Z"),
+            ("fresh-a", "Fresh Seed A", 100, _iso_days_ago(63)),
+            ("fresh-b", "Fresh Seed B", 200, _iso_days_ago(62)),
+            ("fresh-c", "Fresh Seed C", 250, _iso_days_ago(61)),
+            ("stale-a", "Stale Seed A", 300, _iso_days_ago(1000)),
+            ("stale-b", "Stale Seed B", 350, _iso_days_ago(999)),
+            ("fresh-d", "Fresh Seed D", 360, _iso_days_ago(60)),
         )
         for provider_series_id, title, mal_anime_id, watched_at in seed_specs:
             self._insert_series(
@@ -2083,10 +2088,10 @@ class RecommendationTests(unittest.TestCase):
 
     def test_discovery_candidate_stale_support_spread_gets_less_balance_bonus_than_fresh_spread(self) -> None:
         for provider_series_id, title, watched_at, mal_anime_id in (
-            ("seed-fresh-a", "Fresh Seed A", "2026-03-01T01:00:00Z", 100),
-            ("seed-fresh-b", "Fresh Seed B", "2026-03-02T01:00:00Z", 200),
-            ("seed-stale-a", "Stale Seed A", "2023-01-01T01:00:00Z", 300),
-            ("seed-stale-b", "Stale Seed B", "2023-01-02T01:00:00Z", 350),
+            ("seed-fresh-a", "Fresh Seed A", _iso_days_ago(61), 100),
+            ("seed-fresh-b", "Fresh Seed B", _iso_days_ago(60), 200),
+            ("seed-stale-a", "Stale Seed A", _iso_days_ago(1400), 300),
+            ("seed-stale-b", "Stale Seed B", _iso_days_ago(1399), 350),
         ):
             self._insert_series(
                 provider_series_id,

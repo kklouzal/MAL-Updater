@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime, timedelta, timezone
 import unittest
 from pathlib import Path
 from threading import Thread
@@ -20,6 +21,18 @@ from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATIO
 from mal_updater.recommendations import Recommendation, build_recommendations
 
 
+def _iso_utc(value: datetime) -> str:
+    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+# Evidence timestamps are anchored to the real clock: the dashboard judges provider
+# evidence freshness against datetime.now(), so fixed calendar dates silently age out.
+_FIXTURE_NOW = datetime.now(timezone.utc)
+VERIFIED_AT = _iso_utc(_FIXTURE_NOW - timedelta(days=6))
+FRESHNESS_CUTOFF = _iso_utc(_FIXTURE_NOW)
+NEAR_EXPIRY_AT = _iso_utc(_FIXTURE_NOW + timedelta(days=161))
+
+
 def _verified_provider_evidence(
     provider: str = "crunchyroll",
     provider_series_id: str = "verified-1",
@@ -27,7 +40,7 @@ def _verified_provider_evidence(
     *,
     identity_match_kind: str = "approved_mapping",
     audio_locales: list[str] | None = None,
-    last_verified_at: str | None = "2026-07-18T00:00:00Z",
+    last_verified_at: str | None = VERIFIED_AT,
     expires_at: str = "2099-01-01T00:00:00Z",
 ) -> dict[str, object]:
     return {
@@ -42,11 +55,11 @@ def _verified_provider_evidence(
         "english_dub_status": "present",
         "explicit_dub_evidence_source": "provider_audio_locale",
         "audio_locales": list(audio_locales if audio_locales is not None else ["en-US", "ja-JP"]),
-        "fetched_at": "2026-07-18T00:00:00Z",
+        "fetched_at": VERIFIED_AT,
         "last_verified_at": last_verified_at,
         "expires_at": expires_at,
-        "fresh": expires_at > "2026-07-24T00:00:00Z",
-        "expired": expires_at <= "2026-07-24T00:00:00Z",
+        "fresh": expires_at > FRESHNESS_CUTOFF,
+        "expired": expires_at <= FRESHNESS_CUTOFF,
     }
 
 
@@ -267,9 +280,9 @@ class RecommendationDashboardTests(unittest.TestCase):
                     catalog_status="present",
                     english_dub_status="present",
                     audio_locales=audio_locales,
-                    fetched_at="2026-07-18T00:00:00Z",
+                    fetched_at=VERIFIED_AT,
                     expires_at="2099-01-01T00:00:00Z",
-                    last_verified_at="2026-07-18T00:00:00Z",
+                    last_verified_at=VERIFIED_AT,
                 )
             upsert_recommendation_provider_eligibility_evidence(
                 db_path,
@@ -282,9 +295,9 @@ class RecommendationDashboardTests(unittest.TestCase):
                 catalog_status="present",
                 english_dub_status="present",
                 audio_locales=["ja-JP"],
-                fetched_at="2026-07-18T00:00:00Z",
+                fetched_at=VERIFIED_AT,
                 expires_at="2099-01-01T00:00:00Z",
-                last_verified_at="2026-07-18T00:00:00Z",
+                last_verified_at=VERIFIED_AT,
             )
             upsert_recommendation_provider_eligibility_evidence(
                 db_path,
@@ -297,7 +310,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 catalog_status="unknown",
                 english_dub_status="unknown",
                 audio_locales=[],
-                fetched_at="2026-07-18T00:00:00Z",
+                fetched_at=VERIFIED_AT,
                 expires_at="2099-01-01T00:00:00Z",
                 last_verified_at=None,
             )
@@ -768,9 +781,9 @@ class RecommendationDashboardTests(unittest.TestCase):
                         "english_dub_status": "present",
                         "explicit_dub_evidence_source": "provider_audio_locale",
                         "audio_locales": ["en-US", "ja-JP"],
-                        "fetched_at": "2026-07-18T00:00:00Z",
-                        "last_verified_at": "2026-07-18T00:00:00Z",
-                        "expires_at": "2027-01-01T00:00:00Z",
+                        "fetched_at": VERIFIED_AT,
+                        "last_verified_at": VERIFIED_AT,
+                        "expires_at": NEAR_EXPIRY_AT,
                         "fresh": True,
                         "source_evidence": {"large": "raw-json-should-not-render"},
                     }
@@ -794,7 +807,7 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertNotIn("identity approved_mapping", html)
         self.assertNotIn("review verified", html)
         self.assertNotIn("catalog present", html)
-        self.assertNotIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", html)
+        self.assertNotIn(f"fresh; verified {VERIFIED_AT}; expires {NEAR_EXPIRY_AT}", html)
         self.assertIn("Recommended because two completed favorites strongly support it.", html)
         self.assertIn("total 88.5", html)
         self.assertIn("Seed Favorite (17 MAL votes, score 9, completed)", html)
@@ -875,7 +888,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             db_path = Path(temp_dir) / "state.db"
             bootstrap_database(db_path)
 
-            def store_evidence(mal_id: int, provider_series_id: str, title: str, *, identity_match_kind: str, audio_locales: list[str], review_status: str = "verified", catalog_status: str = "present", english_dub_status: str = "present", expires_at: str = "2027-01-01T00:00:00Z", last_verified_at: str | None = "2026-07-18T00:00:00Z") -> dict[str, object]:
+            def store_evidence(mal_id: int, provider_series_id: str, title: str, *, identity_match_kind: str, audio_locales: list[str], review_status: str = "verified", catalog_status: str = "present", english_dub_status: str = "present", expires_at: str = NEAR_EXPIRY_AT, last_verified_at: str | None = VERIFIED_AT) -> dict[str, object]:
                 upsert_recommendation_provider_eligibility_evidence(
                     db_path,
                     mal_anime_id=mal_id,
@@ -891,11 +904,11 @@ class RecommendationDashboardTests(unittest.TestCase):
                     explicit_dub_evidence_source="provider_audio_locale" if audio_locales else None,
                     audio_locales=audio_locales,
                     source_evidence={"test": "dashboard_strict_parity"},
-                    fetched_at="2026-07-18T00:00:00Z",
+                    fetched_at=VERIFIED_AT,
                     expires_at=expires_at,
                     last_verified_at=last_verified_at,
                 )
-                fresh = expires_at > "2026-07-24T00:00:00Z"
+                fresh = expires_at > FRESHNESS_CUTOFF
                 return {
                     "provider": "crunchyroll",
                     "provider_series_id": provider_series_id,
@@ -908,7 +921,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                     "english_dub_status": english_dub_status,
                     "explicit_dub_evidence_source": "provider_audio_locale" if audio_locales else None,
                     "audio_locales": audio_locales,
-                    "fetched_at": "2026-07-18T00:00:00Z",
+                    "fetched_at": VERIFIED_AT,
                     "last_verified_at": last_verified_at,
                     "expires_at": expires_at,
                     "fresh": fresh,
@@ -979,9 +992,9 @@ class RecommendationDashboardTests(unittest.TestCase):
                                     "catalog_status": "present",
                                     "english_dub_status": "present",
                                     "audio_locales": ["en-US", "ja-JP"],
-                                    "fetched_at": "2026-07-18T00:00:00Z",
-                                    "last_verified_at": "2026-07-18T00:00:00Z",
-                                    "expires_at": "2027-01-01T00:00:00Z",
+                                    "fetched_at": VERIFIED_AT,
+                                    "last_verified_at": VERIFIED_AT,
+                                    "expires_at": NEAR_EXPIRY_AT,
                                     "fresh": True,
                                 },
                                 {
@@ -994,9 +1007,9 @@ class RecommendationDashboardTests(unittest.TestCase):
                                     "catalog_status": "present",
                                     "english_dub_status": "present",
                                     "audio_locales": ["en-US", "ja-JP"],
-                                    "fetched_at": "2026-07-18T00:00:00Z",
-                                    "last_verified_at": "2026-07-18T00:00:00Z",
-                                    "expires_at": "2027-01-01T00:00:00Z",
+                                    "fetched_at": VERIFIED_AT,
+                                    "last_verified_at": VERIFIED_AT,
+                                    "expires_at": NEAR_EXPIRY_AT,
                                     "fresh": True,
                                 },
                             ],
@@ -1018,7 +1031,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual("https://www.hidive.com/series/multi", row["provider_badges"][1]["url"])
             self.assertIn("identity approved_mapping, manual_verified", row["verification"])
             self.assertIn("review verified", row["verification"])
-            self.assertIn("fresh; verified 2026-07-18T00:00:00Z; expires 2027-01-01T00:00:00Z", row["evidence_freshness"])
+            self.assertIn(f"fresh; verified {VERIFIED_AT}; expires {NEAR_EXPIRY_AT}", row["evidence_freshness"])
             self.assertEqual("present", row["english_dub_evidence"])
             self.assertIn("Both top watched seeds", row["why_recommended"])
             self.assertIn("total 91.25", row["scorecard_summary"])
@@ -1035,8 +1048,8 @@ class RecommendationDashboardTests(unittest.TestCase):
                 provider="crunchyroll",
                 provider_series_id="cr-review",
                 provider_title="Review Needed",
-                fetched_at="2026-07-18T00:00:00Z",
-                expires_at="2027-01-01T00:00:00Z",
+                fetched_at=VERIFIED_AT,
+                expires_at=NEAR_EXPIRY_AT,
                 review_status="review-needed",
                 catalog_status="unknown",
                 english_dub_status="unknown",
