@@ -324,6 +324,13 @@ def load_provider_series_states(
     with connect(config.db_path) as conn:
         series_rows = conn.execute(series_query, series_params).fetchall()
         progress_rows = conn.execute(progress_query, progress_params).fetchall()
+        first_episode_by_season = {
+            (str(item["provider"]), str(item["provider_season_key"])): int(item["first_episode_number"])
+            for item in conn.execute(
+                "SELECT provider, provider_season_key, first_episode_number FROM provider_season_catalog "
+                "WHERE first_episode_number IS NOT NULL"
+            )
+        }
 
     verified_identity_by_series: dict[tuple[str, str], Any] = {}
     conflicting_verified_identity_keys: set[tuple[str, str]] = set()
@@ -407,17 +414,29 @@ def load_provider_series_states(
             # stored before ordinals were captured carry only the provider
             # number, and mixing the two numberings would corrupt both views.
             numbered = [row for row in unit_progress if row.episode_number is not None]
-            ordinal_summary = (
-                _summarize_episode_progress(
-                    [
-                        replace(row, episode_number=row.season_episode_ordinal if row.episode_number is not None else None)
-                        for row in unit_progress
-                    ],
-                    config,
-                )
-                if keyed_units and numbered and all(row.season_episode_ordinal is not None for row in numbered)
+            # In-season position: from the catalog's first episode number when
+            # known (sequence numbers also count interleaved recaps), else the
+            # provider sequence number.
+            unit_first = (
+                first_episode_by_season.get((unit_progress[0].provider, str(unit_progress[0].provider_season_key)))
+                if unit_progress and unit_progress[0].provider_season_key
                 else None
             )
+            if keyed_units and numbered and unit_first is not None and all(
+                row.episode_number is not None and row.episode_number >= unit_first for row in numbered
+            ):
+                ordinal_rows = [
+                    replace(row, episode_number=row.episode_number - unit_first + 1 if row.episode_number is not None else None)
+                    for row in unit_progress
+                ]
+            elif keyed_units and numbered and all(row.season_episode_ordinal is not None for row in numbered):
+                ordinal_rows = [
+                    replace(row, episode_number=row.season_episode_ordinal if row.episode_number is not None else None)
+                    for row in unit_progress
+                ]
+            else:
+                ordinal_rows = None
+            ordinal_summary = _summarize_episode_progress(ordinal_rows, config) if ordinal_rows is not None else None
             season_split = season_key is not None
             unit_season_number, unit_season_title = (
                 _season_identity(unit_progress) if season_split else (row["season_number"], row["season_title"])

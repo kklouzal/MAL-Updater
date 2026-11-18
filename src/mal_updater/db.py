@@ -71,6 +71,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "033_provider_season_mappings.sql",
     "034_provider_episode_season_ordinal.sql",
     "035_provider_season_catalog.sql",
+    "036_provider_season_catalog_first_episode.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"

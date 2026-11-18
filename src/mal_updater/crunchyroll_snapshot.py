@@ -649,6 +649,10 @@ def _season_catalog_from_episodes(season_key: str, payload: Any) -> ProviderSeas
         date_kind="original_air",
         complete=not (isinstance(total, int) and total > len(episodes)),
         fetched_at="",
+        first_episode_number=min(
+            (int(item["episode_number"]) for item in numbered if isinstance(item.get("episode_number"), int)),
+            default=None,
+        ),
     )
 
 

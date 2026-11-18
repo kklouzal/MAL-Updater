@@ -57,6 +57,10 @@ def _season_catalog_from_pages(season_key: str, pages: list[dict[str, Any]]) -> 
         date_kind="provider_publish",
         complete=declared is None or declared <= len(episodes),
         fetched_at="",
+        first_episode_number=min(
+            (int(episode["episodeInformation"]["episodeNumber"]) for episode in numbered),
+            default=None,
+        ),
     )
 
 

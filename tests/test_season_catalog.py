@@ -67,7 +67,7 @@ class SeasonCatalogRefreshSelectionTests(unittest.TestCase):
             upsert_provider_season_catalog(self.config.db_path, ProviderSeasonCatalog(
                 provider="crunchyroll", provider_season_key=key, title=None, numbered_episode_count=12,
                 total_episode_count=12, first_date="2019-10-01", last_date=last, date_kind="original_air",
-                complete=True, fetched_at=""))
+                complete=True, fetched_at="", first_episode_number=1))
         keys = ["old", "airing", "new"]
         self.assertEqual(["new"], self._needing(keys, days_ahead=2))
         # An airing season is re-read once its row is a week old.
@@ -77,7 +77,7 @@ class SeasonCatalogRefreshSelectionTests(unittest.TestCase):
         upsert_provider_season_catalog(self.config.db_path, ProviderSeasonCatalog(
             provider="crunchyroll", provider_season_key="kept", title="T", numbered_episode_count=12,
             total_episode_count=12, first_date="2019-10-01", last_date=None, date_kind="original_air",
-            complete=True, fetched_at=""))
+            complete=True, fetched_at="", first_episode_number=1))
         for key in ("kept", "gone"):
             record_provider_season_catalog_failure(
                 self.config.db_path, provider="crunchyroll", provider_season_key=key, date_kind="original_air"
@@ -89,6 +89,15 @@ class SeasonCatalogRefreshSelectionTests(unittest.TestCase):
         assert kept is not None and gone is not None
         self.assertEqual(("2019-10-01", 12, True), (kept.first_date, kept.numbered_episode_count, kept.complete))
         self.assertEqual((None, None, False), (gone.first_date, gone.numbered_episode_count, gone.complete))
+
+    def test_rows_read_before_first_episode_capture_are_backfilled(self) -> None:
+        upsert_provider_season_catalog(self.config.db_path, ProviderSeasonCatalog(
+            provider="crunchyroll", provider_season_key="legacy", title="T", numbered_episode_count=12,
+            total_episode_count=12, first_date="2019-10-01", last_date="2019-12-20", date_kind="original_air",
+            complete=True, fetched_at=""))
+        self.assertEqual([], self._needing(["legacy"], days_ahead=0))
+        self.assertEqual(["legacy"], self._needing(["legacy"], days_ahead=1))
+
 
 if __name__ == "__main__":
     unittest.main()

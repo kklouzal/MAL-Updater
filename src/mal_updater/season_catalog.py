@@ -16,6 +16,9 @@ from .db import connect
 # Re-read a season whose last episode is recent: it may still be airing.
 CATALOG_AIRING_WINDOW_DAYS = 45
 CATALOG_AIRING_REFRESH_DAYS = 7
+# Rows read before migration 036 lack first_episode_number; they are re-read,
+# at most this often so a failing season is still deferred.
+CATALOG_BACKFILL_RETRY_HOURS = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +33,7 @@ class ProviderSeasonCatalog:
     date_kind: str
     complete: bool
     fetched_at: str
+    first_episode_number: int | None = None
 
 
 def get_provider_season_catalog(db_path: Path, *, provider: str, provider_season_key: str) -> ProviderSeasonCatalog | None:
@@ -51,6 +55,7 @@ def get_provider_season_catalog(db_path: Path, *, provider: str, provider_season
         date_kind=str(row["date_kind"]),
         complete=bool(row["complete"]),
         fetched_at=str(row["fetched_at"]),
+        first_episode_number=row["first_episode_number"],
     )
 
 
@@ -61,11 +66,13 @@ def season_keys_needing_catalog(
     current = now or datetime.now(timezone.utc)
     airing_cutoff = (current - timedelta(days=CATALOG_AIRING_WINDOW_DAYS)).strftime("%Y-%m-%d")
     refresh_cutoff = (current - timedelta(days=CATALOG_AIRING_REFRESH_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    backfill_cutoff = (current - timedelta(hours=CATALOG_BACKFILL_RETRY_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     with connect(db_path) as conn:
         rows = {
             str(row["provider_season_key"]): row
             for row in conn.execute(
-                "SELECT provider_season_key, last_date, fetched_at, complete FROM provider_season_catalog WHERE provider = ?",
+                "SELECT provider_season_key, last_date, fetched_at, complete, numbered_episode_count, first_episode_number "
+                "FROM provider_season_catalog WHERE provider = ?",
                 (provider,),
             )
         }
@@ -76,7 +83,14 @@ def season_keys_needing_catalog(
             needed.append(key)
             continue
         recent = row["last_date"] is None or str(row["last_date"])[:10] >= airing_cutoff or not row["complete"]
-        if recent and str(row["fetched_at"]) < refresh_cutoff:
+        # Rows read before migration 036 lack the first episode number.
+        missing_first = (
+            row["first_episode_number"] is None
+            and bool(row["numbered_episode_count"])
+            and bool(row["complete"])
+            and str(row["fetched_at"]) < backfill_cutoff
+        )
+        if missing_first or (recent and str(row["fetched_at"]) < refresh_cutoff):
             needed.append(key)
     return needed
 
@@ -87,8 +101,8 @@ def upsert_provider_season_catalog(db_path: Path, entry: ProviderSeasonCatalog) 
             """
             INSERT INTO provider_season_catalog (
                 provider, provider_season_key, title, numbered_episode_count, total_episode_count,
-                first_date, last_date, date_kind, complete, fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                first_date, last_date, date_kind, complete, first_episode_number, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(provider, provider_season_key) DO UPDATE SET
                 title = excluded.title,
                 numbered_episode_count = excluded.numbered_episode_count,
@@ -97,6 +111,7 @@ def upsert_provider_season_catalog(db_path: Path, entry: ProviderSeasonCatalog) 
                 last_date = excluded.last_date,
                 date_kind = excluded.date_kind,
                 complete = excluded.complete,
+                first_episode_number = excluded.first_episode_number,
                 fetched_at = CURRENT_TIMESTAMP
             """,
             (
@@ -109,6 +124,7 @@ def upsert_provider_season_catalog(db_path: Path, entry: ProviderSeasonCatalog) 
                 entry.last_date,
                 entry.date_kind,
                 int(entry.complete),
+                entry.first_episode_number,
             ),
         )
         conn.commit()

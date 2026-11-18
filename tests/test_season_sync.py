@@ -640,6 +640,40 @@ class SeasonSplitExecutorTests(unittest.TestCase):
         sequel = [{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}]
         self.assertIsNone(self._resolve_s2(sequel).mal_anime_id)
 
+    def test_catalog_first_episode_gives_in_season_positions_despite_interleaved_recaps(self) -> None:
+        # Production shape (Slime season 2): episodes 25-48, with two recap
+        # specials interleaved so sequence numbers run to 26.
+        from mal_updater.db import replace_mal_anime_relations
+        from mal_updater.season_catalog import ProviderSeasonCatalog, upsert_provider_season_catalog
+
+        progress = []
+        for index, number in enumerate(range(25, 49), start=1):
+            row = self._progress("cr-1", "S2", number, season_number=2, watched_at=f"2026-03-01T00:{index:02d}:00Z")
+            row["season_episode_ordinal"] = index + (1 if number > 36 else 0) + (1 if number > 46 else 0)
+            progress.append(row)
+        progress.append(self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-02-01T00:00:00Z"))
+        self._ingest([("cr-1", "Slime")], progress)
+        self._map_series("cr-1", 100)
+        upsert_provider_season_mapping(
+            self.config.db_path, provider="crunchyroll", provider_series_id="cr-1", provider_season_key="S2",
+            mal_anime_id=300, mapping_source="auto_exact", confidence=1.0, season_title="Season 2", season_number=2,
+            resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
+        )
+        upsert_provider_season_catalog(self.config.db_path, ProviderSeasonCatalog(
+            provider="crunchyroll", provider_season_key="S2", title="Season 2", numbered_episode_count=24,
+            total_episode_count=26, first_date="2021-01-12", last_date="2021-09-21", date_kind="original_air",
+            complete=True, fetched_at="", first_episode_number=25))
+        replace_mal_anime_relations(
+            self.config.db_path, mal_anime_id=300,
+            relations=[{"related_mal_anime_id": 400, "relation_type": "sequel", "raw": {"node": {"id": 400}}}],
+        )
+        with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list if call.args[0] != 100}
+        self.assertEqual({300: ("completed", 12), 400: ("completed", 12)}, writes)
+
     def test_unresolved_season_is_reviewed_and_never_written(self) -> None:
         progress = [self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-03-01T00:00:00Z")]
         progress += [self._progress("cr-1", "S2", 1, season_number=2, watched_at="2026-03-02T00:00:00Z")]
