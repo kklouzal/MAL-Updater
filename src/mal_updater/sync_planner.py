@@ -1300,7 +1300,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.1"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.2"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1383,7 +1383,12 @@ def _mal_franchise_ids(config: AppConfig, client: MalClient, anchor_id: int) -> 
 _CATALOG_DATE_TOLERANCE_DAYS = 3
 _CATALOG_VETO_DAYS = 45
 _AUXILIARY_MEDIA_TYPES = frozenset({"ova", "special", "tv_special", "movie"})
-_CATALOG_LEAF_RELATIONS = frozenset({"side_story", "parent_story", "other"})
+# "other" is left out: on MAL it is mostly commercials, music videos and
+# collaborations, which only add detail lookups.
+_CATALOG_LEAF_RELATIONS = frozenset({"side_story", "parent_story"})
+# Each candidate costs one (cached) MAL detail lookup. A larger pool declines:
+# uniqueness of the date match cannot be shown on a truncated pool.
+_CATALOG_MAX_CANDIDATES = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -1422,12 +1427,19 @@ def _dated_entry(client: MalClient, mal_anime_id: int) -> _DatedEntry | None:
 
 
 def _catalog_contradicts(client: MalClient, catalog: Any, mal_anime_id: int) -> bool:
-    """A title match whose MAL start date is far from the season's original broadcast."""
+    """A title match whose MAL start date is far from the season's original broadcast.
+
+    A multi-episode season whose episodes all carry one date is a batch drop
+    (e.g. a dub catalog dated by its release, The Promised Neverland season 2
+    is all 2022-03-01), not a broadcast window, so it vetoes nothing.
+    """
     if catalog is None or catalog.date_kind != "original_air":
         return False
     first = _parse_day(catalog.first_date)
+    if first is None or ((catalog.numbered_episode_count or 0) > 1 and catalog.first_date == catalog.last_date):
+        return False
     entry = _dated_entry(client, mal_anime_id)
-    if first is None or entry is None or entry.start is None:
+    if entry is None or entry.start is None:
         return False
     return abs((entry.start - first).days) > _CATALOG_VETO_DAYS
 
@@ -1445,47 +1457,37 @@ def _catalog_dated_candidate(
 
     Sibling seasons often share title stems and episode counts but never their
     broadcast window. Candidates are the matcher's results plus the series'
-    MAL franchise (prequel/sequel chain), restricted to the season's media
-    family (TV/ONA, or OVA/special/movie for extras collections).
-
-    original_air (Crunchyroll): exactly one candidate starts within 3 days of
-    the season's first broadcast; its end must also match, or its direct
-    sequel must end with the season (split cour, Part 1 is returned), or the
-    season's watched positions must fit the entry (provider extras appended).
-    provider_publish (HIDIVE): the provider releases on or after the original
-    broadcast, so the latest family candidate starting by the first publish
-    date is taken when its episode count equals the season's.
+    MAL franchise (prequel/sequel chain) and its side-story leaves, restricted
+    to the season's media family (TV/ONA, or OVA/special/movie for extras
+    collections). See _catalog_entry_for_family for the date rules.
     """
     if catalog is None:
         return None
     first = _parse_day(catalog.first_date)
     if first is None:
         return None
-    family = _AUXILIARY_MEDIA_TYPES if auxiliary_season else _SPLIT_COUR_MEDIA_TYPES
     by_id = {int(candidate.mal_anime_id): candidate for candidate in result.candidates[:6]}
     anchor = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
     if anchor is not None and anchor.approved_by_user:
         franchise, _complete = _mal_franchise_ids(config, client, anchor.mal_anime_id)
         for mal_id in franchise:
             by_id.setdefault(int(mal_id), None)
+            if not auxiliary_season:
+                continue
             # MAL links OVAs/specials as side stories, outside the
             # prequel/sequel chain; they are candidates, not walked further.
             for related, kind in _relation_rows(config, client, mal_id):
                 if kind in _CATALOG_LEAF_RELATIONS:
                     by_id.setdefault(int(related), None)
-    all_entries = [entry for entry in (_dated_entry(client, mal_id) for mal_id in by_id) if entry is not None]
-    # TV before ONA: chibi/mini ONA spin-offs often start within days of the
-    # TV season and share its episode count.
-    families = [_AUXILIARY_MEDIA_TYPES] if auxiliary_season else [frozenset({"tv"}), frozenset({"ona"})]
-    for family in families:
-        entries = [entry for entry in all_entries if entry.media_type in family and entry.start is not None]
-        if not entries:
-            continue
-        chosen_entry = _catalog_entry_for_family(config, client, state, catalog, first, entries)
-        if chosen_entry is not None:
-            break
-    else:
+    if len(by_id) > _CATALOG_MAX_CANDIDATES:
         return None
+    family = _AUXILIARY_MEDIA_TYPES if auxiliary_season else _SPLIT_COUR_MEDIA_TYPES
+    entries = [
+        entry
+        for entry in (_dated_entry(client, mal_id) for mal_id in by_id)
+        if entry is not None and entry.media_type in family and entry.start is not None
+    ]
+    chosen_entry = _catalog_entry_for_family(config, client, state, catalog, first, entries, family) if entries else None
     if chosen_entry is None:
         return None
     candidate = by_id.get(chosen_entry.mal_anime_id)
@@ -1505,6 +1507,24 @@ def _catalog_dated_candidate(
     )
 
 
+def _without_same_week_onas(entries: list[_DatedEntry]) -> list[_DatedEntry]:
+    """Drop ONAs starting within the date tolerance of a TV entry.
+
+    Chibi/mini ONA spin-offs often start within days of their TV season and
+    share its episode count (Hataraku Maou-sama!! and Chiichai! Maou-sama!!),
+    so the TV entry is preferred.
+    """
+    tolerance = timedelta(days=_CATALOG_DATE_TOLERANCE_DAYS)
+    tv_starts = [entry.start for entry in entries if entry.media_type == "tv" and entry.start is not None]
+    return [
+        entry
+        for entry in entries
+        if entry.media_type != "ona"
+        or entry.start is None
+        or not any(abs(entry.start - start) <= tolerance for start in tv_starts)
+    ]
+
+
 def _catalog_entry_for_family(
     config: AppConfig,
     client: MalClient,
@@ -1512,10 +1532,24 @@ def _catalog_entry_for_family(
     catalog: Any,
     first: datetime,
     entries: list[_DatedEntry],
+    family: frozenset[str],
 ) -> _DatedEntry | None:
+    """Pick the entry whose dates fit the season window (entries all have a start).
+
+    original_air (Crunchyroll): exactly one entry is nearest to the season's
+    first broadcast within the tolerance; its end must also match, or its
+    direct sequel must end with the season (split cour, Part 1 is returned),
+    or the season's watched positions must fit the entry (provider extras
+    appended, e.g. OVAs numbered 12-13 after an 11-episode TV season).
+    provider_publish (HIDIVE): the provider releases on or after the original
+    broadcast, so the latest entry started by the first publish date is taken
+    when its episode count equals the season's. A back-catalog season can be
+    published after a later sibling aired, so an equal-count sibling started
+    by then makes the date ambiguous unless the publish date matches the
+    entry's start (a simulcast).
+    """
     tolerance = timedelta(days=_CATALOG_DATE_TOLERANCE_DAYS)
-    family = {entry.media_type for entry in entries}
-    chosen_entry: _DatedEntry | None = None
+    entries = _without_same_week_onas(entries)
     if catalog.date_kind == "original_air":
         starts = sorted(
             (entry for entry in entries if entry.start is not None and abs(entry.start - first) <= tolerance),
@@ -1527,31 +1561,35 @@ def _catalog_entry_for_family(
             return None
         entry = starts[0]
         last = _parse_day(catalog.last_date)
+        if last is None or entry.end is None or abs(entry.end - last) <= tolerance:
+            return entry
+        if last < entry.end - tolerance:
+            return None
+        sequel_id = _direct_sequel_id(config, client, entry.mal_anime_id)
+        sequel = _dated_entry(client, sequel_id) if sequel_id is not None else None
+        if sequel is not None and sequel.media_type in family and sequel.end is not None and abs(sequel.end - last) <= tolerance:
+            return entry
         view = _numbering_view(state, None)
         watched_max = int(view.max_completed_episode_number or view.max_episode_number or 0)
-        if last is None or entry.end is None or abs(entry.end - last) <= tolerance:
-            chosen_entry = entry
-        elif last > entry.end + tolerance:
-            sequel_id = _direct_sequel_id(config, client, entry.mal_anime_id)
-            sequel = _dated_entry(client, sequel_id) if sequel_id is not None else None
-            if sequel is not None and sequel.media_type in family and sequel.end is not None and abs(sequel.end - last) <= tolerance:
-                chosen_entry = entry
-            elif entry.num_episodes and watched_max and watched_max <= entry.num_episodes:
-                chosen_entry = entry
-    else:
-        count = catalog.numbered_episode_count or catalog.total_episode_count
-        started = sorted(
-            (entry for entry in entries if entry.start is not None and entry.start <= first + tolerance),
-            key=lambda entry: entry.start or datetime.min,
-        )
-        if not started or not count:
-            return None
-        latest = started[-1]
-        if len(started) > 1 and started[-2].start == latest.start:
-            return None
-        if latest.num_episodes == count:
-            chosen_entry = latest
-    return chosen_entry
+        if entry.num_episodes and watched_max and watched_max <= entry.num_episodes:
+            return entry
+        return None
+    count = catalog.numbered_episode_count or catalog.total_episode_count
+    started = sorted(
+        (entry for entry in entries if entry.start is not None and entry.start <= first + tolerance),
+        key=lambda entry: entry.start or datetime.min,
+    )
+    if not started or not count:
+        return None
+    latest = started[-1]
+    if len(started) > 1 and started[-2].start == latest.start:
+        return None
+    if latest.num_episodes != count:
+        return None
+    simulcast = latest.start is not None and abs(latest.start - first) <= tolerance
+    if not simulcast and any(entry.num_episodes == count for entry in started[:-1]):
+        return None
+    return latest
 
 
 def _franchise_count_corroborated_candidate(

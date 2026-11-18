@@ -19,6 +19,7 @@ from .hidive_auth import HidiveAuthError, HidiveSession, HidiveStatePaths, start
 from .season_catalog import (
     ProviderSeasonCatalog,
     catalog_candidate_season_keys,
+    record_provider_season_catalog_failure,
     season_keys_needing_catalog,
     upsert_provider_season_catalog,
 )
@@ -63,7 +64,9 @@ def _refresh_season_catalog(session: HidiveSession) -> dict[str, Any]:
     """Catalog a few seasons per run that season-to-MAL matching may need.
 
     Only numeric HIDIVE season ids have a catalog route. A failure never fails
-    the snapshot: catalog facts only add matching evidence.
+    the snapshot: catalog facts only add matching evidence. The first failure
+    ends this run's catalog work and defers that season, so a season that
+    keeps failing cannot starve the others.
     """
     db_path = session.config.db_path
     report: dict[str, Any] = {"requested": 0, "stored": 0, "failed": 0}
@@ -82,14 +85,18 @@ def _refresh_season_catalog(session: HidiveSession) -> dict[str, Any]:
                 if not isinstance(page, dict):
                     raise HidiveSnapshotError("HIDIVE season payload was not a JSON object")
                 pages.append(page)
-                paging = page.get("paging") if isinstance(page.get("paging"), dict) else {}
+                paging_value = page.get("paging")
+                paging: dict[str, Any] = paging_value if isinstance(paging_value, dict) else {}
                 if not paging.get("moreDataAvailable") or paging.get("lastSeen") is None:
                     break
                 params = {"rpp": HIDIVE_HOME_ITEMS_PER_BUCKET, "lastSeen": paging["lastSeen"]}
         except (HidiveAuthError, HidiveSnapshotError) as exc:
             report["failed"] += 1
             report.setdefault("errors", []).append(f"{season_key}: {str(exc)[:160]}")
-            continue
+            record_provider_season_catalog_failure(
+                db_path, provider="hidive", provider_season_key=season_key, date_kind="provider_publish"
+            )
+            break
         upsert_provider_season_catalog(db_path, _season_catalog_from_pages(season_key, pages))
         report["stored"] += 1
     return report

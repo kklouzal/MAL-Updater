@@ -54,7 +54,9 @@ MAL_ANIME_SEARCH_QUERY_MAX_CHARS = 64
 MAL_ANIME_LIST_MAX_LIMIT = 1000
 
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
-_MAL_OMISSIBLE_NULLABLE_ANIME_DETAIL_FIELDS = frozenset({"broadcast", "rank"})
+# start_date/end_date are optional in the MAL v2 anime schema: omitted for
+# unannounced entries and (end_date) for entries still airing.
+_MAL_OMISSIBLE_NULLABLE_ANIME_DETAIL_FIELDS = frozenset({"broadcast", "rank", "start_date", "end_date"})
 # Preserve the existing rank cache-coverage behavior. A cache response that did
 # not request broadcast cannot establish that MAL omitted a requested value.
 _MAL_COVERING_CACHE_OPTIONAL_ANIME_DETAIL_FIELDS = frozenset({"rank"})

@@ -25,6 +25,7 @@ from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, Watchlis
 from .season_catalog import (
     ProviderSeasonCatalog,
     catalog_candidate_season_keys,
+    record_provider_season_catalog_failure,
     season_keys_needing_catalog,
     upsert_provider_season_catalog,
 )
@@ -655,7 +656,9 @@ def _refresh_season_catalog(session: "_CrunchyrollAuthSession") -> dict[str, Any
     """Catalog a few seasons per run that season-to-MAL matching may need.
 
     A failure here never fails the snapshot: catalog facts only add matching
-    evidence and are retried on a later run.
+    evidence. The first failure ends this run's catalog work (a broken session
+    or network fails every read) and defers that season, so a season that
+    keeps failing cannot starve the others.
     """
     db_path = session.config.db_path
     report: dict[str, Any] = {"requested": 0, "stored": 0, "failed": 0}
@@ -673,15 +676,19 @@ def _refresh_season_catalog(session: "_CrunchyrollAuthSession") -> dict[str, Any
                 params={"locale": session.config.crunchyroll.locale},
                 phase=f"season catalog {season_key}",
             )
-        except CrunchyrollSnapshotError as exc:
-            report["failed"] += 1
-            report.setdefault("errors", []).append(f"{season_key}: {str(exc)[:160]}")
-            continue
-        entry = _season_catalog_from_episodes(season_key, payload)
+        except (CrunchyrollSnapshotError, CrunchyrollAuthError) as exc:
+            error = str(exc)[:160]
+            entry = None
+        else:
+            entry = _season_catalog_from_episodes(season_key, payload)
+            error = "malformed episode listing"
         if entry is None:
             report["failed"] += 1
-            report.setdefault("errors", []).append(f"{season_key}: malformed episode listing")
-            continue
+            report.setdefault("errors", []).append(f"{season_key}: {error}")
+            record_provider_season_catalog_failure(
+                db_path, provider="crunchyroll", provider_season_key=season_key, date_kind="original_air"
+            )
+            break
         upsert_provider_season_catalog(db_path, entry)
         report["stored"] += 1
     return report

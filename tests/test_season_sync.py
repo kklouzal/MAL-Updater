@@ -758,9 +758,6 @@ class SeasonMappingCliAndHealthTests(unittest.TestCase):
             self.assertNotIn("unresolved_season_mappings", codes)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class SeasonCatalogDateResolutionTests(unittest.TestCase):
     """Matching by season date windows (probed 2026-11-18 on the unresolved seasons)."""
@@ -862,3 +859,45 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         entries = {100: ("tv", 24, "2018-10-02", "2019-03-19"), 700: ("ova", 5, "2019-07-09", "2020-11-27")}
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2019-07-09", "last": "2020-11-27", "count": 5}, entries)
         self.assertEqual(700, target.mal_anime_id)
+
+    def test_same_week_mini_ona_does_not_take_a_split_tv_season(self) -> None:
+        # The Devil is a Part-Timer! season 2 (probed): TV 48413 + sequel 53200
+        # span the season; chibi ONA 52970 starts 3 days later and ends with it.
+        self._seed("crunchyroll", "Season 2", relations={100: [(300, "sequel"), (900, "side_story")], 300: [(100, "prequel")], 900: []})
+        entries = {100: ("tv", 12, "2022-07-14", "2022-09-29"), 300: ("tv", 12, "2023-07-13", "2023-09-28"),
+                   900: ("ona", 24, "2022-07-17", "2023-10-01")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-07-14", "last": "2023-09-28", "count": 24}, entries)
+        self.assertEqual(100, target.mal_anime_id)
+        # When the TV entry cannot be confirmed (no sequel link, watched past
+        # its count) the same-week ONA is still not taken.
+        self.temp_dir.cleanup()
+        self.setUp()
+        self._seed("crunchyroll", "Season 2", relations={100: [(900, "side_story")], 900: []})
+        entries[100] = ("tv", 10, "2022-07-14", "2022-09-29")
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-07-14", "last": "2023-09-28", "count": 24}, entries)
+        self.assertIsNone(target.mal_anime_id)
+
+    def test_batch_dated_catalog_does_not_veto_a_title_match(self) -> None:
+        # A dub catalog dated by its release (all episodes one day) is not a broadcast window.
+        self._seed("crunchyroll", "Season 1", relations={100: [(200, "sequel")], 200: [(100, "prequel")]})
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-03-01", "last": "2022-03-01"},
+                               self.SIBLINGS, engine_choice=100, engine_auto=True)
+        self.assertEqual(100, target.mal_anime_id)
+        self.assertIn("season_mapping_accepted_by=mapping_engine_auto_approval", target.reasons)
+
+    def test_hidive_back_catalog_publish_date_is_ambiguous_between_equal_siblings(self) -> None:
+        # Season 1 published after its equal-length sequel aired: the latest
+        # started entry is the sequel, so the date cannot decide.
+        self._seed("hidive", "Season 1", relations={100: [(200, "sequel")], 200: [(100, "prequel")]})
+        target = self._resolve("hidive", {"kind": "provider_publish", "first": "2025-09-01", "last": "2025-09-10"}, self.SIBLINGS)
+        self.assertIsNone(target.mal_anime_id)
+        # A simulcast publish date matches the sequel's start and decides.
+        self.temp_dir.cleanup()
+        self.setUp()
+        self._seed("hidive", "Season 2", relations={100: [(200, "sequel")], 200: [(100, "prequel")]})
+        target = self._resolve("hidive", {"kind": "provider_publish", "first": "2025-04-06", "last": "2025-06-22"}, self.SIBLINGS)
+        self.assertEqual(200, target.mal_anime_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

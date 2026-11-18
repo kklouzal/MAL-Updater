@@ -114,6 +114,26 @@ def upsert_provider_season_catalog(db_path: Path, entry: ProviderSeasonCatalog) 
         conn.commit()
 
 
+def record_provider_season_catalog_failure(db_path: Path, *, provider: str, provider_season_key: str, date_kind: str) -> None:
+    """Defer a season whose catalog read failed by CATALOG_AIRING_REFRESH_DAYS.
+
+    Without this a season that keeps failing (e.g. removed from the provider)
+    would stay first in line and starve the per-run budget. A season without
+    a row gets an empty incomplete row, which season resolution ignores; an
+    existing row keeps its facts.
+    """
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_season_catalog (provider, provider_season_key, date_kind, complete, fetched_at)
+            VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT(provider, provider_season_key) DO UPDATE SET fetched_at = CURRENT_TIMESTAMP
+            """,
+            (provider, provider_season_key, date_kind),
+        )
+        conn.commit()
+
+
 def catalog_candidate_season_keys(db_path: Path, *, provider: str) -> list[str]:
     """Season keys that season resolution may need, unresolved seasons first.
 
