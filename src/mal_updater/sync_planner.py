@@ -1325,7 +1325,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.5"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.6"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1413,6 +1413,8 @@ _AUXILIARY_MEDIA_TYPES = frozenset({"ova", "ona", "special", "tv_special", "movi
 # "other" is left out: on MAL it is mostly commercials, music videos and
 # collaborations, which only add detail lookups.
 _CATALOG_LEAF_RELATIONS = frozenset({"side_story", "parent_story"})
+# Director's cuts and re-edits are alternative versions of a TV season.
+_CATALOG_ALTERNATIVE_RELATIONS = frozenset({"alternative_version"})
 # Each candidate costs one (cached) MAL detail lookup. A larger pool declines:
 # uniqueness of the date match cannot be shown on a truncated pool.
 _CATALOG_MAX_CANDIDATES = 40
@@ -1508,14 +1510,14 @@ def _catalog_dated_candidate(
             # A complete franchise walk bounds the season's possible entries;
             # unrelated title-search hits would only add false siblings.
             by_id = {mal_id: candidate for mal_id, candidate in by_id.items() if mal_id in franchise}
+        leaf_relations = (_CATALOG_LEAF_RELATIONS | _CATALOG_ALTERNATIVE_RELATIONS) if auxiliary_season else _CATALOG_ALTERNATIVE_RELATIONS
         for mal_id in franchise:
             by_id.setdefault(int(mal_id), None)
-            if not auxiliary_season:
-                continue
-            # MAL links OVAs/specials as side stories, outside the
-            # prequel/sequel chain; they are candidates, not walked further.
+            # MAL links OVAs/specials as side stories and director's cuts as
+            # alternative versions, outside the prequel/sequel chain; they are
+            # candidates, not walked further.
             for related, kind in _relation_rows(config, client, mal_id):
-                if kind in _CATALOG_LEAF_RELATIONS:
+                if kind in leaf_relations:
                     by_id.setdefault(int(related), None)
     if len(by_id) > _CATALOG_MAX_CANDIDATES:
         return None
@@ -1530,6 +1532,15 @@ def _catalog_dated_candidate(
         # Single-day dates are a real release for an OVA set but a batch drop
         # for a dub catalog; when they fit no entry, fall back to the count.
         chosen_entry = _catalog_count_fingerprint(catalog, pool)
+    single_movie = not catalog.numbered_episode_count and catalog.total_episode_count == 1
+    if chosen_entry is None and single_movie and franchise_complete:
+        # A one-item season without numbered episodes is a film; a dub
+        # catalog dates it by the dub release, so take the franchise's only
+        # movie entry when there is exactly one.
+        movie_pool = [entry for entry in (_dated_entry(client, mal_id) for mal_id in by_id) if entry is not None]
+        movies = [entry for entry in movie_pool if entry.media_type == "movie"]
+        if len(movies) == 1:
+            chosen_entry = movies[0]
     if chosen_entry is None:
         return None
     candidate = by_id.get(chosen_entry.mal_anime_id)
@@ -1805,6 +1816,11 @@ def _resolve_season_target(
     catalog = get_provider_season_catalog(
         config.db_path, provider=state.provider, provider_season_key=state.provider_season_key
     )
+    if catalog is not None and not catalog.numbered_episode_count and catalog.total_episode_count == 1:
+        # A one-item season without numbered episodes is a film or special.
+        auxiliary_season = True
+        if chosen is not None and chosen.media_type == "tv":
+            chosen = None
     accepted_by: str | None = None
     if chosen is not None and should_auto_approve_mapping(result):
         if _catalog_contradicts(client, catalog, chosen.mal_anime_id):

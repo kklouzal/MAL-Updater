@@ -872,7 +872,7 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
 
         upsert_provider_season_catalog(self.config.db_path, ProviderSeasonCatalog(
             provider=provider, provider_season_key="SX", title=None, numbered_episode_count=catalog.get("count", 12),
-            total_episode_count=catalog.get("count", 12), first_date=catalog["first"], last_date=catalog.get("last"),
+            total_episode_count=catalog.get("total", catalog.get("count", 12)), first_date=catalog["first"], last_date=catalog.get("last"),
             date_kind=catalog["kind"], complete=True, fetched_at=""))
         state = next(s for s in load_provider_series_states(self.config, split_seasons=True) if s.provider_season_key == "SX")
         chosen = None
@@ -1004,6 +1004,22 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         entries = {100: ("tv", 12, "2019-01-11", "2019-03-29"), 200: ("tv", 11, "2021-01-08", "2021-03-26")}
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-03-01", "last": "2022-03-01", "count": 12}, entries)
         self.assertEqual(100, target.mal_anime_id)
+
+    def test_directors_cut_season_matches_its_alternative_version_entry(self) -> None:
+        # Production case: Re:Zero "Season 1: Director's Cut" (2020-01-01).
+        self._seed("crunchyroll", "Season 1: Director's Cut", relations={100: [(950, "alternative_version")], 950: []})
+        entries = {100: ("tv", 25, "2016-04-04", "2016-09-19"), 950: ("tv", 13, "2020-01-01", "2020-03-25")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2020-01-01", "last": "2020-04-01", "count": 13}, entries)
+        self.assertEqual(950, target.mal_anime_id)
+
+    def test_dub_dated_single_film_matches_the_franchise_movie(self) -> None:
+        # Production case: Konosuba "Legend of Crimson (English Dub)", one
+        # item dated by the dub release, MAL movie from 2019.
+        self._seed("crunchyroll", "Legend of Crimson (English Dub)", relations={100: [(960, "side_story"), (970, "side_story")], 960: [], 970: []})
+        entries = {100: ("tv", 10, "2016-01-14", "2016-03-17"), 960: ("movie", 1, "2019-08-30", "2019-08-30"),
+                   970: ("ova", 1, "2016-06-24", "2016-06-24")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2020-03-25", "last": "2020-03-25", "count": 0, "total": 1}, entries)
+        self.assertEqual(960, target.mal_anime_id)
 
     def test_ova_season_matches_its_side_story_ova_entry(self) -> None:
         self._seed("crunchyroll", "OVA Season 1", relations={100: [(700, "side_story")], 700: []})
