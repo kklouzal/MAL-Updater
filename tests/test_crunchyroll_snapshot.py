@@ -1055,6 +1055,50 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertFalse((session.state_paths.root / "snapshot_bootstrap_resume.json").exists())
             self.assertTrue(session.state_paths.sync_boundary_path.exists())
 
+    def test_automatic_bootstrap_chunks_resume_by_history_cursor(self) -> None:
+        # Chunks past the numeric page limit continue from the saved cursor; a
+        # resume saved before cursor paging (page 11, no cursor) restarts at page 1.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            requested: list[object] = []
+
+            def fake_get(url, *, params=None, phase=None):
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123"}
+                if url.endswith("/watch-history"):
+                    cursor = params["page"]
+                    requested.append(cursor)
+                    if isinstance(cursor, int) and cursor > 1:
+                        raise AssertionError("only page 1 is requested numerically")
+                    index = 1 if cursor == 1 else int(str(cursor).removeprefix("cur-"))
+                    next_page = "" if index == 3 else f"/content/v2/acct-123/watch-history?page=cur-{index + 1}&page_size=100"
+                    data = [self._history_entry((index - 1) * 100 + i) for i in range(100)]
+                    return {"total": 100, "data": data, "meta": {"next_page": next_page}}
+                if url.endswith("/watchlist"):
+                    return {"total": 0, "data": []}
+                raise AssertionError(url)
+
+            resume_path = session.state_paths.root / "snapshot_bootstrap_resume.json"
+            resume_path.parent.mkdir(parents=True, exist_ok=True)
+            resume_path.write_text(json.dumps({
+                "schema_version": 1, "account_id_hint": "acct-123", "locale": session.config.crunchyroll.locale,
+                "history_next_page": 11, "history_next_cursor": None, "watchlist_next_start": 0,
+                "history_entries": [self._history_entry(9999)], "updated_at": crunchyroll_snapshot._now_string(),
+            }))
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                first = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                self.assertEqual("cur-2", json.loads(resume_path.read_text())["history_next_cursor"])
+                second = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                third = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+            self.assertTrue(first.snapshot.raw["partial"])
+            self.assertTrue(second.snapshot.raw["partial"])
+            self.assertFalse(third.snapshot.raw["partial"])
+            self.assertEqual([1, "cur-2", "cur-3", 1], requested)
+            self.assertEqual(300, third.snapshot.raw["bootstrap_staged_history_count"])
+            self.assertFalse(resume_path.exists())
+
     def test_automatic_bootstrap_page_one_drift_restarts_without_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -1039,6 +1039,14 @@ def _fetch_snapshot_once(
     bootstrap_watchlist_total: int | None = None
     bootstrap_drift_count = 0
     resume_history_cursor: str | None = None
+    if (
+        bootstrap_resume is not None
+        and _non_empty_str(bootstrap_resume.get("history_next_cursor")) is None
+        and int(bootstrap_resume.get("history_next_page") or 1) > CRUNCHYROLL_HISTORY_NUMERIC_PAGE_LIMIT
+    ):
+        # A resume saved before cursor paging cannot continue past the numeric
+        # page limit; restart this bootstrap generation from page 1.
+        bootstrap_resume = None
     if bootstrap_resume is not None:
         if bootstrap_resume.get("quarantined") is True:
             raise CrunchyrollSnapshotError(
@@ -1084,10 +1092,11 @@ def _fetch_snapshot_once(
     page = max(1, history_start_page)
     # Watch history pages by an opaque cursor (meta.next_page). Numeric pages
     # are only honored up to page 10 (1000 entries); deeper ones return 400.
-    history_cursor: str | None = resume_history_cursor if bootstrap_resume is not None else None
-    if page > 1 and history_cursor is None and page > CRUNCHYROLL_HISTORY_NUMERIC_PAGE_LIMIT:
+    history_cursor = resume_history_cursor
+    if history_cursor is None and page > CRUNCHYROLL_HISTORY_NUMERIC_PAGE_LIMIT:
         raise CrunchyrollSnapshotError(
-            f"Crunchyroll watch-history cannot resume at page {page} without a cursor; restart the traversal from page 1"
+            f"Crunchyroll watch-history cannot start at page {page} without a cursor; "
+            f"numeric pages beyond {CRUNCHYROLL_HISTORY_NUMERIC_PAGE_LIMIT} are rejected"
         )
     while True:
         if page > CRUNCHYROLL_HISTORY_PAGE_LIMIT:

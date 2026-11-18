@@ -52,6 +52,7 @@ from .db import (
     record_mal_public_userrecs_revalidation,
     record_mal_public_userrecs_final_anchor,
     renew_mal_public_userrecs_source_claim,
+    mal_anime_relations_from_related,
     replace_mal_anime_relations,
     restart_mal_user_anime_list_traversal_after_drift,
     replace_mal_public_userrecs_staged_page,
@@ -2016,26 +2017,9 @@ def refresh_recommendation_metadata(
             failures.append(MetadataRefreshFailure(mal_anime_id=anime_id, stage="mapped_metadata", error=str(exc)))
             continue
         _metadata_payload_from_details(config.db_path, mal_anime_id=anime_id, details=details)
-        relations_payload: list[dict[str, Any]] = []
-        for relation in details.get("related_anime") or []:
-            if not isinstance(relation, dict):
-                continue
-            node = relation.get("node") or {}
-            if not isinstance(node, dict) or not isinstance(node.get("id"), int):
-                continue
-            relation_type = relation.get("relation_type")
-            if not isinstance(relation_type, str) or not relation_type:
-                continue
-            relations_payload.append(
-                {
-                    "related_mal_anime_id": int(node["id"]),
-                    "relation_type": relation_type,
-                    "relation_type_formatted": relation.get("relation_type_formatted"),
-                    "related_title": node.get("title") if isinstance(node.get("title"), str) else None,
-                    "raw": relation,
-                }
-            )
-        replace_mal_anime_relations(config.db_path, mal_anime_id=anime_id, relations=relations_payload)
+        replace_mal_anime_relations(
+            config.db_path, mal_anime_id=anime_id, relations=mal_anime_relations_from_related(details.get("related_anime"))
+        )
 
         recommendation_edges: list[dict[str, Any]] = []
         for rec in details.get("recommendations") or []:

@@ -279,7 +279,29 @@ class SeasonSplitExecutorTests(unittest.TestCase):
         writes = {call.args[0]: call.kwargs for call in update.call_args_list}
         self.assertEqual(("completed", 12), (writes[100]["status"], writes[100]["num_watched_episodes"]))
         self.assertEqual(("watching", 8), (writes[200]["status"], writes[200]["num_watched_episodes"]))
+        # The unit's last watch was a Part 2 episode, so Part 1's finish date is unknown.
+        self.assertIsNone(writes[100]["finish_date"])
         self.assertTrue(all(any(r.startswith("split_cour_overflow") for r in result.reasons) for result in results))
+
+    def test_single_episode_past_mal_count_is_not_treated_as_part_two(self) -> None:
+        # Production case: a 13-episode provider season whose MAL entry has 12
+        # (episode 13 is an extra) must not mark the MAL sequel "watching 1".
+        from mal_updater.db import replace_mal_anime_relations
+
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 14)]
+        self._ingest([("cr-1", "Example Show")], progress)
+        self._map_series("cr-1", 100)
+        replace_mal_anime_relations(
+            self.config.db_path,
+            mal_anime_id=100,
+            relations=[{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}],
+        )
+        with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
+            MalClient, "update_my_list_status", side_effect=AssertionError("must not write")
+        ):
+            results = execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        self.assertEqual(["review"], [result.proposal_decision for result in results])
+        self.assertEqual([100], [result.mal_anime_id for result in results])
 
     def test_seasons_sharing_one_mal_entry_write_only_the_most_advanced(self) -> None:
         # Production case: a 103-episode MAL entry published as several provider
@@ -335,6 +357,9 @@ class SeasonSplitExecutorTests(unittest.TestCase):
 
         short = replace(state, max_episode_number=10, completed_episode_count=10)
         self.assertIsNone(_split_cour_first_part(self.config, client, short, [candidate(11, 11), candidate(12, 12)]))
+        # Numbering continued from an earlier season (13-24) is not a split cour.
+        continued = replace(state, min_episode_number=13, max_episode_number=24)
+        self.assertIsNone(_split_cour_first_part(self.config, client, continued, [candidate(11, 11), candidate(12, 12)]))
         # A movie candidate is never a split-cour part.
         self.assertIsNone(_split_cour_first_part(self.config, client, state, [candidate(11, 11), candidate(12, 12, "movie")]))
 

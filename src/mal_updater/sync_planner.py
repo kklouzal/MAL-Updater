@@ -14,6 +14,7 @@ from .db import (
     get_mal_user_anime_list_cache,
     get_series_mapping,
     list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
+    mal_anime_relations_from_related,
     reconcile_mal_user_state_after_write,
     replace_mal_anime_relations,
     replace_review_queue_entries,
@@ -1181,11 +1182,9 @@ def build_dry_run_sync_plan(
         )
         for unit_state, unit_target in units:
             assert unit_target.mal_anime_id is not None
-            unit_detail = detail
-            if unit_target.mal_anime_id != chosen_anime_id:
-                unit_detail, _ = _cached_detail(client, unit_target.mal_anime_id)
-                if unit_detail is None:
-                    continue
+            unit_detail = detail if unit_target.mal_anime_id == chosen_anime_id else _cached_detail(client, unit_target.mal_anime_id)[0]
+            if unit_detail is None:
+                continue
             proposal = _plan_status_update(
                 unit_state,
                 unit_detail,
@@ -1239,6 +1238,15 @@ class _ApplyTarget:
 
 
 _SPLIT_COUR_MEDIA_TYPES = frozenset({"tv", "ona"})
+_SPLIT_COUR_MIN_OVERFLOW = 2
+
+
+def _catalog_detail(client: MalClient, mal_anime_id: int) -> dict[str, Any] | None:
+    try:
+        detail = client.get_anime_details(mal_anime_id, fields=_MAL_SYNC_DETAIL_FIELDS)
+    except MalApiError:
+        return None
+    return detail if isinstance(detail, dict) else None
 
 
 def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -> int | None:
@@ -1253,21 +1261,7 @@ def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -
             detail = client.get_anime_details(int(mal_anime_id), fields="id,related_anime")
         except MalApiError:
             return None
-        related = detail.get("related_anime") if isinstance(detail, dict) else None
-        relations = [
-            {
-                "related_mal_anime_id": int(entry["node"]["id"]),
-                "relation_type": str(entry["relation_type"]),
-                "relation_type_formatted": entry.get("relation_type_formatted"),
-                "related_title": entry["node"].get("title"),
-                "raw": entry,
-            }
-            for entry in related or []
-            if isinstance(entry, dict)
-            and isinstance(entry.get("node"), dict)
-            and isinstance(entry["node"].get("id"), int)
-            and isinstance(entry.get("relation_type"), str)
-        ]
+        relations = mal_anime_relations_from_related(detail.get("related_anime") if isinstance(detail, dict) else None)
         if not relations:
             return None
         replace_mal_anime_relations(config.db_path, mal_anime_id=int(mal_anime_id), relations=relations)
@@ -1288,6 +1282,10 @@ def _split_cour_first_part(
     """
     top = [candidate for candidate in candidates[:2] if candidate.media_type in _SPLIT_COUR_MEDIA_TYPES]
     if len(top) != 2 or any(not candidate.num_episodes for candidate in top):
+        return None
+    if state.min_episode_number not in (None, 1):
+        # Numbering continued from an earlier season (Season 2 = 13-24) also
+        # exceeds Part 1; only a season numbered from 1 spans Part 1 into Part 2.
         return None
     evidence = max(int(state.max_episode_number or 0), state.completed_episode_count)
     for first, second in (top, top[::-1]):
@@ -1469,8 +1467,8 @@ def execute_approved_sync(
             continue
         if exact_approved_only and target.mapping_source not in EXACT_APPROVED_MAPPING_SOURCES:
             continue
-        target = _ApplyTarget(target.mal_anime_id, target.mapping_source, target.confidence, base_reasons + target.reasons)
         first_detail, first_lookup_reasons = _cached_detail(client, target.mal_anime_id)
+        target = _ApplyTarget(target.mal_anime_id, target.mapping_source, target.confidence, base_reasons + target.reasons)
         for unit_state, unit_target in _split_cour_units(config, client, state, target, first_detail=first_detail):
             if unit_target.mal_anime_id == target.mal_anime_id:
                 unit_detail, lookup_reasons = first_detail, first_lookup_reasons
@@ -1599,21 +1597,26 @@ def _split_cour_units(
     holds the remainder (MAL Part 1 / Part 2 of one provider season).
     """
     assert target.mal_anime_id is not None
-    detail = first_detail if first_detail is not None else _cached_detail(client, target.mal_anime_id)[0]
+    # Only catalog fields (episode count, media type) are needed here, so the
+    # entry need not be on the user's list.
+    detail = first_detail if first_detail is not None else _catalog_detail(client, target.mal_anime_id)
     first_count = _coerce_detail_int((detail or {}).get("num_episodes"))
     completed = state.completed_episode_count
     max_completed = int(state.max_completed_episode_number or 0)
     if (
         not first_count
-        or completed <= first_count
         or completed != max_completed
         or state.min_episode_number not in (None, 1)
+        # A single episode past MAL's count is far more often an extra the
+        # provider numbers into the season (MAL lists it as an OVA) than a
+        # Part 2; such a unit stays in review until more of Part 2 is watched.
+        or completed - first_count < _SPLIT_COUR_MIN_OVERFLOW
     ):
         return [(state, target)]
     sequel_id = _direct_sequel_id(config, client, target.mal_anime_id)
     if sequel_id is None:
         return [(state, target)]
-    sequel_detail, _ = _cached_detail(client, sequel_id)
+    sequel_detail = _catalog_detail(client, sequel_id)
     sequel_count = _coerce_detail_int((sequel_detail or {}).get("num_episodes"))
     if (
         sequel_detail is None
@@ -1629,6 +1632,9 @@ def _split_cour_units(
         max_completed_episode_number=first_count,
         max_episode_number=min(max_episode, first_count),
         min_episode_number=1,
+        # The unit's last watch may be a Part 2 episode; Part 1's finish date
+        # is unknown, so it is not filled.
+        last_watched_at=None,
     )
     second_state = replace(
         state,

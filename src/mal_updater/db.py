@@ -3012,6 +3012,30 @@ def merge_mal_user_anime_list_cache_into_metadata(
         conn.close()
     return changed
 
+def mal_anime_relations_from_related(related_anime: Any) -> list[dict[str, Any]]:
+    """Rows for replace_mal_anime_relations from a MAL detail ``related_anime`` list."""
+    relations: list[dict[str, Any]] = []
+    for relation in related_anime or []:
+        if not isinstance(relation, dict):
+            continue
+        node = relation.get("node") or {}
+        if not isinstance(node, dict) or not isinstance(node.get("id"), int):
+            continue
+        relation_type = relation.get("relation_type")
+        if not isinstance(relation_type, str) or not relation_type:
+            continue
+        relations.append(
+            {
+                "related_mal_anime_id": int(node["id"]),
+                "relation_type": relation_type,
+                "relation_type_formatted": relation.get("relation_type_formatted"),
+                "related_title": node.get("title") if isinstance(node.get("title"), str) else None,
+                "raw": relation,
+            }
+        )
+    return relations
+
+
 def replace_mal_anime_relations(db_path: Path, *, mal_anime_id: int, relations: list[dict[str, Any]]) -> None:
     with connect(db_path) as conn:
         conn.execute("DELETE FROM mal_anime_relations WHERE mal_anime_id = ?", (int(mal_anime_id),))
