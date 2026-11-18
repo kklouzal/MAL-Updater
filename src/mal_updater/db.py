@@ -67,6 +67,8 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     PROVIDER_FETCH_PROVENANCE_MIGRATION,
     RECOMMENDATION_DECISION_LEDGER_MIGRATION,
     RECOMMENDATION_DECISION_LEDGER_RETENTION_MIGRATION,
+    "032_provider_episode_season_identity.sql",
+    "033_provider_season_mappings.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -1713,9 +1715,24 @@ class MalUserAnimeListRefreshConflictError(RuntimeError):
     """A cache refresh lost ownership of the current active generation."""
 
 
-MAL_USER_LIST_PAGINATION_LOGIC_VERSION = "mal-user-list-pagination-v3"
+# v4: single-request limit=1000 pages and fingerprints over retained semantic
+# fields only (MAL flips node.main_picture between .jpg/.webp per response).
+MAL_USER_LIST_PAGINATION_LOGIC_VERSION = "mal-user-list-pagination-v4"
 MAL_USER_LIST_CLAIM_SECONDS = 15 * 60
-MAL_USER_LIST_MAX_DRIFT_RESTARTS = 2
+# Pre-v4 logic quarantined a lineage after repeated presentation-only drift.
+# Such quarantines are not contract evidence, so newer logic resumes past them.
+MAL_USER_LIST_LEGACY_DRIFT_QUARANTINE_PREFIX = "MAL list snapshot drift"
+# Query keys that may change across logic versions without changing which
+# account list partitions a traversal lineage covers.
+_MAL_USER_LIST_LINEAGE_VOLATILE_QUERY_KEYS = frozenset({"logic_version", "page_size"})
+
+
+class MalUserListSnapshotDriftError(ValueError):
+    """The live MAL list changed during traversal; a fresh snapshot may succeed.
+
+    Plain ValueError from the traversal/validation boundary is a contract
+    violation and quarantines the lineage; this subclass never does.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -2681,12 +2698,17 @@ def reconcile_mal_user_state_after_write(
     *,
     mal_anime_id: int,
     list_status: dict[str, Any],
+    title: str | None = None,
 ) -> None:
-    """Remove stale detail state and reconcile an existing @me-list cache row.
+    """Reconcile local MAL user state with a confirmed MAL list write.
 
     MAL's update response is the committed user-list status.  Detail cache rows
     mix long-lived catalog metadata with that mutable status, so invalidation is
-    safer than extending their lifetime with a partial update response.
+    safer than extending their lifetime with a partial update response.  The
+    @me-list cache row is merged or, for an entry the write just created,
+    inserted; the metadata ``my_list_status`` read by recommendations follows it.
+    A newly inserted row carries the last published generation, so the next
+    complete publication either refreshes it from MAL or prunes it.
     """
     anime_id = int(mal_anime_id)
     committed = dict(list_status)
@@ -2702,6 +2724,9 @@ def reconcile_mal_user_state_after_write(
         row = conn.execute(
             "SELECT * FROM mal_user_anime_list_cache WHERE mal_anime_id = ?",
             (anime_id,),
+        ).fetchone()
+        metadata = conn.execute(
+            "SELECT title, raw_json FROM mal_anime_metadata WHERE mal_anime_id = ?", (anime_id,)
         ).fetchone()
         if row is not None:
             prior_status = _load_json_value(row["list_status_json"], {})
@@ -2731,6 +2756,43 @@ def reconcile_mal_user_state_after_write(
                     json.dumps(raw, ensure_ascii=False, sort_keys=True),
                     anime_id,
                 ),
+            )
+        else:
+            known_title = title if isinstance(title, str) and title.strip() else (
+                metadata["title"] if metadata is not None and isinstance(metadata["title"], str) else None
+            )
+            node = {"id": anime_id, **({"title": known_title.strip()} if known_title and known_title.strip() else {})}
+            fence = conn.execute(
+                "SELECT MAX(generation) AS generation FROM mal_user_anime_list_publication_fence"
+            ).fetchone()
+            published_generation = int(fence["generation"]) if fence is not None and fence["generation"] is not None else 0
+            prepared = _prepare_mal_user_list_cache_item(
+                {"node": node, "list_status": committed},
+                refresh_run_id="mal-write-reconcile",
+                generation=published_generation,
+                fetched_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            )
+            if prepared is None or prepared[2] is None:
+                raise ValueError("confirmed MAL write lacks a supported list status for cache reconciliation")
+            conn.execute(
+                """INSERT INTO mal_user_anime_list_cache
+                   (mal_anime_id,title,list_status,user_score,num_episodes_watched,start_date,finish_date,list_updated_at,
+                    priority,is_rewatching,num_times_rewatched,rewatch_value,tag_count,has_comments,node_json,list_status_json,
+                    raw_json,refresh_run_id,refresh_generation,fetched_at,last_seen_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                prepared,
+            )
+        if metadata is not None:
+            cache_row = conn.execute(
+                "SELECT * FROM mal_user_anime_list_cache WHERE mal_anime_id = ?", (anime_id,)
+            ).fetchone()
+            raw_metadata = _load_json_value(metadata["raw_json"], {})
+            if not isinstance(raw_metadata, dict):
+                raw_metadata = {}
+            raw_metadata["my_list_status"] = _my_list_status_from_cache_entry(_mal_user_list_entry_from_row(cache_row))
+            conn.execute(
+                "UPDATE mal_anime_metadata SET raw_json = ?, updated_at = CURRENT_TIMESTAMP WHERE mal_anime_id = ?",
+                (json.dumps(raw_metadata, ensure_ascii=False, sort_keys=True), anime_id),
             )
         conn.commit()
 
@@ -2866,14 +2928,42 @@ def _my_list_status_from_cache_entry(entry: MalUserAnimeListCacheEntry) -> dict[
     return payload
 
 
-def merge_mal_user_anime_list_cache_into_metadata(db_path: Path, *, metadata_fetched_at_for_new_rows: str = "1970-01-01 00:00:00") -> int:
+def merge_mal_user_anime_list_cache_into_metadata(
+    db_path: Path,
+    *,
+    metadata_fetched_at_for_new_rows: str = "1970-01-01 00:00:00",
+    clear_absent: bool = False,
+) -> int:
+    """Copy cached @me-list state into metadata ``my_list_status``.
+
+    ``clear_absent`` is only valid right after a complete, pruning publication
+    of the whole list: metadata entries not in the cache are then known to be
+    off the user's MAL list and their ``my_list_status`` becomes null (MAL's
+    authenticated representation of "not on list").
+    """
     entries = list_mal_user_anime_list_cache(db_path)
-    if not entries:
+    if not entries and not clear_absent:
         return 0
     changed = 0
     conn = connect(db_path)
     try:
         with conn:
+            if clear_absent:
+                stale = conn.execute(
+                    """SELECT mal_anime_id, raw_json FROM mal_anime_metadata
+                       WHERE mal_anime_id NOT IN (SELECT mal_anime_id FROM mal_user_anime_list_cache)"""
+                ).fetchall()
+                for stale_row in stale:
+                    raw = _load_json_value(stale_row["raw_json"], {})
+                    if not isinstance(raw, dict) or not isinstance(raw.get("my_list_status"), dict):
+                        continue
+                    raw["my_list_status"] = None
+                    raw.pop("mal_user_anime_list_cache", None)
+                    conn.execute(
+                        "UPDATE mal_anime_metadata SET raw_json = ?, updated_at = CURRENT_TIMESTAMP WHERE mal_anime_id = ?",
+                        (json.dumps(raw, ensure_ascii=False, sort_keys=True), int(stale_row["mal_anime_id"])),
+                    )
+                    changed += 1
             for entry in entries:
                 my_list_status = _my_list_status_from_cache_entry(entry)
                 row = conn.execute(
@@ -8073,6 +8163,42 @@ def _mal_user_list_partition_class(row: sqlite3.Row) -> str:
     return "never_started"
 
 
+def _mal_user_list_lineage_key(query: Any) -> str | None:
+    if not isinstance(query, dict):
+        return None
+    stable = {key: value for key, value in query.items() if key not in _MAL_USER_LIST_LINEAGE_VOLATILE_QUERY_KEYS}
+    return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _latest_mal_user_list_lineage_generation(
+    conn: sqlite3.Connection, *, account_key: str, query: dict[str, Any],
+) -> sqlite3.Row | None:
+    """Newest generation of any logic version covering the same account partitions."""
+    wanted = _mal_user_list_lineage_key(query)
+    for row in conn.execute(
+        """SELECT * FROM mal_user_anime_list_refresh_generations
+           WHERE account_key=? ORDER BY generation DESC""",
+        (account_key,),
+    ):
+        try:
+            candidate = json.loads(row["query_json"] or "null")
+        except json.JSONDecodeError:
+            continue
+        if _mal_user_list_lineage_key(candidate) == wanted:
+            return row
+    return None
+
+
+def _mal_user_list_quarantine_is_terminal(row: sqlite3.Row) -> bool:
+    if row["quarantined_at"] is None and row["quarantine_reason"] is None:
+        return False
+    legacy_drift = (
+        str(row["logic_version"] or "") != MAL_USER_LIST_PAGINATION_LOGIC_VERSION
+        and str(row["quarantine_reason"] or "").startswith(MAL_USER_LIST_LEGACY_DRIFT_QUARANTINE_PREFIX)
+    )
+    return not legacy_drift
+
+
 def claim_or_create_mal_user_anime_list_traversal(
     db_path: Path, *, account_id: int, account_name: str, query_identity: str, query: dict[str, Any],
     partitions: Iterable[dict[str, Any]], claim_token: str, fetched_at: str,
@@ -8094,14 +8220,10 @@ def claim_or_create_mal_user_anime_list_traversal(
     conn = connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        quarantined = conn.execute(
-            """SELECT generation FROM mal_user_anime_list_refresh_generations
-               WHERE account_key=? AND query_identity=?
-                 AND (quarantined_at IS NOT NULL OR quarantine_reason IS NOT NULL)
-               ORDER BY generation DESC LIMIT 1""",
-            (account_key, str(query_identity)),
-        ).fetchone()
-        if quarantined is not None and not explicit_reinitialize_quarantined:
+        # Only the newest generation of the lineage decides: a later explicit
+        # reinitialization supersedes an older quarantine.
+        latest = _latest_mal_user_list_lineage_generation(conn, account_key=account_key, query=query)
+        if latest is not None and _mal_user_list_quarantine_is_terminal(latest) and not explicit_reinitialize_quarantined:
             raise MalUserAnimeListRefreshConflictError(
                 "quarantined MAL list generation is terminal; explicit safe reinitialization is required"
             )
@@ -8194,7 +8316,11 @@ def reinitialize_mal_user_anime_list_traversal(
     db_path: Path, *, account_id: int, account_name: str, query_identity: str,
     query: dict[str, Any], partitions: Iterable[dict[str, Any]], operator_reason: str, fetched_at: str,
 ) -> MalUserAnimeListTraversalGeneration:
-    """Explicitly replace the latest exact-identity quarantine without touching published LKG/history."""
+    """Explicitly replace the latest quarantined lineage generation without touching published LKG/history.
+
+    The lineage spans logic versions/page sizes of the same account partitions,
+    matching the claim-side quarantine check.
+    """
     reason = str(operator_reason).strip()
     account_id = int(account_id)
     account_name = str(account_name).strip()
@@ -8205,41 +8331,23 @@ def reinitialize_mal_user_anime_list_traversal(
     requested = list(partitions)
     if not requested:
         raise ValueError("at least one MAL list partition is required")
-    accepted_query_provenance = {
-        hashlib.sha256(query_text.encode("utf-8")).hexdigest(): (
-            query_text,
-            MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
-        )
-    }
-    if str(query.get("logic_version") or "") == MAL_USER_LIST_PAGINATION_LOGIC_VERSION:
-        legacy_query = dict(query)
-        legacy_query["logic_version"] = "mal-user-list-pagination-v2"
-        legacy_query_text = json.dumps(
-            legacy_query, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        accepted_query_provenance[hashlib.sha256(legacy_query_text.encode("utf-8")).hexdigest()] = (
-            legacy_query_text,
-            "mal-user-list-pagination-v2",
-        )
+    if str(query.get("logic_version") or "") != MAL_USER_LIST_PAGINATION_LOGIC_VERSION:
+        raise ValueError("reinitialization query must use the current MAL list logic version")
     if str(query_identity) != hashlib.sha256(query_text.encode("utf-8")).hexdigest():
         raise ValueError("query_identity does not match the canonical MAL list query")
-    identity_placeholders = ",".join("?" for _ in accepted_query_provenance)
     conn = connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        old = conn.execute(
-            f"""SELECT * FROM mal_user_anime_list_refresh_generations
-               WHERE account_key=? AND query_identity IN ({identity_placeholders}) ORDER BY generation DESC LIMIT 1""",
-            (account_key, *sorted(accepted_query_provenance)),
-        ).fetchone()
+        old = _latest_mal_user_list_lineage_generation(conn, account_key=account_key, query=query)
         if old is None or (old["quarantined_at"] is None and old["quarantine_reason"] is None):
             raise MalUserAnimeListRefreshConflictError("latest exact account/query generation is not quarantined")
         if int(old["account_id"] or 0) != account_id or str(old["account_name"] or "") != account_name:
             raise MalUserAnimeListRefreshConflictError("MAL account provenance does not match quarantined generation")
-        expected_query_text, expected_logic_version = accepted_query_provenance[str(old["query_identity"])]
+        old_query_text = str(old["query_json"] or "")
+        old_query = json.loads(old_query_text)
         if (
-            str(old["query_json"]) != expected_query_text
-            or str(old["logic_version"]) != expected_logic_version
+            str(old["query_identity"]) != hashlib.sha256(old_query_text.encode("utf-8")).hexdigest()
+            or str(old_query.get("logic_version") or "") != str(old["logic_version"] or "")
         ):
             raise MalUserAnimeListRefreshConflictError("MAL query provenance does not match quarantined generation")
         authority = conn.execute("SELECT * FROM mal_user_anime_list_account_authority WHERE account_key=?", (account_key,)).fetchone()
@@ -8458,11 +8566,15 @@ def checkpoint_mal_user_anime_list_page(
         expected_page_size = int(limit_text)
         if next_url is not None:
             if len(items) != expected_page_size:
-                raise ValueError("MAL list non-terminal page must contain exactly the expected page size")
+                raise MalUserListSnapshotDriftError("MAL list non-terminal page must contain exactly the expected page size")
             next_query = parse_qs(urlparse(str(next_url)).query, keep_blank_values=True)
             next_offset_text = next_query.get("offset", [None])[0]
-            if not str(next_offset_text).isdigit() or int(next_offset_text) != page_offset + expected_page_size:
-                raise ValueError("MAL list next cursor offset does not equal current offset plus full page size")
+            if not str(next_offset_text).isdigit():
+                raise ValueError("MAL list next cursor has a malformed offset")
+            if int(next_offset_text) != page_offset + expected_page_size:
+                raise MalUserListSnapshotDriftError(
+                    "MAL list next cursor offset does not equal current offset plus full page size"
+                )
         page_sequence = int(partition["page_sequence"]) + 1
         ids = [int((item.get("node") or {}).get("id")) for item in items]
         if len(ids) != len(set(ids)):
@@ -8474,7 +8586,10 @@ def checkpoint_mal_user_anime_list_page(
                 (int(generation), *ids),
             ).fetchone()
             if duplicate is not None:
-                raise ValueError(f"duplicate MAL anime id across staged pages: {int(duplicate['mal_anime_id'])}")
+                # Rows shift across page boundaries when the list changes mid-traversal.
+                raise MalUserListSnapshotDriftError(
+                    f"duplicate MAL anime id across staged pages: {int(duplicate['mal_anime_id'])}"
+                )
         conn.execute(
             """INSERT INTO mal_user_anime_list_staged_pages
                (generation,partition_key,page_sequence,page_url,page_offset,expected_page_size,next_url,item_count,page_fingerprint,anchor_json,terminal_explicit,fetched_at)
@@ -8555,7 +8670,7 @@ def checkpoint_mal_user_anime_list_revalidation(
         expected_fingerprint = staged_page["page_fingerprint"] if staged_page is not None else partition["first_page_fingerprint"] if kind == "validate_page1" else partition["final_page_fingerprint"]
         expected_anchor_json = staged_page["anchor_json"] if staged_page is not None else partition["first_page_anchor_json"] if kind == "validate_page1" else partition["final_page_anchor_json"]
         if str(page_url) != str(expected_url) or str(fingerprint) != str(expected_fingerprint) or json.dumps(anchor, sort_keys=True) != json.dumps(json.loads(expected_anchor_json or "{}"), sort_keys=True):
-            raise ValueError(f"MAL list snapshot drift during {kind}")
+            raise MalUserListSnapshotDriftError(f"MAL list snapshot drift during {kind}")
         if kind != "validate_interior":
             if kind == "validate_page1" and int(partition["page_sequence"]) == 1:
                 conn.execute(
@@ -8602,51 +8717,52 @@ def checkpoint_mal_user_anime_list_revalidation(
     return _mal_user_traversal_generation_from_row(owner), _mal_user_traversal_partition_from_row(partition)
 
 
-def restart_or_quarantine_mal_user_anime_list_traversal(
-    db_path: Path, *, generation: int, claim_token: str, expected_revision: int, reason: str,
+def restart_mal_user_anime_list_traversal_after_drift(
+    db_path: Path, *, generation: int, claim_token: str, expected_revision: int, reason: str, fetched_at: str,
 ) -> MalUserAnimeListTraversalGeneration:
-    """Preserve failed history and create a fresh same-identity generation, bounded by restart limit."""
+    """Fail the drifted generation (history kept) and start a fresh claimed same-identity generation.
+
+    Drift is never terminal: the caller bounds restarts per invocation, and a
+    restarted generation left unfinished is resumed by the next invocation.
+    restart_count/drift_count carry across the lineage as diagnostics only.
+    """
     conn = connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         old = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
         _require_mal_user_list_traversal_claim(conn, old, claim_token=claim_token, expected_revision=expected_revision)
         restart_count = int(old["restart_count"] or 0) + 1
-        if restart_count > MAL_USER_LIST_MAX_DRIFT_RESTARTS:
+        partitions = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal", (int(generation),)).fetchall()
+        conn.execute(
+            """UPDATE mal_user_anime_list_refresh_generations SET status='failed',completed_at=CURRENT_TIMESTAMP,
+               restart_count=?,drift_count=drift_count+1,error=?,claim_token=NULL,claim_expires_at=NULL,
+               revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
+            (restart_count, _bounded_mal_user_list_refresh_error(reason), int(generation)),
+        )
+        run_id = f"mal-list-{str(old['query_identity'])[:16]}-{uuid.uuid4()}-r{restart_count}"
+        cursor = conn.execute(
+            """INSERT INTO mal_user_anime_list_refresh_generations
+               (refresh_run_id,status,fetched_at,account_key,account_id,account_name,query_identity,query_json,logic_version,
+                claim_token,claim_expires_at,revision,restart_count,drift_count,publication_epoch)
+               VALUES (?,'active',?,?,?,?,?,?,?,?,datetime('now',?),1,?,?,?)""",
+            (run_id, str(fetched_at), old["account_key"], old["account_id"], old["account_name"], old["query_identity"],
+             old["query_json"], old["logic_version"], str(claim_token), f"+{MAL_USER_LIST_CLAIM_SECONDS} seconds",
+             restart_count, int(old["drift_count"] or 0)+1, int(old["publication_epoch"] or 0)),
+        )
+        new_id = int(cursor.lastrowid)
+        for item in partitions:
             conn.execute(
-                """UPDATE mal_user_anime_list_refresh_generations SET status='failed',completed_at=CURRENT_TIMESTAMP,
-                   restart_count=?,drift_count=drift_count+1,quarantined_at=CURRENT_TIMESTAMP,quarantine_reason=?,error=?,
-                   claim_token=NULL,claim_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
-                (restart_count, _bounded_mal_user_list_refresh_error(reason), _bounded_mal_user_list_refresh_error(reason), int(generation)),
+                """INSERT INTO mal_user_anime_list_refresh_partitions
+                   (generation,partition_key,requested_status,ordinal,initial_url,next_url)
+                   VALUES (?,?,?,?,?,?)""",
+                (new_id,item["partition_key"],item["requested_status"],item["ordinal"],item["initial_url"],item["initial_url"]),
             )
-            row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (int(generation),)).fetchone()
-        else:
-            partitions = conn.execute("SELECT * FROM mal_user_anime_list_refresh_partitions WHERE generation=? ORDER BY ordinal", (int(generation),)).fetchall()
-            conn.execute(
-                """UPDATE mal_user_anime_list_refresh_generations SET status='failed',completed_at=CURRENT_TIMESTAMP,
-                   restart_count=?,drift_count=drift_count+1,error=?,claim_token=NULL,claim_expires_at=NULL,
-                   revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE generation=?""",
-                (restart_count, _bounded_mal_user_list_refresh_error(reason), int(generation)),
-            )
-            run_id = f"{old['refresh_run_id']}-r{restart_count}"
-            cursor = conn.execute(
-                """INSERT INTO mal_user_anime_list_refresh_generations
-                   (refresh_run_id,status,fetched_at,account_key,account_id,account_name,query_identity,query_json,logic_version,
-                    claim_token,claim_expires_at,revision,restart_count,drift_count)
-                   VALUES (?,'active',?,?,?,?,?,?,?,?,datetime('now',?),1,?,?)""",
-                (run_id, old["fetched_at"], old["account_key"], old["account_id"], old["account_name"], old["query_identity"],
-                 old["query_json"], old["logic_version"], str(claim_token), f"+{MAL_USER_LIST_CLAIM_SECONDS} seconds",
-                 restart_count, int(old["drift_count"] or 0)+1),
-            )
-            new_id = int(cursor.lastrowid)
-            for item in partitions:
-                conn.execute(
-                    """INSERT INTO mal_user_anime_list_refresh_partitions
-                       (generation,partition_key,requested_status,ordinal,initial_url,next_url)
-                       VALUES (?,?,?,?,?,?)""",
-                    (new_id,item["partition_key"],item["requested_status"],item["ordinal"],item["initial_url"],item["initial_url"]),
-                )
-            row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (new_id,)).fetchone()
+        conn.execute(
+            """UPDATE mal_user_anime_list_account_authority SET current_generation=?,updated_at=CURRENT_TIMESTAMP
+               WHERE account_key=? AND current_generation=?""",
+            (new_id, old["account_key"], int(generation)),
+        )
+        row = conn.execute("SELECT * FROM mal_user_anime_list_refresh_generations WHERE generation=?", (new_id,)).fetchone()
         conn.commit()
     except BaseException:
         conn.rollback()

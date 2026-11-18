@@ -8,6 +8,7 @@ from unittest.mock import patch
 from mal_updater.config import MalSecrets, load_config
 from mal_updater.db import (
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
+    MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
     bootstrap_database,
     connect,
     create_or_get_active_mal_public_userrecs_generation,
@@ -359,14 +360,14 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
             side_effect=get_page,
         ):
             summary = refresh_mal_user_anime_list_cache(
-                self.config, max_pages=8, prune_on_complete=True
+                self.config, page_size=100, max_pages=8, prune_on_complete=True
             )
 
         self.assertEqual("ok", summary.status)
         self.assertFalse(summary.partial)
         self.assertEqual([first_url, page2, page3, first_url, page2, page3], requested)
         self.assertEqual(285, len(list_mal_user_anime_list_cache(self.config.db_path)))
-        self.assertEqual("mal-user-list-pagination-v3", summary.traversal["logic_version"])
+        self.assertEqual(MAL_USER_LIST_PAGINATION_LOGIC_VERSION, summary.traversal["logic_version"])
 
     def test_mal_list_refresh_terminal_complete_can_prune_absent_rows(self) -> None:
         replace_mal_user_anime_list_cache_generation(self.config.db_path,items=[self._list_item(90,"Old","completed",score=8)],refresh_run_id="old",fetched_at="2026-07-19T00:00:00Z",prune_absent=True)

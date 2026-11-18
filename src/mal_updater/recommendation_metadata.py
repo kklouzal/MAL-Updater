@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from .db import (
     MalUserAnimeListRefreshConflictError,
     MalUserAnimeListRefreshSummary,
     MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
+    MalUserListSnapshotDriftError,
     abort_mal_user_anime_list_cache_refresh,
     begin_mal_user_anime_list_cache_refresh,
     connect,
@@ -51,7 +53,7 @@ from .db import (
     record_mal_public_userrecs_final_anchor,
     renew_mal_public_userrecs_source_claim,
     replace_mal_anime_relations,
-    restart_or_quarantine_mal_user_anime_list_traversal,
+    restart_mal_user_anime_list_traversal_after_drift,
     replace_mal_public_userrecs_staged_page,
     replace_mal_recommendation_edges,
     upsert_mal_anime_metadata,
@@ -63,7 +65,7 @@ from .db import (
     release_mal_user_anime_list_traversal_claim,
     select_mal_user_anime_list_partition_work,
 )
-from .mal_client import MalApiError, MalClient
+from .mal_client import MAL_ANIME_LIST_MAX_LIMIT, MalApiError, MalClient
 from .periodic_evidence_lifecycle import periodic_evidence_is_due
 from .mal_user_recommendations import (
     DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
@@ -132,6 +134,14 @@ MAL_USER_LIST_FIELD_NAMES = (
     "status",
 )
 MAL_USER_LIST_FIELDS = ",".join(MAL_USER_LIST_FIELD_NAMES)
+# Node fields retained from @me-list rows: MAL's default id/title plus the
+# requested node fields. Presentation fields such as main_picture (whose URL
+# MAL flips between .jpg and .webp per response) are dropped before staging,
+# fingerprinting and publication.
+MAL_USER_LIST_NODE_FIELDS = ("id", "title", "num_episodes", "media_type", "status")
+# Snapshot attempts per invocation before ending as a non-quarantined partial run.
+MAL_USER_LIST_MAX_DRIFT_ATTEMPTS_PER_RUN = 3
+MAL_USER_LIST_DRIFT_BACKOFF_SECONDS = 5.0
 HARVEST_RETRY_STATUSES = frozenset({"unharvested", "stale", "failed"})
 HARVEST_RETRY_ORDER = {"unharvested": 0, "failed": 1, "stale": 2}
 
@@ -579,10 +589,14 @@ def _normalized_user_list_statuses(statuses: list[str] | tuple[str, ...] | None)
     return normalized or [None]
 
 
+def _mal_user_list_page_size(page_size: int) -> int:
+    return min(max(int(page_size), 1), MAL_ANIME_LIST_MAX_LIMIT)
+
+
 def _mal_user_list_query_identity(*, statuses: list[str | None], page_size: int) -> tuple[str, dict[str, Any]]:
     query = {
         "statuses": ["all" if value is None else value for value in statuses],
-        "page_size": min(max(int(page_size), 1), 100),
+        "page_size": _mal_user_list_page_size(page_size),
         "fields": MAL_USER_LIST_FIELDS,
         "logic_version": MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
     }
@@ -591,7 +605,7 @@ def _mal_user_list_query_identity(*, statuses: list[str | None], page_size: int)
 
 
 def _mal_user_list_initial_url(config: AppConfig, *, status: str | None, page_size: int) -> str:
-    query: dict[str, Any] = {"limit": min(max(int(page_size), 1), 100), "fields": MAL_USER_LIST_FIELDS}
+    query: dict[str, Any] = {"limit": _mal_user_list_page_size(page_size), "fields": MAL_USER_LIST_FIELDS}
     if status is not None:
         query["status"] = status
     return f"{config.mal.base_url}/users/@me/animelist?{urlencode(query)}"
@@ -615,7 +629,7 @@ def _validate_mal_user_list_cursor(
     for key, values in query.items():
         if len(values) != 1:
             raise ValueError(f"MAL anime-list next cursor repeats {key}")
-    if query.get("limit", [None])[0] != str(min(max(int(page_size), 1), 100)):
+    if query.get("limit", [None])[0] != str(_mal_user_list_page_size(page_size)):
         raise ValueError("MAL anime-list next cursor changes page limit")
     if query.get("fields", [None])[0] != MAL_USER_LIST_FIELDS:
         raise ValueError("MAL anime-list next cursor changes requested fields")
@@ -626,7 +640,7 @@ def _validate_mal_user_list_cursor(
     if not str(offset).isdigit():
         raise ValueError("MAL anime-list next cursor has a malformed offset")
     if expected_offset is not None and int(offset) != int(expected_offset):
-        raise ValueError("MAL anime-list next cursor skips, repeats, or moves backward across the expected offset boundary")
+        raise MalUserListSnapshotDriftError("MAL anime-list next cursor skips, repeats, or moves backward across the expected offset boundary")
     return str(url)
 
 
@@ -665,7 +679,10 @@ def _parse_mal_user_list_payload(
         if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0):
             raise ValueError("MAL anime-list response row has malformed rank")
         ordered.append((anime_id, rank, list_status.get("updated_at") if isinstance(list_status.get("updated_at"), str) else None))
-        items.append(raw)
+        items.append({
+            "node": {key: node[key] for key in MAL_USER_LIST_NODE_FIELDS if key in node},
+            "list_status": list_status,
+        })
     ids = [item[0] for item in ordered]
     if len(ids) != len(set(ids)):
         raise ValueError("MAL anime-list page repeats an anime id")
@@ -677,13 +694,13 @@ def _parse_mal_user_list_payload(
     # MAL's offset is the index of the next range. A non-terminal page must be
     # full; otherwise the server's offset contract is ambiguous and publishing
     # would risk a skipped interior range.
-    expected_page_size = min(max(int(page_size), 1), 100)
+    expected_page_size = _mal_user_list_page_size(page_size)
     if not next_present and len(items) >= expected_page_size:
-        raise ValueError(
+        raise MalUserListSnapshotDriftError(
             "MAL anime-list response is ambiguous because a full page omits paging.next"
         )
     if next_raw is not None and len(items) != expected_page_size:
-        raise ValueError(
+        raise MalUserListSnapshotDriftError(
             "MAL anime-list non-terminal page was short; expected exactly "
             f"{expected_page_size} distinct valid rows, got {len(items)}"
         )
@@ -694,10 +711,11 @@ def _parse_mal_user_list_payload(
         page_size=page_size,
         expected_offset=current_offset + expected_page_size,
     )
-    # Bind revalidation to every canonical response byte that publication can
-    # retain, as well as the opaque page/cursor identity.  updated_at alone is
-    # not an adequate change token: score, progress, tags, dates, preference
-    # flags, node metadata, and other retained fields may change independently.
+    # Bind revalidation to every byte that publication retains (the projected
+    # rows above), as well as the opaque page/cursor identity.  updated_at alone
+    # is not an adequate change token: score, progress, tags, dates, preference
+    # flags and retained node metadata may change independently.  Dropped
+    # presentation fields must not count as drift.
     canonical = json.dumps(
         {"page_url": page_url, "next_url": next_url, "items": items},
         ensure_ascii=False,
@@ -718,11 +736,19 @@ def refresh_mal_user_anime_list_cache(
     config: AppConfig,
     *,
     statuses: list[str] | tuple[str, ...] | None = None,
-    page_size: int = 100,
+    page_size: int = MAL_ANIME_LIST_MAX_LIMIT,
     max_pages: int | None = 25,
     prune_on_complete: bool = False,
 ) -> MalUserAnimeListRefreshSummary:
-    """Durably refresh MAL @me with fair partition rotation and fail-closed publication."""
+    """Durably refresh MAL @me with fair partition rotation and fail-closed publication.
+
+    Failure classes: snapshot drift (the live list changed between requests)
+    restarts a fresh generation in-run up to MAL_USER_LIST_MAX_DRIFT_ATTEMPTS_PER_RUN
+    snapshots, then ends as a non-quarantined partial run that the next
+    invocation resumes; network/HTTP failures (401/403 included, which a token
+    refresh can fix) schedule a retry; only contract violations quarantine.
+    The published list (LKG) is untouched by every failure class.
+    """
     normalized_max_pages = 25 if max_pages is None else max(0, int(max_pages))
     normalized_statuses = _normalized_user_list_statuses(statuses)
     if normalized_max_pages == 0:
@@ -761,6 +787,7 @@ def refresh_mal_user_anime_list_cache(
         query=query, partitions=partitions, claim_token=token, fetched_at=_now_iso(),
     )
     failure: str | None = None
+    drift_snapshots = 0
     while attempts < normalized_max_pages:
         selected = select_mal_user_anime_list_partition_work(
             config.db_path, generation=generation.generation, claim_token=token
@@ -790,28 +817,46 @@ def refresh_mal_user_anime_list_cache(
                     page_url=page_url, fingerprint=fingerprint, anchor=anchor,
                 )
         except (MalApiError, TimeoutError) as exc:
-            retry_class = "auth_or_contract" if "HTTP 401" in str(exc) or "HTTP 403" in str(exc) else "ordinary_retry"
-            quarantine = retry_class == "auth_or_contract"
+            auth_failure = "HTTP 401" in str(exc) or "HTTP 403" in str(exc)
             generation = record_mal_user_anime_list_request_failure(
                 config.db_path, generation=generation.generation, partition_key=partition.partition_key,
-                claim_token=token, expected_revision=generation.revision, retry_class=retry_class, error=str(exc),
-                next_retry_at=None if quarantine else (datetime.now(timezone.utc)+timedelta(minutes=15)).replace(microsecond=0).isoformat().replace("+00:00","Z"),
-                quarantine=quarantine,
+                claim_token=token, expected_revision=generation.revision,
+                retry_class="auth" if auth_failure else "ordinary_retry", error=str(exc),
+                # Auth failures retry on the next invocation, after mal-refresh.
+                next_retry_at=None if auth_failure else (datetime.now(timezone.utc)+timedelta(minutes=15)).replace(microsecond=0).isoformat().replace("+00:00","Z"),
             )
             failure = str(exc)
             break
+        except MalUserListSnapshotDriftError as exc:
+            drift_snapshots += 1
+            generation = record_mal_user_anime_list_request_failure(
+                config.db_path, generation=generation.generation, partition_key=partition.partition_key,
+                claim_token=token, expected_revision=generation.revision, retry_class="snapshot_drift",
+                error=str(exc), next_retry_at=None,
+            )
+            generation = restart_mal_user_anime_list_traversal_after_drift(
+                config.db_path, generation=generation.generation, claim_token=token,
+                expected_revision=generation.revision, reason=str(exc), fetched_at=_now_iso(),
+            )
+            if drift_snapshots >= MAL_USER_LIST_MAX_DRIFT_ATTEMPTS_PER_RUN:
+                failure = (
+                    f"{exc}; {drift_snapshots} snapshot attempts drifted in this run; "
+                    "a fresh generation resumes on the next run"
+                )
+                break
+            if attempts < normalized_max_pages:
+                time.sleep(MAL_USER_LIST_DRIFT_BACKOFF_SECONDS * drift_snapshots)
+            failure = str(exc)  # cleared once a later snapshot step succeeds
+            continue
         except ValueError as exc:
             generation = record_mal_user_anime_list_request_failure(
                 config.db_path, generation=generation.generation, partition_key=partition.partition_key,
-                claim_token=token, expected_revision=generation.revision, retry_class="snapshot_drift_or_contract",
-                error=str(exc), next_retry_at=None,
-            )
-            generation = restart_or_quarantine_mal_user_anime_list_traversal(
-                config.db_path, generation=generation.generation, claim_token=token,
-                expected_revision=generation.revision, reason=str(exc),
+                claim_token=token, expected_revision=generation.revision, retry_class="contract_violation",
+                error=str(exc), next_retry_at=None, quarantine=True,
             )
             failure = str(exc)
             break
+        failure = None
     # Bind publication to the authenticated account. The initial identity
     # response is stable evidence only for a no-page run; after any list call,
     # revalidate under the same hard request budget before publication.
@@ -849,11 +894,14 @@ def refresh_mal_user_anime_list_cache(
             generation, _items, _proof = load_validated_mal_user_anime_list_staging(
                 config.db_path, generation=generation.generation, claim_token=token, expected_revision=generation.revision,
             )
+            complete_list_prune = bool(normalized_statuses == [None] and prune_on_complete)
             summary = publish_mal_user_anime_list_staging(
                 config.db_path, generation=generation.generation, claim_token=token, expected_revision=generation.revision,
-                delete_absent=bool(normalized_statuses == [None] and prune_on_complete),
+                delete_absent=complete_list_prune,
             )
-            summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(config.db_path)
+            summary.metadata_rows_with_my_list_status = merge_mal_user_anime_list_cache_into_metadata(
+                config.db_path, clear_absent=complete_list_prune,
+            )
             summary.traversal = get_mal_user_anime_list_refresh_diagnostics(config.db_path)
             return summary
         except (ValueError, MalUserAnimeListRefreshConflictError, __import__("json").JSONDecodeError) as exc:

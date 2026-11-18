@@ -111,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
     mal_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /users/@me token check")
     mal_refresh = subparsers.add_parser("mal-refresh", help="Refresh the persisted MAL access token using the local refresh token")
     mal_refresh.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /users/@me token check")
+    mal_refresh.add_argument("--force", action="store_true", help="Refresh even when the recorded access-token expiry is outside the renewal margin")
+    mal_refresh.add_argument(
+        "--min-remaining-hours",
+        type=float,
+        default=None,
+        help="Renew only when the recorded access-token expiry is within this many hours (default: 168); unknown expiry always renews",
+    )
     subparsers.add_parser("mal-whoami", help="Call MAL GET /users/@me with the currently configured access token")
     provider_auth_login = subparsers.add_parser(
         "provider-auth-login",
@@ -147,6 +154,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Link a Crunchyroll account without a password: approve a short code at crunchyroll.com/activate",
     )
     crunchyroll_link.add_argument("--profile", default="default", help="Crunchyroll state profile name")
+    season_mappings = subparsers.add_parser(
+        "season-mappings",
+        help="List per-season provider->MAL mappings for multi-season provider series, or approve one explicitly",
+    )
+    season_mappings.add_argument("--unresolved", action="store_true", help="Only list seasons that could not be matched automatically")
+    season_mappings.add_argument("--approve", action="store_true", help="Approve --mal-anime-id for one season (user_exact)")
+    season_mappings.add_argument("--provider", choices=["crunchyroll", "hidive"], default=None)
+    season_mappings.add_argument("--provider-series-id", default=None)
+    season_mappings.add_argument("--provider-season-key", default=None)
+    season_mappings.add_argument("--mal-anime-id", type=int, default=None)
     crunchyroll_fetch_snapshot = subparsers.add_parser(
         "crunchyroll-fetch-snapshot",
         help="Use the Python Crunchyroll transport to fetch account-scoped history/watchlist details; not a whole-library crawler",
@@ -366,6 +383,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only operate on exact approved mappings (currently auto_exact/user_exact)",
     )
     apply_sync.add_argument("--execute", action="store_true", help="Actually write MAL updates; otherwise revalidate and print what would be applied")
+    apply_sync.add_argument(
+        "--provider",
+        action="append",
+        choices=["crunchyroll", "hidive"],
+        default=None,
+        help="Only apply evidence from this provider (repeatable; default: all providers)",
+    )
     recommend = subparsers.add_parser(
         "recommend",
         help="Generate local recommendations from the ingested provider dataset (grouped by category by default)",
@@ -460,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="MAL list status to refresh (repeatable); default/all fetches every status and prunes absent rows only after a complete run",
     )
-    mal_list_refresh.add_argument("--page-size", type=int, default=100, help="MAL page size, clamped by the client to 1-100")
+    mal_list_refresh.add_argument("--page-size", type=int, default=1000, help="MAL page size, clamped to MAL's documented 1-1000 (default: 1000, one request for lists up to 1000 entries)")
     mal_list_refresh.add_argument("--max-pages", type=int, default=10, help="Maximum MAL network attempts across fair status partitions; 0 is a hard no-network/no-mutation diagnostic run (default: 10)")
     mal_list_refresh.add_argument("--complete", action="store_true", help="Opt in to pruning absent rows, but only if MAL pagination reaches a terminal page within --max-pages")
     mal_list_refresh.add_argument("--format", choices=["json", "summary"], default="json", help="Output format (default: json)")
@@ -468,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mal-list-reinitialize", help="Explicitly reinitialize one quarantined exact MAL account/query traversal",
     )
     mal_list_reinitialize.add_argument("--status", action="append", choices=["all", "completed", "watching", "on_hold", "dropped", "plan_to_watch"], default=None)
-    mal_list_reinitialize.add_argument("--page-size", type=int, default=100)
+    mal_list_reinitialize.add_argument("--page-size", type=int, default=1000)
     mal_list_reinitialize.add_argument("--reason", required=True, help="Audited operator reason; this is the explicit quarantine-reset intent")
     recommend_refresh = subparsers.add_parser(
         "recommend-refresh-metadata",

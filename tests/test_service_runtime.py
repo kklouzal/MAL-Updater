@@ -673,7 +673,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             result = run_pending_tasks(self.config)
         apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
         self.assertEqual("skipped", apply_result["status"])
-        self.assertEqual("same_cycle_provider_fetch_required", apply_result["reason"])
+        self.assertEqual("fresh_provider_fetch_required", apply_result["reason"])
         self.assertEqual(["crunchyroll"], apply_result["missing_providers"])
         self.assertFalse(any(call.kwargs.get("label") == "sync_apply" for call in run_subprocess.call_args_list))
 
@@ -715,6 +715,53 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             ["sync_fetch_crunchyroll", "sync_apply"],
             [call.kwargs.get("label") for call in run_subprocess.call_args_list],
         )
+
+    def test_due_sync_apply_runs_for_providers_fetched_since_last_apply_only(self) -> None:
+        # Production regression: fetch lanes run on independent cadences and one
+        # provider can be down for weeks; apply must not wait for a shared pass.
+        self.config.service.task_execute_limits["sync_apply"] = 2
+        now = time.time()
+        self.config.service_state_path.write_text(
+            json.dumps({"started_at": "2026-03-20T20:00:00Z", "tasks": {
+                "sync_fetch_crunchyroll": {"last_run_epoch": now - 300, "last_status": "ok"},
+                "sync_fetch_hidive": {"last_run_epoch": now - 300, "last_status": "error"},
+                "sync_apply": {"last_run_epoch": now - 4000, "last_status": "ok"},
+            }}), encoding="utf-8",
+        )
+        with patch(
+            "mal_updater.service_runtime._task_specs",
+            return_value=[TaskSpec("sync_apply", 3600, "mal")],
+        ), patch(
+            "mal_updater.service_runtime._available_source_providers",
+            return_value=["crunchyroll", "hidive"],
+        ), patch(
+            "mal_updater.service_runtime._budget_gate",
+            return_value=(True, None, {"provider": "mal"}),
+        ), patch(
+            "mal_updater.service_runtime._run_subprocess",
+            return_value={"status": "ok", "label": "sync_apply", "returncode": 0, "stdout": "", "stderr": ""},
+        ) as run_subprocess:
+            result = run_pending_tasks(self.config)
+
+        apply_result = next(item for item in result["results"] if item["task"] == "sync_apply")
+        self.assertEqual("ok", apply_result["status"])
+        command = run_subprocess.call_args.args[1]
+        self.assertEqual(["crunchyroll"], [command[i + 1] for i, arg in enumerate(command) if arg == "--provider"])
+        apply_state = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_apply"]
+        self.assertEqual(["hidive"], apply_state["apply_stale_providers"])
+
+        # Nothing fetched since this apply: the next due pass is skipped.
+        with patch(
+            "mal_updater.service_runtime._task_specs",
+            return_value=[TaskSpec("sync_apply", 0, "mal")],
+        ), patch(
+            "mal_updater.service_runtime._available_source_providers",
+            return_value=["crunchyroll", "hidive"],
+        ), patch("mal_updater.service_runtime._run_subprocess") as second_run:
+            second = run_pending_tasks(self.config)
+        skipped = next(item for item in second["results"] if item["task"] == "sync_apply")
+        self.assertEqual("fresh_provider_fetch_required", skipped["reason"])
+        second_run.assert_not_called()
 
     def test_zero_sync_apply_limit_disables_unattended_execution(self) -> None:
         self.config.service.sync_every_seconds = 0
@@ -794,7 +841,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
 
     def test_mal_list_refresh_default_command_and_signature_use_ten_attempts(self) -> None:
         self.assertEqual(
-            [sys.executable, "-m", "mal_updater.cli", "mal-list-refresh", "--max-pages", "10"],
+            [sys.executable, "-m", "mal_updater.cli", "mal-list-refresh", "--max-pages", "10", "--complete"],
             _mal_list_refresh_command(self.config),
         )
         self.assertEqual(

@@ -13,7 +13,14 @@ import re
 import shutil
 import uuid
 
-from .auth import OAuthCallbackError, format_auth_flow_prompt, persist_token_response, wait_for_oauth_callback
+from .auth import (
+    DEFAULT_MAL_TOKEN_REFRESH_MARGIN_SECONDS,
+    OAuthCallbackError,
+    format_auth_flow_prompt,
+    persist_token_response,
+    refresh_mal_tokens_if_due,
+    wait_for_oauth_callback,
+)
 from . import bootstrap_guidance as _bootstrap_guidance
 from . import health_report as _health_report
 from . import review_queue_support as _review_queue_support
@@ -41,6 +48,7 @@ from . import provider_snapshot
 from .provider_registry import get_provider, list_provider_slugs
 from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
 from .recommendation_decision_ledger import insert_recommendation_decision_ledger, stable_recommendation_item_identity
+from .season_mappings import get_provider_season_mapping, list_provider_season_mappings, upsert_provider_season_mapping
 from .redaction import sanitize_text
 from .runtime_retention_audit import (
     AuditCaps,
@@ -875,29 +883,42 @@ def _cmd_mal_auth_login(project_root: Path | None, timeout_seconds: float, verif
     return 0
 
 
-def _cmd_mal_refresh(project_root: Path | None, verify_whoami: bool) -> int:
+def _cmd_mal_refresh(
+    project_root: Path | None,
+    verify_whoami: bool,
+    *,
+    force: bool = False,
+    min_remaining_hours: float | None = None,
+) -> int:
     config = load_config(project_root)
     ensure_directories(config)
     secrets = load_mal_secrets(config)
     client = MalClient(config, secrets)
+    margin_seconds = (
+        DEFAULT_MAL_TOKEN_REFRESH_MARGIN_SECONDS
+        if min_remaining_hours is None
+        else max(0, int(float(min_remaining_hours) * 3600))
+    )
     try:
-        token = client.refresh_access_token()
-        persisted = persist_token_response(token, secrets)
+        outcome = refresh_mal_tokens_if_due(client, secrets, force=force, min_remaining_seconds=margin_seconds)
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    print(f"Persisted access token to {persisted.access_token_path}")
-    if token.refresh_token:
-        print(f"Persisted refresh token to {persisted.refresh_token_path}")
+    if outcome.refreshed and outcome.persisted is not None and outcome.token is not None:
+        print(f"Persisted access token to {outcome.persisted.access_token_path}")
+        if outcome.token.refresh_token:
+            print(f"Persisted refresh token to {outcome.persisted.refresh_token_path}")
+    else:
+        print(f"MAL token refresh skipped: {outcome.reason} (access token expires {outcome.as_dict()['access_token_expires_at']})")
 
     if not verify_whoami:
         return 0
 
     try:
-        whoami = client.get_my_user(access_token=token.access_token)
+        whoami = client.get_my_user(access_token=outcome.token.access_token if outcome.token is not None else None)
     except MalApiError as exc:
-        print(f"Refresh succeeded, but /users/@me verification failed: {exc}", file=sys.stderr)
+        print(f"MAL token check via /users/@me failed: {exc}", file=sys.stderr)
         return 1
 
     print(f"Authenticated MAL user: {json.dumps(whoami, indent=2)}")
@@ -2813,7 +2834,15 @@ def _cmd_reopen_review_queue(
     )
 
 
-def _run_apply_sync(config, *, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool):
+def _run_apply_sync(
+    config,
+    *,
+    limit: int,
+    mapping_limit: int,
+    exact_approved_only: bool,
+    execute: bool,
+    providers: list[str] | None = None,
+):
     ensure_directories(config)
     bootstrap_database(config.db_path)
     return execute_approved_sync(
@@ -2822,10 +2851,54 @@ def _run_apply_sync(config, *, limit: int, mapping_limit: int, exact_approved_on
         mapping_limit=mapping_limit,
         exact_approved_only=exact_approved_only,
         dry_run=not execute,
+        providers=providers,
     )
 
 
-def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, exact_approved_only: bool, execute: bool) -> int:
+def _cmd_season_mappings(args) -> int:
+    config = load_config(args.project_root)
+    ensure_directories(config)
+    bootstrap_database(config.db_path)
+    if args.approve:
+        missing = [
+            name
+            for name in ("provider", "provider_series_id", "provider_season_key", "mal_anime_id")
+            if getattr(args, name) in (None, "")
+        ]
+        if missing:
+            print("--approve requires " + ", ".join("--" + name.replace("_", "-") for name in missing), file=sys.stderr)
+            return 2
+        existing = get_provider_season_mapping(
+            config.db_path,
+            provider=args.provider,
+            provider_series_id=args.provider_series_id,
+            provider_season_key=args.provider_season_key,
+        )
+        upsert_provider_season_mapping(
+            config.db_path,
+            provider=args.provider,
+            provider_series_id=args.provider_series_id,
+            provider_season_key=args.provider_season_key,
+            mal_anime_id=int(args.mal_anime_id),
+            mapping_source="user_exact",
+            confidence=1.0,
+            season_title=existing.season_title if existing else None,
+            season_number=existing.season_number if existing else None,
+            resolver_version=existing.resolver_version if existing else "user",
+            detail={"approved_via": "cli", "previous": existing.detail if existing else None},
+        )
+    print(json.dumps(list_provider_season_mappings(config.db_path, unresolved_only=bool(args.unresolved)), indent=2))
+    return 0
+
+
+def _cmd_apply_sync(
+    project_root: Path | None,
+    limit: int,
+    mapping_limit: int,
+    exact_approved_only: bool,
+    execute: bool,
+    providers: list[str] | None = None,
+) -> int:
     config = load_config(project_root)
     try:
         results = _run_apply_sync(
@@ -2834,11 +2907,18 @@ def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, e
             mapping_limit=mapping_limit,
             exact_approved_only=exact_approved_only,
             execute=execute,
+            providers=providers,
         )
     except MalApiError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps([item.as_dict() for item in results], indent=2))
+    failed = [item for item in results if item.proposal_decision == "error"]
+    if failed:
+        # Per-item MAL failures must reach the scheduler (failure backoff and
+        # the repeated-failure health warning) instead of reporting success.
+        print(f"apply-sync: {len(failed)} item(s) failed; see JSON results", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -2978,14 +3058,16 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
             "error": str(exc),
         }
     else:
-        apply_exit_code = 0
+        failed_items = [item for item in apply_results if item.proposal_decision == "error"]
+        apply_exit_code = 1 if failed_items else 0
         apply_payload = {
             "exact_approved_only": True,
             "limit": 0,
             "mapping_limit": 5,
             "execute": True,
-            "status": "ok",
+            "status": "error" if failed_items else "ok",
             "skipped": False,
+            "failed_item_count": len(failed_items),
             "results": [item.as_dict() for item in apply_results],
         }
 
@@ -3552,7 +3634,12 @@ def _dispatch(parser, args) -> int:
     if args.command == "mal-auth-login":
         return _cmd_mal_auth_login(args.project_root, args.timeout_seconds, verify_whoami=not args.no_verify)
     if args.command == "mal-refresh":
-        return _cmd_mal_refresh(args.project_root, verify_whoami=not args.no_verify)
+        return _cmd_mal_refresh(
+            args.project_root,
+            verify_whoami=not args.no_verify,
+            force=args.force,
+            min_remaining_hours=args.min_remaining_hours,
+        )
     if args.command == "mal-whoami":
         return _cmd_mal_whoami(args.project_root)
     if args.command == "provider-auth-login":
@@ -3574,6 +3661,8 @@ def _dispatch(parser, args) -> int:
         return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
     if args.command == "crunchyroll-link":
         return _cmd_crunchyroll_link(args.project_root, args.profile)
+    if args.command == "season-mappings":
+        return _cmd_season_mappings(args)
     if args.command == "crunchyroll-fetch-snapshot":
         return _cmd_crunchyroll_fetch_snapshot(
             args.project_root,
@@ -3745,7 +3834,9 @@ def _dispatch(parser, args) -> int:
             args.cluster_strategy_family,
         )
     if args.command == "apply-sync":
-        return _cmd_apply_sync(args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute)
+        return _cmd_apply_sync(
+            args.project_root, args.limit, args.mapping_limit, args.exact_approved_only, args.execute, args.provider
+        )
     if args.command == "recommend":
         return _cmd_recommend(args.project_root, args.limit, args.flat, args.include_dormant, args.persist_snapshot)
     if args.command == "recommend-snapshots":

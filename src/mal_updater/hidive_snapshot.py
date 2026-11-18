@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,16 @@ CONTINUE_BOUNDARY_MARKER_LIMIT = 25
 FAVOURITE_BOUNDARY_MARKER_LIMIT = 25
 INCREMENTAL_BACKFILL_PAGE_LIMIT = 1
 HIDIVE_HISTORY_PAGE_LIMIT = 1000
+# /customer/history/vod pages with ``rpp`` (results per page) and ``p`` (1-based
+# page).  Production probes (2026-11-18): ``size``/``page`` are silently ignored
+# (default 5 per page, always page 1); rpp=25 is accepted; rpp=50 and rpp=100
+# are rejected with HTTP 400.
+HIDIVE_HISTORY_RPP = 25
+# Hot mode pages history until the stored front-boundary marker is seen.  If it
+# is not reached within this budget the run escalates to a full refresh so the
+# boundary is rebuilt instead of staying unreachable forever.
+HIDIVE_HOT_HISTORY_CATCHUP_PAGE_LIMIT = 20
+HIDIVE_PROGRESS_NORMALIZATION_VERSION = "hidive_progress_v3"
 HIDIVE_FAVOURITE_PAGE_LIMIT = 1000
 HIDIVE_CUSTOM_WATCHLIST_COLLECTION_PAGE_LIMIT = 1000
 HIDIVE_CUSTOM_WATCHLIST_DETAIL_PAGE_LIMIT = 1000
@@ -40,7 +51,6 @@ class _SyncBoundary:
     history_markers: list[str]
     continue_markers: list[str]
     favourite_markers: list[str]
-    history_backfill_markers: list[str]
     favourite_backfill_markers: list[str]
 
 
@@ -77,6 +87,65 @@ def _safe_int(value: Any) -> int | None:
         return int(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _episode_number_and_label(value: Any) -> tuple[int | None, str | None]:
+    """Split a provider episode number into an integral number and display label.
+
+    Non-integral numbers (e.g. 12.5 recaps) keep ``episode_number`` None so they
+    cannot collide with the integral episode they would truncate to.
+    """
+    if isinstance(value, bool) or value is None:
+        return None, None
+    if isinstance(value, int):
+        return value, str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None, None
+        if value.is_integer():
+            return int(value), str(int(value))
+        return None, repr(value)
+    text = str(value).strip()
+    if not text:
+        return None, None
+    try:
+        return int(text), text
+    except ValueError:
+        pass
+    try:
+        numeric = float(text)
+    except ValueError:
+        return None, text
+    if math.isfinite(numeric) and numeric.is_integer():
+        return int(numeric), text
+    return None, text
+
+
+def _season_number(value: Any) -> int | None:
+    number, _label = _episode_number_and_label(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _season_identity(episode_information: dict[str, Any]) -> tuple[str | None, int | None, str | None]:
+    """Return (provider_season_key, season_number, season_title).
+
+    The key is HIDIVE's season id (``episodeInformation.season``) as a string.
+    When a payload lacks it, the deterministic fallback is
+    ``season-number:<seasonNumber>`` (distinct from any numeric id).  HIDIVE
+    carries dubs as audio tracks of one VOD, so no dub collapse is needed.
+    """
+    season_number = _season_number(episode_information.get("seasonNumber"))
+    raw_title = episode_information.get("seasonTitle")
+    season_title = raw_title if isinstance(raw_title, str) and raw_title.strip() else None
+    season_id = episode_information.get("season")
+    key: str | None = None
+    if isinstance(season_id, int) and not isinstance(season_id, bool):
+        key = str(season_id)
+    elif isinstance(season_id, str) and season_id.strip():
+        key = season_id.strip()
+    elif season_number is not None:
+        key = f"season-number:{season_number}"
+    return key, season_number, season_title
 
 
 def _safe_float(value: Any) -> float | None:
@@ -181,7 +250,6 @@ def _load_sync_boundary(state_paths: HidiveStatePaths) -> _SyncBoundary | None:
         history_markers=[str(item) for item in history.get("first_seen", []) if item],
         continue_markers=[str(item) for item in continue_watching.get("first_seen", []) if item],
         favourite_markers=[str(item) for item in favourites.get("first_seen", []) if item],
-        history_backfill_markers=[str(item) for item in history.get("backfill_seen", []) if item],
         favourite_backfill_markers=[str(item) for item in favourites.get("backfill_seen", []) if item],
     )
 
@@ -205,7 +273,6 @@ def _write_sync_boundary(
     history_items: list[dict[str, Any]],
     continue_items: list[dict[str, Any]],
     favourite_items: list[dict[str, Any]],
-    history_backfill_items: list[dict[str, Any]] | None = None,
     favourite_backfill_items: list[dict[str, Any]] | None = None,
     favourite_markers_override: list[str] | None = None,
     favourite_backfill_markers_override: list[str] | None = None,
@@ -218,7 +285,6 @@ def _write_sync_boundary(
         if favourite_markers_override is not None
         else _unique_fingerprints(favourite_items, _favourite_item_fingerprint, FAVOURITE_BOUNDARY_MARKER_LIMIT)
     )
-    history_backfill_markers = _unique_fingerprints(history_backfill_items or [], _history_item_fingerprint, HISTORY_BOUNDARY_MARKER_LIMIT)
     favourite_backfill_markers = (
         list(favourite_backfill_markers_override[:FAVOURITE_BOUNDARY_MARKER_LIMIT])
         if favourite_backfill_markers_override is not None
@@ -228,7 +294,7 @@ def _write_sync_boundary(
         "schema_version": SYNC_BOUNDARY_SCHEMA_VERSION,
         "generated_at": generated_at,
         "account_id_hint": account_id_hint,
-        "history": {"marker_limit": HISTORY_BOUNDARY_MARKER_LIMIT, "retained_count": len(history_markers), "first_seen": history_markers, "backfill_seen": history_backfill_markers, "backfill_retained_count": len(history_backfill_markers)},
+        "history": {"marker_limit": HISTORY_BOUNDARY_MARKER_LIMIT, "retained_count": len(history_markers), "first_seen": history_markers},
         "continue_watching": {"marker_limit": CONTINUE_BOUNDARY_MARKER_LIMIT, "retained_count": len(continue_markers), "first_seen": continue_markers},
         "favourites": {"marker_limit": FAVOURITE_BOUNDARY_MARKER_LIMIT, "retained_count": len(favourite_markers), "first_seen": favourite_markers, "backfill_seen": favourite_backfill_markers, "backfill_retained_count": len(favourite_backfill_markers)},
     }
@@ -236,18 +302,24 @@ def _write_sync_boundary(
 
 
 def _normalize_hidive_watch_progress(raw_progress: Any, duration_seconds: int | None) -> tuple[int | None, float | None]:
+    """Return (playback_seconds, completion_ratio) from Continue Watching.
+
+    Production ``watchProgress`` values are integer seconds (e.g. 1137 of a
+    1488 s episode, or 16 s), so integral values are always seconds; only a
+    non-integral value below 1 is read as a ratio.  A 1-second position must
+    never read as "100% watched".
+    """
     numeric = _safe_float(raw_progress)
-    if numeric is None:
+    if numeric is None or not math.isfinite(numeric) or numeric < 0:
         return None, None
-    if 0.0 <= numeric <= 1.0:
-        playback_ratio = numeric
-        playback_seconds = int((duration_seconds or 0) * playback_ratio) if duration_seconds is not None else None
-        return playback_seconds, playback_ratio
-    if duration_seconds is not None and duration_seconds > 0:
-        playback_seconds = int(max(0.0, numeric))
-        playback_ratio = min(1.0, max(0.0, playback_seconds / duration_seconds))
-        return playback_seconds, playback_ratio
-    return int(max(0.0, numeric)), None
+    known_duration = duration_seconds if duration_seconds is not None and duration_seconds > 0 else None
+    if not numeric.is_integer() and numeric < 1.0:
+        playback_seconds = int(known_duration * numeric) if known_duration is not None else None
+        return playback_seconds, numeric
+    playback_seconds = int(numeric)
+    if known_duration is None:
+        return playback_seconds, None
+    return playback_seconds, min(1.0, playback_seconds / known_duration)
 
 
 def _extract_series_ref_from_episode_info(item: dict[str, Any]) -> SeriesRef | None:
@@ -261,7 +333,7 @@ def _extract_series_ref_from_episode_info(item: dict[str, Any]) -> SeriesRef | N
         provider_series_id=str(provider_series_id),
         title=str(title),
         season_title=(str(episode_information.get("seasonTitle")) if episode_information.get("seasonTitle") is not None else None),
-        season_number=_safe_int(episode_information.get("seasonNumber")),
+        season_number=_season_number(episode_information.get("seasonNumber")),
     )
 
 
@@ -274,10 +346,12 @@ def _history_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
         return None
     duration_seconds = _safe_int(item.get("duration"))
     duration_ms = duration_seconds * 1000 if duration_seconds is not None else None
+    episode_number, episode_label = _episode_number_and_label(episode_information.get("episodeNumber"))
+    season_key, season_number, season_title = _season_identity(episode_information)
     return EpisodeProgress(
         provider_episode_id=str(provider_episode_id),
         provider_series_id=str(provider_series_id),
-        episode_number=_safe_int(episode_information.get("episodeNumber")),
+        episode_number=episode_number,
         episode_title=str(item.get("title")) if item.get("title") is not None else None,
         playback_position_ms=None,
         duration_ms=duration_ms,
@@ -289,7 +363,11 @@ def _history_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
         progress_source_surface="hidive_history",
         progress_observation_kind="history_membership",
         completion_assertion="unknown",
-        normalization_logic_version="hidive_progress_v2",
+        normalization_logic_version=HIDIVE_PROGRESS_NORMALIZATION_VERSION,
+        provider_season_key=season_key,
+        season_number=season_number,
+        season_title=season_title,
+        episode_label=episode_label,
     )
 
 
@@ -305,10 +383,20 @@ def _continue_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
     duration_ms = duration_seconds * 1000 if duration_seconds is not None else None
     playback_seconds, watch_progress = _normalize_hidive_watch_progress(item.get("watchProgress"), duration_seconds)
     playback_position_ms = playback_seconds * 1000 if playback_seconds is not None else None
+    if playback_position_ms is not None:
+        observation_kind = "position"
+    elif watch_progress is not None:
+        observation_kind = "ratio"
+    else:
+        # Bucket membership without any measurement is no stronger than history
+        # membership and must not outrank measured evidence.
+        observation_kind = "history_membership"
+    episode_number, episode_label = _episode_number_and_label(episode_information.get("episodeNumber"))
+    season_key, season_number, season_title = _season_identity(episode_information)
     return EpisodeProgress(
         provider_episode_id=str(provider_episode_id),
         provider_series_id=series_ref.provider_series_id,
-        episode_number=_safe_int(episode_information.get("episodeNumber")),
+        episode_number=episode_number,
         episode_title=str(item.get("title")) if item.get("title") is not None else None,
         playback_position_ms=playback_position_ms,
         duration_ms=duration_ms,
@@ -318,31 +406,54 @@ def _continue_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
         subtitle_locale=None,
         rating=str(item.get("rating")) if item.get("rating") is not None else None,
         progress_source_surface="hidive_continue_watching",
-        progress_observation_kind="position" if playback_position_ms is not None else "ratio",
-        completion_assertion="confirmed" if watch_progress == 1.0 else "unknown",
-        normalization_logic_version="hidive_progress_v2",
+        progress_observation_kind=observation_kind,
+        completion_assertion="confirmed" if watch_progress is not None and watch_progress >= 1.0 else "unknown",
+        normalization_logic_version=HIDIVE_PROGRESS_NORMALIZATION_VERSION,
+        provider_season_key=season_key,
+        season_number=season_number,
+        season_title=season_title,
+        episode_label=episode_label,
     )
+
+
+@dataclass(slots=True)
+class _HistoryFetch:
+    items: list[dict[str, Any]]
+    pages_fetched: int
+    # True when paging stopped before the declared terminal page for any reason
+    # other than reaching the front boundary (guard, cap, non-advancing page).
+    stopped_early: bool
+    # True when the declared terminal page was read: every item was observed.
+    traversal_complete: bool
+    front_boundary_seen: bool
+    catchup_cap_hit: bool
+    next_page: int | None
+    diagnostics: list[dict[str, Any]]
+
+    @property
+    def front_boundary_complete(self) -> bool:
+        # Reading the whole history proves nothing newer was skipped even if the
+        # stored markers vanished (e.g. every marker episode was rewatched).
+        return self.front_boundary_seen or self.traversal_complete
 
 
 def _fetch_history_items(
     session: HidiveSession,
     *,
     history_markers: set[str] | None = None,
-    backfill_markers: set[str] | None = None,
     max_pages: int | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, bool, bool, bool, list[dict[str, Any]]]:
-    page = 1
-    size = 100
+    start_page: int = 1,
+) -> _HistoryFetch:
+    page = start_page
     items: list[dict[str, Any]] = []
-    backfill_items: list[dict[str, Any]] = []
     pages_fetched = 0
-    backfill_pages_fetched = 0
     stopped_early = False
-    backfill_exhausted = False
+    traversal_complete = False
+    catchup_cap_hit = False
+    next_page: int | None = None
     diagnostics: list[dict[str, Any]] = []
     seen_page_fingerprints: dict[str, int] = {}
     front_boundary_seen = not history_markers
-    backfill_cursor_seen = not backfill_markers
     while True:
         if pages_fetched >= HIDIVE_HISTORY_PAGE_LIMIT:
             stopped_early = True
@@ -352,7 +463,7 @@ def _fetch_history_items(
                 pages_fetched=pages_fetched,
             ))
             break
-        payload = session.json_get("/customer/history/vod", params={"size": size, "page": page})
+        payload = session.json_get("/customer/history/vod", params={"rpp": HIDIVE_HISTORY_RPP, "p": page})
         pages_fetched += 1
         if not isinstance(payload, dict):
             raise HidiveSnapshotError("HIDIVE history payload was not a JSON object")
@@ -362,15 +473,19 @@ def _fetch_history_items(
         batch = [item for item in vods if isinstance(item, dict)]
         batch_fingerprint = _page_fingerprint(batch, _history_item_fingerprint)
         previous_page = seen_page_fingerprints.get(batch_fingerprint)
-        if previous_page is not None:
+        echoed_page = _safe_int(payload.get("page"))
+        if (batch and previous_page is not None) or (echoed_page is not None and echoed_page != page):
+            # The server echoes the page it served; a mismatch or a repeated
+            # page means the paging parameters were ignored.
             stopped_early = True
             diagnostics.append(
                 _diagnostic(
                     "history_pagination_non_advancing",
                     surface="history",
-                    detail="HIDIVE returned a duplicate history page fingerprint before the declared terminal page; stopped to avoid repeated non-advancing requests",
+                    detail="HIDIVE history served a repeated or different page than requested; stopped to avoid repeated non-advancing requests",
                     previous_page=previous_page,
-                    repeated_page=page,
+                    requested_page=page,
+                    echoed_page=echoed_page,
                     pages_fetched=pages_fetched,
                     batch_count=len(batch),
                     declared_total_pages=_safe_int(payload.get("totalPages")),
@@ -380,63 +495,43 @@ def _fetch_history_items(
             break
         seen_page_fingerprints[batch_fingerprint] = page
         items.extend(batch)
-        batch_markers = {marker for item in batch if (marker := _history_item_fingerprint(item))}
-        if not front_boundary_seen and history_markers and history_markers.intersection(batch_markers):
-            front_boundary_seen = True
-        elif front_boundary_seen and not backfill_cursor_seen and backfill_markers and backfill_markers.intersection(batch_markers):
-            backfill_cursor_seen = True
-        elif front_boundary_seen and backfill_cursor_seen and history_markers:
-            backfill_items.extend(batch)
-            backfill_pages_fetched += 1
-            if backfill_pages_fetched >= INCREMENTAL_BACKFILL_PAGE_LIMIT:
-                stopped_early = True
-                break
-        total_pages = _safe_int(payload.get("totalPages")) or 1
-        if page >= total_pages or not vods:
-            if front_boundary_seen:
-                backfill_exhausted = True
+        if history_markers and not front_boundary_seen:
+            batch_markers = {marker for item in batch if (marker := _history_item_fingerprint(item))}
+            front_boundary_seen = bool(history_markers.intersection(batch_markers))
+        total_pages = _safe_int(payload.get("totalPages"))
+        if not batch or (total_pages is not None and page >= total_pages) or (total_pages is None and len(batch) < HIDIVE_HISTORY_RPP):
+            traversal_complete = True
             break
         if history_markers and front_boundary_seen:
             break
-        # Production forensics show that this endpoint ignores page numbers and
-        # repeats page 1.  Preserve explicit full-history incompleteness without
-        # issuing a known-useless second request.
-        if not history_markers:
-            stopped_early = True
-            diagnostics.append(
-                _diagnostic(
-                    "history_partial_unpageable",
-                    surface="history",
-                    severity="info",
-                    detail="HIDIVE history declares additional pages but ignores page-number pagination; retained verified page 1 only",
-                    pages_fetched=pages_fetched,
-                    declared_total_pages=total_pages,
-                    declared_total_results=_safe_int(payload.get("totalResults")),
-                )
-            )
-            break
         if max_pages is not None and pages_fetched >= max_pages:
             stopped_early = True
+            catchup_cap_hit = True
+            next_page = page + 1
             diagnostics.append(_diagnostic(
-                "history_page_cap_hit", surface="history",
-                detail="HIDIVE history stopped at the configured page cap",
+                "history_page_cap_hit", surface="history", severity="info",
+                detail="HIDIVE history stopped at the page budget before the stored front boundary",
                 pages_fetched=pages_fetched,
             ))
             break
         page += 1
-    return (
-        items,
-        backfill_items,
-        pages_fetched,
-        backfill_pages_fetched,
-        stopped_early,
-        backfill_exhausted,
-        front_boundary_seen,
-        diagnostics,
+    return _HistoryFetch(
+        items=items,
+        pages_fetched=pages_fetched,
+        stopped_early=stopped_early,
+        traversal_complete=traversal_complete,
+        front_boundary_seen=front_boundary_seen,
+        catchup_cap_hit=catchup_cap_hit,
+        next_page=next_page,
+        diagnostics=diagnostics,
     )
 
 
 def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+    # Production probes (2026-11-18): /content/home ignores size/page (the
+    # Continue Watching bucket reports page 1, resultsPerPage 5) and rejects
+    # rpp=25 with bpp=25 (HTTP 400).  No bucket paging parameters are verified,
+    # so only page 1 is read and a larger bucket is reported partial.
     payload = session.json_get("/content/home", params={"size": 100, "page": 1})
     if not isinstance(payload, dict):
         raise HidiveSnapshotError("HIDIVE home payload was not a JSON object")
@@ -481,7 +576,7 @@ def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] 
                         "continue_watching_partial_unpageable",
                         surface="continue_watching",
                         severity="info",
-                        detail="HIDIVE home Continue Watching exposes page-1 bucket metadata but repeated home page requests return the same bucket; retained page 1 only",
+                        detail="HIDIVE home Continue Watching bucket serves its first page only (5 items); no working bucket paging parameters are established, so page 1 is retained",
                         item_count=len(items),
                         declared_total_pages=bucket_total_pages,
                         declared_total_results=bucket_total_results,
@@ -960,18 +1055,41 @@ def _fetch_snapshot(
                 boundary_account_status = "account_mismatch"
             else:
                 boundary_account_status = "account_match"
-        # HIDIVE's hot path intentionally limits history to the first page and skips
-        # account-scope continue/favourites surfaces.  Only use that abbreviated
-        # mode once we have a matching local boundary; first-run or account-swapped
-        # snapshots need a bounded account refresh so normal provider use is not
-        # reduced to page-1 history forever.
+        # HIDIVE's hot path pages history only down to the stored front-boundary
+        # marker and skips account-scope favourites/custom watchlists.  Only use
+        # that abbreviated mode once we have a matching local boundary;
+        # first-run or account-swapped snapshots need a full account refresh.
         hot_mode = use_incremental_boundary and boundary is not None
-        history_items, history_backfill_items, history_pages_fetched, history_backfill_pages_fetched, history_stopped_early, history_backfill_exhausted, history_boundary_reached, history_diagnostics = _fetch_history_items(
-            session,
-            history_markers=set(boundary.history_markers) if boundary else None,
-            backfill_markers=set(boundary.history_backfill_markers) if boundary else None,
-            max_pages=None,
-        )
+        escalated_to_full_refresh = False
+        if hot_mode and boundary is not None:
+            history = _fetch_history_items(
+                session,
+                history_markers=set(boundary.history_markers),
+                max_pages=HIDIVE_HOT_HISTORY_CATCHUP_PAGE_LIMIT,
+            )
+            if history.catchup_cap_hit and not history.front_boundary_complete and history.next_page is not None:
+                # The boundary is unreachable within the hot budget.  Staying hot
+                # would never advance it, so finish this run as a full refresh
+                # (remaining history plus watchlist surfaces) and rebuild it.
+                remainder = _fetch_history_items(session, start_page=history.next_page)
+                history = _HistoryFetch(
+                    items=[*history.items, *remainder.items],
+                    pages_fetched=history.pages_fetched + remainder.pages_fetched,
+                    stopped_early=remainder.stopped_early,
+                    traversal_complete=remainder.traversal_complete,
+                    front_boundary_seen=remainder.front_boundary_seen,
+                    catchup_cap_hit=True,
+                    next_page=None,
+                    diagnostics=[*history.diagnostics, *remainder.diagnostics],
+                )
+                hot_mode = False
+                escalated_to_full_refresh = True
+        else:
+            history = _fetch_history_items(session)
+        history_items = history.items
+        history_pages_fetched = history.pages_fetched
+        history_stopped_early = history.stopped_early
+        history_diagnostics = history.diagnostics
         if hot_mode:
             continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(
                 session,
@@ -986,15 +1104,10 @@ def _fetch_snapshot(
                 "lists": [],
             }, [], False
         else:
-            continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(
-                session,
-                continue_markers=set(boundary.continue_markers) if boundary else None,
-            )
-            favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = _fetch_favourite_items(
-                session,
-                favourite_markers=set(boundary.favourite_markers) if boundary else None,
-                backfill_markers=set(boundary.favourite_backfill_markers) if boundary else None,
-            )
+            # Full refresh (including an escalated hot run) traverses every
+            # surface from the start; stored markers must not cut it short.
+            continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(session)
+            favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = _fetch_favourite_items(session)
             custom_series, custom_watchlist_entries, custom_watchlist_metadata, custom_watchlist_diagnostics, custom_watchlist_partial = _fetch_custom_watchlist_items(session)
     except HidiveAuthError as exc:
         raise
@@ -1011,8 +1124,8 @@ def _fetch_snapshot(
     diagnostics = [*history_diagnostics, *(continue_metadata.get("diagnostics") if isinstance(continue_metadata.get("diagnostics"), list) else []), *custom_watchlist_diagnostics]
     history_non_advancing_detected = any(item.get("code") == "history_pagination_non_advancing" for item in diagnostics if isinstance(item, dict))
     continue_partial = continue_metadata.get("partial") is True
-    history_front_boundary_complete = history_boundary_reached
-    history_full_complete = not hot_mode and not history_stopped_early
+    history_front_boundary_complete = history.front_boundary_complete
+    history_full_complete = history.traversal_complete
     continue_complete = not continue_partial
     watchlist_complete = bool(
         not hot_mode
@@ -1025,10 +1138,13 @@ def _fetch_snapshot(
         and session.token.account_id
         and stored_boundary.account_id_hint != session.token.account_id
     )
+    # A hot run with a proven history front rewrites the history/continue
+    # markers (favourite markers are carried over unchanged below).  Without
+    # this the markers age until hot mode can no longer reach them.
     boundary_rewrite_eligible = bool(
         session.token.account_id
         and history_front_boundary_complete
-        and watchlist_complete
+        and (watchlist_complete or hot_mode)
         and not stored_boundary_account_mismatch
     )
     partial = bool(
@@ -1076,11 +1192,13 @@ def _fetch_snapshot(
             "history_pages_fetched": history_pages_fetched,
             "history_stopped_early": history_stopped_early,
             "history_non_advancing_detected": history_non_advancing_detected,
-            "history_backfill_pages_fetched": history_backfill_pages_fetched,
-            "history_backfill_exhausted": history_backfill_exhausted,
-            # Surface authority is intentionally split: HIDIVE's history endpoint
-            # may ignore page numbers, but a verified page 1 can still establish
-            # the safe incremental front boundary.
+            "history_traversal_complete": history.traversal_complete,
+            "history_catchup_page_limit": HIDIVE_HOT_HISTORY_CATCHUP_PAGE_LIMIT,
+            "history_results_per_page": HIDIVE_HISTORY_RPP,
+            "sync_boundary_escalated_to_full_refresh": escalated_to_full_refresh,
+            # Surface authority is intentionally split: a hot run proves the
+            # history front (down to the stored marker) without traversing the
+            # full history.
             "history_boundary_complete": history_front_boundary_complete,
             "history_front_boundary_complete": history_front_boundary_complete,
             "history_full_complete": history_full_complete,
@@ -1118,6 +1236,8 @@ def _fetch_snapshot(
             "sync_boundary_refresh_kind": (
                 "hot_boundary_refresh"
                 if hot_mode
+                else "hot_boundary_unreachable_full_refresh"
+                if escalated_to_full_refresh
                 else "explicit_full_refresh"
                 if not use_incremental_boundary
                 else "account_repair_full_refresh"
@@ -1152,7 +1272,6 @@ def _fetch_snapshot(
             history_items=history_items,
             continue_items=continue_items,
             favourite_items=favourite_items,
-            history_backfill_items=[] if history_backfill_exhausted else history_backfill_items,
             favourite_backfill_items=[] if favourite_backfill_exhausted else favourite_backfill_items,
             favourite_markers_override=boundary.favourite_markers if hot_mode and boundary else None,
             favourite_backfill_markers_override=boundary.favourite_backfill_markers if hot_mode and boundary else None,

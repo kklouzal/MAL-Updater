@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -10,7 +11,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, MalSecrets, ensure_secret_directory, mal_callback_bind_warning
-from .mal_client import TokenResponse
+from .mal_client import (
+    MalClient,
+    TokenResponse,
+    clear_mal_access_token_state,
+    mal_token_expires_at,
+    read_mal_access_token_expiry,
+    write_mal_access_token_state,
+)
 
 
 class OAuthCallbackError(RuntimeError):
@@ -97,23 +105,110 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 
 def write_secret_file(path: Path, value: str) -> None:
+    """Durably replace one private secret file (fsynced temp file + atomic rename)."""
     ensure_secret_directory(path.parent)
     with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
-        tmp.write(value.strip() + "\n")
         temp_path = Path(tmp.name)
-    os.chmod(temp_path, 0o600)
-    temp_path.replace(path)
+        try:
+            tmp.write(value.strip() + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except BaseException:
+            tmp.close()
+            temp_path.unlink(missing_ok=True)
+            raise
+    try:
+        os.chmod(temp_path, 0o600)
+        temp_path.replace(path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
     os.chmod(path, 0o600)
+    dir_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
-def persist_token_response(token: TokenResponse, secrets: MalSecrets) -> PersistedTokenPaths:
-    write_secret_file(secrets.access_token_path, token.access_token)
+def persist_token_response(
+    token: TokenResponse, secrets: MalSecrets, *, obtained_at: datetime | None = None,
+) -> PersistedTokenPaths:
+    """Persist a MAL token grant so that no crash point strands a spent refresh token.
+
+    MAL rotates the refresh token on every refresh grant, so the new refresh
+    token is made durable first. The expiry record is dropped before and
+    rewritten after both tokens, and it is bound to the access token by digest,
+    so any interrupted sequence reads as "expiry unknown" and the next
+    mal-refresh run renews instead of skipping.
+    """
+    obtained = obtained_at or datetime.now(timezone.utc)
+    clear_mal_access_token_state(secrets)
     if token.refresh_token:
         write_secret_file(secrets.refresh_token_path, token.refresh_token)
+    write_secret_file(secrets.access_token_path, token.access_token)
+    write_mal_access_token_state(secrets, token, obtained_at=obtained)
     return PersistedTokenPaths(
         access_token_path=secrets.access_token_path,
         refresh_token_path=secrets.refresh_token_path,
     )
+
+
+# MAL's documented grant returns ~31-day access tokens. Renewing a week before
+# expiry keeps a wide margin for downtime and for refresh-token lifetimes that
+# MAL does not document, while avoiding a refresh-token rotation every hour.
+DEFAULT_MAL_TOKEN_REFRESH_MARGIN_SECONDS = 7 * 24 * 60 * 60
+
+
+@dataclass(slots=True)
+class MalTokenRefreshOutcome:
+    refreshed: bool
+    reason: str
+    access_token_expires_at: datetime | None
+    token: TokenResponse | None = None
+    persisted: PersistedTokenPaths | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "refreshed": self.refreshed,
+            "reason": self.reason,
+            "access_token_expires_at": None
+            if self.access_token_expires_at is None
+            else self.access_token_expires_at.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
+        if self.persisted is not None:
+            payload["access_token_path"] = str(self.persisted.access_token_path)
+            payload["refresh_token_path"] = str(self.persisted.refresh_token_path)
+        return payload
+
+
+def refresh_mal_tokens_if_due(
+    client: MalClient,
+    secrets: MalSecrets,
+    *,
+    force: bool = False,
+    min_remaining_seconds: int = DEFAULT_MAL_TOKEN_REFRESH_MARGIN_SECONDS,
+    now: datetime | None = None,
+) -> MalTokenRefreshOutcome:
+    """Refresh only when forced, when expiry is unknown, or when it is within the margin.
+
+    Expiry is unknown for tokens persisted before expiry recording existed, for
+    grants without ``expires_in``, after an interrupted persist, and after any
+    MAL API 401 for the current bearer token (MalClient clears the record).
+    Raises MalApiError when a due refresh fails.
+    """
+    current = now or datetime.now(timezone.utc)
+    expires_at = read_mal_access_token_expiry(secrets)
+    if not force and expires_at is not None:
+        remaining = (expires_at - current).total_seconds()
+        if remaining > max(0, int(min_remaining_seconds)):
+            return MalTokenRefreshOutcome(False, "access_token_not_near_expiry", expires_at)
+    reason = "forced" if force else ("expiry_unknown" if expires_at is None else "access_token_near_expiry")
+    token = client.refresh_access_token()
+    persisted = persist_token_response(token, secrets, obtained_at=current)
+    new_expiry = mal_token_expires_at(token, obtained_at=current)
+    return MalTokenRefreshOutcome(True, reason, new_expiry, token=token, persisted=persisted)
 
 
 def wait_for_oauth_callback(host: str, port: int, expected_state: str | None, timeout_seconds: float = 300.0) -> OAuthCallbackResult:

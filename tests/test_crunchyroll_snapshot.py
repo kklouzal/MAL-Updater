@@ -1102,5 +1102,108 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertTrue(session.state_paths.sync_boundary_path.exists())
 
 
+    def test_full_refresh_pages_past_a_full_page_whose_total_equals_page_size(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            requested_pages: list[int] = []
+
+            def fake_get(url, *, params=None, phase=None):
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123"}
+                if url.endswith("/watch-history"):
+                    page = int(params["page"])
+                    requested_pages.append(page)
+                    data = [self._history_entry((page - 1) * 100 + i) for i in range(100 if page < 3 else 7)]
+                    # Per-response count, not an overall total.
+                    return {"total": len(data), "data": data}
+                if url.endswith("/watchlist"):
+                    return {"total": 0, "data": []}
+                raise AssertionError(url)
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                result = _fetch_snapshot_once(session, use_incremental_boundary=False)
+
+        self.assertEqual([1, 2, 3], requested_pages)
+        self.assertEqual(207, result.snapshot.raw["history_count"])
+        self.assertFalse(result.snapshot.raw["history_partial"])
+        self.assertEqual("complete", result.snapshot.fetch_provenance[0].completeness)
+
+
+class CrunchyrollProgressSeasonIdentityTests(unittest.TestCase):
+    def _entry(self, **metadata_overrides) -> dict:
+        metadata = {
+            "series_id": "series-1",
+            "series_title": "Show",
+            "season_id": "dub-season",
+            "season_title": "Show Season 2 (English Dub)",
+            "season_number": 1,
+            "season_sequence_number": 2,
+            "episode": "12.5",
+            "episode_number": None,
+            "duration_ms": 1_440_000,
+            "audio_locale": "en-US",
+            "versions": [
+                {"audio_locale": "en-US", "guid": "ep-dub", "original": False, "season_guid": "dub-season"},
+                {"audio_locale": "ja-JP", "guid": "ep-orig", "original": True, "season_guid": "orig-season"},
+            ],
+        }
+        metadata.update(metadata_overrides)
+        return {
+            "date_played": "2026-11-01T00:00:00Z",
+            "playhead": 900,
+            "fully_watched": True,
+            "panel": {"type": "episode", "id": "ep-dub", "title": "Recap", "episode_metadata": metadata},
+        }
+
+    def test_dub_episode_collapses_onto_original_season_and_keeps_fully_watched(self) -> None:
+        progress = crunchyroll_snapshot._progress_from_history_entry(self._entry())
+        assert progress is not None
+        self.assertEqual("orig-season", progress.provider_season_key)
+        self.assertEqual(2, progress.season_number)
+        self.assertEqual("Show Season 2 (English Dub)", progress.season_title)
+        self.assertEqual("12.5", progress.episode_label)
+        self.assertIsNone(progress.episode_number)
+        self.assertIs(True, progress.fully_watched)
+        # A playhead no longer discards the explicit completion.
+        self.assertEqual(900_000, progress.playback_position_ms)
+        self.assertEqual("explicit_completed", progress.progress_observation_kind)
+        self.assertEqual("confirmed", progress.completion_assertion)
+        self.assertEqual("crunchyroll_history", progress.progress_source_surface)
+
+    def test_season_key_falls_back_to_season_id_and_partial_progress_is_position(self) -> None:
+        entry = self._entry(versions=None, episode="3", episode_number=3)
+        entry["fully_watched"] = False
+        progress = crunchyroll_snapshot._progress_from_history_entry(entry)
+        assert progress is not None
+        self.assertEqual("dub-season", progress.provider_season_key)
+        self.assertEqual((3, "3"), (progress.episode_number, progress.episode_label))
+        self.assertIs(False, progress.fully_watched)
+        self.assertEqual(("position", "unknown"), (progress.progress_observation_kind, progress.completion_assertion))
+
+    def test_missing_fully_watched_flag_stays_unknown(self) -> None:
+        entry = self._entry()
+        del entry["fully_watched"]
+        del entry["playhead"]
+        progress = crunchyroll_snapshot._progress_from_history_entry(entry)
+        assert progress is not None
+        self.assertIsNone(progress.fully_watched)
+        self.assertEqual("history_membership", progress.progress_observation_kind)
+
+    def test_movie_uses_movie_listing_as_season_key(self) -> None:
+        entry = {
+            "date_played": "2026-11-01T00:00:00Z",
+            "playhead": 10,
+            "fully_watched": True,
+            "panel": {"type": "movie", "id": "movie-ep", "title": "Film", "movie_metadata": {"movie_listing_id": "listing-9", "duration_ms": 6_000_000}},
+        }
+        progress = crunchyroll_snapshot._progress_from_history_entry(entry)
+        assert progress is not None
+        self.assertEqual("listing-9", progress.provider_season_key)
+        self.assertIs(True, progress.fully_watched)
+        self.assertEqual("confirmed", progress.completion_assertion)
+
+
 if __name__ == "__main__":
     unittest.main()

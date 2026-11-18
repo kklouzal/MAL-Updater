@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
-from .auth import persist_token_response
+from .auth import refresh_mal_tokens_if_due
 from .auth_failure_signals import looks_auth_style_failure
 from .config import (
     AppConfig,
@@ -584,14 +584,9 @@ def _refresh_mal_tokens(config: AppConfig) -> dict[str, Any]:
     secrets = load_mal_secrets(config)
     if not (secrets.client_id and secrets.refresh_token):
         return {"status": "skipped", "reason": "missing_mal_refresh_material"}
-    client = MalClient(config, secrets)
-    token = client.refresh_access_token()
-    persisted = persist_token_response(token, secrets)
-    return {
-        "status": "ok",
-        "access_token_path": str(persisted.access_token_path),
-        "refresh_token_path": str(persisted.refresh_token_path),
-    }
+    # Rotating every hour gains nothing (tokens live ~31 days) and widens the
+    # window for losing a rotated refresh token; renew near expiry instead.
+    return refresh_mal_tokens_if_due(MalClient(config, secrets), secrets).as_dict()
 
 
 def _available_source_providers(config: AppConfig) -> list[str]:
@@ -775,7 +770,7 @@ def effective_niceness_policy(config: AppConfig) -> dict[str, Any]:
             "stale_while_revalidate": True,
             "negative_absence_uses_shorter_cadence": True,
             "provider_title_identity_only_days": PROVIDER_SEARCH_CACHE_TTL_DAYS,
-            "same_cycle_provider_fetch_required_for_unattended_apply": True,
+            "fresh_provider_fetch_since_last_apply_required_for_unattended_apply": True,
         },
         "cache_horizons_days": {
             "mal_search_positive": int(config.mal.search_cache_ttl_days),
@@ -1112,11 +1107,11 @@ def _provider_fetch_health_request(config: AppConfig, provider: str, task_state:
 
 
 
-def _apply_sync_command(config: AppConfig) -> list[str]:
+def _apply_sync_command(config: AppConfig, *, providers: list[str] | None = None) -> list[str]:
     apply_limit = config.service.execute_limit_for("sync_apply")
     if apply_limit is None:
         apply_limit = DEFAULT_SERVICE_TASK_EXECUTE_LIMITS.get("sync_apply", 0)
-    return [
+    command = [
         sys.executable,
         "-m",
         "mal_updater.cli",
@@ -1126,6 +1121,17 @@ def _apply_sync_command(config: AppConfig) -> list[str]:
         "--exact-approved-only",
         "--execute",
     ]
+    for provider in providers or []:
+        command.extend(["--provider", provider])
+    return command
+
+
+def _provider_fetch_succeeded_since(tasks_state: dict[str, Any], provider: str, *, since_epoch: float) -> bool:
+    fetch_state = tasks_state.get(f"sync_fetch_{provider}")
+    if not isinstance(fetch_state, dict) or fetch_state.get("last_status") != "ok":
+        return False
+    fetch_run = fetch_state.get("last_run_epoch")
+    return isinstance(fetch_run, (int, float)) and float(fetch_run) > since_epoch
 
 
 def _recommendation_metadata_refresh_command(config: AppConfig) -> list[str]:
@@ -1180,6 +1186,9 @@ def _mal_list_refresh_command(config: AppConfig) -> list[str]:
         "mal-list-refresh",
         "--max-pages",
         str(max(1, int(max_pages))),
+        # Prune entries removed on MAL; pruning still requires the traversal
+        # to reach MAL's terminal page within the page budget.
+        "--complete",
     ]
 
 
@@ -1982,6 +1991,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
 
     for spec in _task_specs(config):
         task_state = tasks_state.setdefault(spec.name, {})
+        apply_providers: list[str] = []
         task_state["budget_provider"] = spec.budget_provider
         task_state["budget_scope"] = config.service.budget_scope_for(spec.budget_provider, task_name=spec.name)
         task_state["every_seconds"] = int(spec.every_seconds)
@@ -2062,18 +2072,27 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
         if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) > 0:
+            # Apply only evidence that is newer than the previous apply: each
+            # provider qualifies once its fetch has succeeded since then. Fetch
+            # lanes run on independent cadences and one provider may be down,
+            # so neither a shared loop pass nor every provider is required.
             required_providers = _available_source_providers(config)
-            missing_fresh_fetches = [
-                provider for provider in required_providers if provider not in provider_fetch_success_this_cycle
+            fresh_providers = [
+                provider
+                for provider in required_providers
+                if provider in provider_fetch_success_this_cycle
+                or _provider_fetch_succeeded_since(tasks_state, provider, since_epoch=last_run)
             ]
-            if missing_fresh_fetches:
+            missing_fresh_fetches = [provider for provider in required_providers if provider not in fresh_providers]
+            task_state.pop("same_cycle_provider_fetch_required", None)
+            task_state.pop("same_cycle_provider_fetch_missing", None)
+            task_state["apply_stale_providers"] = missing_fresh_fetches
+            if not fresh_providers:
                 task_state.update(
                     {
                         "last_status": "skipped",
                         "execution_state": "idle",
-                        "last_skip_reason": "same_cycle_provider_fetch_required",
-                        "same_cycle_provider_fetch_required": required_providers,
-                        "same_cycle_provider_fetch_missing": missing_fresh_fetches,
+                        "last_skip_reason": "fresh_provider_fetch_required",
                     }
                 )
                 _set_task_next_due(task_state, base_epoch=now, every_seconds=min(60, max(5, int(spec.every_seconds))))
@@ -2081,12 +2100,13 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                     {
                         "task": spec.name,
                         "status": "skipped",
-                        "reason": "same_cycle_provider_fetch_required",
+                        "reason": "fresh_provider_fetch_required",
                         "required_providers": required_providers,
                         "missing_providers": missing_fresh_fetches,
                     }
                 )
                 continue
+            apply_providers = fresh_providers
         _maybe_reset_task_projection_state_for_signature(config, spec, task_state, fetch_mode=planned_fetch_mode)
         backoff_until_epoch = float(task_state.get("budget_backoff_until_epoch", 0))
         if backoff_until_epoch > now:
@@ -2229,7 +2249,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 command_args = _mal_list_refresh_command(config)
                 started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
                 result = _run_subprocess(config, command_args, label=spec.name)
-                result["max_pages"] = int(command_args[-1])
+                result["max_pages"] = int(command_args[command_args.index("--max-pages") + 1])
             elif spec.name.startswith("sync_fetch_"):
                 provider = spec.name.removeprefix("sync_fetch_")
                 full_refresh_reasons = list(planned_full_refresh_reasons)
@@ -2244,7 +2264,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 if downgrade_reason:
                     result["deferred_full_refresh_reason"] = downgrade_reason
             elif spec.name == "sync_apply":
-                command_args = _apply_sync_command(config)
+                command_args = _apply_sync_command(config, providers=apply_providers)
                 started_epoch, started_at = _mark_task_running(config, state, spec.name, command_args)
                 result = _run_subprocess(config, command_args, label="sync_apply")
                 apply_limit = config.service.execute_limit_for("sync_apply")

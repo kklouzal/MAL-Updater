@@ -21,6 +21,7 @@ from .db import (
 )
 from .mal_client import MalApiError, MalClient
 from .mapping import SeriesMappingInput, extract_provider_mapping_evidence, map_series, merge_provider_mapping_evidence, should_auto_approve_mapping
+from .season_mappings import get_provider_season_mapping, upsert_provider_season_mapping
 
 
 EXACT_APPROVED_MAPPING_SOURCES = frozenset({"auto_exact", "user_exact"})
@@ -74,6 +75,14 @@ class ProviderSeriesState:
     verified_identity_evidence: dict[str, Any] | None = None
     account_observed_at: str | None = None
     catalog_observed_at: str | None = None
+    # Season-split planning: a provider series whose progress spans several
+    # canonical seasons yields one state per season (MAL lists seasons as
+    # separate entries). provider_season_key is None for a whole-series state.
+    provider_season_key: str | None = None
+    season_split: bool = False
+    season_unit_rank: int = 0
+    min_episode_number: int | None = None
+    completed_unnumbered_count: int = 0
 
 
 @dataclass(slots=True)
@@ -90,6 +99,11 @@ class EpisodeProgressState:
     completion_assertion: str | None = None
     normalization_logic_version: str | None = None
     last_seen_at: str | None = None
+    provider_season_key: str | None = None
+    season_number: int | None = None
+    season_title: str | None = None
+    episode_label: str | None = None
+    fully_watched: bool | None = None
 
 
 @dataclass(slots=True)
@@ -108,11 +122,13 @@ class SyncProposal:
     completion_audit: dict[str, Any] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
     provider: str = "crunchyroll"
+    provider_season_key: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "provider": self.provider,
             "provider_series_id": self.provider_series_id,
+            "provider_season_key": self.provider_season_key,
             "provider_title": self.provider_title,
             "crunchyroll_title": self.provider_title,
             "mapping_status": self.mapping_status,
@@ -190,11 +206,13 @@ class ApplyResult:
     requested_status: dict[str, Any] | None
     response_status: dict[str, Any] | None
     reasons: list[str] = field(default_factory=list)
+    provider_season_key: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "provider": self.provider,
             "provider_series_id": self.provider_series_id,
+            "provider_season_key": self.provider_season_key,
             "mal_anime_id": self.mal_anime_id,
             "mal_title": self.mal_title,
             "applied": self.applied,
@@ -212,6 +230,7 @@ def load_provider_series_states(
     provider_series_ids: list[str] | None = None,
     *,
     account_observed_only: bool = True,
+    split_seasons: bool = False,
 ) -> list[ProviderSeriesState]:
     if limit is not None and limit <= 0:
         limit = None
@@ -251,7 +270,12 @@ def load_provider_series_states(
             progress_observation_kind,
             completion_assertion,
             normalization_logic_version,
-            last_seen_at
+            last_seen_at,
+            provider_season_key,
+            season_number,
+            season_title,
+            episode_label,
+            fully_watched
         FROM provider_episode_progress
         WHERE 1=1
     """
@@ -313,13 +337,17 @@ def load_provider_series_states(
                 completion_assertion=row["completion_assertion"],
                 normalization_logic_version=row["normalization_logic_version"],
                 last_seen_at=row["last_seen_at"],
+                provider_season_key=row["provider_season_key"],
+                season_number=row["season_number"],
+                season_title=row["season_title"],
+                episode_label=row["episode_label"],
+                fully_watched=None if row["fully_watched"] is None else bool(row["fully_watched"]),
             )
         )
 
     states: list[tuple[str | None, str, ProviderSeriesState]] = []
     for row in series_rows:
         series_progress = progress_by_series.get((row["provider"], row["provider_series_id"]), [])
-        summary = _summarize_episode_progress(series_progress, config)
         verified_identity = verified_identity_by_series.get((row["provider"], row["provider_series_id"]))
         provider_evidence = extract_provider_mapping_evidence(_load_series_raw_json(row["raw_json"]))
         verified_identity_evidence = provider_evidence.identity_evidence if isinstance(provider_evidence.identity_evidence, dict) else None
@@ -331,38 +359,66 @@ def load_provider_series_states(
                     provider_evidence,
                     extract_provider_mapping_evidence({"identity_evidence": raw_identity_evidence}),
                 )
-        sort_key = summary["last_watched_at"] or row["account_observed_at"]
-        states.append(
-            (
-                sort_key,
-                row["title"],
-                ProviderSeriesState(
-                    provider=row["provider"],
-                    provider_series_id=row["provider_series_id"],
-                    title=row["title"],
-                    season_title=row["season_title"],
-                    season_number=row["season_number"],
-                    progress_rows=summary["progress_rows"],
-                    max_episode_number=summary["max_episode_number"],
-                    completed_episode_count=summary["completed_episode_count"],
-                    max_completed_episode_number=summary["max_completed_episode_number"],
-                    watchlist_status=row["watchlist_status"],
-                    last_watched_at=summary["last_watched_at"],
-                    completion_audit=summary["completion_audit"],
-                    last_progress_seen_at=summary["last_progress_seen_at"],
-                    last_series_seen_at=row["account_observed_at"],
-                    verified_mal_anime_id=verified_identity.mal_anime_id if verified_identity else None,
-                    verified_identity_kind=verified_identity.identity_match_kind if verified_identity else None,
-                    verified_identity_evidence=verified_identity_evidence,
-                    provider_episode_count=provider_evidence.episode_count,
-                    provider_season_count=provider_evidence.season_count,
-                    provider_start_year=provider_evidence.start_year,
-                    provider_start_year_is_trustworthy=provider_evidence.start_year_is_trustworthy,
-                    account_observed_at=row["account_observed_at"],
-                    catalog_observed_at=row["catalog_observed_at"],
-                ),
+        season_groups = _season_progress_groups(series_progress) if split_seasons else None
+        units: list[tuple[str | None, list[EpisodeProgressState]]]
+        if season_groups and len(season_groups) > 1:
+            units = list(season_groups.items())
+        elif season_groups:
+            # One canonical season: plan it against the series mapping, without
+            # unkeyed legacy rows that may belong to other seasons.
+            units = [(None, next(iter(season_groups.values())))]
+        else:
+            units = [(None, series_progress)]
+        built: list[tuple[str | None, str, ProviderSeriesState]] = []
+        for season_key, unit_progress in units:
+            summary = _summarize_episode_progress(unit_progress, config)
+            season_split = season_key is not None
+            unit_season_number, unit_season_title = (
+                _season_identity(unit_progress) if season_split else (row["season_number"], row["season_title"])
             )
-        )
+            sort_key = summary["last_watched_at"] or row["account_observed_at"]
+            built.append(
+                (
+                    sort_key,
+                    row["title"],
+                    ProviderSeriesState(
+                        provider=row["provider"],
+                        provider_series_id=row["provider_series_id"],
+                        title=row["title"],
+                        season_title=unit_season_title,
+                        season_number=unit_season_number,
+                        progress_rows=summary["progress_rows"],
+                        max_episode_number=summary["max_episode_number"],
+                        completed_episode_count=summary["completed_episode_count"],
+                        max_completed_episode_number=summary["max_completed_episode_number"],
+                        # A series-level watchlist entry says nothing about which
+                        # season to add, so split season states never carry it.
+                        watchlist_status=None if season_split else row["watchlist_status"],
+                        last_watched_at=summary["last_watched_at"],
+                        completion_audit=summary["completion_audit"],
+                        last_progress_seen_at=summary["last_progress_seen_at"],
+                        last_series_seen_at=row["account_observed_at"],
+                        verified_mal_anime_id=verified_identity.mal_anime_id if verified_identity else None,
+                        verified_identity_kind=verified_identity.identity_match_kind if verified_identity else None,
+                        verified_identity_evidence=verified_identity_evidence,
+                        provider_episode_count=None if season_split else provider_evidence.episode_count,
+                        provider_season_count=provider_evidence.season_count,
+                        provider_start_year=None if season_split else provider_evidence.start_year,
+                        provider_start_year_is_trustworthy=False if season_split else provider_evidence.start_year_is_trustworthy,
+                        account_observed_at=row["account_observed_at"],
+                        catalog_observed_at=row["catalog_observed_at"],
+                        provider_season_key=season_key,
+                        season_split=season_split,
+                        min_episode_number=summary["min_episode_number"],
+                        completed_unnumbered_count=summary["completed_unnumbered_count"],
+                    ),
+                )
+            )
+        if len(built) > 1:
+            built.sort(key=lambda item: item[2].last_watched_at or "", reverse=True)
+            for rank, item in enumerate(built):
+                item[2].season_unit_rank = rank
+        states.extend(built)
 
     states.sort(key=lambda item: (item[0] is not None, item[0] or "", item[1]), reverse=True)
     ordered = [item[2] for item in states]
@@ -390,15 +446,20 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     max_completed_episode_number: int | None = None
     last_watched_at: str | None = None
     last_progress_seen_at: str | None = None
+    min_episode_number: int | None = None
     completion_reason_counts: dict[str, int] = {
+        "provider_fully_watched": 0,
         "ratio_threshold": 0,
         "credits_window": 0,
         "later_episode_evidence": 0,
+        "next_episode_started_after_runtime": 0,
     }
     completion_reason_examples: dict[str, list[str]] = {
+        "provider_fully_watched": [],
         "ratio_threshold": [],
         "credits_window": [],
         "later_episode_evidence": [],
+        "next_episode_started_after_runtime": [],
     }
     incomplete_examples: list[str] = []
     uncertain_reason_counts: dict[str, int] = {
@@ -409,7 +470,8 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     for row in rows:
         if row.last_seen_at and (last_progress_seen_at is None or row.last_seen_at > last_progress_seen_at):
             last_progress_seen_at = row.last_seen_at
-        uncertainty_reason = _completion_uncertainty_reason(row)
+        completion_reason = _completion_reason(row, rows, config)
+        uncertainty_reason = None if completion_reason is not None else _completion_uncertainty_reason(row)
         if uncertainty_reason is not None:
             uncertain_reason_counts[uncertainty_reason] += 1
         else:
@@ -417,9 +479,9 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
             # but cannot extend a completion-dependent tail or its freshness.
             if row.episode_number is not None:
                 max_episode_number = row.episode_number if max_episode_number is None else max(max_episode_number, row.episode_number)
+                min_episode_number = row.episode_number if min_episode_number is None else min(min_episode_number, row.episode_number)
             if row.last_watched_at and (last_watched_at is None or row.last_watched_at > last_watched_at):
                 last_watched_at = row.last_watched_at
-        completion_reason = _completion_reason(row, rows, config)
         if completion_reason is None:
             if len(incomplete_examples) < 5:
                 incomplete_examples.append(_episode_audit_label(row))
@@ -436,10 +498,19 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
         else:
             completed_episode_ids_without_number.add(row.provider_episode_id)
 
+    # Unnumbered items (PVs, recaps, OVAs, movies attached to a series) are not
+    # MAL episodes of the mapped entry. Only a unit with no numbered episodes at
+    # all (a standalone movie or one-shot) counts its completion as one episode.
+    numbered_rows_present = any(row.episode_number is not None for row in rows)
+    completed_episode_count = len(completed_episode_numbers)
+    if not numbered_rows_present and completed_episode_ids_without_number:
+        completed_episode_count = 1
     return {
         "progress_rows": len(rows),
         "max_episode_number": max_episode_number,
-        "completed_episode_count": len(completed_episode_numbers) + len(completed_episode_ids_without_number),
+        "min_episode_number": min_episode_number,
+        "completed_episode_count": completed_episode_count,
+        "completed_unnumbered_count": len(completed_episode_ids_without_number),
         "max_completed_episode_number": max_completed_episode_number,
         "last_watched_at": last_watched_at,
         "last_progress_seen_at": last_progress_seen_at,
@@ -472,8 +543,10 @@ def _completion_uncertainty_reason(row: EpisodeProgressState) -> str | None:
 
 
 def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgressState], config: AppConfig) -> str | None:
+    if row.fully_watched is True:
+        return "provider_fully_watched"
     if _completion_uncertainty_reason(row) is not None:
-        return None
+        return _history_completion_inference(row, all_rows)
     completion_ratio = row.completion_ratio
     if completion_ratio is not None and completion_ratio >= config.completion_threshold:
         return "ratio_threshold"
@@ -497,6 +570,80 @@ def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgress
     ):
         return "later_episode_evidence"
     return None
+
+
+_NEXT_EPISODE_RUNTIME_FRACTION = 0.9
+
+
+def _history_completion_inference(row: EpisodeProgressState, all_rows: list[EpisodeProgressState]) -> str | None:
+    """Infer completion of a membership-only history row from the next episode.
+
+    HIDIVE history proves an episode was started, not finished. When episode
+    N+1 of the same season was started at least 90% of episode N's runtime
+    after N was started, N was played through (or skipped forward past its end).
+    """
+    if row.progress_observation_kind != "history_membership" and not (
+        row.completion_assertion == "unknown" and row.progress_source_surface == "hidive_history"
+    ):
+        return None
+    if row.episode_number is None or row.duration_ms is None or row.duration_ms <= 0:
+        return None
+    if row.provider_season_key is None:
+        # Without season identity, "episode N+1" may belong to another season.
+        return None
+    started = _parse_iso_utc(row.last_watched_at)
+    if started is None:
+        return None
+    for later in all_rows:
+        if later.episode_number != row.episode_number + 1:
+            continue
+        if later.provider_season_key != row.provider_season_key:
+            continue
+        later_started = _parse_iso_utc(later.last_watched_at)
+        if later_started is None:
+            continue
+        if (later_started - started).total_seconds() * 1000 >= row.duration_ms * _NEXT_EPISODE_RUNTIME_FRACTION:
+            return "next_episode_started_after_runtime"
+    return None
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _season_progress_groups(rows: list[EpisodeProgressState]) -> dict[str, list[EpisodeProgressState]]:
+    """Group rows by canonical provider season; rows lacking a key are excluded.
+
+    Unkeyed rows predate season capture. Once any row carries a key, the full
+    history refetch has re-observed the series, so unkeyed leftovers cannot be
+    attributed to a season and are not counted toward any MAL entry.
+    """
+    groups: dict[str, list[EpisodeProgressState]] = {}
+    for row in rows:
+        if row.provider_season_key:
+            groups.setdefault(row.provider_season_key, []).append(row)
+    return groups
+
+
+def _season_identity(rows: list[EpisodeProgressState]) -> tuple[int | None, str | None]:
+    """Season number/title for a canonical season unit.
+
+    Rows of one key can come from several dub listings of the same season
+    (Crunchyroll collapses dubs onto the original season). The lowest season
+    ordinal is preferred because dub listings sort after their original;
+    ties fall back to the most recently watched row.
+    """
+    latest_first = sorted(rows, key=lambda row: row.last_watched_at or "", reverse=True)
+    numbered = [row for row in latest_first if row.season_number is not None]
+    # min() keeps the first (most recent) row among equal season ordinals.
+    chosen = min(numbered, key=lambda row: row.season_number or 0) if numbered else latest_first[0]
+    return chosen.season_number, chosen.season_title
 
 
 def _episode_audit_label(row: EpisodeProgressState) -> str:
@@ -740,8 +887,12 @@ def _persist_watch_confirmation_provenance_snapshot(
     detail: dict[str, Any] | None,
     mapping_reasons: list[str] | None = None,
 ) -> None:
+    if state.season_unit_rank > 0:
+        # Provenance is one row per provider series; a season-split series
+        # records its most recently watched season only.
+        return
     mal_num_episodes = _coerce_detail_int((detail or {}).get("num_episodes"))
-    provider_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
+    provider_watched_episodes, _, _ = _provider_watched_episodes(state, mal_num_episodes)
     confirmed_complete, completion_decision, completion_status = _completion_decision_for_provenance(
         provider_watched_episodes=provider_watched_episodes,
         mal_num_episodes=mal_num_episodes,
@@ -773,6 +924,7 @@ def _persist_watch_confirmation_provenance_snapshot(
     progress_audit = {
         "provider": state.provider,
         "provider_series_id": state.provider_series_id,
+        "provider_season_key": state.provider_season_key,
         "watchlist_status": state.watchlist_status,
         "progress_rows": state.progress_rows,
         "completed_episode_count": state.completed_episode_count,
@@ -839,15 +991,17 @@ def _materialize_hidive_dry_run_confirmations(
     details_by_series: dict[tuple[str, str], dict[str, Any] | None],
 ) -> dict[str, Any]:
     """Materialize all HIDIVE progress-series evidence after a completed plan."""
+    # Season-split series contribute their most recently watched season
+    # (rank 0); provenance is one row per provider series.
     proposal_by_series = {
-        proposal.provider_series_id: proposal
-        for proposal in proposals
-        if proposal.provider == "hidive"
+        state.provider_series_id: proposal
+        for state, proposal in zip(planned_states, proposals)
+        if state.provider == "hidive" and state.season_unit_rank == 0
     }
     state_by_series = {
         state.provider_series_id: state
         for state in planned_states
-        if state.provider == "hidive" and state.progress_rows > 0
+        if state.provider == "hidive" and state.progress_rows > 0 and state.season_unit_rank == 0
     }
     # A bounded plan may omit progress-bearing series. Fill only missing rows for
     # those series, preserving any richer prior confirmation snapshot.
@@ -906,10 +1060,13 @@ def build_dry_run_sync_plan(
     exact_approved_only: bool = False,
     provider: str | None = None,
 ) -> list[SyncProposal]:
-    states = load_provider_series_states(config, limit=limit, provider=provider)
+    states = load_provider_series_states(config, limit=limit, provider=provider, split_seasons=True)
     client = MalClient(config, load_mal_secrets(config))
     proposals: list[SyncProposal] = []
+    # Keyed per provider series for confirmation provenance, which records the
+    # most recently watched season (rank 0) of a season-split series.
     details_by_series: dict[tuple[str, str], dict[str, Any] | None] = {}
+    search_budget = [max(0, int(mapping_limit))]
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
         if approved_mappings_only and not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
@@ -934,9 +1091,11 @@ def build_dry_run_sync_plan(
                 persisted_mapping_approved=False,
                 reasons=reasons,
                 provider=state.provider,
+                provider_season_key=state.provider_season_key,
             )
             proposals.append(proposal)
-            details_by_series[(state.provider, state.provider_series_id)] = None
+            if state.season_unit_rank == 0:
+                details_by_series[(state.provider, state.provider_series_id)] = None
             continue
 
         mapping_status, confidence, chosen_anime_id, mapping_source, approved, mapping_reasons = _resolve_mapping_for_sync(
@@ -947,6 +1106,15 @@ def build_dry_run_sync_plan(
             mapping_limit=mapping_limit,
             allow_live_search=not approved_mappings_only,
         )
+        if chosen_anime_id is not None and state.season_split:
+            if approved:
+                season_target = _resolve_season_target(config, client, state, search_budget=search_budget)
+                chosen_anime_id = season_target.mal_anime_id
+                mapping_source = season_target.mapping_source
+                mapping_reasons = mapping_reasons + season_target.reasons
+            else:
+                chosen_anime_id = None
+                mapping_reasons = mapping_reasons + ["season_split_requires_approved_series_mapping"]
         if chosen_anime_id is None:
             proposal = SyncProposal(
                 provider_series_id=state.provider_series_id,
@@ -962,9 +1130,11 @@ def build_dry_run_sync_plan(
                 persisted_mapping_approved=approved,
                 reasons=mapping_reasons,
                 provider=state.provider,
+                provider_season_key=state.provider_season_key,
             )
             proposals.append(proposal)
-            details_by_series[(state.provider, state.provider_series_id)] = None
+            if state.season_unit_rank == 0:
+                details_by_series[(state.provider, state.provider_series_id)] = None
             continue
 
         try:
@@ -987,9 +1157,11 @@ def build_dry_run_sync_plan(
                 persisted_mapping_approved=approved,
                 reasons=mapping_reasons + [f"mal_details_lookup_failed:{exc}"],
                 provider=state.provider,
+                provider_season_key=state.provider_season_key,
             )
             proposals.append(proposal)
-            details_by_series[(state.provider, state.provider_series_id)] = None
+            if state.season_unit_rank == 0:
+                details_by_series[(state.provider, state.provider_series_id)] = None
             continue
         proposal = _plan_status_update(
             state,
@@ -1001,7 +1173,8 @@ def build_dry_run_sync_plan(
             extra_reasons=mapping_reasons,
         )
         proposals.append(proposal)
-        details_by_series[(state.provider, state.provider_series_id)] = detail
+        if state.season_unit_rank == 0:
+            details_by_series[(state.provider, state.provider_series_id)] = detail
     if provider in {None, "hidive"}:
         coverage = _materialize_hidive_dry_run_confirmations(config, states, proposals, details_by_series)
         if not coverage["invariant_satisfied"]:
@@ -1028,255 +1201,392 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.1"
+SEASON_MAPPING_RETRY_SECONDS = 7 * 24 * 60 * 60
+_MAL_SYNC_DETAIL_FIELDS = "id,title,num_episodes,media_type,status,my_list_status,alternative_titles"
+
+
+@dataclass(slots=True)
+class _ApplyTarget:
+    mal_anime_id: int | None
+    mapping_source: str | None
+    confidence: float
+    reasons: list[str]
+
+
+def _resolve_season_target(
+    config: AppConfig,
+    client: MalClient,
+    state: ProviderSeriesState,
+    *,
+    search_budget: list[int],
+) -> _ApplyTarget:
+    """Resolve one canonical provider season of a season-split series to a MAL entry.
+
+    The series-level mapping identifies the franchise only; each season is
+    matched with the same mapping engine and auto-approval rules used for
+    series. Unresolved seasons are recorded and retried on a cadence.
+    """
+    assert state.provider_season_key is not None
+    season_label = f"season={state.provider_season_key}"
+    stored = get_provider_season_mapping(
+        config.db_path,
+        provider=state.provider,
+        provider_series_id=state.provider_series_id,
+        provider_season_key=state.provider_season_key,
+    )
+    if stored is not None and stored.approved and stored.mal_anime_id is not None:
+        return _ApplyTarget(
+            stored.mal_anime_id,
+            stored.mapping_source,
+            float(stored.confidence or 1.0),
+            [f"season_mapping={stored.mapping_source}", season_label],
+        )
+    if stored is not None and stored.resolver_version == SEASON_MAPPING_RESOLVER_VERSION:
+        resolved_at = _parse_iso_utc(stored.resolved_at.replace(" ", "T") + ("" if stored.resolved_at.endswith("Z") else "Z"))
+        if resolved_at is not None and (datetime.now(timezone.utc) - resolved_at).total_seconds() < SEASON_MAPPING_RETRY_SECONDS:
+            return _ApplyTarget(None, None, 0.0, ["season_mapping_unresolved", season_label])
+    if search_budget[0] <= 0:
+        return _ApplyTarget(None, None, 0.0, ["season_mapping_pending_search_budget", season_label])
+    search_budget[0] -= 1
+    result = map_series(client, _build_series_mapping_input(state))
+    chosen = result.chosen_candidate
+    candidates = [
+        {"mal_anime_id": candidate.mal_anime_id, "title": candidate.title, "media_type": candidate.media_type}
+        for candidate in result.candidates[:5]
+    ]
+    if should_auto_approve_mapping(result) and chosen is not None:
+        upsert_provider_season_mapping(
+            config.db_path,
+            provider=state.provider,
+            provider_series_id=state.provider_series_id,
+            provider_season_key=state.provider_season_key,
+            mal_anime_id=chosen.mal_anime_id,
+            mapping_source="auto_exact",
+            confidence=float(result.confidence),
+            season_title=state.season_title,
+            season_number=state.season_number,
+            resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
+            detail={"rationale": list(result.rationale), "candidates": candidates},
+        )
+        return _ApplyTarget(chosen.mal_anime_id, "auto_exact", float(result.confidence), ["season_mapping=auto_exact", season_label])
+    upsert_provider_season_mapping(
+        config.db_path,
+        provider=state.provider,
+        provider_series_id=state.provider_series_id,
+        provider_season_key=state.provider_season_key,
+        mal_anime_id=chosen.mal_anime_id if chosen is not None else None,
+        mapping_source="unresolved",
+        confidence=float(result.confidence),
+        season_title=state.season_title,
+        season_number=state.season_number,
+        resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
+        detail={"status": result.status, "rationale": list(result.rationale), "candidates": candidates},
+    )
+    return _ApplyTarget(None, None, 0.0, ["season_mapping_unresolved", f"season_mapping_status={result.status}", season_label])
+
+
+def _apply_target(
+    config: AppConfig,
+    client: MalClient,
+    state: ProviderSeriesState,
+    persisted: PersistedSeriesMapping,
+    *,
+    search_budget: list[int],
+) -> _ApplyTarget:
+    if state.season_split:
+        return _resolve_season_target(config, client, state, search_budget=search_budget)
+    return _ApplyTarget(persisted.mal_anime_id, persisted.mapping_source, float(persisted.confidence or 1.0), [])
+
+
+def _apply_priority_key(state: ProviderSeriesState) -> tuple[int, float]:
+    """Progress-bearing series first (most recently watched first), then watchlist-only."""
+    watched_at = _parse_iso_utc(state.last_watched_at)
+    if watched_at is not None:
+        return (0, -watched_at.timestamp())
+    return (1, 0.0)
+
+
 def execute_approved_sync(
     config: AppConfig,
     limit: int | None = 20,
     mapping_limit: int = 5,
     exact_approved_only: bool = False,
     dry_run: bool = True,
+    providers: list[str] | None = None,
 ) -> list[ApplyResult]:
-    states = load_provider_series_states(config, limit=limit)
+    """Plan every approved provider series (season-split) and apply up to ``limit`` updates.
+
+    Planning uses cached MAL state, which costs no request for cached entries;
+    only proposals that need a write are revalidated live and written, and
+    ``limit`` bounds those. Seasons needing a new MAL search are bounded by
+    ``mapping_limit``.
+    """
+    provider_filter = set(providers) if providers else None
+    states = [
+        state
+        for state in load_provider_series_states(config, limit=None, split_seasons=True)
+        if provider_filter is None or state.provider in provider_filter
+    ]
+    states.sort(key=_apply_priority_key)
     client = MalClient(config, load_mal_secrets(config))
     results: list[ApplyResult] = []
+    search_budget = [max(0, int(mapping_limit))]
+    # None or a non-positive limit means unbounded (the CLI maps --limit 0 to a
+    # full scan; the service disables a zero limit before calling).
+    live_budget = None if limit is None or int(limit) <= 0 else int(limit)
+    deferred = 0
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
-        if not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
+        if persisted is None or not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
             continue
-        try:
-            detail = client.get_anime_details(
-                persisted.mal_anime_id,
-                fields="id,title,num_episodes,media_type,status,my_list_status,alternative_titles",
-                force_refresh=not dry_run,
-                require_user=not dry_run,
-            )
-        except MalApiError as exc:
-            lookup_reason = (
-                f"mal_details_lookup_failed:{exc}"
-                if dry_run
-                else f"mal_live_state_revalidation_failed:{exc}"
-            )
-            error_reasons = [
-                "using_user_approved_mapping",
-                *(["exact_approved_only_enabled"] if exact_approved_only else []),
-                lookup_reason,
-            ]
-            proposal = SyncProposal(
-                provider_series_id=state.provider_series_id,
-                provider_title=state.title,
-                mapping_status="approved",
-                confidence=float(persisted.confidence or 1.0),
-                mal_anime_id=persisted.mal_anime_id,
-                mal_title=None,
-                current_my_list_status=None,
-                proposed_my_list_status=None,
-                decision="review",
-                mapping_source=persisted.mapping_source,
-                persisted_mapping_approved=True,
-                reasons=error_reasons,
-                provider=state.provider,
-            )
-            if not dry_run:
-                _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=None, mapping_reasons=error_reasons)
+        base_reasons = ["using_user_approved_mapping", *(["exact_approved_only_enabled"] if exact_approved_only else [])]
+        target = _apply_target(config, client, state, persisted, search_budget=search_budget)
+        if target.mal_anime_id is None:
             results.append(
                 ApplyResult(
                     provider=state.provider,
                     provider_series_id=state.provider_series_id,
+                    provider_season_key=state.provider_season_key,
                     mal_anime_id=persisted.mal_anime_id,
                     mal_title=None,
                     applied=False,
-                    proposal_decision="error",
+                    proposal_decision="review",
                     requested_status=None,
                     response_status=None,
-                    reasons=error_reasons,
+                    reasons=base_reasons + target.reasons,
                 )
             )
             continue
-
-        evidence_reasons: list[str] = []
-        if not dry_run:
-            live_status, validation_reason = _validated_live_mal_user_state(
-                detail,
-                expected_anime_id=persisted.mal_anime_id,
+        if exact_approved_only and target.mapping_source not in EXACT_APPROVED_MAPPING_SOURCES:
+            continue
+        base_reasons = base_reasons + target.reasons
+        lookup_error: MalApiError | None = None
+        try:
+            cached_detail = client.get_anime_details(target.mal_anime_id, fields=_MAL_SYNC_DETAIL_FIELDS)
+        except MalApiError as exc:
+            cached_detail = None
+            lookup_error = exc
+        if isinstance(cached_detail, dict) and (
+            "my_list_status" not in cached_detail
+            or _validated_live_mal_user_state(cached_detail, expected_anime_id=target.mal_anime_id)[1] is not None
+        ):
+            # Unusable cached shape: only the authoritative live read decides.
+            cached_detail = None
+        if isinstance(cached_detail, dict):
+            preview = _plan_status_update(
+                state,
+                cached_detail,
+                mapping_status="approved",
+                confidence=target.confidence,
+                mapping_source=target.mapping_source,
+                persisted_mapping_approved=True,
+                extra_reasons=base_reasons,
             )
-            if validation_reason is not None:
-                error_reasons = [
-                    "using_user_approved_mapping",
-                    "executor_revalidated_live_mal_state",
-                    *( ["exact_approved_only_enabled"] if exact_approved_only else []),
-                    validation_reason,
-                    "mal_live_user_state_invalid_fail_closed",
-                ]
-                proposal = SyncProposal(
-                    provider_series_id=state.provider_series_id,
-                    provider_title=state.title,
-                    mapping_status="approved",
-                    confidence=float(persisted.confidence or 1.0),
-                    mal_anime_id=persisted.mal_anime_id,
-                    mal_title=_coerce_optional_str(detail.get("title")) if isinstance(detail, dict) else None,
-                    current_my_list_status=None,
-                    proposed_my_list_status=None,
-                    decision="review",
-                    mapping_source=persisted.mapping_source,
-                    persisted_mapping_approved=True,
-                    completion_audit=state.completion_audit,
-                    reasons=error_reasons,
-                    provider=state.provider,
-                )
+            if preview.decision != "propose_update" and not dry_run:
                 _persist_watch_confirmation_provenance_snapshot(
-                    config,
-                    state,
-                    proposal,
-                    detail=detail if isinstance(detail, dict) else None,
-                    mapping_reasons=error_reasons,
+                    config, state, preview, detail=cached_detail, mapping_reasons=preview.reasons
                 )
+            if preview.decision != "propose_update" or dry_run:
                 results.append(
                     ApplyResult(
                         provider=state.provider,
                         provider_series_id=state.provider_series_id,
-                        mal_anime_id=persisted.mal_anime_id,
-                        mal_title=proposal.mal_title,
+                        provider_season_key=state.provider_season_key,
+                        mal_anime_id=target.mal_anime_id,
+                        mal_title=preview.mal_title,
                         applied=False,
-                        proposal_decision="error",
-                        requested_status=None,
-                        response_status=None,
-                        reasons=error_reasons,
+                        proposal_decision=preview.decision,
+                        requested_status=preview.proposed_my_list_status,
+                        response_status=preview.current_my_list_status,
+                        reasons=preview.reasons + (["executor_dry_run"] if dry_run and preview.decision == "propose_update" else []),
                     )
                 )
                 continue
-            detail = {**detail, "my_list_status": live_status}
-            evidence_reasons = _mal_user_list_cache_conflict_reasons(
-                get_mal_user_anime_list_cache(config.db_path, persisted.mal_anime_id),
-                live_status,
-            )
-            if evidence_reasons:
-                proposal = SyncProposal(
-                    provider_series_id=state.provider_series_id,
-                    provider_title=state.title,
-                    mapping_status="approved",
-                    confidence=float(persisted.confidence or 1.0),
-                    mal_anime_id=persisted.mal_anime_id,
-                    mal_title=_coerce_optional_str(detail.get("title")),
-                    current_my_list_status=detail.get("my_list_status") if isinstance(detail.get("my_list_status"), dict) else None,
-                    proposed_my_list_status=None,
-                    decision="review",
-                    mapping_source=persisted.mapping_source,
-                    persisted_mapping_approved=True,
-                    completion_audit=state.completion_audit,
-                    reasons=[
-                        "using_user_approved_mapping",
-                        "executor_revalidated_live_mal_state",
-                        *(["exact_approved_only_enabled"] if exact_approved_only else []),
-                        *evidence_reasons,
-                        "conflicting_mal_user_state_evidence_fail_closed",
-                    ],
-                    provider=state.provider,
-                )
-                _persist_watch_confirmation_provenance_snapshot(
-                    config,
-                    state,
-                    proposal,
-                    detail=detail,
-                    mapping_reasons=proposal.reasons,
-                )
-                results.append(
-                    ApplyResult(
-                        provider=state.provider,
-                        provider_series_id=state.provider_series_id,
-                        mal_anime_id=persisted.mal_anime_id,
-                        mal_title=proposal.mal_title,
-                        applied=False,
-                        proposal_decision="review",
-                        requested_status=None,
-                        response_status=proposal.current_my_list_status,
-                        reasons=proposal.reasons,
-                    )
-                )
-                continue
-
-        proposal = _plan_status_update(
-            state,
-            detail,
-            mapping_status="approved",
-            confidence=float(persisted.confidence or 1.0),
-            mapping_source=persisted.mapping_source,
-            persisted_mapping_approved=True,
-            extra_reasons=[
-                "using_user_approved_mapping",
-                *(["executor_revalidated_live_mal_state"] if not dry_run else []),
-                *(["exact_approved_only_enabled"] if exact_approved_only else []),
-            ],
-        )
-        if not dry_run:
-            _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=proposal.reasons)
-        if proposal.decision != "propose_update":
+        elif dry_run:
+            reasons = base_reasons + ([f"mal_details_lookup_failed:{lookup_error}"] if lookup_error else ["mal_cached_detail_unusable"])
             results.append(
                 ApplyResult(
                     provider=state.provider,
                     provider_series_id=state.provider_series_id,
-                    mal_anime_id=persisted.mal_anime_id,
-                    mal_title=proposal.mal_title,
+                    provider_season_key=state.provider_season_key,
+                    mal_anime_id=target.mal_anime_id,
+                    mal_title=None,
                     applied=False,
-                    proposal_decision=proposal.decision,
-                    requested_status=proposal.proposed_my_list_status,
-                    response_status=proposal.current_my_list_status,
-                    reasons=proposal.reasons,
+                    proposal_decision="error" if lookup_error else "review",
+                    requested_status=None,
+                    response_status=None,
+                    reasons=reasons,
                 )
             )
             continue
-        response_status = proposal.current_my_list_status
-        applied = False
-        reasons = list(proposal.reasons)
-        if dry_run:
-            reasons.append("executor_dry_run")
-        else:
-            requested = proposal.proposed_my_list_status or {}
-            try:
-                response = client.update_my_list_status(
-                    persisted.mal_anime_id,
-                    status=str(requested["status"]),
-                    num_watched_episodes=int(requested.get("num_watched_episodes") or 0),
-                    score=_coerce_optional_int(requested.get("score")),
-                    start_date=_coerce_optional_str(requested.get("start_date")),
-                    finish_date=_coerce_optional_str(requested.get("finish_date")),
-                )
-                response_status = _validated_mal_write_result(response, requested=requested)
-            except MalApiError as exc:
-                reasons.append(f"mal_update_failed:{exc}")
-                results.append(
-                    ApplyResult(
-                        provider=state.provider,
-                        provider_series_id=state.provider_series_id,
-                        mal_anime_id=persisted.mal_anime_id,
-                        mal_title=proposal.mal_title,
-                        applied=False,
-                        proposal_decision="error",
-                        requested_status=proposal.proposed_my_list_status,
-                        response_status=None,
-                        reasons=reasons,
-                    )
-                )
-                continue
-            reconcile_mal_user_state_after_write(
-                config.db_path,
-                mal_anime_id=persisted.mal_anime_id,
-                list_status=response_status,
+        if live_budget is not None and live_budget <= 0:
+            deferred += 1
+            continue
+        if live_budget is not None:
+            live_budget -= 1
+        results.append(
+            _revalidate_and_apply(
+                config,
+                client,
+                state,
+                target,
+                base_reasons=base_reasons,
             )
-            applied = True
-            reasons.extend(["applied_to_mal", "reconciled_local_mal_user_state_caches"])
+        )
+    if deferred:
         results.append(
             ApplyResult(
-                provider=state.provider,
-                provider_series_id=state.provider_series_id,
-                mal_anime_id=persisted.mal_anime_id,
-                mal_title=proposal.mal_title,
-                applied=applied,
-                proposal_decision=proposal.decision,
-                requested_status=proposal.proposed_my_list_status,
-                response_status=response_status,
-                reasons=reasons,
+                provider="all",
+                provider_series_id="",
+                mal_anime_id=0,
+                mal_title=None,
+                applied=False,
+                proposal_decision="deferred",
+                requested_status=None,
+                response_status=None,
+                reasons=[f"write_limit_reached deferred_proposals={deferred}"],
             )
         )
     return results
+
+
+def _revalidate_and_apply(
+    config: AppConfig,
+    client: MalClient,
+    state: ProviderSeriesState,
+    target: _ApplyTarget,
+    *,
+    base_reasons: list[str],
+) -> ApplyResult:
+    assert target.mal_anime_id is not None
+    mal_anime_id = target.mal_anime_id
+
+    def result(**kwargs: Any) -> ApplyResult:
+        return ApplyResult(
+            provider=state.provider,
+            provider_series_id=state.provider_series_id,
+            provider_season_key=state.provider_season_key,
+            mal_anime_id=mal_anime_id,
+            **kwargs,
+        )
+
+    def review_proposal(*, mal_title: str | None, current: dict[str, Any] | None, reasons: list[str]) -> SyncProposal:
+        return SyncProposal(
+            provider_series_id=state.provider_series_id,
+            provider_title=state.title,
+            mapping_status="approved",
+            confidence=target.confidence,
+            mal_anime_id=mal_anime_id,
+            mal_title=mal_title,
+            current_my_list_status=current,
+            proposed_my_list_status=None,
+            decision="review",
+            mapping_source=target.mapping_source,
+            persisted_mapping_approved=True,
+            completion_audit=state.completion_audit,
+            reasons=reasons,
+            provider=state.provider,
+            provider_season_key=state.provider_season_key,
+        )
+
+    try:
+        detail = client.get_anime_details(
+            mal_anime_id,
+            fields=_MAL_SYNC_DETAIL_FIELDS,
+            force_refresh=True,
+            require_user=True,
+        )
+    except MalApiError as exc:
+        error_reasons = [*base_reasons, f"mal_live_state_revalidation_failed:{exc}"]
+        _persist_watch_confirmation_provenance_snapshot(
+            config, state, review_proposal(mal_title=None, current=None, reasons=error_reasons), detail=None, mapping_reasons=error_reasons
+        )
+        return result(mal_title=None, applied=False, proposal_decision="error", requested_status=None, response_status=None, reasons=error_reasons)
+
+    live_status, validation_reason = _validated_live_mal_user_state(detail, expected_anime_id=mal_anime_id)
+    if validation_reason is not None:
+        error_reasons = [*base_reasons, "executor_revalidated_live_mal_state", validation_reason, "mal_live_user_state_invalid_fail_closed"]
+        proposal = review_proposal(
+            mal_title=_coerce_optional_str(detail.get("title")) if isinstance(detail, dict) else None,
+            current=None,
+            reasons=error_reasons,
+        )
+        _persist_watch_confirmation_provenance_snapshot(
+            config, state, proposal, detail=detail if isinstance(detail, dict) else None, mapping_reasons=error_reasons
+        )
+        return result(mal_title=proposal.mal_title, applied=False, proposal_decision="error", requested_status=None, response_status=None, reasons=error_reasons)
+    detail = {**detail, "my_list_status": live_status}
+    evidence_reasons = _mal_user_list_cache_conflict_reasons(get_mal_user_anime_list_cache(config.db_path, mal_anime_id), live_status)
+    if evidence_reasons:
+        proposal = review_proposal(
+            mal_title=_coerce_optional_str(detail.get("title")),
+            current=live_status if isinstance(live_status, dict) else None,
+            reasons=[*base_reasons, "executor_revalidated_live_mal_state", *evidence_reasons, "conflicting_mal_user_state_evidence_fail_closed"],
+        )
+        _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=proposal.reasons)
+        return result(
+            mal_title=proposal.mal_title,
+            applied=False,
+            proposal_decision="review",
+            requested_status=None,
+            response_status=proposal.current_my_list_status,
+            reasons=proposal.reasons,
+        )
+
+    proposal = _plan_status_update(
+        state,
+        detail,
+        mapping_status="approved",
+        confidence=target.confidence,
+        mapping_source=target.mapping_source,
+        persisted_mapping_approved=True,
+        extra_reasons=[*base_reasons, "executor_revalidated_live_mal_state"],
+    )
+    _persist_watch_confirmation_provenance_snapshot(config, state, proposal, detail=detail, mapping_reasons=proposal.reasons)
+    if proposal.decision != "propose_update":
+        return result(
+            mal_title=proposal.mal_title,
+            applied=False,
+            proposal_decision=proposal.decision,
+            requested_status=proposal.proposed_my_list_status,
+            response_status=proposal.current_my_list_status,
+            reasons=proposal.reasons,
+        )
+    requested = proposal.proposed_my_list_status or {}
+    reasons = list(proposal.reasons)
+    try:
+        response = client.update_my_list_status(
+            mal_anime_id,
+            status=str(requested["status"]),
+            num_watched_episodes=int(requested.get("num_watched_episodes") or 0),
+            score=_coerce_optional_int(requested.get("score")),
+            start_date=_coerce_optional_str(requested.get("start_date")),
+            finish_date=_coerce_optional_str(requested.get("finish_date")),
+        )
+        response_status = _validated_mal_write_result(response, requested=requested)
+    except MalApiError as exc:
+        reasons.append(f"mal_update_failed:{exc}")
+        return result(
+            mal_title=proposal.mal_title,
+            applied=False,
+            proposal_decision="error",
+            requested_status=proposal.proposed_my_list_status,
+            response_status=None,
+            reasons=reasons,
+        )
+    reconcile_mal_user_state_after_write(
+        config.db_path, mal_anime_id=mal_anime_id, list_status=response_status, title=proposal.mal_title
+    )
+    reasons.extend(["applied_to_mal", "reconciled_local_mal_user_state_caches"])
+    return result(
+        mal_title=proposal.mal_title,
+        applied=True,
+        proposal_decision=proposal.decision,
+        requested_status=proposal.proposed_my_list_status,
+        response_status=response_status,
+        reasons=reasons,
+    )
 
 
 def _safe_mal_list_status_result(response: dict[str, Any]) -> dict[str, Any]:
@@ -1443,11 +1753,38 @@ def _plan_status_update(
     persisted_mapping_approved: bool,
     extra_reasons: list[str] | None = None,
 ) -> SyncProposal:
+    proposal = _plan_status_update_for_state(
+        state,
+        detail,
+        mapping_status,
+        confidence,
+        mapping_source=mapping_source,
+        persisted_mapping_approved=persisted_mapping_approved,
+        extra_reasons=extra_reasons,
+    )
+    proposal.provider_season_key = state.provider_season_key
+    return proposal
+
+
+def _plan_status_update_for_state(
+    state: ProviderSeriesState,
+    detail: dict[str, Any],
+    mapping_status: str,
+    confidence: float,
+    *,
+    mapping_source: str | None,
+    persisted_mapping_approved: bool,
+    extra_reasons: list[str] | None = None,
+) -> SyncProposal:
     mal_title = str(detail.get("title") or "")
     mal_anime_id = int(detail["id"])
     current_status = detail.get("my_list_status") or None
     num_episodes = detail.get("num_episodes")
-    provider_watched_episodes = max(state.completed_episode_count, int(state.max_completed_episode_number or 0))
+    provider_watched_episodes, watched_reason, watched_review_reason = _provider_watched_episodes(
+        state,
+        _coerce_detail_int(num_episodes),
+        current_watched=_coerce_detail_int((current_status or {}).get("num_episodes_watched")),
+    )
     reasons: list[str] = [
         "merge_policy=missing_data_only",
         "completion_policy=ratio>=0.95_or_remaining<=120s_or_later_episode_progress_with_ratio>=0.85",
@@ -1472,6 +1809,29 @@ def _plan_status_update(
             reasons.append(f"{uncertainty_reason}={count}")
     if extra_reasons:
         reasons = list(extra_reasons) + reasons
+    if state.provider_season_key is not None:
+        reasons.append(f"provider_season_key={state.provider_season_key}")
+    if state.completed_unnumbered_count:
+        reasons.append(f"unnumbered_items_not_counted={state.completed_unnumbered_count}")
+    if watched_reason:
+        reasons.append(watched_reason)
+    if watched_review_reason:
+        return SyncProposal(
+            provider_series_id=state.provider_series_id,
+            provider_title=state.title,
+            mapping_status=mapping_status,
+            confidence=confidence,
+            mal_anime_id=mal_anime_id,
+            mal_title=mal_title,
+            current_my_list_status=current_status,
+            proposed_my_list_status=None,
+            decision="review",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
+            completion_audit=state.completion_audit,
+            reasons=reasons + [watched_review_reason],
+            provider=state.provider,
+        )
 
     proposed_status: dict[str, Any] | None = None
     if provider_watched_episodes > 0:
@@ -1510,6 +1870,30 @@ def _plan_status_update(
     current_watched = int((current_status or {}).get("num_episodes_watched") or 0)
     current_list_status = _coerce_optional_str((current_status or {}).get("status"))
     proposed_watched = int(proposed_status.get("num_watched_episodes") or 0)
+
+    if (
+        current_list_status not in (None, "plan_to_watch")
+        and proposed_watched == 0
+        and proposed_status["status"] == "plan_to_watch"
+    ):
+        # A provider watchlist entry only ever adds a missing title; it never
+        # competes with a status the user already set on MAL.
+        return SyncProposal(
+            provider_series_id=state.provider_series_id,
+            provider_title=state.title,
+            mapping_status=mapping_status,
+            confidence=confidence,
+            mal_anime_id=mal_anime_id,
+            mal_title=mal_title,
+            current_my_list_status=current_status,
+            proposed_my_list_status=None,
+            decision="skip",
+            mapping_source=mapping_source,
+            persisted_mapping_approved=persisted_mapping_approved,
+            completion_audit=state.completion_audit,
+            reasons=reasons + ["mal_entry_exists_watchlist_only"],
+            provider=state.provider,
+        )
 
     if current_list_status == "plan_to_watch" and proposed_watched > 0:
         reasons.append("override_plan_to_watch_due_to_provider_watch_evidence")
@@ -1631,6 +2015,53 @@ def _plan_status_update(
         reasons=reasons,
         provider=state.provider,
     )
+
+
+def _provider_watched_episodes(
+    state: ProviderSeriesState, mal_num_episodes: int | None, *, current_watched: int | None = None
+) -> tuple[int, str | None, str | None]:
+    """Return (watched, info_reason, review_reason) for a MAL entry of known size.
+
+    The highest completed episode number stands in for episodes watched
+    elsewhere, but provider numbering can continue across seasons (a second
+    season numbered 13-24). When that exceeds the MAL episode count the count
+    is rebased on the first episode number seen; evidence that still exceeds
+    MAL's count points at a wrong mapping or aggregation and goes to review,
+    as does a completion that rests only on unobserved lower-numbered
+    episodes. Numbers within MAL's count are not rebased: the same numbering
+    is correct for a MAL entry spanning several provider seasons (e.g. a
+    long-running series MAL lists as one entry).
+    """
+    count = state.completed_episode_count
+    max_number = int(state.max_completed_episode_number or 0)
+    min_number = int(state.min_episode_number or 1)
+    watched = max(count, max_number)
+    if not mal_num_episodes or mal_num_episodes <= 0 or watched < mal_num_episodes:
+        return watched, None, None
+    if watched == mal_num_episodes:
+        if count < mal_num_episodes and min_number > 1 and (current_watched or 0) < min_number - 1:
+            # Completion would rest on unobserved episodes below the first
+            # observed number. With numbering that continues from an earlier
+            # season (season 2 = 13-25 on a 13-episode MAL entry) episode 13
+            # is the first episode, not the last, so do not claim completion
+            # unless MAL already records the episodes before it.
+            return watched, None, (
+                f"provider_completion_rests_on_unobserved_episodes min_episode={min_number} "
+                f"max_completed_episode={max_number} completed={count} mal_num_episodes={mal_num_episodes}"
+            )
+        return watched, None, None
+    if count > mal_num_episodes:
+        return mal_num_episodes, None, (
+            f"provider_completed_episodes_exceed_mal_episode_count completed={count} mal_num_episodes={mal_num_episodes}"
+        )
+    offset = max(0, min_number - 1)
+    rebased = max(count, max_number - offset)
+    if rebased > mal_num_episodes:
+        return mal_num_episodes, None, (
+            f"provider_episode_numbering_exceeds_mal_episode_count max_completed_episode={max_number} "
+            f"mal_num_episodes={mal_num_episodes}"
+        )
+    return rebased, f"provider_episode_numbering_rebased offset={offset}", None
 
 
 def _build_missing_field_merge(

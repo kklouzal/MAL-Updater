@@ -602,7 +602,7 @@ class MalClientTests(unittest.TestCase):
                 return _JsonResponse({"data": [{"node": {"id": 2, "title": "Two"}}], "paging": {}})
 
             with patch("mal_updater.mal_client.urlopen", fake_urlopen):
-                pages = list(client.iter_my_anime_list_pages(status="completed", limit=500, fields="list_status", max_pages=2))
+                pages = list(client.iter_my_anime_list_pages(status="completed", limit=5000, fields="list_status", max_pages=2))
 
             self.assertEqual(2, len(pages))
             self.assertEqual(2, len(requested_urls))
@@ -612,7 +612,8 @@ class MalClientTests(unittest.TestCase):
             )
             first_query = parse_qs(urlparse(requested_urls[0]).query)
             self.assertEqual(["completed"], first_query["status"])
-            self.assertEqual(["100"], first_query["limit"])
+            # MAL documents limit<=1000 for the user anime list.
+            self.assertEqual(["1000"], first_query["limit"])
             self.assertEqual(["Bearer access-token", "Bearer access-token"], requested_auth)
 
     def test_my_anime_list_paginates_with_custom_base_path(self) -> None:
@@ -762,7 +763,7 @@ class MalClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
             client = MalClient(config, self._secrets(config, access_token="token"))
-            repeated = f"{config.mal.base_url}/users/@me/animelist?limit=100&fields=list_status%2Cnum_episodes%2Cmedia_type%2Cstatus"
+            repeated = f"{config.mal.base_url}/users/@me/animelist?limit=1000&fields=list_status%2Cnum_episodes%2Cmedia_type%2Cstatus"
             with patch.object(client, "_get_json", return_value={"data": [], "paging": {"next": repeated}}):
                 with self.assertRaisesRegex(MalApiError, "repeated"):
                     list(client.iter_my_anime_list_pages(max_pages=2))

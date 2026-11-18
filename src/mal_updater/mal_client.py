@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from socket import timeout as SocketTimeout
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -19,6 +20,7 @@ from .request_tracking import record_api_request_event
 from .provider_niceness import ProviderRequestGate, retry_delay_seconds
 from .db import bootstrap_database, find_covering_mal_anime_detail_cache, get_mal_anime_detail_cache, get_mal_anime_search_cache, upsert_mal_anime_detail_cache, upsert_mal_anime_search_cache
 from .periodic_evidence_lifecycle import periodic_evidence_is_due
+from .persistence import atomic_write_bytes
 
 
 @dataclass(slots=True)
@@ -47,6 +49,9 @@ _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAL_SEARCH_CACHE_LOGIC_VERSION = "mal-search-v2"
 MAL_DETAIL_CACHE_LOGIC_VERSION = "mal-detail-v2"
 MAL_ANIME_SEARCH_QUERY_MAX_CHARS = 64
+
+# MAL API v2 documents limit<=1000 for GET /users/{user_name}/animelist.
+MAL_ANIME_LIST_MAX_LIMIT = 1000
 
 _MAL_LIST_STATUSES = frozenset({"completed", "watching", "on_hold", "dropped", "plan_to_watch"})
 _MAL_OMISSIBLE_NULLABLE_ANIME_DETAIL_FIELDS = frozenset({"broadcast", "rank"})
@@ -220,6 +225,80 @@ def _decode_json_object(body: bytes, *, error_context: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise MalApiError(f"{error_context}: JSON response must be an object")
     return payload
+
+
+def _access_token_digest(token: str) -> str:
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def mal_access_token_state_path(secrets: MalSecrets) -> Path:
+    """Expiry record beside the access-token file, bound to that token by digest."""
+    path = secrets.access_token_path
+    return path.with_name(f"{path.name}.state.json")
+
+
+def mal_token_expires_at(token: TokenResponse, *, obtained_at: datetime) -> datetime | None:
+    expires_in = token.expires_in
+    if isinstance(expires_in, int) and not isinstance(expires_in, bool) and expires_in > 0:
+        return (obtained_at + timedelta(seconds=expires_in)).astimezone(timezone.utc)
+    return None
+
+
+def write_mal_access_token_state(secrets: MalSecrets, token: TokenResponse, *, obtained_at: datetime) -> None:
+    expires_at = mal_token_expires_at(token, obtained_at=obtained_at)
+    payload = {
+        "access_token_sha256": _access_token_digest(token.access_token),
+        "obtained_at": obtained_at.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "expires_at": None if expires_at is None else expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    atomic_write_bytes(mal_access_token_state_path(secrets), json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+
+def clear_mal_access_token_state(secrets: MalSecrets, *, only_for_token: str | None = None) -> None:
+    """Drop the expiry record (optionally only when it describes ``only_for_token``)."""
+    path = mal_access_token_state_path(secrets)
+    if only_for_token is not None:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(state, dict) or state.get("access_token_sha256") != _access_token_digest(only_for_token):
+            return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def read_mal_access_token_expiry(secrets: MalSecrets) -> datetime | None:
+    """Return the recorded expiry of the current access token, or None when unknown.
+
+    The record only counts when its digest matches the access token that would
+    actually be sent, so a crash between token and record writes, an operator
+    token replacement, or a 401 invalidation all read as "unknown".
+    """
+    token = secrets.access_token.strip() if secrets.access_token else ""
+    if not token:
+        return None
+    try:
+        state = json.loads(mal_access_token_state_path(secrets).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("access_token_sha256") != _access_token_digest(token):
+        return None
+    expires_at = state.get("expires_at")
+    if not isinstance(expires_at, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _bearer_token(headers: dict[str, str]) -> str | None:
+    value = headers.get("Authorization", "")
+    return value[len("Bearer "):] if value.startswith("Bearer ") else None
 
 
 class MalClient:
@@ -558,7 +637,7 @@ class MalClient:
         self,
         *,
         status: str | None = None,
-        limit: int = 100,
+        limit: int = MAL_ANIME_LIST_MAX_LIMIT,
         fields: str = "list_status,num_episodes,media_type,status",
         max_pages: int | None = None,
     ):
@@ -567,7 +646,7 @@ class MalClient:
         normalized_max_pages = int(max_pages)
         if normalized_max_pages <= 0:
             raise ValueError("max_pages must be positive")
-        normalized_limit = min(max(int(limit), 1), 100)
+        normalized_limit = min(max(int(limit), 1), MAL_ANIME_LIST_MAX_LIMIT)
         normalized_status = None
         if status is not None:
             normalized_status = str(status).strip().lower()
@@ -609,7 +688,7 @@ class MalClient:
         self,
         *,
         status: str | None = None,
-        limit: int = 100,
+        limit: int = MAL_ANIME_LIST_MAX_LIMIT,
         fields: str = "list_status,num_episodes,media_type,status",
     ) -> dict[str, Any]:
         return next(self.iter_my_anime_list_pages(status=status, limit=limit, fields=fields, max_pages=1))
@@ -654,7 +733,8 @@ class MalClient:
             return self._request_with_timeout_retry(error_context, _send, operation="update_my_list_status", url=request.full_url, method="PUT")
         except HTTPError as exc:
             _read_http_error_detail(exc)
-            raise MalApiError(f"{error_context}: HTTP {exc.code}") from exc
+            suffix = self._note_rejected_bearer(exc, headers)
+            raise MalApiError(f"{error_context}: HTTP {exc.code}{suffix}") from exc
         except URLError as exc:
             raise MalApiError(f"{error_context}: network error") from exc
 
@@ -680,9 +760,25 @@ class MalClient:
             )
         except HTTPError as exc:
             _read_http_error_detail(exc)
-            raise MalApiError(f"{error_context}: HTTP {exc.code}") from exc
+            suffix = self._note_rejected_bearer(exc, headers)
+            raise MalApiError(f"{error_context}: HTTP {exc.code}{suffix}") from exc
         except URLError as exc:
             raise MalApiError(f"{error_context}: network error") from exc
+
+    def _note_rejected_bearer(self, exc: HTTPError, headers: dict[str, str]) -> str:
+        """A 401 for a bearer token voids its recorded expiry so mal-refresh renews it.
+
+        Returns a message suffix when that cleanup itself fails, so the HTTP
+        failure stays primary and the cleanup failure is still reported.
+        """
+        token = _bearer_token(headers)
+        if exc.code != 401 or not token:
+            return ""
+        try:
+            clear_mal_access_token_state(self.secrets, only_for_token=token)
+        except OSError as cleanup_exc:
+            return f" (also failed to clear the MAL access-token expiry record: {type(cleanup_exc).__name__})"
+        return ""
 
     def _post_form(self, url: str, data: bytes) -> TokenResponse:
         # MAL OAuth2 Scheme 1 documents client_id as the Basic auth username

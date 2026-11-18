@@ -36,6 +36,18 @@ class EpisodeProgress:
     observation_id: str | None = None
     observed_at: str | None = None
     effective_at: str | None = None
+    # Additive per-episode season identity. None means the producer did not
+    # observe the value; consumers must not treat it as "no season".
+    # provider_season_key is the canonical, dub-collapsed season identity
+    # (format is provider-specific and opaque; see each snapshot producer).
+    provider_season_key: str | None = None
+    season_number: int | None = None
+    season_title: str | None = None
+    # Provider display episode string (e.g. "12.5", "SP"); episode_number is
+    # only set when the provider number is integral.
+    episode_label: str | None = None
+    # Provider's explicit fully-watched flag; None when the surface has none.
+    fully_watched: bool | None = None
 
 
 @dataclass(slots=True)

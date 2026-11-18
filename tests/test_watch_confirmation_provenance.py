@@ -240,7 +240,13 @@ class WatchConfirmationProvenanceTests(unittest.TestCase):
         self.assertEqual("complete", row.completion_status)
         self.assertEqual("2026-07-25T00:04:00Z", row.last_progress_seen_at)
         self.assertEqual("2026-07-25T00:05:00Z", row.last_series_seen_at)
-        self.assertEqual({"ratio_threshold": 2, "credits_window": 0, "later_episode_evidence": 0}, row.completed_by)
+        self.assertEqual({
+                    "provider_fully_watched": 0,
+                    "ratio_threshold": 2,
+                    "credits_window": 0,
+                    "later_episode_evidence": 0,
+                    "next_episode_started_after_runtime": 0,
+                }, row.completed_by)
         self.assertEqual("propose_update", row.decision_audit["decision"])
         self.assertEqual("approved", row.mapping_audit["mapping_status"])
 

@@ -316,6 +316,10 @@ def _observation_id(provider: str, entry: Any) -> str:
         "duration_ms": entry.duration_ms,
         "completion_ratio": entry.completion_ratio,
     }
+    # Only added when observed, so observation ids of producers without the
+    # flag stay stable; a changed flag is a distinct observation.
+    if entry.fully_watched is not None:
+        identity["fully_watched"] = entry.fully_watched
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return f"provider-progress:{digest}"
 
@@ -334,8 +338,9 @@ def _insert_progress_observation(conn, provider: str, entry: Any) -> None:
             source_surface, observation_kind, completion_assertion,
             normalization_logic_version, observed_at, effective_at,
             episode_number, episode_title, playback_position_ms, duration_ms,
-            completion_ratio, audio_locale, subtitle_locale, rating, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            completion_ratio, audio_locale, subtitle_locale, rating, raw_json,
+            provider_season_key, season_number, season_title, episode_label, fully_watched
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             _observation_id(provider, entry), provider, entry.provider_episode_id,
@@ -345,6 +350,8 @@ def _insert_progress_observation(conn, provider: str, entry: Any) -> None:
             entry.episode_number, entry.episode_title, entry.playback_position_ms,
             entry.duration_ms, entry.completion_ratio, entry.audio_locale,
             entry.subtitle_locale, entry.rating, _entry_json(entry),
+            entry.provider_season_key, entry.season_number, entry.season_title,
+            entry.episode_label, entry.fully_watched,
         ),
     )
 
@@ -372,9 +379,14 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 completion_assertion,
                 normalization_logic_version,
                 raw_json,
+                provider_season_key,
+                season_number,
+                season_title,
+                episode_label,
+                fully_watched,
                 first_seen_at,
                 last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(provider, provider_episode_id) DO UPDATE SET
                 provider_series_id = excluded.provider_series_id,
                 episode_number = excluded.episode_number,
@@ -444,6 +456,18 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                         WHEN 'explicit_completed' THEN 4 WHEN 'position' THEN 3 WHEN 'ratio' THEN 3
                         WHEN 'inferred_later_episode' THEN 3 WHEN 'history_membership' THEN 1 ELSE 2 END
                     THEN excluded.raw_json ELSE provider_episode_progress.raw_json END,
+                -- Season identity is descriptive, not ranked evidence: any
+                -- observation carrying it backfills/refreshes the row, and an
+                -- observation lacking it never erases a known value.
+                provider_season_key = COALESCE(excluded.provider_season_key, provider_episode_progress.provider_season_key),
+                season_number = COALESCE(excluded.season_number, provider_episode_progress.season_number),
+                season_title = COALESCE(excluded.season_title, provider_episode_progress.season_title),
+                episode_label = COALESCE(excluded.episode_label, provider_episode_progress.episode_label),
+                -- A provider fully-watched assertion is sticky, matching the
+                -- rank-sticky explicit_completed provenance above.
+                fully_watched = CASE
+                    WHEN provider_episode_progress.fully_watched = 1 THEN 1
+                    ELSE COALESCE(excluded.fully_watched, provider_episode_progress.fully_watched) END,
                 last_seen_at = CURRENT_TIMESTAMP
             """,
             (
@@ -464,6 +488,11 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 entry.completion_assertion,
                 entry.normalization_logic_version,
                 _entry_json(entry),
+                entry.provider_season_key,
+                entry.season_number,
+                entry.season_title,
+                entry.episode_label,
+                entry.fully_watched,
             ),
         )
 

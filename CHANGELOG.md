@@ -14,6 +14,8 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Added durable final-anchor validation for resumable public MAL user-recommendation crawls (migration 024), including bounded progress when only one page may be fetched per invocation.
 - Added current-membership generations and account provenance for provider watchlists (migration 025), enabling conservative deactivation only after complete, account-proven full snapshots.
 - Added staged Crunchyroll cold-bootstrap recovery and quarantine/reset controls that preserve the last-known-good boundary.
+- Added per-season sync for provider series spanning several seasons: episodes record their canonical provider season (migration 032; Crunchyroll dubs collapse onto the original-language season), each season resolves to its own MAL entry (migration 033), and unresolved seasons go to review with an `unresolved_season_mappings` health warning and a `season-mappings` command to list/approve them.
+- Added `apply-sync --provider` and `mal-refresh --force/--min-remaining-hours`.
 
 ### Changed
 
@@ -23,10 +25,20 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Aligned the secondary `recommend-maintain --mal-list-max-pages` default with the effective 10-page service budget.
 - Tightened stale-running diagnostics so only an explicit released lease or elapsed timeout is terminal evidence.
 - Expanded MAL/provider pacing, cache, ingestion, planner, migration, and validation coverage; nullable optional MAL detail containers remain accepted while missing/malformed requested fields fail closed.
+- `apply-sync --limit` now bounds live revalidations/writes instead of the number of series inspected: every approved series is planned from cached MAL state and writes go most recently watched first, with the remainder reported as `deferred`. `apply-sync` exits non-zero when any item failed.
+- Unattended `sync_apply` now applies each provider whose fetch succeeded since the previous apply instead of requiring every provider to succeed in the same scheduler pass.
+- MAL token refresh renews only when the recorded access-token expiry is within 7 days (or unknown), and persists a rotated refresh token before the access token so an interrupted write cannot strand it.
+- The service MAL list refresh now requests `limit=1000` pages and prunes rows removed on MAL after a complete traversal; snapshot drift restarts in-run and is never terminal, and auth failures retry instead of quarantining.
 
 ### Fixed
 
 - Fixed public MAL user-recommendation refreshes of already-published sources being rejected forever by the queue claim fence.
+- Fixed watch progress of multi-season provider series being summed into one MAL entry (for example 88 episodes on a 16-episode season).
+- Fixed unnumbered PVs, recaps, OVAs and movies counting as watched episodes, and watched counts exceeding the MAL episode count being written; episode numbers continuing across seasons are rebased when they exceed the MAL episode count, and a completion resting only on unobserved lower-numbered episodes goes to review.
+- Fixed unattended `sync_apply` being skipped since late September because fetch lanes never all succeeded in one scheduler pass, and `apply-sync --limit` never reaching older backlog.
+- Fixed Crunchyroll episodes flagged fully watched not completing when a playhead was also present.
+- Fixed HIDIVE Continue Watching positions of 0/1 seconds being read as 0%/100% watched, history paging (only the first 5 entries were read), and a hot sync boundary that could never be reached again; HIDIVE history-only episodes now count as completed when the next episode of the same season was started at least 90% of the runtime later.
+- Fixed the MAL list cache going stale after repeated drift quarantines caused by MAL flipping `main_picture` URLs; legacy drift quarantines resume automatically.
 - Fixed Crunchyroll full refreshes failing validation when the offset-paged watchlist repeats a series across pages; repeats are dropped and the surface is marked partial.
 - Fixed HIDIVE sync failing indefinitely once the saved refresh token expired (HIDIVE answers it with HTTP 404); an expired refresh token now triggers one credential re-login.
 - Extended bounded health-history housekeeping to timestamped hourly health-check logs while preserving the configured recent floor and ignoring unrelated logs, backups, and runtime data.

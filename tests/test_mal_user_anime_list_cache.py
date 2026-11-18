@@ -823,13 +823,14 @@ class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
             select_mal_user_anime_list_partition_work(
                 self.db_path, generation=generation.generation, claim_token="first"
             )
+        from mal_updater.db import MAL_USER_LIST_PAGINATION_LOGIC_VERSION
         legacy_query = {
             "fields": "id,title",
-            "logic_version": "mal-user-list-pagination-v2",
+            "logic_version": "mal-user-list-pagination-v3",
             "page_size": 100,
             "statuses": ["completed", "watching"],
         }
-        current_query = {**legacy_query, "logic_version": "mal-user-list-pagination-v3"}
+        current_query = {**legacy_query, "logic_version": MAL_USER_LIST_PAGINATION_LOGIC_VERSION, "page_size": 1000}
         legacy_identity = __import__("hashlib").sha256(
             __import__("json").dumps(legacy_query, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -838,7 +839,7 @@ class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
         ).hexdigest()
         with connect(self.db_path) as conn:
             conn.execute(
-                "UPDATE mal_user_anime_list_refresh_generations SET query_identity=?, query_json=?, logic_version='mal-user-list-pagination-v2' WHERE generation=?",
+                "UPDATE mal_user_anime_list_refresh_generations SET query_identity=?, query_json=?, logic_version='mal-user-list-pagination-v3' WHERE generation=?",
                 (
                     legacy_identity,
                     __import__("json").dumps(legacy_query, sort_keys=True, separators=(",", ":")),
@@ -847,6 +848,13 @@ class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
             )
             conn.commit()
         from mal_updater.db import reinitialize_mal_user_anime_list_traversal
+        # A legacy contract quarantine still blocks the lineage under new logic.
+        with self.assertRaisesRegex(MalUserAnimeListRefreshConflictError, "explicit safe reinitialization"):
+            claim_or_create_mal_user_anime_list_traversal(
+                self.db_path, account_id=7, account_name="owner", query_identity=current_identity,
+                query=current_query, partitions=self.partitions(),
+                claim_token="second", fetched_at="2026-08-13T00:01:00Z",
+            )
         fresh = reinitialize_mal_user_anime_list_traversal(
             self.db_path, account_id=7, account_name="owner", query_identity=current_identity,
             query=current_query, partitions=self.partitions(),
@@ -859,8 +867,15 @@ class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
                 "SELECT logic_version FROM mal_user_anime_list_refresh_generations WHERE generation=?",
                 (fresh.generation,),
             ).fetchone()["logic_version"]
-        self.assertEqual("mal-user-list-pagination-v3", logic_version)
+        self.assertEqual(MAL_USER_LIST_PAGINATION_LOGIC_VERSION, logic_version)
         self.assertEqual(current_identity, fresh.query_identity)
+        # The newest lineage generation decides, so the reinitialized one is claimable.
+        claimed, _ = claim_or_create_mal_user_anime_list_traversal(
+            self.db_path, account_id=7, account_name="owner", query_identity=current_identity,
+            query=current_query, partitions=self.partitions(),
+            claim_token="third", fetched_at="2026-08-13T00:03:00Z",
+        )
+        self.assertEqual(fresh.generation, claimed.generation)
 
     def test_reinitialize_rejects_mismatched_legacy_logic_provenance(self) -> None:
         from mal_updater.db import (
@@ -878,17 +893,18 @@ class MalUserAnimeListDurableTraversalTests(unittest.TestCase):
             claim_token="first", expected_revision=generation.revision, retry_class="auth_or_contract",
             error="identity contract failed", next_retry_at=None, quarantine=True,
         )
+        from mal_updater.db import MAL_USER_LIST_PAGINATION_LOGIC_VERSION
         current_query = {
             "fields": "id,title",
-            "logic_version": "mal-user-list-pagination-v3",
-            "page_size": 100,
+            "logic_version": MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
+            "page_size": 1000,
             "statuses": ["completed", "watching"],
         }
         current_query_text = __import__("json").dumps(current_query, sort_keys=True, separators=(",", ":"))
         current_identity = __import__("hashlib").sha256(current_query_text.encode()).hexdigest()
         with connect(self.db_path) as conn:
             conn.execute(
-                "UPDATE mal_user_anime_list_refresh_generations SET query_identity=?, query_json=?, logic_version='mal-user-list-pagination-v2' WHERE generation=?",
+                "UPDATE mal_user_anime_list_refresh_generations SET query_identity=?, query_json=?, logic_version='mal-user-list-pagination-v3' WHERE generation=?",
                 (current_identity, current_query_text, generation.generation),
             )
             conn.commit()

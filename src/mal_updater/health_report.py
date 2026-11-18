@@ -27,6 +27,7 @@ from .db import (
 )
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
 from .redaction import sanitize_text
+from .season_mappings import count_unresolved_provider_season_mappings
 from . import review_queue_support as _review_queue_support
 from .service_auth_state import (
     describe_auth_failure_kind,
@@ -1174,6 +1175,19 @@ def build_health_report(
     if isinstance(mal_auth_failure, dict):
         auth_reported_tasks.add("mal_refresh")
     warnings.extend(_repeated_task_failure_warnings(service_state, exclude=auth_reported_tasks))
+    unresolved_seasons = count_unresolved_provider_season_mappings(config.db_path)
+    if unresolved_seasons:
+        warnings.append(
+            {
+                "code": "unresolved_season_mappings",
+                "detail": (
+                    f"{unresolved_seasons} provider season(s) of multi-season series could not be matched to a MAL entry "
+                    "automatically, so their progress is not synced; run `mal-updater season-mappings --unresolved` "
+                    "and approve with `season-mappings --approve`"
+                ),
+                "count": unresolved_seasons,
+            }
+        )
     coverage_ratio = mapping_coverage.get("eligible_approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
     unmapped_series_count = mapping_coverage.get("eligible_unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (

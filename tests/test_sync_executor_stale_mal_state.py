@@ -73,9 +73,11 @@ class SyncExecutorStaleMalStateTests(unittest.TestCase):
             ) as update:
                 results = execute_approved_sync(config, limit=0, exact_approved_only=True, dry_run=False)
 
-            details.assert_called_once()
-            self.assertTrue(details.call_args.kwargs["force_refresh"])
-            self.assertTrue(details.call_args.kwargs["require_user"])
+            # The cached plan proposes a write, so exactly one authoritative
+            # live read follows before any write decision.
+            live_calls = [call for call in details.call_args_list if call.kwargs.get("force_refresh")]
+            self.assertEqual(1, len(live_calls))
+            self.assertTrue(live_calls[0].kwargs["require_user"])
             update.assert_not_called()
             self.assertEqual(1, len(results))
             self.assertFalse(results[0].applied)
@@ -244,12 +246,16 @@ class SyncExecutorStaleMalStateTests(unittest.TestCase):
             )
             before = self._detail({"status": "watching", "num_episodes_watched": 9, "score": 8})
             after = self._detail({"status": "watching", "num_episodes_watched": 10, "score": 8})
-            live_reads = [before, after]
+            mal_state = {"detail": before}
 
-            with patch.object(MalClient, "get_anime_details", side_effect=lambda *_args, **_kwargs: live_reads.pop(0)), patch.object(
+            def write(*_args, **_kwargs):
+                mal_state["detail"] = after
+                return {"status": "watching", "num_episodes_watched": 10, "score": 8}
+
+            with patch.object(MalClient, "get_anime_details", side_effect=lambda *_args, **_kwargs: mal_state["detail"]), patch.object(
                 MalClient,
                 "update_my_list_status",
-                return_value={"status": "watching", "num_episodes_watched": 10, "score": 8},
+                side_effect=write,
             ) as update:
                 first = execute_approved_sync(config, limit=0, exact_approved_only=True, dry_run=False)
                 second = execute_approved_sync(config, limit=0, exact_approved_only=True, dry_run=False)

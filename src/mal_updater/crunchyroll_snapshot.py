@@ -553,6 +553,49 @@ def _series_from_panel(panel: dict[str, Any]) -> SeriesRef | None:
     )
 
 
+CRUNCHYROLL_PROGRESS_SOURCE_SURFACE = "crunchyroll_history"
+CRUNCHYROLL_PROGRESS_NORMALIZATION_VERSION = "crunchyroll_progress_v2"
+
+
+def _non_empty_str(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _episode_season_key(metadata: dict[str, Any]) -> str | None:
+    """Canonical, dub-collapsed season identity for an episode panel.
+
+    Crunchyroll models each audio dub as its own season. ``versions`` lists
+    every audio version of the episode; the entry flagged ``original`` names
+    the original-language season, so dub episodes collapse onto it. Without
+    that evidence the panel's own ``season_id`` is the best identity.
+    """
+    versions = metadata.get("versions")
+    if isinstance(versions, list):
+        for version in versions:
+            if isinstance(version, dict) and version.get("original") is True:
+                season_guid = _non_empty_str(version.get("season_guid"))
+                if season_guid is not None:
+                    return season_guid
+    return _non_empty_str(metadata.get("season_id"))
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _progress_kind_and_assertion(*, fully_watched: bool | None, playback_position_ms: int | None) -> tuple[str, str]:
+    """Label evidence; an explicit fully_watched outranks any playhead."""
+    if fully_watched is True:
+        return "explicit_completed", "confirmed"
+    if playback_position_ms is not None:
+        return "position", "unknown"
+    return "history_membership", "unknown"
+
+
 def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | None:
     panel = entry.get("panel")
     if not isinstance(panel, dict):
@@ -561,7 +604,10 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
     panel_type = panel.get("type")
     metadata = _panel_metadata(panel)
     playhead = entry.get("playhead")
-    fully_watched = bool(entry.get("fully_watched"))
+    raw_fully_watched = entry.get("fully_watched")
+    # Only an explicit boolean is provider evidence; absence stays unknown.
+    fully_watched_flag = raw_fully_watched if isinstance(raw_fully_watched, bool) else None
+    fully_watched = fully_watched_flag is True
     last_watched_at = entry.get("date_played")
 
     if panel_type == "episode":
@@ -580,6 +626,9 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
         elif fully_watched:
             completion_ratio = 1.0
         episode_number = metadata.get("episode_number")
+        observation_kind, completion_assertion = _progress_kind_and_assertion(
+            fully_watched=fully_watched_flag, playback_position_ms=playback_position_ms,
+        )
         return EpisodeProgress(
             provider_episode_id=str(provider_episode_id),
             provider_series_id=str(provider_series_id),
@@ -592,6 +641,18 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
             audio_locale=str(metadata.get("audio_locale")) if metadata.get("audio_locale") else None,
             subtitle_locale=_pick_subtitle_locale(panel),
             rating=None,
+            progress_source_surface=CRUNCHYROLL_PROGRESS_SOURCE_SURFACE,
+            progress_observation_kind=observation_kind,
+            completion_assertion=completion_assertion,
+            normalization_logic_version=CRUNCHYROLL_PROGRESS_NORMALIZATION_VERSION,
+            provider_season_key=_episode_season_key(metadata),
+            # season_sequence_number orders seasons within the series listing
+            # (the MAL sequel order); licensor season_number repeats across
+            # split cours and specials, so it is not used.
+            season_number=_non_negative_int(metadata.get("season_sequence_number")),
+            season_title=_non_empty_str(metadata.get("season_title")),
+            episode_label=_non_empty_str(metadata.get("episode")),
+            fully_watched=fully_watched_flag,
         )
 
     if panel_type == "movie":
@@ -608,6 +669,9 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
             completion_ratio = max(0.0, min(1.0, playback_position_ms / duration_ms))
         elif fully_watched:
             completion_ratio = 1.0
+        observation_kind, completion_assertion = _progress_kind_and_assertion(
+            fully_watched=fully_watched_flag, playback_position_ms=playback_position_ms,
+        )
         return EpisodeProgress(
             provider_episode_id=str(provider_episode_id),
             provider_series_id=str(provider_series_id),
@@ -620,6 +684,13 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
             audio_locale=None,
             subtitle_locale=None,
             rating="movie",
+            progress_source_surface=CRUNCHYROLL_PROGRESS_SOURCE_SURFACE,
+            progress_observation_kind=observation_kind,
+            completion_assertion=completion_assertion,
+            normalization_logic_version=CRUNCHYROLL_PROGRESS_NORMALIZATION_VERSION,
+            # A movie listing is a single-item season-like unit.
+            provider_season_key=str(provider_series_id),
+            fully_watched=fully_watched_flag,
         )
 
     return None
@@ -1035,11 +1106,11 @@ def _fetch_snapshot_once(
         if automatic_bootstrap_chunk and page == 1:
             bootstrap_history_page1_fingerprint = batch_fingerprint
             bootstrap_history_total = total if isinstance(total, int) else None
+        # Terminate only on a short/empty page. Watch-history ``total`` is not
+        # a trustworthy overall count: a production full refresh stopped after
+        # one full page of 100 with history claimed complete, which only the
+        # former ``page * 100 >= total`` check could cause.
         if len(batch) < 100:
-            if history_front_boundary_seen:
-                history_backfill_exhausted = True
-            break
-        if isinstance(total, int) and (page * 100) >= total:
             if history_front_boundary_seen:
                 history_backfill_exhausted = True
             break

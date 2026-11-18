@@ -66,6 +66,26 @@ def sample_snapshot() -> dict:
 
 
 class ValidationTests(unittest.TestCase):
+    def test_validate_progress_season_identity_fields(self) -> None:
+        payload = sample_snapshot()
+        payload["progress"][0].update(
+            provider_season_key="season-guid", season_number=0, season_title="Season",
+            episode_label="SP", fully_watched=False,
+        )
+        progress = validate_snapshot_payload(payload).progress[0]
+        self.assertEqual(
+            ("season-guid", 0, "Season", "SP", False),
+            (progress.provider_season_key, progress.season_number, progress.season_title, progress.episode_label, progress.fully_watched),
+        )
+        for field, value in (
+            ("fully_watched", 1), ("season_number", -1), ("season_number", "2"),
+            ("provider_season_key", " "), ("episode_label", 12.5),
+        ):
+            bad = sample_snapshot()
+            bad["progress"][0][field] = value
+            with self.assertRaises(SnapshotValidationError, msg=field):
+                validate_snapshot_payload(bad)
+
     def test_crunchyroll_contract_alias_remains_compatible(self) -> None:
         self.assertIs(CrunchyrollSnapshot, ProviderSnapshot)
         self.assertIs(CrunchyrollSnapshotCompatAlias, ProviderSnapshot)
@@ -224,6 +244,46 @@ class _FakeHidiveProvider:
 
 
 class IngestionTests(unittest.TestCase):
+    def test_season_identity_backfills_existing_rows_and_is_never_nulled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            config = load_config(root)
+            legacy = sample_snapshot()
+            ingest_snapshot_payload(legacy, config)
+
+            backfill = sample_snapshot()
+            backfill["progress"][0].update(
+                provider_season_key="orig-season", season_number=2, season_title="Show Season 2",
+                episode_label="12.5", episode_number=None, fully_watched=True,
+                progress_source_surface="crunchyroll_history",
+                progress_observation_kind="explicit_completed", completion_assertion="confirmed",
+            )
+            ingest_snapshot_payload(backfill, config)
+
+            later = sample_snapshot()
+            later["progress"][0].update(
+                fully_watched=False, last_watched_at="2026-03-15T20:55:00Z",
+                progress_observation_kind="position", completion_assertion="unknown",
+            )
+            ingest_snapshot_payload(later, config)
+
+            with contextlib.closing(sqlite3.connect(config.db_path)) as conn:
+                row = conn.execute(
+                    "SELECT provider_season_key, season_number, season_title, episode_label, fully_watched, "
+                    "progress_observation_kind, completion_assertion FROM provider_episode_progress"
+                ).fetchone()
+                observations = conn.execute(
+                    "SELECT provider_season_key, episode_label, fully_watched FROM provider_progress_observations "
+                    "ORDER BY rowid"
+                ).fetchall()
+            self.assertEqual(
+                ("orig-season", 2, "Show Season 2", "12.5", 1, "explicit_completed", "confirmed"), row,
+            )
+            self.assertEqual(
+                [(None, None, None), ("orig-season", "12.5", 1), (None, None, 0)], observations,
+            )
+
     def test_ingestion_persists_fetch_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

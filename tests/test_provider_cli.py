@@ -128,6 +128,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "review-queue-refresh-worklist",
     "review-queue-worklist",
     "runtime-retention-audit",
+    "season-mappings",
     "service-run",
     "service-run-once",
     "service-status",
@@ -393,7 +394,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(58, len(actual_commands))
+        self.assertEqual(59, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",
