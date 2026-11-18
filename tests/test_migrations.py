@@ -51,6 +51,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "028_provider_progress_observations.sql",
                 "029_provider_fetch_provenance.sql",
                 "030_recommendation_decision_ledger.sql",
+                "031_recommendation_decision_ledger_retention.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -109,6 +110,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "028_provider_progress_observations.sql",
                     "029_provider_fetch_provenance.sql",
                     "030_recommendation_decision_ledger.sql",
+                    "031_recommendation_decision_ledger_retention.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -146,6 +148,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "028_provider_progress_observations.sql",
                     "029_provider_fetch_provenance.sql",
                     "030_recommendation_decision_ledger.sql",
+                    "031_recommendation_decision_ledger_retention.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )

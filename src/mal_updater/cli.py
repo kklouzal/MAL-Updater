@@ -704,6 +704,8 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
                     "available_free_bytes",
                     "initial_available_free_bytes",
                     "post_backup_available_free_bytes",
+                    "pruned_backup_archives",
+                    "backup_prune_error_type",
                     "error_type",
                 ):
                     result_value = last_result.get(result_field)

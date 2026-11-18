@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -42,6 +43,8 @@ class DatabaseCompactionReport:
     initial_available_free_bytes: int = 0
     post_backup_available_free_bytes: int = 0
     error_type: str | None = None
+    pruned_backup_archives: int = 0
+    backup_prune_error_type: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -117,6 +120,8 @@ def _base_report(config: AppConfig, *, status: str, reason: str | None, attempte
         initial_available_free_bytes=int(extra.pop("initial_available_free_bytes", 0)),
         post_backup_available_free_bytes=int(extra.pop("post_backup_available_free_bytes", 0)),
         error_type=extra.pop("error_type", None),
+        pruned_backup_archives=int(extra.pop("pruned_backup_archives", 0)),
+        backup_prune_error_type=extra.pop("backup_prune_error_type", None),
     )
 
 
@@ -125,6 +130,32 @@ def _previous_success_too_recent(previous: dict[str, Any] | None, now: float, mi
         return False
     epoch = previous.get("last_success_epoch")
     return isinstance(epoch, (int, float)) and now - float(epoch) < min_interval
+
+
+PRE_VACUUM_BACKUP_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_PRE_VACUUM_ARCHIVE_NAME = re.compile(r"mal-updater-pre-vacuum-(\d+)\.tar\.gz")
+
+
+def _prune_pre_vacuum_archives(backup_dir: Path, *, keep: Path, now: float) -> tuple[int, str | None]:
+    """Delete this task's own pre-vacuum archives older than the retention window.
+
+    Only names this task generates are considered, the archive just written is
+    always kept, and age comes from the epoch embedded in the name. It runs
+    after a completed VACUUM, so a filesystem error stops pruning and is
+    returned for the report instead of masking the compaction outcome.
+    """
+    removed = 0
+    try:
+        for entry in backup_dir.iterdir():
+            match = _PRE_VACUUM_ARCHIVE_NAME.fullmatch(entry.name)
+            if match is None or entry == keep or entry.is_symlink() or not entry.is_file():
+                continue
+            if now - int(match.group(1)) > PRE_VACUUM_BACKUP_RETENTION_SECONDS:
+                entry.unlink()
+                removed += 1
+    except OSError as exc:
+        return removed, sanitize_text(type(exc).__name__, max_length=100)
+    return removed, None
 
 
 def compact_database_if_due(config: AppConfig, *, previous: dict[str, Any] | None = None, now: float | None = None) -> DatabaseCompactionReport:
@@ -174,6 +205,7 @@ def compact_database_if_due(config: AppConfig, *, previous: dict[str, Any] | Non
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("VACUUM")
         after_size = config.db_path.stat().st_size
-        return _base_report(config, status="compacted", reason=None, attempted_at=attempted_at, stats=stats, previous=previous, db_size_after=after_size, bytes_reclaimed=max(0, size - after_size), backup_archive=str(created), backup_archive_sha256=str(verified.get("archive_sha256") or ""), backup_file_count=len(verified.get("manifest", {}).get("files", [])) if isinstance(verified.get("manifest"), dict) else 0, last_success_epoch=current, required_free_bytes=required, available_free_bytes=post_backup_available, initial_available_free_bytes=available, post_backup_available_free_bytes=post_backup_available)
+        pruned_archives, prune_error_type = _prune_pre_vacuum_archives(backup_dir, keep=Path(created), now=current)
+        return _base_report(config, status="compacted", pruned_backup_archives=pruned_archives, backup_prune_error_type=prune_error_type, reason=None, attempted_at=attempted_at, stats=stats, previous=previous, db_size_after=after_size, bytes_reclaimed=max(0, size - after_size), backup_archive=str(created), backup_archive_sha256=str(verified.get("archive_sha256") or ""), backup_file_count=len(verified.get("manifest", {}).get("files", [])) if isinstance(verified.get("manifest"), dict) else 0, last_success_epoch=current, required_free_bytes=required, available_free_bytes=post_backup_available, initial_available_free_bytes=available, post_backup_available_free_bytes=post_backup_available)
     finally:
         release_database_lock(lock)

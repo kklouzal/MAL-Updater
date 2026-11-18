@@ -136,6 +136,8 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
         "available_free_bytes",
         "initial_available_free_bytes",
         "post_backup_available_free_bytes",
+        "pruned_backup_archives",
+        "backup_prune_error_type",
         "error_type",
         "retention_days",
         "min_count",

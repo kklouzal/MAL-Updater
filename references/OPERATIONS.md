@@ -47,18 +47,20 @@ PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 | Surface | Cadence | Current policy |
 | --- | --- | --- |
 | Recommendation score snapshots | Every scheduler pass (normally hourly) | Logical deletion only: 14-day horizon, newest 30 runs/kind protected, 10,000-row cap per pass; never triggers hourly `VACUUM`. |
+| Recommendation decision ledger | Every scheduler pass (normally hourly) | Logical deletion of whole runs (run plus its items) older than 30 days, at most 25 runs per pass in one transaction; SQL triggers reject deletes of rows younger than 7 days and the configured retention is floored there. |
 | API request telemetry (`api-request-events.jsonl`) | Every scheduler pass (normally hourly) | Atomic, fail-closed pruning of events older than 14 days; malformed telemetry blocks pruning and preserves the original file. |
 | SQLite physical compaction | Checked weekly; successful runs at least 30 days apart | Requires both 128 MiB and 10% freelist, verified fresh backup, pre/post-backup free-space gates, and writer exclusion. |
-| Health artifacts | Health task normally hourly; retention daily | `latest-health-check.json` is never deleted. Timestamped JSON history keeps 90 days and at least the newest 168 snapshots, deleting at most 100 safe-name regular files/pass; any unsafe name, symlink, or filesystem error blocks the pass. |
+| Health artifacts | Health task normally hourly; retention daily | `latest-health-check.json` is never deleted. Timestamped JSON history keeps 30 days and at least the newest 168 snapshots, deleting at most 1,000 safe-name regular files/pass; any unsafe name, symlink, or filesystem error blocks the pass. |
 | Service logs | Written continuously; checked before every append | `service.log` rotates before an append would exceed 16 MiB and retains five numbered generations. Symlinks/special files block appends; failures are not recursively logged. |
-| Database backups | Created by operators and before compaction/restore; audited weekly | High-value manual retention only. The automatic local/read-only runtime inventory reports review candidates, but backups are never automatically deleted and require an explicit owner-approved archival/removal decision. |
+| Database backups | Created by operators and before compaction/restore; audited weekly | After each successful compaction, `db_compaction` deletes its own `mal-updater-pre-vacuum-<epoch>.tar.gz` archives older than 30 days (never the archive it just wrote). All other backups are manual retention only: the read-only runtime inventory reports review candidates, and removal requires an explicit owner decision. |
 | Other runtime families (auth/provider data, tmp, cache, artifacts, ambiguous files) | Audited weekly | Automatic bounded read-only inventory only. Any archive/prune/delete action remains explicit and human-gated; the audit never mutates these families. |
 
 Every listed surface now has recurring automatic maintenance or a recurring
 read-only audit with explicit human-gated action. Automatic deletion remains
-limited to established telemetry/snapshot policy and safe timestamped health
-history; backups, auth/provider data, ambiguous mappings, and arbitrary files
-are never selected by these housekeeping lanes.
+limited to established telemetry/snapshot/decision-ledger policy, safe timestamped
+health history, and expired automatic pre-vacuum archives; other backups,
+auth/provider data, ambiguous mappings, and arbitrary files are never selected
+by these housekeeping lanes.
 
 ## Initialize runtime / DB
 
@@ -160,8 +162,10 @@ space for a SQLite rewrite plus margin, and a fresh container-native backup unde
 `.MAL-Updater/state/backups/` verifies by manifest/checksum. Free space is checked
 again after retaining that archive and immediately before `VACUUM`. The 128 MiB
 and 10% defaults deliberately qualify the observed 175.3 MiB / 14.43% steady-state
-freelist while still requiring both meaningful absolute and proportional waste. Backup retention remains high-value/manual-policy; this lane
-creates recovery evidence and does not delete old archives.
+freelist while still requiring both meaningful absolute and proportional waste. After a successful `VACUUM` this lane
+deletes only its own pre-vacuum archives older than 30 days, always keeping the
+one it just wrote; `pruned_backup_archives` and `backup_prune_error_type` report
+the result. Other backups remain manual-policy.
 
 SQLite `VACUUM` takes an exclusive database lock and rewrites the database file,
 so expect a maintenance pause while `db_compaction` is running. It is safe to

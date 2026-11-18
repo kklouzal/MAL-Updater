@@ -763,7 +763,7 @@ def build_runtime_retention_audit_payload(config: RuntimeAuditConfig, options: A
             "diagnostic_only_no_delete_or_prune": True,
             "review_candidates_are_not_commands": True,
             "no_automatic_retention_policy_guess": True,
-            "db_backups": "High-value/manual-policy family; verify backup/recovery needs before any separate retention action.",
+            "db_backups": "Automatic pre-vacuum archives are pruned after 30 days by db_compaction; other backups are manual-policy, so verify recovery needs before removing them.",
             "disposableish_families": ["tmp", "cache", "state_logs", "request_events", "artifacts"],
             "health_snapshots": "Timestamped health JSON is automatically age/count bounded; audit retained history before any separate action.",
         },

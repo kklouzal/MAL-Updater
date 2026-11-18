@@ -126,6 +126,49 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         self.assertFalse(any(path.startswith("state/backups/") for path in manifest_paths), manifest_paths)
         self.assertTrue(prior.exists())
 
+    def test_compaction_prunes_only_own_pre_vacuum_archives_past_retention(self) -> None:
+        self._make_freelist()
+        backup_dir = self.config.state_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        expired = backup_dir / f"mal-updater-pre-vacuum-{now - 31 * 86400}.tar.gz"
+        recent = backup_dir / f"mal-updater-pre-vacuum-{now - 29 * 86400}.tar.gz"
+        manual = backup_dir / "mal-updater-pre-restore-1.tar.gz"
+        for path in (expired, recent, manual):
+            path.write_bytes(b"x")
+
+        report = compact_database_if_due(self.config).as_dict()
+
+        self.assertEqual("compacted", report["status"])
+        self.assertEqual(1, report["pruned_backup_archives"])
+        self.assertFalse(expired.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(manual.exists())
+        self.assertTrue(Path(report["backup_archive"]).exists())
+        self.assertIsNone(report["backup_prune_error_type"])
+
+    def test_archive_prune_failure_is_reported_without_masking_completed_vacuum(self) -> None:
+        self._make_freelist()
+        backup_dir = self.config.state_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        expired = backup_dir / f"mal-updater-pre-vacuum-{int(time.time()) - 31 * 86400}.tar.gz"
+        expired.write_bytes(b"x")
+
+        real_unlink = Path.unlink
+
+        def unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == expired:
+                raise PermissionError("denied")
+            real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=unlink):
+            report = compact_database_if_due(self.config).as_dict()
+
+        self.assertEqual("compacted", report["status"])
+        self.assertEqual(0, report["pruned_backup_archives"])
+        self.assertEqual("PermissionError", report["backup_prune_error_type"])
+        self.assertTrue(expired.exists())
+
     def test_scheduler_projects_compaction_status_and_next_due(self) -> None:
         self.config.service.db_compaction_every_seconds = 60
         self.config.service.sync_every_seconds = 0

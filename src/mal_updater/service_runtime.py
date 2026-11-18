@@ -45,6 +45,7 @@ from .request_tracking import (
     request_context_environment,
     summarize_recent_api_usage,
 )
+from .recommendation_decision_ledger import prune_recommendation_decision_ledger
 from .recommendation_snapshot_retention import prune_recommendation_score_snapshots
 
 
@@ -1956,6 +1957,26 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             f"{snapshot_prune['deleted_rows']} remaining_eligible={snapshot_prune.get('remaining_eligible_rows', 0)} "
             f"rows_after={snapshot_prune.get('rows_after', 0)}",
         )
+    try:
+        ledger_prune = prune_recommendation_decision_ledger(
+            config.db_path,
+            retention_days=config.service.recommendation_decision_ledger_retention_days,
+            batch_runs=config.service.recommendation_decision_ledger_prune_batch_runs,
+        )
+    except Exception as exc:
+        ledger_prune = {
+            "status": "blocked_error",
+            "error_type": sanitize_text(type(exc).__name__, max_length=100),
+            "deleted_runs": 0,
+        }
+    state["recommendation_decision_ledger_retention"] = ledger_prune
+    if ledger_prune.get("deleted_runs"):
+        _append_log(
+            config,
+            "recommendation_decision_ledger_pruned="
+            f"{ledger_prune['deleted_runs']} items={ledger_prune.get('deleted_items', 0)} "
+            f"remaining_eligible_runs={ledger_prune.get('remaining_eligible_runs', 0)}",
+        )
     tasks_state = state.setdefault("tasks", {})
     provider_fetch_success_this_cycle: set[str] = set()
 
@@ -2309,6 +2330,12 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                     task_state["last_success_epoch"] = result.get("last_success_epoch", time.time())
                     task_state["last_success_at"] = result.get("attempted_at")
                     task_state["last_bytes_reclaimed"] = result.get("bytes_reclaimed", 0)
+                    if result.get("backup_prune_error_type"):
+                        _append_log(
+                            config,
+                            "db_compaction_backup_prune_failed="
+                            f"{result['backup_prune_error_type']} pruned_backup_archives={result.get('pruned_backup_archives', 0)}",
+                        )
                 elif result.get("status") in {"blocked", "error"}:
                     result["status"] = "error"
             elif spec.name == "health_history_retention":
@@ -2472,6 +2499,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
         "state_file": str(config.service_state_path),
         "api_usage": state["api_usage"],
         "recommendation_snapshot_retention": snapshot_prune,
+        "recommendation_decision_ledger_retention": ledger_prune,
     }
     safe_payload = sanitize_value(payload, max_depth=10, max_items=500, max_string=_SUBPROCESS_STREAM_LIMIT)
     return safe_payload if isinstance(safe_payload, dict) else {"status": "error", "reason": "result_sanitization_failed"}

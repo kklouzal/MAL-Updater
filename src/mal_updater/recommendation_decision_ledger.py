@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -376,3 +376,62 @@ def list_recommendation_decision_ledger_items(
         )
         for row in rows
     ]
+
+
+# Mirrors migration 031: rows younger than this are delete-protected in SQL.
+DECISION_LEDGER_MIN_RETENTION_DAYS = 7
+
+
+def prune_recommendation_decision_ledger(
+    db_path: Path,
+    *,
+    retention_days: int = 30,
+    batch_runs: int = 25,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Delete a bounded batch of whole ledger runs older than the retention horizon.
+
+    Items and their run are removed together in one IMMEDIATE transaction
+    (items first, because of the ON DELETE RESTRICT foreign key). Free pages
+    are left for the db_compaction task; VACUUM is never performed here.
+    """
+    retention_days = max(DECISION_LEDGER_MIN_RETENTION_DAYS, int(retention_days))
+    batch_runs = max(1, int(batch_runs))
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    # created_at is SQLite CURRENT_TIMESTAMP text, so compare in that format.
+    cutoff = (current - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        run_ids = [
+            str(row["run_id"])
+            for row in conn.execute(
+                """
+                SELECT run_id FROM recommendation_decision_ledger_runs
+                WHERE created_at < ?
+                ORDER BY created_at, run_id
+                LIMIT ?
+                """,
+                (cutoff, batch_runs),
+            )
+        ]
+        deleted_items = 0
+        for run_id in run_ids:
+            deleted_items += conn.execute(
+                "DELETE FROM recommendation_decision_ledger_items WHERE run_id = ?", (run_id,)
+            ).rowcount
+            conn.execute("DELETE FROM recommendation_decision_ledger_runs WHERE run_id = ?", (run_id,))
+        remaining = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM recommendation_decision_ledger_runs WHERE created_at < ?", (cutoff,)
+            ).fetchone()[0]
+        )
+        conn.commit()
+    return {
+        "status": "pruned" if run_ids else "no_change",
+        "retention_days": retention_days,
+        "batch_runs": batch_runs,
+        "cutoff": cutoff,
+        "deleted_runs": len(run_ids),
+        "deleted_items": deleted_items,
+        "remaining_eligible_runs": remaining,
+    }

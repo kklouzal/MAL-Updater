@@ -89,15 +89,17 @@ DEFAULT_SERVICE_RECOMMENDATIONS_WEBHOOK_PUSH_EVERY_SECONDS = 0
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS = 14
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND = 30
 DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE = 10_000
+DEFAULT_SERVICE_RECOMMENDATION_DECISION_LEDGER_RETENTION_DAYS = 30
+DEFAULT_SERVICE_RECOMMENDATION_DECISION_LEDGER_PRUNE_BATCH_RUNS = 25
 DEFAULT_SERVICE_DB_COMPACTION_EVERY_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_SERVICE_DB_COMPACTION_MIN_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_BYTES = 128 * 1024 * 1024
 DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_RATIO = 0.10
 DEFAULT_SERVICE_DB_COMPACTION_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
 DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_EVERY_SECONDS = 24 * 60 * 60
-DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_DAYS = 90
+DEFAULT_SERVICE_HEALTH_HISTORY_RETENTION_DAYS = 30
 DEFAULT_SERVICE_HEALTH_HISTORY_MIN_COUNT = 168
-DEFAULT_SERVICE_HEALTH_HISTORY_PRUNE_BATCH_SIZE = 100
+DEFAULT_SERVICE_HEALTH_HISTORY_PRUNE_BATCH_SIZE = 1000
 DEFAULT_SERVICE_LOG_MAX_BYTES = 16 * 1024 * 1024
 DEFAULT_SERVICE_LOG_RETAINED_GENERATIONS = 5
 DEFAULT_SERVICE_RUNTIME_RETENTION_AUDIT_EVERY_SECONDS = 7 * 24 * 60 * 60
@@ -305,6 +307,8 @@ class ServiceSettings:
     recommendation_snapshot_retention_days: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_RETENTION_DAYS
     recommendation_snapshot_min_runs_per_kind: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_MIN_RUNS_PER_KIND
     recommendation_snapshot_prune_batch_size: int = DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE
+    recommendation_decision_ledger_retention_days: int = DEFAULT_SERVICE_RECOMMENDATION_DECISION_LEDGER_RETENTION_DAYS
+    recommendation_decision_ledger_prune_batch_runs: int = DEFAULT_SERVICE_RECOMMENDATION_DECISION_LEDGER_PRUNE_BATCH_RUNS
     db_compaction_every_seconds: int = DEFAULT_SERVICE_DB_COMPACTION_EVERY_SECONDS
     db_compaction_min_interval_seconds: int = DEFAULT_SERVICE_DB_COMPACTION_MIN_INTERVAL_SECONDS
     db_compaction_min_freelist_bytes: int = DEFAULT_SERVICE_DB_COMPACTION_MIN_FREELIST_BYTES
@@ -1142,6 +1146,32 @@ def _load_config_unchecked(project_root: Path | None = None) -> AppConfig:
                             service_section,
                             "recommendation_snapshot_prune_batch_size",
                             DEFAULT_SERVICE_RECOMMENDATION_SNAPSHOT_PRUNE_BATCH_SIZE,
+                        ),
+                    )
+                ),
+            ),
+            recommendation_decision_ledger_retention_days=max(
+                7,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_RECOMMENDATION_DECISION_LEDGER_RETENTION_DAYS",
+                        _get_int(
+                            service_section,
+                            "recommendation_decision_ledger_retention_days",
+                            DEFAULT_SERVICE_RECOMMENDATION_DECISION_LEDGER_RETENTION_DAYS,
+                        ),
+                    )
+                ),
+            ),
+            recommendation_decision_ledger_prune_batch_runs=max(
+                1,
+                int(
+                    os.getenv(
+                        "MAL_UPDATER_SERVICE_RECOMMENDATION_DECISION_LEDGER_PRUNE_BATCH_RUNS",
+                        _get_int(
+                            service_section,
+                            "recommendation_decision_ledger_prune_batch_runs",
+                            DEFAULT_SERVICE_RECOMMENDATION_DECISION_LEDGER_PRUNE_BATCH_RUNS,
                         ),
                     )
                 ),

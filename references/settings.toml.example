@@ -85,6 +85,8 @@ recommend_maintain_every_seconds = 3600  # DB/local-only recommendation snapshot
 recommendation_snapshot_retention_days = 14  # bounded operational horizon; newest 30 runs/kind remain protected even when older
 recommendation_snapshot_min_runs_per_kind = 30  # always retain at least this many newest distinct runs for every recommendation kind
 recommendation_snapshot_prune_batch_size = 10000  # bounded logical deletion per scheduler pass; never VACUUMs hourly
+recommendation_decision_ledger_retention_days = 30  # whole decision-ledger runs older than this are deleted; floored at 7 (SQL delete guard)
+recommendation_decision_ledger_prune_batch_runs = 25  # bounded whole-run deletion per scheduler pass; never VACUUMs
 # Low-frequency, fail-closed SQLite physical compaction. The daemon checks weekly,
 # but only VACUUMs after the minimum successful interval has elapsed, freelist
 # thresholds justify it, a fresh backup verifies, the DB volume has headroom, and
@@ -94,12 +96,12 @@ db_compaction_min_interval_seconds = 2592000
 db_compaction_min_freelist_bytes = 134217728
 db_compaction_min_freelist_ratio = 0.10
 db_compaction_free_space_margin_bytes = 67108864
-# Daily bounded health-history pruning: keep 90 days and always protect the
-# newest 168 hourly snapshots; remove at most 100 old snapshots per pass.
+# Daily bounded health-history pruning: keep 30 days and always protect the
+# newest 168 hourly snapshots; remove at most 1000 old snapshots per pass.
 health_history_retention_every_seconds = 86400
-health_history_retention_days = 90
+health_history_retention_days = 30
 health_history_min_count = 168
-health_history_prune_batch_size = 100
+health_history_prune_batch_size = 1000
 # Rotate service.log before an append would exceed 16 MiB; retain five generations.
 service_log_max_bytes = 16777216
 service_log_retained_generations = 5

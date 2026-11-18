@@ -6,6 +6,9 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Added
 
+- Added password-free Crunchyroll account linking with a TV activation code (Settings **Link Crunchyroll account** and `mal-updater crunchyroll-link`); a linked session renews itself and counts as fully configured.
+- Added a `scheduled_task_failures_repeated` health warning for any scheduled task that fails three times in a row, so non-auth failures no longer stay visible only in the service log.
+- Added 30-day retention for the recommendation decision ledger (migration 031 keeps rows younger than 7 days delete-protected) and for automatic pre-vacuum database backups.
 - Added an accessible **Export PDF** control to the live dashboard using the browser print/save-to-PDF flow, with print-only report timing and a readable presentation that omits navigation and interactive filtering/visibility controls.
 - Added bounded operational-limit controls to the trusted-LAN Settings page for hourly request budgets, per-run and pagination bounds, request pacing/retries, and learned-budget thresholds/backoff. Settings saves are strictly numeric/allowlisted, preserve unrelated TOML content and comments, and explicitly require a scheduler/container restart to apply.
 - Added durable final-anchor validation for resumable public MAL user-recommendation crawls (migration 024), including bounded progress when only one page may be fetched per invocation.
@@ -14,6 +17,8 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Changed
 
+- Lowered the default health-history retention from 90 to 30 days and raised its per-run prune batch from 100 to 1000 files.
+- Rotated the Crunchyroll OAuth client after the previous Android TV client was retired, and send the Android TV User-Agent that the token endpoint now requires.
 - Hardened provider session, boundary, and snapshot JSON writes through the shared restrictive atomic persistence implementation.
 - Aligned the secondary `recommend-maintain --mal-list-max-pages` default with the effective 10-page service budget.
 - Tightened stale-running diagnostics so only an explicit released lease or elapsed timeout is terminal evidence.
@@ -21,6 +26,9 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Fixed
 
+- Fixed public MAL user-recommendation refreshes of already-published sources being rejected forever by the queue claim fence.
+- Fixed Crunchyroll full refreshes failing validation when the offset-paged watchlist repeats a series across pages; repeats are dropped and the surface is marked partial.
+- Fixed HIDIVE sync failing indefinitely once the saved refresh token expired (HIDIVE answers it with HTTP 404); an expired refresh token now triggers one credential re-login.
 - Extended bounded health-history housekeeping to timestamped hourly health-check logs while preserving the configured recent floor and ignoring unrelated logs, backups, and runtime data.
 - Derived health snapshot/log file-count review thresholds from the configured health cadence and retention window instead of fixed limits below the normal 90-day hourly volume.
 

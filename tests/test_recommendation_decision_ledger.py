@@ -15,6 +15,7 @@ from mal_updater.recommendation_decision_ledger import (
     RECOMMENDATION_POLICY_ARTIFACT_SHA256,
     insert_recommendation_decision_ledger,
     list_recommendation_decision_ledger_items,
+    prune_recommendation_decision_ledger,
 )
 from mal_updater.recommendations import Recommendation
 
@@ -135,6 +136,45 @@ class RecommendationDecisionLedgerTests(unittest.TestCase):
                 cutoff_at="2026-08-15T21:00:00Z",
                 output_limit=20,
             )
+
+    def _insert_run(self, run_id: str) -> None:
+        insert_recommendation_decision_ledger(
+            self.config.db_path,
+            [{"kind": "resume_backlog", "provider": "hidive", "provider_series_id": run_id, "title": run_id, "priority": 1, "reasons": ["r"]}],
+            run_id=run_id,
+            cutoff_at="2026-08-15T21:00:00Z",
+            output_limit=None,
+        )
+
+    def _age_run(self, run_id: str, aged_run_id: str, created_at: str) -> None:
+        # Rows are immutable, so an aged copy is inserted with an explicit created_at.
+        with connect(self.config.db_path) as conn:
+            for table in ("recommendation_decision_ledger_runs", "recommendation_decision_ledger_items"):
+                cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+                select = ", ".join("?" if c == "run_id" else ("?" if c == "created_at" else c) for c in cols)
+                conn.execute(
+                    f"INSERT INTO {table} ({', '.join(cols)}) SELECT {select} FROM {table} WHERE run_id = ?",
+                    tuple(aged_run_id if c == "run_id" else created_at for c in cols if c in ("run_id", "created_at")) + (run_id,),
+                )
+            conn.commit()
+
+    def test_prune_removes_only_whole_runs_past_retention_in_bounded_batches(self) -> None:
+        self._insert_run("fresh")
+        self._age_run("fresh", "old-1", "2026-01-01 00:00:00")
+        self._age_run("fresh", "old-2", "2026-01-02 00:00:00")
+
+        first = prune_recommendation_decision_ledger(self.config.db_path, retention_days=30, batch_runs=1)
+        self.assertEqual((1, 1, 1), (first["deleted_runs"], first["deleted_items"], first["remaining_eligible_runs"]))
+        second = prune_recommendation_decision_ledger(self.config.db_path, retention_days=30, batch_runs=10)
+        self.assertEqual((1, 0), (second["deleted_runs"], second["remaining_eligible_runs"]))
+        # A retention below the SQL-enforced floor is clamped, so fresh rows survive.
+        floor = prune_recommendation_decision_ledger(self.config.db_path, retention_days=0)
+        self.assertEqual(("no_change", 7), (floor["status"], floor["retention_days"]))
+        with connect(self.config.db_path) as conn:
+            runs = [row[0] for row in conn.execute("SELECT run_id FROM recommendation_decision_ledger_runs")]
+            items = conn.execute("SELECT COUNT(*) FROM recommendation_decision_ledger_items").fetchone()[0]
+        self.assertEqual(["fresh"], runs)
+        self.assertEqual(1, items)
 
     def test_ledger_rows_are_immutable(self) -> None:
         insert_recommendation_decision_ledger(
