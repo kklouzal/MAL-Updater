@@ -614,6 +614,26 @@ def _progress_kind_and_assertion(*, fully_watched: bool | None, playback_positio
     return "history_membership", "unknown"
 
 
+def _episode_numbers(metadata: dict[str, Any], episode_label: str | None) -> tuple[int | None, int | None]:
+    """Return (episode_number, season_episode_ordinal) for an episode panel.
+
+    Specials carry a non-numeric display label ("SP1", "PV") while reusing low
+    episode_number values (SP1 -> 1), so they get neither number. Otherwise
+    episode_number is the provider number (possibly absolute across the
+    series, e.g. 60-87) and the ordinal is sequence_number, the position
+    within the season (probed 2026-11-18).
+    """
+    if episode_label is not None and not episode_label.isdigit():
+        return None, None
+    number = metadata.get("episode_number")
+    episode_number = number if isinstance(number, int) and not isinstance(number, bool) else None
+    sequence = metadata.get("sequence_number")
+    if isinstance(sequence, float) and sequence.is_integer():
+        sequence = int(sequence)
+    ordinal = sequence if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence >= 0 else None
+    return episode_number, ordinal
+
+
 def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | None:
     panel = entry.get("panel")
     if not isinstance(panel, dict):
@@ -643,14 +663,16 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
             completion_ratio = max(0.0, min(1.0, playback_position_ms / duration_ms))
         elif fully_watched:
             completion_ratio = 1.0
-        episode_number = metadata.get("episode_number")
+        episode_label = _non_empty_str(metadata.get("episode"))
+        episode_number, season_episode_ordinal = _episode_numbers(metadata, episode_label)
         observation_kind, completion_assertion = _progress_kind_and_assertion(
             fully_watched=fully_watched_flag, playback_position_ms=playback_position_ms,
         )
         return EpisodeProgress(
             provider_episode_id=str(provider_episode_id),
             provider_series_id=str(provider_series_id),
-            episode_number=int(episode_number) if isinstance(episode_number, int) else None,
+            episode_number=episode_number,
+            season_episode_ordinal=season_episode_ordinal,
             episode_title=str(panel.get("title")) if panel.get("title") else None,
             playback_position_ms=playback_position_ms,
             duration_ms=duration_ms,
@@ -669,7 +691,7 @@ def _progress_from_history_entry(entry: dict[str, Any]) -> EpisodeProgress | Non
             # split cours and specials, so it is not used.
             season_number=_non_negative_int(metadata.get("season_sequence_number")),
             season_title=_non_empty_str(metadata.get("season_title")),
-            episode_label=_non_empty_str(metadata.get("episode")),
+            episode_label=episode_label,
             fully_watched=fully_watched_flag,
         )
 

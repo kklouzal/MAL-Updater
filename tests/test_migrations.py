@@ -54,6 +54,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "031_recommendation_decision_ledger_retention.sql",
                 "032_provider_episode_season_identity.sql",
                 "033_provider_season_mappings.sql",
+                "034_provider_episode_season_ordinal.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -115,6 +116,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "031_recommendation_decision_ledger_retention.sql",
                     "032_provider_episode_season_identity.sql",
                     "033_provider_season_mappings.sql",
+                    "034_provider_episode_season_ordinal.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -155,6 +157,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "031_recommendation_decision_ledger_retention.sql",
                     "032_provider_episode_season_identity.sql",
                     "033_provider_season_mappings.sql",
+                    "034_provider_episode_season_ordinal.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )

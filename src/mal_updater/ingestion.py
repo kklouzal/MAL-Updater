@@ -339,8 +339,9 @@ def _insert_progress_observation(conn, provider: str, entry: Any) -> None:
             normalization_logic_version, observed_at, effective_at,
             episode_number, episode_title, playback_position_ms, duration_ms,
             completion_ratio, audio_locale, subtitle_locale, rating, raw_json,
-            provider_season_key, season_number, season_title, episode_label, fully_watched
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_season_key, season_number, season_title, episode_label, fully_watched,
+            season_episode_ordinal
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             _observation_id(provider, entry), provider, entry.provider_episode_id,
@@ -352,6 +353,7 @@ def _insert_progress_observation(conn, provider: str, entry: Any) -> None:
             entry.subtitle_locale, entry.rating, _entry_json(entry),
             entry.provider_season_key, entry.season_number, entry.season_title,
             entry.episode_label, entry.fully_watched,
+            entry.season_episode_ordinal,
         ),
     )
 
@@ -384,9 +386,10 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 season_title,
                 episode_label,
                 fully_watched,
+                season_episode_ordinal,
                 first_seen_at,
                 last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(provider, provider_episode_id) DO UPDATE SET
                 provider_series_id = excluded.provider_series_id,
                 episode_number = excluded.episode_number,
@@ -463,6 +466,7 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 season_number = COALESCE(excluded.season_number, provider_episode_progress.season_number),
                 season_title = COALESCE(excluded.season_title, provider_episode_progress.season_title),
                 episode_label = COALESCE(excluded.episode_label, provider_episode_progress.episode_label),
+                season_episode_ordinal = COALESCE(excluded.season_episode_ordinal, provider_episode_progress.season_episode_ordinal),
                 -- A provider fully-watched assertion is sticky, matching the
                 -- rank-sticky explicit_completed provenance above.
                 fully_watched = CASE
@@ -493,6 +497,7 @@ def _upsert_progress(conn, provider: str, progress_entries: list[Any]) -> None:
                 entry.season_title,
                 entry.episode_label,
                 entry.fully_watched,
+                entry.season_episode_ordinal,
             ),
         )
 

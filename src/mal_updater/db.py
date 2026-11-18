@@ -69,6 +69,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     RECOMMENDATION_DECISION_LEDGER_RETENTION_MIGRATION,
     "032_provider_episode_season_identity.sql",
     "033_provider_season_mappings.sql",
+    "034_provider_episode_season_ordinal.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"

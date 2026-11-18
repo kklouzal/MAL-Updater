@@ -46,6 +46,8 @@ class EpisodeProgress:
     # Provider display episode string (e.g. "12.5", "SP"); episode_number is
     # only set when the provider number is integral.
     episode_label: str | None = None
+    # Position within the provider season (None when unknown or a special).
+    season_episode_ordinal: int | None = None
     # Provider's explicit fully-watched flag; None when the surface has none.
     fully_watched: bool | None = None
 

@@ -242,6 +242,7 @@ class WatchConfirmationProvenanceTests(unittest.TestCase):
         self.assertEqual("2026-07-25T00:05:00Z", row.last_series_seen_at)
         self.assertEqual({
                     "provider_fully_watched": 0,
+                    "provider_progress_cleared": 0,
                     "ratio_threshold": 2,
                     "credits_window": 0,
                     "later_episode_evidence": 0,

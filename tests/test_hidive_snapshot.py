@@ -81,7 +81,7 @@ class HidiveProgressNormalizationTests(unittest.TestCase):
         self.assertEqual(("35350", 2, "Season 2"), (progress.provider_season_key, progress.season_number, progress.season_title))
         self.assertEqual((3, "3"), (progress.episode_number, progress.episode_label))
         self.assertIsNone(progress.fully_watched)
-        self.assertEqual("hidive_progress_v3", progress.normalization_logic_version)
+        self.assertEqual("hidive_progress_v4", progress.normalization_logic_version)
 
     def test_decimal_episode_numbers_keep_label_without_truncated_number(self) -> None:
         for raw, expected in ((12.5, (None, "12.5")), ("12.5", (None, "12.5")), (12.0, (12, "12")), ("7", (7, "7")), ("SP", (None, "SP")), (None, (None, None))):
@@ -259,8 +259,9 @@ class HidiveSnapshotTests(unittest.TestCase):
         self.assertEqual(1001, int(progress_by_episode["1001"].provider_episode_id))
         self.assertIsNone(progress_by_episode["1001"].completion_ratio)
         self.assertIsNone(progress_by_episode["1001"].playback_position_ms)
-        self.assertEqual("history_membership", progress_by_episode["1001"].progress_observation_kind)
-        self.assertEqual("unknown", progress_by_episode["1001"].completion_assertion)
+        # HIDIVE clears an episode's resume point once it is finished.
+        self.assertEqual("explicit_completed", progress_by_episode["1001"].progress_observation_kind)
+        self.assertEqual("inferred", progress_by_episode["1001"].completion_assertion)
         self.assertEqual(600000, progress_by_episode["2002"].playback_position_ms)
         self.assertEqual(0.4, progress_by_episode["2002"].completion_ratio)
         self.assertEqual("position", progress_by_episode["2002"].progress_observation_kind)
@@ -734,3 +735,21 @@ class HidiveSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HidiveContinueWatchingRequestTests(unittest.TestCase):
+    def test_continue_watching_requests_full_bucket_with_bpp_and_rpp(self) -> None:
+        # Probed 2026-11-18: size/page are ignored (5 items); rpp=25 returns
+        # the whole 19-item bucket, rpp=50 is rejected with HTTP 400.
+        calls = []
+
+        class Session:
+            def json_get(self, path, *, params=None, timeout_seconds=None):
+                calls.append((path, params))
+                return {"buckets": [{"name": "Continue Watching", "totalResults": 19, "totalPages": 1,
+                                     "contentList": [{"id": n} for n in range(19)]}]}
+
+        items, _stopped, metadata = hidive_snapshot._fetch_continue_items(Session())
+        self.assertEqual([("/content/home", {"bpp": 5, "rpp": 25})], calls)
+        self.assertEqual(19, len(items))
+        self.assertFalse(metadata["partial"])

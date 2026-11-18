@@ -1285,3 +1285,15 @@ class CrunchyrollProgressSeasonIdentityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class CrunchyrollEpisodeNumberingTests(unittest.TestCase):
+    def test_specials_get_no_number_and_ordinal_is_sequence_number(self) -> None:
+        from mal_updater.crunchyroll_snapshot import _episode_numbers
+
+        # Probed 2026-11-18 (Attack on Titan Final Season catalog).
+        self.assertEqual((60, 1), _episode_numbers({"episode_number": 60, "sequence_number": 1}, "60"))
+        self.assertEqual((None, None), _episode_numbers({"episode_number": 1, "sequence_number": 29}, "SP1"))
+        self.assertEqual((None, None), _episode_numbers({"episode_number": 12, "sequence_number": 12.5}, "12.5"))
+        self.assertEqual((3, 3), _episode_numbers({"episode_number": 3, "sequence_number": 3.0}, None))

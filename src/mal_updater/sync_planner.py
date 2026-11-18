@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -85,6 +86,12 @@ class ProviderSeriesState:
     season_unit_rank: int = 0
     min_episode_number: int | None = None
     completed_unnumbered_count: int = 0
+    # The same evidence counted by position within the provider season
+    # (None when the unit has no ordinals, e.g. a whole-series state).
+    ordinal_completed_episode_count: int | None = None
+    ordinal_max_completed_episode_number: int | None = None
+    ordinal_max_episode_number: int | None = None
+    ordinal_min_episode_number: int | None = None
 
 
 @dataclass(slots=True)
@@ -106,6 +113,7 @@ class EpisodeProgressState:
     season_title: str | None = None
     episode_label: str | None = None
     fully_watched: bool | None = None
+    season_episode_ordinal: int | None = None
 
 
 @dataclass(slots=True)
@@ -277,7 +285,8 @@ def load_provider_series_states(
             season_number,
             season_title,
             episode_label,
-            fully_watched
+            fully_watched,
+            season_episode_ordinal
         FROM provider_episode_progress
         WHERE 1=1
     """
@@ -325,11 +334,15 @@ def load_provider_series_states(
 
     progress_by_series: dict[tuple[str, str], list[EpisodeProgressState]] = {}
     for row in progress_rows:
+        label = row["episode_label"]
+        # Specials carry a non-numeric label but may reuse low episode numbers
+        # (Crunchyroll SP1 -> episode_number 1); they are never MAL episodes.
+        is_special = isinstance(label, str) and bool(label) and not label.isdigit()
         progress_by_series.setdefault((row["provider"], row["provider_series_id"]), []).append(
             EpisodeProgressState(
                 provider=row["provider"],
                 provider_episode_id=row["provider_episode_id"],
-                episode_number=row["episode_number"],
+                episode_number=None if is_special else row["episode_number"],
                 completion_ratio=row["completion_ratio"],
                 playback_position_ms=row["playback_position_ms"],
                 duration_ms=row["duration_ms"],
@@ -344,6 +357,7 @@ def load_provider_series_states(
                 season_title=row["season_title"],
                 episode_label=row["episode_label"],
                 fully_watched=None if row["fully_watched"] is None else bool(row["fully_watched"]),
+                season_episode_ordinal=None if is_special else row["season_episode_ordinal"],
             )
         )
 
@@ -372,8 +386,22 @@ def load_provider_series_states(
         else:
             units = [(None, series_progress)]
         built: list[tuple[str | None, str, ProviderSeriesState]] = []
+        keyed_units = bool(season_groups)
         for season_key, unit_progress in units:
             summary = _summarize_episode_progress(unit_progress, config)
+            ordinal_summary = (
+                _summarize_episode_progress(
+                    [
+                        replace(row, episode_number=row.season_episode_ordinal)
+                        if row.season_episode_ordinal is not None
+                        else row
+                        for row in unit_progress
+                    ],
+                    config,
+                )
+                if keyed_units and any(row.season_episode_ordinal is not None for row in unit_progress)
+                else None
+            )
             season_split = season_key is not None
             unit_season_number, unit_season_title = (
                 _season_identity(unit_progress) if season_split else (row["season_number"], row["season_title"])
@@ -413,6 +441,10 @@ def load_provider_series_states(
                         season_split=season_split,
                         min_episode_number=summary["min_episode_number"],
                         completed_unnumbered_count=summary["completed_unnumbered_count"],
+                        ordinal_completed_episode_count=ordinal_summary["completed_episode_count"] if ordinal_summary else None,
+                        ordinal_max_completed_episode_number=ordinal_summary["max_completed_episode_number"] if ordinal_summary else None,
+                        ordinal_max_episode_number=ordinal_summary["max_episode_number"] if ordinal_summary else None,
+                        ordinal_min_episode_number=ordinal_summary["min_episode_number"] if ordinal_summary else None,
                     ),
                 )
             )
@@ -451,6 +483,7 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     min_episode_number: int | None = None
     completion_reason_counts: dict[str, int] = {
         "provider_fully_watched": 0,
+        "provider_progress_cleared": 0,
         "ratio_threshold": 0,
         "credits_window": 0,
         "later_episode_evidence": 0,
@@ -458,6 +491,7 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
     }
     completion_reason_examples: dict[str, list[str]] = {
         "provider_fully_watched": [],
+        "provider_progress_cleared": [],
         "ratio_threshold": [],
         "credits_window": [],
         "later_episode_evidence": [],
@@ -528,7 +562,11 @@ def _summarize_episode_progress(rows: list[EpisodeProgressState], config: AppCon
 def _completion_uncertainty_reason(row: EpisodeProgressState) -> str | None:
     if row.provider != "hidive":
         return None
-    if row.progress_observation_kind == "history_membership" or row.completion_assertion == "unknown" and row.progress_source_surface == "hidive_history":
+    if row.progress_observation_kind == "history_membership" or (
+        row.completion_assertion == "unknown"
+        and row.progress_source_surface == "hidive_history"
+        and row.playback_position_ms is None
+    ):
         return "completion_unknown_history_membership"
     if (
         row.progress_source_surface is None
@@ -547,6 +585,9 @@ def _completion_uncertainty_reason(row: EpisodeProgressState) -> str | None:
 def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgressState], config: AppConfig) -> str | None:
     if row.fully_watched is True:
         return "provider_fully_watched"
+    if row.provider == "hidive" and row.progress_observation_kind == "explicit_completed":
+        # HIDIVE clears an episode's resume point once it is finished.
+        return "provider_progress_cleared"
     if _completion_uncertainty_reason(row) is not None:
         return _history_completion_inference(row, all_rows)
     completion_ratio = row.completion_ratio
@@ -574,7 +615,10 @@ def _completion_reason(row: EpisodeProgressState, all_rows: list[EpisodeProgress
     return None
 
 
-_NEXT_EPISODE_RUNTIME_FRACTION = 0.9
+# Same bar as the later-episode rule for measured progress (ratio >= 0.85):
+# HIDIVE autoplays the next episode when the end credits start, about 87-88%
+# into an episode (observed 2026-11-18 across 335 consecutive-episode gaps).
+_NEXT_EPISODE_RUNTIME_FRACTION = 0.85
 
 
 def _history_completion_inference(row: EpisodeProgressState, all_rows: list[EpisodeProgressState]) -> str | None:
@@ -680,6 +724,9 @@ def _auto_approve_mapping(config: AppConfig, state: ProviderSeriesState, mapping
 
 
 def _build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInput:
+    if state.season_split:
+        # A season is matched on its own, so its evidence is in-season.
+        state = _numbering_view(state, None)
     return SeriesMappingInput(
         provider=state.provider,
         provider_series_id=state.provider_series_id,
@@ -1224,7 +1271,10 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.2"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.3"
+# Provider season titles naming non-TV content; such a season never
+# auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
+_AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
 SEASON_MAPPING_RETRY_SECONDS = 7 * 24 * 60 * 60
 _MAL_SYNC_DETAIL_FIELDS = "id,title,num_episodes,media_type,status,my_list_status,alternative_titles"
 
@@ -1283,6 +1333,7 @@ def _split_cour_first_part(
     top = [candidate for candidate in candidates[:2] if candidate.media_type in _SPLIT_COUR_MEDIA_TYPES]
     if len(top) != 2 or any(not candidate.num_episodes for candidate in top):
         return None
+    state = _numbering_view(state, None)
     if state.min_episode_number not in (None, 1):
         # Numbering continued from an earlier season (Season 2 = 13-24) also
         # exceeds Part 1; only a season numbered from 1 spans Part 1 into Part 2.
@@ -1317,7 +1368,12 @@ def _resolve_season_target(
         provider_series_id=state.provider_series_id,
         provider_season_key=state.provider_season_key,
     )
-    if stored is not None and stored.approved and stored.mal_anime_id is not None:
+    # User approvals are final; automatic matches are re-resolved when the
+    # resolver logic changes.
+    stored_is_current = stored is not None and (
+        stored.mapping_source == "user_exact" or stored.resolver_version == SEASON_MAPPING_RESOLVER_VERSION
+    )
+    if stored is not None and stored.approved and stored.mal_anime_id is not None and (stored_is_current or search_budget[0] <= 0):
         return _ApplyTarget(
             stored.mal_anime_id,
             stored.mapping_source,
@@ -1337,12 +1393,15 @@ def _resolve_season_target(
         {"mal_anime_id": candidate.mal_anime_id, "title": candidate.title, "media_type": candidate.media_type}
         for candidate in result.candidates[:5]
     ]
+    auxiliary_season = bool(state.season_title and _AUXILIARY_SEASON_TITLE_RE.search(state.season_title))
+    if auxiliary_season and chosen is not None and chosen.media_type == "tv":
+        chosen = None
     split_first = None
-    if not should_auto_approve_mapping(result):
+    if chosen is not None and not should_auto_approve_mapping(result):
         split_first = _split_cour_first_part(config, client, state, list(result.candidates))
         if split_first is not None:
             chosen = split_first
-    if (split_first is not None or should_auto_approve_mapping(result)) and chosen is not None:
+    if chosen is not None and (split_first is not None or should_auto_approve_mapping(result)):
         upsert_provider_season_mapping(
             config.db_path,
             provider=state.provider,
@@ -1601,6 +1660,7 @@ def _split_cour_units(
     # entry need not be on the user's list.
     detail = first_detail if first_detail is not None else _catalog_detail(client, target.mal_anime_id)
     first_count = _coerce_detail_int((detail or {}).get("num_episodes"))
+    state = _numbering_view(state, first_count)
     completed = state.completed_episode_count
     max_completed = int(state.max_completed_episode_number or 0)
     if (
@@ -2218,6 +2278,35 @@ def _plan_status_update_for_state(
     )
 
 
+def _numbering_view(state: ProviderSeriesState, mal_num_episodes: int | None) -> ProviderSeriesState:
+    """Choose absolute or in-season episode numbering for one MAL target.
+
+    Provider episode numbers can be absolute across a series (Attack on Titan
+    Final Season is 60-87) while MAL lists that season separately, or one MAL
+    entry can span several provider seasons with continuous numbering
+    (D.Gray-man, 103 episodes over four provider seasons). The absolute
+    numbers are used when they fit within the MAL entry; otherwise the
+    position within the season is. With an unknown MAL count the in-season
+    position is used: it can only under-report, and writes never decrease.
+    """
+    if state.ordinal_completed_episode_count is None:
+        return state
+    absolute_max = int(state.max_completed_episode_number or state.max_episode_number or 0)
+    if mal_num_episodes and mal_num_episodes > 0 and absolute_max and absolute_max <= mal_num_episodes:
+        return state
+    return replace(
+        state,
+        completed_episode_count=state.ordinal_completed_episode_count,
+        max_completed_episode_number=state.ordinal_max_completed_episode_number,
+        max_episode_number=state.ordinal_max_episode_number,
+        min_episode_number=state.ordinal_min_episode_number,
+        ordinal_completed_episode_count=None,
+        ordinal_max_completed_episode_number=None,
+        ordinal_max_episode_number=None,
+        ordinal_min_episode_number=None,
+    )
+
+
 def _provider_watched_episodes(
     state: ProviderSeriesState, mal_num_episodes: int | None, *, current_watched: int | None = None
 ) -> tuple[int, str | None, str | None]:
@@ -2233,6 +2322,7 @@ def _provider_watched_episodes(
     is correct for a MAL entry spanning several provider seasons (e.g. a
     long-running series MAL lists as one entry).
     """
+    state = _numbering_view(state, mal_num_episodes)
     count = state.completed_episode_count
     max_number = int(state.max_completed_episode_number or 0)
     min_number = int(state.min_episode_number or 1)

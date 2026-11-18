@@ -52,6 +52,7 @@ PROGRESS_SEASON_IDENTITY_KEYS = {
     "season_number",
     "season_title",
     "episode_label",
+    "season_episode_ordinal",
     "fully_watched",
 }
 PROGRESS_ALLOWED_KEYS = PROGRESS_REQUIRED_KEYS | PROGRESS_PROVENANCE_KEYS | PROGRESS_SEASON_IDENTITY_KEYS
@@ -182,6 +183,7 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     season_number = item.get("season_number")
     season_title = item.get("season_title")
     episode_label = item.get("episode_label")
+    season_episode_ordinal = item.get("season_episode_ordinal")
     fully_watched = item.get("fully_watched")
     _expect_optional_type(provider_season_key, str, f"{field}.provider_season_key")
     if provider_season_key is not None and not provider_season_key.strip():
@@ -189,6 +191,7 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
     _expect_non_negative_int(season_number, f"{field}.season_number")
     _expect_optional_type(season_title, str, f"{field}.season_title")
     _expect_optional_type(episode_label, str, f"{field}.episode_label")
+    _expect_non_negative_int(season_episode_ordinal, f"{field}.season_episode_ordinal")
     _expect_optional_type(fully_watched, bool, f"{field}.fully_watched")
     if progress_observation_kind is not None and progress_observation_kind not in PROGRESS_OBSERVATION_KINDS:
         raise SnapshotValidationError(f"{field}.progress_observation_kind has unsupported value: {progress_observation_kind}")
@@ -224,6 +227,7 @@ def _validate_progress_item(item: Any, index: int) -> EpisodeProgress:
         season_number=season_number,
         season_title=season_title,
         episode_label=episode_label,
+        season_episode_ordinal=season_episode_ordinal,
         fully_watched=fully_watched,
     )
 

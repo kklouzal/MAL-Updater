@@ -37,7 +37,9 @@ HIDIVE_HISTORY_RPP = 25
 # is not reached within this budget the run escalates to a full refresh so the
 # boundary is rebuilt instead of staying unreachable forever.
 HIDIVE_HOT_HISTORY_CATCHUP_PAGE_LIMIT = 20
-HIDIVE_PROGRESS_NORMALIZATION_VERSION = "hidive_progress_v3"
+HIDIVE_PROGRESS_NORMALIZATION_VERSION = "hidive_progress_v4"
+HIDIVE_HOME_BUCKETS_PER_PAGE = 5
+HIDIVE_HOME_ITEMS_PER_BUCKET = 25
 HIDIVE_FAVOURITE_PAGE_LIMIT = 1000
 HIDIVE_CUSTOM_WATCHLIST_COLLECTION_PAGE_LIMIT = 1000
 HIDIVE_CUSTOM_WATCHLIST_DETAIL_PAGE_LIMIT = 1000
@@ -348,26 +350,42 @@ def _history_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
     duration_ms = duration_seconds * 1000 if duration_seconds is not None else None
     episode_number, episode_label = _episode_number_and_label(episode_information.get("episodeNumber"))
     season_key, season_number, season_title = _season_identity(episode_information)
+    # HIDIVE keeps a resume point (watchProgress, seconds) only while an
+    # episode is unfinished and clears it once the episode is finished
+    # (probed 2026-11-18: all 20 of 401 history items carrying progress were
+    # partial plays). A history item without progress is a finished episode.
+    if "watchProgress" in item and item.get("watchProgress") is not None:
+        playback_seconds, completion_ratio = _normalize_hidive_watch_progress(item.get("watchProgress"), duration_seconds)
+        playback_position_ms = playback_seconds * 1000 if playback_seconds is not None else None
+        observation_kind = "position" if playback_position_ms is not None else "history_membership"
+        completion_assertion = "confirmed" if completion_ratio is not None and completion_ratio >= 1.0 else "unknown"
+    else:
+        playback_position_ms = None
+        completion_ratio = None
+        observation_kind = "explicit_completed"
+        completion_assertion = "inferred"
     return EpisodeProgress(
         provider_episode_id=str(provider_episode_id),
         provider_series_id=str(provider_series_id),
         episode_number=episode_number,
         episode_title=str(item.get("title")) if item.get("title") is not None else None,
-        playback_position_ms=None,
+        playback_position_ms=playback_position_ms,
         duration_ms=duration_ms,
-        completion_ratio=None,
+        completion_ratio=completion_ratio,
         last_watched_at=_iso_from_epoch_ms(item.get("watchedAt")),
         audio_locale=None,
         subtitle_locale=None,
         rating=str(item.get("rating")) if item.get("rating") is not None else None,
         progress_source_surface="hidive_history",
-        progress_observation_kind="history_membership",
-        completion_assertion="unknown",
+        progress_observation_kind=observation_kind,
+        completion_assertion=completion_assertion,
         normalization_logic_version=HIDIVE_PROGRESS_NORMALIZATION_VERSION,
         provider_season_key=season_key,
         season_number=season_number,
         season_title=season_title,
         episode_label=episode_label,
+        # HIDIVE numbers episodes per season (E1 restarts each season).
+        season_episode_ordinal=episode_number,
     )
 
 
@@ -413,6 +431,8 @@ def _continue_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
         season_number=season_number,
         season_title=season_title,
         episode_label=episode_label,
+        # HIDIVE numbers episodes per season (E1 restarts each season).
+        season_episode_ordinal=episode_number,
     )
 
 
@@ -528,11 +548,12 @@ def _fetch_history_items(
 
 
 def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] | None = None) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
-    # Production probes (2026-11-18): /content/home ignores size/page (the
-    # Continue Watching bucket reports page 1, resultsPerPage 5) and rejects
-    # rpp=25 with bpp=25 (HTTP 400).  No bucket paging parameters are verified,
-    # so only page 1 is read and a larger bucket is reported partial.
-    payload = session.json_get("/content/home", params={"size": 100, "page": 1})
+    # Production probes (2026-11-18): /content/home pages buckets with bpp
+    # (buckets per page) and items per bucket with rpp, which accepts at most
+    # 25 (rpp=50 -> HTTP 400); size/page are ignored (5 items). With rpp=25 the
+    # whole Continue Watching bucket (19 items) arrives in one response. A
+    # bucket larger than 25 has no verified item paging and is reported partial.
+    payload = session.json_get("/content/home", params={"bpp": HIDIVE_HOME_BUCKETS_PER_PAGE, "rpp": HIDIVE_HOME_ITEMS_PER_BUCKET})
     if not isinstance(payload, dict):
         raise HidiveSnapshotError("HIDIVE home payload was not a JSON object")
     buckets = payload.get("buckets")
@@ -576,7 +597,7 @@ def _fetch_continue_items(session: HidiveSession, *, continue_markers: set[str] 
                         "continue_watching_partial_unpageable",
                         surface="continue_watching",
                         severity="info",
-                        detail="HIDIVE home Continue Watching bucket serves its first page only (5 items); no working bucket paging parameters are established, so page 1 is retained",
+                        detail=f"HIDIVE Continue Watching holds more than {HIDIVE_HOME_ITEMS_PER_BUCKET} items (the per-bucket maximum) and has no verified item paging; the first {HIDIVE_HOME_ITEMS_PER_BUCKET} are retained",
                         item_count=len(items),
                         declared_total_pages=bucket_total_pages,
                         declared_total_results=bucket_total_results,

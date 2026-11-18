@@ -47,12 +47,18 @@ class HidiveProgressProvenanceTests(unittest.TestCase):
         item.update(overrides)
         return item
 
-    def test_history_membership_normalizes_activity_without_completion(self):
-        progress = _history_item_to_progress({"id": 9, "duration": 1440, "watchedAt": 1770000000000, "episodeInformation": {"episodeNumber": 1, "seriesInformation": {"id": 7}}})
-        self.assertIsNone(progress.playback_position_ms)
-        self.assertIsNone(progress.completion_ratio)
-        self.assertEqual("history_membership", progress.progress_observation_kind)
-        self.assertEqual("unknown", progress.completion_assertion)
+    def test_history_item_progress_presence_distinguishes_unfinished_from_finished(self):
+        # Probed 2026-11-18: HIDIVE keeps watchProgress (seconds) only while an
+        # episode is unfinished and clears it once the episode is finished.
+        base = {"id": 9, "duration": 1440, "watchedAt": 1770000000000, "episodeInformation": {"episodeNumber": 1, "seriesInformation": {"id": 7}}}
+        finished = _history_item_to_progress(base)
+        self.assertIsNone(finished.playback_position_ms)
+        self.assertEqual("explicit_completed", finished.progress_observation_kind)
+        self.assertEqual("inferred", finished.completion_assertion)
+        unfinished = _history_item_to_progress({**base, "watchProgress": 16})
+        self.assertEqual(16000, unfinished.playback_position_ms)
+        self.assertEqual("position", unfinished.progress_observation_kind)
+        self.assertEqual("unknown", unfinished.completion_assertion)
 
     def test_measured_continue_evidence_outranks_newer_history_membership(self):
         from mal_updater.contracts import EpisodeProgress
