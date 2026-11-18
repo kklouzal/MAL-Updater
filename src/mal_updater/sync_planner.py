@@ -415,13 +415,19 @@ def load_provider_series_states(
             # number, and mixing the two numberings would corrupt both views.
             numbered = [row for row in unit_progress if row.episode_number is not None]
             # In-season position: from the catalog's first episode number when
-            # known (sequence numbers also count interleaved recaps), else the
+            # known (sequence numbers also count interleaved recaps), or the
+            # episode number itself when numbering starts at 1, else the
             # provider sequence number.
             unit_first = (
                 first_episode_by_season.get((unit_progress[0].provider, str(unit_progress[0].provider_season_key)))
                 if unit_progress and unit_progress[0].provider_season_key
                 else None
             )
+            if unit_first is None and numbered and min(int(row.episode_number or 0) for row in numbered) <= 1:
+                # Numbering already starts at the season's first episode, so it
+                # is the in-season position; sequence numbers would be shifted
+                # by interleaved recaps (NieR episode 18.5).
+                unit_first = 1
             if keyed_units and numbered and unit_first is not None and all(
                 row.episode_number is not None and row.episode_number >= unit_first for row in numbered
             ):
@@ -1401,7 +1407,9 @@ def _mal_franchise_ids(config: AppConfig, client: MalClient, anchor_id: int) -> 
 
 _CATALOG_DATE_TOLERANCE_DAYS = 3
 _CATALOG_VETO_DAYS = 45
-_AUXILIARY_MEDIA_TYPES = frozenset({"ova", "special", "tv_special", "movie"})
+# MAL sometimes files an OVA release as an ONA (e.g. Slime "Coleus no Yume",
+# Crunchyroll "OVA Season 2"); date uniqueness still decides the match.
+_AUXILIARY_MEDIA_TYPES = frozenset({"ova", "ona", "special", "tv_special", "movie"})
 # "other" is left out: on MAL it is mostly commercials, music videos and
 # collaborations, which only add detail lookups.
 _CATALOG_LEAF_RELATIONS = frozenset({"side_story", "parent_story"})
@@ -1733,8 +1741,22 @@ def _resolve_season_target(
             [f"season_mapping={stored.mapping_source}", season_label],
         )
     if stored is not None and stored.resolver_version == SEASON_MAPPING_RESOLVER_VERSION:
-        resolved_at = _parse_iso_utc(stored.resolved_at.replace(" ", "T") + ("" if stored.resolved_at.endswith("Z") else "Z"))
-        if resolved_at is not None and (datetime.now(timezone.utc) - resolved_at).total_seconds() < SEASON_MAPPING_RETRY_SECONDS:
+        resolved_at = _sqlite_utc(stored.resolved_at)
+        catalog_row = get_provider_season_catalog(
+            config.db_path, provider=state.provider, provider_season_key=state.provider_season_key
+        )
+        # New catalog evidence since the last attempt warrants an immediate retry.
+        catalog_newer = (
+            catalog_row is not None
+            and catalog_row.first_date is not None
+            and resolved_at is not None
+            and (_sqlite_utc(catalog_row.fetched_at) or resolved_at) > resolved_at
+        )
+        if (
+            not catalog_newer
+            and resolved_at is not None
+            and (datetime.now(timezone.utc) - resolved_at).total_seconds() < SEASON_MAPPING_RETRY_SECONDS
+        ):
             return _ApplyTarget(None, None, 0.0, ["season_mapping_unresolved", season_label])
     if search_budget[0] <= 0:
         return _ApplyTarget(None, None, 0.0, ["season_mapping_pending_search_budget", season_label])
@@ -1809,6 +1831,13 @@ def _resolve_season_target(
         detail={"status": result.status, "rationale": list(result.rationale), "candidates": candidates},
     )
     return _ApplyTarget(None, None, 0.0, ["season_mapping_unresolved", f"season_mapping_status={result.status}", season_label])
+
+
+def _sqlite_utc(value: str | None) -> datetime | None:
+    """Parse SQLite CURRENT_TIMESTAMP text (UTC, 'YYYY-MM-DD HH:MM:SS')."""
+    if not value:
+        return None
+    return _parse_iso_utc(value.replace(" ", "T") + ("" if value.endswith("Z") else "Z"))
 
 
 def _apply_target(

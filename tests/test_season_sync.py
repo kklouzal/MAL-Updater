@@ -379,6 +379,10 @@ class SeasonSplitExecutorTests(unittest.TestCase):
         # Evidence that fits Part 1 alone is not a split.
         from dataclasses import replace
 
+        # Hypothetical states set absolute fields only; drop the in-season view.
+        state = replace(state, ordinal_completed_episode_count=None, ordinal_max_completed_episode_number=None,
+                        ordinal_max_episode_number=None, ordinal_min_episode_number=None,
+                        ordinal_completed_episode_numbers=None)
         short = replace(state, max_episode_number=10, completed_episode_count=10)
         self.assertIsNone(_split_cour_first_part(self.config, client, short, [candidate(11, 11), candidate(12, 12)]))
         # Numbering continued from an earlier season (13-24) is not a split cour.
@@ -674,6 +678,33 @@ class SeasonSplitExecutorTests(unittest.TestCase):
         writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list if call.args[0] != 100}
         self.assertEqual({300: ("completed", 12), 400: ("completed", 12)}, writes)
 
+    def test_interleaved_recap_does_not_shift_numbering_that_starts_at_one(self) -> None:
+        # Production shape (NieR:Automata): episodes 1-24 plus recap "18.5",
+        # so sequence numbers after it run one ahead (episode 24 -> 25).
+        from mal_updater.db import replace_mal_anime_relations
+
+        progress = []
+        for number in range(1, 25):
+            row = self._progress("cr-1", "S1", number, season_number=1, watched_at=f"2026-03-01T00:{number:02d}:00Z")
+            row["season_episode_ordinal"] = number + (1 if number > 18 else 0)
+            row["episode_label"] = str(number)
+            progress.append(row)
+        recap = self._progress("cr-1", "S1", 18, season_number=1, watched_at="2026-03-01T00:30:00Z")
+        recap.update(provider_episode_id="cr-1-recap", episode_label="18.5", episode_number=None, season_episode_ordinal=None)
+        progress.append(recap)
+        self._ingest([("cr-1", "NieR")], progress)
+        self._map_series("cr-1", 100)
+        replace_mal_anime_relations(
+            self.config.db_path, mal_anime_id=100,
+            relations=[{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}],
+        )
+        with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list}
+        self.assertEqual({100: ("completed", 12), 200: ("completed", 12)}, writes)
+
     def test_unresolved_season_is_reviewed_and_never_written(self) -> None:
         progress = [self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-03-01T00:00:00Z")]
         progress += [self._progress("cr-1", "S2", 1, season_number=2, watched_at="2026-03-02T00:00:00Z")]
@@ -885,6 +916,33 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         self._seed("hidive", "Season 1", relations={100: [(500, "sequel"), (600, "side_story")], 500: [(100, "prequel")], 600: []})
         entries = {100: ("tv", 12, "2023-07-07", "2023-09-22"), 500: ("tv", 12, "2026-04-07", "2026-06-23"),
                    600: ("ona", 12, "2023-07-09", "2023-09-24")}
+        target = self._resolve("hidive", {"kind": "provider_publish", "first": "2024-01-25", "last": "2024-04-11"}, entries)
+        self.assertEqual(100, target.mal_anime_id)
+
+    def test_ova_season_matches_an_entry_mal_files_as_ona(self) -> None:
+        # Production case: Crunchyroll "OVA Season 2" (3 episodes, 2023-11-01)
+        # is MAL 54565, which MAL lists as an ONA starting 2023-11-02.
+        self._seed("crunchyroll", "OVA Season 2", relations={100: [(800, "side_story")], 800: []})
+        entries = {100: ("tv", 24, "2018-10-02", "2019-03-19"), 800: ("ona", 3, "2023-11-02", "2023-11-02")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2023-11-01", "last": "2023-11-01", "count": 3}, entries)
+        self.assertEqual(800, target.mal_anime_id)
+
+    def test_new_catalog_evidence_retries_an_unresolved_season_immediately(self) -> None:
+        from mal_updater.config import load_mal_secrets
+        from mal_updater.db import connect
+        from mal_updater.mapping import MappingResult
+        from mal_updater.sync_planner import _resolve_season_target
+
+        self._seed("hidive", "Season 1", relations={100: [(500, "sequel")], 500: [(100, "prequel")]})
+        state = next(s for s in load_provider_series_states(self.config, split_seasons=True) if s.provider_season_key == "SX")
+        empty = MappingResult(series=None, status="strong", confidence=0.5, chosen_candidate=None, candidates=[], rationale=[])
+        client = MalClient(self.config, load_mal_secrets(self.config))
+        with patch("mal_updater.sync_planner.map_series", return_value=empty):
+            self.assertIsNone(_resolve_season_target(self.config, client, state, search_budget=[1]).mal_anime_id)
+        with connect(self.config.db_path) as conn:
+            conn.execute("UPDATE provider_season_mappings SET resolved_at = datetime('now', '-1 hour')")
+            conn.commit()
+        entries = {100: ("tv", 12, "2023-07-07", "2023-09-22"), 500: ("tv", 12, "2026-04-07", "2026-06-23")}
         target = self._resolve("hidive", {"kind": "provider_publish", "first": "2024-01-25", "last": "2024-04-11"}, entries)
         self.assertEqual(100, target.mal_anime_id)
 
