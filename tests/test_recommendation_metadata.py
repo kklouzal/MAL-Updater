@@ -1082,6 +1082,37 @@ class FullUserRecommendationHarvestResumableTests(unittest.TestCase):
         self.assertEqual(0, summary.as_dict()["paused"])
         self.assertEqual({10: 3}, self._published_targets())
 
+    def test_refresh_of_published_source_rebinds_queue_to_new_generation(self) -> None:
+        # Production regression: the queue keeps last_generation_id pointing at the
+        # published generation, and the refresh must not be fenced out by it.
+        self._seed_positive_list((1, "Seed 1"))
+        page1 = self._source_url(1, "Seed 1")
+        first = _FakePublicUserRecsClient(
+            {(1, page1): _public_userrecs_page_result(source_id=1, page_url=page1, next_url=None, targets=[(10, "Ten", 3)])}
+        )
+        self.assertEqual(1, refresh_full_user_recommendation_harvest(self.config, max_pages=2, client=first).harvested)
+        with connect(self.config.db_path) as conn:
+            published_id = conn.execute(
+                "SELECT last_generation_id FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = 1"
+            ).fetchone()[0]
+            self.assertIsNotNone(published_id)
+            conn.execute("UPDATE mal_public_userrecs_source_queue SET queue_class = 'refresh_due' WHERE source_mal_anime_id = 1")
+            conn.commit()
+        second = _FakePublicUserRecsClient(
+            {(1, page1): _public_userrecs_page_result(source_id=1, page_url=page1, next_url=None, targets=[(11, "Eleven", 5)])}
+        )
+
+        summary = refresh_full_user_recommendation_harvest(self.config, max_pages=2, force_refresh=True, client=second)
+
+        self.assertEqual(1, summary.harvested)
+        self.assertEqual(0, summary.failed)
+        self.assertEqual({11: 5}, self._published_targets())
+        with connect(self.config.db_path) as conn:
+            rebound_id = conn.execute(
+                "SELECT last_generation_id FROM mal_public_userrecs_source_queue WHERE source_mal_anime_id = 1"
+            ).fetchone()[0]
+        self.assertGreater(rebound_id, published_id)
+
     def test_zero_request_budget_performs_no_fetch_and_creates_no_generation(self) -> None:
         self._seed_positive_list((1, "Seed 1"))
         client = _FakePublicUserRecsClient({})

@@ -136,6 +136,14 @@ class HidiveSession:
         return _profile_identity(self.json_get("/user/profile", timeout_seconds=timeout_seconds))
 
     def refresh_tokens(self, *, timeout_seconds: float | None = None) -> None:
+        refresh_remaining = _seconds_until_jwt_expiry(self.token.refresh_token)
+        if refresh_remaining is not None and refresh_remaining <= 0:
+            # HIDIVE answers an expired refresh token with HTTP 404, which is not a
+            # rebootstrap-eligible status; the JWT expiry is proof enough to log in again.
+            if self.credential_rebootstrap_attempted:
+                raise HidiveAuthError("HIDIVE refresh token has expired and credential re-login was already attempted")
+            self._rebootstrap_with_credentials(timeout_seconds=timeout_seconds)
+            return
         try:
             payload = _hidive_json_request(
                 self.config,
@@ -170,17 +178,20 @@ class HidiveSession:
         except HidiveAuthError as refresh_exc:
             if self.credential_rebootstrap_attempted or not _auth_failure_allows_credential_rebootstrap(refresh_exc):
                 raise
-            bootstrap = hidive_login_with_credentials(
-                self.config,
-                profile=self.profile,
-                timeout_seconds=timeout_seconds,
-                verify_account=True,
-            )
-            self.token.authorisation_token = bootstrap.authorisation_token
-            self.token.refresh_token = bootstrap.refresh_token
-            self.token.account_id = bootstrap.account_id
-            self.token.account_name = bootstrap.account_name
-            self.credential_rebootstrap_attempted = True
+            self._rebootstrap_with_credentials(timeout_seconds=timeout_seconds)
+
+    def _rebootstrap_with_credentials(self, *, timeout_seconds: float | None) -> None:
+        bootstrap = hidive_login_with_credentials(
+            self.config,
+            profile=self.profile,
+            timeout_seconds=timeout_seconds,
+            verify_account=True,
+        )
+        self.token.authorisation_token = bootstrap.authorisation_token
+        self.token.refresh_token = bootstrap.refresh_token
+        self.token.account_id = bootstrap.account_id
+        self.token.account_name = bootstrap.account_name
+        self.credential_rebootstrap_attempted = True
 
 
 def _auth_failure_allows_credential_rebootstrap(exc: HidiveAuthError) -> bool:

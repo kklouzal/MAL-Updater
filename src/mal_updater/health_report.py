@@ -26,6 +26,7 @@ from .db import (
     list_review_queue_entries,
 )
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
+from .redaction import sanitize_text
 from . import review_queue_support as _review_queue_support
 from .service_auth_state import (
     describe_auth_failure_kind,
@@ -511,11 +512,12 @@ def _build_health_maintenance_commands(
     refresh_provider = "crunchyroll"
     if isinstance(latest_completed_sync_run, dict) and isinstance(latest_completed_sync_run.get("provider"), str):
         refresh_provider = str(latest_completed_sync_run.get("provider"))
-    elif hidive_credentials_present and hidive_state_present and not crunchyroll_credentials_present:
+    elif hidive_credentials_present and hidive_state_present and not (crunchyroll_credentials_present or crunchyroll_state_present):
         refresh_provider = "hidive"
 
     provider_ready = {
-        "crunchyroll": crunchyroll_credentials_present and crunchyroll_state_present,
+        # A session linked through the TV activation code renews without saved credentials.
+        "crunchyroll": crunchyroll_state_present,
         "hidive": hidive_credentials_present and hidive_state_present,
     }
     provider_snapshot_output = {
@@ -857,6 +859,43 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
                 print("recommended_resolve=" + str(resolve_command))
 
 
+REPEATED_TASK_FAILURE_THRESHOLD = 3
+
+
+def _repeated_task_failure_warnings(
+    service_state: dict[str, object] | None, *, exclude: set[str]
+) -> list[dict[str, object]]:
+    """Surface any scheduled task stuck in failure backoff, whatever the cause.
+
+    Auth-classified failures already have dedicated warnings; everything else
+    (crashes, provider contract drift, validation rejects) would otherwise only
+    be visible in the service log.
+    """
+    tasks = service_state.get("tasks") if isinstance(service_state, dict) else None
+    if not isinstance(tasks, dict):
+        return []
+    warnings: list[dict[str, object]] = []
+    for task_name in sorted(tasks):
+        task_state = tasks[task_name]
+        if task_name in exclude or not isinstance(task_state, dict):
+            continue
+        consecutive = task_state.get("failure_backoff_consecutive_failures")
+        if not isinstance(consecutive, (int, float)) or int(consecutive) < REPEATED_TASK_FAILURE_THRESHOLD:
+            continue
+        reason = task_state.get("failure_backoff_reason") or task_state.get("last_error")
+        warning: dict[str, object] = {
+            "code": "scheduled_task_failures_repeated",
+            "detail": f"Scheduled task {task_name} has failed {int(consecutive)} times in a row; see the service log for the full error",
+            "task": task_name,
+            "consecutive_failures": int(consecutive),
+            "reason": sanitize_text(reason.strip(), max_length=500) if isinstance(reason, str) else None,
+        }
+        if isinstance(task_state.get("failure_backoff_until"), str):
+            warning["failure_backoff_until"] = task_state["failure_backoff_until"]
+        warnings.append(warning)
+    return warnings
+
+
 def build_health_report(
     config: AppConfig,
     *,
@@ -989,9 +1028,11 @@ def build_health_report(
 
     warnings: list[dict[str, object]] = []
 
-    if not crunchyroll_credentials.username or not crunchyroll_credentials.password:
-        warnings.append({"code": "missing_crunchyroll_credentials", "detail": "Crunchyroll username/password secrets are not both present"})
-    if not crunchyroll_state.refresh_token_path.exists() or not crunchyroll_state.device_id_path.exists():
+    crunchyroll_session_linked = crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists()
+    # A session linked through the TV activation code needs no saved password.
+    if not crunchyroll_session_linked and not (crunchyroll_credentials.username and crunchyroll_credentials.password):
+        warnings.append({"code": "missing_crunchyroll_credentials", "detail": "Crunchyroll is neither linked nor configured with both username/password secrets"})
+    if not crunchyroll_session_linked:
         warnings.append({"code": "missing_crunchyroll_state", "detail": "Crunchyroll refresh token or device id is missing"})
     if hidive_credentials.username or hidive_credentials.password:
         if not (hidive_credentials.username and hidive_credentials.password):
@@ -1129,6 +1170,10 @@ def build_health_report(
                 **mal_auth_failure,
             }
         )
+    auth_reported_tasks = {f"sync_fetch_{provider}" for provider in provider_auth_failures}
+    if isinstance(mal_auth_failure, dict):
+        auth_reported_tasks.add("mal_refresh")
+    warnings.extend(_repeated_task_failure_warnings(service_state, exclude=auth_reported_tasks))
     coverage_ratio = mapping_coverage.get("eligible_approved_coverage_ratio") if isinstance(mapping_coverage, dict) else None
     unmapped_series_count = mapping_coverage.get("eligible_unmapped_series_count") if isinstance(mapping_coverage, dict) else None
     if (
@@ -1268,7 +1313,7 @@ def build_health_report(
 
     maintenance_commands = _build_health_maintenance_commands(
         crunchyroll_credentials_present=bool(crunchyroll_credentials.username and crunchyroll_credentials.password),
-        crunchyroll_state_present=crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists(),
+        crunchyroll_state_present=crunchyroll_session_linked,
         hidive_credentials_present=bool(hidive_credentials.username and hidive_credentials.password),
         hidive_state_present=hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists(),
         mal_client_id_present=bool(secrets.client_id),

@@ -631,6 +631,37 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertIsNone(session_state["last_error"])
             self.assertEqual(session_state["last_account_id_hint"], "acct-123")
 
+    def test_watchlist_repeated_across_shifted_pages_is_deduped_and_marked_partial(self) -> None:
+        # Production regression: Crunchyroll reorders the watchlist on activity, so
+        # offset page 2 can repeat a page-1 series; the snapshot must still validate.
+        from mal_updater.validation import validate_snapshot_payload
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+
+            def fake_get(url: str, *, params=None, phase=None):
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123", "email": "user@example.com"}
+                if url.endswith("/watch-history"):
+                    return {"total": 1, "data": [self._history_entry(1)]}
+                if url.endswith("/watchlist"):
+                    if int(params["start"]) == 0:
+                        return {"total": 120, "data": [self._watchlist_entry(idx) for idx in range(1, 101)]}
+                    return {"total": 120, "data": [self._watchlist_entry(idx) for idx in [100, *range(102, 121)]]}
+                raise AssertionError((url, params, phase))
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                result = _fetch_snapshot_once(session, use_incremental_boundary=False)
+
+            raw = result.snapshot.raw
+            self.assertEqual(1, raw["watchlist_duplicate_count"])
+            self.assertEqual(119, raw["watchlist_count"])
+            self.assertTrue(raw["watchlist_partial"])
+            self.assertTrue(raw["partial"])
+            validate_snapshot_payload(shared_snapshot_to_dict(result.snapshot))
+
     def test_requested_incremental_without_boundary_bootstraps_all_history_and_watchlist(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1023,6 +1054,52 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             resume = json.loads((session.state_paths.root / "snapshot_bootstrap_resume.json").read_text())
             self.assertEqual(1, resume["history_next_page"])
             self.assertEqual([], resume["history_entries"])
+
+    def test_automatic_bootstrap_watchlist_repeat_across_chunks_restarts_then_completes(self) -> None:
+        # The watchlist reorders between chunk invocations, so the resumed offset page
+        # repeats a staged series: that is generation drift, not a mergeable chunk.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            offset_page_calls = 0
+
+            def fake_get(url, *, params=None, phase=None):
+                nonlocal offset_page_calls
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123"}
+                if url.endswith("/watch-history"):
+                    return {"total": 1, "data": [self._history_entry(1)]}
+                if url.endswith("/watchlist"):
+                    if int(params["start"]) == 0:
+                        return {"total": 120, "data": [self._watchlist_entry(idx) for idx in range(1, 101)]}
+                    offset_page_calls += 1
+                    ids = [100, *range(102, 121)] if offset_page_calls == 1 else list(range(101, 121))
+                    return {"total": 120, "data": [self._watchlist_entry(idx) for idx in ids]}
+                raise AssertionError(url)
+
+            resume_path = session.state_paths.root / "snapshot_bootstrap_resume.json"
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                first = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                drifted = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                resume = json.loads(resume_path.read_text())
+                restarted = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+                completed = _fetch_snapshot_once(session, max_history_pages=1, max_watchlist_pages=1)
+
+            self.assertTrue(first.snapshot.raw["partial"])
+            self.assertEqual(1, drifted.snapshot.raw["watchlist_duplicate_count"])
+            self.assertTrue(drifted.snapshot.raw["bootstrap_drift_detected"])
+            self.assertFalse(drifted.snapshot.raw["bootstrap_generation_validated"])
+            self.assertEqual(0, resume["watchlist_next_start"])
+            self.assertEqual([], resume["watchlist_entries"])
+            self.assertEqual(1, resume["drift_count"])
+            self.assertFalse(resume["quarantined"])
+            self.assertTrue(restarted.snapshot.raw["partial"])
+            self.assertFalse(completed.snapshot.raw["partial"])
+            self.assertEqual(0, completed.snapshot.raw["watchlist_duplicate_count"])
+            self.assertEqual(120, len(completed.snapshot.watchlist))
+            self.assertFalse(resume_path.exists())
+            self.assertTrue(session.state_paths.sync_boundary_path.exists())
 
 
 if __name__ == "__main__":

@@ -641,6 +641,67 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("sync_review", payload["review_queue"]["recommendation_issue_type_filter"])
         self.assertEqual("blocked | missing_exact_approval", payload["review_queue"]["recommended_next"]["bucket_key"])
 
+    def test_linked_crunchyroll_session_without_password_is_not_missing_credentials(self) -> None:
+        from mal_updater.bootstrap_guidance import build_bootstrap_audit_payload
+
+        crunchyroll_state_root = self.config.state_dir / "crunchyroll" / "default"
+        crunchyroll_state_root.mkdir(parents=True, exist_ok=True)
+        (crunchyroll_state_root / "refresh_token.txt").write_text("cr-token\n", encoding="utf-8")
+        (crunchyroll_state_root / "device_id.txt").write_text("device-id\n", encoding="utf-8")
+
+        _, payload = self._run_health_check()
+
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertNotIn("missing_crunchyroll_credentials", warning_codes)
+        self.assertNotIn("missing_crunchyroll_state", warning_codes)
+        self.assertIn(
+            "refresh_ingested_snapshot",
+            [item["reason_code"] for item in payload["maintenance"]["recommended_commands"]],
+        )
+        audit = build_bootstrap_audit_payload(self.config)
+        crunchyroll = audit["providers"]["crunchyroll"]
+        self.assertNotIn("credentials", crunchyroll["missing"])
+        self.assertNotIn(
+            "stage-crunchyroll-credentials", [step["step"] for step in audit["onboarding_steps"]]
+        )
+
+    def test_health_check_flags_repeated_non_auth_task_failures_and_hidive_refresh_404(self) -> None:
+        (self.config.secrets_dir / "hidive_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "hidive_password.txt").write_text("super-secret\n", encoding="utf-8")
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "recommend_full_harvest": {
+                            "last_status": "error",
+                            "failure_backoff_reason": "Traceback (most recent call last):",
+                            "failure_backoff_consecutive_failures": 3,
+                        },
+                        "sync_fetch_hidive": {
+                            "last_status": "error",
+                            "failure_backoff_reason": "HIDIVE POST /token/refresh failed: HTTP 404",
+                            "failure_backoff_consecutive_failures": 5,
+                        },
+                        "mal_list_refresh": {
+                            "last_status": "error",
+                            "failure_backoff_reason": "transient",
+                            "failure_backoff_consecutive_failures": 2,
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _, payload = self._run_health_check()
+
+        repeated = [w for w in payload["warnings"] if w["code"] == "scheduled_task_failures_repeated"]
+        self.assertEqual(["recommend_full_harvest"], [w["task"] for w in repeated])
+        self.assertEqual(3, repeated[0]["consecutive_failures"])
+        hidive = [w for w in payload["warnings"] if w["code"] == "hidive_auth_failures_repeated"]
+        self.assertEqual(1, len(hidive))
+        self.assertEqual("login_failure", hidive[0]["auth_failure_kind"])
+
     def test_health_check_recommends_crunchyroll_reauth_after_repeated_auth_failures(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
         (self.config.secrets_dir / "crunchyroll_password.txt").write_text("super-secret\n", encoding="utf-8")

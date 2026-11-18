@@ -4051,7 +4051,17 @@ def create_or_get_active_mal_public_userrecs_generation(
                 SET last_generation_id = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE source_mal_anime_id = ? AND claim_token = ?
                   AND datetime(claim_expires_at) > datetime('now')
-                  AND (last_generation_id IS NULL OR last_generation_id = ?)
+                  AND (
+                    last_generation_id IS NULL
+                    OR last_generation_id = ?
+                    -- A refresh replaces a terminal (published/discarded) generation;
+                    -- only a different still-open generation is an identity conflict.
+                    OR NOT EXISTS (
+                        SELECT 1 FROM mal_public_userrecs_crawl_generations AS prior
+                        WHERE prior.generation_id = mal_public_userrecs_source_queue.last_generation_id
+                          AND prior.status IN ('active', 'paused', 'ready')
+                    )
+                  )
                 """,
                 (generation_id, source_id, normalized_claim_token, generation_id),
             )

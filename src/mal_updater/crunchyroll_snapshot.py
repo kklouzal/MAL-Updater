@@ -1161,6 +1161,8 @@ def _fetch_snapshot_once(
 
     watchlist_series: list[SeriesRef] = []
     watchlist_entries: list[WatchlistEntry] = []
+    seen_watchlist_series_ids: set[str] = set()
+    watchlist_duplicate_count = 0
     for entry in all_watchlist_data:
         if not isinstance(entry, dict):
             continue
@@ -1168,7 +1170,21 @@ def _fetch_snapshot_once(
         if series_ref is not None:
             watchlist_series.append(series_ref)
         if watchlist_entry is not None:
+            if watchlist_entry.provider_series_id in seen_watchlist_series_ids:
+                watchlist_duplicate_count += 1
+                continue
+            seen_watchlist_series_ids.add(watchlist_entry.provider_series_id)
             watchlist_entries.append(watchlist_entry)
+    if watchlist_duplicate_count:
+        # The watchlist is offset-paged over a list Crunchyroll reorders on activity;
+        # a repeat across pages means the order shifted mid-fetch and items may have
+        # been skipped, so the surface cannot be claimed complete. During a chunked
+        # bootstrap this is the same generation drift as a page-1 mismatch.
+        watchlist_partial = True
+        if automatic_bootstrap_chunk and not bootstrap_drift_detected:
+            bootstrap_drift_detected = True
+            bootstrap_generation_validated = False
+            history_partial = True
 
     generated_at = _now_string()
     snapshot = CrunchyrollSnapshot(
@@ -1243,6 +1259,7 @@ def _fetch_snapshot_once(
             "watchlist_pages_fetched": watchlist_pages_fetched,
             "watchlist_page_limit_applied": max_watchlist_pages,
             "watchlist_partial": watchlist_partial,
+            "watchlist_duplicate_count": watchlist_duplicate_count,
             "watchlist_next_start": next_watchlist_start,
             "watchlist_stopped_early": watchlist_stopped_early,
             "watchlist_backfill_pages_fetched": watchlist_backfill_pages_fetched,

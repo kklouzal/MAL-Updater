@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 AUTH_FAILURE_KIND_LABELS = {
@@ -74,6 +75,10 @@ AUTH_STYLE_FAILURE_MARKERS = (
     "bearer",
 )
 
+# A refresh endpoint rejecting the token with a 4xx (HIDIVE answers an expired one
+# with 404). 408/429 are transient and transport errors say "request failed".
+_REFRESH_ENDPOINT_REJECTION = re.compile(r"token/refresh failed: http 4(?!08|29)\d\d")
+
 AUTH_STYLE_SESSION_PHASES = {
     "auth_failed",
     "auth_retrying_with_refresh_token",
@@ -142,7 +147,9 @@ def classify_auth_style_failure(
             "kind": "session_auth_failed",
             "label": AUTH_FAILURE_KIND_LABELS["session_auth_failed"],
         }
-    if any(marker in combined for marker in ("login failed", "login did not return", "token refresh", "refresh token", "credential_rebootstrap")):
+    if _REFRESH_ENDPOINT_REJECTION.search(combined) or any(
+        marker in combined for marker in ("login failed", "login did not return", "token refresh", "refresh token", "credential_rebootstrap")
+    ):
         return {
             "kind": "login_failure",
             "label": AUTH_FAILURE_KIND_LABELS["login_failure"],

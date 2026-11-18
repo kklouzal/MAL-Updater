@@ -594,6 +594,9 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
 
     crunchyroll_credentials_present = bool(crunchyroll_credentials.username) and bool(crunchyroll_credentials.password)
     crunchyroll_session_present = crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists()
+    # A session linked through the TV activation code renews itself; saved
+    # username/password are then optional rather than a missing prerequisite.
+    crunchyroll_credentials_satisfied = crunchyroll_credentials_present or crunchyroll_session_present
     hidive_credentials_present = bool(hidive_credentials.username) and bool(hidive_credentials.password)
     hidive_session_present = hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists()
     mal_app_present = bool(secrets.client_id)
@@ -621,7 +624,7 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
     )
     crunchyroll_guidance = _provider_bootstrap_guidance_status(
         provider_name="crunchyroll",
-        credentials_present=crunchyroll_credentials_present,
+        credentials_present=crunchyroll_credentials_satisfied,
         session_present=crunchyroll_session_present,
         transport_ready=dependency_checks["curl_cffi"],
         bootstrap_command=crunchyroll_bootstrap_descriptor,
@@ -642,7 +645,7 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
         python_available=dependency_checks["python3"],
         systemctl_available=dependency_checks["systemctl"],
         mal_oauth_present=mal_oauth_present and not isinstance(mal_auth_issue, dict),
-        crunchyroll_credentials_present=crunchyroll_credentials_present,
+        crunchyroll_credentials_present=crunchyroll_credentials_satisfied,
         crunchyroll_session_present=crunchyroll_session_present and not isinstance(provider_auth_issues.get("crunchyroll"), dict),
         crunchyroll_transport_ready=dependency_checks["curl_cffi"],
         hidive_credentials_present=hidive_credentials_present,
@@ -716,7 +719,7 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
         add_onboarding_step(**mal_auth_descriptor.bootstrap_onboarding_step_fields())
     elif isinstance(mal_auth_issue, dict):
         add_onboarding_step(**mal_rebootstrap_auth_descriptor(mal_auth_issue).bootstrap_onboarding_step_fields())
-    if not crunchyroll_credentials_present:
+    if not crunchyroll_credentials_satisfied:
         add_onboarding_step(
             step="stage-crunchyroll-credentials",
             details=f"Store Crunchyroll credentials at {crunchyroll_credentials.username_path} and {crunchyroll_credentials.password_path}.",
@@ -901,7 +904,7 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
             "missing": [
                 name
                 for name, present in (
-                    ("credentials", crunchyroll_credentials_present),
+                    ("credentials", crunchyroll_credentials_satisfied),
                     ("session", crunchyroll_session_present),
                     ("transport", dependency_checks["curl_cffi"]),
                     ("auth", not isinstance(provider_auth_issues.get("crunchyroll"), dict)),

@@ -374,6 +374,43 @@ class HidiveAuthTests(unittest.TestCase):
             self.assertEqual(session.token.refresh_token, "credential-refresh")
             self.assertTrue(session.credential_rebootstrap_attempted)
 
+    def test_refresh_endpoint_rejection_is_auth_style_but_throttling_is_not(self) -> None:
+        from mal_updater.auth_failure_signals import looks_auth_style_failure
+
+        self.assertTrue(looks_auth_style_failure("HIDIVE POST /token/refresh failed: HTTP 404"))
+        self.assertFalse(looks_auth_style_failure("HIDIVE POST /token/refresh failed: HTTP 429"))
+        self.assertFalse(looks_auth_style_failure("HIDIVE POST /token/refresh failed: HTTP 408"))
+        self.assertFalse(looks_auth_style_failure("HIDIVE POST /token/refresh request failed: ReadTimeout"))
+
+    def test_expired_refresh_token_logs_in_with_credentials_without_refresh_post(self) -> None:
+        # Production regression: HIDIVE answers an expired refresh token with HTTP 404,
+        # which never reached the credential fallback, so sync failed for weeks.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(Path(td))
+            expired_refresh = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjEwMH0.signature"  # exp=100
+            session.token.refresh_token = expired_refresh
+            with patch("mal_updater.hidive_auth._hidive_json_request") as mock_request, patch(
+                "mal_updater.hidive_auth.hidive_login_with_credentials"
+            ) as mock_login:
+                mock_login.return_value = type("Bootstrap", (), {
+                    "authorisation_token": "credential-access",
+                    "refresh_token": "credential-refresh",
+                    "account_id": "acct-123",
+                    "account_name": "example-user",
+                })()
+                session.refresh_tokens()
+                # A second expired token in the same session must not log in again.
+                session.token.refresh_token = expired_refresh
+                with self.assertRaises(HidiveAuthError):
+                    session.refresh_tokens()
+
+            mock_request.assert_not_called()
+            mock_login.assert_called_once()
+            self.assertEqual(session.token.authorisation_token, "credential-access")
+            self.assertTrue(session.credential_rebootstrap_attempted)
+
     def test_cached_expired_access_token_refreshes_before_profile_verification(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
