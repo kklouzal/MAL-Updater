@@ -54,6 +54,7 @@ class CrunchyrollAuthRecoveryTests(unittest.TestCase):
                             ),
                         )
                     post.assert_called_once()
+                    self.assertTrue(post.call_args.kwargs["headers"]["User-Agent"].startswith("Crunchyroll/ANDROIDTV/"))
 
     def test_crunchyroll_snapshot_http_requires_curl_cffi_transport(self) -> None:
         with tempfile.TemporaryDirectory() as td:

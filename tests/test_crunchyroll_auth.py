@@ -202,6 +202,8 @@ class CrunchyrollAuthTests(unittest.TestCase):
             self.assertEqual(request_body["grant_type"], "password")
             self.assertEqual(request_body["scope"], "offline_access")
             self.assertEqual(request_body["device_type"], "ANDROIDTV")
+            # Crunchyroll only accepts the password grant from an Android TV app User-Agent.
+            self.assertTrue(mock_post.call_args.kwargs["headers"]["User-Agent"].startswith("Crunchyroll/ANDROIDTV/"))
 
     def test_crunchyroll_login_with_credentials_records_failure_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:

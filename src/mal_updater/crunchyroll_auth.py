@@ -27,6 +27,10 @@ CRUNCHYROLL_ME_URL = "https://www.crunchyroll.com/accounts/v1/me"
 # invalid_client / auth.obtain_access_token.client_inactive, and refresh tokens
 # issued to the old client cannot be reused, so rotation needs a credential login.
 CRUNCHYROLL_BASIC_AUTH_TOKEN = "ZXI5bmdnMmtvNW9oaXJsYTUxaTI6VmwxVDBQbjhRWko2d3o0NnhYRGxIekRGUDV0Wlgxb3E="
+# Token requests must identify as the Android TV app: with the browser User-Agent
+# that curl_cffi's Chrome impersonation sends, Crunchyroll answers the password
+# grant with unsupported_grant_type (observed 2026-11-18).
+CRUNCHYROLL_ANDROIDTV_USER_AGENT = "Crunchyroll/ANDROIDTV/3.76.0_22366 (Android 12; en-US; SHIELD Android TV Build/SR1A.220624.014)"
 DEFAULT_CRUNCHYROLL_USERNAME_FILE = "crunchyroll_username.txt"
 DEFAULT_CRUNCHYROLL_PASSWORD_FILE = "crunchyroll_password.txt"
 DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
@@ -244,6 +248,7 @@ def crunchyroll_login_with_credentials(
         "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
         "Content-Type": "application/x-www-form-urlencoded",
         "ETP-Anonymous-ID": device_id,
+        "User-Agent": CRUNCHYROLL_ANDROIDTV_USER_AGENT,
     }
 
     response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds, config=config, pacer=pacer)

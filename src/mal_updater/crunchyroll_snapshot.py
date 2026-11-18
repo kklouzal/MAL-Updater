@@ -25,6 +25,7 @@ from .fetch_provenance import FetchProvenance
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .crunchyroll_auth import (
+    CRUNCHYROLL_ANDROIDTV_USER_AGENT,
     CRUNCHYROLL_BASIC_AUTH_TOKEN,
     CRUNCHYROLL_ME_URL,
     CRUNCHYROLL_TOKEN_URL,
@@ -361,6 +362,7 @@ def refresh_access_token(
         "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
         "Content-Type": "application/x-www-form-urlencoded",
         "ETP-Anonymous-ID": device_id,
+        "User-Agent": CRUNCHYROLL_ANDROIDTV_USER_AGENT,
     }
     # Refresh tokens may be rotated even when the response is lost or transient;
     # never replay this credential POST automatically.
