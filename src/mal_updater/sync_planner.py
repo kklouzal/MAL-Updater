@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import AppConfig, load_mal_secrets
@@ -23,7 +23,15 @@ from .db import (
     upsert_watch_confirmation_provenance,
 )
 from .mal_client import MalApiError, MalClient
-from .mapping import SeriesMappingInput, extract_provider_mapping_evidence, map_series, merge_provider_mapping_evidence, should_auto_approve_mapping
+from .mapping import (
+    MappingCandidate,
+    SeriesMappingInput,
+    extract_provider_mapping_evidence,
+    map_series,
+    merge_provider_mapping_evidence,
+    should_auto_approve_mapping,
+)
+from .season_catalog import get_provider_season_catalog
 from .season_mappings import get_provider_season_mapping, upsert_provider_season_mapping
 
 
@@ -1292,7 +1300,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.5"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.1"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1370,6 +1378,180 @@ def _mal_franchise_ids(config: AppConfig, client: MalClient, anchor_id: int) -> 
             return seen, True
         frontier = next_frontier
     return seen, False
+
+
+_CATALOG_DATE_TOLERANCE_DAYS = 3
+_CATALOG_VETO_DAYS = 45
+_AUXILIARY_MEDIA_TYPES = frozenset({"ova", "special", "tv_special", "movie"})
+_CATALOG_LEAF_RELATIONS = frozenset({"side_story", "parent_story", "other"})
+
+
+@dataclass(frozen=True, slots=True)
+class _DatedEntry:
+    mal_anime_id: int
+    media_type: str | None
+    num_episodes: int | None
+    start: datetime | None
+    end: datetime | None
+
+
+def _parse_day(value: Any) -> datetime | None:
+    """Parse a full YYYY-MM-DD date (MAL omits the day for imprecise dates)."""
+    if not isinstance(value, str) or len(value) < 10:
+        return None
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _dated_entry(client: MalClient, mal_anime_id: int) -> _DatedEntry | None:
+    try:
+        detail = client.get_anime_details(int(mal_anime_id), fields="id,title,num_episodes,media_type,start_date,end_date")
+    except MalApiError:
+        return None
+    if not isinstance(detail, dict):
+        return None
+    return _DatedEntry(
+        mal_anime_id=int(mal_anime_id),
+        media_type=_coerce_optional_str(detail.get("media_type")),
+        num_episodes=_coerce_detail_int(detail.get("num_episodes")),
+        start=_parse_day(detail.get("start_date")),
+        end=_parse_day(detail.get("end_date")),
+    )
+
+
+def _catalog_contradicts(client: MalClient, catalog: Any, mal_anime_id: int) -> bool:
+    """A title match whose MAL start date is far from the season's original broadcast."""
+    if catalog is None or catalog.date_kind != "original_air":
+        return False
+    first = _parse_day(catalog.first_date)
+    entry = _dated_entry(client, mal_anime_id)
+    if first is None or entry is None or entry.start is None:
+        return False
+    return abs((entry.start - first).days) > _CATALOG_VETO_DAYS
+
+
+def _catalog_dated_candidate(
+    config: AppConfig,
+    client: MalClient,
+    state: ProviderSeriesState,
+    result: Any,
+    catalog: Any,
+    *,
+    auxiliary_season: bool,
+) -> Any | None:
+    """Match a season to the one MAL entry whose dates fit its catalog window.
+
+    Sibling seasons often share title stems and episode counts but never their
+    broadcast window. Candidates are the matcher's results plus the series'
+    MAL franchise (prequel/sequel chain), restricted to the season's media
+    family (TV/ONA, or OVA/special/movie for extras collections).
+
+    original_air (Crunchyroll): exactly one candidate starts within 3 days of
+    the season's first broadcast; its end must also match, or its direct
+    sequel must end with the season (split cour, Part 1 is returned), or the
+    season's watched positions must fit the entry (provider extras appended).
+    provider_publish (HIDIVE): the provider releases on or after the original
+    broadcast, so the latest family candidate starting by the first publish
+    date is taken when its episode count equals the season's.
+    """
+    if catalog is None:
+        return None
+    first = _parse_day(catalog.first_date)
+    if first is None:
+        return None
+    family = _AUXILIARY_MEDIA_TYPES if auxiliary_season else _SPLIT_COUR_MEDIA_TYPES
+    by_id = {int(candidate.mal_anime_id): candidate for candidate in result.candidates[:6]}
+    anchor = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
+    if anchor is not None and anchor.approved_by_user:
+        franchise, _complete = _mal_franchise_ids(config, client, anchor.mal_anime_id)
+        for mal_id in franchise:
+            by_id.setdefault(int(mal_id), None)
+            # MAL links OVAs/specials as side stories, outside the
+            # prequel/sequel chain; they are candidates, not walked further.
+            for related, kind in _relation_rows(config, client, mal_id):
+                if kind in _CATALOG_LEAF_RELATIONS:
+                    by_id.setdefault(int(related), None)
+    all_entries = [entry for entry in (_dated_entry(client, mal_id) for mal_id in by_id) if entry is not None]
+    # TV before ONA: chibi/mini ONA spin-offs often start within days of the
+    # TV season and share its episode count.
+    families = [_AUXILIARY_MEDIA_TYPES] if auxiliary_season else [frozenset({"tv"}), frozenset({"ona"})]
+    for family in families:
+        entries = [entry for entry in all_entries if entry.media_type in family and entry.start is not None]
+        if not entries:
+            continue
+        chosen_entry = _catalog_entry_for_family(config, client, state, catalog, first, entries)
+        if chosen_entry is not None:
+            break
+    else:
+        return None
+    if chosen_entry is None:
+        return None
+    candidate = by_id.get(chosen_entry.mal_anime_id)
+    if candidate is not None:
+        return candidate
+    return MappingCandidate(
+        mal_anime_id=chosen_entry.mal_anime_id,
+        title="",
+        alternative_titles=[],
+        media_type=chosen_entry.media_type,
+        status=None,
+        num_episodes=chosen_entry.num_episodes,
+        score=0.0,
+        matched_query="season_catalog_dates",
+        match_reasons=["season_catalog_dates"],
+        raw={},
+    )
+
+
+def _catalog_entry_for_family(
+    config: AppConfig,
+    client: MalClient,
+    state: ProviderSeriesState,
+    catalog: Any,
+    first: datetime,
+    entries: list[_DatedEntry],
+) -> _DatedEntry | None:
+    tolerance = timedelta(days=_CATALOG_DATE_TOLERANCE_DAYS)
+    family = {entry.media_type for entry in entries}
+    chosen_entry: _DatedEntry | None = None
+    if catalog.date_kind == "original_air":
+        starts = sorted(
+            (entry for entry in entries if entry.start is not None and abs(entry.start - first) <= tolerance),
+            key=lambda entry: abs((entry.start or first) - first),
+        )
+        if not starts:
+            return None
+        if len(starts) > 1 and abs((starts[0].start or first) - first) == abs((starts[1].start or first) - first):
+            return None
+        entry = starts[0]
+        last = _parse_day(catalog.last_date)
+        view = _numbering_view(state, None)
+        watched_max = int(view.max_completed_episode_number or view.max_episode_number or 0)
+        if last is None or entry.end is None or abs(entry.end - last) <= tolerance:
+            chosen_entry = entry
+        elif last > entry.end + tolerance:
+            sequel_id = _direct_sequel_id(config, client, entry.mal_anime_id)
+            sequel = _dated_entry(client, sequel_id) if sequel_id is not None else None
+            if sequel is not None and sequel.media_type in family and sequel.end is not None and abs(sequel.end - last) <= tolerance:
+                chosen_entry = entry
+            elif entry.num_episodes and watched_max and watched_max <= entry.num_episodes:
+                chosen_entry = entry
+    else:
+        count = catalog.numbered_episode_count or catalog.total_episode_count
+        started = sorted(
+            (entry for entry in entries if entry.start is not None and entry.start <= first + tolerance),
+            key=lambda entry: entry.start or datetime.min,
+        )
+        if not started or not count:
+            return None
+        latest = started[-1]
+        if len(started) > 1 and started[-2].start == latest.start:
+            return None
+        if latest.num_episodes == count:
+            chosen_entry = latest
+    return chosen_entry
 
 
 def _franchise_count_corroborated_candidate(
@@ -1519,25 +1701,27 @@ def _resolve_season_target(
     auxiliary_season = bool(state.season_title and _AUXILIARY_SEASON_TITLE_RE.search(state.season_title))
     if auxiliary_season and chosen is not None and chosen.media_type == "tv":
         chosen = None
-    split_first = None
-    corroborated = None
-    if chosen is not None and not should_auto_approve_mapping(result):
+    catalog = get_provider_season_catalog(
+        config.db_path, provider=state.provider, provider_season_key=state.provider_season_key
+    )
+    accepted_by: str | None = None
+    if chosen is not None and should_auto_approve_mapping(result):
+        if _catalog_contradicts(client, catalog, chosen.mal_anime_id):
+            chosen = None
+        else:
+            accepted_by = "mapping_engine_auto_approval"
+    if accepted_by is None and chosen is not None:
         split_first = _split_cour_first_part(config, client, state, list(result.candidates))
         if split_first is not None:
-            chosen = split_first
-        else:
-            corroborated = _franchise_count_corroborated_candidate(config, client, state, result)
-            if corroborated is not None:
-                chosen = corroborated
-    accepted_by = (
-        "split_cour_first_part"
-        if split_first is not None
-        else "franchise_episode_count_corroborated"
-        if corroborated is not None
-        else "mapping_engine_auto_approval"
-        if should_auto_approve_mapping(result)
-        else None
-    )
+            chosen, accepted_by = split_first, "split_cour_first_part"
+    if accepted_by is None:
+        dated = _catalog_dated_candidate(config, client, state, result, catalog, auxiliary_season=auxiliary_season)
+        if dated is not None:
+            chosen, accepted_by = dated, f"season_catalog_{catalog.date_kind if catalog else 'dates'}"
+    if accepted_by is None and chosen is not None:
+        corroborated = _franchise_count_corroborated_candidate(config, client, state, result)
+        if corroborated is not None:
+            chosen, accepted_by = corroborated, "franchise_episode_count_corroborated"
     if chosen is not None and accepted_by is not None:
         upsert_provider_season_mapping(
             config.db_path,

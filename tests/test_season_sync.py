@@ -760,3 +760,105 @@ class SeasonMappingCliAndHealthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeasonCatalogDateResolutionTests(unittest.TestCase):
+    """Matching by season date windows (probed 2026-11-18 on the unresolved seasons)."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        (root / ".MAL-Updater" / "config").mkdir(parents=True)
+        self.config = load_config(root)
+        bootstrap_database(self.config.db_path)
+        secrets = root / ".MAL-Updater" / "secrets"
+        secrets.mkdir(parents=True, exist_ok=True)
+        (secrets / "mal_client_id.txt").write_text("client-id\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _seed(self, provider: str, season_title: str, *, relations: dict[int, list[tuple[int, str]]]) -> None:
+        from mal_updater.db import replace_mal_anime_relations
+
+        progress = []
+        for key, number_range, title in (("S0", range(1, 3), "Season 0"), ("SX", range(1, 13), season_title)):
+            for n in number_range:
+                progress.append({
+                    "provider_episode_id": f"{key}-{n}", "provider_series_id": "ser-1", "episode_number": n,
+                    "episode_title": None, "playback_position_ms": 1400000, "duration_ms": 1440000, "completion_ratio": 0.98,
+                    "last_watched_at": f"2026-03-0{1 if key == 'S0' else 2}T00:{n:02d}:00Z", "audio_locale": None,
+                    "subtitle_locale": None, "rating": None, "provider_season_key": key, "season_number": 0 if key == "S0" else 2,
+                    "season_title": title, "season_episode_ordinal": n,
+                })
+        ingest_snapshot_payload({
+            "contract_version": "1.0", "generated_at": "2026-03-14T21:00:00Z", "provider": provider, "account_id_hint": None,
+            "series": [{"provider_series_id": "ser-1", "title": "Show", "season_title": None, "season_number": None}],
+            "progress": progress, "watchlist": [], "raw": {},
+        }, self.config)
+        upsert_series_mapping(self.config.db_path, provider=provider, provider_series_id="ser-1", mal_anime_id=100,
+                              confidence=1.0, mapping_source="user_exact", approved_by_user=True, notes=None)
+        for mal_id, rels in relations.items():
+            replace_mal_anime_relations(self.config.db_path, mal_anime_id=mal_id, relations=[
+                {"related_mal_anime_id": rid, "relation_type": kind, "raw": {"node": {"id": rid}}} for rid, kind in rels])
+
+    def _resolve(self, provider, catalog, entries, *, engine_choice=None, engine_auto=False):
+        from mal_updater.config import load_mal_secrets
+        from mal_updater.mapping import MappingCandidate, MappingResult
+        from mal_updater.season_catalog import ProviderSeasonCatalog, upsert_provider_season_catalog
+        from mal_updater.sync_planner import _resolve_season_target
+
+        upsert_provider_season_catalog(self.config.db_path, ProviderSeasonCatalog(
+            provider=provider, provider_season_key="SX", title=None, numbered_episode_count=catalog.get("count", 12),
+            total_episode_count=catalog.get("count", 12), first_date=catalog["first"], last_date=catalog.get("last"),
+            date_kind=catalog["kind"], complete=True, fetched_at=""))
+        state = next(s for s in load_provider_series_states(self.config, split_seasons=True) if s.provider_season_key == "SX")
+        chosen = None
+        if engine_choice is not None:
+            chosen = MappingCandidate(engine_choice, "T", [], "tv", None, 12, 0.9, "q", [], {})
+        result = MappingResult(series=None, status="exact" if engine_auto else "strong", confidence=0.9,
+                               chosen_candidate=chosen, candidates=[chosen] if chosen else [], rationale=[])
+
+        def details(anime_id, **_kwargs):
+            media, num, start, end = entries[anime_id]
+            return {"id": anime_id, "title": f"T{anime_id}", "media_type": media, "num_episodes": num, "start_date": start, "end_date": end}
+
+        with patch("mal_updater.sync_planner.map_series", return_value=result), patch(
+            "mal_updater.sync_planner.should_auto_approve_mapping", return_value=engine_auto
+        ), patch.object(MalClient, "get_anime_details", side_effect=details):
+            return _resolve_season_target(self.config, MalClient(self.config, load_mal_secrets(self.config)), state, search_budget=[1])
+
+    SIBLINGS = {100: ("tv", 12, "2021-04-10", "2021-06-26"), 200: ("tv", 12, "2025-04-05", "2025-06-21")}
+
+    def test_same_length_sibling_is_told_apart_by_broadcast_window(self) -> None:
+        self._seed("crunchyroll", "Season 1", relations={100: [(200, "sequel")], 200: [(100, "prequel")]})
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2021-04-10", "last": "2021-06-26"},
+                               self.SIBLINGS, engine_choice=200)
+        self.assertEqual(100, target.mal_anime_id)
+        self.assertIn("season_mapping_accepted_by=season_catalog_original_air", target.reasons)
+
+    def test_original_air_dates_veto_a_wrong_auto_approved_title_match(self) -> None:
+        self._seed("crunchyroll", "Season 1", relations={100: [(200, "sequel")], 200: [(100, "prequel")]})
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2021-04-10", "last": "2021-06-26"},
+                               self.SIBLINGS, engine_choice=200, engine_auto=True)
+        self.assertEqual(100, target.mal_anime_id)
+
+    def test_season_ending_with_the_sequel_resolves_to_part_one(self) -> None:
+        self._seed("crunchyroll", "Season 2", relations={100: [(300, "sequel")], 300: [(100, "prequel"), (400, "sequel")], 400: [(300, "prequel")]})
+        entries = {100: ("tv", 12, "2018-10-02", "2019-03-19"), 300: ("tv", 12, "2021-01-12", "2021-03-30"),
+                   400: ("tv", 12, "2021-07-06", "2021-09-21")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2021-01-12", "last": "2021-09-21", "count": 24}, entries)
+        self.assertEqual(300, target.mal_anime_id)
+
+    def test_hidive_publish_date_picks_latest_tv_entry_over_a_mini_ona(self) -> None:
+        self._seed("hidive", "Season 1", relations={100: [(500, "sequel"), (600, "side_story")], 500: [(100, "prequel")], 600: []})
+        entries = {100: ("tv", 12, "2023-07-07", "2023-09-22"), 500: ("tv", 12, "2026-04-07", "2026-06-23"),
+                   600: ("ona", 12, "2023-07-09", "2023-09-24")}
+        target = self._resolve("hidive", {"kind": "provider_publish", "first": "2024-01-25", "last": "2024-04-11"}, entries)
+        self.assertEqual(100, target.mal_anime_id)
+
+    def test_ova_season_matches_its_side_story_ova_entry(self) -> None:
+        self._seed("crunchyroll", "OVA Season 1", relations={100: [(700, "side_story")], 700: []})
+        entries = {100: ("tv", 24, "2018-10-02", "2019-03-19"), 700: ("ova", 5, "2019-07-09", "2020-11-27")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2019-07-09", "last": "2020-11-27", "count": 5}, entries)
+        self.assertEqual(700, target.mal_anime_id)

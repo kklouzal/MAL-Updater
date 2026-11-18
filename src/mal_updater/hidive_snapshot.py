@@ -16,6 +16,83 @@ from .fetch_provenance import FetchProvenance
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .hidive_auth import HidiveAuthError, HidiveSession, HidiveStatePaths, start_hidive_session
+from .season_catalog import (
+    ProviderSeasonCatalog,
+    catalog_candidate_season_keys,
+    season_keys_needing_catalog,
+    upsert_provider_season_catalog,
+)
+
+
+HIDIVE_CATALOG_SEASONS_PER_RUN = 10
+HIDIVE_CATALOG_MAX_PAGES = 20
+
+
+def _season_catalog_from_pages(season_key: str, pages: list[dict[str, Any]]) -> ProviderSeasonCatalog:
+    """Summarize /api/v4/season/{id} (probed 2026-11-18).
+
+    Episode publishedDate is HIDIVE's own release, never earlier than the
+    original broadcast (a 2023 season published 2024-01), so the dates are
+    provider_publish, not original_air.
+    """
+    episodes = [episode for page in pages for episode in (page.get("episodes") or []) if isinstance(episode, dict)]
+    numbered = [
+        episode
+        for episode in episodes
+        if isinstance((episode.get("episodeInformation") or {}).get("episodeNumber"), int)
+    ]
+    dated = numbered or episodes
+    dates = sorted(str(episode["publishedDate"])[:10] for episode in dated if episode.get("publishedDate"))
+    first = pages[0] if pages else {}
+    declared = _safe_int(first.get("episodeCount"))
+    return ProviderSeasonCatalog(
+        provider="hidive",
+        provider_season_key=season_key,
+        title=str(first.get("title")) if first.get("title") else None,
+        numbered_episode_count=len(numbered),
+        total_episode_count=len(episodes),
+        first_date=dates[0] if dates else None,
+        last_date=dates[-1] if dates else None,
+        date_kind="provider_publish",
+        complete=declared is None or declared <= len(episodes),
+        fetched_at="",
+    )
+
+
+def _refresh_season_catalog(session: HidiveSession) -> dict[str, Any]:
+    """Catalog a few seasons per run that season-to-MAL matching may need.
+
+    Only numeric HIDIVE season ids have a catalog route. A failure never fails
+    the snapshot: catalog facts only add matching evidence.
+    """
+    db_path = session.config.db_path
+    report: dict[str, Any] = {"requested": 0, "stored": 0, "failed": 0}
+    if not db_path.exists():
+        return report
+    candidates = [key for key in catalog_candidate_season_keys(db_path, provider="hidive") if key.isdigit()]
+    pending = season_keys_needing_catalog(db_path, provider="hidive", season_keys=candidates)
+    report["pending"] = len(pending)
+    for season_key in pending[:HIDIVE_CATALOG_SEASONS_PER_RUN]:
+        report["requested"] += 1
+        pages: list[dict[str, Any]] = []
+        params: dict[str, Any] = {"rpp": HIDIVE_HOME_ITEMS_PER_BUCKET}
+        try:
+            for _ in range(HIDIVE_CATALOG_MAX_PAGES):
+                page = session.json_get(f"/api/v4/season/{quote(season_key, safe='')}", params=params)
+                if not isinstance(page, dict):
+                    raise HidiveSnapshotError("HIDIVE season payload was not a JSON object")
+                pages.append(page)
+                paging = page.get("paging") if isinstance(page.get("paging"), dict) else {}
+                if not paging.get("moreDataAvailable") or paging.get("lastSeen") is None:
+                    break
+                params = {"rpp": HIDIVE_HOME_ITEMS_PER_BUCKET, "lastSeen": paging["lastSeen"]}
+        except (HidiveAuthError, HidiveSnapshotError) as exc:
+            report["failed"] += 1
+            report.setdefault("errors", []).append(f"{season_key}: {str(exc)[:160]}")
+            continue
+        upsert_provider_season_catalog(db_path, _season_catalog_from_pages(season_key, pages))
+        report["stored"] += 1
+    return report
 
 
 class HidiveSnapshotError(RuntimeError):
@@ -1207,6 +1284,7 @@ def _fetch_snapshot(
         raw={
             "partial": partial,
             "diagnostics": diagnostics,
+            "season_catalog": _refresh_season_catalog(session),
             "snapshot_producer": "mal_updater.hidive_snapshot",
             "surface_authority_schema_version": 1,
             "history_count": len(history_items),

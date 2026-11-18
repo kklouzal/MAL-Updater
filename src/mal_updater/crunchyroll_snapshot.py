@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 try:
     from curl_cffi import requests as curl_requests
@@ -22,6 +22,12 @@ from .config import AppConfig, _read_secret_file
 from .request_tracking import record_api_request_event
 from .provider_niceness import ProviderRequestGate, response_retry_after, retry_delay_seconds
 from .contracts import CrunchyrollSnapshot, EpisodeProgress, SeriesRef, WatchlistEntry
+from .season_catalog import (
+    ProviderSeasonCatalog,
+    catalog_candidate_season_keys,
+    season_keys_needing_catalog,
+    upsert_provider_season_catalog,
+)
 from .fetch_provenance import FetchProvenance
 from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
@@ -612,6 +618,73 @@ def _progress_kind_and_assertion(*, fully_watched: bool | None, playback_positio
     if playback_position_ms is not None:
         return "position", "unknown"
     return "history_membership", "unknown"
+
+
+CRUNCHYROLL_CATALOG_SEASONS_PER_RUN = 6
+
+
+def _season_catalog_from_episodes(season_key: str, payload: Any) -> ProviderSeasonCatalog | None:
+    """Summarize a season's episode listing (probed 2026-11-18).
+
+    episode_air_date is the original broadcast date; specials carry a
+    non-numeric display label ("SP1") and are counted apart from episodes.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return None
+    episodes = [item for item in payload["data"] if isinstance(item, dict)]
+    numbered = [item for item in episodes if str(item.get("episode") or "").isdigit()]
+    dated = numbered or episodes
+    air_dates = sorted(str(item["episode_air_date"])[:10] for item in dated if item.get("episode_air_date"))
+    total = payload.get("total")
+    title = next((str(item["season_title"]) for item in episodes if item.get("season_title")), None)
+    return ProviderSeasonCatalog(
+        provider="crunchyroll",
+        provider_season_key=season_key,
+        title=title,
+        numbered_episode_count=len(numbered),
+        total_episode_count=len(episodes),
+        first_date=air_dates[0] if air_dates else None,
+        last_date=air_dates[-1] if air_dates else None,
+        date_kind="original_air",
+        complete=not (isinstance(total, int) and total > len(episodes)),
+        fetched_at="",
+    )
+
+
+def _refresh_season_catalog(session: "_CrunchyrollAuthSession") -> dict[str, Any]:
+    """Catalog a few seasons per run that season-to-MAL matching may need.
+
+    A failure here never fails the snapshot: catalog facts only add matching
+    evidence and are retried on a later run.
+    """
+    db_path = session.config.db_path
+    report: dict[str, Any] = {"requested": 0, "stored": 0, "failed": 0}
+    if not db_path.exists():
+        return report
+    pending = season_keys_needing_catalog(
+        db_path, provider="crunchyroll", season_keys=catalog_candidate_season_keys(db_path, provider="crunchyroll")
+    )
+    report["pending"] = len(pending)
+    for season_key in pending[:CRUNCHYROLL_CATALOG_SEASONS_PER_RUN]:
+        report["requested"] += 1
+        try:
+            payload = session.authorized_json_get(
+                f"https://www.crunchyroll.com/content/v2/cms/seasons/{quote(season_key, safe='')}/episodes",
+                params={"locale": session.config.crunchyroll.locale},
+                phase=f"season catalog {season_key}",
+            )
+        except CrunchyrollSnapshotError as exc:
+            report["failed"] += 1
+            report.setdefault("errors", []).append(f"{season_key}: {str(exc)[:160]}")
+            continue
+        entry = _season_catalog_from_episodes(season_key, payload)
+        if entry is None:
+            report["failed"] += 1
+            report.setdefault("errors", []).append(f"{season_key}: malformed episode listing")
+            continue
+        upsert_provider_season_catalog(db_path, entry)
+        report["stored"] += 1
+    return report
 
 
 def _episode_numbers(metadata: dict[str, Any], episode_label: str | None) -> tuple[int | None, int | None]:
@@ -1291,6 +1364,7 @@ def _fetch_snapshot_once(
     all_history_entries = staged_history_entries + history_entries
     all_watchlist_data = staged_watchlist_entries + watchlist_data
     progress = _dedupe_progress([item for item in (_progress_from_history_entry(entry) for entry in all_history_entries) if item is not None])
+    season_catalog_report = _refresh_season_catalog(session)
     history_series = [item for item in (_series_from_panel(entry.get("panel")) for entry in all_history_entries if isinstance(entry.get("panel"), dict)) if item is not None]
 
     watchlist_series: list[SeriesRef] = []
@@ -1407,6 +1481,7 @@ def _fetch_snapshot_once(
             "retry_after_cap_seconds": config.crunchyroll.retry_after_cap_seconds,
             "niceness_policy": "local_host_process_gate",
             "auth_source": session.auth_source,
+            "season_catalog": season_catalog_report,
         },
     )
     is_partial = history_partial or watchlist_partial or (hot_mode and not history_boundary_complete)
