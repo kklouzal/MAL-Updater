@@ -32,6 +32,7 @@ from .crunchyroll_auth import (
     CrunchyrollBootstrapResult,
     CrunchyrollStatePaths,
     crunchyroll_login_with_credentials,
+    crunchyroll_token_error_message,
     resolve_crunchyroll_state_paths,
 )
 
@@ -396,16 +397,7 @@ def refresh_access_token(
         break
     assert response is not None
     if response.status_code >= 400:
-        message = f"Crunchyroll refresh-token login failed: HTTP {response.status_code}"
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if isinstance(payload, dict):
-            error = payload.get("error")
-            error_description = payload.get("error_description")
-            if error or error_description:
-                message = f"Crunchyroll refresh-token login failed: {error or 'unknown_error'} - {error_description or 'no description'}"
+        message = crunchyroll_token_error_message("Crunchyroll refresh-token login failed", response)
         _write_session_state(
             state_paths=state_paths,
             profile=profile,

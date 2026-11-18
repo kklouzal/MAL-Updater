@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 AUTH_FAILURE_KIND_LABELS = {
+    "client_rejected": "provider rejected the app OAuth client",
     "invalid_grant": "revoked or invalid refresh/auth token",
     "missing_refresh_material": "missing refresh material",
     "malformed_token_payload": "malformed token payload",
@@ -13,6 +14,10 @@ AUTH_FAILURE_KIND_LABELS = {
 }
 
 AUTH_FAILURE_REMEDIATION = {
+    "client_rejected": {
+        "remediation_kind": "oauth-client-rejected",
+        "detail": "the provider rejected the app's OAuth client (retired or invalid client credentials); update the client credentials in the code, then log in again, because re-login with the old client cannot succeed",
+    },
     "invalid_grant": {
         "remediation_kind": "refresh-token-invalidated",
         "detail": "stage fresh auth material because the existing refresh/auth token looks revoked, expired, or otherwise invalid",
@@ -50,6 +55,7 @@ AUTH_STYLE_FAILURE_MARKERS = (
     "forbidden",
     "auth_failed",
     "invalid_grant",
+    "invalid_client",
     "invalid token",
     "expired token",
     "token refresh",
@@ -86,6 +92,11 @@ def classify_auth_style_failure(
     lowered_session_error = session_last_error.lower() if isinstance(session_last_error, str) else ""
     combined = "\n".join(part for part in (lowered, lowered_session_error) if part)
 
+    if "invalid_client" in combined:
+        return {
+            "kind": "client_rejected",
+            "label": AUTH_FAILURE_KIND_LABELS["client_rejected"],
+        }
     if "invalid_grant" in combined or "revoked" in combined:
         return {
             "kind": "invalid_grant",

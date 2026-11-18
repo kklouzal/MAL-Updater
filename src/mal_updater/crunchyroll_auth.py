@@ -22,7 +22,11 @@ from .provider_niceness import ProviderRequestGate, response_retry_after, retry_
 
 CRUNCHYROLL_TOKEN_URL = "https://www.crunchyroll.com/auth/v1/token"
 CRUNCHYROLL_ME_URL = "https://www.crunchyroll.com/accounts/v1/me"
-CRUNCHYROLL_BASIC_AUTH_TOKEN = "dC1rZGdwMmg4YzNqdWI4Zm4wZnE6eWZMRGZNZnJZdktYaDRKWFMxTEVJMmNDcXUxdjVXYW4="
+# Android TV OAuth client (client_id er9ngg2ko5ohirla51i2). Crunchyroll retires
+# app clients periodically; a retired client fails every grant with
+# invalid_client / auth.obtain_access_token.client_inactive, and refresh tokens
+# issued to the old client cannot be reused, so rotation needs a credential login.
+CRUNCHYROLL_BASIC_AUTH_TOKEN = "ZXI5bmdnMmtvNW9oaXJsYTUxaTI6VmwxVDBQbjhRWko2d3o0NnhYRGxIekRGUDV0Wlgxb3E="
 DEFAULT_CRUNCHYROLL_USERNAME_FILE = "crunchyroll_username.txt"
 DEFAULT_CRUNCHYROLL_PASSWORD_FILE = "crunchyroll_password.txt"
 DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
@@ -30,6 +34,24 @@ DEFAULT_CRUNCHYROLL_DEVICE_TYPE = "ANDROIDTV"
 
 class CrunchyrollAuthError(RuntimeError):
     pass
+
+
+def crunchyroll_token_error_message(prefix: str, response: Any) -> str:
+    """Describe a failed token-endpoint response, keeping Crunchyroll's specific error code."""
+    message = f"{prefix}: HTTP {response.status_code}"
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        error_description = payload.get("error_description")
+        code = payload.get("code")
+        if error or error_description:
+            message = f"{prefix}: {error or 'unknown_error'} - {error_description or 'no description'}"
+        if code:
+            message += f" ({code})"
+    return message
 
 
 def _require_curl_requests():
@@ -226,16 +248,7 @@ def crunchyroll_login_with_credentials(
 
     response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds, config=config, pacer=pacer)
     if response.status_code >= 400:
-        message = f"Crunchyroll credential login failed: HTTP {response.status_code}"
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if isinstance(payload, dict):
-            error = payload.get("error")
-            error_description = payload.get("error_description")
-            if error or error_description:
-                message = f"Crunchyroll credential login failed: {error or 'unknown_error'} - {error_description or 'no description'}"
+        message = crunchyroll_token_error_message("Crunchyroll credential login failed", response)
         _write_session_state(
             state_paths=state_paths,
             profile=profile,

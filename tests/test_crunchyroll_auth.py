@@ -230,5 +230,38 @@ class CrunchyrollAuthTests(unittest.TestCase):
             self.assertIn("invalid_grant", session_payload["last_error"])
 
 
+    def test_retired_oauth_client_is_reported_as_client_rejection_without_credential_retry(self) -> None:
+        from mal_updater.auth_failure_signals import auth_failure_remediation, classify_auth_style_failure
+        from mal_updater.crunchyroll_snapshot import _auth_failure_allows_credential_rebootstrap
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets").mkdir(parents=True)
+            (root / ".MAL-Updater" / "secrets" / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+            (root / ".MAL-Updater" / "secrets" / "crunchyroll_password.txt").write_text("pw-123\n", encoding="utf-8")
+            config = load_config(root)
+
+            with patch("mal_updater.crunchyroll_auth._http_post") as mock_post:
+                # Verbatim shape of Crunchyroll's response to a retired app client (observed 2026-11-18).
+                mock_post.return_value = _FakeResponse(
+                    401,
+                    {"code": "auth.obtain_access_token.client_inactive", "context": [], "error": "invalid_client"},
+                )
+                with self.assertRaises(CrunchyrollAuthError) as caught:
+                    crunchyroll_login_with_credentials(config)
+
+        message = str(caught.exception)
+        self.assertEqual(
+            "Crunchyroll credential login failed: invalid_client - no description (auth.obtain_access_token.client_inactive)",
+            message,
+        )
+        kind = classify_auth_style_failure(message)
+        self.assertEqual("client_rejected", kind["kind"] if kind else None)
+        self.assertEqual("oauth-client-rejected", auth_failure_remediation(kind)["remediation_kind"])
+        # A retired client rejects every grant, so spending a credential POST on it is never useful.
+        self.assertFalse(_auth_failure_allows_credential_rebootstrap(CrunchyrollAuthError(message)))
+
+
 if __name__ == "__main__":
     unittest.main()
