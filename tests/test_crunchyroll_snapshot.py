@@ -631,6 +631,40 @@ class CrunchyrollSnapshotBoundaryTests(unittest.TestCase):
             self.assertIsNone(session_state["last_error"])
             self.assertEqual(session_state["last_account_id_hint"], "acct-123")
 
+    def test_full_refresh_follows_history_cursor_past_numeric_page_limit(self) -> None:
+        # Production regression: numeric watch-history pages beyond 10 return
+        # HTTP 400 and ``total`` is the page's own count; Crunchyroll pages by
+        # an opaque meta.next_page cursor.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".MAL-Updater" / "config").mkdir(parents=True)
+            session = self._build_session(root)
+            history_pages: list[object] = []
+            pages = 12
+
+            def fake_get(url: str, *, params=None, phase=None):
+                if url == CRUNCHYROLL_ME_URL:
+                    return {"account_id": "acct-123", "email": "user@example.com"}
+                if url.endswith("/watch-history"):
+                    cursor = params["page"]
+                    history_pages.append(cursor)
+                    index = 1 if cursor == 1 else int(str(cursor).removeprefix("cur-"))
+                    if isinstance(cursor, int) and cursor > 10:
+                        raise AssertionError("numeric pages beyond 10 are rejected by Crunchyroll")
+                    next_page = "" if index == pages else f"/content/v2/acct-123/watch-history?locale=en-US&page=cur-{index + 1}&page_size=100"
+                    data = [self._history_entry((index - 1) * 100 + idx + 1) for idx in range(100)]
+                    return {"total": 100, "data": data, "meta": {"prev_page": "", "next_page": next_page}}
+                if url.endswith("/watchlist"):
+                    return {"total": 0, "data": []}
+                raise AssertionError((url, params, phase))
+
+            with patch.object(_CrunchyrollAuthSession, "authorized_json_get", side_effect=fake_get):
+                result = _fetch_snapshot_once(session, use_incremental_boundary=False)
+
+            self.assertEqual([1, *[f"cur-{n}" for n in range(2, pages + 1)]], history_pages)
+            self.assertEqual(pages * 100, result.snapshot.raw["history_count"])
+            self.assertFalse(result.snapshot.raw["history_partial"])
+
     def test_watchlist_repeated_across_shifted_pages_is_deduped_and_marked_partial(self) -> None:
         # Production regression: Crunchyroll reorders the watchlist on activity, so
         # offset page 2 can repeat a page-1 series; the snapshot must still validate.

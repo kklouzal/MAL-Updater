@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from curl_cffi import requests as curl_requests
@@ -66,6 +67,8 @@ HOT_HISTORY_CATCHUP_PAGE_LIMIT = 100
 BOOTSTRAP_RESUME_MAX_AGE_DAYS = 14
 BOOTSTRAP_DRIFT_QUARANTINE_LIMIT = 3
 CRUNCHYROLL_HISTORY_PAGE_LIMIT = 1000
+# Numeric watch-history pages beyond this return HTTP 400; deeper pages need the cursor.
+CRUNCHYROLL_HISTORY_NUMERIC_PAGE_LIMIT = 10
 CRUNCHYROLL_WATCHLIST_PAGE_LIMIT = 1000
 
 
@@ -581,6 +584,21 @@ def _episode_season_key(metadata: dict[str, Any]) -> str | None:
     return _non_empty_str(metadata.get("season_id"))
 
 
+def _history_next_cursor(payload: dict[str, Any]) -> tuple[bool, str | None]:
+    """Return (paging_meta_present, cursor) from watch-history ``meta.next_page``.
+
+    An empty next_page in present paging metadata marks the end of history.
+    """
+    meta = payload.get("meta")
+    if not isinstance(meta, dict) or "next_page" not in meta:
+        return False, None
+    next_page = meta.get("next_page")
+    if not isinstance(next_page, str) or not next_page.strip():
+        return True, None
+    values = parse_qs(urlsplit(next_page).query).get("page")
+    return True, (values[0] if values and values[0] else None)
+
+
 def _non_negative_int(value: Any) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
@@ -1020,6 +1038,7 @@ def _fetch_snapshot_once(
     bootstrap_history_total: int | None = None
     bootstrap_watchlist_total: int | None = None
     bootstrap_drift_count = 0
+    resume_history_cursor: str | None = None
     if bootstrap_resume is not None:
         if bootstrap_resume.get("quarantined") is True:
             raise CrunchyrollSnapshotError(
@@ -1027,6 +1046,7 @@ def _fetch_snapshot_once(
                 "run an explicit full refresh or remove the non-secret bootstrap resume state after review"
             )
         history_start_page = max(1, int(bootstrap_resume.get("history_next_page") or 1))
+        resume_history_cursor = _non_empty_str(bootstrap_resume.get("history_next_cursor"))
         watchlist_start = max(0, int(bootstrap_resume.get("watchlist_next_start") or 0))
         resume_history_markers = [str(item) for item in bootstrap_resume.get("history_first_markers", []) if item]
         resume_watchlist_markers = [str(item) for item in bootstrap_resume.get("watchlist_first_markers", []) if item]
@@ -1060,7 +1080,15 @@ def _fetch_snapshot_once(
     history_guard_or_duplicate = False
     seen_history_pages: set[str] = set()
     next_history_page: int | None = None
+    next_history_cursor: str | None = None
     page = max(1, history_start_page)
+    # Watch history pages by an opaque cursor (meta.next_page). Numeric pages
+    # are only honored up to page 10 (1000 entries); deeper ones return 400.
+    history_cursor: str | None = resume_history_cursor if bootstrap_resume is not None else None
+    if page > 1 and history_cursor is None and page > CRUNCHYROLL_HISTORY_NUMERIC_PAGE_LIMIT:
+        raise CrunchyrollSnapshotError(
+            f"Crunchyroll watch-history cannot resume at page {page} without a cursor; restart the traversal from page 1"
+        )
     while True:
         if page > CRUNCHYROLL_HISTORY_PAGE_LIMIT:
             raise CrunchyrollSnapshotError(f"Crunchyroll watch-history exceeded page guard ({CRUNCHYROLL_HISTORY_PAGE_LIMIT})")
@@ -1068,7 +1096,7 @@ def _fetch_snapshot_once(
         _log_fetch_progress(f"watch-history page={page} endpoint={history_url}")
         history_payload = session.authorized_json_get(
             history_url,
-            params={"page": page, "page_size": 100, "locale": config.crunchyroll.locale},
+            params={"page": history_cursor or page, "page_size": 100, "locale": config.crunchyroll.locale},
             phase=f"watch-history page {page}",
         )
         history_pages_fetched += 1
@@ -1106,11 +1134,10 @@ def _fetch_snapshot_once(
         if automatic_bootstrap_chunk and page == 1:
             bootstrap_history_page1_fingerprint = batch_fingerprint
             bootstrap_history_total = total if isinstance(total, int) else None
-        # Terminate only on a short/empty page. Watch-history ``total`` is not
-        # a trustworthy overall count: a production full refresh stopped after
-        # one full page of 100 with history claimed complete, which only the
-        # former ``page * 100 >= total`` check could cause.
-        if len(batch) < 100:
+        # Watch-history ``total`` is the item count of this page, not of the
+        # history; the end is an empty next_page cursor (or a short page).
+        paging_meta_present, history_cursor = _history_next_cursor(history_payload)
+        if len(batch) < 100 or (paging_meta_present and history_cursor is None):
             if history_front_boundary_seen:
                 history_backfill_exhausted = True
             break
@@ -1125,6 +1152,7 @@ def _fetch_snapshot_once(
             history_partial = True
             history_stopped_early = True
             next_history_page = page + 1
+            next_history_cursor = history_cursor
             break
         page += 1
 
@@ -1319,6 +1347,7 @@ def _fetch_snapshot_once(
             "history_page_limit_applied": max_history_pages,
             "history_partial": history_partial,
             "history_next_page": next_history_page,
+            "history_next_cursor": next_history_cursor,
             "history_stopped_early": history_stopped_early,
             "history_boundary_complete": history_boundary_complete,
             "history_guard_or_duplicate": history_guard_or_duplicate,
@@ -1359,6 +1388,7 @@ def _fetch_snapshot_once(
                 "account_id_hint": account_id,
                 "locale": config.crunchyroll.locale,
                 "history_next_page": 1 if reset_for_drift else (next_history_page or history_start_page),
+                "history_next_cursor": None if reset_for_drift else next_history_cursor,
                 "watchlist_next_start": 0 if reset_for_drift else (next_watchlist_start if next_watchlist_start is not None else watchlist_start),
                 "history_first_markers": [] if reset_for_drift else resume_history_markers,
                 "watchlist_first_markers": [] if reset_for_drift else resume_watchlist_markers,
