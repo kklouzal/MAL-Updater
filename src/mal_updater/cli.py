@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import time
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,10 @@ from .config import ConfigError, ensure_directories, load_config, load_mal_secre
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
+    crunchyroll_auth_material_present,
     crunchyroll_login_with_credentials,
+    crunchyroll_poll_device_code,
+    crunchyroll_request_device_code,
     load_crunchyroll_credentials,
     resolve_crunchyroll_state_paths,
 )
@@ -965,6 +969,29 @@ def _cmd_crunchyroll_auth_login(project_root: Path | None, profile: str, no_veri
     print(f"locale={result.locale}")
     print(f"device_type={result.device_type}")
     return 0
+
+
+def _cmd_crunchyroll_link(project_root: Path | None, profile: str) -> int:
+    config = load_config(project_root)
+    ensure_directories(config)
+    try:
+        code = crunchyroll_request_device_code(config, profile=profile)
+        print(f"Open {code.verification_url} while signed in to Crunchyroll and enter the code: {code.user_code}")
+        print(f"Waiting up to {code.expires_in_seconds}s for approval...", flush=True)
+        deadline = time.monotonic() + code.expires_in_seconds
+        while time.monotonic() < deadline:
+            time.sleep(5)
+            result = crunchyroll_poll_device_code(config, code, profile=profile)
+            if result is not None:
+                print("Crunchyroll account linked")
+                print(f"Staged Crunchyroll refresh token to {result.refresh_token_path}")
+                print(f"profile={result.profile}")
+                return 0
+    except CrunchyrollAuthError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print("The code expired before it was approved; run crunchyroll-link again.", file=sys.stderr)
+    return 1
 
 
 def _cmd_validate_snapshot(project_root: Path | None, snapshot_path: Path | None) -> int:
@@ -2815,8 +2842,7 @@ def _cmd_apply_sync(project_root: Path | None, limit: int, mapping_limit: int, e
 
 def _iter_exact_approved_sync_cycle_providers(config) -> list[tuple[str, Path]]:
     providers: list[tuple[str, Path]] = []
-    crunchyroll_credentials = load_crunchyroll_credentials(config)
-    if crunchyroll_credentials.username and crunchyroll_credentials.password:
+    if crunchyroll_auth_material_present(config):
         providers.append(("crunchyroll", config.cache_dir / "live-crunchyroll-snapshot.json"))
     hidive_credentials = load_hidive_credentials(config)
     if hidive_credentials.username and hidive_credentials.password:
@@ -3544,6 +3570,8 @@ def _dispatch(parser, args) -> int:
         )
     if args.command == "crunchyroll-auth-login":
         return _cmd_crunchyroll_auth_login(args.project_root, args.profile, args.no_verify)
+    if args.command == "crunchyroll-link":
+        return _cmd_crunchyroll_link(args.project_root, args.profile)
     if args.command == "crunchyroll-fetch-snapshot":
         return _cmd_crunchyroll_fetch_snapshot(
             args.project_root,

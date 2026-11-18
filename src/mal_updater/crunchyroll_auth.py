@@ -22,6 +22,10 @@ from .provider_niceness import ProviderRequestGate, response_retry_after, retry_
 
 CRUNCHYROLL_TOKEN_URL = "https://www.crunchyroll.com/auth/v1/token"
 CRUNCHYROLL_ME_URL = "https://www.crunchyroll.com/accounts/v1/me"
+CRUNCHYROLL_DEVICE_CODE_URL = "https://www.crunchyroll.com/auth/v1/device/code"
+CRUNCHYROLL_DEVICE_TOKEN_URL = "https://www.crunchyroll.com/auth/v1/device/token"
+CRUNCHYROLL_ACTIVATE_URL = "https://www.crunchyroll.com/activate"
+CRUNCHYROLL_DEVICE_NAME = "MAL-Updater"
 # Android TV OAuth client (client_id er9ngg2ko5ohirla51i2). Crunchyroll retires
 # app clients periodically; a retired client fails every grant with
 # invalid_client / auth.obtain_access_token.client_inactive, and refresh tokens
@@ -175,7 +179,25 @@ def _request_pacer(config: AppConfig | None, pacer: Any | None) -> Any | None:
     )
 
 
-def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeout_seconds: float, config: AppConfig | None = None, pacer: Any | None = None):
+class _UnpacedRequests:
+    """Pacer for interactive account linking: a person is waiting on each request,
+    the volume is bounded by the device-code lifetime, and each request is still
+    recorded in the API request events that feed the hourly budgets."""
+
+    def wait_turn(self) -> None:
+        return None
+
+
+def _http_post(
+    url: str,
+    *,
+    data: dict[str, str] | None = None,
+    json_body: dict[str, str] | None = None,
+    headers: dict[str, str],
+    timeout_seconds: float,
+    config: AppConfig | None = None,
+    pacer: Any | None = None,
+):
     transport = _require_curl_requests()
     active_pacer = _request_pacer(config, pacer)
     # Credential and refresh-token POSTs are single-attempt: the server may
@@ -185,7 +207,10 @@ def _http_post(url: str, *, data: dict[str, str], headers: dict[str, str], timeo
         if active_pacer is not None:
             active_pacer.wait_turn()
         try:
-            response = transport.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
+            if json_body is not None:
+                response = transport.post(url, json=json_body, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
+            else:
+                response = transport.post(url, data=data, headers=headers, timeout=timeout_seconds, impersonate="chrome124")
         except Exception as exc:
             record_api_request_event("crunchyroll", "auth_post", url=url, method="POST", outcome="request_error", error=type(exc).__name__, config=config)
             raise
@@ -265,12 +290,43 @@ def crunchyroll_login_with_credentials(
         )
         raise CrunchyrollAuthError(message)
 
-    token_payload = response.json()
+    return _complete_token_login(
+        config,
+        response.json(),
+        state_paths=state_paths,
+        profile=profile,
+        device_id=device_id,
+        device_type=device_type,
+        credentials=credentials,
+        login_label="credential login",
+        verify_account=verify_account,
+        timeout_seconds=timeout_seconds,
+        pacer=pacer,
+    )
+
+
+def _complete_token_login(
+    config: AppConfig,
+    token_payload: Any,
+    *,
+    state_paths: CrunchyrollStatePaths,
+    profile: str,
+    device_id: str,
+    device_type: str,
+    credentials: CrunchyrollCredentials,
+    login_label: str,
+    verify_account: bool,
+    timeout_seconds: float,
+    pacer: Any | None,
+) -> CrunchyrollBootstrapResult:
+    """Validate a successful token response, optionally verify the account, then persist the session."""
+    if not isinstance(token_payload, dict):
+        token_payload = {}
     access_token = token_payload.get("access_token")
     refresh_token = token_payload.get("refresh_token")
     account_id = token_payload.get("account_id")
     if not access_token or not refresh_token:
-        message = "Crunchyroll credential login succeeded but did not return both access_token and refresh_token"
+        message = f"Crunchyroll {login_label} succeeded but did not return both access_token and refresh_token"
         _write_session_state(
             state_paths=state_paths,
             profile=profile,
@@ -335,3 +391,119 @@ def crunchyroll_login_with_credentials(
         device_id=device_id,
         device_type=device_type,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CrunchyrollDeviceCode:
+    """A pending TV-style account link: the user approves ``user_code`` at ``verification_url``."""
+
+    user_code: str
+    device_code: str
+    device_id: str
+    expires_in_seconds: int
+    verification_url: str
+
+
+def _device_flow_headers(device_id: str, content_type: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
+        "Content-Type": content_type,
+        "ETP-Anonymous-ID": device_id,
+        "User-Agent": CRUNCHYROLL_ANDROIDTV_USER_AGENT,
+    }
+
+
+def crunchyroll_request_device_code(
+    config: AppConfig,
+    *,
+    profile: str = "default",
+    timeout_seconds: float = 15.0,
+) -> CrunchyrollDeviceCode:
+    """Start a password-free account link, like the Crunchyroll TV apps' activation codes.
+
+    Nothing is persisted until the link is approved and polled successfully, so an
+    abandoned or expired code leaves the current session untouched.
+    """
+    state_paths = resolve_crunchyroll_state_paths(config, profile=profile)
+    device_id = _read_secret_file(state_paths.device_id_path) or str(uuid.uuid4())
+    response = _http_post(
+        CRUNCHYROLL_DEVICE_CODE_URL,
+        data={"device_id": device_id, "device_type": DEFAULT_CRUNCHYROLL_DEVICE_TYPE, "device_name": CRUNCHYROLL_DEVICE_NAME},
+        headers=_device_flow_headers(device_id, "application/x-www-form-urlencoded"),
+        timeout_seconds=timeout_seconds,
+        config=config,
+        pacer=_UnpacedRequests(),
+    )
+    if response.status_code >= 400:
+        raise CrunchyrollAuthError(crunchyroll_token_error_message("Crunchyroll account link could not start", response))
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict) or not payload.get("user_code") or not payload.get("device_code"):
+        raise CrunchyrollAuthError("Crunchyroll account link could not start: response did not include a code")
+    try:
+        expires_in = int(payload.get("expires_in") or 300)
+    except (TypeError, ValueError):
+        expires_in = 300
+    return CrunchyrollDeviceCode(
+        user_code=str(payload["user_code"]),
+        device_code=str(payload["device_code"]),
+        device_id=device_id,
+        expires_in_seconds=max(1, expires_in),
+        verification_url=CRUNCHYROLL_ACTIVATE_URL,
+    )
+
+
+def crunchyroll_poll_device_code(
+    config: AppConfig,
+    code: CrunchyrollDeviceCode,
+    *,
+    profile: str = "default",
+    timeout_seconds: float = 15.0,
+) -> CrunchyrollBootstrapResult | None:
+    """Poll once for approval of ``code``. Returns None while approval is still pending.
+
+    Crunchyroll answers 204 (or 200 with an empty body) until the code is approved,
+    then 200 with a normal token set bound to the Android TV client, which the
+    regular refresh-token renewal keeps alive afterwards.
+    """
+    response = _http_post(
+        CRUNCHYROLL_DEVICE_TOKEN_URL,
+        json_body={"device_id": code.device_id, "device_code": code.device_code},
+        headers=_device_flow_headers(code.device_id, "application/json"),
+        timeout_seconds=timeout_seconds,
+        config=config,
+        pacer=_UnpacedRequests(),
+    )
+    if response.status_code in {204, 428}:
+        return None
+    if response.status_code >= 400:
+        raise CrunchyrollAuthError(crunchyroll_token_error_message("Crunchyroll account link failed", response))
+    try:
+        payload = response.json() if (response.content or b"").strip() else None
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        return None
+    return _complete_token_login(
+        config,
+        payload,
+        state_paths=resolve_crunchyroll_state_paths(config, profile=profile),
+        profile=profile,
+        device_id=code.device_id,
+        device_type=DEFAULT_CRUNCHYROLL_DEVICE_TYPE,
+        credentials=load_crunchyroll_credentials(config),
+        login_label="account link",
+        verify_account=True,
+        timeout_seconds=timeout_seconds,
+        pacer=_UnpacedRequests(),
+    )
+
+
+def crunchyroll_auth_material_present(config: AppConfig, *, profile: str = "default") -> bool:
+    """True when unattended Crunchyroll auth is possible: a linked session or saved credentials."""
+    credentials = load_crunchyroll_credentials(config)
+    if credentials.username and credentials.password:
+        return True
+    return bool(_read_secret_file(resolve_crunchyroll_state_paths(config, profile=profile).refresh_token_path))

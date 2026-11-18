@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS, load_config
-from .crunchyroll_auth import load_crunchyroll_credentials
+from .crunchyroll_auth import crunchyroll_auth_material_present
 from .db import (
     bootstrap_database,
     connect,
@@ -1659,8 +1659,7 @@ def _public_userrecs_diagnostics_for_dashboard(db_path: Path, *, reason: str | N
 def _dashboard_configured_provider_slugs(config: Any) -> list[str]:
     providers: list[str] = []
     try:
-        crunchyroll_credentials = load_crunchyroll_credentials(config)
-        if crunchyroll_credentials.username and crunchyroll_credentials.password:
+        if crunchyroll_auth_material_present(config):
             providers.append("crunchyroll")
     except (AttributeError, OSError, ValueError, TypeError):
         pass

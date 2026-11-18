@@ -84,6 +84,7 @@ EXPECTED_CLI_COMMAND_SURFACE = (
     "bootstrap-audit",
     "crunchyroll-auth-login",
     "crunchyroll-fetch-snapshot",
+    "crunchyroll-link",
     "crunchyroll-recommendation-shadow-audit",
     "dashboard-serve",
     "dry-run-sync",
@@ -392,7 +393,7 @@ class ProviderCliTests(unittest.TestCase):
         actual_commands = tuple(sorted(command_parsers))
 
         self.assertEqual(EXPECTED_CLI_COMMAND_SURFACE, actual_commands)
-        self.assertEqual(57, len(actual_commands))
+        self.assertEqual(58, len(actual_commands))
 
         for command, expected_help in {
             "provider-fetch-snapshot": "account-scoped history/watchlist details",

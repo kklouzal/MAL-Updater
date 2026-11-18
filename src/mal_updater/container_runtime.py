@@ -13,7 +13,7 @@ from .auth import persist_token_response
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
 from .container_web import ControlStore, MAX_BODY
 from .container_ui import page as product_page
-from .crunchyroll_auth import CRUNCHYROLL_ME_URL
+from .crunchyroll_auth import CRUNCHYROLL_ME_URL, crunchyroll_poll_device_code, crunchyroll_request_device_code
 from .crunchyroll_snapshot import _build_request_pacer, _start_auth_session
 from .db import bootstrap_database
 from .hidive_auth import start_hidive_session
@@ -119,9 +119,16 @@ def _default_connection_tester(config: AppConfig, kind: str, timeout: int) -> No
         display = {"mal": "MAL", "crunchyroll": "Crunchyroll", "hidive": "HIDIVE"}.get(kind, "Provider")
         raise ConnectionTestError(f"{display} connection failed") from exc
 
-def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[bytes] | None], store: ControlStore, *, oauth_exchange: Any = None, connection_tester: Any = None) -> type:
+def _mask_email(email: object) -> str | None:
+    if not isinstance(email, str) or "@" not in email: return None
+    local, _, domain = email.partition("@")
+    return f"{local[:1]}***@{domain}"
+
+def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[bytes] | None], store: ControlStore, *, oauth_exchange: Any = None, connection_tester: Any = None, crunchyroll_link_start: Any = None, crunchyroll_link_poll: Any = None) -> type:
     dashboard = make_dashboard_handler(config.db_path, settings_href="/settings", config=config)
     test_connection = connection_tester or (lambda kind, timeout: _default_connection_tester(config, kind, timeout))
+    start_link = crunchyroll_link_start or (lambda: crunchyroll_request_device_code(config))
+    poll_link = crunchyroll_link_poll or (lambda code: crunchyroll_poll_device_code(config, code))
     class Handler(dashboard):
         server_version = "MAL-Updater"
         sys_version = ""
@@ -219,6 +226,33 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
                     message = "Connection succeeded"
                     store.record_connection_test(kind, ok=True, message=message)
                     self._send_json({"ok": True, "kind": kind, "message": message}); return
+                if path == "/api/crunchyroll/link/start":
+                    if not store.rate.allow("crunchyroll-link:" + key): raise PermissionError("rate_limited")
+                    try: code = start_link()
+                    except Exception as exc:
+                        print(json.dumps({"event": "crunchyroll_link_start_failed", "error_type": type(exc).__name__, "error": str(exc)[:300]}), flush=True)
+                        raise ValueError("Crunchyroll account link could not start") from exc
+                    flow_id = store.begin_crunchyroll_link(code)
+                    activation_url = f"{code.verification_url}?{urlencode({'code': code.user_code})}"
+                    self._send_json({"flow_id": flow_id, "user_code": code.user_code, "activation_url": activation_url, "verification_url": code.verification_url, "expires_in": code.expires_in_seconds}); return
+                if path == "/api/crunchyroll/link/poll":
+                    flow_id = str(data.get("flow_id", ""))
+                    state, code = store.claim_crunchyroll_link_poll(flow_id)
+                    if state == "unknown": raise ValueError("no pending Crunchyroll link")
+                    if state == "expired": self._send_json({"status": "expired"}); return
+                    if state == "wait": self._send_json({"status": "pending"}); return
+                    try: result = poll_link(code)
+                    except Exception as exc:
+                        # Transport failures land here too: the device code may already be consumed, so restart cleanly.
+                        store.finish_crunchyroll_link(flow_id)
+                        store.record_connection_test("crunchyroll", ok=False, message="Crunchyroll account link failed")
+                        print(json.dumps({"event": "crunchyroll_link_failed", "error_type": type(exc).__name__, "error": str(exc)[:300]}), flush=True)
+                        self._send_json({"status": "error", "message": "Crunchyroll account link failed; start a new link to try again."}); return
+                    if result is None: self._send_json({"status": "pending"}); return
+                    store.finish_crunchyroll_link(flow_id)
+                    store.record_connection_test("crunchyroll", ok=True, message="Crunchyroll account linked")
+                    store.audit("crunchyroll_account_linked")
+                    self._send_json({"status": "linked", "account": _mask_email(result.account_email)}); return
                 if path == "/api/oauth/mal/start":
                     scheme, host = self._origin(); self._send_json(store.begin_oauth(f"{scheme}://{host}/oauth/mal/callback")); return
                 self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)

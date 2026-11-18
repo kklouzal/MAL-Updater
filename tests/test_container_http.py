@@ -56,6 +56,30 @@ class HttpTests(unittest.TestCase):
   _,j=post(self.base+'/api/connections/test',{'kind':'mal'},csrf,self.base)
   self.assertEqual('Connection succeeded',j['message']); self.assertNotIn('mock ok',json.dumps(j)); self.assertEqual([('mal',10)],self.calls)
   self.assertFalse((self.config.secrets_dir/'container_auth.json').exists())
+ def test_crunchyroll_link_flow_starts_polls_and_records_linked_account(self):
+  from types import SimpleNamespace
+  from mal_updater.crunchyroll_auth import CrunchyrollDeviceCode
+  self.server.shutdown(); self.server.server_close()
+  polls=[]
+  results=[None,SimpleNamespace(account_email='person@example.com')]
+  def poll(code): polls.append(code.device_code); return results.pop(0)
+  start=lambda: CrunchyrollDeviceCode('3c3k4e','dev-code','device-1',300,'https://www.crunchyroll.com/activate')
+  self.server=ThreadingHTTPServer(('127.0.0.1',0),make_container_handler(self.config,[None],self.store,connection_tester=lambda kind,timeout: None,crunchyroll_link_start=start,crunchyroll_link_poll=poll))
+  self.thread=threading.Thread(target=self.server.serve_forever,daemon=True); self.thread.start(); self.base=f'http://127.0.0.1:{self.server.server_port}'
+  self.assertEqual(403,self.http_error(urllib.request.Request(self.base+'/api/crunchyroll/link/start',data=b'{}',headers={'Content-Type':'application/json'},method='POST')).code)
+  _,csrf_payload=self.get_json('/api/csrf'); csrf=csrf_payload['csrf_token']
+  _,started=post(self.base+'/api/crunchyroll/link/start',{},csrf,self.base)
+  self.assertEqual('3c3k4e',started['user_code']); self.assertEqual('https://www.crunchyroll.com/activate?code=3c3k4e',started['activation_url']); self.assertEqual(300,started['expires_in']); self.assertNotIn('dev-code',json.dumps(started))
+  _,first=post(self.base+'/api/crunchyroll/link/poll',{'flow_id':started['flow_id']},csrf,self.base)
+  _,spaced=post(self.base+'/api/crunchyroll/link/poll',{'flow_id':started['flow_id']},csrf,self.base)
+  self.assertEqual('pending',first['status']); self.assertEqual('pending',spaced['status']); self.assertEqual(['dev-code'],polls)
+  self.store.crunchyroll_link['next_poll']=0.0
+  _,linked=post(self.base+'/api/crunchyroll/link/poll',{'flow_id':started['flow_id']},csrf,self.base)
+  self.assertEqual({'status':'linked','account':'p***@example.com'},linked)
+  _,settings=self.get_json('/api/settings'); self.assertEqual('Crunchyroll account linked',settings['connection_tests']['crunchyroll']['message'])
+  self.assertIsNone(self.store.crunchyroll_link)
+  with self.assertRaises(urllib.error.HTTPError) as cm: post(self.base+'/api/crunchyroll/link/poll',{'flow_id':started['flow_id']},csrf,self.base)
+  self.assertEqual(400,cm.exception.code)
  def test_settings_api_returns_effective_values_and_saves_allowlisted_limits(self):
   _,before=self.get_json('/api/settings')
   self.assertEqual(180,before['settings']['service']['crunchyroll_hourly_limit'])

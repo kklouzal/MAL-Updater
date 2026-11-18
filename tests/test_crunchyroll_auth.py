@@ -265,5 +265,68 @@ class CrunchyrollAuthTests(unittest.TestCase):
         self.assertFalse(_auth_failure_allows_credential_rebootstrap(CrunchyrollAuthError(message)))
 
 
+    def test_device_link_requests_code_polls_pending_then_persists_linked_session(self) -> None:
+        class Response(_FakeResponse):
+            def __init__(self, status_code: int, payload: dict[str, object] | None) -> None:
+                super().__init__(status_code, payload or {})
+                self.content = json.dumps(payload).encode() if payload is not None else b""
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            responses = [
+                Response(200, {"user_code": "3c3k4e", "device_code": "dev-code", "interval": 500, "expires_in": 300}),
+                Response(204, None),
+                Response(200, {"access_token": "access", "refresh_token": "linked-refresh", "account_id": "acct-1"}),
+            ]
+            posts: list[dict[str, object]] = []
+
+            def fake_post(url, **kwargs):
+                posts.append({"url": url, **kwargs})
+                return responses.pop(0)
+
+            with patch("mal_updater.crunchyroll_auth._http_post", side_effect=fake_post), patch(
+                "mal_updater.crunchyroll_auth._http_get",
+                return_value=_FakeResponse(200, {"account_id": "acct-1", "email": "user@example.com"}),
+            ):
+                code = crunchyroll_auth.crunchyroll_request_device_code(config)
+                self.assertEqual("3c3k4e", code.user_code)
+                self.assertEqual("https://www.crunchyroll.com/activate", code.verification_url)
+                self.assertFalse(crunchyroll_auth.crunchyroll_auth_material_present(config))
+                self.assertIsNone(crunchyroll_auth.crunchyroll_poll_device_code(config, code))
+                result = crunchyroll_auth.crunchyroll_poll_device_code(config, code)
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual("user@example.com", result.account_email)
+            paths = resolve_crunchyroll_state_paths(config)
+            self.assertEqual("linked-refresh", paths.refresh_token_path.read_text(encoding="utf-8").strip())
+            self.assertEqual(code.device_id, paths.device_id_path.read_text(encoding="utf-8").strip())
+            session = json.loads(paths.session_state_path.read_text(encoding="utf-8"))
+            self.assertEqual("ready", session["crunchyroll_phase"])
+            # A linked session alone (no saved username/password) makes unattended auth possible.
+            self.assertTrue(crunchyroll_auth.crunchyroll_auth_material_present(config))
+            # The code request is a form POST; polling sends JSON with the same device id; both identify as Android TV.
+            self.assertEqual("https://www.crunchyroll.com/auth/v1/device/code", posts[0]["url"])
+            self.assertIn("data", posts[0])
+            self.assertEqual({"device_id": code.device_id, "device_code": "dev-code"}, posts[1]["json_body"])
+            for post in posts:
+                self.assertTrue(post["headers"]["User-Agent"].startswith("Crunchyroll/ANDROIDTV/"))
+
+    def test_device_link_poll_error_raises_with_crunchyroll_code_and_stages_nothing(self) -> None:
+        class Response(_FakeResponse):
+            content = b"{}"
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config(Path(td))
+            code = crunchyroll_auth.CrunchyrollDeviceCode("abc123", "dev-code", "device-1", 300, "https://www.crunchyroll.com/activate")
+            with patch(
+                "mal_updater.crunchyroll_auth._http_post",
+                return_value=Response(400, {"error": "invalid_grant", "code": "auth.obtain_device_access_token.expired"}),
+            ):
+                with self.assertRaisesRegex(CrunchyrollAuthError, "auth.obtain_device_access_token.expired"):
+                    crunchyroll_auth.crunchyroll_poll_device_code(config, code)
+            self.assertFalse(resolve_crunchyroll_state_paths(config).refresh_token_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

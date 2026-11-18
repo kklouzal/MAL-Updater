@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 import uuid
 
@@ -23,7 +24,7 @@ from .config import (
     load_config,
     load_mal_secrets,
 )
-from .crunchyroll_auth import load_crunchyroll_credentials
+from .crunchyroll_auth import crunchyroll_auth_material_present, resolve_crunchyroll_state_paths
 from .database_maintenance import compact_database_if_due
 from .runtime_housekeeping import inspect_service_log, prune_health_history, rotate_service_log
 from .runtime_retention_audit import build_runtime_retention_audit_payload
@@ -594,8 +595,7 @@ def _refresh_mal_tokens(config: AppConfig) -> dict[str, Any]:
 
 def _available_source_providers(config: AppConfig) -> list[str]:
     providers: list[str] = []
-    crunchyroll_credentials = load_crunchyroll_credentials(config)
-    if crunchyroll_credentials.username and crunchyroll_credentials.password:
+    if crunchyroll_auth_material_present(config):
         providers.append("crunchyroll")
     hidive_credentials = load_hidive_credentials(config)
     if hidive_credentials.username and hidive_credentials.password:
@@ -1788,6 +1788,44 @@ def _failure_backoff_seconds(config: AppConfig, spec: TaskSpec, task_state: dict
     return max(0, int(cooldown_seconds)), classification, configured_floor
 
 
+def _provider_auth_material_path(config: AppConfig, provider: str | None) -> Path | None:
+    if provider == "crunchyroll":
+        return resolve_crunchyroll_state_paths(config).refresh_token_path
+    return None
+
+
+def _provider_auth_material_mtime(config: AppConfig, provider: str | None) -> float | None:
+    """mtime of the provider's staged session, 0.0 when absent, None when the provider has none tracked."""
+    path = _provider_auth_material_path(config, provider)
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _provider_auth_renewed_since_failure(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any], *, last_run: float) -> bool:
+    """An auth-class failure backoff ends as soon as the provider's session is renewed.
+
+    Retrying a rejected login on a fixed schedule cannot help, but once someone
+    re-links the account (or otherwise stages new auth material) after the
+    failure was recorded, the task should run on the next scheduler pass instead
+    of waiting out the remaining backoff and cadence. The baseline is the session
+    mtime observed when the failure was recorded, not the run start, so a failed
+    run that itself rotated the refresh token cannot re-trigger itself each pass.
+    """
+    if task_state.get("failure_backoff_class") != "auth" or last_run <= 0:
+        return False
+    current = _provider_auth_material_mtime(config, spec.budget_provider)
+    if not current:
+        return False
+    baseline = task_state.get("failure_backoff_auth_material_mtime")
+    if not isinstance(baseline, (int, float)):
+        baseline = last_run  # backoff recorded before the baseline was tracked
+    return current > float(baseline)
+
+
 def _clear_failure_backoff(task_state: dict[str, Any]) -> None:
     task_state.pop("failure_backoff_until_epoch", None)
     task_state.pop("failure_backoff_until", None)
@@ -1796,6 +1834,7 @@ def _clear_failure_backoff(task_state: dict[str, Any]) -> None:
     task_state.pop("failure_backoff_consecutive_failures", None)
     task_state.pop("failure_backoff_class", None)
     task_state.pop("failure_backoff_floor_seconds", None)
+    task_state.pop("failure_backoff_auth_material_mtime", None)
 
 
 def _set_failure_backoff(
@@ -1816,6 +1855,11 @@ def _set_failure_backoff(
     task_state["failure_backoff_until_epoch"] = now + cooldown_seconds
     task_state["failure_backoff_until"] = _iso_after_seconds(cooldown_seconds)
     task_state["failure_backoff_remaining_seconds"] = cooldown_seconds
+    auth_material_mtime = _provider_auth_material_mtime(config, spec.budget_provider) if failure_class == "auth" else None
+    if auth_material_mtime is None:
+        task_state.pop("failure_backoff_auth_material_mtime", None)
+    else:
+        task_state["failure_backoff_auth_material_mtime"] = auth_material_mtime
     return {
         "failure_backoff_until": task_state["failure_backoff_until"],
         "failure_backoff_remaining_seconds": cooldown_seconds,
@@ -1992,7 +2036,8 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             _set_task_next_due(task_state, base_epoch=now, every_seconds=spec.every_seconds)
             results.append({"task": spec.name, "status": "skipped", "reason": "execute_limit_zero"})
             continue
-        if now - last_run < spec.every_seconds and not health_requested_run:
+        auth_renewed = _provider_auth_renewed_since_failure(config, spec, task_state, last_run=last_run)
+        if now - last_run < spec.every_seconds and not health_requested_run and not auth_renewed:
             _set_task_next_due(task_state, base_epoch=last_run, every_seconds=spec.every_seconds)
             continue
         if spec.name == "sync_apply" and (config.service.execute_limit_for("sync_apply") or 0) > 0:
@@ -2045,6 +2090,8 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 }
             )
             continue
+        if auth_renewed:
+            _clear_failure_backoff(task_state)
         failure_backoff_until_epoch = float(task_state.get("failure_backoff_until_epoch", 0))
         if failure_backoff_until_epoch > now:
             remaining = max(0, int(failure_backoff_until_epoch - now))

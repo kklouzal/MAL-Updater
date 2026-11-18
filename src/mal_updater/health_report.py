@@ -14,7 +14,7 @@ from .auth_remediation import (
     provider_rebootstrap_auth_descriptor,
 )
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
-from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
+from .crunchyroll_auth import crunchyroll_auth_material_present, load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .db import (
     bootstrap_database,
     get_latest_completed_sync_run,
@@ -883,7 +883,7 @@ def build_health_report(
         stale_after_days=max(1, int(config.service.recommendation_full_harvest_stale_after_days)),
     )
     credentialed_provider_slugs: list[str] = []
-    if crunchyroll_credentials.username and crunchyroll_credentials.password:
+    if crunchyroll_auth_material_present(config):
         credentialed_provider_slugs.append("crunchyroll")
     if hidive_credentials.username and hidive_credentials.password:
         credentialed_provider_slugs.append("hidive")

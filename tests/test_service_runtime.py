@@ -2020,6 +2020,80 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertIn("failure_backoff_active", sync_state["last_skip_reason"])
         self.assertGreater(sync_state["failure_backoff_remaining_seconds"], 0)
 
+    def test_run_pending_tasks_runs_auth_backed_off_task_once_session_is_renewed(self) -> None:
+        from mal_updater.crunchyroll_auth import resolve_crunchyroll_state_paths
+
+        now = datetime.now(timezone.utc).timestamp()
+        refresh_token_path = resolve_crunchyroll_state_paths(self.config).refresh_token_path
+        refresh_token_path.parent.mkdir(parents=True, exist_ok=True)
+        refresh_token_path.write_text("linked-refresh\n", encoding="utf-8")
+        for renewed in (True, False):
+            with self.subTest(renewed=renewed):
+                # The last failed run happened just before (renewed) or just after (not renewed) the session file was written.
+                last_run = refresh_token_path.stat().st_mtime + (-120 if renewed else 120)
+                state = {
+                    "started_at": "2026-03-20T20:00:00Z",
+                    "tasks": {
+                        "sync_fetch_crunchyroll": {
+                            "last_run_epoch": last_run,
+                            "failure_backoff_until_epoch": now + 3600,
+                            "failure_backoff_until": "2026-03-20T21:10:00Z",
+                            "failure_backoff_reason": "Crunchyroll refresh-token login failed: invalid_client",
+                            "failure_backoff_class": "auth",
+                            "failure_backoff_floor_seconds": 7200,
+                            "failure_backoff_consecutive_failures": 5,
+                        }
+                    },
+                }
+                self.config.service_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                with patch("mal_updater.service_runtime._budget_gate", return_value=(True, None, None)), patch(
+                    "mal_updater.service_runtime._refresh_mal_tokens",
+                    return_value={"status": "ok"},
+                ), patch(
+                    "mal_updater.service_runtime._run_subprocess",
+                    side_effect=lambda command, *args, **kwargs: {"status": "ok", "label": "task", "returncode": 0, "stdout": "", "stderr": ""},
+                ):
+                    result = run_pending_tasks(self.config)
+                sync_results = [item for item in result["results"] if item["task"] == "sync_fetch_crunchyroll"]
+                saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_fetch_crunchyroll"]
+                if renewed:
+                    self.assertEqual("ok", saved["last_status"])
+                    self.assertNotIn("failure_backoff_until_epoch", saved)
+                    self.assertNotIn("failure_backoff_class", saved)
+                else:
+                    self.assertNotIn("ok", [item["status"] for item in sync_results])
+                    self.assertNotEqual("ok", saved.get("last_status"))
+                    self.assertEqual("auth", saved["failure_backoff_class"])
+                    self.assertGreater(saved["failure_backoff_until_epoch"], now)
+
+    def test_auth_failure_after_own_token_rotation_does_not_lift_its_backoff(self) -> None:
+        from mal_updater.crunchyroll_auth import resolve_crunchyroll_state_paths
+
+        refresh_token_path = resolve_crunchyroll_state_paths(self.config).refresh_token_path
+        refresh_token_path.parent.mkdir(parents=True, exist_ok=True)
+        fetch_runs: list[int] = []
+
+        def run_subprocess(_config, _command, *args, label: str = "task", **kwargs):
+            if label == "sync_fetch_crunchyroll":
+                # The run rotates the refresh token, then a later request is rejected.
+                fetch_runs.append(1)
+                refresh_token_path.write_text(f"rotated-{len(fetch_runs)}\n", encoding="utf-8")
+                return {"status": "error", "label": label, "returncode": 1, "stdout": "", "stderr": "", "reason": "HTTP 401 from Crunchyroll"}
+            return {"status": "ok", "label": label, "returncode": 0, "stdout": "", "stderr": ""}
+
+        with patch("mal_updater.service_runtime._budget_gate", return_value=(True, None, None)), patch(
+            "mal_updater.service_runtime._refresh_mal_tokens",
+            return_value={"status": "ok"},
+        ), patch("mal_updater.service_runtime._run_subprocess", side_effect=run_subprocess):
+            run_pending_tasks(self.config)
+            saved = json.loads(self.config.service_state_path.read_text(encoding="utf-8"))["tasks"]["sync_fetch_crunchyroll"]
+            self.assertEqual("auth", saved["failure_backoff_class"])
+            self.assertEqual(refresh_token_path.stat().st_mtime, saved["failure_backoff_auth_material_mtime"])
+            second = run_pending_tasks(self.config)
+
+        self.assertEqual(1, len(fetch_runs))
+        self.assertNotIn("error", [item["status"] for item in second["results"] if item["task"] == "sync_fetch_crunchyroll"])
+
     def test_run_pending_tasks_clears_failure_backoff_after_successful_run(self) -> None:
         state = {
             "started_at": "2026-03-20T20:00:00Z",

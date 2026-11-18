@@ -1,7 +1,7 @@
 """Trusted-LAN container control-plane state."""
 from __future__ import annotations
 
-import json, math, os, re, secrets, threading, time
+import hmac, json, math, os, re, secrets, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +29,7 @@ from .config import (
     load_config,
     load_mal_secrets,
 )
-from .crunchyroll_auth import load_crunchyroll_credentials
+from .crunchyroll_auth import crunchyroll_auth_material_present, load_crunchyroll_credentials
 from .hidive_auth import load_hidive_credentials
 from .persistence import atomic_write_text
 
@@ -222,6 +222,9 @@ class ControlStore:
         # is intentionally neither a credential nor persisted installation state.
         self.csrf_token = secrets.token_urlsafe(32)
         self.oauth: dict[str, dict[str, Any]] = {}
+        # At most one pending Crunchyroll account link (device code). The device
+        # code is a bearer secret until it expires, so it stays in process memory.
+        self.crunchyroll_link: dict[str, Any] | None = None
         self.connection_results: dict[str, dict[str, Any]] = {}
         self.rate = RateLimiter()
         self.lock = threading.RLock()
@@ -277,8 +280,8 @@ class ControlStore:
             "secrets_present": present,
             "providers": {
                 "crunchyroll": {
-                    "scheduler_eligible": bool(crunchyroll.username and crunchyroll.password),
-                    "scheduling_basis": "credentials_present",
+                    "scheduler_eligible": crunchyroll_auth_material_present(self.config),
+                    "scheduling_basis": "linked_session_or_credentials",
                 },
                 "hidive": {
                     "scheduler_eligible": bool(hidive.username and hidive.password),
@@ -414,6 +417,30 @@ class ControlStore:
         with self.lock: item = self.oauth.pop(state, None)
         if not item or item["expires"] < time.monotonic(): raise ValueError("invalid OAuth state")
         return item
+    CRUNCHYROLL_LINK_POLL_SPACING_SECONDS = 4.0
+    def begin_crunchyroll_link(self, code: Any) -> str:
+        flow_id = secrets.token_urlsafe(24)
+        with self.lock:
+            self.crunchyroll_link = {"flow_id": flow_id, "code": code, "expires": time.monotonic() + int(code.expires_in_seconds), "next_poll": 0.0}
+        return flow_id
+    def claim_crunchyroll_link_poll(self, flow_id: str) -> tuple[str, Any]:
+        """Return ("unknown"|"expired"|"wait", None) or ("poll", code); spaces upstream polls across concurrent requests."""
+        with self.lock:
+            link = self.crunchyroll_link
+            if not link or not hmac.compare_digest(str(link["flow_id"]), str(flow_id)):
+                return "unknown", None
+            now = time.monotonic()
+            if link["expires"] <= now:
+                self.crunchyroll_link = None
+                return "expired", None
+            if link["next_poll"] > now:
+                return "wait", None
+            link["next_poll"] = now + self.CRUNCHYROLL_LINK_POLL_SPACING_SECONDS
+            return "poll", link["code"]
+    def finish_crunchyroll_link(self, flow_id: str) -> None:
+        with self.lock:
+            if self.crunchyroll_link and hmac.compare_digest(str(self.crunchyroll_link["flow_id"]), str(flow_id)):
+                self.crunchyroll_link = None
     def audit(self, event: str, **fields: Any) -> None:
         safe = {"time": int(time.time()), "event": event, **fields}
         line = json.dumps(safe, separators=(",", ":")) + "\n"

@@ -142,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crunchyroll_auth_login.add_argument("--profile", default="default", help="Crunchyroll state profile name")
     crunchyroll_auth_login.add_argument("--no-verify", action="store_true", help="Skip the follow-up GET /accounts/v1/me token check")
+    crunchyroll_link = subparsers.add_parser(
+        "crunchyroll-link",
+        help="Link a Crunchyroll account without a password: approve a short code at crunchyroll.com/activate",
+    )
+    crunchyroll_link.add_argument("--profile", default="default", help="Crunchyroll state profile name")
     crunchyroll_fetch_snapshot = subparsers.add_parser(
         "crunchyroll-fetch-snapshot",
         help="Use the Python Crunchyroll transport to fetch account-scoped history/watchlist details; not a whole-library crawler",
