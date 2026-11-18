@@ -946,6 +946,46 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         target = self._resolve("hidive", {"kind": "provider_publish", "first": "2024-01-25", "last": "2024-04-11"}, entries)
         self.assertEqual(100, target.mal_anime_id)
 
+    def test_veto_spares_a_season_inside_a_long_mal_entry_and_keeps_unconfirmed_matches(self) -> None:
+        # Production cases: D.Gray-man "Season 3-4" is the second half of one
+        # 2006-2008 MAL entry; re-checking an earlier automatic match that the
+        # rules cannot confirm keeps it.
+        from mal_updater.config import load_mal_secrets
+        from mal_updater.season_catalog import ProviderSeasonCatalog
+        from mal_updater.sync_planner import _catalog_contradicts
+
+        entries = {100: ("tv", 103, "2006-10-03", "2008-09-30"), 200: ("tv", 12, "2011-01-11", "2011-03-09")}
+
+        def details(anime_id, **_kwargs):
+            media, num, start, end = entries[anime_id]
+            return {"id": anime_id, "title": "T", "media_type": media, "num_episodes": num, "start_date": start, "end_date": end}
+
+        catalog = ProviderSeasonCatalog(provider="crunchyroll", provider_season_key="SX", title=None, numbered_episode_count=52,
+                                        total_episode_count=52, first_date="2007-10-09", last_date="2008-09-30",
+                                        date_kind="original_air", complete=True, fetched_at="")
+        with patch.object(MalClient, "get_anime_details", side_effect=details):
+            client = MalClient(self.config, load_mal_secrets(self.config))
+            self.assertFalse(_catalog_contradicts(client, catalog, 100))
+            self.assertTrue(_catalog_contradicts(client, catalog, 200))
+
+    def test_unconfirmed_earlier_automatic_match_is_kept(self) -> None:
+        from mal_updater.season_mappings import get_provider_season_mapping
+
+        self._seed("crunchyroll", "Season 2", relations={100: [], 900: []})
+        upsert_provider_season_mapping(
+            self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="SX",
+            mal_anime_id=900, mapping_source="auto_exact", confidence=0.9, season_title="Season 2", season_number=2,
+            resolver_version="older",
+        )
+        entries = {100: ("tv", 12, "2018-01-01", "2018-03-20"), 900: ("tv", 12, "2021-01-01", "2021-03-20")}
+        # The matcher now offers a different, unconfirmable candidate.
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2021-01-02", "last": "2021-03-21"}, entries,
+                               engine_choice=100)
+        self.assertEqual(900, target.mal_anime_id)
+        self.assertIn("season_mapping_reresolve_unconfirmed_kept", target.reasons)
+        stored = get_provider_season_mapping(self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="SX")
+        self.assertEqual(SEASON_MAPPING_RESOLVER_VERSION, stored.resolver_version)
+
     def test_ova_season_matches_its_side_story_ova_entry(self) -> None:
         self._seed("crunchyroll", "OVA Season 1", relations={100: [(700, "side_story")], 700: []})
         entries = {100: ("tv", 24, "2018-10-02", "2019-03-19"), 700: ("ova", 5, "2019-07-09", "2020-11-27")}

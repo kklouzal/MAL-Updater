@@ -1325,7 +1325,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.3"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.4"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1468,7 +1468,15 @@ def _catalog_contradicts(client: MalClient, catalog: Any, mal_anime_id: int) -> 
     entry = _dated_entry(client, mal_anime_id)
     if entry is None or entry.start is None:
         return False
-    return abs((entry.start - first).days) > _CATALOG_VETO_DAYS
+    # A provider season can be part of a long MAL entry (D.Gray-man "Season
+    # 3-4" is the second half of one 103-episode entry), and single episode
+    # dates can be wrong (a 2011 typo in a 2021 season). Only a season with
+    # neither end of its window inside the entry's broadcast span contradicts.
+    margin = timedelta(days=_CATALOG_VETO_DAYS)
+    span_start = entry.start - margin
+    span_end = (entry.end or entry.start) + margin
+    last = _parse_day(catalog.last_date) or first
+    return not (span_start <= first <= span_end or span_start <= last <= span_end)
 
 
 def _catalog_dated_candidate(
@@ -1801,6 +1809,36 @@ def _resolve_season_target(
         corroborated = _franchise_count_corroborated_candidate(config, client, state, result)
         if corroborated is not None:
             chosen, accepted_by = corroborated, "franchise_episode_count_corroborated"
+    if (
+        accepted_by is None
+        and stored is not None
+        and stored.approved
+        and stored.mapping_source == "auto_exact"
+        and stored.mal_anime_id is not None
+        and not _catalog_contradicts(client, catalog, stored.mal_anime_id)
+    ):
+        # Re-checking an earlier automatic match that the current rules cannot
+        # confirm is not evidence against it; only contradicting dates demote it.
+        # It is restamped with the current resolver so it is not re-searched.
+        upsert_provider_season_mapping(
+            config.db_path,
+            provider=state.provider,
+            provider_series_id=state.provider_series_id,
+            provider_season_key=state.provider_season_key,
+            mal_anime_id=stored.mal_anime_id,
+            mapping_source="auto_exact",
+            confidence=stored.confidence,
+            season_title=state.season_title,
+            season_number=state.season_number,
+            resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
+            detail={**stored.detail, "kept_unconfirmed_by_resolver": SEASON_MAPPING_RESOLVER_VERSION},
+        )
+        return _ApplyTarget(
+            stored.mal_anime_id,
+            stored.mapping_source,
+            float(stored.confidence or 1.0),
+            [f"season_mapping={stored.mapping_source}", season_label, "season_mapping_reresolve_unconfirmed_kept"],
+        )
     if chosen is not None and accepted_by is not None:
         upsert_provider_season_mapping(
             config.db_path,
