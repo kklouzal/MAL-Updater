@@ -36,6 +36,7 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Fixed
 
+- Fixed season sync accuracy on real provider data: each season is numbered by absolute episode numbers when an earlier provider season maps to the same MAL entry (one entry spanning seasons) and by in-season position otherwise; split-cour seasons assign each completed episode to MAL Part 1 or Part 2 (a skipped episode no longer blocks the split, and Part 2 completion needs observed episodes); completions resting on unobserved earlier episodes write the observed count; season matches the title matcher rates below auto-approval are accepted only when the candidate is in the series' MAL franchise, its episode count equals the season's completed episodes, and no same-count sibling or existing season mapping contradicts it.
 - Fixed public MAL user-recommendation refreshes of already-published sources being rejected forever by the queue claim fence.
 - Fixed watch progress of multi-season provider series being summed into one MAL entry (for example 88 episodes on a 16-episode season).
 - Fixed unnumbered PVs, recaps, OVAs and movies counting as watched episodes, and watched counts exceeding the MAL episode count being written; episode numbers continuing across seasons are rebased when they exceed the MAL episode count, and a completion resting only on unobserved lower-numbered episodes goes to review.

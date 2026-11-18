@@ -1124,8 +1124,10 @@ def build_dry_run_sync_plan(
 ) -> list[SyncProposal]:
     states = load_provider_series_states(config, limit=limit, provider=provider, split_seasons=True)
     client = MalClient(config, load_mal_secrets(config))
-    proposals: list[SyncProposal] = []
-    proposal_states: list[ProviderSeriesState] = []
+    # One slot per state, filled in order; resolved states are planned after
+    # every season target is known, since numbering depends on sibling seasons.
+    slots: list[list[tuple[SyncProposal, ProviderSeriesState]]] = []
+    resolved: list[tuple[int, ProviderSeriesState, str, float, int, str | None, bool, list[str]]] = []
     # Keyed per provider series for confirmation provenance, which records the
     # most recently watched season (rank 0) of a season-split series.
     details_by_series: dict[tuple[str, str], dict[str, Any] | None] = {}
@@ -1156,8 +1158,7 @@ def build_dry_run_sync_plan(
                 provider=state.provider,
                 provider_season_key=state.provider_season_key,
             )
-            proposals.append(proposal)
-            proposal_states.append(state)
+            slots.append([(proposal, state)])
             if state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = None
             continue
@@ -1196,12 +1197,19 @@ def build_dry_run_sync_plan(
                 provider=state.provider,
                 provider_season_key=state.provider_season_key,
             )
-            proposals.append(proposal)
-            proposal_states.append(state)
+            slots.append([(proposal, state)])
             if state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = None
             continue
 
+        resolved.append((len(slots), state, mapping_status, confidence, chosen_anime_id, mapping_source, approved, mapping_reasons))
+        slots.append([])
+
+    hints = _season_numbering_hints([(item[1], item[4]) for item in resolved])
+    for slot, state, mapping_status, confidence, chosen_anime_id, mapping_source, approved, mapping_reasons in resolved:
+        hint = hints.get((state.provider, state.provider_series_id, state.provider_season_key))
+        if hint is not None:
+            state = replace(state, numbering_hint=hint)
         try:
             detail = client.get_anime_details(
                 chosen_anime_id,
@@ -1224,8 +1232,7 @@ def build_dry_run_sync_plan(
                 provider=state.provider,
                 provider_season_key=state.provider_season_key,
             )
-            proposals.append(proposal)
-            proposal_states.append(state)
+            slots[slot].append((proposal, state))
             if state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = None
             continue
@@ -1254,10 +1261,11 @@ def build_dry_run_sync_plan(
                 persisted_mapping_approved=approved,
                 extra_reasons=unit_target.reasons,
             )
-            proposals.append(proposal)
-            proposal_states.append(unit_state)
+            slots[slot].append((proposal, unit_state))
             if unit_state.season_unit_rank == 0:
                 details_by_series[(state.provider, state.provider_series_id)] = unit_detail
+    proposals = [proposal for entries in slots for proposal, _ in entries]
+    proposal_states = [unit_state for entries in slots for _, unit_state in entries]
     if provider in {None, "hidive"}:
         coverage = _materialize_hidive_dry_run_confirmations(config, proposal_states, proposals, details_by_series)
         if not coverage["invariant_satisfied"]:
@@ -1284,7 +1292,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.4"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-18.5"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1339,24 +1347,29 @@ def _direct_sequel_id(config: AppConfig, client: MalClient, mal_anime_id: int) -
 
 
 _FRANCHISE_MAX_HOPS = 12
+# Relation lookups per franchise walk. Lookups are cached locally, so the
+# bound only matters for a first walk of a large franchise; a truncated walk
+# makes the corroboration below decline rather than guess.
+_FRANCHISE_MAX_LOOKUPS = 40
 
 
-def _in_mal_franchise(config: AppConfig, client: MalClient, anchor_id: int, candidate_id: int) -> bool:
-    """Whether candidate is reachable from anchor through prequel/sequel links."""
-    frontier, seen = [int(anchor_id)], {int(anchor_id)}
+def _mal_franchise_ids(config: AppConfig, client: MalClient, anchor_id: int) -> tuple[set[int], bool]:
+    """Entries reachable from anchor through prequel/sequel links, and whether the walk finished."""
+    frontier, seen, lookups = [int(anchor_id)], {int(anchor_id)}, 0
     for _ in range(_FRANCHISE_MAX_HOPS):
-        if candidate_id in seen:
-            return True
         next_frontier: list[int] = []
         for mal_id in frontier:
+            if lookups >= _FRANCHISE_MAX_LOOKUPS:
+                return seen, False
+            lookups += 1
             for related, kind in _relation_rows(config, client, mal_id):
                 if kind in ("sequel", "prequel") and related not in seen:
                     seen.add(related)
                     next_frontier.append(related)
         if not next_frontier:
-            break
+            return seen, True
         frontier = next_frontier
-    return candidate_id in seen
+    return seen, False
 
 
 def _franchise_count_corroborated_candidate(
@@ -1369,22 +1382,54 @@ def _franchise_count_corroborated_candidate(
     the same MAL franchise as the series' approved mapping and its episode
     count equals the number of episodes completed in this season (positions
     1..N, i.e. the season was watched through).
+
+    Sibling seasons often share an episode count (two 12-episode seasons),
+    so the count alone cannot tell them apart. The candidate is declined
+    when another TV/ONA candidate of the franchise has the same count, when
+    another provider season of the series already maps to it, or when it is
+    the series anchor while this is a later provider season.
     """
     candidate = result.chosen_candidate or (result.candidates[0] if result.candidates else None)
     if candidate is None or candidate.media_type not in _SPLIT_COUR_MEDIA_TYPES or not candidate.num_episodes:
         return None
+    episodes = int(candidate.num_episodes)
+    candidate_id = int(candidate.mal_anime_id)
     view = _numbering_view(state, None)
     if (
         view.min_episode_number not in (None, 1)
-        or view.completed_episode_count != int(candidate.num_episodes)
-        or int(view.max_completed_episode_number or 0) != int(candidate.num_episodes)
+        or view.completed_episode_count != episodes
+        or int(view.max_completed_episode_number or 0) != episodes
     ):
         return None
     anchor = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
     if anchor is None or not anchor.approved_by_user:
         return None
-    if not _in_mal_franchise(config, client, anchor.mal_anime_id, int(candidate.mal_anime_id)):
+    if candidate_id == int(anchor.mal_anime_id) and state.season_number is not None and int(state.season_number) > 1:
         return None
+    with connect(config.db_path) as conn:
+        claimed = conn.execute(
+            """
+            SELECT 1 FROM provider_season_mappings
+            WHERE provider = ? AND provider_series_id = ? AND provider_season_key != ?
+              AND approved = 1 AND mal_anime_id = ?
+            LIMIT 1
+            """,
+            (state.provider, state.provider_series_id, state.provider_season_key, candidate_id),
+        ).fetchone()
+    if claimed is not None:
+        return None
+    franchise, complete = _mal_franchise_ids(config, client, anchor.mal_anime_id)
+    if candidate_id not in franchise:
+        return None
+    for other in result.candidates:
+        if (
+            int(other.mal_anime_id) != candidate_id
+            and other.media_type in _SPLIT_COUR_MEDIA_TYPES
+            and other.num_episodes
+            and int(other.num_episodes) == episodes
+            and (not complete or int(other.mal_anime_id) in franchise)
+        ):
+            return None
     return candidate
 
 
@@ -1789,6 +1834,16 @@ def _split_cour_units(
     ):
         return [(state, target)]
     max_episode = int(state.max_episode_number or max(numbers))
+    # The derived parts are already in the chosen numbering; clearing the
+    # alternative keeps a later numbering choice from swapping in the whole
+    # unit's in-season counts.
+    resolved_numbering: dict[str, Any] = {
+        "ordinal_completed_episode_count": None,
+        "ordinal_max_completed_episode_number": None,
+        "ordinal_max_episode_number": None,
+        "ordinal_min_episode_number": None,
+        "ordinal_completed_episode_numbers": None,
+    }
     units: list[tuple[ProviderSeriesState, int]] = []
     if first_numbers:
         units.append(
@@ -1803,6 +1858,7 @@ def _split_cour_units(
                     # The unit's last watch may be a Part 2 episode; Part 1's
                     # finish date is unknown, so it is not filled.
                     last_watched_at=None,
+                    **resolved_numbering,
                 ),
                 target.mal_anime_id,
             )
@@ -1814,10 +1870,15 @@ def _split_cour_units(
                 completed_episode_count=len(second_numbers),
                 max_completed_episode_number=max(second_numbers),
                 max_episode_number=max(0, max_episode - first_count),
-                min_episode_number=1,
+                # Started-but-unfinished Part 2 rows are not known per part,
+                # so the first completed Part 2 episode bounds the minimum:
+                # completing Part 2 from its last episodes alone must still
+                # rest on observed episodes (see _provider_watched_episodes).
+                min_episode_number=min(second_numbers),
                 completed_episode_numbers=tuple(second_numbers),
                 # Provenance is one row per provider series; the first part keeps it.
                 season_unit_rank=state.season_unit_rank + (1000 if first_numbers else 0),
+                **resolved_numbering,
             ),
             sequel_id,
         )
@@ -2408,7 +2469,9 @@ def _season_numbering_hints(
 
     If the nearest earlier provider season of the same series resolved to the
     same MAL entry, that entry spans provider seasons and absolute numbers
-    apply; a different entry means each season is its own MAL entry.
+    apply; a different entry means each season is its own MAL entry. Several
+    units can share a season number (e.g. dub and sub seasons); the hint is
+    given only when every unit of the nearest earlier season agrees.
     """
     by_series: dict[tuple[str, str], list[tuple[ProviderSeriesState, int]]] = {}
     for state, mal_id in targets:
@@ -2416,14 +2479,19 @@ def _season_numbering_hints(
             by_series.setdefault((state.provider, state.provider_series_id), []).append((state, int(mal_id)))
     hints: dict[tuple[str, str, str | None], str] = {}
     for units in by_series.values():
-        ordered = sorted(units, key=lambda item: int(item[0].season_number or 0))
-        for previous, current in zip(ordered, ordered[1:]):
-            if previous[0].season_number == current[0].season_number:
+        targets_by_season: dict[int, set[int]] = {}
+        for state, mal_id in units:
+            targets_by_season.setdefault(int(state.season_number or 0), set()).add(mal_id)
+        for state, mal_id in units:
+            earlier = [number for number in targets_by_season if number < int(state.season_number or 0)]
+            if not earlier:
                 continue
-            state = current[0]
-            hints[(state.provider, state.provider_series_id, state.provider_season_key)] = (
-                "absolute" if previous[1] == current[1] else "ordinal"
-            )
+            previous = targets_by_season[max(earlier)]
+            key = (state.provider, state.provider_series_id, state.provider_season_key)
+            if previous == {mal_id}:
+                hints[key] = "absolute"
+            elif mal_id not in previous:
+                hints[key] = "ordinal"
     return hints
 
 
