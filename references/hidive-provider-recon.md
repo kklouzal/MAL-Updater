@@ -405,9 +405,9 @@ In other words, the remaining gap is now mostly **frontend route archaeology**, 
    - identify the exact page chunk(s) and fetch path(s) for `my-list` / `watchlists`
    - look for list enumeration, selected list ids, and per-list content resolution
 
-2. **Continue-watching / progress fidelity**
-   - inspect whether `watchProgress` is consistently present only for partially watched items
-   - determine whether missing `watchProgress` implies watched/completed versus stale/home fallback data
+2. **Continue-watching / progress fidelity** (answered by the 2026-11-18 probes)
+   - `watchProgress` (seconds) is present only while an episode is unfinished; HIDIVE clears it once the episode is finished (all 20 of 401 history items carrying it were partial plays), and `watchedAt` is the play start time. A history item without `watchProgress` is therefore a finished episode.
+   - `/content/home` pages buckets with `bpp` and items per bucket with `rpp` (at most 25; `rpp=50` answers HTTP 400; `size`/`page` are ignored), so `rpp=25` returns the whole Continue Watching bucket up to 25 items.
 
 3. **Token lifecycle**
    - record bearer token expiry claims directly and align refresh timing to the observed server rule
@@ -423,8 +423,10 @@ snapshot is operator-visible/info and automation-safe only when its persisted
 diagnostics prove all of the following: the boundary belongs to the current
 account, page 1 intersects the expected history marker, and the retained
 watchlist generation is authoritative.  In that state, the documented
-unpageable history and Continue Watching limitations remain visible, while a
-redundant generic `snapshot_partial` diagnostic is suppressed.
+history limitation and any Continue Watching bucket larger than the 25-item
+per-bucket maximum remain visible (a complete Continue Watching bucket carries
+no limitation diagnostic), while a redundant generic `snapshot_partial`
+diagnostic is suppressed.
 
 Bootstrap/manual full-history inability to establish that boundary, an account
 mismatch, a missing expected boundary intersection, incomplete watchlist

@@ -423,6 +423,23 @@ class SeasonSplitExecutorTests(unittest.TestCase):
             execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
         self.assertEqual([(500, 102)], [(call.args[0], call.kwargs["num_watched_episodes"]) for call in update.call_args_list])
 
+    def test_rows_without_ordinals_keep_provider_numbering(self) -> None:
+        # Rows stored before ordinals were captured carry only the absolute
+        # number; mixing them with in-season positions would corrupt both views.
+        progress = []
+        for ordinal in range(1, 6):
+            row = self._progress("cr-1", "FS", 59 + ordinal, season_number=4, watched_at=f"2026-03-01T00:0{ordinal}:00Z")
+            if ordinal >= 4:
+                row["season_episode_ordinal"] = ordinal
+            progress.append(row)
+        recap = self._progress("cr-1", "FS", 0, season_number=4, watched_at="2026-03-01T00:09:00Z")
+        recap.update(provider_episode_id="cr-1-recap", episode_number=None, season_episode_ordinal=None)
+        progress.append(recap)
+        self._ingest([("cr-1", "Titan")], progress)
+        (state,) = load_provider_series_states(self.config, split_seasons=True)
+        self.assertIsNone(state.ordinal_completed_episode_count)
+        self.assertEqual(64, state.max_completed_episode_number)
+
     def test_ova_season_never_auto_matches_a_tv_entry(self) -> None:
         # Production case: "Attack on Titan OADs" auto-matched the TV season 1.
         from mal_updater.mapping import MappingCandidate, MappingResult
@@ -444,6 +461,69 @@ class SeasonSplitExecutorTests(unittest.TestCase):
             target = _resolve_season_target(self.config, MalClient(self.config, load_mal_secrets(self.config)), state, search_budget=[1])
         self.assertIsNone(target.mal_anime_id)
         self.assertIn("season_mapping_unresolved", target.reasons)
+
+    def test_stale_automatic_season_match_survives_an_empty_re_resolution(self) -> None:
+        from mal_updater.config import load_mal_secrets
+        from mal_updater.mapping import MappingResult
+        from mal_updater.sync_planner import _resolve_season_target
+
+        progress = [self._progress("cr-1", key, 1, season_number=n, watched_at=f"2026-03-0{n}T00:00:00Z") for n, key in ((1, "S1"), (2, "S2"))]
+        self._ingest([("cr-1", "Show")], progress)
+        upsert_provider_season_mapping(
+            self.config.db_path, provider="crunchyroll", provider_series_id="cr-1", provider_season_key="S2",
+            mal_anime_id=222, mapping_source="auto_exact", confidence=1.0,
+            season_title="Season 2", season_number=2, resolver_version="older",
+        )
+        state = next(s for s in load_provider_series_states(self.config, split_seasons=True) if s.provider_season_key == "S2")
+        # map_series tolerates MAL search errors and then returns no candidates.
+        empty = MappingResult(series=None, status="no_candidates", confidence=0.0, chosen_candidate=None, candidates=[], rationale=[])
+        client = MalClient(self.config, load_mal_secrets(self.config))
+        budget = [1]
+        with patch("mal_updater.sync_planner.map_series", return_value=empty):
+            target = _resolve_season_target(self.config, client, state, search_budget=budget)
+        self.assertEqual(222, target.mal_anime_id)
+        self.assertIn("season_mapping_reresolve_inconclusive", target.reasons)
+        self.assertEqual(0, budget[0])
+        stored = get_provider_season_mapping(self.config.db_path, provider="crunchyroll", provider_series_id="cr-1", provider_season_key="S2")
+        assert stored is not None
+        self.assertEqual(("auto_exact", "older"), (stored.mapping_source, stored.resolver_version))
+        # With the search budget spent, the stale match keeps applying.
+        with patch("mal_updater.sync_planner.map_series") as search:
+            target = _resolve_season_target(self.config, client, state, search_budget=[0])
+        search.assert_not_called()
+        self.assertEqual(222, target.mal_anime_id)
+
+    def test_sibling_season_with_its_own_mal_entry_uses_in_season_position(self) -> None:
+        # Season 2 numbered 13-24 has its own 25-episode MAL entry: watching 13-20
+        # is 8 episodes of that entry, although the absolute 20 would "fit".
+        progress = []
+        for n in range(1, 13):
+            row = self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z")
+            row["season_episode_ordinal"] = n
+            progress.append(row)
+        for ordinal in range(1, 9):
+            row = self._progress("cr-1", "S2", 12 + ordinal, season_number=2, watched_at=f"2026-03-05T00:{ordinal:02d}:00Z")
+            row["season_episode_ordinal"] = ordinal
+            progress.append(row)
+        self._ingest([("cr-1", "Example Show")], progress)
+        self._map_series("cr-1", 100)
+        for key, mal_id, season in (("S1", 100, 1), ("S2", 200, 2)):
+            upsert_provider_season_mapping(
+                self.config.db_path, provider="crunchyroll", provider_series_id="cr-1", provider_season_key=key,
+                mal_anime_id=mal_id, mapping_source="auto_exact", confidence=1.0,
+                season_title=f"Season {season}", season_number=season, resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
+            )
+
+        def details(anime_id, **_kwargs):
+            return {"id": anime_id, "title": f"MAL {anime_id}", "num_episodes": 12 if anime_id == 100 else 25,
+                    "media_type": "tv", "status": "finished_airing", "my_list_status": None, "alternative_titles": {}}
+
+        with patch.object(MalClient, "get_anime_details", side_effect=details), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list}
+        self.assertEqual({100: ("completed", 12), 200: ("watching", 8)}, writes)
 
     def test_unresolved_season_is_reviewed_and_never_written(self) -> None:
         progress = [self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-03-01T00:00:00Z")]

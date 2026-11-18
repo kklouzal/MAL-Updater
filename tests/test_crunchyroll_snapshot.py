@@ -1297,3 +1297,5 @@ class CrunchyrollEpisodeNumberingTests(unittest.TestCase):
         self.assertEqual((None, None), _episode_numbers({"episode_number": 1, "sequence_number": 29}, "SP1"))
         self.assertEqual((None, None), _episode_numbers({"episode_number": 12, "sequence_number": 12.5}, "12.5"))
         self.assertEqual((3, 3), _episode_numbers({"episode_number": 3, "sequence_number": 3.0}, None))
+        # An unnumbered item (recap, movie) gets no in-season position either.
+        self.assertEqual((None, None), _episode_numbers({"episode_number": None, "sequence_number": 13}, None))

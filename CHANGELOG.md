@@ -16,6 +16,7 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Added staged Crunchyroll cold-bootstrap recovery and quarantine/reset controls that preserve the last-known-good boundary.
 - Added per-season sync for provider series spanning several seasons: episodes record their canonical provider season (migration 032; Crunchyroll dubs collapse onto the original-language season), each season resolves to its own MAL entry (migration 033), and unresolved seasons go to review with an `unresolved_season_mappings` health warning and a `season-mappings` command to list/approve them.
 - Added `apply-sync --provider` and `mal-refresh --force/--min-remaining-hours`.
+- Added the in-season episode position (migration 034; Crunchyroll `sequence_number`, HIDIVE per-season number). Each MAL target uses the provider's episode numbers when they fit the entry (one MAL entry spanning several provider seasons) and the in-season position otherwise, so a season numbered 60-87 syncs as 1-28 (then split across MAL Part 1/Part 2).
 
 ### Changed
 
@@ -28,6 +29,9 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - `apply-sync --limit` now bounds live revalidations/writes instead of the number of series inspected: every approved series is planned from cached MAL state and writes go most recently watched first, with the remainder reported as `deferred`. `apply-sync` exits non-zero when any item failed.
 - Unattended `sync_apply` now applies each provider whose fetch succeeded since the previous apply instead of requiring every provider to succeed in the same scheduler pass.
 - MAL token refresh renews only when the recorded access-token expiry is within 7 days (or unknown), and persists a rotated refresh token before the access token so an interrupted write cannot strand it.
+- HIDIVE history items without `watchProgress` now count as finished episodes (HIDIVE clears the resume point once an episode is finished); partial plays keep their position.
+- HIDIVE Continue Watching is read with `bpp=5`/`rpp=25`, which returns the whole bucket up to 25 items; it is reported partial only beyond that, and a hot snapshot with a complete Continue Watching bucket is healthy.
+- Automatic season matches from older resolver versions are re-resolved (within the per-run search budget; the stored match keeps applying until then), and a provider season titled OVA/OAD/special/movie/recap never auto-matches a TV entry.
 - The service MAL list refresh now requests `limit=1000` pages and prunes rows removed on MAL after a complete traversal; snapshot drift restarts in-run and is never terminal, and auth failures retry instead of quarantining.
 
 ### Fixed
@@ -37,7 +41,8 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Fixed unnumbered PVs, recaps, OVAs and movies counting as watched episodes, and watched counts exceeding the MAL episode count being written; episode numbers continuing across seasons are rebased when they exceed the MAL episode count, and a completion resting only on unobserved lower-numbered episodes goes to review.
 - Fixed unattended `sync_apply` being skipped since late September because fetch lanes never all succeeded in one scheduler pass, and `apply-sync --limit` never reaching older backlog.
 - Fixed Crunchyroll episodes flagged fully watched not completing when a playhead was also present.
-- Fixed HIDIVE Continue Watching positions of 0/1 seconds being read as 0%/100% watched, history paging (only the first 5 entries were read), and a hot sync boundary that could never be reached again; HIDIVE history-only episodes now count as completed when the next episode of the same season was started at least 90% of the runtime later.
+- Fixed Crunchyroll specials ("SP1", "SP2") counting as episodes 1/2 of their season.
+- Fixed HIDIVE Continue Watching positions of 0/1 seconds being read as 0%/100% watched, history paging (only the first 5 entries were read), and a hot sync boundary that could never be reached again; HIDIVE history items whose progress is unknown count as completed when the next episode of the same season was started at least 85% of the runtime later.
 - Fixed the MAL list cache going stale after repeated drift quarantines caused by MAL flipping `main_picture` URLs; legacy drift quarantines resume automatically.
 - Fixed Crunchyroll full refreshes failing validation when the offset-paged watchlist repeats a series across pages; repeats are dropped and the surface is marked partial.
 - Fixed HIDIVE sync failing indefinitely once the saved refresh token expired (HIDIVE answers it with HTTP 404); an expired refresh token now triggers one credential re-login.

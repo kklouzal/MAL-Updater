@@ -354,7 +354,7 @@ def _history_item_to_progress(item: dict[str, Any]) -> EpisodeProgress | None:
     # episode is unfinished and clears it once the episode is finished
     # (probed 2026-11-18: all 20 of 401 history items carrying progress were
     # partial plays). A history item without progress is a finished episode.
-    if "watchProgress" in item and item.get("watchProgress") is not None:
+    if item.get("watchProgress") is not None:
         playback_seconds, completion_ratio = _normalize_hidive_watch_progress(item.get("watchProgress"), duration_seconds)
         playback_position_ms = playback_seconds * 1000 if playback_seconds is not None else None
         observation_kind = "position" if playback_position_ms is not None else "history_membership"

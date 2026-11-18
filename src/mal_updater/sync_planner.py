@@ -92,6 +92,10 @@ class ProviderSeriesState:
     ordinal_max_completed_episode_number: int | None = None
     ordinal_max_episode_number: int | None = None
     ordinal_min_episode_number: int | None = None
+    # "absolute" when an earlier provider season of the series maps to the
+    # same MAL entry (the entry spans seasons), "ordinal" when it maps to a
+    # different one; None when unknown.
+    numbering_hint: str | None = None
 
 
 @dataclass(slots=True)
@@ -389,17 +393,19 @@ def load_provider_series_states(
         keyed_units = bool(season_groups)
         for season_key, unit_progress in units:
             summary = _summarize_episode_progress(unit_progress, config)
+            # In-season numbering needs an ordinal on every numbered row: rows
+            # stored before ordinals were captured carry only the provider
+            # number, and mixing the two numberings would corrupt both views.
+            numbered = [row for row in unit_progress if row.episode_number is not None]
             ordinal_summary = (
                 _summarize_episode_progress(
                     [
-                        replace(row, episode_number=row.season_episode_ordinal)
-                        if row.season_episode_ordinal is not None
-                        else row
+                        replace(row, episode_number=row.season_episode_ordinal if row.episode_number is not None else None)
                         for row in unit_progress
                     ],
                     config,
                 )
-                if keyed_units and any(row.season_episode_ordinal is not None for row in unit_progress)
+                if keyed_units and numbered and all(row.season_episode_ordinal is not None for row in numbered)
                 else None
             )
             season_split = season_key is not None
@@ -941,6 +947,8 @@ def _persist_watch_confirmation_provenance_snapshot(
         # records its most recently watched season only.
         return
     mal_num_episodes = _coerce_detail_int((detail or {}).get("num_episodes"))
+    # Record the episode counts in the numbering the decision used.
+    state = _numbering_view(state, mal_num_episodes)
     provider_watched_episodes, _, _ = _provider_watched_episodes(state, mal_num_episodes)
     confirmed_complete, completion_decision, completion_status = _completion_decision_for_provenance(
         provider_watched_episodes=provider_watched_episodes,
@@ -1388,6 +1396,16 @@ def _resolve_season_target(
         return _ApplyTarget(None, None, 0.0, ["season_mapping_pending_search_budget", season_label])
     search_budget[0] -= 1
     result = map_series(client, _build_series_mapping_input(state))
+    if not result.candidates and stored is not None and stored.approved and stored.mal_anime_id is not None:
+        # Re-resolving a stale automatic match found no candidates at all: a
+        # failed or empty search (map_series tolerates MAL search errors) is
+        # no evidence against the match, so keep it and retry on a later run.
+        return _ApplyTarget(
+            stored.mal_anime_id,
+            stored.mapping_source,
+            float(stored.confidence or 1.0),
+            [f"season_mapping={stored.mapping_source}", season_label, "season_mapping_reresolve_inconclusive"],
+        )
     chosen = result.chosen_candidate
     candidates = [
         {"mal_anime_id": candidate.mal_anime_id, "title": candidate.title, "media_type": candidate.media_type}
@@ -1500,8 +1518,9 @@ def execute_approved_sync(
             reasons=preview.reasons + extra,
         )
 
-    # Phase 1: plan every unit from cached MAL state (no write budget used).
-    candidates: list[tuple[ProviderSeriesState, _ApplyTarget, SyncProposal | None, list[str], dict[str, Any] | None]] = []
+    # Phase 1: resolve every unit's MAL target, then plan each from cached MAL
+    # state (no write budget used).
+    targeted: list[tuple[ProviderSeriesState, _ApplyTarget, list[str]]] = []
     for state in states:
         persisted = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
         if persisted is None or not _is_approved_mapping_eligible(persisted, exact_approved_only=exact_approved_only):
@@ -1526,6 +1545,15 @@ def execute_approved_sync(
             continue
         if exact_approved_only and target.mapping_source not in EXACT_APPROVED_MAPPING_SOURCES:
             continue
+        targeted.append((state, target, base_reasons))
+
+    hints = _season_numbering_hints([(state, target.mal_anime_id) for state, target, _ in targeted])
+    candidates: list[tuple[ProviderSeriesState, _ApplyTarget, SyncProposal | None, list[str], dict[str, Any] | None]] = []
+    for state, target, base_reasons in targeted:
+        assert target.mal_anime_id is not None
+        hint = hints.get((state.provider, state.provider_series_id, state.provider_season_key))
+        if hint is not None:
+            state = replace(state, numbering_hint=hint)
         first_detail, first_lookup_reasons = _cached_detail(client, target.mal_anime_id)
         target = _ApplyTarget(target.mal_anime_id, target.mapping_source, target.confidence, base_reasons + target.reasons)
         for unit_state, unit_target in _split_cour_units(config, client, state, target, first_detail=first_detail):
@@ -2041,6 +2069,12 @@ def _plan_status_update_for_state(
     mal_anime_id = int(detail["id"])
     current_status = detail.get("my_list_status") or None
     num_episodes = detail.get("num_episodes")
+    # Report the episode counts in the numbering the decision uses.
+    state = _numbering_view(
+        state,
+        _coerce_detail_int(num_episodes),
+        current_watched=_coerce_optional_int((current_status or {}).get("num_episodes_watched")),
+    )
     provider_watched_episodes, watched_reason, watched_review_reason = _provider_watched_episodes(
         state,
         _coerce_detail_int(num_episodes),
@@ -2278,7 +2312,35 @@ def _plan_status_update_for_state(
     )
 
 
-def _numbering_view(state: ProviderSeriesState, mal_num_episodes: int | None) -> ProviderSeriesState:
+def _season_numbering_hints(
+    targets: list[tuple[ProviderSeriesState, int | None]]
+) -> dict[tuple[str, str, str | None], str]:
+    """Derive per-season numbering from how sibling seasons resolved.
+
+    If the nearest earlier provider season of the same series resolved to the
+    same MAL entry, that entry spans provider seasons and absolute numbers
+    apply; a different entry means each season is its own MAL entry.
+    """
+    by_series: dict[tuple[str, str], list[tuple[ProviderSeriesState, int]]] = {}
+    for state, mal_id in targets:
+        if state.season_split and mal_id is not None and state.season_number is not None:
+            by_series.setdefault((state.provider, state.provider_series_id), []).append((state, int(mal_id)))
+    hints: dict[tuple[str, str, str | None], str] = {}
+    for units in by_series.values():
+        ordered = sorted(units, key=lambda item: int(item[0].season_number or 0))
+        for previous, current in zip(ordered, ordered[1:]):
+            if previous[0].season_number == current[0].season_number:
+                continue
+            state = current[0]
+            hints[(state.provider, state.provider_series_id, state.provider_season_key)] = (
+                "absolute" if previous[1] == current[1] else "ordinal"
+            )
+    return hints
+
+
+def _numbering_view(
+    state: ProviderSeriesState, mal_num_episodes: int | None, *, current_watched: int | None = None
+) -> ProviderSeriesState:
     """Choose absolute or in-season episode numbering for one MAL target.
 
     Provider episode numbers can be absolute across a series (Attack on Titan
@@ -2292,8 +2354,22 @@ def _numbering_view(state: ProviderSeriesState, mal_num_episodes: int | None) ->
     if state.ordinal_completed_episode_count is None:
         return state
     absolute_max = int(state.max_completed_episode_number or state.max_episode_number or 0)
-    if mal_num_episodes and mal_num_episodes > 0 and absolute_max and absolute_max <= mal_num_episodes:
+    if state.numbering_hint == "absolute":
         return state
+    if state.numbering_hint is None:
+        if mal_num_episodes and mal_num_episodes > 0:
+            if absolute_max and absolute_max <= mal_num_episodes:
+                return state
+        elif (
+            current_watched is not None
+            and state.min_episode_number is not None
+            and int(state.min_episode_number) > 1
+            and current_watched >= int(state.min_episode_number) - 1
+            and current_watched > int(state.ordinal_max_completed_episode_number or 0)
+        ):
+            # Unknown MAL count (still airing): MAL already records the
+            # episodes before this season, so the entry spans provider seasons.
+            return state
     return replace(
         state,
         completed_episode_count=state.ordinal_completed_episode_count,
@@ -2322,7 +2398,7 @@ def _provider_watched_episodes(
     is correct for a MAL entry spanning several provider seasons (e.g. a
     long-running series MAL lists as one entry).
     """
-    state = _numbering_view(state, mal_num_episodes)
+    state = _numbering_view(state, mal_num_episodes, current_watched=current_watched)
     count = state.completed_episode_count
     max_number = int(state.max_completed_episode_number or 0)
     min_number = int(state.min_episode_number or 1)

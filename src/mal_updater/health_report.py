@@ -364,16 +364,18 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
         and authority.get("account_identity_proven") is True
         and authority.get("history_front_boundary_complete") is True
         and authority.get("history_full_complete") is False
-        and authority.get("continue_complete") is False
+        and isinstance(authority.get("continue_complete"), bool)
         and authority.get("watchlist_authority_safe") is True
     )
     # A hot fetch that intersects its saved history marker has completed the
     # bounded history-front objective and legitimately has no history-partial
-    # diagnostic.  Continue Watching is still concretely partial/unpageable and
-    # remains required; the known history limitation is allowed when emitted.
-    expected_limitations = {"continue_watching_partial_unpageable"}
+    # diagnostic; the known history limitation is allowed when emitted.
+    # Continue Watching arrives whole up to 25 items (rpp=25); only a larger
+    # bucket is partial, and then its limitation diagnostic is required. A
+    # complete bucket that still reports the limitation is contradictory.
+    continue_partial = isinstance(authority, dict) and authority.get("continue_complete") is False
     only_documented_limitations = bool(
-        expected_limitations.issubset(codes)
+        ("continue_watching_partial_unpageable" in codes) == continue_partial
         and codes.issubset(documented_limitations)
     )
     automation_safe = authority_safe and only_documented_limitations

@@ -621,12 +621,16 @@ def _episode_numbers(metadata: dict[str, Any], episode_label: str | None) -> tup
     episode_number values (SP1 -> 1), so they get neither number. Otherwise
     episode_number is the provider number (possibly absolute across the
     series, e.g. 60-87) and the ordinal is sequence_number, the position
-    within the season (probed 2026-11-18).
+    within the season (probed 2026-11-18). An item without an episode number
+    (recap, movie) gets no ordinal either: the planner never counts
+    unnumbered items as episodes, under either numbering.
     """
     if episode_label is not None and not episode_label.isdigit():
         return None, None
     number = metadata.get("episode_number")
     episode_number = number if isinstance(number, int) and not isinstance(number, bool) else None
+    if episode_number is None:
+        return None, None
     sequence = metadata.get("sequence_number")
     if isinstance(sequence, float) and sequence.is_integer():
         sequence = int(sequence)

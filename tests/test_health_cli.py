@@ -207,6 +207,47 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual("unhealthy", posture["health_posture"])
         self.assertFalse(posture["automation_safe"])
 
+    def test_hidive_hot_surface_with_complete_continue_watching_is_automation_safe(self) -> None:
+        # rpp=25 returns the whole Continue Watching bucket, so a hot run can
+        # be complete there and carry no Continue Watching limitation.
+        authority = {
+            "code": "hidive_surface_authority",
+            "surface": "provider_snapshot",
+            "severity": "info",
+            "sync_boundary_mode": "hot",
+            "sync_boundary_account_status": "account_match",
+            "producer_authenticated": True,
+            "account_identity_proven": True,
+            "history_front_boundary_complete": True,
+            "history_full_complete": False,
+            "continue_complete": True,
+            "watchlist_authority_safe": True,
+        }
+        from mal_updater.health_report import _provider_surface_diagnostics_from_sync_run
+
+        posture = _provider_surface_diagnostics_from_sync_run(
+            {"id": 1, "provider": "hidive", "mode": "hot", "summary": {"diagnostics": [authority]}}
+        )
+        self.assertIsNotNone(posture)
+        self.assertEqual("operator_visible", posture["health_posture"])
+        self.assertTrue(posture["automation_safe"])
+
+        contradictory = _provider_surface_diagnostics_from_sync_run(
+            {
+                "id": 2,
+                "provider": "hidive",
+                "mode": "hot",
+                "summary": {
+                    "diagnostics": [
+                        {"code": "continue_watching_partial_unpageable", "surface": "continue_watching", "severity": "info"},
+                        authority,
+                    ]
+                },
+            }
+        )
+        self.assertIsNotNone(contradictory)
+        self.assertEqual("unhealthy", contradictory["health_posture"])
+
     def test_hidive_surface_authority_matrix_fails_closed(self) -> None:
         base = {
             "code": "hidive_surface_authority",
