@@ -1325,10 +1325,11 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.6"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.8"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
+_FILM_TITLE_KINDS = frozenset({"movie", "movies", "film"})
 SEASON_MAPPING_RETRY_SECONDS = 7 * 24 * 60 * 60
 _MAL_SYNC_DETAIL_FIELDS = "id,title,num_episodes,media_type,status,my_list_status,alternative_titles"
 
@@ -1528,12 +1529,17 @@ def _catalog_dated_candidate(
     if first is not None:
         entries = [entry for entry in pool if entry.start is not None]
         chosen_entry = _catalog_entry_for_family(config, client, state, catalog, first, entries, family) if entries else None
-    if chosen_entry is None and (first is None or batch_dated) and franchise_complete and not auxiliary_season:
+    if chosen_entry is None and (first is None or batch_dated) and franchise_complete and not auxiliary_season and catalog.complete:
         # Single-day dates are a real release for an OVA set but a batch drop
         # for a dub catalog; when they fit no entry, fall back to the count.
         chosen_entry = _catalog_count_fingerprint(catalog, pool)
+        if chosen_entry is not None and _claimed_by_other_season(config, state, chosen_entry.mal_anime_id):
+            # The count is shared with a season mapped elsewhere (a 24-episode
+            # season 1 and a dub season 2 that MAL splits 12 + 12).
+            chosen_entry = None
     single_movie = not catalog.numbered_episode_count and catalog.total_episode_count == 1
-    if chosen_entry is None and single_movie and franchise_complete:
+    title_kinds = {kind.lower() for kind in _AUXILIARY_SEASON_TITLE_RE.findall(state.season_title or "")}
+    if chosen_entry is None and single_movie and franchise_complete and not title_kinds - _FILM_TITLE_KINDS:
         # A one-item season without numbered episodes is a film; a dub
         # catalog dates it by the dub release, so take the franchise's only
         # movie entry when there is exactly one.
@@ -1619,21 +1625,27 @@ def _catalog_entry_for_family(
     entry's start (a simulcast).
     """
     tolerance = timedelta(days=_CATALOG_DATE_TOLERANCE_DAYS)
-    entries = _without_same_week_onas(entries)
     if catalog.date_kind == "original_air":
         starts = sorted(
             (entry for entry in entries if entry.start is not None and abs(entry.start - first) <= tolerance),
             key=lambda entry: abs((entry.start or first) - first),
         )
-        if not starts:
-            return None
-        if len(starts) > 1 and abs((starts[0].start or first) - first) == abs((starts[1].start or first) - first):
+
+        def tied(found: list[_DatedEntry]) -> bool:
+            return len(found) > 1 and abs((found[0].start or first) - first) == abs((found[1].start or first) - first)
+
+        if tied(starts):
+            # A same-week mini ONA loses a tie to its TV entry; an ONA strictly
+            # nearer to the season's broadcast is the season's own entry.
+            starts = _without_same_week_onas(starts)
+        if not starts or tied(starts):
             return None
         # The entry that starts with the season is its MAL entry (Part 1 of a
         # split cour, or the TV season of a provider season with appended
         # extras, or a season still airing). How many episodes go where is the
         # planner's job: it splits into the sequel or reviews an overflow.
         return starts[0]
+    entries = _without_same_week_onas(entries)
     count = catalog.numbered_episode_count or catalog.total_episode_count
     started = sorted(
         (entry for entry in entries if entry.start is not None and entry.start <= first + tolerance),
@@ -1686,17 +1698,7 @@ def _franchise_count_corroborated_candidate(
         return None
     if candidate_id == int(anchor.mal_anime_id) and state.season_number is not None and int(state.season_number) > 1:
         return None
-    with connect(config.db_path) as conn:
-        claimed = conn.execute(
-            """
-            SELECT 1 FROM provider_season_mappings
-            WHERE provider = ? AND provider_series_id = ? AND provider_season_key != ?
-              AND approved = 1 AND mal_anime_id = ?
-            LIMIT 1
-            """,
-            (state.provider, state.provider_series_id, state.provider_season_key, candidate_id),
-        ).fetchone()
-    if claimed is not None:
+    if _claimed_by_other_season(config, state, candidate_id):
         return None
     franchise, complete = _mal_franchise_ids(config, client, anchor.mal_anime_id)
     if candidate_id not in franchise:
@@ -1711,6 +1713,42 @@ def _franchise_count_corroborated_candidate(
         ):
             return None
     return candidate
+
+
+def _in_series_franchise(config: AppConfig, client: MalClient, state: ProviderSeriesState, mal_anime_id: int) -> bool:
+    """Whether the entry is in the series' franchise (unknown franchise -> True).
+
+    Older resolver versions accepted title-search hits outside the franchise;
+    such a match is not kept when the franchise walk proves it unrelated.
+    """
+    anchor = get_series_mapping(config.db_path, state.provider, state.provider_series_id)
+    if anchor is None or not anchor.approved_by_user:
+        return True
+    franchise, complete = _mal_franchise_ids(config, client, anchor.mal_anime_id)
+    if not complete:
+        return True
+    leaves = {
+        related
+        for mal_id in franchise
+        for related, kind in _relation_rows(config, client, mal_id)
+        if kind in _CATALOG_LEAF_RELATIONS | _CATALOG_ALTERNATIVE_RELATIONS
+    }
+    return int(mal_anime_id) in franchise or int(mal_anime_id) in leaves
+
+
+def _claimed_by_other_season(config: AppConfig, state: ProviderSeriesState, mal_anime_id: int) -> bool:
+    """Whether another provider season of the series already maps to the entry."""
+    with connect(config.db_path) as conn:
+        claimed = conn.execute(
+            """
+            SELECT 1 FROM provider_season_mappings
+            WHERE provider = ? AND provider_series_id = ? AND provider_season_key != ?
+              AND approved = 1 AND mal_anime_id = ?
+            LIMIT 1
+            """,
+            (state.provider, state.provider_series_id, state.provider_season_key, int(mal_anime_id)),
+        ).fetchone()
+    return claimed is not None
 
 
 def _split_cour_first_part(
@@ -1827,17 +1865,24 @@ def _resolve_season_target(
             chosen = None
         else:
             accepted_by = "mapping_engine_auto_approval"
-    if accepted_by is None and chosen is not None:
-        split_first = _split_cour_first_part(config, client, state, list(result.candidates))
-        if split_first is not None:
-            chosen, accepted_by = split_first, "split_cour_first_part"
+    # Catalog dates come before the count-based rules: the split-cour rule
+    # once took season 1 as "Part 1" of a provider season 2 whose episodes
+    # fit both entries (Assassination Classroom).
     if accepted_by is None:
         dated = _catalog_dated_candidate(config, client, state, result, catalog, auxiliary_season=auxiliary_season)
         if dated is not None:
             chosen, accepted_by = dated, f"season_catalog_{catalog.date_kind if catalog else 'dates'}"
     if accepted_by is None and chosen is not None:
+        split_first = _split_cour_first_part(config, client, state, list(result.candidates))
+        if (
+            split_first is not None
+            and not _catalog_contradicts(client, catalog, split_first.mal_anime_id)
+            and not _claimed_by_other_season(config, state, split_first.mal_anime_id)
+        ):
+            chosen, accepted_by = split_first, "split_cour_first_part"
+    if accepted_by is None and chosen is not None:
         corroborated = _franchise_count_corroborated_candidate(config, client, state, result)
-        if corroborated is not None:
+        if corroborated is not None and not _catalog_contradicts(client, catalog, corroborated.mal_anime_id):
             chosen, accepted_by = corroborated, "franchise_episode_count_corroborated"
     if (
         accepted_by is None
@@ -1846,9 +1891,12 @@ def _resolve_season_target(
         and stored.mapping_source == "auto_exact"
         and stored.mal_anime_id is not None
         and not _catalog_contradicts(client, catalog, stored.mal_anime_id)
+        and not (auxiliary_season and (kept := _dated_entry(client, stored.mal_anime_id)) is not None and kept.media_type == "tv")
+        and _in_series_franchise(config, client, state, stored.mal_anime_id)
     ):
         # Re-checking an earlier automatic match that the current rules cannot
-        # confirm is not evidence against it; only contradicting dates demote it.
+        # confirm is not evidence against it; only contradicting dates or a
+        # TV entry for an extras/film season (never auto-matched) demote it.
         # It is restamped with the current resolver so it is not re-searched.
         upsert_provider_season_mapping(
             config.db_path,

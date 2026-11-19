@@ -981,10 +981,19 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
             self.assertFalse(_catalog_contradicts(client, catalog, 100))
             self.assertTrue(_catalog_contradicts(client, catalog, 200))
 
+    def test_split_rule_never_takes_an_entry_the_dates_contradict(self) -> None:
+        # Production case (Assassination Classroom): provider season 2 (25
+        # episodes, 2016) fit "season 1 (22) + sequel" and was taken as Part 1.
+        self._seed("crunchyroll", "Season 2", relations={100: [(300, "sequel")], 300: [(100, "prequel")]})
+        entries = {100: ("tv", 22, "2015-01-10", "2015-06-20"), 300: ("tv", 25, "2016-01-08", "2016-06-30")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2016-01-07", "last": "2016-06-30", "count": 25},
+                               entries, engine_choice=300)
+        self.assertEqual(300, target.mal_anime_id)
+
     def test_unconfirmed_earlier_automatic_match_is_kept(self) -> None:
         from mal_updater.season_mappings import get_provider_season_mapping
 
-        self._seed("crunchyroll", "Season 2", relations={100: [], 900: []})
+        self._seed("crunchyroll", "Season 2", relations={100: [(900, "sequel")], 900: [(100, "prequel")]})
         upsert_provider_season_mapping(
             self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="SX",
             mal_anime_id=900, mapping_source="auto_exact", confidence=0.9, season_title="Season 2", season_number=2,
@@ -992,7 +1001,7 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         )
         entries = {100: ("tv", 12, "2018-01-01", "2018-03-20"), 900: ("tv", 12, "2021-01-01", "2021-03-20")}
         # The matcher now offers a different, unconfirmable candidate.
-        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2021-01-02", "last": "2021-03-21"}, entries,
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2021-02-15", "last": "2021-03-21"}, entries,
                                engine_choice=100)
         self.assertEqual(900, target.mal_anime_id)
         self.assertIn("season_mapping_reresolve_unconfirmed_kept", target.reasons)
@@ -1039,6 +1048,48 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         entries = {100: ("tv", 24, "2018-10-02", "2019-03-19"), 700: ("ova", 5, "2019-07-09", "2020-11-27")}
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2019-07-09", "last": "2020-11-27", "count": 5}, entries)
         self.assertEqual(700, target.mal_anime_id)
+
+    def test_ona_season_strictly_nearer_than_its_tv_sibling_takes_the_ona(self) -> None:
+        # A chibi ONA's own provider season starts 3 days after the TV season:
+        # the TV entry is still within tolerance but the ONA airs on that day.
+        self._seed("crunchyroll", "Chiichai", relations={100: [(900, "sequel")], 900: [(100, "prequel")]})
+        entries = {100: ("tv", 12, "2022-07-14", "2022-09-29"), 900: ("ona", 24, "2022-07-17", "2023-10-01")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-07-17", "last": "2023-10-01", "count": 24}, entries)
+        self.assertEqual(900, target.mal_anime_id)
+
+    def test_count_fingerprint_declines_an_entry_another_season_maps_to(self) -> None:
+        # Season 1 (24 episodes) is mapped; a batch-dated dub season 2 of 24
+        # episodes that MAL splits 12 + 12 must not take season 1's entry.
+        self._seed("crunchyroll", "Season 2", relations={100: [(200, "sequel")], 200: [(100, "prequel"), (300, "sequel")], 300: [(200, "prequel")]})
+        upsert_provider_season_mapping(
+            self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="S0",
+            mal_anime_id=100, mapping_source="auto_exact", confidence=1.0, season_title="Season 0", season_number=0,
+            resolver_version=SEASON_MAPPING_RESOLVER_VERSION,
+        )
+        entries = {100: ("tv", 24, "2019-01-01", "2019-06-20"), 200: ("tv", 12, "2021-01-01", "2021-03-20"),
+                   300: ("tv", 12, "2021-07-01", "2021-09-20")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2022-03-01", "last": "2022-03-01", "count": 24}, entries)
+        self.assertIsNone(target.mal_anime_id)
+
+    def test_film_fallback_skips_seasons_titled_as_non_film_extras(self) -> None:
+        self._seed("crunchyroll", "OVA", relations={100: [(960, "side_story")], 960: []})
+        entries = {100: ("tv", 10, "2016-01-14", "2016-03-17"), 960: ("movie", 1, "2019-08-30", "2019-08-30")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2020-03-25", "last": "2020-03-25", "count": 0, "total": 1}, entries)
+        self.assertIsNone(target.mal_anime_id)
+
+    def test_earlier_tv_match_of_an_extras_season_is_not_kept(self) -> None:
+        self._seed("crunchyroll", "OVAs", relations={100: []})
+        upsert_provider_season_mapping(
+            self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="SX",
+            mal_anime_id=100, mapping_source="auto_exact", confidence=0.9, season_title="OVAs", season_number=2,
+            resolver_version="older",
+        )
+        # A dub-dated catalog does not contradict the TV entry's dates.
+        entries = {100: ("tv", 12, "2013-04-07", "2013-09-29")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2013-06-01", "last": "2013-06-01", "count": 3}, entries,
+                               engine_choice=100)
+        self.assertIsNone(target.mal_anime_id)
+        self.assertNotIn("season_mapping_reresolve_unconfirmed_kept", target.reasons)
 
     def test_same_week_mini_ona_does_not_take_a_split_tv_season(self) -> None:
         # The Devil is a Part-Timer! season 2 (probed): TV 48413 + sequel 53200
