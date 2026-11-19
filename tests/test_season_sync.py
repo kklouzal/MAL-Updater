@@ -321,11 +321,11 @@ class SeasonSplitExecutorTests(unittest.TestCase):
             relations=[{"related_mal_anime_id": 200, "relation_type": "sequel", "raw": {"node": {"id": 200}}}],
         )
         with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
-            MalClient, "update_my_list_status", side_effect=AssertionError("must not write")
-        ):
-            results = execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
-        self.assertEqual(["review"], [result.proposal_decision for result in results])
-        self.assertEqual([100], [result.mal_anime_id for result in results])
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        # The sequel is untouched; the fully watched entry itself completes.
+        self.assertEqual([(100, "completed", 12)], [(c.args[0], c.kwargs["status"], c.kwargs["num_watched_episodes"]) for c in update.call_args_list])
 
     def test_seasons_sharing_one_mal_entry_write_only_the_most_advanced(self) -> None:
         # Production case: a 103-episode MAL entry published as several provider
@@ -704,6 +704,19 @@ class SeasonSplitExecutorTests(unittest.TestCase):
             execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
         writes = {call.args[0]: (call.kwargs["status"], call.kwargs["num_watched_episodes"]) for call in update.call_args_list}
         self.assertEqual({100: ("completed", 12), 200: ("completed", 12)}, writes)
+
+    def test_extra_episode_beyond_a_fully_watched_mal_entry_completes_it(self) -> None:
+        # Production cases (Arifureta S2, Kore wa Zombie): the provider season
+        # carries an extra numbered episode after the MAL entry's 12.
+        progress = [self._progress("cr-1", "S1", n, season_number=1, watched_at=f"2026-03-01T00:{n:02d}:00Z") for n in range(1, 14)]
+        self._ingest([("cr-1", "Example Show")], progress)
+        self._map_series("cr-1", 100)
+        with patch.object(MalClient, "get_anime_details", side_effect=self._details({})), patch.object(
+            MalClient, "update_my_list_status", side_effect=self._write_echo
+        ) as update:
+            results = execute_approved_sync(self.config, limit=None, exact_approved_only=True, dry_run=False)
+        self.assertEqual([(100, "completed", 12)], [(c.args[0], c.kwargs["status"], c.kwargs["num_watched_episodes"]) for c in update.call_args_list])
+        self.assertTrue(any(r.startswith("provider_extra_episodes_beyond_mal_count_ignored") for r in results[0].reasons))
 
     def test_unresolved_season_is_reviewed_and_never_written(self) -> None:
         progress = [self._progress("cr-1", "S1", 1, season_number=1, watched_at="2026-03-01T00:00:00Z")]

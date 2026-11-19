@@ -2880,6 +2880,9 @@ def _numbering_view(
     )
 
 
+_SINGLE_EXTRA_EPISODE = 1
+
+
 def _provider_watched_episodes(
     state: ProviderSeriesState, mal_num_episodes: int | None, *, current_watched: int | None = None
 ) -> tuple[int, str | None, str | None]:
@@ -2916,6 +2919,18 @@ def _provider_watched_episodes(
                 f"max_completed_episode={max_number} completed={count} mal_num_episodes={mal_num_episodes}"
             ), None
         return watched, None, None
+    if (
+        state.completed_episode_numbers
+        and max(state.completed_episode_numbers) - mal_num_episodes <= _SINGLE_EXTRA_EPISODE
+        and set(range(1, mal_num_episodes + 1)) <= set(state.completed_episode_numbers)
+    ):
+        # Every episode of the MAL entry is completed and the provider season
+        # carries one extra after it (an OVA numbered 13 after a 12-episode TV
+        # season), which does not change this entry. Two or more extras are the
+        # split-cour signal and stay with the split/review rules.
+        return mal_num_episodes, (
+            f"provider_extra_episodes_beyond_mal_count_ignored completed={count} mal_num_episodes={mal_num_episodes}"
+        ), None
     if count > mal_num_episodes:
         return mal_num_episodes, None, (
             f"provider_completed_episodes_exceed_mal_episode_count completed={count} mal_num_episodes={mal_num_episodes}"
