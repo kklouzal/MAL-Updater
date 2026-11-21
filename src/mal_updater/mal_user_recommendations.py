@@ -10,7 +10,7 @@ import time
 from socket import timeout as SocketTimeout
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, urlencode, unquote, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import AppConfig
@@ -38,6 +38,10 @@ _NO_USER_RECOMMENDATIONS_EMPTY_STATE_RE = re.compile(
     re.IGNORECASE,
 )
 _USER_RECS_HEADING_TEXTS = frozenset({"recommendations", "user recommendations", "anime recommendations"})
+# MAL's own wording for a title nobody has recommended anything for (probed
+# 2026-11-20 on /anime/40841/x/userrecs). It is a bare text node right after
+# the page's "Recommendations" heading, with no dedicated container.
+_MAL_NO_USERRECS_SENTENCE_RE = re.compile(r"\bNo recommendations have been made for this title\b", re.IGNORECASE)
 
 
 class PublicMalUserRecommendationsError(MalApiError):
@@ -180,6 +184,8 @@ class _UserRecommendationsHTMLParser(HTMLParser):
         self._surface_text_captures: list[_SurfaceTextCapture] = []
         self._saw_userrecs_surface = False
         self._saw_explicit_empty = False
+        self.saw_mal_empty_sentence = False
+        self.saw_source_make_recommendation_link = False
         self._saw_html_start = False
         self._saw_html_end = False
         self._saw_body_start = False
@@ -211,8 +217,9 @@ class _UserRecommendationsHTMLParser(HTMLParser):
             self._saw_body_start = True
         if lowered == "tr":
             self._blocks.append(_RecommendationBlock())
-            self._recommendation_row_count += 1
         elif lowered == "a":
+            if self._is_source_make_recommendation_href(attrs_dict.get("href", "")):
+                self.saw_source_make_recommendation_link = True
             self._anchors.append(
                 _Anchor(
                     href=unescape(attrs_dict.get("href", "")).strip() or None,
@@ -221,11 +228,6 @@ class _UserRecommendationsHTMLParser(HTMLParser):
                     aria_label=attrs_dict.get("aria-label", ""),
                 )
             )
-        elif lowered == "body":
-            # Presence of a normal body is not sufficient for a valid rec page,
-            # but helps distinguish an empty userrecs page once recommendation
-            # page-specific copy is seen in text data.
-            pass
         if _should_capture_surface_text(lowered, attrs_dict):
             self._surface_text_captures.append(
                 _SurfaceTextCapture(
@@ -255,6 +257,12 @@ class _UserRecommendationsHTMLParser(HTMLParser):
             return
         if lowered == "tr" and self._blocks:
             block = self._blocks.pop()
+            # A candidate recommendation row links another anime. Layout rows
+            # (list status, score, sidebar) do not, so they never count; a
+            # candidate row whose edge extraction fails still counts and
+            # blocks an empty harvest.
+            if block.target_titles_by_id:
+                self._recommendation_row_count += 1
             edge = self._edge_from_block(block)
             if edge is not None:
                 self.edges.append(edge)
@@ -273,7 +281,16 @@ class _UserRecommendationsHTMLParser(HTMLParser):
             if dedicated_empty and _NO_USER_RECOMMENDATIONS_EMPTY_STATE_RE.search(text):
                 self._saw_explicit_empty = True
 
+    def _is_source_make_recommendation_href(self, href: str) -> bool:
+        parsed = urlparse(urljoin(self.page_url, unescape(href).strip()))
+        if parsed.path != "/myrecommendations.php":
+            return False
+        query = parse_qs(parsed.query)
+        return query.get("go") == ["make"] and query.get("aid") == [str(self.source_mal_anime_id)]
+
     def handle_data(self, data: str) -> None:
+        if _MAL_NO_USERRECS_SENTENCE_RE.search(data):
+            self.saw_mal_empty_sentence = True
         if self._anchors:
             self._anchors[-1].text_parts.append(data)
         if self._blocks:
@@ -585,7 +602,18 @@ def parse_public_user_recommendations_page(
         raise PublicMalUserRecommendationsError("public MAL userrecs HTML did not contain a recognizable recommendation surface")
     if not parser.document_complete:
         raise PublicMalUserRecommendationsError("public MAL userrecs HTML document was incomplete or truncated")
-    if validated_next is None and not edges and not parser.saw_explicit_empty:
+    # MAL's real empty page has no dedicated container: its exact sentence is
+    # accepted only on a recognized userrecs page (checked above) that also
+    # carries the "make a recommendation" link for this very title, with no
+    # candidate recommendation rows, no edges and no next page.
+    explicit_empty = parser.saw_explicit_empty or (
+        parser.saw_mal_empty_sentence
+        and parser.saw_source_make_recommendation_link
+        and parser.recommendation_row_count == 0
+        and not edges
+        and validated_next is None
+    )
+    if validated_next is None and not edges and not explicit_empty:
         raise PublicMalUserRecommendationsError(
             "public MAL userrecs terminal empty state lacked dedicated structural evidence; manual review required"
         )
@@ -595,13 +623,13 @@ def parse_public_user_recommendations_page(
         "recommendation_row_count": parser.recommendation_row_count,
         "next_candidate_count": len(parser.next_hrefs),
         "next_links_consistent": len(distinct_next) <= 1,
-        "explicit_empty": bool(parser.saw_explicit_empty and not edges and validated_next is None),
+        "explicit_empty": bool(explicit_empty and not edges and validated_next is None),
         "terminal": validated_next is None,
     }
     return ParsedPublicUserRecommendationsPage(
         edges=edges,
         next_url=validated_next,
-        explicit_empty=bool(parser.saw_explicit_empty and not edges and validated_next is None),
+        explicit_empty=bool(explicit_empty and not edges and validated_next is None),
         document_complete=parser.document_complete,
         terminal_evidence=terminal_evidence,
     )

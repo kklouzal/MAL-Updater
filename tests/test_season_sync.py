@@ -1034,6 +1034,19 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2020-01-01", "last": "2020-04-01", "count": 13}, entries)
         self.assertEqual(950, target.mal_anime_id)
 
+    def test_ova_of_a_sequel_reached_through_an_alternative_version_matches(self) -> None:
+        # Production case: Steins;Gate (100) reaches Steins;Gate 0 (300) only
+        # via "Divide By Zero" (950), an alternative version of the TV series
+        # and the prequel of Steins;Gate 0; the Valentine OVA (400, a special
+        # from 2018-12-21) is a side story of Steins;Gate 0.
+        self._seed("crunchyroll", "OVA", relations={
+            100: [(950, "alternative_version")], 950: [(100, "alternative_version"), (300, "sequel")],
+            300: [(950, "prequel"), (400, "side_story")], 400: [(300, "parent_story")]})
+        entries = {100: ("tv", 24, "2011-04-06", "2011-09-14"), 950: ("special", 1, "2015-06-10", "2015-06-10"),
+                   300: ("tv", 23, "2018-04-12", "2018-09-27"), 400: ("special", 1, "2018-12-21", "2018-12-21")}
+        target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2018-12-21", "last": "2018-12-21", "count": 1, "total": 1}, entries)
+        self.assertEqual(400, target.mal_anime_id)
+
     def test_dub_dated_single_film_matches_the_franchise_movie(self) -> None:
         # Production case: Konosuba "Legend of Crimson (English Dub)", one
         # item dated by the dub release, MAL movie from 2019.

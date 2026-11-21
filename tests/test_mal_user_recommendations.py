@@ -525,5 +525,74 @@ class PublicMalUserRecommendationsDbTests(unittest.TestCase):
         self.assertEqual(1, status["is_complete"])
 
 
+
+class MalEmptyUserRecommendationsPageTests(unittest.TestCase):
+    """Real MAL markup for a title nobody has recommended anything for (probed 2026-11-20)."""
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "mal_userrecs_empty_40841.html"
+    URL = "https://myanimelist.net/anime/40841/x/userrecs"
+
+    def test_mal_empty_sentence_after_the_userrecs_heading_is_a_terminal_empty_page(self) -> None:
+        from mal_updater.mal_user_recommendations import parse_public_user_recommendations_page
+
+        parsed = parse_public_user_recommendations_page(
+            self.FIXTURE.read_text(encoding="utf-8"),
+            source_mal_anime_id=40841,
+            page_url=self.URL,
+            public_base_url="https://myanimelist.net",
+        )
+        self.assertEqual([], list(parsed.edges))
+        self.assertTrue(parsed.explicit_empty)
+        self.assertTrue(parsed.terminal_evidence["explicit_empty"])
+        self.assertTrue(parsed.terminal_evidence["terminal"])
+        # The page's layout <tr>s (list status, score) are not candidate rows;
+        # the staged-publication guard requires a zero candidate-row count.
+        self.assertEqual(0, parsed.terminal_evidence["recommendation_row_count"])
+        self.assertEqual(0, parsed.terminal_evidence["next_candidate_count"])
+
+    def test_empty_sentence_does_not_cover_recommendation_rows_that_fail_extraction(self) -> None:
+        from mal_updater.mal_user_recommendations import (
+            PublicMalUserRecommendationsError,
+            parse_public_user_recommendations_page,
+        )
+
+        real = self.FIXTURE.read_text(encoding="utf-8")
+        # A recommendation row MAL renders in an unrecognized shape: it links
+        # another anime but has no "Recommended by" text, so no edge is built.
+        unparsed_row = '<table><tr><td><a href="/anime/2/Two">Two</a></td><td>Liked by someone</td></tr></table>'
+        html = real.replace('<h2 class="h2_overwrite">Recommendations</h2></div>', '<h2 class="h2_overwrite">Recommendations</h2></div>' + unparsed_row, 1)
+        self.assertNotEqual(real, html)
+        with self.assertRaisesRegex(PublicMalUserRecommendationsError, "dedicated structural evidence"):
+            parse_public_user_recommendations_page(
+                html, source_mal_anime_id=40841, page_url=self.URL, public_base_url="https://myanimelist.net"
+            )
+
+    def test_empty_sentence_without_the_userrecs_heading_is_not_accepted(self) -> None:
+        from mal_updater.mal_user_recommendations import (
+            PublicMalUserRecommendationsError,
+            parse_public_user_recommendations_page,
+        )
+
+        # No userrecs heading at all.
+        html = "<html><body><p>No recommendations have been made for this title.</p></body></html>"
+        with self.assertRaises(PublicMalUserRecommendationsError):
+            parse_public_user_recommendations_page(
+                html, source_mal_anime_id=40841, page_url=self.URL, public_base_url="https://myanimelist.net"
+            )
+
+    def test_empty_sentence_needs_the_make_recommendation_link_for_this_title(self) -> None:
+        from mal_updater.mal_user_recommendations import (
+            PublicMalUserRecommendationsError,
+            parse_public_user_recommendations_page,
+        )
+
+        real = self.FIXTURE.read_text(encoding="utf-8")
+        for other in (real.replace("aid=40841", "aid=1"), real.replace("go=make&aid=40841", "go=view&aid=40841")):
+            with self.assertRaisesRegex(PublicMalUserRecommendationsError, "dedicated structural evidence"):
+                parse_public_user_recommendations_page(
+                    other, source_mal_anime_id=40841, page_url=self.URL, public_base_url="https://myanimelist.net"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

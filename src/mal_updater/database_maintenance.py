@@ -7,6 +7,9 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -158,6 +161,43 @@ def _prune_pre_vacuum_archives(backup_dir: Path, *, keep: Path, now: float) -> t
     return removed, None
 
 
+_VACUUM_SCRIPT = (
+    "import sqlite3, sys\n"
+    "conn = sqlite3.connect(sys.argv[1])\n"
+    "try:\n"
+    "    conn.execute('VACUUM')\n"
+    "finally:\n"
+    "    conn.close()\n"
+)
+
+
+def _vacuum_on_database_volume(db_path: Path, *, lock_handle: Any) -> None:
+    """VACUUM with SQLite's rewrite copy on the database volume.
+
+    VACUUM builds the compacted copy in SQLite's temp directory, which a
+    process resolves once from SQLITE_TMPDIR/TMPDIR. A container /tmp is
+    often a small tmpfs (64 MB in production), far below the copy of a
+    multi-GB database ("database or disk is full"), and the free-space
+    precheck measures the database volume. A child process therefore runs the
+    VACUUM with its temp directory beside the database. The child inherits the
+    caller's repo writer lock descriptor, so the lock stays held for as long as
+    the VACUUM runs, even if the caller dies first.
+    """
+    with tempfile.TemporaryDirectory(prefix=".vacuum-tmp-", dir=db_path.parent) as temp_dir:
+        env = {**os.environ, "SQLITE_TMPDIR": temp_dir, "TMPDIR": temp_dir}
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", _VACUUM_SCRIPT, str(db_path)],
+            env=env,
+            pass_fds=(lock_handle.fileno(),),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if completed.returncode != 0:
+        detail = (completed.stderr.strip().splitlines() or ["no diagnostics"])[-1]
+        raise sqlite3.OperationalError(f"VACUUM failed: {sanitize_text(detail, max_length=300)}")
+
+
 def compact_database_if_due(config: AppConfig, *, previous: dict[str, Any] | None = None, now: float | None = None) -> DatabaseCompactionReport:
     current = time.time() if now is None else float(now)
     attempted_at = datetime.fromtimestamp(current, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -201,9 +241,13 @@ def compact_database_if_due(config: AppConfig, *, previous: dict[str, Any] | Non
         post_backup_available = shutil.disk_usage(config.db_path.parent).free
         if post_backup_available < required:
             return _base_report(config, status="blocked", reason="insufficient_database_volume_space_after_backup", attempted_at=attempted_at, stats=stats, previous=previous, backup_archive=str(created), backup_archive_sha256=str(verified.get("archive_sha256") or ""), backup_file_count=len(verified.get("manifest", {}).get("files", [])) if isinstance(verified.get("manifest"), dict) else 0, required_free_bytes=required, available_free_bytes=post_backup_available, initial_available_free_bytes=available, post_backup_available_free_bytes=post_backup_available)
-        with sqlite3.connect(config.db_path) as conn:
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("VACUUM")
+        try:
+            _vacuum_on_database_volume(config.db_path, lock_handle=lock)
+        except (sqlite3.Error, OSError) as exc:
+            # Reported as a task error so the scheduler's failure backoff
+            # applies; raising would stop the service loop and repeat the full
+            # pre-VACUUM backup on every restart. The verified archive is kept.
+            return _base_report(config, status="error", reason="vacuum_failed", attempted_at=attempted_at, stats=stats, previous=previous, backup_archive=str(created), backup_archive_sha256=str(verified.get("archive_sha256") or ""), required_free_bytes=required, available_free_bytes=post_backup_available, initial_available_free_bytes=available, post_backup_available_free_bytes=post_backup_available, error_type=sanitize_text(type(exc).__name__, max_length=100))
         after_size = config.db_path.stat().st_size
         pruned_archives, prune_error_type = _prune_pre_vacuum_archives(backup_dir, keep=Path(created), now=current)
         return _base_report(config, status="compacted", pruned_backup_archives=pruned_archives, backup_prune_error_type=prune_error_type, reason=None, attempted_at=attempted_at, stats=stats, previous=previous, db_size_after=after_size, bytes_reclaimed=max(0, size - after_size), backup_archive=str(created), backup_archive_sha256=str(verified.get("archive_sha256") or ""), backup_file_count=len(verified.get("manifest", {}).get("files", [])) if isinstance(verified.get("manifest"), dict) else 0, last_success_epoch=current, required_free_bytes=required, available_free_bytes=post_backup_available, initial_available_free_bytes=available, post_backup_available_free_bytes=post_backup_available)

@@ -1325,7 +1325,7 @@ def persist_sync_review_queue(config: AppConfig, proposals: list[SyncProposal]) 
     return replace_review_queue_entries(config.db_path, issue_type="sync_review", entries=queue_entries)
 
 
-SEASON_MAPPING_RESOLVER_VERSION = "2026-11-19.8"
+SEASON_MAPPING_RESOLVER_VERSION = "2026-11-21.1"
 # Provider season titles naming non-TV content; such a season never
 # auto-matches a TV entry (e.g. "Attack on Titan OADs" -> the TV season).
 _AUXILIARY_SEASON_TITLE_RE = re.compile(r"\b(?:ova|ovas|oad|oads|oav|oavs|specials?|movies?|film|recaps?|extras?)\b", re.IGNORECASE)
@@ -1387,8 +1387,14 @@ _FRANCHISE_MAX_HOPS = 12
 _FRANCHISE_MAX_LOOKUPS = 40
 
 
+# MAL sometimes chains a franchise through an alternative version: Steins;Gate
+# reaches Steins;Gate 0 only via "Divide By Zero", an alternative version of
+# the TV series and the prequel of Steins;Gate 0.
+_FRANCHISE_WALK_RELATIONS = frozenset({"sequel", "prequel", "alternative_version"})
+
+
 def _mal_franchise_ids(config: AppConfig, client: MalClient, anchor_id: int) -> tuple[set[int], bool]:
-    """Entries reachable from anchor through prequel/sequel links, and whether the walk finished."""
+    """Entries reachable from anchor through prequel/sequel/alternative-version links, and whether the walk finished."""
     frontier, seen, lookups = [int(anchor_id)], {int(anchor_id)}, 0
     for _ in range(_FRANCHISE_MAX_HOPS):
         next_frontier: list[int] = []
@@ -1397,7 +1403,7 @@ def _mal_franchise_ids(config: AppConfig, client: MalClient, anchor_id: int) -> 
                 return seen, False
             lookups += 1
             for related, kind in _relation_rows(config, client, mal_id):
-                if kind in ("sequel", "prequel") and related not in seen:
+                if kind in _FRANCHISE_WALK_RELATIONS and related not in seen:
                     seen.add(related)
                     next_frontier.append(related)
         if not next_frontier:
@@ -1414,8 +1420,6 @@ _AUXILIARY_MEDIA_TYPES = frozenset({"ova", "ona", "special", "tv_special", "movi
 # "other" is left out: on MAL it is mostly commercials, music videos and
 # collaborations, which only add detail lookups.
 _CATALOG_LEAF_RELATIONS = frozenset({"side_story", "parent_story"})
-# Director's cuts and re-edits are alternative versions of a TV season.
-_CATALOG_ALTERNATIVE_RELATIONS = frozenset({"alternative_version"})
 # Each candidate costs one (cached) MAL detail lookup. A larger pool declines:
 # uniqueness of the date match cannot be shown on a truncated pool.
 _CATALOG_MAX_CANDIDATES = 40
@@ -1495,7 +1499,7 @@ def _catalog_dated_candidate(
 
     Sibling seasons often share title stems and episode counts but never their
     broadcast window. Candidates are the matcher's results plus the series'
-    MAL franchise (prequel/sequel chain) and its side-story leaves, restricted
+    MAL franchise (see _mal_franchise_ids) and its side-story leaves, restricted
     to the season's media family (TV/ONA, or OVA/special/movie for extras
     collections). See _catalog_entry_for_family for the date rules.
     """
@@ -1511,14 +1515,14 @@ def _catalog_dated_candidate(
             # A complete franchise walk bounds the season's possible entries;
             # unrelated title-search hits would only add false siblings.
             by_id = {mal_id: candidate for mal_id, candidate in by_id.items() if mal_id in franchise}
-        leaf_relations = (_CATALOG_LEAF_RELATIONS | _CATALOG_ALTERNATIVE_RELATIONS) if auxiliary_season else _CATALOG_ALTERNATIVE_RELATIONS
         for mal_id in franchise:
             by_id.setdefault(int(mal_id), None)
-            # MAL links OVAs/specials as side stories and director's cuts as
-            # alternative versions, outside the prequel/sequel chain; they are
-            # candidates, not walked further.
+            if not auxiliary_season:
+                continue
+            # MAL links OVAs/specials as side stories, outside the walked
+            # chain; they are candidates, not walked further.
             for related, kind in _relation_rows(config, client, mal_id):
-                if kind in leaf_relations:
+                if kind in _CATALOG_LEAF_RELATIONS:
                     by_id.setdefault(int(related), None)
     if len(by_id) > _CATALOG_MAX_CANDIDATES:
         return None
@@ -1731,7 +1735,7 @@ def _in_series_franchise(config: AppConfig, client: MalClient, state: ProviderSe
         related
         for mal_id in franchise
         for related, kind in _relation_rows(config, client, mal_id)
-        if kind in _CATALOG_LEAF_RELATIONS | _CATALOG_ALTERNATIVE_RELATIONS
+        if kind in _CATALOG_LEAF_RELATIONS
     }
     return int(mal_anime_id) in franchise or int(mal_anime_id) in leaves
 

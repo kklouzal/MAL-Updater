@@ -36,6 +36,9 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Fixed
 
+- Fixed public MAL user-recommendation harvests failing closed on titles nobody has recommended anything for; MAL's real empty page (its exact sentence, the title's make-recommendation link, no candidate rows, no next page) is now accepted, so those sources stop pausing for manual review.
+- Fixed database compaction failing with "database or disk is full" when the process temp directory is a small tmpfs: VACUUM now runs in a child process (sharing the writer lock) with its rewrite copy on the database volume, and a VACUUM failure is reported as a task error with failure backoff instead of stopping the service loop.
+- Fixed season matching missing entries that MAL chains through an alternative version (Steins;Gate reaches Steins;Gate 0 only via "Divide By Zero"); the franchise walk now follows alternative-version links.
 - Fixed season sync accuracy on real provider data: each season is numbered by absolute episode numbers when an earlier provider season maps to the same MAL entry (one entry spanning seasons) and by in-season position otherwise; split-cour seasons assign each completed episode to MAL Part 1 or Part 2 (a skipped episode no longer blocks the split, and Part 2 completion needs observed episodes); completions resting on unobserved earlier episodes write the observed count; season matches the title matcher rates below auto-approval are accepted only when the candidate is in the series' MAL franchise, its episode count equals the season's completed episodes, and no same-count sibling or existing season mapping contradicts it.
 - Fixed public MAL user-recommendation refreshes of already-published sources being rejected forever by the queue claim fence.
 - Fixed watch progress of multi-season provider series being summed into one MAL entry (for example 88 episodes on a 16-episode season).

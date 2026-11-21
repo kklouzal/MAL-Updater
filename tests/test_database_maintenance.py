@@ -62,6 +62,19 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         self.assertEqual("backup_verify_failed", report["reason"])
         self.assertGreater(report["freelist_bytes"], 0)
 
+    def test_vacuum_failure_is_a_reported_error_that_keeps_the_verified_backup(self) -> None:
+        self._make_freelist()
+        with patch(
+            "mal_updater.database_maintenance._vacuum_on_database_volume",
+            side_effect=sqlite3.OperationalError("VACUUM failed: database or disk is full"),
+        ):
+            report = compact_database_if_due(self.config).as_dict()
+        self.assertEqual("error", report["status"])
+        self.assertEqual("vacuum_failed", report["reason"])
+        self.assertEqual("OperationalError", report["error_type"])
+        self.assertTrue(Path(report["backup_archive"]).exists())
+        self.assertNotIn("last_success_epoch", {k for k, v in report.items() if v is not None})
+
     def test_insufficient_space_blocks_before_backup(self) -> None:
         self._make_freelist()
         with patch("mal_updater.database_maintenance.shutil.disk_usage") as disk_usage, patch(
@@ -189,6 +202,61 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         status = doctor_service(self.config)
         self.assertIn("db_compaction", status["task_state"])
         self.assertIn("last_result", status["task_state"]["db_compaction"])
+
+
+
+class VacuumTempDirectoryTests(unittest.TestCase):
+    def test_vacuum_rewrite_copy_uses_the_database_volume_not_the_process_tmp(self) -> None:
+        import subprocess
+
+        from mal_updater import database_maintenance
+
+        with tempfile.TemporaryDirectory(prefix="mal-vacuum-tmp-test-") as tmp:
+            db_path = Path(tmp) / "db.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE probe(payload BLOB NOT NULL)")
+                conn.executemany("INSERT INTO probe(payload) VALUES (randomblob(65536))", [()] * 16)
+                conn.commit()
+                conn.execute("DELETE FROM probe WHERE rowid % 2 = 0")
+                conn.commit()
+            before = db_path.stat().st_size
+            seen: list[dict[str, str]] = []
+            real_run = subprocess.run
+
+            passed_fds: list[tuple[int, ...]] = []
+
+            def recording_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+                seen.append(dict(kwargs["env"]))
+                passed_fds.append(tuple(kwargs["pass_fds"]))
+                return real_run(*args, **kwargs)
+
+            lock = database_maintenance.acquire_database_lock(db_path, exclusive=True, blocking=False)
+            try:
+                with patch("mal_updater.database_maintenance.subprocess.run", side_effect=recording_run):
+                    database_maintenance._vacuum_on_database_volume(db_path, lock_handle=lock)
+                # The child holds the writer lock descriptor for the whole VACUUM.
+                self.assertEqual([(lock.fileno(),)], passed_fds)
+            finally:
+                database_maintenance.release_database_lock(lock)
+
+            self.assertLess(db_path.stat().st_size, before)
+            self.assertEqual(1, len(seen))
+            temp_dir = Path(seen[0]["SQLITE_TMPDIR"])
+            self.assertEqual(db_path.parent, temp_dir.parent)
+            self.assertFalse(temp_dir.exists())
+
+    def test_vacuum_failure_is_raised_with_its_diagnostic(self) -> None:
+        from mal_updater import database_maintenance
+
+        with tempfile.TemporaryDirectory(prefix="mal-vacuum-tmp-test-") as tmp:
+            db_path = Path(tmp) / "not-a-database.sqlite3"
+            db_path.write_bytes(b"x" * 4096)
+            lock = database_maintenance.acquire_database_lock(db_path, exclusive=True, blocking=False)
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "VACUUM failed: .*not a database"):
+                    database_maintenance._vacuum_on_database_volume(db_path, lock_handle=lock)
+            finally:
+                database_maintenance.release_database_lock(lock)
 
 
 if __name__ == "__main__":
