@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import shlex
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -490,7 +491,7 @@ class HealthCheckCliTests(unittest.TestCase):
         command = run_mock.call_args.args[0]
         self.assertEqual(
             [
-                "python3",
+                sys.executable,
                 "-m",
                 "mal_updater.cli",
                 "--project-root",

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import email.utils
-import fcntl
 import json
 import os
 import random
@@ -11,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import timezone
 from pathlib import Path
 from typing import Callable
+
+from .file_locks import lock_file, unlock_file
 
 
 _LOCKS: dict[str, threading.Lock] = {}
@@ -62,8 +63,8 @@ class ProviderRequestGate:
     def wait_turn(self) -> None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with _thread_lock(self._thread_key):
-            with self.lock_path.open("a+", encoding="utf-8") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            with self.lock_path.open("a+", encoding="utf-8") as handle:
+                lock_file(handle)
                 try:
                     last_started_at: float | None = None
                     try:
@@ -83,7 +84,7 @@ class ProviderRequestGate:
                     tmp.write_text(json.dumps({"provider": self.provider, "last_request_started_at": now}) + "\n", encoding="utf-8")
                     os.replace(tmp, self.state_path)
                 finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    unlock_file(handle)
 
 
 def retry_after_seconds(value: str | None, *, now: Callable[[], float] = time.time) -> float | None:

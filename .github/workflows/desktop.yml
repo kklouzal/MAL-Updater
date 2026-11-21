@@ -1,0 +1,87 @@
+name: desktop
+
+# Builds the standalone desktop app (no Docker or Python needed) for Windows,
+# macOS and Linux, tests each build on its own OS, and uploads it as a
+# workflow artifact. Release tags attach these files to the GitHub release
+# (see release.yml).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: windows-x64, os: windows-latest}
+          - {target: macos-arm64, os: macos-latest}
+          - {target: macos-x64, os: macos-15-intel}
+          # The oldest supported runner, so the build runs on older glibc versions too.
+          - {target: linux-x64, os: ubuntu-22.04}
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints/ci.txt
+
+      - name: Install package and packaging tools
+        shell: bash
+        run: python -m pip install -c constraints/ci.txt ".[desktop]" pytest
+
+      - name: Run the cross-platform tests natively
+        shell: bash
+        run: python -m pytest -q tests/test_file_locks.py tests/test_desktop.py tests/test_persistence.py
+
+      - name: Build the app
+        shell: bash
+        run: python -m PyInstaller --noconfirm --clean packaging/mal-updater.spec
+
+      - name: Smoke-test the build
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Windows) exe=dist/MAL-Updater/MAL-Updater.exe ;;
+            macOS)   exe=dist/MAL-Updater.app/Contents/MacOS/MAL-Updater ;;
+            *)       exe=dist/MAL-Updater/MAL-Updater ;;
+          esac
+          python scripts/smoke_desktop_build.py "$exe"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          name="MAL-Updater-${{ matrix.target }}"
+          case "${{ runner.os }}" in
+            Windows) (cd dist && 7z a -tzip "../package/$name.zip" MAL-Updater >/dev/null) ;;
+            macOS)   hdiutil create -volname MAL-Updater -srcfolder dist/MAL-Updater.app -ov -format UDZO "package/$name.dmg" ;;
+            *)       tar -C dist -czf "package/$name.tar.gz" MAL-Updater ;;
+          esac
+          ls -l package
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: MAL-Updater-${{ matrix.target }}
+          path: package/*
+          if-no-files-found: error
+          retention-days: 30

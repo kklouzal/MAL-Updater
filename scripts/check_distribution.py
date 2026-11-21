@@ -12,6 +12,7 @@ EXPECTED_ENTRY_POINTS = {
     "mal-updater = mal_updater.cli:main",
     "mal-updater-container = mal_updater.container_runtime:main",
     "mal-updater-tools = mal_updater.container_lifecycle:main",
+    "mal-updater-desktop = mal_updater.desktop:main",
 }
 EXPECTED_METADATA_FIELDS = {
     "License-Expression": "MIT",

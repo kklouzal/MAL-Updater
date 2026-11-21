@@ -26,8 +26,13 @@ keywords = [
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
+  "Environment :: MacOS X",
+  "Environment :: Win32 (MS Windows)",
+  "Environment :: X11 Applications",
   "Intended Audience :: End Users/Desktop",
   "Intended Audience :: System Administrators",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -51,6 +56,9 @@ Issues = "https://github.com/kklouzal/MAL-Updater/issues"
 Documentation = "https://github.com/kklouzal/MAL-Updater#readme"
 
 [project.optional-dependencies]
+desktop = [
+  "pyinstaller>=6.10,<7"
+]
 dev = [
   "build>=1.3,<2",
   "coverage[toml]>=7.10,<8",
@@ -63,6 +71,7 @@ dev = [
 mal-updater = "mal_updater.cli:main"
 mal-updater-container = "mal_updater.container_runtime:main"
 mal-updater-tools = "mal_updater.container_lifecycle:main"
+mal-updater-desktop = "mal_updater.desktop:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -71,6 +80,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
+"mal_updater" = ["assets/*.png"]
 "mal_updater.migrations" = ["*.sql"]
 
 [tool.pytest.ini_options]
@@ -107,6 +117,8 @@ files = [
   "src/mal_updater/auth_utils.py",
   "src/mal_updater/cli_parser.py",
   "src/mal_updater/contracts",
+  "src/mal_updater/desktop.py",
+  "src/mal_updater/file_locks.py",
   "src/mal_updater/hidive_auth.py",
   "src/mal_updater/hidive_urls.py",
   "src/mal_updater/ingestion.py",

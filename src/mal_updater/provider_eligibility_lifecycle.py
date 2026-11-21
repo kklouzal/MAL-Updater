@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
@@ -8,6 +7,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .file_locks import lock_file, unlock_file
 
 from .periodic_evidence_lifecycle import (
     DEFAULT_PERIODIC_EVIDENCE_REFRESH_JITTER_DAYS,
@@ -39,7 +40,7 @@ class ProviderEligibilityProcessLease:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.lock_path.open("a+", encoding="utf-8")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(handle, blocking=False)
         except BlockingIOError:
             handle.close()
             self.status = {"status": "busy", "provider": self.provider, "reason": "lease_busy"}
@@ -61,7 +62,7 @@ class ProviderEligibilityProcessLease:
             return
         self.status = {**self.status, "status": "released", "released_at": _iso(datetime.now(timezone.utc))}
         self.status_path.write_text(json.dumps(self.status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        unlock_file(self._handle)
         self._handle.close()
         self._handle = None
 

@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, TextIO
 
 from .config import AppConfig, ensure_directories
+from .file_locks import lock_file, unlock_file
 from .health_report import build_health_report, health_report_exit_code, render_health_report, render_health_report_json
 from .persistence import atomic_write_text
 
@@ -28,18 +30,16 @@ class HealthCycleAutoRemediationError(RuntimeError):
 
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
-    import fcntl
-
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock_file:
+    with path.open("a+", encoding="utf-8") as handle:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(handle, blocking=False)
         except BlockingIOError as exc:
             raise HealthCycleLockBusyError(str(path)) from exc
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
 
 
 @contextmanager
@@ -135,7 +135,7 @@ def _run_auto_command(selection: dict[str, object], *, project_root: Path) -> No
         subprocess_env = env
         command_display = " ".join(shlex.quote(part) for part in command)
     else:
-        command = ["python3", "-m", "mal_updater.cli", "--project-root", str(project_root), *command_args]
+        command = [sys.executable, "-m", "mal_updater.cli", "--project-root", str(project_root), *command_args]
         subprocess_env = {**env, "PYTHONPATH": str(_SOURCE_ROOT)}
         command_display = "PYTHONPATH=src " + " ".join(shlex.quote(part) for part in command)
     print("auto_remediation=enabled")

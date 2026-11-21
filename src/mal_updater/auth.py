@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, MalSecrets, ensure_secret_directory, mal_callback_bind_warning
+from .persistence import fsync_parent_directory
 from .mal_client import (
     MalClient,
     TokenResponse,
@@ -124,11 +125,7 @@ def write_secret_file(path: Path, value: str) -> None:
         temp_path.unlink(missing_ok=True)
         raise
     os.chmod(path, 0o600)
-    dir_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    fsync_parent_directory(path)
 
 
 def persist_token_response(

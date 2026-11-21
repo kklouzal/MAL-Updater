@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import fcntl
 import json
 import math
 import os
@@ -26,6 +25,7 @@ from .config import (
 )
 from .crunchyroll_auth import resolve_crunchyroll_state_paths
 from .database_maintenance import compact_database_if_due
+from .file_locks import lock_file, lock_inheritance_fds, unlock_file
 from .runtime_housekeeping import inspect_service_log, prune_health_history, rotate_service_log
 from .runtime_retention_audit import build_runtime_retention_audit_payload
 from .provider_registry import connected_source_providers
@@ -149,7 +149,7 @@ class _ProcessLease:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.lock_path.open("a+", encoding="utf-8")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(handle, blocking=False)
         except BlockingIOError:
             handle.close()
             holder = _read_json_dict(self.status_path)
@@ -199,11 +199,10 @@ class _ProcessLease:
         payload["updated_at"] = _now_iso()
         self._write_status(payload)
 
-    @property
-    def fileno(self) -> int:
+    def inheritance_fds(self) -> tuple[int, ...]:
         if self._handle is None:
             raise RuntimeError("lease is not acquired")
-        return int(self._handle.fileno())
+        return lock_inheritance_fds(self._handle)
 
     def release(self) -> None:
         if self._handle is None:
@@ -211,7 +210,7 @@ class _ProcessLease:
         payload = dict(self.status)
         payload.update({"status": "released", "released_at": _now_iso(), "released_epoch": time.time()})
         self._write_status(payload)
-        fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        unlock_file(self._handle)
         self._handle.close()
         self._handle = None
 
@@ -493,8 +492,9 @@ def _run_subprocess(config: AppConfig, args: list[str], *, label: str, run_id: s
                 env=env,
                 timeout=timeout_seconds,
                 # If the scheduler is killed mid-task, the child retains the lock
-                # until it exits, preventing a restarted daemon from duplicating it.
-                pass_fds=(lease.fileno,),
+                # until it exits, preventing a restarted daemon from duplicating it
+                # (POSIX only; see file_locks.lock_inheritance_fds).
+                pass_fds=lease.inheritance_fds(),
             )
         except subprocess.TimeoutExpired as exc:
             duration_seconds = round(time.monotonic() - started, 3)

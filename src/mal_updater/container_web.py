@@ -444,6 +444,6 @@ class ControlStore:
         line = json.dumps(safe, separators=(",", ":")) + "\n"
         with self.lock:
             self.audit_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as f: f.write(line)
             os.chmod(self.audit_path, 0o600)

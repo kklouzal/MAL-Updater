@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import fcntl
 import os
 import re
 import shutil
@@ -16,6 +15,7 @@ from typing import Any
 
 from .config import AppConfig
 from .container_lifecycle import backup as create_backup, inspect as inspect_backup
+from .file_locks import lock_file, lock_inheritance_fds, unlock_file
 from .redaction import sanitize_text
 
 
@@ -80,11 +80,8 @@ def acquire_database_lock(db_path: Path, *, exclusive: bool, blocking: bool = Tr
     lock_path = database_lock_path(db_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
-    flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    if not blocking:
-        flags |= fcntl.LOCK_NB
     try:
-        fcntl.flock(handle.fileno(), flags)
+        lock_file(handle, exclusive=exclusive, blocking=blocking)
     except BaseException:
         handle.close()
         raise
@@ -93,7 +90,7 @@ def acquire_database_lock(db_path: Path, *, exclusive: bool, blocking: bool = Tr
 
 def release_database_lock(handle: Any) -> None:
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_file(handle)
     finally:
         handle.close()
 
@@ -203,7 +200,7 @@ def _vacuum_on_database_volume(db_path: Path, *, lock_handle: Any) -> None:
         completed = subprocess.run(
             [sys.executable, "-I", "-c", _VACUUM_SCRIPT, str(db_path)],
             env=env,
-            pass_fds=(lock_handle.fileno(),),
+            pass_fds=lock_inheritance_fds(lock_handle),
             capture_output=True,
             text=True,
             check=False,

@@ -5,7 +5,6 @@ import math
 import os
 import threading
 import uuid
-import fcntl
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .timestamps import parse_utc_timestamp
+from .file_locks import lock_file, unlock_file
 from .config import AppConfig, load_config
 from .persistence import DEFAULT_JSONL_MAX_LINE_BYTES, atomic_writer, iter_json_lines
 from .redaction import sanitize_text, sanitize_url
@@ -142,12 +142,12 @@ def _events_path(config: AppConfig | None = None) -> Path:
 @contextmanager
 def _event_file_lock(path: Path, *, exclusive: bool):
     lock_path = path.with_name(f"{path.name}.lock")
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        lock_file(handle, exclusive=exclusive)
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
 
 
 def _iter_events(config: AppConfig | None = None) -> Iterator[dict[str, Any]]:

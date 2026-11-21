@@ -10,8 +10,10 @@ permissions:
 jobs:
   quality:
     uses: ./.github/workflows/quality.yml
+  desktop:
+    uses: ./.github/workflows/desktop.yml
   release:
-    needs: quality
+    needs: [quality, desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +40,8 @@ jobs:
           sbom: true
       - uses: sigstore/cosign-installer@v3
       - run: cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.build.outputs.digest }}"
+      - uses: actions/download-artifact@v8
+        with: {pattern: 'MAL-Updater-*', path: desktop, merge-multiple: true}
       - run: |
           mkdir -p release-bundle/docs
           cp compose.yaml .env.example README.md CHANGELOG.md RELEASE_NOTES.md LICENSE release-bundle/
@@ -48,13 +52,17 @@ jobs:
           tar -czf "mal-updater-${GITHUB_REF_NAME}.tar.gz" release-bundle
           (cd dist && sha256sum *) > SHA256SUMS
           sha256sum "mal-updater-${GITHUB_REF_NAME}.tar.gz" >> SHA256SUMS
+          (cd desktop && sha256sum MAL-Updater-*) >> SHA256SUMS
       - uses: actions/attest-build-provenance@v4
         with:
-          subject-path: 'mal-updater-*.tar.gz'
+          subject-path: |
+            mal-updater-*.tar.gz
+            desktop/MAL-Updater-*
       - uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
           files: |
             dist/*
             mal-updater-*.tar.gz
+            desktop/MAL-Updater-*
             SHA256SUMS

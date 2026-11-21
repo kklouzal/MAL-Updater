@@ -300,21 +300,42 @@ class SchedulerSupervisor:
         if self.daemon_ref[0] is None and now >= self.next_start:
             self.daemon_ref[0] = self.popen(daemon_command(self.config.project_root), start_new_session=False)
 
+class ContainerRuntime:
+    """The HTTP control plane and the scheduler supervisor, started and stopped together.
+
+    Binding happens in the constructor, so a busy port fails before anything runs.
+    serve() blocks until request_stop() (from any thread) and then stops the scheduler.
+    """
+
+    def __init__(self, *, project_root: Path | None = None, host: str = "0.0.0.0", port: int = 8080, popen: Any = subprocess.Popen):
+        self.config = initialize_runtime(project_root); self.store = ControlStore(self.config); self.daemon_ref: list[subprocess.Popen[bytes] | None] = [None]
+        self.server = ThreadingHTTPServer((host, port), make_container_handler(self.config, self.daemon_ref, self.store))
+        self.scheduler = SchedulerSupervisor(self.config, self.store, self.daemon_ref, popen=popen)
+        self._stop = threading.Event()
+
+    @property
+    def port(self) -> int:
+        return int(self.server.server_address[1])
+
+    def request_stop(self) -> None:
+        self._stop.set(); threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    def serve(self) -> None:
+        def supervise() -> None:
+            while not self._stop.wait(1):
+                self.scheduler.reconcile()
+        supervisor = threading.Thread(target=supervise, daemon=True); supervisor.start()
+        try: self.server.serve_forever(.5)
+        finally:
+            self._stop.set(); self.server.server_close(); supervisor.join(timeout=2)
+            if self.daemon_ref[0] is not None: _terminate_process(self.daemon_ref[0])
+
 def run_container(*, project_root: Path | None = None, host: str = "0.0.0.0", port: int = 8080, popen: Any = subprocess.Popen) -> int:
-    config = initialize_runtime(project_root); store = ControlStore(config); daemon_ref = [None]
     print(json.dumps({"event": "container_starting"}), flush=True)
-    server = ThreadingHTTPServer((host, port), make_container_handler(config, daemon_ref, store)); stop = threading.Event()
-    scheduler = SchedulerSupervisor(config, store, daemon_ref, popen=popen)
-    def supervise():
-        while not stop.wait(1):
-            scheduler.reconcile()
-    supervisor = threading.Thread(target=supervise, daemon=True); supervisor.start()
-    def request_stop(*_): stop.set(); threading.Thread(target=server.shutdown, daemon=True).start()
-    previous = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
-    try: server.serve_forever(.5)
+    runtime = ContainerRuntime(project_root=project_root, host=host, port=port, popen=popen)
+    previous = {sig: signal.signal(sig, lambda *_: runtime.request_stop()) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try: runtime.serve()
     finally:
-        stop.set(); server.server_close(); supervisor.join(timeout=2)
-        if daemon_ref[0] is not None: _terminate_process(daemon_ref[0])
         for sig, handler in previous.items(): signal.signal(sig, handler)
     return 0
 def main(argv: Sequence[str] | None = None) -> int:

@@ -127,7 +127,18 @@ def _ensure_parent_dir(path: Path) -> None:
             continue
 
 
-def _fsync_parent(path: Path) -> None:
+# Windows text-mode descriptors would translate newlines; POSIX has no such flag.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _fchmod(fd: int, mode: int) -> None:
+    # os.fchmod reaches Windows only in Python 3.13; there it only toggles read-only.
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)
+
+
+def fsync_parent_directory(path: Path) -> None:
+    """Persist a rename in path's directory; Windows cannot open directories, so it is skipped there."""
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except OSError:
@@ -147,15 +158,15 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd: int | None = None
     try:
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, target_mode)
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, target_mode)
         with os.fdopen(fd, "wb") as fh:
             fd = None
-            os.fchmod(fh.fileno(), target_mode)
+            _fchmod(fh.fileno(), target_mode)
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, path)
-        _fsync_parent(path)
+        fsync_parent_directory(path)
     except OSError as exc:
         if fd is not None:
             try:
@@ -191,16 +202,16 @@ def atomic_writer(path: Path, *, mode: int = 0o600) -> Iterator[BinaryIO]:
     fd: int | None = None
     committed = False
     try:
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, target_mode)
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, target_mode)
         with os.fdopen(fd, "wb") as fh:
             fd = None
-            os.fchmod(fh.fileno(), target_mode)
+            _fchmod(fh.fileno(), target_mode)
             yield fh
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, path)
         committed = True
-        _fsync_parent(path)
+        fsync_parent_directory(path)
     except OSError as exc:
         raise PersistentWriteError(_safe_os_error_message(path, exc, operation="atomic_write")) from None
     finally:
