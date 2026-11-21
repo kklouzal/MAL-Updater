@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from .timestamps import parse_utc_timestamp
 from .config import AppConfig, load_mal_secrets
 from .db import (
+    get_mal_anime_relations_map,
     MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     MalAnimeMetadata,
@@ -66,6 +67,7 @@ from .db import (
 )
 from .mal_client import MAL_ANIME_LIST_MAX_LIMIT, MalApiError, MalClient
 from .periodic_evidence_lifecycle import periodic_evidence_is_due
+from .recommendations import mal_sequel_target_ids
 from .mal_user_recommendations import (
     DEFAULT_PUBLIC_USER_RECS_MAX_BODY_BYTES,
     DEFAULT_PUBLIC_USER_RECS_MAX_PAGES,
@@ -197,6 +199,8 @@ class MetadataRefreshSummary:
     refreshed: int
     discovery_considered: int = 0
     discovery_refreshed: int = 0
+    sequel_considered: int = 0
+    sequel_refreshed: int = 0
     failures: list[MetadataRefreshFailure] | None = None
     eligible_seed_count: int = 0
     harvest_unharvested: int = 0
@@ -219,6 +223,8 @@ class MetadataRefreshSummary:
             "harvested_edge_count": self.harvested_edge_count,
             "discovery_considered": self.discovery_considered,
             "discovery_refreshed": self.discovery_refreshed,
+            "sequel_considered": self.sequel_considered,
+            "sequel_refreshed": self.sequel_refreshed,
             "target_hydration_skip_reasons": dict(self.target_hydration_skip_reasons),
             "fresh_skipped": self.fresh_skipped,
             "refresh_tiers": dict(self.refresh_tiers),
@@ -1893,6 +1899,33 @@ def refresh_full_user_recommendation_harvest(
         fetch_failed=fetch_counts["failed"],
     )
 
+SEQUEL_TARGET_UNFINISHED_REFRESH_DAYS = 14
+
+
+def _due_sequel_target_ids(config: AppConfig, entries: list[Any], metadata_by_id: dict[int, Any]) -> list[tuple[int, bool]]:
+    """Sequel targets of completed list titles whose MAL details are missing or may have changed.
+
+    Returns ``(mal_anime_id, recheck)`` pairs, missing details first; announced
+    or airing entries are re-checked (``recheck``) every two weeks so a sequel
+    that starts airing gets picked up.
+    """
+    missing: list[int] = []
+    unfinished: list[tuple[str, int]] = []
+    for target_id in sorted(mal_sequel_target_ids(entries, get_mal_anime_relations_map(config.db_path))):
+        meta = metadata_by_id.get(target_id)
+        if meta is None:
+            missing.append(target_id)
+        elif (meta.status or "").strip().lower() != "finished_airing" and periodic_evidence_is_due(
+            successful_at=meta.fetched_at,
+            surface="mal_sequel_target",
+            identity={"mal_anime_id": int(target_id)},
+            target_days=SEQUEL_TARGET_UNFINISHED_REFRESH_DAYS,
+            jitter_days=3,
+        ):
+            unfinished.append((meta.fetched_at or "", target_id))
+    return [(target_id, False) for target_id in missing] + [(target_id, True) for _fetched_at, target_id in sorted(unfinished)]
+
+
 def refresh_recommendation_metadata(
     config: AppConfig,
     *,
@@ -1960,7 +1993,9 @@ def refresh_recommendation_metadata(
     client = MalClient(config, load_mal_secrets(config))
     if force_refresh:
         original_get_anime_details = client.get_anime_details
-        def _forced_get_anime_details(anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status") -> dict[str, Any]:
+        def _forced_get_anime_details(
+            anime_id: int, *, fields: str = "id,title,num_episodes,my_list_status", force_refresh: bool = True
+        ) -> dict[str, Any]:
             return original_get_anime_details(anime_id, fields=fields, force_refresh=True)
         client.get_anime_details = _forced_get_anime_details  # type: ignore[assignment]
     refreshed = 0
@@ -2016,6 +2051,14 @@ def refresh_recommendation_metadata(
     discovery_considered = 0
     discovery_refreshed = 0
     target_hydration_skip_reasons: dict[str, int] = {}
+    # Discovery and sequel targets share the per-run discovery-target budget so a
+    # run stays within the request envelope the scheduler's hourly task budget
+    # was sized for. Due sequel targets get at least half of it: discovery
+    # targets rank by fresh vote evidence and would otherwise starve them.
+    sequel_due: list[tuple[int, bool]] = (
+        _due_sequel_target_ids(config, cached_list_entries, metadata_by_id) if include_discovery_targets else []
+    )
+    target_budget = discovery_target_limit if discovery_target_limit is not None and discovery_target_limit > 0 else None
     if include_discovery_targets and discovered_targets:
         ranked_targets = sorted(
             discovered_targets.items(),
@@ -2037,8 +2080,8 @@ def refresh_recommendation_metadata(
                 _record_target_skip(target_hydration_skip_reasons, "already_listed")
                 continue
             hydratable_targets.append((target_id, info))
-        if discovery_target_limit is not None and discovery_target_limit > 0:
-            hydratable_targets = hydratable_targets[:discovery_target_limit]
+        if target_budget is not None:
+            hydratable_targets = hydratable_targets[: target_budget - min(len(sequel_due), (target_budget + 1) // 2)]
         discovery_considered = len(hydratable_targets)
         for target_id, _info in hydratable_targets:
             try:
@@ -2051,12 +2094,26 @@ def refresh_recommendation_metadata(
                 continue
             _metadata_payload_from_details(config.db_path, mal_anime_id=target_id, details=details)
             discovery_refreshed += 1
+    sequel_targets = sequel_due if target_budget is None else sequel_due[: target_budget - discovery_considered]
+    sequel_considered = len(sequel_targets)
+    sequel_refreshed = 0
+    for target_id, recheck in sequel_targets:
+        try:
+            # A re-check must reach MAL: the detail cache outlives the re-check interval.
+            details = client.get_anime_details(target_id, fields=DISCOVERY_DETAIL_FIELDS, force_refresh=recheck)
+        except (MalApiError, TimeoutError) as exc:
+            failures.append(MetadataRefreshFailure(mal_anime_id=target_id, stage="sequel_metadata", error=str(exc)))
+            continue
+        _metadata_payload_from_details(config.db_path, mal_anime_id=target_id, details=details)
+        sequel_refreshed += 1
     merge_mal_user_anime_list_cache_into_metadata(config.db_path)
     return MetadataRefreshSummary(
         considered=len(anime_ids),
         refreshed=refreshed,
         discovery_considered=discovery_considered,
         discovery_refreshed=discovery_refreshed,
+        sequel_considered=sequel_considered,
+        sequel_refreshed=sequel_refreshed,
         failures=failures,
         eligible_seed_count=eligible_seed_count,
         harvest_unharvested=harvest_unharvested,

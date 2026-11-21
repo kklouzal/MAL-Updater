@@ -12,7 +12,7 @@ Service configuration is read at process start: restart the container (or `mal-u
 | MAL token refresh (`mal_refresh`) | Checked hourly; renews only when the recorded access-token expiry is within 7 days or unknown (`mal-refresh --force` renews immediately). |
 | MAL list refresh (`mal_list_refresh`) | Every 8 hours; 10 network attempts per run against a 14-request task-hour cap, `limit=1000` pages. The service passes `--complete`, so rows removed on MAL are pruned only after a traversal reaches its terminal page. |
 | MAL apply (`sync_apply`) | **Disabled by default** (`service.task_execute_limits.sync_apply = 0`). With a positive opt-in, each run writes at most that many entries and applies only providers whose fetch lane succeeded since the previous apply (`apply-sync --provider ...`); with no fresh provider the run is skipped (`fresh_provider_fetch_required`). Per-item MAL failures make the run exit non-zero, which feeds failure backoff and the `scheduled_task_failures_repeated` health warning. |
-| Recommendation metadata | Every 12 hours; 3 seed rows plus 5 discovery targets. |
+| Recommendation metadata | Every 12 hours; 3 seed rows plus 5 discovery or sequel targets (due sequels take up to half). |
 | Public MAL userrecs harvest (`recommend_full_harvest`) | Hourly; 3 source titles, 10 network attempts per source per run including final revalidation, 120 +/-15-day refresh horizon; 30-request cold projection against a 40-request task-hour cap. |
 | Provider eligibility | Hourly, one lane per credentialed provider; 5 candidates (uncovered first), 1 alias query each, 5 returned matches. |
 | Recommendation snapshot and health | Hourly, DB/local only. |

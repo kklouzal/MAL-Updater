@@ -137,6 +137,14 @@ class Recommendation:
         return payload
 
 
+MAL_SEQUEL_KIND = "mal_sequel"
+# Main continuations only: specials, recaps, music videos and promos are extras.
+_MAL_SEQUEL_MEDIA_TYPES = frozenset({"tv", "ona", "movie"})
+_MAL_SEQUEL_MIN_OVA_EPISODES = 2
+_MAL_SEQUEL_WATCHABLE_STATUSES = frozenset({"finished_airing", "currently_airing"})
+_MAL_SEQUEL_DISLIKED_SCORE = 5
+
+
 @dataclass(slots=True, frozen=True)
 class RecommendationSectionDefinition:
     key: str
@@ -151,6 +159,12 @@ _RECOMMENDATION_SECTIONS: tuple[RecommendationSectionDefinition, ...] = (
         title="Continue next",
         kinds=("new_season",),
         description="Later-season continuations that look ready because an earlier installment appears completed.",
+    ),
+    RecommendationSectionDefinition(
+        key="continue_franchise",
+        title="Continue a franchise",
+        kinds=(MAL_SEQUEL_KIND,),
+        description="MAL sequels of titles you completed that are not on your MAL list yet.",
     ),
     RecommendationSectionDefinition(
         key="fresh_dubbed_episodes",
@@ -460,6 +474,24 @@ def build_recommendations(
         )
     )
     recommendations.extend(_build_new_episode_recommendations(states, mapping_by_series=mapping_by_series, metadata_by_id=metadata_by_id))
+    provider_continuation_ids = {
+        mal_id
+        for item in recommendations
+        if item.kind == "new_season" and isinstance(mal_id := item.context.get("mal_anime_id"), int)
+    }
+    provider_watched_ids = {
+        mapping_by_series[key]
+        for key, state in state_by_id.items()
+        if key in mapping_by_series and state.completed_episode_count > 0
+    }
+    recommendations.extend(
+        build_mal_sequel_recommendations(
+            list_mal_user_anime_list_cache(config.db_path),
+            metadata_by_id=metadata_by_id,
+            relations_by_id=relations_by_id,
+            exclude_mal_ids=provider_continuation_ids | provider_watched_ids,
+        )
+    )
     recommendations = _dedupe_recommendations(recommendations)
     recommendations = _merge_cross_provider_recommendations(
         recommendations,
@@ -470,6 +502,101 @@ def build_recommendations(
     if limit is None or limit <= 0:
         return recommendations
     return recommendations[:limit]
+
+
+def mal_sequel_target_ids(entries: list[Any], relations_by_id: dict[int, list[Any]]) -> dict[int, list[int]]:
+    """Sequel targets of completed, not-disliked MAL list titles that are not on the list.
+
+    Maps each target MAL id to the completed source ids it continues.
+    """
+    listed_ids = {int(entry.mal_anime_id) for entry in entries}
+    targets: dict[int, list[int]] = {}
+    for entry in entries:
+        if (entry.list_status or "").strip().lower() != "completed":
+            continue
+        if entry.user_score and entry.user_score <= _MAL_SEQUEL_DISLIKED_SCORE:
+            continue
+        for relation in relations_by_id.get(int(entry.mal_anime_id), []):
+            target_id = int(relation.related_mal_anime_id)
+            if relation.relation_type == "sequel" and target_id not in listed_ids:
+                targets.setdefault(target_id, []).append(int(entry.mal_anime_id))
+    return targets
+
+
+def _is_main_continuation(meta: Any) -> bool:
+    media_type = (meta.media_type or "").strip().lower()
+    if media_type == "ova":
+        return (meta.num_episodes or 0) >= _MAL_SEQUEL_MIN_OVA_EPISODES
+    return media_type in _MAL_SEQUEL_MEDIA_TYPES
+
+
+def build_mal_sequel_recommendations(
+    entries: list[Any],
+    *,
+    metadata_by_id: dict[int, Any],
+    relations_by_id: dict[int, list[Any]],
+    exclude_mal_ids: set[int] = frozenset(),
+) -> list[Recommendation]:
+    """MAL-graph continuations: sequels of completed list titles not yet on the MAL list.
+
+    Needs no provider data. Targets without cached MAL details are skipped until
+    the metadata refresh hydrates them; extras and unaired entries are skipped.
+    """
+    entry_by_id = {int(entry.mal_anime_id): entry for entry in entries}
+    items: list[Recommendation] = []
+    for target_id, source_ids in mal_sequel_target_ids(entries, relations_by_id).items():
+        meta = metadata_by_id.get(target_id)
+        if target_id in exclude_mal_ids or meta is None or not _is_main_continuation(meta):
+            continue
+        status = (meta.status or "").strip().lower()
+        if status not in _MAL_SEQUEL_WATCHABLE_STATUSES:
+            continue
+        sources = sorted((entry_by_id[source_id] for source_id in source_ids), key=lambda entry: -(entry.user_score or 0))
+        best_score = sources[0].user_score or None
+        source_titles = [entry.title for entry in sources]
+        start_season_label = _format_start_season(_metadata_start_season(meta))
+        media_label = (meta.media_type or "").upper() if (meta.media_type or "").lower() in {"tv", "ona", "ova"} else (meta.media_type or "").title()
+        reasons = [f"Sequel to {source_titles[0]}, which you completed" + (f" and scored {best_score}" if best_score else "")]
+        if len(source_titles) > 1:
+            reasons.append(f"Also continues {', '.join(source_titles[1:])}")
+        reasons.append("Currently airing" if status == "currently_airing" else f"{media_label} on MAL, not on your list yet")
+        if start_season_label:
+            reasons.append(start_season_label)
+        if meta.mean is not None:
+            reasons.append(f"MAL {meta.mean:.2f}")
+        # Rank by how much you liked what it continues, then MAL reception.
+        priority = 100 + 4 * (best_score or 6) + (round(meta.mean * 2) if meta.mean is not None else 0)
+        if (meta.media_type or "").lower() in {"tv", "ona"}:
+            priority += 4
+        items.append(
+            Recommendation(
+                kind=MAL_SEQUEL_KIND,
+                priority=priority,
+                provider="mal",
+                provider_series_id=f"mal:{target_id}",
+                title=meta.title,
+                season_title=None,
+                reasons=reasons,
+                context={
+                    "mal_anime_id": target_id,
+                    "english_title": meta.title_english or None,
+                    "cover_image_url": _mal_main_picture_url(meta),
+                    "synopsis": _mal_synopsis(meta),
+                    "genres": sorted(_metadata_genre_names(meta)),
+                    "media_type": meta.media_type,
+                    "num_episodes": meta.num_episodes,
+                    "airing_status": status,
+                    "mean": meta.mean,
+                    "start_season_label": start_season_label,
+                    "why_recommended": "; ".join(reasons) + ".",
+                    "supporting_seed_details": [
+                        {"mal_anime_id": int(entry.mal_anime_id), "title": entry.title, "user_score": entry.user_score or None, "status": "completed"}
+                        for entry in sources
+                    ],
+                },
+            )
+        )
+    return items
 
 
 def _build_new_episode_recommendations(

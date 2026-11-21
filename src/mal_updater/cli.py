@@ -2884,8 +2884,15 @@ def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool
     return 0 if apply_exit_code == 0 else 1
 
 
-def _snapshot_recommendation_rows(results: list[object], limit: int | None) -> list[dict[str, object]]:
+def _snapshot_recommendation_rows(results: list[object], limit: int | None, *, per_kind: bool = False) -> list[dict[str, object]]:
+    """Rows in ranked order, capped at ``limit`` overall or, with ``per_kind``, per kind.
+
+    The persisted snapshot caps per kind (like the grouped output and the
+    dashboard's per-section limit) so high-priority discovery rows cannot crowd
+    other kinds out of it.
+    """
     rows: list[dict[str, object]] = []
+    kind_counts: dict[object, int] = {}
     for item in results:
         if hasattr(item, "as_dict"):
             row = item.as_dict()
@@ -2893,9 +2900,15 @@ def _snapshot_recommendation_rows(results: list[object], limit: int | None) -> l
             row = item
         else:
             continue
-        if isinstance(row, dict):
-            rows.append(row)
-        if limit is not None and limit > 0 and len(rows) >= limit:
+        if not isinstance(row, dict):
+            continue
+        if per_kind:
+            kind = row.get("kind")
+            if limit is not None and limit > 0 and kind_counts.get(kind, 0) >= limit:
+                continue
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        rows.append(row)
+        if not per_kind and limit is not None and limit > 0 and len(rows) >= limit:
             break
     return rows
 
@@ -2921,7 +2934,7 @@ def _cmd_recommend(project_root: Path | None, limit: int, flat: bool, include_do
         generated_at = datetime.now(timezone.utc).isoformat()
         insert_recommendation_snapshot_rows(
             config.db_path,
-            _snapshot_recommendation_rows(results, normalized_limit),
+            _snapshot_recommendation_rows(results, normalized_limit, per_kind=True),
             run_id=run_id,
             generated_at=generated_at,
         )

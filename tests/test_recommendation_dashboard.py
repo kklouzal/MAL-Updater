@@ -560,7 +560,15 @@ class RecommendationDashboardTests(unittest.TestCase):
                             "provider_series_id": "mal:500",
                             "priority": 88,
                             "context": {"mal_anime_id": 500, "english_dub_signal": "unknown"},
-                        }
+                        },
+                        {
+                            "kind": "mal_sequel",
+                            "provider": "mal",
+                            "title": "Finished Show Season 2",
+                            "provider_series_id": "mal:600",
+                            "priority": 140,
+                            "context": {"mal_anime_id": 600},
+                        },
                     ],
                     run_id="run-mal-only",
                     generated_at="2026-11-20T02:00:00Z",
@@ -574,6 +582,9 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertEqual([], state["source_providers"])
         self.assertEqual(MAL_ONLY_MESSAGE, state["message"])
         self.assertEqual(["MAL Graph Pick"], [row["title"] for row in recommendations["sections"]["discovery_high_confidence"]])
+        # Sequels lead discovery; JSON responses sort keys, so the order travels separately.
+        self.assertEqual(["mal_sequel", "discovery_high_confidence"], recommendations["section_order"])
+        self.assertEqual("Continue a franchise", recommendations["section_metadata"]["mal_sequel"]["label"])
         meta = recommendations["section_metadata"]["discovery_high_confidence"]
         self.assertEqual("Recommended from your MAL list", meta["label"])
         self.assertNotIn("diagnostic_only", meta)
@@ -613,6 +624,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                     "strict_default",
                     "items",
                     "sections",
+                    "section_order",
                     "section_totals",
                     "section_metadata",
                     "coverage_state",
@@ -700,6 +712,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                     "strict_default",
                     "items",
                     "sections",
+                    "section_order",
                     "section_totals",
                     "section_metadata",
                     "coverage_state",

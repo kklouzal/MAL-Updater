@@ -2242,7 +2242,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 result["discovery_target_limit"] = max(0, int(discovery_target_limit))
                 parsed_stdout = _parse_json_stdout(result)
                 if parsed_stdout is not None:
-                    for key in ("considered", "refreshed", "discovery_considered", "discovery_refreshed"):
+                    for key in ("considered", "refreshed", "discovery_considered", "discovery_refreshed", "sequel_considered", "sequel_refreshed"):
                         value = parsed_stdout.get(key)
                         if isinstance(value, int):
                             result[key] = max(0, int(value))

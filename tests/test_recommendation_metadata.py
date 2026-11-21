@@ -670,6 +670,44 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         self.assertIn(400, metadata)
         self.assertEqual("original", metadata[400].raw["source"])
 
+    def test_sequel_targets_share_discovery_budget_and_rechecks_bypass_detail_cache(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.config.db_path,
+            items=[self._list_item(100, "Seed 100", "completed", score=9)],
+            refresh_run_id="list",
+            fetched_at="2026-11-01T00:00:00Z",
+            prune_absent=True,
+        )
+        self._cache_metadata(201, title="Airing Sequel", fetched_at="2000-01-01 00:00:00")
+        with connect(self.config.db_path) as conn:
+            conn.execute("UPDATE mal_anime_metadata SET status = 'currently_airing' WHERE mal_anime_id = 201")
+            conn.commit()
+        seed = self._seed_detail(100, recommendations=[{"node": {"id": target_id, "title": f"Rec {target_id}"}, "num_recommendations": 5} for target_id in (400, 401, 402)])
+        seed["related_anime"] = [{"node": {"id": target_id, "title": f"Sequel {target_id}"}, "relation_type": "sequel"} for target_id in (200, 201, 202)]
+        calls: list[tuple[int, bool]] = []
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "", force_refresh: bool = False) -> dict:
+            calls.append((anime_id, force_refresh))
+            return seed if anime_id == 100 else {"id": anime_id, "title": f"Target {anime_id}", "media_type": "tv", "status": "finished_airing"}
+
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details):
+            summary = refresh_recommendation_metadata(self.config, limit=1, include_discovery_targets=True, discovery_target_limit=4)
+
+        # One seed plus at most the discovery-target limit: due sequels take half of it.
+        self.assertEqual(100, calls[0][0])
+        self.assertEqual(5, len(calls))
+        self.assertEqual((2, 2), (summary.discovery_considered, summary.sequel_considered))
+        self.assertEqual([(200, False), (202, False)], calls[3:])
+        self.assertEqual(2, summary.sequel_refreshed)
+
+        calls.clear()
+        with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details):
+            summary = refresh_recommendation_metadata(self.config, limit=0, include_discovery_targets=True, discovery_target_limit=4)
+
+        # The airing sequel's re-check must reach MAL rather than the detail cache.
+        self.assertIn((201, True), calls)
+        self.assertEqual("finished_airing", get_mal_anime_metadata_map(self.config.db_path)[201].status)
+
 
 class FullUserRecommendationHarvestResumableTests(unittest.TestCase):
     def setUp(self) -> None:

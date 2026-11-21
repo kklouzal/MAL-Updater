@@ -64,6 +64,11 @@ _SECTION_METADATA: dict[str, dict[str, str]] = {
         "description": "All fresh MAL user-recommendation-backed discovery candidates, with provider availability evidence when known.",
         "title_label": "English title",
     },
+    "mal_sequel": {
+        "label": "Continue a franchise",
+        "description": "Sequels of titles you completed on MAL that are not on your MAL list yet. Specials, recaps and unaired entries are left out; where they stream is not checked.",
+        "title_label": "Title",
+    },
     "resume_backlog": {
         "label": "Resume backlog",
         "description": "Known provider or MAL-list titles that look ready to resume from existing watch progress.",
@@ -778,7 +783,7 @@ _DASHBOARD_COLUMNS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-_STATIC_SECTION_ORDER: tuple[str, ...] = ("discovery_available_now", "discovery_high_confidence", "resume_backlog")
+_STATIC_SECTION_ORDER: tuple[str, ...] = ("discovery_available_now", "mal_sequel", "discovery_high_confidence", "resume_backlog")
 
 _DASHBOARD_REQUIRED_TABLES: frozenset[str] = frozenset(
     {
@@ -884,6 +889,7 @@ def _unavailable_dashboard_payload(*, limit: int, reason: str, db_path: Path | N
             "strict_default": True,
             "items": [],
             "sections": {},
+            "section_order": [],
             "section_totals": {},
             "section_metadata": section_metadata,
             "coverage_state": coverage_state,
@@ -1919,6 +1925,8 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
         section_totals[section_key] = section_totals.get(section_key, 0) + 1
         if len(sections.setdefault(section_key, [])) < display_limit:
             sections[section_key].append(row)
+    section_rank = {kind: index for index, kind in enumerate(_STATIC_SECTION_ORDER)}
+    sections = dict(sorted(sections.items(), key=lambda item: (section_rank.get(item[0], len(section_rank)), item[0])))
     _fill_missing_mal_metadata(db_path, [row for section_rows in sections.values() for row in section_rows])
     eligibility_counts = _eligibility_coverage_counts(db_path)
     strict_actionable_count = section_totals.get("discovery_available_now", 0)
@@ -1969,7 +1977,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "snapshot": latest_snapshot,
         "genre_affinity": _genre_affinity_from_local_state(db_path),
-        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "diagnostic_source_snapshot": diagnostic_source_snapshot, "limit": display_limit, "limit_scope": "per_section"},
+        "recommendations": {"mode": "diagnostic_snapshot" if dormant_count else "strict_actionable", "strict_default": True, "items": [row for section_rows in sections.values() for row in section_rows], "sections": sections, "section_order": list(sections), "section_totals": section_totals, "section_metadata": section_metadata, "coverage_state": coverage_state, "diagnostic_source_snapshot": diagnostic_source_snapshot, "limit": display_limit, "limit_scope": "per_section"},
         "coverage": coverage,
         "operational": operational,
         "recent_sync_runs": _recent_sync_runs(db_path),
@@ -2043,6 +2051,8 @@ _PAGE_CSS = r"""
 .rec-table tr.diagnostic-row>*{background:#181b17}
 .col-rank{width:6rem}.col-cover{width:6.4rem}.col-title{width:17%}.col-why{width:21%}.col-score{width:12.5rem}
 .col-genres{width:8.5rem}.col-actions{width:5.6rem}.col-progress{width:10rem}
+/* Tables without the seeds column give its share to "Why recommended". */
+.rec-table.no-seeds .col-why{width:auto}
 .rank{display:inline-block;min-width:2.4rem;text-align:center;font-weight:750;font-variant-numeric:tabular-nums;background:var(--surface-3);border-radius:.4rem;padding:.12rem .4rem}
 .cover-link{display:block;width:4.9rem}
 .cover{position:relative;display:block;width:4.9rem;aspect-ratio:225/318;border-radius:.4rem;overflow:hidden;background:var(--surface-3)}
@@ -2290,7 +2300,7 @@ function titleCell(r, extraMeta, progressSection){
   if (!progressSection && r.episode_total) meta.push(plural(r.episode_total, 'episode'));
   meta.push(...extraMeta);
   const label = r.diagnostic_only ? '<span class="diagnostic-label">Discovery only · unverified</span>' : '';
-  const providers = latestDashboardData?.recommendations?.coverage_state?.mal_only ? '' : `<div class="providers" aria-label="Where to watch">${providerBadges(r)}</div>`;
+  const providers = latestDashboardData?.recommendations?.coverage_state?.mal_only || r.kind === 'mal_sequel' ? '' : `<div class="providers" aria-label="Where to watch">${providerBadges(r)}</div>`;
   return `${label}${name}${meta.length ? `<div class="title-meta">${esc(meta.join(' · '))}</div>` : ''}${providers}`;
 }
 const SCORE_PARTS = [['consensus', 'Consensus'], ['affinity', 'Affinity'], ['quality', 'Quality'], ['availability', 'Availability'], ['dub_watchable', 'English dub'], ['confidence', 'Confidence']];
@@ -2326,7 +2336,7 @@ function progressCell(r){
   return `<div class="progress-cell"><span class="progress-text">${esc(match[1])} / ${esc(match[2])}</span> <span class="muted">episodes</span><span class="bar" aria-hidden="true"><span style="width:${percent}%"></span></span></div>`;
 }
 const genreList = r => { const genres = Array.isArray(r.genres) ? r.genres : []; return genres.length ? `<ul class="tags">${genres.map(genre => `<li>${esc(genre)}</li>`).join('')}</ul>` : '<span class="muted">—</span>'; };
-function recRow(r, progressSection){
+function recRow(r, progressSection, sequelSection = false){
   const identity = recommendationIdentity(r);
   const hidden = hiddenTitles.has(identity);
   const {meta, why} = rowPresentation(r);
@@ -2338,7 +2348,7 @@ function recRow(r, progressSection){
     `<th scope="row" class="c-title">${titleCell(r, meta, progressSection)}</th>`,
     progressSection ? `<td class="c-progress" data-label="Progress">${progressCell(r)}</td>` : '',
     `<td class="c-why" data-label="Why recommended">${whyHtml}</td>`,
-    progressSection ? '' : `<td class="c-score" data-label="Score">${scoreCell(r)}</td><td class="c-seeds" data-label="Top watched seeds">${seedsCell(r)}</td>`,
+    progressSection || sequelSection ? '' : `<td class="c-score" data-label="Score">${scoreCell(r)}</td><td class="c-seeds" data-label="Top watched seeds">${seedsCell(r)}</td>`,
     `<td class="c-genres" data-label="Genres">${genreList(r)}</td>`,
     `<td class="c-actions dashboard-interactive-only"><button type="button" class="button small row-visibility-button" data-recommendation-id="${esc(identity)}" aria-pressed="${hidden}">${hidden ? 'Unhide' : 'Hide'}</button></td>`,
   ];
@@ -2346,12 +2356,16 @@ function recRow(r, progressSection){
 }
 function recTable(rows, meta){
   const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog';
+  const sequelSection = meta.kind === 'mal_sequel';
   const columns = progressSection
     ? [['rank', 'Priority'], ['cover', '<span class="sr-only">Cover</span>'], ['title', 'Title'], ['progress', 'Progress'], ['why', 'Why recommended'], ['genres', 'Genres'], ['actions', '<span class="sr-only">Visibility</span>']]
+    : sequelSection
+    ? [['rank', 'Priority'], ['cover', '<span class="sr-only">Cover</span>'], ['title', 'Title'], ['why', 'Why recommended'], ['genres', 'Genres'], ['actions', '<span class="sr-only">Visibility</span>']]
     : [['rank', 'Priority'], ['cover', '<span class="sr-only">Cover</span>'], ['title', 'Title'], ['why', 'Why recommended'], ['score', 'Score'], ['seeds', 'Top watched seeds'], ['genres', 'Genres'], ['actions', '<span class="sr-only">Visibility</span>']];
   const colgroup = columns.map(([key]) => `<col class="col-${key}">`).join('');
   const head = columns.map(([key, label]) => `<th scope="col"${key === 'actions' ? ' class="dashboard-interactive-only"' : ''}>${label}</th>`).join('');
-  return `<table class="rec-table"><caption class="sr-only">${esc(meta.label || 'Recommendations')}</caption><colgroup>${colgroup}</colgroup><thead><tr>${head}</tr></thead><tbody>${rows.map(r => recRow(r, progressSection)).join('')}</tbody></table>`;
+  const tableClass = columns.some(([key]) => key === 'seeds') ? 'rec-table' : 'rec-table no-seeds';
+  return `<table class="${tableClass}"><caption class="sr-only">${esc(meta.label || 'Recommendations')}</caption><colgroup>${colgroup}</colgroup><thead><tr>${head}</tr></thead><tbody>${rows.map(r => recRow(r, progressSection, sequelSection)).join('')}</tbody></table>`;
 }
 function visibleRows(rows){
   const query = titleQuery.trim().toLowerCase();
@@ -2363,7 +2377,10 @@ function visibleRows(rows){
   });
 }
 function sectionsHtml(data){
-  const sections = Object.entries(data.recommendations?.sections || {});
+  // JSON responses sort keys, so the server sends the display order separately.
+  const byName = data.recommendations?.sections || {};
+  const order = (data.recommendations?.section_order || []).filter(name => name in byName);
+  const sections = [...order, ...Object.keys(byName).filter(name => !order.includes(name))].map(name => [name, byName[name]]);
   if (!sections.length) return '<p class="muted" role="status">No recommendations yet.</p>';
   return sections.map(([name, rows]) => {
     const meta = {kind: name, label: name, ...(data.recommendations?.section_metadata?.[name] || {})};

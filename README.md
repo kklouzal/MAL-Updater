@@ -2,7 +2,7 @@
 
 Container-first trusted-LAN control plane for conservative provider-to-MyAnimeList sync and recommendations. It reads Crunchyroll and HIDIVE watch history, maps each provider season to its MyAnimeList entry, and fills in missing MAL progress without overwriting meaningful MAL data.
 
-Crunchyroll and HIDIVE are optional. With only a MAL account connected (MAL-only mode), MAL-Updater still refreshes your MAL list, harvests MAL community recommendations, ranks recommendations from your list, and serves the dashboard, genre affinity and PDF export. What needs a provider is watch-history sync to MAL and the **Watchable now** check (verified streaming availability plus English dub).
+Crunchyroll and HIDIVE are optional. With only a MAL account connected (MAL-only mode), MAL-Updater still refreshes your MAL list, harvests MAL community recommendations, ranks recommendations from your list, suggests sequels of titles you completed (**Continue a franchise**), and serves the dashboard, genre affinity and PDF export. What needs a provider is watch-history sync to MAL and the **Watchable now** check (verified streaming availability plus English dub).
 
 ## Quick start (container)
 

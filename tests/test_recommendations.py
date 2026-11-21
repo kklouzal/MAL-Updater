@@ -172,7 +172,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("MAL Only Candidate", rows[0].title)
         self.assertEqual("mal", rows[0].provider)
 
-    def test_cli_recommend_persist_snapshot_uses_full_candidate_limit_not_display_sections(self) -> None:
+    def test_cli_recommend_persist_snapshot_caps_each_kind_not_display_sections(self) -> None:
         recommendations = [
             Recommendation(
                 kind="discovery_candidate",
@@ -222,10 +222,11 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         rows = list_latest_recommendation_snapshot_rows(self.config.db_path, limit=120)
-        self.assertEqual(100, len(rows))
+        # --limit caps each kind, so lower-priority kinds are not crowded out.
+        self.assertEqual(105, len(rows))
         self.assertEqual(82, sum(1 for row in rows if row.provider == "mal" and row.kind == "discovery_candidate"))
         self.assertEqual(5, sum(1 for row in rows if row.provider == "crunchyroll" and row.kind == "discovery_candidate"))
-        self.assertGreater(sum(1 for row in rows if row.kind == "resume_backlog"), 0)
+        self.assertEqual(18, sum(1 for row in rows if row.kind == "resume_backlog"))
 
     def _insert_series(
         self,
@@ -310,6 +311,8 @@ class RecommendationTests(unittest.TestCase):
         start_season: dict | None = None,
         my_list_status: dict | None = None,
         num_episodes: int = 12,
+        media_type: str = "tv",
+        status: str = "finished_airing",
     ) -> None:
         raw = {"id": mal_anime_id, "title": title}
         if genres:
@@ -327,8 +330,8 @@ class RecommendationTests(unittest.TestCase):
             title_english=title_english,
             title_japanese=None,
             alternative_titles=[],
-            media_type="tv",
-            status="finished_airing",
+            media_type=media_type,
+            status=status,
             num_episodes=num_episodes,
             mean=mean,
             popularity=popularity,
@@ -338,6 +341,23 @@ class RecommendationTests(unittest.TestCase):
 
     def _cache_relations(self, mal_anime_id: int, relations: list[dict]) -> None:
         replace_mal_anime_relations(self.config.db_path, mal_anime_id=mal_anime_id, relations=relations)
+
+    def _cache_sequels(self, mal_anime_id: int, target_ids: list[int], *, prequel_ids: tuple[int, ...] = ()) -> None:
+        """Replace mal_anime_id's relations with these sequels (and prequels)."""
+        self._cache_relations(
+            mal_anime_id,
+            [
+                {
+                    "related_mal_anime_id": target_id,
+                    "relation_type": relation_type,
+                    "relation_type_formatted": relation_type.title(),
+                    "related_title": f"Target {target_id}",
+                    "raw": {"relation_type": relation_type, "node": {"id": target_id}},
+                }
+                for relation_type, ids in (("sequel", target_ids), ("prequel", prequel_ids))
+                for target_id in ids
+            ],
+        )
 
     def _cache_recommendations(self, mal_anime_id: int, edges: list[dict], *, make_targets_available: bool = True) -> None:
         replace_mal_recommendation_edges(self.config.db_path, source_mal_anime_id=mal_anime_id, hop_distance=1, edges=edges)
@@ -4306,6 +4326,82 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(["mal:300"], [row["provider_series_id"] for row in payload])
         self.assertFalse(payload[0]["context"]["watch_now_eligible"])
         self.assertEqual("none", payload[0]["context"]["availability_confidence"])
+
+    def test_mal_sequel_recommends_unlisted_main_continuations_of_completed_titles(self) -> None:
+        self._disconnect_source_providers()
+        self._cache_metadata(100, title="Liked Show")
+        self._cache_mal_list_status(100, "Liked Show", "completed", score=9)
+        self._cache_metadata(101, title="Disliked Show")
+        self._cache_mal_list_status(101, "Disliked Show", "completed", score=4)
+        self._cache_metadata(102, title="Ongoing Show")
+        self._cache_mal_list_status(102, "Ongoing Show", "watching")
+        self._cache_metadata(203, title="Planned Sequel")
+        self._cache_mal_list_status(203, "Planned Sequel", "plan_to_watch")
+        self._cache_metadata(200, title="Liked Show Season 2", title_english="Liked Show 2", mean=8.1, genres=["Action"])
+        self._cache_metadata(201, title="Liked Show Special", media_type="special", num_episodes=1)
+        self._cache_metadata(202, title="Liked Show Season 3", status="not_yet_aired")
+        self._cache_metadata(204, title="Disliked Show Season 2")
+        self._cache_metadata(205, title="Ongoing Show Season 2")
+        self._cache_metadata(207, title="Liked Show Prequel")
+        self._cache_sequels(100, [200, 201, 202, 203, 206], prequel_ids=(207,))
+        self._cache_sequels(101, [204])
+        self._cache_sequels(102, [205])
+        # An unscored completed title continuing into the same sequel is a second source, not a second row.
+        self._cache_metadata(103, title="Unscored Show")
+        self._cache_mal_list_status(103, "Unscored Show", "completed")
+        self._cache_sequels(103, [200])
+
+        sequels = [item for item in build_recommendations(self.config, limit=0) if item.kind == "mal_sequel"]
+
+        self.assertEqual(["mal:200"], [item.provider_series_id for item in sequels])
+        sequel = sequels[0]
+        self.assertEqual("Sequel to Liked Show, which you completed and scored 9", sequel.reasons[0])
+        self.assertEqual("Also continues Unscored Show", sequel.reasons[1])
+        self.assertIn("MAL 8.10", sequel.reasons)
+        self.assertEqual("Liked Show 2", sequel.context["english_title"])
+        self.assertEqual(["Action"], sequel.context["genres"])
+        self.assertEqual([100, 103], [seed["mal_anime_id"] for seed in sequel.context["supporting_seed_details"]])
+        grouped = {section["key"]: section for section in group_recommendations(sequels)}
+        self.assertEqual("Continue a franchise", grouped["continue_franchise"]["title"])
+
+    def test_mal_sequel_skips_targets_already_covered_by_provider_continuations(self) -> None:
+        self._cache_metadata(100, title="Liked Show")
+        self._cache_mal_list_status(100, "Liked Show", "completed", score=9)
+        self._cache_metadata(200, title="Liked Show Season 2")
+        self._cache_sequels(100, [200])
+
+        def provider_continuation(*_args, **_kwargs):
+            return [Recommendation(kind="new_season", priority=110, provider="crunchyroll", provider_series_id="cr-200", title="Liked Show Season 2", season_title=None, reasons=[], context={"mal_anime_id": 200})]
+
+        with patch("mal_updater.recommendations._build_new_season_recommendations", side_effect=provider_continuation):
+            kinds = [item.kind for item in build_recommendations(self.config, limit=0)]
+
+        self.assertIn("new_season", kinds)
+        self.assertNotIn("mal_sequel", kinds)
+
+    def test_sequel_target_hydration_prioritizes_missing_metadata(self) -> None:
+        from mal_updater.db import list_mal_user_anime_list_cache
+        from mal_updater.recommendation_metadata import _due_sequel_target_ids
+
+        self._cache_metadata(100, title="Liked Show")
+        self._cache_mal_list_status(100, "Liked Show", "completed", score=9)
+        self._cache_metadata(200, title="Liked Show Season 2")
+        self._cache_sequels(100, [200, 206])
+
+        due = _due_sequel_target_ids(
+            self.config, list_mal_user_anime_list_cache(self.config.db_path), get_mal_anime_metadata_map(self.config.db_path)
+        )
+
+        self.assertEqual([(206, False)], due)
+
+    def test_persisted_snapshot_rows_are_capped_per_kind(self) -> None:
+        from mal_updater.cli import _snapshot_recommendation_rows
+
+        rows = [{"kind": "discovery_candidate", "n": index} for index in range(5)] + [{"kind": "mal_sequel", "n": 9}]
+
+        self.assertEqual(2, len(_snapshot_recommendation_rows(rows, 2)))
+        per_kind = _snapshot_recommendation_rows(rows, 2, per_kind=True)
+        self.assertEqual(["discovery_candidate", "discovery_candidate", "mal_sequel"], [row["kind"] for row in per_kind])
 
     def test_recommend_cli_surfaces_provider_available_non_english_dub_discovery_as_unknown(self) -> None:
         self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")
