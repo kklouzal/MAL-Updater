@@ -187,7 +187,7 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
         self.config.service_state_path.write_text(json.dumps({"tasks": {"db_compaction": {"last_run_epoch": 1}}}), encoding="utf-8")
-        with patch("mal_updater.service_runtime._available_source_providers", return_value=[]), patch(
+        with patch("mal_updater.service_runtime.connected_source_providers", return_value=[]), patch(
             "mal_updater.service_runtime.load_mal_secrets"
         ) as secrets, patch("mal_updater.service_runtime.prune_recommendation_score_snapshots") as prune:
             secrets.return_value.access_token = None

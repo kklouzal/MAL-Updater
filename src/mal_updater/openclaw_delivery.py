@@ -245,7 +245,13 @@ def build_recommendation_delivery_payload(
     normalized_mode = _normalize_delivery_mode(delivery_mode or config.openclaw.recommendations_webhook_delivery_mode)
     suppressed_fingerprints = set(suppress_item_fingerprints or set())
     if include_dormant and max_dormant_discovery_items is not None:
-        items = build_recommendations(config, limit=0, require_provider_availability=True)
+        # Without a connected provider the strict build already includes dormant
+        # discovery rows; keep only provider-visible ones so the cap below holds.
+        items = [
+            item
+            for item in build_recommendations(config, limit=0, require_provider_availability=True)
+            if item.kind != "discovery_candidate" or item.context.get("availability_visible")
+        ]
         dormant_limit = max(0, int(max_dormant_discovery_items))
         if dormant_limit > 0:
             provider_item_keys = {(item.kind, item.provider_series_id) for item in items}

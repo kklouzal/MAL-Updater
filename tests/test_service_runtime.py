@@ -732,7 +732,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             "mal_updater.service_runtime._task_specs",
             return_value=[TaskSpec("sync_apply", 3600, "mal")],
         ), patch(
-            "mal_updater.service_runtime._available_source_providers",
+            "mal_updater.service_runtime.connected_source_providers",
             return_value=["crunchyroll", "hidive"],
         ), patch(
             "mal_updater.service_runtime._budget_gate",
@@ -755,7 +755,7 @@ class ServiceRuntimeApplyBatchingTests(unittest.TestCase):
             "mal_updater.service_runtime._task_specs",
             return_value=[TaskSpec("sync_apply", 0, "mal")],
         ), patch(
-            "mal_updater.service_runtime._available_source_providers",
+            "mal_updater.service_runtime.connected_source_providers",
             return_value=["crunchyroll", "hidive"],
         ), patch("mal_updater.service_runtime._run_subprocess") as second_run:
             second = run_pending_tasks(self.config)

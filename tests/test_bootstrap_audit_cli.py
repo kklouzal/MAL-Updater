@@ -125,10 +125,9 @@ class BootstrapAuditCliTests(unittest.TestCase):
         command_strings = [item["command"] for item in commands]
         self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli init", command_strings)
         self.assertIn("PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login", command_strings)
-        self.assertIn(
-            "PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll",
-            command_strings,
-        )
+        # Source providers are optional: nothing staged means no provider onboarding steps.
+        self.assertFalse(any("provider-auth-login" in command for command in command_strings))
+        self.assertFalse(any(step["applies_to"] in {"crunchyroll", "hidive"} for step in payload["onboarding_steps"]))
         self.assertIn(str(self.project_root / "scripts" / "install_user_systemd_units.sh"), command_strings)
         init_command = next(item for item in commands if item["command"] == "PYTHONPATH=src python3 -m mal_updater.cli init")
         self.assertEqual("initialize_runtime", init_command["reason_code"])
@@ -246,10 +245,13 @@ class BootstrapAuditCliTests(unittest.TestCase):
         payload = json.loads(stdout)
 
         self.assertEqual(0, exit_code)
-        self.assertEqual("bootstrap-provider-staged", payload["summary"]["operation_mode"])
+        # MAL auth alone is a complete (MAL-only) install.
+        self.assertEqual("daemon-expected-for-unattended", payload["summary"]["operation_mode"])
         self.assertTrue(payload["summary"]["manual_foreground_acceptable"])
-        self.assertFalse(payload["summary"]["daemon_expected"])
-        self.assertEqual("bootstrap-provider-staged", payload["operation_modes"]["mode"])
+        self.assertTrue(payload["summary"]["daemon_expected"])
+        self.assertEqual("daemon-expected-for-unattended", payload["operation_modes"]["mode"])
+        self.assertTrue(payload["operation_modes"]["unattended_ready"])
+        self.assertIn("MAL-only", payload["operation_modes"]["details"])
         self.assertEqual(0, payload["summary"]["intended_provider_count"])
         self.assertEqual(0, payload["summary"]["partially_staged_provider_count"])
 

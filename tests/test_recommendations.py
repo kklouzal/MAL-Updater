@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from mal_updater.cli import main as cli_main
 from mal_updater.config import load_config
+from mal_updater.crunchyroll_auth import load_crunchyroll_credentials
 from mal_updater.db import (
     bootstrap_database,
     connect,
@@ -41,9 +42,19 @@ class RecommendationTests(unittest.TestCase):
         (self.project_root / ".MAL-Updater" / "config").mkdir(parents=True, exist_ok=True)
         self.config = load_config(self.project_root)
         bootstrap_database(self.config.db_path)
+        # These fixtures model ingested provider watch history, so a source
+        # provider is connected; MAL-only behaviour is covered explicitly.
+        self.crunchyroll_credentials = load_crunchyroll_credentials(self.config)
+        for path in (self.crunchyroll_credentials.username_path, self.crunchyroll_credentials.password_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def _disconnect_source_providers(self) -> None:
+        self.crunchyroll_credentials.username_path.unlink()
+        self.crunchyroll_credentials.password_path.unlink()
 
     def test_build_recommendations_read_only_skips_metadata_cache_merge_but_default_preserves_it(self) -> None:
         with patch("mal_updater.recommendations.merge_mal_user_anime_list_cache_into_metadata", return_value=0) as merge_mock:
@@ -4276,6 +4287,25 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         payload = json.loads(stdout.getvalue())
         self.assertEqual([], payload)
+
+    def test_recommend_cli_ranks_mal_graph_discovery_by_default_without_source_providers(self) -> None:
+        self._disconnect_source_providers()
+        self._cache_metadata(100, title="Seed A")
+        self._cache_mal_list_status(100, "Seed A", "completed", score=9)
+        self._cache_metadata(300, title="MAL Graph Candidate")
+        self._cache_recommendations(100, [
+            {"target_mal_anime_id": 300, "target_title": "MAL Graph Candidate", "num_recommendations": 20, "raw": {}},
+        ], make_targets_available=False)
+
+        argv = ["mal-updater", "--project-root", str(self.project_root), "recommend", "--limit", "0", "--flat"]
+        with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = cli_main()
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(["mal:300"], [row["provider_series_id"] for row in payload])
+        self.assertFalse(payload[0]["context"]["watch_now_eligible"])
+        self.assertEqual("none", payload[0]["context"]["availability_confidence"])
 
     def test_recommend_cli_surfaces_provider_available_non_english_dub_discovery_as_unknown(self) -> None:
         self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")

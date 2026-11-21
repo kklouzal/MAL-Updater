@@ -16,7 +16,7 @@ from .auth_remediation import (
     provider_rebootstrap_auth_descriptor,
 )
 from .config import AppConfig, ensure_directories, load_config, load_mal_secrets
-from .crunchyroll_auth import crunchyroll_auth_material_present, load_crunchyroll_credentials, resolve_crunchyroll_state_paths
+from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .db import (
     bootstrap_database,
     get_latest_completed_sync_run,
@@ -28,6 +28,7 @@ from .db import (
     list_review_queue_entries,
 )
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
+from .provider_registry import connected_source_providers, started_source_providers
 from .persistence import PersistentJsonError, read_json_dict_bounded
 from .redaction import sanitize_text
 from .season_mappings import count_unresolved_provider_season_mappings
@@ -902,11 +903,7 @@ def build_health_report(
         max_pages_per_source_per_run=config.service.execute_limit_for("recommend_full_harvest_pages"),
         stale_after_days=max(1, int(config.service.recommendation_full_harvest_stale_after_days)),
     )
-    credentialed_provider_slugs: list[str] = []
-    if crunchyroll_auth_material_present(config):
-        credentialed_provider_slugs.append("crunchyroll")
-    if hidive_credentials.username and hidive_credentials.password:
-        credentialed_provider_slugs.append("hidive")
+    credentialed_provider_slugs = connected_source_providers(config)
     provider_enrichment_diagnostics = build_provider_enrichment_diagnostics(
         config,
         provider_slugs=credentialed_provider_slugs,
@@ -1000,20 +997,30 @@ def build_health_report(
     )
     automation_installation = _build_automation_installation_status(config)
     service_state = load_service_state(config)
+    # Task state of a provider that is no longer connected is stale: its lanes
+    # are unscheduled, so neither its failures nor sync_apply's are reported.
     provider_auth_failures = {
         provider: payload
-        for provider in ("crunchyroll", "hidive")
+        for provider in credentialed_provider_slugs
         if (payload := provider_service_auth_failure(service_state, provider=provider, config=config)) is not None
     }
+    unscheduled_provider_tasks = {
+        f"sync_fetch_{provider}" for provider in ("crunchyroll", "hidive") if provider not in credentialed_provider_slugs
+    }
+    if not credentialed_provider_slugs:
+        unscheduled_provider_tasks.add("sync_apply")
     mal_auth_failure = mal_service_auth_failure(service_state)
 
     warnings: list[dict[str, object]] = []
 
     crunchyroll_session_linked = crunchyroll_state.refresh_token_path.exists() and crunchyroll_state.device_id_path.exists()
+    # Source providers are optional: only a provider that has been started
+    # (any credential or session file staged) can be incompletely configured.
+    crunchyroll_started = "crunchyroll" in started_source_providers(config)
     # A session linked through the TV activation code needs no saved password.
-    if not crunchyroll_session_linked and not (crunchyroll_credentials.username and crunchyroll_credentials.password):
+    if crunchyroll_started and not crunchyroll_session_linked and not (crunchyroll_credentials.username and crunchyroll_credentials.password):
         warnings.append({"code": "missing_crunchyroll_credentials", "detail": "Crunchyroll is neither linked nor configured with both username/password secrets"})
-    if not crunchyroll_session_linked:
+    if crunchyroll_started and not crunchyroll_session_linked:
         warnings.append({"code": "missing_crunchyroll_state", "detail": "Crunchyroll refresh token or device id is missing"})
     if hidive_credentials.username or hidive_credentials.password:
         if not (hidive_credentials.username and hidive_credentials.password):
@@ -1062,11 +1069,13 @@ def build_health_report(
                 "inactive_services": inactive_automation_services,
             }
         )
-    if not isinstance(latest_completed_sync_run, dict):
+    # Provider ingest freshness only matters while a source provider is connected;
+    # MAL-only installs never ingest watch history.
+    if credentialed_provider_slugs and not isinstance(latest_completed_sync_run, dict):
         warnings.append({"code": "no_completed_ingest_snapshot", "detail": "No completed sync_runs row exists yet"})
-    if isinstance(latest_sync_run, dict) and latest_sync_run.get("status") == "failed":
+    if credentialed_provider_slugs and isinstance(latest_sync_run, dict) and latest_sync_run.get("status") == "failed":
         warnings.append({"code": "latest_sync_run_failed", "detail": "Latest sync_runs row is failed", "sync_run_id": latest_sync_run.get("id")})
-    if latest_completed_age_seconds is not None and latest_completed_age_seconds > stale_hours * 3600:
+    if credentialed_provider_slugs and latest_completed_age_seconds is not None and latest_completed_age_seconds > stale_hours * 3600:
         warnings.append(
             {
                 "code": "completed_snapshot_stale",
@@ -1151,7 +1160,7 @@ def build_health_report(
                 **mal_auth_failure,
             }
         )
-    auth_reported_tasks = {f"sync_fetch_{provider}" for provider in provider_auth_failures}
+    auth_reported_tasks = {f"sync_fetch_{provider}" for provider in provider_auth_failures} | unscheduled_provider_tasks
     if isinstance(mal_auth_failure, dict):
         auth_reported_tasks.add("mal_refresh")
     warnings.extend(_repeated_task_failure_warnings(service_state, exclude=auth_reported_tasks))

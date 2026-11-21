@@ -180,7 +180,9 @@ class ProviderSeriesObservationProvenanceTests(unittest.TestCase):
             self.assertEqual("2026-01-04T00:00:00Z", by_id["legacy-watchlist"].account_observed_at)
 
     def test_catalog_only_provider_eligibility_evidence_remains_usable_for_recommendations(self) -> None:
-        with isolated_config() as (_root, config):
+        with isolated_config() as (_root, config), patch(
+            "mal_updater.recommendations.connected_source_providers", return_value=["crunchyroll"]
+        ):
             bootstrap_database(config.db_path)
             _insert_catalog_only_provider_series(config, provider_series_id="catalog-evidence", title="Catalog Evidence Provider")
             self.assertEqual([], load_provider_series_states(config, limit=0))

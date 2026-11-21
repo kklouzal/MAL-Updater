@@ -17,7 +17,7 @@ from unittest.mock import patch
 from mal_updater.config import load_config
 from mal_updater.db import bootstrap_database, connect, insert_recommendation_snapshot_rows, replace_mal_recommendation_edges, upsert_mal_anime_metadata, upsert_recommendation_provider_eligibility_evidence
 from mal_updater.cli import build_parser, _cmd_recommend_snapshots
-from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, GENRE_AFFINITY_DEFAULT_LIMIT, aggregate_genre_affinity, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_dynamic_debug_html, render_recommendation_dashboard, write_recommendation_dashboard
+from mal_updater.recommendation_dashboard import DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT, DASHBOARD_MAX_RECOMMENDATION_LIMIT, DASHBOARD_MIN_RECOMMENDATION_LIMIT, GENRE_AFFINITY_DEFAULT_LIMIT, MAL_ONLY_MESSAGE, aggregate_genre_affinity, _current_ranked_discovery_rows_from_local_state, _eligibility_coverage_counts, _is_displayable_discovery, _strict_actionability_failure_reasons, build_dashboard_payload, make_dashboard_handler, render_dynamic_dashboard_html, render_dynamic_debug_html, render_recommendation_dashboard, write_recommendation_dashboard
 from mal_updater.recommendations import Recommendation, build_recommendations
 
 
@@ -535,6 +535,52 @@ class RecommendationDashboardTests(unittest.TestCase):
             diagnostics = payload["operational"]["provider_enrichment"]
             self.assertEqual(["no_configured_credentialed_providers"], diagnostics["reason_codes"])
             self.assertNotIn("dashboard_config_unavailable", diagnostics["reason_codes"])
+
+    def test_build_dashboard_payload_presents_mal_only_installs_without_provider_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_root = Path(temp_dir) / "data"
+            with patch.dict(
+                os.environ,
+                {
+                    "MAL_UPDATER_RUNTIME_ROOT": str(runtime_root),
+                    "MAL_UPDATER_SETTINGS_PATH": str(runtime_root / "config" / "settings.toml"),
+                },
+                clear=False,
+            ):
+                config = load_config(Path(temp_dir))
+                config.db_path.parent.mkdir(parents=True, exist_ok=True)
+                bootstrap_database(config.db_path)
+                insert_recommendation_snapshot_rows(
+                    config.db_path,
+                    [
+                        {
+                            "kind": "discovery_candidate",
+                            "provider": "mal",
+                            "title": "MAL Graph Pick",
+                            "provider_series_id": "mal:500",
+                            "priority": 88,
+                            "context": {"mal_anime_id": 500, "english_dub_signal": "unknown"},
+                        }
+                    ],
+                    run_id="run-mal-only",
+                    generated_at="2026-11-20T02:00:00Z",
+                )
+
+                payload = build_dashboard_payload(config.db_path, config=config)
+
+        recommendations = payload["recommendations"]
+        state = recommendations["coverage_state"]
+        self.assertTrue(state["mal_only"])
+        self.assertEqual([], state["source_providers"])
+        self.assertEqual(MAL_ONLY_MESSAGE, state["message"])
+        self.assertEqual(["MAL Graph Pick"], [row["title"] for row in recommendations["sections"]["discovery_high_confidence"]])
+        meta = recommendations["section_metadata"]["discovery_high_confidence"]
+        self.assertEqual("Recommended from your MAL list", meta["label"])
+        self.assertNotIn("diagnostic_only", meta)
+        messages = [(item["level"], item["message"]) for item in payload["indicators"]]
+        self.assertIn(("info", MAL_ONLY_MESSAGE), messages)
+        self.assertFalse(any("Crunchyroll/HIDIVE + English-dub" in message for _level, message in messages))
+        self.assertFalse(any("Dormant discovery" in message for _level, message in messages))
 
     def test_build_dashboard_payload_rejects_mismatched_supplied_config_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1990,7 +2036,7 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertNotIn("<h2>Indicators</h2>", html)
             self.assertIn("<h2>Indicators</h2>", debug_html)
             self.assertIn("(data.indicators || []).map", debug_html)
-            self.assertIn("i.level === 'error' ? 'bad' : 'warn'", debug_html)
+            self.assertIn("i.level === 'error' ? 'bad' : i.level === 'info' ? 'muted' : 'warn'", debug_html)
             self.assertIn("unknown_pages_per_source", debug_html)
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(db_path))
@@ -2075,6 +2121,28 @@ class DashboardUiPayloadTests(unittest.TestCase):
         }
         row.update(overrides)
         return row
+
+    def test_ui_view_drops_provider_placeholders_in_mal_only_mode(self) -> None:
+        from mal_updater.recommendation_dashboard import dashboard_ui_payload
+
+        row = self._row(
+            provider="mal", diagnostic_only=True, provider_badges=[], provider_evidence="unknown/unverified", availability_providers=[],
+            reasons=["recommended from 9 watched seed title(s)", "provider availability and English dub evidence are unknown/unverified."],
+            scorecard={"total": 70.0, "components": {"consensus": 100.0, "availability": 25.0, "dub_watchable": 35.0, "confidence": 90.0}},
+        )
+        sections = {"discovery_high_confidence": [row]}
+        mal_only = dashboard_ui_payload({"recommendations": {"sections": sections, "coverage_state": {"mal_only": True}}})
+        with_providers = dashboard_ui_payload({"recommendations": {"sections": sections, "coverage_state": {"mal_only": False}}})
+
+        slim = mal_only["recommendations"]["sections"]["discovery_high_confidence"][0]
+        for dropped in ("diagnostic_only", "provider_evidence", "availability_providers"):
+            self.assertNotIn(dropped, slim)
+        self.assertEqual(["recommended from 9 watched seed title(s)"], slim["why_points"])
+        self.assertEqual({"consensus": 100.0, "confidence": 90.0}, slim["score_components"])
+        unchanged = with_providers["recommendations"]["sections"]["discovery_high_confidence"][0]
+        self.assertTrue(unchanged["diagnostic_only"])
+        self.assertIn("availability", unchanged["score_components"])
+        self.assertEqual(2, len(unchanged["why_points"]))
 
     def test_ui_view_drops_duplicate_items_and_heavy_row_fields(self) -> None:
         from mal_updater.recommendation_dashboard import dashboard_ui_payload

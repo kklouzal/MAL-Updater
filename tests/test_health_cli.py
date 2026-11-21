@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from mal_updater.cli import build_parser, main as cli_main
 from mal_updater.config import ensure_directories, load_config
+from mal_updater.crunchyroll_auth import resolve_crunchyroll_state_paths
 from mal_updater.sync_planner import MAPPING_REVIEW_HEURISTICS_REVISION
 from mal_updater.db import bootstrap_database, connect, replace_review_queue_entries
 from mal_updater.health_cycle import _run_auto_command
@@ -434,16 +435,17 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(health_report_exit_code(payload, strict=True), strict_exit_code)
         self.assertEqual(expected_json, strict_stdout)
 
-    def test_health_check_flags_missing_auth_and_missing_completed_snapshot(self) -> None:
+    def test_health_check_treats_unconfigured_source_providers_as_optional(self) -> None:
         exit_code, payload = self._run_health_check()
 
         self.assertEqual(0, exit_code)
         self.assertFalse(payload["healthy"])
         warning_codes = {warning["code"] for warning in payload["warnings"]}
-        self.assertIn("missing_crunchyroll_credentials", warning_codes)
-        self.assertIn("missing_crunchyroll_state", warning_codes)
         self.assertIn("missing_mal_auth_material", warning_codes)
-        self.assertIn("no_completed_ingest_snapshot", warning_codes)
+        self.assertNotIn("missing_crunchyroll_credentials", warning_codes)
+        self.assertNotIn("missing_crunchyroll_state", warning_codes)
+        self.assertNotIn("missing_hidive_credentials", warning_codes)
+        self.assertNotIn("no_completed_ingest_snapshot", warning_codes)
         self.assertIsNone(payload["latest_sync_run"])
         self.assertEqual(0, payload["mappings"]["total"])
         self.assertEqual(0, payload["mappings"]["approved"])
@@ -741,6 +743,37 @@ class HealthCheckCliTests(unittest.TestCase):
         hidive = [w for w in payload["warnings"] if w["code"] == "hidive_auth_failures_repeated"]
         self.assertEqual(1, len(hidive))
         self.assertEqual("login_failure", hidive[0]["auth_failure_kind"])
+
+    def test_health_check_ignores_stale_task_state_of_disconnected_providers(self) -> None:
+        # Provider removed after it failed: its lanes and sync_apply are no longer scheduled.
+        with connect(self.config.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, datetime('now', '-1 day'), datetime('now', '-1 day'), ?)",
+                ("hidive", "1.0", "ingest_snapshot", "failed", "{}"),
+            )
+            conn.commit()
+        failing = {"last_status": "error", "failure_backoff_consecutive_failures": 5}
+        self.config.service_state_path.write_text(
+            json.dumps(
+                {
+                    "tasks": {
+                        "sync_fetch_hidive": {**failing, "failure_backoff_reason": "HIDIVE POST /token/refresh failed: HTTP 404"},
+                        "sync_fetch_crunchyroll": {**failing, "failure_backoff_reason": "HTTP 500 from Crunchyroll"},
+                        "sync_apply": {**failing, "failure_backoff_reason": "Traceback (most recent call last):"},
+                        "recommend_full_harvest": {**failing, "failure_backoff_reason": "Traceback (most recent call last):"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _, payload = self._run_health_check()
+
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertNotIn("hidive_auth_failures_repeated", warning_codes)
+        self.assertNotIn("latest_sync_run_failed", warning_codes)
+        repeated = [w["task"] for w in payload["warnings"] if w["code"] == "scheduled_task_failures_repeated"]
+        self.assertEqual(["recommend_full_harvest"], repeated)
 
     def test_health_check_recommends_crunchyroll_reauth_after_repeated_auth_failures(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
@@ -1192,6 +1225,10 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertIsNone(payload["review_queue"]["recommended_apply_worklist"])
 
     def test_health_check_flags_failed_latest_run_stale_snapshot_and_open_review_queue(self) -> None:
+        crunchyroll_state = resolve_crunchyroll_state_paths(self.config)
+        crunchyroll_state.refresh_token_path.parent.mkdir(parents=True, exist_ok=True)
+        crunchyroll_state.refresh_token_path.write_text("refresh-token\n", encoding="utf-8")
+        crunchyroll_state.device_id_path.write_text("device-id\n", encoding="utf-8")
         with connect(self.config.db_path) as conn:
             conn.execute(
                 "INSERT INTO sync_runs(provider, contract_version, mode, status, started_at, completed_at, summary_json) VALUES (?, ?, ?, ?, datetime('now', '-10 days'), datetime('now', '-10 days'), ?)",
@@ -1226,9 +1263,12 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual({"mapping_review": 1}, payload["review_queue"]["open"])
         self.assertEqual("failed", payload["latest_sync_run"]["status"])
         self.assertEqual("completed", payload["latest_completed_sync_run"]["status"])
-        self.assertEqual([], payload["maintenance"]["recommended_commands"])
-        self.assertIsNone(payload["maintenance"]["recommended_command"])
-        self.assertIsNone(payload["maintenance"]["recommended_automation_command"])
+        # Crunchyroll is connected, so its stale snapshot gets a refresh recommendation.
+        self.assertEqual(
+            ["refresh_ingested_snapshot"],
+            [command["reason_code"] for command in payload["maintenance"]["recommended_commands"]],
+        )
+        self.assertEqual("refresh_ingested_snapshot", payload["maintenance"]["recommended_automation_command"]["reason_code"])
         self.assertEqual("fix-strategy", payload["review_queue"]["recommended_next"]["bucket_type"])
         self.assertEqual("needs_manual_match | same_franchise_tie", payload["review_queue"]["recommended_next"]["bucket_key"])
         self.assertEqual(
@@ -2640,8 +2680,8 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertIn("healthy=False", stdout)
-        self.assertIn("warning_count=6", stdout)
-        self.assertIn("warnings=missing_crunchyroll_credentials, missing_crunchyroll_state, missing_mal_auth_material, no_completed_ingest_snapshot, mapping_review_queue_stale_heuristics, open_review_queue", stdout)
+        self.assertIn("warning_count=3", stdout)
+        self.assertIn("warnings=missing_mal_auth_material, mapping_review_queue_stale_heuristics, open_review_queue", stdout)
         self.assertIn(f"mapping_review_stale_entries=1/1 revision={MAPPING_REVIEW_HEURISTICS_REVISION}", stdout)
         self.assertIn(
             'recommended_next=PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --fix-strategy "needs_manual_match | same_franchise_tie"',
@@ -2830,7 +2870,7 @@ class HealthCheckCliTests(unittest.TestCase):
 
         self.assertEqual(2, exit_code)
         self.assertIn("healthy=False", stdout)
-        self.assertIn("warning_count=4", stdout)
+        self.assertIn("warning_count=1", stdout)
 
     def test_health_check_strict_returns_non_zero_when_warnings_exist(self) -> None:
         exit_code, payload = self._run_health_check("--strict")
@@ -2838,7 +2878,27 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertFalse(payload["healthy"])
         warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("missing_mal_auth_material", warning_codes)
+
+    def test_health_check_flags_partially_configured_crunchyroll(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+
+        _exit_code, payload = self._run_health_check()
+
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
         self.assertIn("missing_crunchyroll_credentials", warning_codes)
+        self.assertIn("missing_crunchyroll_state", warning_codes)
+
+    def test_health_check_requires_ingest_once_a_source_provider_is_connected(self) -> None:
+        (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")
+        (self.config.secrets_dir / "crunchyroll_password.txt").write_text("secret\n", encoding="utf-8")
+
+        _exit_code, payload = self._run_health_check()
+
+        warning_codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertNotIn("missing_crunchyroll_credentials", warning_codes)
+        self.assertIn("missing_crunchyroll_state", warning_codes)
+        self.assertIn("no_completed_ingest_snapshot", warning_codes)
 
     def test_health_check_strict_stays_zero_when_healthy(self) -> None:
         (self.config.secrets_dir / "crunchyroll_username.txt").write_text("user@example.com\n", encoding="utf-8")

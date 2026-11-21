@@ -24,6 +24,7 @@ from .auth_remediation import (
 from .config import AppConfig, load_mal_secrets, mal_callback_bind_warning
 from .crunchyroll_auth import load_crunchyroll_credentials, resolve_crunchyroll_state_paths
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
+from .provider_registry import started_source_providers
 from .service_auth_state import (
     load_service_state,
     mal_bootstrap_auth_issue,
@@ -427,7 +428,9 @@ def _bootstrap_operation_mode_status(
         if payload["credentials_present"] and payload["session_present"] and payload["transport_ready"]
     )
     partially_staged_provider_count = max(0, intended_provider_count - ready_provider_count)
-    unattended_ready = runtime_initialized and mal_oauth_present and intended_provider_count > 0 and partially_staged_provider_count == 0
+    # Source providers are optional: MAL list refresh and recommendations run
+    # unattended with MAL auth alone.
+    unattended_ready = runtime_initialized and mal_oauth_present and partially_staged_provider_count == 0
 
     base_payload = {
         "intended_provider_count": intended_provider_count,
@@ -494,7 +497,12 @@ def _bootstrap_operation_mode_status(
         "manual_foreground_acceptable": True,
         "daemon_preferred": True,
         "daemon_expected": True,
-        "details": "MAL auth and all currently intended providers are bootstrapped, so manual foreground CLI runs remain valid for validation/recovery, but the repo-owned user-systemd daemon is the expected path for unattended background sync.",
+        "details": (
+            "MAL auth and all currently intended providers are bootstrapped"
+            if intended_provider_count
+            else "MAL auth is bootstrapped and no source provider is configured (MAL-only: list refresh and recommendations, no watch-history sync)"
+        )
+        + ", so manual foreground CLI runs remain valid for validation/recovery, but the repo-owned user-systemd daemon is the expected path for unattended background sync.",
     }
 
 
@@ -526,6 +534,11 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
     crunchyroll_credentials_satisfied = crunchyroll_credentials_present or crunchyroll_session_present
     hidive_credentials_present = bool(hidive_credentials.username) and bool(hidive_credentials.password)
     hidive_session_present = hidive_state.access_token_path.exists() and hidive_state.refresh_token_path.exists()
+    # Source providers are optional; onboarding steps only apply to a provider
+    # once any of its credential or session files has been staged.
+    started_providers = started_source_providers(config)
+    crunchyroll_started = "crunchyroll" in started_providers
+    hidive_started = "hidive" in started_providers
     mal_app_present = bool(secrets.client_id)
     mal_oauth_present = bool(secrets.access_token) and bool(secrets.refresh_token)
     mal_auth_descriptor = mal_missing_auth_descriptor()
@@ -646,32 +659,32 @@ def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:
         add_onboarding_step(**mal_auth_descriptor.bootstrap_onboarding_step_fields())
     elif isinstance(mal_auth_issue, dict):
         add_onboarding_step(**mal_rebootstrap_auth_descriptor(mal_auth_issue).bootstrap_onboarding_step_fields())
-    if not crunchyroll_credentials_satisfied:
+    if crunchyroll_started and not crunchyroll_credentials_satisfied:
         add_onboarding_step(
             step="stage-crunchyroll-credentials",
             details=f"Store Crunchyroll credentials at {crunchyroll_credentials.username_path} and {crunchyroll_credentials.password_path}.",
             user_action_required=True,
             applies_to="crunchyroll",
         )
-    if not crunchyroll_session_present:
+    if crunchyroll_started and not crunchyroll_session_present:
         add_onboarding_step(**crunchyroll_bootstrap_descriptor.bootstrap_onboarding_step_fields())
-    elif isinstance(provider_auth_issues.get("crunchyroll"), dict):
+    elif crunchyroll_started and isinstance(provider_auth_issues.get("crunchyroll"), dict):
         add_onboarding_step(
             **provider_rebootstrap_auth_descriptor(
                 "crunchyroll",
                 provider_auth_issues["crunchyroll"],
             ).bootstrap_onboarding_step_fields()
         )
-    if not hidive_credentials_present:
+    if hidive_started and not hidive_credentials_present:
         add_onboarding_step(
             step="stage-hidive-credentials",
             details=f"Store HIDIVE credentials at {hidive_credentials.username_path} and {hidive_credentials.password_path}.",
             user_action_required=True,
             applies_to="hidive",
         )
-    if not hidive_session_present:
+    if hidive_started and not hidive_session_present:
         add_onboarding_step(**hidive_bootstrap_descriptor.bootstrap_onboarding_step_fields())
-    elif isinstance(provider_auth_issues.get("hidive"), dict):
+    elif hidive_started and isinstance(provider_auth_issues.get("hidive"), dict):
         add_onboarding_step(
             **provider_rebootstrap_auth_descriptor(
                 "hidive",

@@ -29,8 +29,9 @@ from .config import (
     load_config,
     load_mal_secrets,
 )
-from .crunchyroll_auth import crunchyroll_auth_material_present, load_crunchyroll_credentials
+from .crunchyroll_auth import load_crunchyroll_credentials
 from .hidive_auth import load_hidive_credentials
+from .provider_registry import connected_source_providers
 from .persistence import atomic_write_text
 
 MAX_BODY = 64 * 1024
@@ -266,6 +267,7 @@ class ControlStore:
             blockers.append("mal_client_id")
         if not (mal.access_token and mal.refresh_token):
             blockers.append("mal_oauth_tokens")
+        connected = connected_source_providers(self.config)
         return {
             "setup_complete": complete,
             "automation_desired": True,
@@ -276,11 +278,11 @@ class ControlStore:
             "secrets_present": present,
             "providers": {
                 "crunchyroll": {
-                    "scheduler_eligible": crunchyroll_auth_material_present(self.config),
+                    "scheduler_eligible": "crunchyroll" in connected,
                     "scheduling_basis": "linked_session_or_credentials",
                 },
                 "hidive": {
-                    "scheduler_eligible": bool(hidive.username and hidive.password),
+                    "scheduler_eligible": "hidive" in connected,
                     "scheduling_basis": "credentials_present",
                 },
             },

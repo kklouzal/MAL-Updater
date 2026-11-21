@@ -2,6 +2,8 @@
 
 Container-first trusted-LAN control plane for conservative provider-to-MyAnimeList sync and recommendations. It reads Crunchyroll and HIDIVE watch history, maps each provider season to its MyAnimeList entry, and fills in missing MAL progress without overwriting meaningful MAL data.
 
+Crunchyroll and HIDIVE are optional. With only a MAL account connected (MAL-only mode), MAL-Updater still refreshes your MAL list, harvests MAL community recommendations, ranks recommendations from your list, and serves the dashboard, genre affinity and PDF export. What needs a provider is watch-history sync to MAL and the **Watchable now** check (verified streaming availability plus English dub).
+
 ## Quick start (container)
 
 ```bash
@@ -32,8 +34,8 @@ docker compose -f compose.yaml -f compose.build.yaml up -d --build
 1. Open Settings and add MAL app credentials. Saving credentials never tests or calls MAL.
 2. Use **Test connection** explicitly when desired. Tests are user-triggered, rate-limited, timeout-bounded, and redact errors.
 3. Start MAL OAuth from Settings. Configure the MAL app callback as `http://localhost/oauth/mal/callback` for local access, or the exact trusted LAN/proxy URL you use.
-4. Connect providers: **Link Crunchyroll account** (shows a TV activation code to approve at crunchyroll.com/activate; no password is stored) or Crunchyroll username/password, and HIDIVE username/password.
-5. The scheduler starts automatically once the MAL client ID and MAL OAuth tokens are present, and stops if either is removed. It then fetches providers, refreshes the MAL list, and builds recommendations.
+4. Optionally connect providers: **Link Crunchyroll account** (shows a TV activation code to approve at crunchyroll.com/activate; no password is stored) or Crunchyroll username/password, and HIDIVE username/password.
+5. The scheduler starts automatically once the MAL client ID and MAL OAuth tokens are present, and stops if either is removed. It then fetches any connected providers, refreshes the MAL list, and builds recommendations.
 6. Unattended MAL writes stay off until you opt in: set **Per-run execution bounds → sync_apply** in Settings to a positive number of writes per run (for example 8), then restart the container. Review a dry run first (see `references/OPERATIONS.md`).
 
 MAL OAuth and provider secrets stay outside every UI response.

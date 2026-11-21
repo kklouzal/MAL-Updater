@@ -24,11 +24,11 @@ from .config import (
     load_config,
     load_mal_secrets,
 )
-from .crunchyroll_auth import crunchyroll_auth_material_present, resolve_crunchyroll_state_paths
+from .crunchyroll_auth import resolve_crunchyroll_state_paths
 from .database_maintenance import compact_database_if_due
 from .runtime_housekeeping import inspect_service_log, prune_health_history, rotate_service_log
 from .runtime_retention_audit import build_runtime_retention_audit_payload
-from .hidive_auth import load_hidive_credentials
+from .provider_registry import connected_source_providers
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .persistence import PersistentJsonError, atomic_write_json, read_json_dict_bounded
@@ -590,22 +590,14 @@ def _refresh_mal_tokens(config: AppConfig) -> dict[str, Any]:
     return refresh_mal_tokens_if_due(MalClient(config, secrets), secrets).as_dict()
 
 
-def _available_source_providers(config: AppConfig) -> list[str]:
-    providers: list[str] = []
-    if crunchyroll_auth_material_present(config):
-        providers.append("crunchyroll")
-    hidive_credentials = load_hidive_credentials(config)
-    if hidive_credentials.username and hidive_credentials.password:
-        providers.append("hidive")
-    return providers
-
-
 def _task_specs(config: AppConfig) -> list[TaskSpec]:
     specs = [TaskSpec("mal_refresh", config.service.mal_refresh_every_seconds, budget_provider="mal")]
-    providers = _available_source_providers(config)
+    providers = connected_source_providers(config)
     for provider in providers:
         specs.append(TaskSpec(f"sync_fetch_{provider}", config.service.sync_every_seconds, budget_provider=provider))
-    specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
+    if providers:
+        # sync_apply only writes provider watch progress; MAL-only installs have none.
+        specs.append(TaskSpec("sync_apply", config.service.sync_every_seconds, budget_provider="mal"))
     mal_secrets = load_mal_secrets(config)
     if int(config.service.mal_list_refresh_every_seconds) > 0 and bool(mal_secrets.access_token):
         specs.append(
@@ -860,8 +852,9 @@ def maintenance_cycle_plan(
     """
 
     commands: list[dict[str, Any]] = []
+    providers = connected_source_providers(config)
     if include_provider_refresh and not local_only:
-        for provider in _available_source_providers(config):
+        for provider in providers:
             command = _provider_fetch_command(config, provider, full_refresh=False)
             if provider == "crunchyroll":
                 if provider_max_history_pages is not None:
@@ -873,20 +866,22 @@ def maintenance_cycle_plan(
             commands.append({"label": f"maintain_provider_refresh_{provider}", "args": command})
 
     if not local_only:
-        commands.extend(
-            [
-            {
-                "label": "maintain_safe_mapping_review",
-                "args": [
-                    sys.executable,
-                    "-m",
-                    "mal_updater.cli",
-                    "apply-sync",
-                    "--limit",
-                    str(max(0, int(mapping_limit))),
-                    "--exact-approved-only",
-                ],
-            },
+        if providers:
+            commands.append(
+                {
+                    "label": "maintain_safe_mapping_review",
+                    "args": [
+                        sys.executable,
+                        "-m",
+                        "mal_updater.cli",
+                        "apply-sync",
+                        "--limit",
+                        str(max(0, int(mapping_limit))),
+                        "--exact-approved-only",
+                    ],
+                }
+            )
+        commands.append(
             {
                 "label": "maintain_mal_list_refresh",
                 "args": [
@@ -897,24 +892,26 @@ def maintenance_cycle_plan(
                     "--max-pages",
                     str(max(1, int(mal_list_max_pages))),
                 ],
-            },
-            {
-                "label": "maintain_recommend_provider_eligibility",
-                "args": [
-                    sys.executable,
-                    "-m",
-                    "mal_updater.cli",
-                    "recommend-enrich-provider-availability",
-                    "--limit",
-                    str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT),
-                    "--search-limit",
-                    str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT),
-                    "--queries-per-candidate",
-                    str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE),
-                ],
-            },
-            ]
+            }
         )
+        if providers:
+            commands.append(
+                {
+                    "label": "maintain_recommend_provider_eligibility",
+                    "args": [
+                        sys.executable,
+                        "-m",
+                        "mal_updater.cli",
+                        "recommend-enrich-provider-availability",
+                        "--limit",
+                        str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_REFRESH_LIMIT),
+                        "--search-limit",
+                        str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_SEARCH_LIMIT),
+                        "--queries-per-candidate",
+                        str(_RECOMMENDATION_PROVIDER_ELIGIBILITY_QUERIES_PER_CANDIDATE),
+                    ],
+                }
+            )
     commands.extend(
         [
             {
@@ -2036,7 +2033,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             # provider qualifies once its fetch has succeeded since then. Fetch
             # lanes run on independent cadences and one provider may be down,
             # so neither a shared loop pass nor every provider is required.
-            required_providers = _available_source_providers(config)
+            required_providers = connected_source_providers(config)
             fresh_providers = [
                 provider
                 for provider in required_providers
@@ -2467,7 +2464,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
             end_api_request_context(request_context_token)
 
     state["last_loop_at"] = _now_iso()
-    tracked_providers = {"mal", "crunchyroll", *config.service.provider_hourly_limits.keys(), *_available_source_providers(config)}
+    tracked_providers = {"mal", "crunchyroll", *config.service.provider_hourly_limits.keys(), *connected_source_providers(config)}
     state["api_usage"] = {
         provider: summarize_recent_api_usage(provider=provider, window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config).as_dict()
         for provider in sorted(tracked_providers)

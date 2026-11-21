@@ -30,7 +30,7 @@ class RecommendMaintainTests(unittest.TestCase):
     def test_explicit_plan_orders_provider_mapping_eligibility_snapshot_health_without_metadata_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=["crunchyroll"]):
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=["crunchyroll"]):
                 plan = maintenance_cycle_plan(
                     config,
                     metadata_limit=7,
@@ -107,7 +107,7 @@ class RecommendMaintainTests(unittest.TestCase):
             config = self._config(Path(tmp))
             config.service.crunchyroll_provider_max_history_pages = 12
             config.service.crunchyroll_provider_max_watchlist_pages = 5
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=["crunchyroll"]):
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=["crunchyroll"]):
                 plan = maintenance_cycle_plan(config)
 
         provider_args = plan[0]["args"]
@@ -117,12 +117,23 @@ class RecommendMaintainTests(unittest.TestCase):
     def test_maintenance_plan_explicit_zero_disables_service_caps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=["crunchyroll"]):
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=["crunchyroll"]):
                 plan = maintenance_cycle_plan(config, provider_max_history_pages=0, provider_max_watchlist_pages=0)
 
         provider_args = plan[0]["args"]
         self.assertNotIn("--max-history-pages", provider_args)
         self.assertNotIn("--max-watchlist-pages", provider_args)
+
+    def test_mal_only_plan_skips_provider_backed_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=[]):
+                plan = maintenance_cycle_plan(config)
+
+        self.assertEqual(
+            [step["label"] for step in plan],
+            ["maintain_mal_list_refresh", "maintain_recommend_snapshot", "maintain_health"],
+        )
 
     def test_run_cycle_keeps_going_and_summarizes_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,7 +154,7 @@ class RecommendMaintainTests(unittest.TestCase):
                     }
                 return {"status": "ok", "label": label, "returncode": 0, "stderr": "", "stdout": "{}"}
 
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=[]), patch(
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=["crunchyroll"]), patch(
                 "mal_updater.service_runtime._run_subprocess", side_effect=fake_run
             ):
                 result = run_maintenance_cycle(config, dry_run=False)
@@ -153,6 +164,7 @@ class RecommendMaintainTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
+                "maintain_provider_refresh_crunchyroll",
                 "maintain_safe_mapping_review",
                 "maintain_mal_list_refresh",
                 "maintain_recommend_provider_eligibility",
@@ -171,7 +183,7 @@ class RecommendMaintainTests(unittest.TestCase):
     def test_daemon_local_only_plan_has_no_network_children(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=["crunchyroll"]):
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=["crunchyroll"]):
                 plan = maintenance_cycle_plan(config, local_only=True)
 
         self.assertEqual(["maintain_recommend_snapshot", "maintain_health"], [step["label"] for step in plan])
@@ -185,7 +197,7 @@ class RecommendMaintainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
             config.service.recommendation_metadata_refresh_every_seconds = 60
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=[]):
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=[]):
                 names = [spec.name for spec in _task_specs(config)]
 
         self.assertIn("recommend_metadata_refresh", names)
@@ -195,7 +207,7 @@ class RecommendMaintainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp))
             ensure_directories(config)
-            with patch("mal_updater.service_runtime._available_source_providers", return_value=[]), patch(
+            with patch("mal_updater.service_runtime.connected_source_providers", return_value=[]), patch(
                 "mal_updater.service_runtime._run_subprocess"
             ) as run_subprocess:
                 result = run_maintenance_cycle(config, dry_run=True)

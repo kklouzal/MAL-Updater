@@ -276,19 +276,21 @@ openclaw_hook_token = "openclaw_hook_token.txt"
                 }
             ]
 
-        with (
-            patch("mal_updater.openclaw_delivery.build_recommendations", side_effect=[[provider_item], dormant_items]),
-            patch("mal_updater.openclaw_delivery.group_recommendations", side_effect=fake_group),
-        ):
-            payload = build_recommendation_delivery_payload(
-                self.config,
-                limit=10,
-                include_dormant=True,
-                delivery_mode="digest",
-                max_dormant_discovery_items=1,
-            )
+        # Without a connected provider the strict build already returns dormant rows.
+        for strict_items in ([provider_item], dormant_items):
+            with (
+                patch("mal_updater.openclaw_delivery.build_recommendations", side_effect=[strict_items, dormant_items]),
+                patch("mal_updater.openclaw_delivery.group_recommendations", side_effect=fake_group),
+            ):
+                payload = build_recommendation_delivery_payload(
+                    self.config,
+                    limit=10,
+                    include_dormant=True,
+                    delivery_mode="digest",
+                    max_dormant_discovery_items=1,
+                )
 
-        self.assertEqual(["Provider Pick", "Dormant Pick A"], [item["title"] for item in payload["sections"][0]["items"]])
+            self.assertEqual(["Provider Pick", "Dormant Pick A"], [item["title"] for item in payload["sections"][0]["items"]])
 
     def test_deliver_recommendations_via_openclaw_returns_no_recommendations_without_post(self) -> None:
         with (

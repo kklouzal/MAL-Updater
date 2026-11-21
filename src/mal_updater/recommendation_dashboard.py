@@ -11,7 +11,6 @@ from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS, load_config
-from .crunchyroll_auth import crunchyroll_auth_material_present
 from .web_shell import FAVICON_LINK, SHELL_CSS, top_bar
 from .db import (
     MAL_RECOMMENDATION_HARVEST_SUMMARY_COUNTERS,
@@ -25,7 +24,7 @@ from .db import (
     list_recommendation_provider_eligibility_evidence_for_provider_series_keys,
     unknown_public_userrecs_diagnostics,
 )
-from .hidive_auth import load_hidive_credentials
+from .provider_registry import connected_source_providers
 
 from .recommendation_actionability import (
     is_strict_provider_eligibility_actionable,
@@ -71,6 +70,29 @@ _SECTION_METADATA: dict[str, dict[str, str]] = {
         "title_label": "Title",
     },
 }
+
+_MAL_ONLY_SECTION_METADATA: dict[str, dict[str, str]] = {
+    "discovery_high_confidence": {
+        "label": "Recommended from your MAL list",
+        "description": "Ranked from your MAL list and MAL community recommendations. No streaming provider is connected, so where each title streams and whether it has an English dub are not checked.",
+        "title_label": "English title",
+    },
+}
+MAL_ONLY_MESSAGE = (
+    "No Crunchyroll or HIDIVE account is connected, so recommendations are ranked from your MAL list and "
+    "MAL community recommendations; where each title streams is not checked."
+)
+
+
+def _dashboard_source_providers(config: AppConfig | None) -> list[str] | None:
+    """Connected watch-history providers, or None when the configuration is unknown."""
+    if config is None:
+        return None
+    try:
+        return connected_source_providers(config)
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+
 
 def _section_metadata_for(kind: str) -> dict[str, str]:
     meta = _SECTION_METADATA.get(kind)
@@ -1641,22 +1663,6 @@ def _public_userrecs_diagnostics_for_dashboard(db_path: Path, *, reason: str | N
     return get_public_userrecs_diagnostics(db_path, **policy_kwargs)
 
 
-def _dashboard_configured_provider_slugs(config: Any) -> list[str]:
-    providers: list[str] = []
-    try:
-        if crunchyroll_auth_material_present(config):
-            providers.append("crunchyroll")
-    except (AttributeError, OSError, ValueError, TypeError):
-        pass
-    try:
-        hidive_credentials = load_hidive_credentials(config)
-        if hidive_credentials.username and hidive_credentials.password:
-            providers.append("hidive")
-    except (AttributeError, OSError, ValueError, TypeError):
-        pass
-    return providers
-
-
 def _provider_enrichment_diagnostics_for_dashboard(db_path: Path, *, config: AppConfig | None = None) -> dict[str, Any]:
     config = _dashboard_config(db_path, config)
     if config is None:
@@ -1664,7 +1670,7 @@ def _provider_enrichment_diagnostics_for_dashboard(db_path: Path, *, config: App
     try:
         return build_provider_enrichment_diagnostics(
             config,
-            provider_slugs=_dashboard_configured_provider_slugs(config),
+            provider_slugs=connected_source_providers(config),
         )
     except (AttributeError, OSError, ValueError, TypeError) as exc:
         return unknown_provider_enrichment_diagnostics(
@@ -1821,7 +1827,12 @@ def _ui_why_points(row: dict[str, Any], context: dict[str, Any]) -> list[str]:
     return [reason.rstrip(".") for reason in reasons]
 
 
-def _ui_recommendation_row(row: dict[str, Any]) -> dict[str, Any]:
+# Without a connected provider these are constant placeholders on every row.
+_MAL_ONLY_HIDDEN_ROW_FIELDS = ("diagnostic_only", "provider_evidence", "availability_providers")
+_MAL_ONLY_HIDDEN_SCORE_COMPONENTS = ("availability", "dub_watchable")
+
+
+def _ui_recommendation_row(row: dict[str, Any], *, mal_only: bool = False) -> dict[str, Any]:
     slim = {key: row[key] for key in _UI_ROW_FIELDS if key in row}
     context = row.get("context")
     context = context if isinstance(context, dict) else {}
@@ -1835,6 +1846,13 @@ def _ui_recommendation_row(row: dict[str, Any]) -> dict[str, Any]:
     slim["score_total"] = scorecard.get("total")
     slim["score_components"] = components if isinstance(components, dict) else {}
     slim["seeds"] = (evidence.get("top_supporting_seeds") if isinstance(evidence, dict) else None) or []
+    if mal_only:
+        for key in _MAL_ONLY_HIDDEN_ROW_FIELDS:
+            slim.pop(key, None)
+        slim["why_points"] = [point for point in slim["why_points"] if not point.lower().startswith("provider availability")]
+        slim["score_components"] = {
+            key: value for key, value in slim["score_components"].items() if key not in _MAL_ONLY_HIDDEN_SCORE_COMPONENTS
+        }
     return slim
 
 
@@ -1847,8 +1865,10 @@ def dashboard_ui_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
     recommendations = dict(payload.get("recommendations") or {})
     recommendations.pop("items", None)
+    coverage_state = recommendations.get("coverage_state")
+    mal_only = isinstance(coverage_state, dict) and coverage_state.get("mal_only") is True
     recommendations["sections"] = {
-        name: [_ui_recommendation_row(row) for row in rows]
+        name: [_ui_recommendation_row(row, mal_only=mal_only) for row in rows]
         for name, rows in (recommendations.get("sections") or {}).items()
     }
     return {**payload, "recommendations": recommendations}
@@ -1912,28 +1932,39 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
         "message": "Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence." if strict_actionable_count == 0 else "Strict actionable discovery is populated from verified current provider+dub evidence.",
         "next_diagnostic_command": STRICT_DISCOVERY_DIAGNOSTIC_COMMAND,
     }
+    source_providers = _dashboard_source_providers(_dashboard_config(db_path, config))
+    mal_only = source_providers == []
+    if mal_only:
+        coverage_state["message"] = MAL_ONLY_MESSAGE
+    coverage_state["source_providers"] = source_providers
+    coverage_state["mal_only"] = mal_only
     latest_run = operational.get("latest_sync_run") or {}
     indicators: list[dict[str, str]] = []
     if latest_snapshot is None:
         indicators.append({"level": "warning", "message": "No persisted recommendation snapshot is available yet."})
     elif latest_snapshot.get("item_count", 0) == 0:
         indicators.append({"level": "warning", "message": "Latest recommendation snapshot has no items."})
-    if latest_run and latest_run.get("status") not in (None, "completed"):
+    if not mal_only and latest_run and latest_run.get("status") not in (None, "completed"):
         indicators.append({"level": "error", "message": f"Latest provider sync run is {latest_run.get('status')}."})
     cov_summary = coverage.get("summary") or {}
     if cov_summary.get("unharvested") or cov_summary.get("stale") or cov_summary.get("failed"):
         indicators.append({"level": "warning", "message": "Recommendation harvest coverage is stale, failed, or incomplete."})
-    if strict_actionable_count == 0:
+    if mal_only:
+        indicators.append({"level": "info", "message": MAL_ONLY_MESSAGE})
+    elif strict_actionable_count == 0:
         indicators.append({"level": "warning", "message": coverage_state["message"]})
-    if dormant_count:
+    if dormant_count and not mal_only:
         indicators.append({"level": "warning", "message": "Dormant discovery diagnostic rows are present; they are not actionable without strict provider+dub proof."})
-    if diagnostic_source_snapshot is not None and diagnostic_source_snapshot.get("run_id") != latest_run_id:
+    if not mal_only and diagnostic_source_snapshot is not None and diagnostic_source_snapshot.get("run_id") != latest_run_id:
         if diagnostic_source_snapshot.get("run_id") == "local-diagnostic-current":
             message = "Ranked discovery recommendations are sourced from current local diagnostic scorer output, not persisted diagnostic data or the latest strict snapshot."
         else:
             message = "Ranked discovery recommendations are sourced from the latest persisted diagnostic discovery snapshot, not the latest strict snapshot."
         indicators.append({"level": "warning", "message": message})
     section_metadata = {kind: _section_metadata_for(kind) for kind in (*_STATIC_SECTION_ORDER, *sections.keys())}
+    if mal_only:
+        for kind, override in _MAL_ONLY_SECTION_METADATA.items():
+            section_metadata[kind] = {"kind": kind, **override}
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "snapshot": latest_snapshot,
@@ -1955,6 +1986,7 @@ _COMMON_PAGE_CSS = r"""
 .alert{margin:0 0 1rem;border-left:4px solid var(--warn)}
 .alert.bad{border-left-color:var(--bad)}
 .alert.good{border-left-color:var(--good)}
+.alert.info{border-left-color:var(--accent)}
 .alert h2{font-size:1rem;margin-bottom:.35rem}
 .alert ul{margin:.25rem 0 0;padding-left:1.2rem}
 .alert p{margin:0}
@@ -2258,7 +2290,8 @@ function titleCell(r, extraMeta, progressSection){
   if (!progressSection && r.episode_total) meta.push(plural(r.episode_total, 'episode'));
   meta.push(...extraMeta);
   const label = r.diagnostic_only ? '<span class="diagnostic-label">Discovery only · unverified</span>' : '';
-  return `${label}${name}${meta.length ? `<div class="title-meta">${esc(meta.join(' · '))}</div>` : ''}<div class="providers" aria-label="Where to watch">${providerBadges(r)}</div>`;
+  const providers = latestDashboardData?.recommendations?.coverage_state?.mal_only ? '' : `<div class="providers" aria-label="Where to watch">${providerBadges(r)}</div>`;
+  return `${label}${name}${meta.length ? `<div class="title-meta">${esc(meta.join(' · '))}</div>` : ''}${providers}`;
 }
 const SCORE_PARTS = [['consensus', 'Consensus'], ['affinity', 'Affinity'], ['quality', 'Quality'], ['availability', 'Availability'], ['dub_watchable', 'English dub'], ['confidence', 'Confidence']];
 function scoreCell(r){
@@ -2374,11 +2407,12 @@ function alertsHtml(data){
   let html = '';
   if (errors.length) html += `<section class="alert bad" role="alert" aria-labelledby="dashboard-failures"><h2 id="dashboard-failures" class="bad">Needs attention</h2><ul>${errors.map(message => `<li>${esc(message)}</li>`).join('')}</ul></section>`;
   if (failedHarvests > 0) html += `<section class="alert"><p><strong>${esc(plural(failedHarvests, 'MAL recommendation source'))} failed to harvest.</strong> They are retried automatically; see <a href="${esc(DEBUG_HREF)}">Debug</a> for details.</p></section>`;
-  if (data.recommendations?.mode === 'diagnostic_snapshot') html += '<section class="alert"><p><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown or unverified provider and dub evidence; only Watchable now is actionable.</p></section>';
+  if (data.recommendations?.coverage_state?.mal_only) html += `<section class="alert info"><p><strong>MAL-only mode.</strong> ${esc(data.recommendations.coverage_state.message)} ${SETTINGS_HREF ? `Connect an account in <a href="${esc(SETTINGS_HREF)}">Settings</a> to see what you can watch now.` : ''}</p></section>`;
+  else if (data.recommendations?.mode === 'diagnostic_snapshot') html += '<section class="alert"><p><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown or unverified provider and dub evidence; only Watchable now is actionable.</p></section>';
   return html;
 }
 function emptyState(state){
-  if (!state || state.strict_actionable_count !== 0) return '';
+  if (!state || state.mal_only || state.strict_actionable_count !== 0) return '';
   return `<section class="empty-state"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class="muted">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`;
 }
 function renderControls(){
@@ -2487,7 +2521,7 @@ function syncTable(runs){
 function pageSignature(data){ const {generated_at, ...rest} = data; return JSON.stringify(rest); }
 function renderPage(data){
   const state = data.recommendations?.coverage_state || {};
-  const indicators = (data.indicators || []).map(i => `<li class="${i.level === 'error' ? 'bad' : 'warn'}">${esc(i.message)}</li>`).join('') || '<li class="muted">No indicators.</li>';
+  const indicators = (data.indicators || []).map(i => `<li class="${i.level === 'error' ? 'bad' : i.level === 'info' ? 'muted' : 'warn'}">${esc(i.message)}</li>`).join('') || '<li class="muted">No indicators.</li>';
   const snapshot = data.snapshot || {};
   const overview = [
     card('Snapshot', kv({run: snapshot.run_id || 'none', generated: snapshot.generated_at, items: snapshot.item_count || 0}), 'h2'),
@@ -2533,7 +2567,10 @@ def _render_dynamic_dashboard_page(
     )
     page_css = _PAGE_CSS if is_dashboard else _DEBUG_CSS
     page_js = _DASHBOARD_JS if is_dashboard else _DEBUG_JS
-    config_js = f"const DATA_URL = '/api/dashboard?view=ui';\nconst DEBUG_HREF = {json.dumps(debug_href)};\n"
+    config_js = (
+        f"const DATA_URL = '/api/dashboard?view=ui';\nconst DEBUG_HREF = {json.dumps(debug_href)};\n"
+        f"const SETTINGS_HREF = {json.dumps(settings_href or '')};\n"
+    )
     return (
         '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">'

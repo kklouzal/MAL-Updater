@@ -20,6 +20,7 @@ from .db import (
     merge_mal_user_anime_list_cache_into_metadata,
 )
 from .mapping import _ORDINAL_TO_NUMBER, _ROMAN_TO_NUMBER, normalize_title
+from .provider_registry import connected_source_providers
 from .recommendation_actionability import is_strict_provider_eligibility_actionable
 from .sync_planner import ProviderSeriesState, load_provider_series_states
 
@@ -404,7 +405,14 @@ def build_recommendations(
     list rows into metadata before scoring.  ``read_only=True`` is for request
     surfaces that must not mutate local state; it skips that merge and applies the
     same cached MAL list payloads to the in-memory metadata map instead.
+
+    Without a connected source provider, provider availability can never be
+    verified, so discovery is ranked from the MAL list and recommendation graph
+    alone (the ``--include-dormant`` semantics) instead of returning nothing.
     """
+    if require_provider_availability and not connected_source_providers(config):
+        require_provider_availability = False
+        include_discovery_candidates_without_actionable_provider_evidence = True
     states = load_provider_series_states(config, limit=None)
     state_by_id = {(state.provider, state.provider_series_id): state for state in states}
     persisted_mappings = list_series_mappings(config.db_path, approved_only=False)

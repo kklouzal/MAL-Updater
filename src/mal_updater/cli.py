@@ -26,7 +26,6 @@ from .config import ConfigError, ensure_directories, load_config, load_mal_secre
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .crunchyroll_auth import (
     CrunchyrollAuthError,
-    crunchyroll_auth_material_present,
     crunchyroll_login_with_credentials,
     crunchyroll_poll_device_code,
     crunchyroll_request_device_code,
@@ -42,7 +41,7 @@ from .crunchyroll_recommendation_shadow import (
 from .hidive_auth import HidiveAuthError, load_hidive_credentials, resolve_hidive_state_paths
 from .hidive_snapshot import HidiveSnapshotError
 from . import provider_snapshot
-from .provider_registry import get_provider, list_provider_slugs
+from .provider_registry import connected_source_providers, get_provider, list_provider_slugs
 from .request_tracking import begin_api_request_context, current_api_request_context, end_api_request_context
 from .recommendation_decision_ledger import insert_recommendation_decision_ledger, stable_recommendation_item_identity
 from .season_mappings import get_provider_season_mapping, list_provider_season_mappings, upsert_provider_season_mapping
@@ -2714,13 +2713,7 @@ def _cmd_apply_sync(
 
 
 def _iter_exact_approved_sync_cycle_providers(config) -> list[tuple[str, Path]]:
-    providers: list[tuple[str, Path]] = []
-    if crunchyroll_auth_material_present(config):
-        providers.append(("crunchyroll", config.cache_dir / "live-crunchyroll-snapshot.json"))
-    hidive_credentials = load_hidive_credentials(config)
-    if hidive_credentials.username and hidive_credentials.password:
-        providers.append(("hidive", config.cache_dir / "live-hidive-snapshot.json"))
-    return providers
+    return [(provider, config.cache_dir / f"live-{provider}-snapshot.json") for provider in connected_source_providers(config)]
 
 
 def _cmd_exact_approved_sync_cycle(project_root: Path | None, full_refresh: bool, allow_stale_provider_apply: bool = False) -> int:
@@ -3219,7 +3212,9 @@ def _cmd_recommend_enrich_provider_availability(
     config = load_config(project_root)
     ensure_directories(config)
     bootstrap_database(config.db_path)
-    provider_slugs = [provider] if provider else list(list_provider_slugs())
+    # The default matches the scheduler's eligibility lanes: connected providers only
+    # (Crunchyroll search needs its session; HIDIVE's public search is not consulted unconnected).
+    provider_slugs = [provider] if provider else connected_source_providers(config)
     providers = [get_provider(slug) for slug in provider_slugs]
     summary = enrich_discovery_provider_availability(
         config,

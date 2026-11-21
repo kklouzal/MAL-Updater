@@ -144,11 +144,17 @@ class ContainerRuntimeTests(unittest.TestCase):
         baseline = {spec.name for spec in _task_specs(self.config)}
         self.assertNotIn("sync_fetch_crunchyroll", baseline)
         self.assertNotIn("sync_fetch_hidive", baseline)
+        # MAL-only installs keep the MAL list and recommendation lanes but have
+        # no provider progress for sync_apply to write.
+        self.assertNotIn("sync_apply", baseline)
+        self.assertIn("mal_list_refresh", baseline)
+        self.assertIn("recommend_full_harvest", baseline)
 
         self.store.save_secrets({"crunchyroll_username": "user", "crunchyroll_password": "password"})
         crunchyroll_only = {spec.name for spec in _task_specs(self.config)}
         self.assertIn("sync_fetch_crunchyroll", crunchyroll_only)
         self.assertNotIn("sync_fetch_hidive", crunchyroll_only)
+        self.assertIn("sync_apply", crunchyroll_only)
 
     def test_mal_connection_test_is_read_only_single_attempt_and_does_not_mutate_config(self) -> None:
         self.store.save_secrets({"mal_client_id": "client"})
