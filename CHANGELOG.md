@@ -2,11 +2,7 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
-## [Unreleased]
-
-### Changed
-
-- File locks, atomic file writes and the audit log now also work on Windows (`file_locks` uses `LockFileEx` there instead of `flock`), and health-check auto-remediation runs the current Python interpreter instead of whatever `python3` is on `PATH`.
+## [0.3.0] - 2026-11-21
 
 ### Removed
 
@@ -33,6 +29,8 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Changed
 
+- File locks, atomic file writes and the audit log now also work on Windows (`file_locks` uses `LockFileEx` there instead of `flock`), and health-check auto-remediation runs the current Python interpreter instead of whatever `python3` is on `PATH`.
+- Updated the pinned container/bundle and Python package version to 0.3.0.
 - Unattended `sync_apply` now ships disabled: the default `service.task_execute_limits.sync_apply` changed from 8 to 0, so unattended MAL writes need an explicit positive opt-in. Manual `apply-sync` is unchanged.
 - Lowered the default health-history retention from 90 to 30 days and raised its per-run prune batch from 100 to 1000 files.
 - Rotated the Crunchyroll OAuth client after the previous Android TV client was retired, and send the Android TV User-Agent that the token endpoint now requires.
@@ -75,10 +73,6 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Fixed HIDIVE sync failing indefinitely once the saved refresh token expired (HIDIVE answers it with HTTP 404); an expired refresh token now triggers one credential re-login.
 - Extended bounded health-history housekeeping to timestamped hourly health-check logs while preserving the configured recent floor and ignoring unrelated logs, backups, and runtime data.
 - Derived health snapshot/log file-count review thresholds from the configured health cadence and retention window instead of fixed limits below the normal 90-day hourly volume.
-
-### Release status
-
-- These changes (including schema migrations 020-036) are unreleased; `master` intentionally remains versioned as 0.2.9. Existing 0.2.9 wheels, source archives, release bundles, and container images do **not** contain them; no publication or container-pin change is implied.
 
 ## [0.2.9] - 2026-08-12
 

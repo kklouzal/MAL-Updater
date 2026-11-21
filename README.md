@@ -36,7 +36,7 @@ Open **http://localhost/** (or `http://<lan-host>/` if you changed the port). Th
 
 There is no installation claim, dashboard account, password, or sign-in flow.
 
-The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.9`. For local development builds use:
+The image defaults to `ghcr.io/kklouzal/mal-updater:0.3.0`. For local development builds use:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
@@ -118,6 +118,6 @@ A source checkout can also run as a user-level systemd daemon (`references/AUTOM
 
 ## Release/support policy
 
-MAL-Updater is alpha software. Semver tags build the desktop apps for Windows, macOS and Linux, multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history; `master` carries the changes listed under `Unreleased`.
+MAL-Updater is alpha software. Semver tags build the desktop apps for Windows, macOS and Linux, multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history.
 
 Report bugs and feature requests at <https://github.com/kklouzal/MAL-Updater/issues>.
