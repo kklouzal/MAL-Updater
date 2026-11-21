@@ -111,7 +111,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(secrets.client_id_path, (root / ".MAL-Updater" / "secrets" / "custom_client_id.txt").resolve())
 
 
-
     def test_load_config_reads_crunchyroll_request_spacing_and_jitter_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

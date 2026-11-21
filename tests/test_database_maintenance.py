@@ -204,7 +204,6 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         self.assertIn("last_result", status["task_state"]["db_compaction"])
 
 
-
 class VacuumTempDirectoryTests(unittest.TestCase):
     def test_vacuum_rewrite_copy_uses_the_database_volume_not_the_process_tmp(self) -> None:
         import subprocess

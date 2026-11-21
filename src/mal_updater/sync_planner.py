@@ -6,7 +6,9 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .timestamps import parse_utc_timestamp
 from .config import AppConfig, load_mal_secrets
+from .db import _coerce_optional_int as _lenient_optional_int
 from .db import (
     MalUserAnimeListCacheEntry,
     PersistedSeriesMapping,
@@ -681,7 +683,7 @@ def _history_completion_inference(row: EpisodeProgressState, all_rows: list[Epis
     if row.provider_season_key is None:
         # Without season identity, "episode N+1" may belong to another season.
         return None
-    started = _parse_iso_utc(row.last_watched_at)
+    started = parse_utc_timestamp(row.last_watched_at)
     if started is None:
         return None
     for later in all_rows:
@@ -689,22 +691,12 @@ def _history_completion_inference(row: EpisodeProgressState, all_rows: list[Epis
             continue
         if later.provider_season_key != row.provider_season_key:
             continue
-        later_started = _parse_iso_utc(later.last_watched_at)
+        later_started = parse_utc_timestamp(later.last_watched_at)
         if later_started is None:
             continue
         if (later_started - started).total_seconds() * 1000 >= row.duration_ms * _NEXT_EPISODE_RUNTIME_FRACTION:
             return "next_episode_started_after_runtime"
     return None
-
-
-def _parse_iso_utc(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _season_progress_groups(rows: list[EpisodeProgressState]) -> dict[str, list[EpisodeProgressState]]:
@@ -767,7 +759,7 @@ def _auto_approve_mapping(config: AppConfig, state: ProviderSeriesState, mapping
     )
 
 
-def _build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInput:
+def build_series_mapping_input(state: ProviderSeriesState) -> SeriesMappingInput:
     if state.season_split:
         # A season is matched on its own, so its evidence is in-season.
         state = _numbering_view(state, None)
@@ -820,7 +812,7 @@ def build_mapping_review(
             )
             continue
 
-        mapping = map_series(client, _build_series_mapping_input(state), limit=mapping_limit)
+        mapping = map_series(client, build_series_mapping_input(state), limit=mapping_limit)
         reasons = list(mapping.rationale)
         if existing:
             reasons.append(
@@ -868,37 +860,14 @@ def build_mapping_review(
                 decision=decision,
                 reasons=reasons,
                 candidates=[
-                    {
-                        "mal_anime_id": candidate.mal_anime_id,
-                        "title": candidate.title,
-                        "score": candidate.score,
-                        "matched_query": candidate.matched_query,
-                        "match_reasons": candidate.match_reasons,
-                        "media_type": candidate.media_type,
-                    }
+                    candidate.summary(media_type=True)
                     for candidate in mapping.candidates
                 ],
                 bundle_companion_candidate=None
                 if not mapping.bundle_companion_candidate
-                else {
-                    "mal_anime_id": mapping.bundle_companion_candidate.mal_anime_id,
-                    "title": mapping.bundle_companion_candidate.title,
-                    "score": mapping.bundle_companion_candidate.score,
-                    "matched_query": mapping.bundle_companion_candidate.matched_query,
-                    "match_reasons": mapping.bundle_companion_candidate.match_reasons,
-                    "media_type": mapping.bundle_companion_candidate.media_type,
-                    "num_episodes": mapping.bundle_companion_candidate.num_episodes,
-                },
+                else mapping.bundle_companion_candidate.summary(media_type=True, episodes=True),
                 bundle_companion_candidates=[
-                    {
-                        "mal_anime_id": candidate.mal_anime_id,
-                        "title": candidate.title,
-                        "score": candidate.score,
-                        "matched_query": candidate.matched_query,
-                        "match_reasons": candidate.match_reasons,
-                        "media_type": candidate.media_type,
-                        "num_episodes": candidate.num_episodes,
-                    }
+                    candidate.summary(media_type=True, episodes=True)
                     for candidate in (mapping.bundle_companion_candidates or [])
                 ],
             )
@@ -906,40 +875,26 @@ def build_mapping_review(
     return items
 
 
+def mapping_review_queue_entries(items: list[MappingReviewItem]) -> list[dict[str, Any]]:
+    """Review-queue entries for mapping review items that need an operator decision."""
+    return [
+        {
+            "provider": item.provider,
+            "provider_series_id": item.provider_series_id,
+            "severity": "error" if item.decision == "needs_manual_match" else "warning",
+            "payload": item.as_dict(),
+        }
+        for item in items
+        if item.decision not in MAPPING_REVIEW_NO_QUEUE_DECISIONS
+    ]
+
+
 def persist_mapping_review_queue(config: AppConfig, items: list[MappingReviewItem]) -> dict[str, int]:
-    queue_entries = []
-    for item in items:
-        if item.decision in MAPPING_REVIEW_NO_QUEUE_DECISIONS:
-            continue
-        severity = "error" if item.decision == "needs_manual_match" else "warning"
-        queue_entries.append(
-            {
-                "provider": item.provider,
-                "provider_series_id": item.provider_series_id,
-                "severity": severity,
-                "payload": item.as_dict(),
-            }
-        )
-    return replace_review_queue_entries(config.db_path, issue_type="mapping_review", entries=queue_entries)
+    return replace_review_queue_entries(config.db_path, issue_type="mapping_review", entries=mapping_review_queue_entries(items))
 
 
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _coerce_detail_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            return int(value.strip())
-        except ValueError:
-            return None
-    return None
 
 
 def _completion_decision_for_provenance(
@@ -984,7 +939,7 @@ def _persist_watch_confirmation_provenance_snapshot(
         # Provenance is one row per provider series; a season-split series
         # records its most recently watched season only.
         return
-    mal_num_episodes = _coerce_detail_int((detail or {}).get("num_episodes"))
+    mal_num_episodes = _lenient_optional_int((detail or {}).get("num_episodes"))
     # Record the episode counts in the numbering the decision used.
     state = _numbering_view(state, mal_num_episodes)
     provider_watched_episodes, _, _ = _provider_watched_episodes(state, mal_num_episodes)
@@ -1454,7 +1409,7 @@ def _dated_entry(client: MalClient, mal_anime_id: int) -> _DatedEntry | None:
     return _DatedEntry(
         mal_anime_id=int(mal_anime_id),
         media_type=_coerce_optional_str(detail.get("media_type")),
-        num_episodes=_coerce_detail_int(detail.get("num_episodes")),
+        num_episodes=_lenient_optional_int(detail.get("num_episodes")),
         start=_parse_day(detail.get("start_date")),
         end=_parse_day(detail.get("end_date")),
     )
@@ -1842,7 +1797,7 @@ def _resolve_season_target(
     if search_budget[0] <= 0:
         return _ApplyTarget(None, None, 0.0, ["season_mapping_pending_search_budget", season_label])
     search_budget[0] -= 1
-    result = map_series(client, _build_series_mapping_input(state))
+    result = map_series(client, build_series_mapping_input(state))
     if not result.candidates and stored is not None and stored.approved and stored.mal_anime_id is not None:
         # Re-resolving a stale automatic match found no candidates at all: a
         # failed or empty search (map_series tolerates MAL search errors) is
@@ -1963,7 +1918,7 @@ def _sqlite_utc(value: str | None) -> datetime | None:
     """Parse SQLite CURRENT_TIMESTAMP text (UTC, 'YYYY-MM-DD HH:MM:SS')."""
     if not value:
         return None
-    return _parse_iso_utc(value.replace(" ", "T") + ("" if value.endswith("Z") else "Z"))
+    return parse_utc_timestamp(value.replace(" ", "T") + ("" if value.endswith("Z") else "Z"))
 
 
 def _apply_target(
@@ -1981,7 +1936,7 @@ def _apply_target(
 
 def _apply_priority_key(state: ProviderSeriesState) -> tuple[int, float]:
     """Progress-bearing series first (most recently watched first), then watchlist-only."""
-    watched_at = _parse_iso_utc(state.last_watched_at)
+    watched_at = parse_utc_timestamp(state.last_watched_at)
     if watched_at is not None:
         return (0, -watched_at.timestamp())
     return (1, 0.0)
@@ -2201,7 +2156,7 @@ def _split_cour_units(
     # Only catalog fields (episode count, media type) are needed here, so the
     # entry need not be on the user's list.
     detail = first_detail if first_detail is not None else _catalog_detail(client, target.mal_anime_id)
-    first_count = _coerce_detail_int((detail or {}).get("num_episodes"))
+    first_count = _lenient_optional_int((detail or {}).get("num_episodes"))
     state = _numbering_view(state, first_count)
     numbers = state.completed_episode_numbers
     if not numbers:
@@ -2221,7 +2176,7 @@ def _split_cour_units(
     if sequel_id is None:
         return [(state, target)]
     sequel_detail = _catalog_detail(client, sequel_id)
-    sequel_count = _coerce_detail_int((sequel_detail or {}).get("num_episodes"))
+    sequel_count = _lenient_optional_int((sequel_detail or {}).get("num_episodes"))
     if (
         sequel_detail is None
         or str(sequel_detail.get("media_type") or "") not in _SPLIT_COUR_MEDIA_TYPES
@@ -2536,7 +2491,7 @@ def _resolve_mapping_for_sync(
     if not allow_live_search:
         return ("unapproved", 0.0, None, persisted.mapping_source if persisted else None, False, ["live_search_disabled"])
 
-    mapping = map_series(client, _build_series_mapping_input(state), limit=mapping_limit)
+    mapping = map_series(client, build_series_mapping_input(state), limit=mapping_limit)
     mapping_reasons = list(mapping.rationale)
     mapping_source: str | None = persisted.mapping_source if persisted else None
     if persisted:
@@ -2618,13 +2573,13 @@ def _plan_status_update_for_state(
     # Report the episode counts in the numbering the decision uses.
     state = _numbering_view(
         state,
-        _coerce_detail_int(num_episodes),
+        _lenient_optional_int(num_episodes),
         current_watched=_coerce_optional_int((current_status or {}).get("num_episodes_watched")),
     )
     provider_watched_episodes, watched_reason, watched_review_reason = _provider_watched_episodes(
         state,
-        _coerce_detail_int(num_episodes),
-        current_watched=_coerce_detail_int((current_status or {}).get("num_episodes_watched")),
+        _lenient_optional_int(num_episodes),
+        current_watched=_lenient_optional_int((current_status or {}).get("num_episodes_watched")),
     )
     reasons: list[str] = [
         "merge_policy=missing_data_only",
@@ -3029,11 +2984,11 @@ def _build_missing_field_merge(
 
 def _summarize_field_merge(field_merge: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
-    for field in ("status", "num_watched_episodes", "score", "start_date", "finish_date"):
-        if field in field_merge:
-            reasons.append(f"fill_missing_{field}")
+    for merged_field in ("status", "num_watched_episodes", "score", "start_date", "finish_date"):
+        if merged_field in field_merge:
+            reasons.append(f"fill_missing_{merged_field}")
         else:
-            reasons.append(f"preserve_meaningful_{field}")
+            reasons.append(f"preserve_meaningful_{merged_field}")
     return reasons
 
 

@@ -312,6 +312,22 @@ class MappingCandidate:
     match_reasons: list[str]
     raw: dict[str, Any]
 
+    def summary(self, *, reasons: bool = True, media_type: bool = False, episodes: bool = False) -> dict[str, Any]:
+        """JSON summary for review payloads and CLI output; flags keep each caller's established fields."""
+        payload: dict[str, Any] = {
+            "mal_anime_id": self.mal_anime_id,
+            "title": self.title,
+            "score": self.score,
+            "matched_query": self.matched_query,
+        }
+        if reasons:
+            payload["match_reasons"] = self.match_reasons
+        if media_type:
+            payload["media_type"] = self.media_type
+        if episodes:
+            payload["num_episodes"] = self.num_episodes
+        return payload
+
 
 @dataclass(slots=True)
 class MappingResult:
@@ -354,15 +370,6 @@ class MappingResult:
 
     def has_deterministic_aggregate_progress_classification(self) -> bool:
         return _has_reason_with_prefix(_mapping_result_reasons(self), (_AGGREGATE_PROGRESS_REASON_PREFIX,))
-
-    def has_deterministic_non_actionable_classification(self) -> bool:
-        return (
-            self.is_deterministic_multi_entry_bundle()
-            or self.has_deterministic_provider_shell_classification()
-            or self.has_deterministic_ambiguous_exact_title_classification()
-            or self.has_deterministic_aggregate_progress_classification()
-        )
-
 
 def _mapping_result_reasons(result: MappingResult) -> list[str]:
     reasons = [*result.rationale]
@@ -515,7 +522,6 @@ def merge_provider_mapping_evidence(*items: ProviderMappingEvidence) -> Provider
         start_year_is_trustworthy=start_year_is_trustworthy,
         identity_evidence=identity_evidence,
     )
-
 
 
 def _normalize_with_cleanup_patterns(value: str | None, cleanup_patterns: list[re.Pattern[str]]) -> str:
@@ -782,7 +788,6 @@ def _season_title_is_installment_only_extension(title: str, season_title: str | 
     if not suffix:
         return True
     return bool(_INSTALLMENT_ONLY_EXTENSION_RE.fullmatch(suffix))
-
 
 
 def build_search_queries(series: SeriesMappingInput) -> list[str]:
@@ -1282,7 +1287,6 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             best_source = source
     reasons: list[str] = []
     score = best_ratio
-    best_norm = normalize_title(best_title)
     best_strict_norm = normalize_title_strict(best_title)
     extra_title_suffix = bool(
         query_strict_norm and best_strict_norm and best_strict_norm.startswith(f"{query_strict_norm} ")
@@ -1387,7 +1391,6 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
             score -= 0.06
             reasons.append("candidate_extra_installment_hint")
 
-    exact_later_installment_alignment = False
 
     if provider_has_non_base_installment_hint and not candidate_has_non_base_installment_hint:
         provider_season_number_for_penalty, _ = _provider_season_number(series)
@@ -1469,7 +1472,6 @@ def _score_candidate(series: SeriesMappingInput, query: str, node: dict[str, Any
         )
     ):
         score += 0.08
-        exact_later_installment_alignment = True
         reasons.append("exact_later_installment_alignment")
 
     provider_auxiliary_markers = _provider_auxiliary_markers(series)
@@ -1852,7 +1854,6 @@ def _candidate_is_explainably_weaker(series: SeriesMappingInput, candidate: Mapp
     return False
 
 
-
 def _candidate_is_non_exact_franchise_extension(candidate: MappingCandidate) -> bool:
     if "exact_normalized_title" in candidate.match_reasons:
         return False
@@ -1871,7 +1872,6 @@ def _candidate_is_non_exact_franchise_extension(candidate: MappingCandidate) -> 
     return True
 
 
-
 def _candidate_has_installment_progression_reason(candidate: MappingCandidate) -> bool:
     return any(
         reason.startswith((
@@ -1885,7 +1885,6 @@ def _candidate_has_installment_progression_reason(candidate: MappingCandidate) -
         ))
         for reason in candidate.match_reasons
     ) or "final_season_hint_match" in candidate.match_reasons
-
 
 
 def _candidate_has_explicit_followup_installment_hint(candidate: MappingCandidate) -> bool:
@@ -1925,7 +1924,6 @@ def _candidate_has_explicit_followup_installment_hint(candidate: MappingCandidat
     )
 
 
-
 def _supports_exact_title_overflow_auto_resolution(
     series: SeriesMappingInput,
     top: MappingCandidate,
@@ -1955,7 +1953,6 @@ def _supports_exact_title_overflow_auto_resolution(
     return True
 
 
-
 def _supports_exact_later_installment_auto_resolution(
     series: SeriesMappingInput,
     top: MappingCandidate,
@@ -1981,7 +1978,6 @@ def _supports_exact_later_installment_auto_resolution(
     if second_query_norm == base_query_norm and "exact_normalized_title" not in second.match_reasons:
         return True
     return False
-
 
 
 def _supports_exact_bundle_auto_resolution(
@@ -2021,7 +2017,6 @@ def _supports_exact_bundle_auto_resolution(
     return True
 
 
-
 def _titles_share_bundle_family(top_title: str, companion_title: str) -> bool:
     top_title_norm = normalize_title_strict(top_title)
     companion_title_norm = normalize_title_strict(companion_title)
@@ -2040,10 +2035,8 @@ def _titles_share_bundle_family(top_title: str, companion_title: str) -> bool:
     return shared_prefix_tokens >= 2
 
 
-
 def _candidate_shares_bundle_title_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
     return _titles_share_bundle_family(top.title, companion.title)
-
 
 
 def _candidate_shares_bundle_alias_family(top: MappingCandidate, companion: MappingCandidate) -> bool:
@@ -2054,7 +2047,6 @@ def _candidate_shares_bundle_alias_family(top: MappingCandidate, companion: Mapp
             if _titles_share_bundle_family(top_title, companion_title):
                 return True
     return False
-
 
 
 def _is_low_score_bundle_companion(top: MappingCandidate, companion: MappingCandidate) -> bool:
@@ -2092,7 +2084,6 @@ def _is_safe_supplemental_bundle_companion(top: MappingCandidate, companion: Map
     return True
 
 
-
 def _candidate_is_safe_exact_bundle_suffix_companion(top: MappingCandidate, companion: MappingCandidate) -> bool:
     if companion.media_type != "tv":
         return False
@@ -2103,7 +2094,6 @@ def _candidate_is_safe_exact_bundle_suffix_companion(top: MappingCandidate, comp
     if _has_reason_with_prefix(companion.match_reasons, _BUNDLE_DISQUALIFYING_REASON_PREFIXES):
         return False
     return companion.score >= max(0.70, top.score - 0.18)
-
 
 
 def _candidate_is_safe_exact_bundle_pair_member(top: MappingCandidate, companion: MappingCandidate) -> bool:
@@ -2202,7 +2192,6 @@ def _is_deterministic_multi_entry_bundle(result: MappingResult) -> bool:
             continue
         return False
     return True
-
 
 
 def _candidate_has_non_base_positive_installment_alignment(candidate: MappingCandidate) -> bool:
@@ -2344,7 +2333,6 @@ def _candidate_installment_indexes(candidate: MappingCandidate) -> set[int]:
     return indexes
 
 
-
 def _bundle_group_followup_rank(
     series: SeriesMappingInput,
     top: MappingCandidate,
@@ -2373,7 +2361,6 @@ def _bundle_group_followup_rank(
     gap_penalty = sum(abs(actual - expected) for actual, expected in zip(ordered_indexes, expected_indexes))
     skip_penalty = sum(max(0, actual - expected) for actual, expected in zip(ordered_indexes, expected_indexes))
     return (gap_penalty, skip_penalty, ordered_indexes[0])
-
 
 
 def _suspect_multi_entry_bundle(
@@ -2454,7 +2441,6 @@ def _suspect_multi_entry_bundle(
                 list(companion_group),
             )
     return best_match
-
 
 
 def _provider_episode_evidence(series: SeriesMappingInput) -> int:
@@ -2896,7 +2882,6 @@ def _relation_expansion_seed_key(candidate: MappingCandidate) -> tuple[int, floa
     )
 
 
-
 def _best_candidate_from_node(
     series: SeriesMappingInput,
     queries: list[str],
@@ -3114,7 +3099,6 @@ def _inject_verified_identity_candidate(
     previous = by_id.get(candidate.mal_anime_id)
     if previous is None or candidate.score >= previous.score:
         by_id[candidate.mal_anime_id] = candidate
-
 
 
 def _expand_candidates_via_relations(

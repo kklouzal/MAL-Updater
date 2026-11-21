@@ -3,14 +3,14 @@
 ## 2026-03-14 - Core integration direction
 
 ### Decision
-Build MAL-Updater as a local Orin-hosted integration using:
+Build MAL-Updater as a self-hosted integration (originally a single local host; now shipped as a container, with the native user-systemd path kept for source installs) using:
 - Python application/worker
 - SQLite state database
 - official MAL OAuth + REST API
 - Python-side Crunchyroll auth + live fetches
 
 ### Why
-- the working Crunchyroll path on this host is Python-side
+- the working Crunchyroll path was Python-side
 - Python is better for orchestration, mapping logic, sync policy, and future recommendation work
 - SQLite is sufficient and simple for local state
 - keeping the implementation in one language leaves the repo smaller and easier to maintain
@@ -162,8 +162,8 @@ When a daemon task tied to a provider fails, persist an adaptive failure-backoff
 
 ### Decision
 Keep provider fetch lanes incremental by default, but let the unattended daemon both:
-- persist a provider-specific full-refresh anchor only when full-refresh cadence is explicitly enabled (`service.full_refresh_every_seconds > 0`; default is disabled), and
-- honor the latest health-check `refresh_full_snapshot` recommendation for a provider only when the operator has explicitly enabled unattended full-refresh cadence (`service.full_refresh_every_seconds > 0`), so diagnostics do not silently turn into routine full resweeps.
+- persist a provider-specific full-refresh anchor when full-refresh cadence is enabled (`service.full_refresh_every_seconds > 0`; the shipped default is weekly and applies only to the page-bounded Crunchyroll lane, never to HIDIVE), and
+- honor the latest health-check `refresh_full_snapshot` recommendation only for a lane that is bounded and has that cadence enabled, so diagnostics do not silently turn into unbounded resweeps.
 
 Only advance `last_fetch_mode`, `last_successful_full_refresh_*`, and the full-refresh anchor after a **successful** provider fetch. A failed attempted full refresh must not be recorded as if the canonical resweep already happened.
 
@@ -647,6 +647,27 @@ Change the shipped `service.task_execute_limits.sync_apply` default from `8` to 
 - absence of an operator decision must not authorize unattended remote writes
 - scheduler zero already has fail-closed skip semantics, so the safer default uses an existing tested control rather than adding a second enable flag
 - keeping request-budget defaults available preserves coherent behavior after an explicit positive opt-in
+
+## 2026-11-18 - Per-season sync and fresh-fetch apply gate
+
+### Decision
+- Sync each canonical provider season to its own MAL entry (`provider_season_mappings`). Crunchyroll dubs collapse onto the original-language season. A season is matched automatically only by the provider season catalog's dates and episode counts within the series' MAL franchise, under the same auto-approval rules as series mapping; anything else stays `unresolved`, is never written, and waits for `season-mappings --approve`.
+- Bump `SEASON_MAPPING_RESOLVER_VERSION` whenever matching rules change, so older automatic matches are re-resolved while the stored match keeps applying.
+- Unattended `sync_apply` applies only providers whose fetch lane succeeded since the previous apply, instead of requiring every provider to succeed in the same scheduler pass.
+- `apply-sync --limit` bounds live revalidations/writes, not series inspected; writes go most recently watched first.
+
+### Why
+- MAL lists each season as a separate entry, so summing a multi-season provider series into one entry wrote impossible progress.
+- Provider fetch lanes run on independent cadences; the old all-providers-in-one-pass gate had silently blocked every unattended apply for weeks.
+- Bounding writes rather than inspection lets later runs reach older backlog.
+
+## 2026-11-18 - 30-day operational retention
+
+### Decision
+Operational history self-cleans and is kept at most about 30 days: the recommendation decision ledger (whole runs older than 30 days; rows younger than 7 days are delete-protected), automatic pre-vacuum backups (30 days), and health history (30 days, at least the newest 168 snapshots). API request telemetry keeps 14 days and recommendation score snapshots 14 days with the newest 30 runs per kind protected. Manual backups remain owner-managed.
+
+### Why
+Unbounded logs and history grew the database and volume without adding diagnostic value beyond a month.
 
 ## 2026-04-10 - Discovery neutral-seed weighting posture
 

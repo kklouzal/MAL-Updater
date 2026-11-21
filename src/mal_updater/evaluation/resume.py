@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
 import hashlib
-import json
 import math
 from pathlib import Path
 import sqlite3
@@ -18,13 +17,6 @@ PREDICTION_VERSION = "mal-eval-prediction/v1"
 POLICY_ID = "resume-production-v1"
 POLICY_VERSION = "1"
 FEATURE_VERSION = "resume-features/v1"
-
-
-def _dt(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        raise ValueError("timestamps must include a timezone")
-    return parsed.astimezone(timezone.utc)
 
 
 def _iso(value: datetime) -> str:

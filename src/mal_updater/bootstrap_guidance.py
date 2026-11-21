@@ -8,15 +8,14 @@ import shlex
 import shutil
 import stat
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
-from pathlib import Path
 
+from .timestamps import parse_utc_timestamp
 from . import health_report
 from . import review_queue_support as _review_queue_support
 from . import service_systemd_status
 from .auth_remediation import (
     AuthRemediationDescriptor,
-    guidance_command_fields as _auth_guidance_command_fields,
+    guidance_command_fields as _guidance_command_fields,
     mal_missing_auth_descriptor,
     mal_rebootstrap_auth_descriptor,
     provider_missing_state_descriptor,
@@ -31,24 +30,6 @@ from .service_auth_state import (
     provider_bootstrap_auth_issue,
 )
 from .service_units import systemd_unit_path_context
-
-
-def _parse_sqlite_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    for parser in (
-        lambda raw: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
-        lambda raw: datetime.fromisoformat(raw.replace("Z", "+00:00")),
-    ):
-        try:
-            parsed = parser(text)
-        except ValueError:
-            continue
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    return None
 
 
 def _runtime_initialization_status(config) -> dict[str, object]:
@@ -95,45 +76,12 @@ def _secrets_dir_permission_status(config) -> dict[str, object]:
     }
 
 
-def _guidance_command_fields(
-    *,
-    command: str | None,
-    reason_code: str | None = None,
-    automation_safe: bool | None = None,
-    requires_auth_interaction: bool | None = None,
-    auth_failure_kind: str | None = None,
-    auth_remediation_kind: str | None = None,
-) -> dict[str, object]:
-    return _auth_guidance_command_fields(
-        command=command,
-        reason_code=reason_code,
-        automation_safe=automation_safe,
-        requires_auth_interaction=requires_auth_interaction,
-        auth_failure_kind=auth_failure_kind,
-        auth_remediation_kind=auth_remediation_kind,
-    )
-
-
 def _auth_command_string(command: AuthRemediationDescriptor | str, default: AuthRemediationDescriptor) -> str:
     if isinstance(command, AuthRemediationDescriptor):
         return command.command
     if isinstance(command, str) and command:
         return command
     return default.command
-
-
-def _provider_from_refresh_command_args(command_args: object) -> str | None:
-    if not isinstance(command_args, list) or not command_args:
-        return None
-    if command_args[0] == "crunchyroll-fetch-snapshot":
-        return "crunchyroll"
-    if len(command_args) >= 2 and command_args[0] == "sync-source" and isinstance(command_args[1], str):
-        return str(command_args[1])
-    if command_args[0] == "provider-fetch-snapshot":
-        for index, part in enumerate(command_args[:-1]):
-            if part == "--provider" and isinstance(command_args[index + 1], str):
-                return str(command_args[index + 1])
-    return None
 
 
 def _normalized_provider_fetch_command_args(provider: str, command_args: list[str]) -> list[str]:
@@ -175,7 +123,7 @@ def _provider_task_clears_health_refresh_recommendation(
         return False
     if task_state.get("last_status") != "ok":
         return False
-    last_finished_at = _parse_sqlite_timestamp(task_state.get("last_finished_at"))
+    last_finished_at = parse_utc_timestamp(task_state.get("last_finished_at"))
     if last_finished_at is not None and last_finished_at.timestamp() >= float(health_mtime):
         return True
     last_run_epoch = task_state.get("last_run_epoch")
@@ -190,25 +138,10 @@ def _provider_bootstrap_health_refresh_recommendation(
     provider: str,
     service_state: dict[str, object] | None,
 ) -> dict[str, object] | None:
-    path = config.health_latest_json_path
-    if not path.exists():
+    latest = health_report.latest_health_refresh_commands(config.health_latest_json_path)
+    if latest is None:
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    maintenance = payload.get("maintenance")
-    if not isinstance(maintenance, dict):
-        return None
-    commands = maintenance.get("recommended_commands")
-    if not isinstance(commands, list):
-        return None
-    try:
-        health_mtime = path.stat().st_mtime
-    except OSError:
-        return None
+    commands, health_mtime = latest
     task_state = None
     if isinstance(service_state, dict):
         tasks = service_state.get("tasks")
@@ -217,12 +150,8 @@ def _provider_bootstrap_health_refresh_recommendation(
             if isinstance(candidate_state, dict):
                 task_state = candidate_state
     for command in commands:
-        if not isinstance(command, dict):
-            continue
         reason_code = command.get("reason_code")
-        if reason_code not in {"refresh_ingested_snapshot", "refresh_full_snapshot"}:
-            continue
-        if _provider_from_refresh_command_args(command.get("command_args")) != provider:
+        if health_report.provider_from_refresh_command_args(command.get("command_args")) != provider:
             continue
         command_args = command.get("command_args")
         if not isinstance(command_args, list) or not all(isinstance(part, str) for part in command_args):
@@ -567,8 +496,6 @@ def _bootstrap_operation_mode_status(
         "daemon_expected": True,
         "details": "MAL auth and all currently intended providers are bootstrapped, so manual foreground CLI runs remain valid for validation/recovery, but the repo-owned user-systemd daemon is the expected path for unattended background sync.",
     }
-
-
 
 
 def build_bootstrap_audit_payload(config: AppConfig) -> dict[str, object]:

@@ -5,24 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Protocol, Sequence
-
-from .resume import ReplayQuery
-
-
-class EventStore(Protocol):
-    def evidence_as_of(self, query: ReplayQuery) -> Iterable[dict[str, Any]]: ...
-    def outcomes_after(self, query: ReplayQuery) -> Iterable[dict[str, Any]]: ...
-
-
-class CandidateGenerator(Protocol):
-    def generate(self, query: ReplayQuery, evidence: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]: ...
-
-
-class RankingPolicy(Protocol):
-    policy_id: str
-    policy_version: str
-    def rank(self, query: ReplayQuery, candidates: Sequence[dict[str, Any]], *, k: int) -> Sequence[dict[str, Any]]: ...
+from typing import Any, Iterable
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,16 +13,6 @@ class ValidationReport:
     valid: bool
     violations: tuple[dict[str, str], ...]
     record_counts: dict[str, int]
-
-
-@dataclass(frozen=True, slots=True)
-class RunManifest:
-    files: dict[str, str]
-
-
-@dataclass(frozen=True, slots=True)
-class LabelPolicyV1:
-    policy_id: str = "label-policy/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,27 +145,6 @@ def validate_bundle(path: Path, *, exact_required: bool = True) -> ValidationRep
     return ValidationReport(not violations, tuple(violations), counts)
 
 
-def materialize_candidates(store: EventStore, queries: Sequence[ReplayQuery], generator: CandidateGenerator) -> RunManifest:
-    raise NotImplementedError("bundle materialization is outside resume slice 1")
-
-
-def build_labels(store: EventStore, queries: Sequence[ReplayQuery], candidates: Iterable[dict[str, Any]], policy: LabelPolicyV1) -> Iterable[dict[str, Any]]:
-    for query in queries:
-        outcomes = list(store.outcomes_after(query))
-        for candidate in candidates:
-            if candidate.get("query_id") != query.query_id:
-                continue
-            matches = [event for event in outcomes if event.get("entity", {}).get("entity_id") == candidate.get("item_id")]
-            yield {"schema_version": "mal-eval-label/v1", "query_id": query.query_id,
-                   "item_id": candidate["item_id"], "binary_relevance": 1 if matches else 0,
-                   "graded_relevance": 2 if matches else 0,
-                   "label_state": "positive" if matches else "unobserved",
-                   "first_positive_at": min((event["occurred_at"] for event in matches), default=None),
-                   "outcome_event_ids": sorted({event["event_id"] for event in matches}),
-                   "observable_days": 30, "exposure_known": False,
-                   "reason_codes": ["provider_play_started"] if matches else ["insufficient_observability"]}
-
-
 def evaluate(predictions: Iterable[dict[str, Any]], labels: Iterable[dict[str, Any]], *, config: EvalConfigV1) -> EvaluationReportV1:
     from .resume import _metrics
     prediction_rows, label_rows = list(predictions), list(labels)
@@ -200,7 +152,3 @@ def evaluate(predictions: Iterable[dict[str, Any]], labels: Iterable[dict[str, A
     return EvaluationReportV1({"schema_version": "mal-eval-report/v1", "objective": "resume",
                                "metrics": _metrics(prediction_rows, known, config.k),
                                "counts": {"predictions": len(prediction_rows), "labels": len(label_rows), "positives": sum(known.values())}})
-
-
-def compare(baseline: Any, contender: Any, *, bootstrap: Any) -> dict[str, Any]:
-    raise NotImplementedError("policy comparison is outside resume slice 1")

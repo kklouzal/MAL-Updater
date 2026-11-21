@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
-from typing import Any, Iterable
+from typing import Any
 
 EVENT_SCHEMA_VERSION = "mal-eval-event/v1"
 NORMALIZATION_VERSION = "resume-observation/v1"

@@ -40,19 +40,11 @@ def _sql_map(directory: Path) -> dict[str, Path]:
     return {path.name: path for path in sorted(directory.glob("*.sql"))}
 
 
-def _check_source_migration_parity(repo_root: Path) -> dict[str, bytes]:
-    root_migrations = _sql_map(repo_root / "migrations")
+def _source_migrations(repo_root: Path) -> dict[str, bytes]:
     package_migrations = _sql_map(repo_root / "src" / "mal_updater" / "migrations")
-    if not root_migrations:
-        _die("no root migrations/*.sql files found")
-    if set(root_migrations) != set(package_migrations):
-        missing_in_package = sorted(set(root_migrations) - set(package_migrations))
-        missing_in_root = sorted(set(package_migrations) - set(root_migrations))
-        _die(f"source migration name mismatch; missing_in_package={missing_in_package}; missing_in_root={missing_in_root}")
-    mismatched = [name for name, path in root_migrations.items() if path.read_bytes() != package_migrations[name].read_bytes()]
-    if mismatched:
-        _die(f"source migration content mismatch: {mismatched}")
-    return {name: root_migrations[name].read_bytes() for name in sorted(root_migrations)}
+    if not package_migrations:
+        _die("no src/mal_updater/migrations/*.sql files found")
+    return {name: path.read_bytes() for name, path in package_migrations.items()}
 
 
 def _single_artifact(dist_dir: Path, pattern: str) -> Path:
@@ -151,18 +143,13 @@ def _tar_member_bytes(sdist: tarfile.TarFile, member_name: str) -> bytes:
         return extracted.read()
 
 
-def _sdist_sql_member_maps(names: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+def _sdist_package_sql_members(names: list[str]) -> dict[str, str]:
     package_sql_members: dict[str, str] = {}
-    root_sql_members: dict[str, str] = {}
     for name in names:
         path = PurePosixPath(name)
-        if not name.endswith(".sql"):
-            continue
-        if len(path.parts) >= 5 and path.parts[1:4] == ("src", "mal_updater", "migrations"):
+        if name.endswith(".sql") and len(path.parts) >= 5 and path.parts[1:4] == ("src", "mal_updater", "migrations"):
             package_sql_members[path.name] = name
-        if len(path.parts) >= 3 and path.parts[1] == "migrations":
-            root_sql_members[path.name] = name
-    return package_sql_members, root_sql_members
+    return package_sql_members
 
 
 def _check_sdist(sdist_path: Path, expected_sql_bytes: dict[str, bytes]) -> None:
@@ -173,21 +160,13 @@ def _check_sdist(sdist_path: Path, expected_sql_bytes: dict[str, bytes]) -> None
         _die(f"invalid sdist artifact {sdist_path.name}: {exc}")
     with sdist_context as sdist:
         names = sdist.getnames()
-        package_sql_members, root_sql_members = _sdist_sql_member_maps(names)
+        package_sql_members = _sdist_package_sql_members(names)
         _check_sql_member_names(package_sql_members, expected_sql, label="sdist package", artifact_name=sdist_path.name)
-        _check_sql_member_names(root_sql_members, expected_sql, label="sdist root", artifact_name=sdist_path.name)
         _check_sql_member_contents(
             lambda member: _tar_member_bytes(sdist, member),
             package_sql_members,
             expected_sql_bytes,
             label="sdist package",
-            artifact_name=sdist_path.name,
-        )
-        _check_sql_member_contents(
-            lambda member: _tar_member_bytes(sdist, member),
-            root_sql_members,
-            expected_sql_bytes,
-            label="sdist root",
             artifact_name=sdist_path.name,
         )
         pyproject_files = [name for name in names if PurePosixPath(name).name == "pyproject.toml"]
@@ -206,16 +185,16 @@ def check_distribution(repo_root: Path, dist_dir: Path) -> int:
     if not dist_dir.is_dir():
         _die(f"dist directory does not exist: {dist_dir}")
 
-    expected_sql_bytes = _check_source_migration_parity(repo_root)
+    expected_sql_bytes = _source_migrations(repo_root)
     wheel_path = _single_artifact(dist_dir, "*.whl")
     sdist_path = _single_artifact(dist_dir, "*.tar.gz")
     _check_wheel(wheel_path, expected_sql_bytes)
     _check_sdist(sdist_path, expected_sql_bytes)
 
     sql_count = len(expected_sql_bytes)
-    print(f"source migration parity: {sql_count} SQL files")
+    print(f"source migrations: {sql_count} SQL files")
     print(f"wheel migrations: {wheel_path.name}: {sql_count} SQL files")
-    print(f"sdist package/root migrations: {sdist_path.name}: {sql_count} SQL files each")
+    print(f"sdist migrations: {sdist_path.name}: {sql_count} SQL files")
     print("wheel entry points: mal-updater, mal-updater-container, mal-updater-tools")
     print("package metadata: MIT license expression/file, project URLs, classifiers, and keywords")
     return 0

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mal_updater.cli import _filter_review_queue_items, _review_queue_item_label, _summarize_review_queue
+from mal_updater.review_queue_support import _filter_review_queue_items, _review_queue_item_label, _summarize_review_queue
 from mal_updater.config import load_config
 from mal_updater.db import bootstrap_database, connect, get_provider_series_title_map_by_keys, list_review_queue_entries
 

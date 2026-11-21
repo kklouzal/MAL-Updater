@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from .database_maintenance import COMPACTION_REPORT_STATUS_FIELDS
+from .timestamps import parse_utc_timestamp
 from .config import AppConfig, ensure_directories, load_config
 from .persistence import PersistentJsonError, atomic_write_text, read_json_dict_bounded
 from .redaction import sanitize_text, sanitize_url, sanitize_value
@@ -95,18 +97,6 @@ def _snippet(value: object, *, limit: int = _RESULT_SNIPPET_LIMIT) -> str | None
     return sanitize_text(trimmed, max_length=limit)
 
 
-def _parse_iso_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
 def _summarize_last_result(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -125,20 +115,7 @@ def _summarize_last_result(value: object) -> dict[str, Any] | None:
         "request_id",
         "request_url",
         "http_status",
-        "db_size_before",
-        "db_size_after",
-        "freelist_bytes",
-        "freelist_ratio",
-        "bytes_reclaimed",
-        "backup_archive",
-        "backup_archive_sha256",
-        "required_free_bytes",
-        "available_free_bytes",
-        "initial_available_free_bytes",
-        "post_backup_available_free_bytes",
-        "pruned_backup_archives",
-        "backup_prune_error_type",
-        "error_type",
+        *COMPACTION_REPORT_STATUS_FIELDS,
         "retention_days",
         "min_count",
         "batch_size",
@@ -301,7 +278,7 @@ def _derive_task_execution_state(
             payload["execution_state_remaining_seconds"] = max(0, int(timeout_seconds) - elapsed)
         return payload
 
-    failure_backoff_until = _parse_iso_timestamp(task_state.get("failure_backoff_until"))
+    failure_backoff_until = parse_utc_timestamp(task_state.get("failure_backoff_until"))
     if failure_backoff_until is not None and failure_backoff_until > now:
         remaining = max(0, int((failure_backoff_until - now).total_seconds()))
         payload: dict[str, Any] = {
@@ -314,7 +291,7 @@ def _derive_task_execution_state(
             payload["execution_state_detail"] = failure_class
         return payload
 
-    budget_backoff_until = _parse_iso_timestamp(task_state.get("budget_backoff_until"))
+    budget_backoff_until = parse_utc_timestamp(task_state.get("budget_backoff_until"))
     if budget_backoff_until is not None and budget_backoff_until > now:
         remaining = max(0, int((budget_backoff_until - now).total_seconds()))
         payload = {
@@ -327,7 +304,7 @@ def _derive_task_execution_state(
             payload["execution_state_detail"] = budget_level
         return payload
 
-    next_due_at = _parse_iso_timestamp(task_state.get("next_due_at"))
+    next_due_at = parse_utc_timestamp(task_state.get("next_due_at"))
     if next_due_at is not None:
         remaining = int((next_due_at - now).total_seconds())
         if remaining <= 0:
@@ -432,13 +409,13 @@ def _summarize_task_state(config: AppConfig, task_name: str, value: object) -> d
     if isinstance(value.get("last_request_delta"), (int, float)):
         summary["last_request_delta"] = int(value["last_request_delta"])
     now_dt = datetime.now(timezone.utc)
-    next_due_at = _parse_iso_timestamp(value.get("next_due_at"))
+    next_due_at = parse_utc_timestamp(value.get("next_due_at"))
     if next_due_at is not None:
         summary["next_due_in_seconds"] = max(0, int((next_due_at - now_dt).total_seconds()))
-    budget_backoff_until = _parse_iso_timestamp(value.get("budget_backoff_until"))
+    budget_backoff_until = parse_utc_timestamp(value.get("budget_backoff_until"))
     if budget_backoff_until is not None:
         summary["budget_backoff_remaining_seconds"] = max(0, int((budget_backoff_until - now_dt).total_seconds()))
-    failure_backoff_until = _parse_iso_timestamp(value.get("failure_backoff_until"))
+    failure_backoff_until = parse_utc_timestamp(value.get("failure_backoff_until"))
     if failure_backoff_until is not None:
         summary["failure_backoff_remaining_seconds"] = max(0, int((failure_backoff_until - now_dt).total_seconds()))
     execution_state = _derive_task_execution_state(value, now=now_dt, config=config, task_name=task_name)

@@ -1,6 +1,6 @@
 # MAL-Updater 0.2.9
 
-> **Source-tree caveat:** the current dirty development tree also contains unreleased migration 024/025 and provider/MAL reliability work documented under `CHANGELOG.md` → `Unreleased`. The published 0.2.9 artifacts and pinned 0.2.9 container do not contain that work. Any locally built 0.2.9 wheel/sdist from this tree is validation-only and must not be represented as the published release.
+> **Source-tree caveat:** `master` also carries unreleased work (schema migrations 020-036, per-season sync, and the other changes under `CHANGELOG.md` → `Unreleased`). The published 0.2.9 artifacts and pinned 0.2.9 container do not contain it, and a 0.2.9 wheel/sdist built from `master` is not the published release.
 
 This alpha patch finishes the recommendation dashboard presentation polish. Static and live recommendation tables now use the concise `Title` heading, and provider proof buttons no longer repeat the provider-seen title beside each link. Accessible evidence links and the underlying provider/title evidence remain intact.
 

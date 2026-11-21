@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import sys
 import time
-from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import re
-import shutil
 import uuid
 
+from .timestamps import parse_utc_timestamp
 from .auth import (
     DEFAULT_MAL_TOKEN_REFRESH_MARGIN_SECONDS,
     OAuthCallbackError,
@@ -58,12 +55,12 @@ from .runtime_retention_audit import (
     render_runtime_retention_audit_summary,
 )
 from . import providers as _providers  # noqa: F401
+from .database_maintenance import COMPACTION_REPORT_STATUS_FIELDS
 from .db import (
     backfill_hidive_series_urls,
     bootstrap_database,
     get_mal_recommendation_harvest_coverage,
     get_latest_completed_sync_run,
-    get_operational_snapshot,
     get_provider_stale_row_age_buckets,
     get_provider_stale_row_counts,
     get_provider_stale_row_last_seen_ranges,
@@ -83,7 +80,7 @@ from .db import (
 )
 from .ingestion import ingest_provider_fetch_result, ingest_snapshot_file, ingest_snapshot_payload
 from .mal_client import MalApiError, MalClient
-from .mapping import SeriesMappingInput, map_series, normalize_title
+from .mapping import map_series
 from .recommendation_dashboard import (
     DASHBOARD_DEFAULT_RECOMMENDATION_LIMIT,
     recommendation_snapshot_availability_payload,
@@ -100,27 +97,21 @@ from .recommendation_shadow_audit import build_mal_suggestions_shadow_audit, loa
 from .mal_user_recommendations import validate_public_user_recs_url
 from .persistence import atomic_write_json
 from .recommendations import build_recommendations, group_recommendations, trim_grouped_recommendations
-from .service_manager import doctor_service, install_service, restart_service, service_status, start_service, stop_service, uninstall_service
+from .service_manager import doctor_service, install_service, restart_service, start_service, stop_service, uninstall_service
 from .service_runtime import run_maintenance_cycle, run_pending_tasks, run_service_loop
-from . import service_systemd_status as _service_systemd_status
-from .service_units import SERVICE_UNIT_NAME, render_systemd_unit_template_file as _render_systemd_unit_template
+from .service_units import SERVICE_UNIT_NAME
 from .snapshot_authority import has_hidive_snapshot_authority
 from .sync_planner import (
-    MAPPING_REVIEW_HEURISTICS_REVISION,
-    MAPPING_REVIEW_NO_QUEUE_DECISIONS,
     build_dry_run_sync_plan,
     build_mapping_review,
+    build_series_mapping_input,
     execute_approved_sync,
     load_provider_series_states,
+    mapping_review_queue_entries,
     persist_mapping_review_queue,
     persist_sync_review_queue,
 )
 from .validation import SnapshotValidationError, validate_snapshot_payload
-
-_filter_review_queue_items = _review_queue_support._filter_review_queue_items
-_review_queue_item_label = _review_queue_support._review_queue_item_label
-_summarize_review_queue = _review_queue_support._summarize_review_queue
-_age_seconds_from_timestamp = _health_report._age_seconds_from_timestamp
 
 
 def _cmd_init(project_root: Path | None) -> int:
@@ -329,19 +320,6 @@ def _cmd_recommend_maintain(
     )
     print(json.dumps(result, indent=2))
     return 0 if result.get("status") in {"ok", "dry_run", "skipped"} else 1
-
-
-_runtime_initialization_status = _bootstrap_guidance._runtime_initialization_status
-_secrets_dir_permission_status = _bootstrap_guidance._secrets_dir_permission_status
-_guidance_command_fields = _bootstrap_guidance._guidance_command_fields
-_provider_from_refresh_command_args = _bootstrap_guidance._provider_from_refresh_command_args
-_normalized_provider_fetch_command_args = _bootstrap_guidance._normalized_provider_fetch_command_args
-_provider_task_clears_health_refresh_recommendation = _bootstrap_guidance._provider_task_clears_health_refresh_recommendation
-_provider_bootstrap_health_refresh_recommendation = _bootstrap_guidance._provider_bootstrap_health_refresh_recommendation
-_bootstrap_health_review_recommendations = _bootstrap_guidance._bootstrap_health_review_recommendations
-_provider_bootstrap_guidance_status = _bootstrap_guidance._provider_bootstrap_guidance_status
-_mal_bootstrap_guidance_status = _bootstrap_guidance._mal_bootstrap_guidance_status
-_bootstrap_operation_mode_status = _bootstrap_guidance._bootstrap_operation_mode_status
 
 
 def _cmd_bootstrap_audit(project_root: Path | None, summary_only: bool) -> int:
@@ -700,22 +678,7 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
                 last_result_http_status = last_result.get("http_status") if isinstance(last_result.get("http_status"), int) else None
                 if last_result_http_status is not None:
                     print(f"task_{task_name}_last_result_http_status={last_result_http_status}")
-                for result_field in (
-                    "db_size_before",
-                    "db_size_after",
-                    "freelist_bytes",
-                    "freelist_ratio",
-                    "bytes_reclaimed",
-                    "backup_archive",
-                    "backup_archive_sha256",
-                    "required_free_bytes",
-                    "available_free_bytes",
-                    "initial_available_free_bytes",
-                    "post_backup_available_free_bytes",
-                    "pruned_backup_archives",
-                    "backup_prune_error_type",
-                    "error_type",
-                ):
+                for result_field in COMPACTION_REPORT_STATUS_FIELDS:
                     result_value = last_result.get(result_field)
                     if isinstance(result_value, (str, int, float)) and not isinstance(result_value, bool):
                         print(f"task_{task_name}_last_result_{result_field}={result_value}")
@@ -725,50 +688,6 @@ def _emit_service_status_summary(payload: dict[str, object]) -> None:
         last_log_line = service_log_tail[-1]
         if isinstance(last_log_line, str) and last_log_line:
             print(f"service_log_last_line={last_log_line}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _cmd_health_check(
@@ -1188,26 +1107,8 @@ def _format_sqlite_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _parse_sqlite_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    for parser in (
-        lambda raw: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
-        lambda raw: datetime.fromisoformat(raw.replace("Z", "+00:00")),
-    ):
-        try:
-            parsed = parser(text)
-        except ValueError:
-            continue
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    return None
-
-
 def _stale_row_age_days(reference_now: datetime, timestamp: object) -> float | None:
-    parsed = _parse_sqlite_timestamp(timestamp)
+    parsed = parse_utc_timestamp(timestamp)
     if parsed is None:
         return None
     age_seconds = max(0.0, (reference_now.astimezone(timezone.utc) - parsed).total_seconds())
@@ -1811,27 +1712,7 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
     results = []
     for state in states:
         try:
-            mapping = map_series(
-                client,
-                SeriesMappingInput(
-                    provider=state.provider,
-                    provider_series_id=state.provider_series_id,
-                    title=state.title,
-                    season_title=state.season_title,
-                    season_number=state.season_number,
-                    max_episode_number=state.max_episode_number,
-                    completed_episode_count=state.completed_episode_count,
-                    max_completed_episode_number=state.max_completed_episode_number,
-                    verified_mal_anime_id=state.verified_mal_anime_id,
-                    verified_identity_kind=state.verified_identity_kind,
-                    provider_episode_count=state.provider_episode_count,
-                    provider_season_count=state.provider_season_count,
-                    provider_start_year=state.provider_start_year,
-                    provider_start_year_is_trustworthy=state.provider_start_year_is_trustworthy,
-                    verified_identity_evidence=state.verified_identity_evidence,
-                ),
-                limit=mapping_limit,
-            )
+            mapping = map_series(client, build_series_mapping_input(state), limit=mapping_limit)
         except MalApiError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -1845,44 +1726,16 @@ def _cmd_map_series(project_root: Path | None, limit: int, mapping_limit: int) -
                 "rationale": mapping.rationale,
                 "chosen_candidate": None
                 if not mapping.chosen_candidate
-                else {
-                    "mal_anime_id": mapping.chosen_candidate.mal_anime_id,
-                    "title": mapping.chosen_candidate.title,
-                    "score": mapping.chosen_candidate.score,
-                    "matched_query": mapping.chosen_candidate.matched_query,
-                    "match_reasons": mapping.chosen_candidate.match_reasons,
-                },
+                else mapping.chosen_candidate.summary(),
                 "bundle_companion_candidate": None
                 if not mapping.bundle_companion_candidate
-                else {
-                    "mal_anime_id": mapping.bundle_companion_candidate.mal_anime_id,
-                    "title": mapping.bundle_companion_candidate.title,
-                    "score": mapping.bundle_companion_candidate.score,
-                    "matched_query": mapping.bundle_companion_candidate.matched_query,
-                    "match_reasons": mapping.bundle_companion_candidate.match_reasons,
-                    "media_type": mapping.bundle_companion_candidate.media_type,
-                    "num_episodes": mapping.bundle_companion_candidate.num_episodes,
-                },
+                else mapping.bundle_companion_candidate.summary(media_type=True, episodes=True),
                 "bundle_companion_candidates": [
-                    {
-                        "mal_anime_id": candidate.mal_anime_id,
-                        "title": candidate.title,
-                        "score": candidate.score,
-                        "matched_query": candidate.matched_query,
-                        "match_reasons": candidate.match_reasons,
-                        "media_type": candidate.media_type,
-                        "num_episodes": candidate.num_episodes,
-                    }
+                    candidate.summary(media_type=True, episodes=True)
                     for candidate in (mapping.bundle_companion_candidates or [])
                 ],
                 "candidates": [
-                    {
-                        "mal_anime_id": candidate.mal_anime_id,
-                        "title": candidate.title,
-                        "score": candidate.score,
-                        "matched_query": candidate.matched_query,
-                        "media_type": candidate.media_type,
-                    }
+                    candidate.summary(reasons=False, media_type=True)
                     for candidate in mapping.candidates
                 ],
             }
@@ -1927,24 +1780,11 @@ def _refresh_mapping_review_queue_for_provider_series_ids(
         mapping_limit=mapping_limit,
         provider_series_ids=normalized_provider_series_ids,
     )
-    queue_entries = []
-    for item in items:
-        if item.decision in MAPPING_REVIEW_NO_QUEUE_DECISIONS:
-            continue
-        severity = "error" if item.decision == "needs_manual_match" else "warning"
-        queue_entries.append(
-            {
-                "provider": item.provider,
-                "provider_series_id": item.provider_series_id,
-                "severity": severity,
-                "payload": item.as_dict(),
-            }
-        )
     review_queue_result = refresh_review_queue_entries(
         config.db_path,
         issue_type="mapping_review",
         provider_series_ids=normalized_provider_series_ids,
-        entries=queue_entries,
+        entries=mapping_review_queue_entries(items),
     )
     return {
         "provider_series_ids": normalized_provider_series_ids,
@@ -1992,7 +1832,7 @@ def _resolve_refresh_mapping_review_queue_provider_series_ids(
                 if item.provider and item.provider_series_id
             ],
         )
-        filtered_open_rows = _filter_review_queue_items(
+        filtered_open_rows = _review_queue_support._filter_review_queue_items(
             open_rows,
             provider_series_titles=provider_series_titles,
             title_cluster=title_cluster,
@@ -2167,53 +2007,6 @@ def _cmd_dry_run_sync(
     return 0
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _cmd_review_queue_next(
     project_root: Path | None,
     status: str,
@@ -2240,7 +2033,7 @@ def _cmd_review_queue_next(
             if item.provider and item.provider_series_id
         ],
     )
-    filtered_items = _filter_review_queue_items(
+    filtered_items = _review_queue_support._filter_review_queue_items(
         items,
         provider_series_titles=provider_series_titles,
         title_cluster=title_cluster,
@@ -2252,7 +2045,7 @@ def _cmd_review_queue_next(
         fix_strategy_family=fix_strategy_family,
         cluster_strategy_family=cluster_strategy_family,
     )
-    summary = _summarize_review_queue(
+    summary = _review_queue_support._summarize_review_queue(
         filtered_items,
         status=status,
         issue_type=issue_type,
@@ -2317,7 +2110,7 @@ def _load_filtered_review_queue_context(
             if item.provider and item.provider_series_id
         ],
     )
-    filtered_items = _filter_review_queue_items(
+    filtered_items = _review_queue_support._filter_review_queue_items(
         items,
         provider_series_titles=provider_series_titles,
         title_cluster=title_cluster,
@@ -2329,7 +2122,7 @@ def _load_filtered_review_queue_context(
         fix_strategy_family=fix_strategy_family,
         cluster_strategy_family=cluster_strategy_family,
     )
-    summary = _summarize_review_queue(
+    summary = _review_queue_support._summarize_review_queue(
         filtered_items,
         status=status,
         issue_type=issue_type,
@@ -2397,8 +2190,6 @@ def _cmd_review_queue_worklist(
     return 0
 
 
-
-
 def _cmd_review_queue_apply_worklist(
     project_root: Path | None,
     status: str,
@@ -2437,7 +2228,7 @@ def _cmd_review_queue_apply_worklist(
     bucket_updates: list[dict[str, object]] = []
     for candidate in selected_buckets:
         bucket_filters = _review_queue_support._review_queue_bucket_filter_kwargs(candidate)
-        bucket_items = _filter_review_queue_items(
+        bucket_items = _review_queue_support._filter_review_queue_items(
             filtered_items,
             provider_series_titles=provider_series_titles,
             **bucket_filters,
@@ -2532,7 +2323,7 @@ def _cmd_review_queue_refresh_worklist(
     bucket_updates: list[dict[str, object]] = []
     for candidate in selected_buckets:
         bucket_filters = _review_queue_support._review_queue_bucket_filter_kwargs(candidate)
-        bucket_items = _filter_review_queue_items(
+        bucket_items = _review_queue_support._filter_review_queue_items(
             filtered_items,
             provider_series_titles=provider_series_titles,
             **bucket_filters,
@@ -2641,7 +2432,7 @@ def _cmd_list_review_queue(
             if item.provider and item.provider_series_id
         ],
     )
-    items = _filter_review_queue_items(
+    items = _review_queue_support._filter_review_queue_items(
         items,
         provider_series_titles=provider_series_titles,
         title_cluster=title_cluster,
@@ -2656,7 +2447,7 @@ def _cmd_list_review_queue(
     if summary:
         print(
             json.dumps(
-                _summarize_review_queue(
+                _review_queue_support._summarize_review_queue(
                     items,
                     status=status,
                     issue_type=issue_type,
@@ -2724,7 +2515,7 @@ def _cmd_update_review_queue_status(
             if item.provider and item.provider_series_id
         ],
     )
-    filtered_items = _filter_review_queue_items(
+    filtered_items = _review_queue_support._filter_review_queue_items(
         items,
         provider_series_titles=provider_series_titles,
         title_cluster=title_cluster,
@@ -2765,7 +2556,7 @@ def _cmd_update_review_queue_status(
                 "severity": item.severity,
                 "decision": item.payload.get("decision") if isinstance(item.payload, dict) else None,
                 "reasons": item.payload.get("reasons") if isinstance(item.payload.get("reasons"), list) else [],
-                "title": _review_queue_item_label(item, provider_series_titles=provider_series_titles).get("title"),
+                "title": _review_queue_support._review_queue_item_label(item, provider_series_titles=provider_series_titles).get("title"),
             }
             for item in selected_items
         ],

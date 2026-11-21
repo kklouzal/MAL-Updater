@@ -6,7 +6,9 @@ import os
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
+from .timestamps import parse_utc_timestamp
 from .auth_remediation import (
     mal_missing_auth_descriptor,
     mal_rebootstrap_auth_descriptor,
@@ -26,6 +28,7 @@ from .db import (
     list_review_queue_entries,
 )
 from .hidive_auth import load_hidive_credentials, resolve_hidive_state_paths
+from .persistence import PersistentJsonError, read_json_dict_bounded
 from .redaction import sanitize_text
 from .season_mappings import count_unresolved_provider_season_mappings
 from . import review_queue_support as _review_queue_support
@@ -41,33 +44,56 @@ from .service_units import systemd_unit_path_context
 from .recommendation_enrichment import build_provider_enrichment_diagnostics
 
 
-def _parse_sqlite_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
+HEALTH_REFRESH_REASON_CODES = frozenset({"refresh_ingested_snapshot", "refresh_full_snapshot"})
+# The health snapshot is small; the bound only guards against a corrupt file.
+_HEALTH_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
+
+
+def provider_from_refresh_command_args(command_args: object) -> str | None:
+    """Provider named by a recommended refresh command, including legacy persisted forms."""
+    if not isinstance(command_args, list) or not command_args:
         return None
-    text = value.strip()
-    for parser in (
-        lambda raw: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
-        lambda raw: datetime.fromisoformat(raw.replace("Z", "+00:00")),
-    ):
-        try:
-            parsed = parser(text)
-        except ValueError:
-            continue
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+    if command_args[0] == "crunchyroll-fetch-snapshot":
+        return "crunchyroll"
+    if len(command_args) >= 2 and command_args[0] == "sync-source" and isinstance(command_args[1], str):
+        return str(command_args[1])
+    if command_args[0] == "provider-fetch-snapshot":
+        for index, part in enumerate(command_args[:-1]):
+            if part == "--provider" and isinstance(command_args[index + 1], str):
+                return str(command_args[index + 1])
     return None
 
 
+def latest_health_refresh_commands(path: Path) -> tuple[list[dict[str, Any]], float] | None:
+    """Provider refresh commands the latest health snapshot recommends, and the snapshot's mtime.
+
+    None when the snapshot is absent, unreadable or has no recommendation list.
+    """
+    try:
+        payload = read_json_dict_bounded(path, max_bytes=_HEALTH_SNAPSHOT_MAX_BYTES)
+    except PersistentJsonError:
+        return None
+    maintenance = payload.get("maintenance") if payload is not None else None
+    commands = maintenance.get("recommended_commands") if isinstance(maintenance, dict) else None
+    if not isinstance(commands, list):
+        return None
+    try:
+        health_mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    refresh_commands = [
+        command for command in commands
+        if isinstance(command, dict) and command.get("reason_code") in HEALTH_REFRESH_REASON_CODES
+    ]
+    return refresh_commands, health_mtime
+
+
 def age_seconds_from_timestamp(value: object) -> float | None:
-    parsed = _parse_sqlite_timestamp(value)
+    parsed = parse_utc_timestamp(value)
     if parsed is None:
         return None
     return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
 
-
-def _age_seconds_from_timestamp(value: object) -> float | None:
-    return age_seconds_from_timestamp(value)
 
 def _sync_run_summary_counts(sync_run: dict[str, object] | None) -> dict[str, int]:
     if not isinstance(sync_run, dict):
@@ -334,21 +360,6 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
     codes = {str(item.get("code")) for item in normalized}
     authority_items = [item for item in normalized if item.get("code") == "hidive_surface_authority"]
     authority = authority_items[-1] if authority_items else None
-    blocking_codes = {
-        "snapshot_partial",
-        "history_pagination_non_advancing",
-        "history_page_guard_hit",
-        "history_page_cap_hit",
-        "custom_watchlist_partial",
-        "custom_watchlist_collection_page_guard_hit",
-        "custom_watchlist_collection_pagination_non_advancing",
-        "custom_watchlist_collection_cursor_non_advancing",
-        "custom_watchlist_collection_missing_cursor",
-        "custom_watchlist_detail_page_guard_hit",
-        "custom_watchlist_detail_pagination_non_advancing",
-        "custom_watchlist_detail_cursor_non_advancing",
-        "custom_watchlist_detail_missing_cursor",
-    }
     documented_limitations = {
         "history_partial_unpageable",
         "continue_watching_partial_unpageable",
@@ -397,16 +408,9 @@ def _provider_surface_diagnostics_from_sync_run(sync_run: dict[str, object] | No
         ),
     }
 
-def _format_systemd_usec_timestamp(value: str) -> str | None:
-    return _service_systemd_status.format_systemd_usec_timestamp(value)
-
-def _read_systemd_user_unit_runtime(unit_name: str) -> dict[str, object]:
-    return _service_systemd_status.read_systemd_user_unit_runtime(unit_name)
-
 def _build_automation_installation_status(config: AppConfig) -> dict[str, object] | None:
     return _service_systemd_status.build_automation_installation_status(
         config.project_root,
-        runtime_reader=_read_systemd_user_unit_runtime,
         path_context=systemd_unit_path_context(config),
     )
 
@@ -448,7 +452,7 @@ def _build_health_maintenance_commands(
         auth_remediation_kind: str | None = None,
         command_builder=None,
     ) -> None:
-        command = command_builder(args) if command_builder is not None else _build_review_queue_command(args)
+        command = command_builder(args) if command_builder is not None else _review_queue_support._build_review_queue_command(args)
         existing = seen_commands.get(command)
         if isinstance(existing, dict):
             additional_reason_codes = existing.setdefault("additional_reason_codes", [])
@@ -602,7 +606,7 @@ def _build_health_maintenance_commands(
             [install_script_path],
             automation_safe=True,
             requires_auth_interaction=False,
-            command_builder=_build_shell_command,
+            command_builder=_review_queue_support._build_shell_command,
         )
 
     if review_queue_refresh_worklist_command_args and mal_auth_present:
@@ -674,17 +678,6 @@ def select_maintenance_command(
     return None
 
 
-def _select_maintenance_command(
-    recommended_commands: object,
-    *,
-    require_automation_safe: bool = False,
-) -> dict[str, object] | None:
-    return select_maintenance_command(
-        recommended_commands,
-        require_automation_safe=require_automation_safe,
-    )
-
-
 def emit_recommended_command_summary(prefix: str, command_payload: object) -> None:
     if not isinstance(command_payload, dict):
         return
@@ -708,21 +701,6 @@ def emit_recommended_command_summary(prefix: str, command_payload: object) -> No
     if isinstance(auth_remediation_kind, str) and auth_remediation_kind:
         print(f"{prefix}_auth_remediation_kind={auth_remediation_kind}")
 
-
-def _emit_recommended_command_summary(prefix: str, command_payload: object) -> None:
-    emit_recommended_command_summary(prefix, command_payload)
-
-_review_queue_item_label = _review_queue_support._review_queue_item_label
-_review_queue_title_cluster_key = _review_queue_support._review_queue_title_cluster_key
-_review_queue_reason_family = _review_queue_support._review_queue_reason_family
-_review_queue_apply_worklist_args = _review_queue_support._review_queue_apply_worklist_args
-_filter_review_queue_items = _review_queue_support._filter_review_queue_items
-_review_queue_refresh_worklist_args = _review_queue_support._review_queue_refresh_worklist_args
-_summarize_review_queue = _review_queue_support._summarize_review_queue
-_build_review_queue_worklist = _review_queue_support._build_review_queue_worklist
-_build_shell_command = _review_queue_support._build_shell_command
-_build_review_queue_command = _review_queue_support._build_review_queue_command
-_select_review_queue_next_bucket = _review_queue_support._select_review_queue_next_bucket
 
 
 def _emit_health_check_summary(payload: dict[str, object]) -> None:
@@ -839,10 +817,10 @@ def _emit_health_check_summary(payload: dict[str, object]) -> None:
                 print("automation_service_runtime=" + " | ".join(parts))
     if install_units_command:
         print("automation_install_command=" + install_units_command)
-    top_command = _select_maintenance_command(recommended_commands)
-    _emit_recommended_command_summary("maintenance_recommended", top_command)
-    top_auto_command = _select_maintenance_command(recommended_commands, require_automation_safe=True)
-    _emit_recommended_command_summary("maintenance_recommended_auto", top_auto_command)
+    top_command = select_maintenance_command(recommended_commands)
+    emit_recommended_command_summary("maintenance_recommended", top_command)
+    top_auto_command = select_maintenance_command(recommended_commands, require_automation_safe=True)
+    emit_recommended_command_summary("maintenance_recommended_auto", top_auto_command)
     if recommended_next:
         command = recommended_next.get("drilldown_command")
         if command:
@@ -936,7 +914,7 @@ def build_health_report(
 
     latest_sync_run = snapshot.get("latest_sync_run")
     latest_completed_sync_run = snapshot.get("latest_completed_sync_run")
-    latest_completed_age_seconds = _age_seconds_from_timestamp(
+    latest_completed_age_seconds = age_seconds_from_timestamp(
         latest_completed_sync_run.get("completed_at") if isinstance(latest_completed_sync_run, dict) else None
     )
     latest_provider_stale_row_counts: dict[str, int] | None = None
@@ -985,7 +963,7 @@ def build_health_report(
             if isinstance(latest_provider, str) and latest_provider
             else None
         )
-        latest_full_refresh_age_seconds = _age_seconds_from_timestamp(
+        latest_full_refresh_age_seconds = age_seconds_from_timestamp(
             latest_full_refresh.get("completed_at") if isinstance(latest_full_refresh, dict) else None
         )
         latest_full_refresh_started_at = latest_full_refresh.get("started_at") if isinstance(latest_full_refresh, dict) else None
@@ -1254,25 +1232,25 @@ def build_health_report(
                 if item.provider and item.provider_series_id
             ],
         )
-        review_queue_summary = _summarize_review_queue(
+        review_queue_summary = _review_queue_support._summarize_review_queue(
             recommendation_items,
             status="open",
             issue_type=review_issue_type,
             provider_series_titles=provider_series_titles,
         )
-        review_queue_next = _select_review_queue_next_bucket(review_queue_summary, bucket="cluster-strategy")
+        review_queue_next = _review_queue_support._select_review_queue_next_bucket(review_queue_summary, bucket="cluster-strategy")
         if review_queue_next is None:
             for fallback_bucket in ("fix-strategy", "title-cluster", "reason", "decision"):
-                review_queue_next = _select_review_queue_next_bucket(review_queue_summary, bucket=fallback_bucket)
+                review_queue_next = _review_queue_support._select_review_queue_next_bucket(review_queue_summary, bucket=fallback_bucket)
                 if review_queue_next is not None:
                     break
-        review_queue_worklist = _build_review_queue_worklist(
+        review_queue_worklist = _review_queue_support._build_review_queue_worklist(
             review_queue_summary,
             bucket_order=["cluster-strategy", "fix-strategy", "title-cluster", "reason", "decision"],
             limit=review_worklist_limit,
         )
         if review_queue_worklist:
-            apply_args = _review_queue_apply_worklist_args(
+            apply_args = _review_queue_support._review_queue_apply_worklist_args(
                 status="open",
                 issue_type=review_issue_type,
                 limit=review_worklist_limit,
@@ -1284,11 +1262,11 @@ def build_health_report(
                 "bucket_limit": review_worklist_limit,
                 "per_bucket_limit": 20,
                 "command_args": apply_args,
-                "command": _build_review_queue_command(apply_args),
+                "command": _review_queue_support._build_review_queue_command(apply_args),
             }
             if review_issue_type != "sync_review":
                 refresh_issue_type = review_issue_type if review_issue_type == "mapping_review" else None
-                refresh_args = _review_queue_refresh_worklist_args(
+                refresh_args = _review_queue_support._review_queue_refresh_worklist_args(
                     status="open",
                     issue_type=refresh_issue_type,
                     limit=review_worklist_limit,
@@ -1302,7 +1280,7 @@ def build_health_report(
                     "per_bucket_limit": 20,
                     "mapping_limit": 5,
                     "command_args": refresh_args,
-                    "command": _build_review_queue_command(refresh_args),
+                    "command": _review_queue_support._build_review_queue_command(refresh_args),
                 }
 
     review_queue_refresh_command_args = None
@@ -1364,8 +1342,8 @@ def build_health_report(
         "warnings": warnings,
         "maintenance": {
             "recommended_commands": maintenance_commands,
-            "recommended_command": _select_maintenance_command(maintenance_commands),
-            "recommended_automation_command": _select_maintenance_command(
+            "recommended_command": select_maintenance_command(maintenance_commands),
+            "recommended_automation_command": select_maintenance_command(
                 maintenance_commands,
                 require_automation_safe=True,
             ),

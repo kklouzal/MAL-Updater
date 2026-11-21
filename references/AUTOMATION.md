@@ -1,103 +1,63 @@
-# Automation
+# Native daemon (user systemd)
 
-MAL-Updater now uses a **long-lived user-systemd daemon** rather than timer-driven one-shot jobs as the primary unattended model.
-
-## Daemon model
-
-The installed service runs:
+The container runs the scheduler itself (`references/CONTAINERS.md`). On a native source checkout the same scheduler runs as a long-lived user-level systemd service:
 
 ```bash
 python3 -m mal_updater.cli --project-root <repo-root> service-run
 ```
 
-That foreground process owns its own internal loop cadence and recurring lanes for:
+Lane cadences, budgets and housekeeping are documented once, in `references/OPERATIONS.md`.
 
-- MAL token refresh
-- bounded exact-approved sync batches
-- recurring health-check/report generation
-- API request logging / budget awareness
+## Install
 
-## User systemd install
-
-Repo-owned templates live in `ops/systemd-user/`.
-
-Install the daemon with:
+Templates live in `ops/systemd-user/`. Render and install them with:
 
 ```bash
 cd <repo-root>
-scripts/install_user_systemd_units.sh
-```
-
-Important:
-- the committed `.service` file is a template, not a host-bound final unit
-- the installer renders the current repo root and service env path into the installed copy
-- this keeps the repo portable while still producing a valid host-specific user daemon
-
-Useful variants:
-
-```bash
+scripts/install_user_systemd_units.sh            # render, install, enable mal-updater.service
 scripts/install_user_systemd_units.sh --dry-run
 scripts/install_user_systemd_units.sh --no-enable
 scripts/install_user_systemd_units.sh --start-service
+scripts/install_user_systemd_units.sh --install-dashboard   # also render the optional dashboard unit
+scripts/install_user_systemd_units.sh --enable-dashboard    # and enable it
 ```
 
-## Direct service commands
+The committed `.service` files are templates; the installer substitutes the repo root, Python binary, service env file and a de-duplicated `ReadWritePaths` allowlist of the resolved runtime directories. It supports absolute paths without whitespace/control characters and fails fast otherwise. It also installs `ops/systemd-user/mal-updater-service.env.example` as the service env file (mode 0600) when none exists. Units run with `UMask=0077`, `NoNewPrivileges=true`, `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only` and an `AF_UNIX`/`AF_INET`/`AF_INET6` address-family allowlist.
+
+`mal-updater-dashboard.service` runs `dashboard-serve --host 127.0.0.1`; keep it on loopback unless you deliberately review a wider exposure. `--start-service` restarts only the main daemon.
+
+`python3 -m mal_updater.cli install-service` is a lower-level service-manager path for targeted repair or tests; do not run both install paths as routine setup.
+
+## Inspect
 
 ```bash
-cd <repo-root>
 PYTHONPATH=src python3 -m mal_updater.cli service-status
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
+PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
+PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 PYTHONPATH=src python3 -m mal_updater.cli restart-service
 ```
 
-Do not run both service install paths as routine setup. Prefer `scripts/install_user_systemd_units.sh` for normal host bootstrap; use `PYTHONPATH=src python3 -m mal_updater.cli install-service` only as the lower-level service-manager compatibility path when you intentionally want that behavior.
+`service-status` is the main observability surface. Besides systemd enabled/active state it reports the last loop time; per-lane state from `service-state.json` (cadence, last decision, last run start/finish/duration, next due, and a derived execution state: `waiting_until_due`, `due_now`, `cooling_down_for_budget`, `cooling_down_after_failure` or `awaiting_schedule`); budget and failure backoff with their source (task vs provider policy) and the projection estimator in use; each provider fetch lane's planned fetch mode and any full-refresh reason, including overdue age and budget deferral; the effective `niceness_policy`; API usage; the `service.log` tail; and the parsed latest health artifact with its top maintenance command and that command's `reason_code`, automation-safety and auth posture.
 
-`service-run-once` is deliberately not a routine/read-only service check. It is an opt-in live daemon pass that can run provider fetches, local ingest, and exact-approved MAL apply lanes; prefer `service-status` plus `health-check` for inspection.
+By default `service-status` never fails. `--strict` exits 2 when the main daemon unit, env file, systemctl or runtime state is not automation-ready; a stopped or absent optional dashboard is not a failure.
 
-`service-status` is now the main structured observability surface for unattended debugging. In addition to user-systemd enabled/active state, it reports:
+`service-run-once` is not an inspection command: it runs due lanes once, which can include provider fetches, ingest and (when opted in) MAL apply. Use it only with explicit operator intent.
 
-- recent daemon loop timing (`last_loop_at`)
-- per-lane task summaries from `service-state.json` (including last decision time plus last-run start/finish/duration when available)
-- persisted budget backoff details, including whether a lane is cooling down at `warn` or `critical` level, whether the active cooldown policy came from task-level vs provider-level budget settings, and which learned projection source (configured / smoothed / percentile / auto-bursty percentile) the daemon is currently trusting for pre-run request budgeting
-- each provider fetch lane's currently planned fetch mode plus any current full-refresh reason, so operator checks can immediately see when periodic or health-driven full-refresh pressure is active even before the next fetch executes; cadence-driven overdue resweeps now also expose when they first became due plus the current overdue age in seconds, and when the last run had to budget-defer that heavier resweep and fall back to incremental, service-status now also marks that deferred posture explicitly
-- fail-closed unattended `sync_apply`: the shipped execution limit is `0`, and only an explicit positive `service.task_execute_limits.sync_apply` opt-in enables the scheduler lane; zero skips rather than becoming an unbounded write pass (manual CLI `--limit 0` retains its explicit full-scan meaning), plus automatic reset of stale projected-request/backoff state when that execution posture changes so old full-pass history does not keep poisoning the lane
-- the slow recommendation metadata hydration lane (`recommend_metadata_refresh`), including its independent cadence, bounded seed/discovery batch posture, and the most recent hydrated seed/discovery counts when the task's JSON stdout is available
-- the slower complete public MAL userrecs cold lane (`recommend_full_harvest`), including its independent cadence, bounded source-title/per-run page posture, resumable staging semantics, stale horizon, and most recent seed/harvest/pause/failure/edge counts when task JSON stdout is available; a configured zero source-title limit disables the daemon lane instead of becoming an unbounded crawl
-- the optional recommendation webhook delivery lane (`push_recommendations_webhook`), including its independent cadence, bounded digest size, configured delivery mode (`fresh` / `digest` / `all`), and item-aware dedupe behavior so unchanged recommendation payloads do not keep re-posting into OpenClaw even when the request id changes
-- persisted failure-backoff details for task errors, including retry countdown, last failure reason, and consecutive-failure streaks for auth-fragile provider lanes
-- health-check-driven auth recovery hints: repeated auth-style provider fetch failures recorded in daemon state now surface as explicit re-bootstrap recommendations (`provider-auth-login --provider crunchyroll` / `provider-auth-login --provider hidive`) instead of only opaque backoff residue
-- Crunchyroll cold/full refresh defaults to a weekly cadence and is bounded by the configured history/watchlist page caps; HIDIVE full refresh remains manual because its current fetch path has no chunk controls. Health recommendations can upgrade only the bounded Crunchyroll lane, while lighter `refresh_ingested_snapshot` recommendations can still trigger an early hot fetch.
-- Network ownership is explicit: provider hot fetch hourly, MAL user-list refresh every 8h with a 10-network-attempt bounded refresh and matching 10-request cold projection against a 14-request task cap (`limit=1000` pages, durable partial pagination; the service prunes rows removed on MAL only after proven terminal completion), recommendation metadata every 12h, complete public MAL userrecs cold harvest hourly with three source titles per run, a 10-network-attempt per-source/run budget, and a deterministic 120 +/-15-day horizon, and one hourly provider-eligibility task per credentialed provider (5 candidates, 1 alias, 5 returned matches). The full-userrecs lane seeds a conservative 30-request projection against a 40-request task cap, while the 120/hour MAL global cap and learned-history gates still apply. The hourly recommendation maintenance pass is DB/local-only. Periodic durable positive evidence is stale-while-revalidate for read/display use, while absence claims keep shorter cadences and unattended writes require strict current eligibility; explicitly enabled `sync_apply` applies only providers whose fetch succeeded since the previous apply and is skipped when none did. Service configuration is loaded at process start; edits require restarting `mal-updater.service` before `service-status` can represent the new effective policy.
-- current API-usage snapshot when available
-- recent `service.log` tail lines
-- parsed `latest-health-check.json` state (or parse errors when the artifact is malformed)
-- a terse `service-status --format summary` view for quick operator checks and log-friendly output; that summary now also preserves the parsed health artifact's top maintenance command metadata (`reason_code`, automation-safe posture, auth-interaction posture, and auth failure/remediation classification when present) instead of only echoing the bare command string
+## Manual cycle commands
 
-## Repo-native manual cycle commands and compatibility wrappers
+- `exact-approved-sync-cycle [--full-refresh]`: fetch every credentialed provider, then run a bounded exact-approved apply. If any provider fetch fails it skips the apply unless `--allow-stale-provider-apply` is given.
+- `health-check-cycle`: write a health artifact and optionally run safe recommended maintenance (`--auto-run-recommended`); accepts the same tuning flags as `health-check`.
 
-The daemon-first unattended model now keeps both maintenance lanes on repo-native CLI surfaces:
-
-- `python3 -m mal_updater.cli exact-approved-sync-cycle` (manual guarded fetch+apply cycle across all staged providers)
-- `python3 -m mal_updater.cli health-check-cycle` (repo-native health lane)
-
-Compatibility wrappers still exist:
-
-- `scripts/run_exact_approved_sync_cycle.sh` → thin shim to `exact-approved-sync-cycle`
-- `scripts/run_health_check_cycle.sh` → thin shim to `health-check-cycle`
-
-Those commands still write runtime artifacts under `.MAL-Updater/state/` and `.MAL-Updater/cache/`, but they are subordinate to the daemon-first orchestration model.
+`scripts/run_exact_approved_sync_cycle.sh` and `scripts/run_health_check_cycle.sh` are thin wrappers around these commands.
 
 ## Recommended bootstrap order
 
 1. `bootstrap-audit`
 2. `init`
-3. MAL / provider auth setup (`provider-auth-login --provider crunchyroll` and/or `provider-auth-login --provider hidive`)
+3. MAL OAuth (`references/MAL_OAUTH.md`) and provider auth (`provider-auth-login --provider crunchyroll|hidive`, or `crunchyroll-link`)
 4. `scripts/install_user_systemd_units.sh`
-5. `service-status`
-6. `health-check --format summary`
+5. `service-status` and `health-check --format summary`
+6. Only with operator consent: set `service.task_execute_limits.sync_apply` to a positive value and `restart-service` to enable unattended MAL writes.
 
-Run `service-run-once` only as a separate opt-in manual daemon pass after explicit operator intent.
-
-`health-check --format summary` now mirrors the top maintenance command metadata from the richer JSON payload too, so shell/log consumers can see not just the recommended command but also why it was chosen and whether it is automation-safe or auth-interactive.
-
-Do not claim unattended automation is installed or healthy until the installer, service-status, and health-check all agree.
+Do not claim unattended automation is installed or healthy until the installer, `service-status` and `health-check` agree.

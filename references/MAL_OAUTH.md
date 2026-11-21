@@ -1,6 +1,8 @@
 # MAL OAuth
 
-MAL-Updater keeps MAL auth material outside the repo under `.MAL-Updater/secrets/` by default.
+This page covers native source installs. In the container, MAL OAuth runs from Settings with the callback `<browser URL>/oauth/mal/callback` (`references/CONTAINERS.md`).
+
+Native installs keep MAL auth material outside the repo under `.MAL-Updater/secrets/` by default.
 
 Use `status` to see the currently resolved paths and redirect URI.
 
@@ -48,4 +50,4 @@ The skill reads these from the resolved runtime secrets dir, not from inside the
 
 - Keep secrets out of committed config.
 - `mal-auth-login` persists tokens locally after the callback exchange.
-- `mal-refresh` updates the stored token pair in place.
+- `mal-refresh` renews only when the recorded access-token expiry is within 7 days (or unknown); `--min-remaining-hours` changes that margin and `--force` renews now. A rotated refresh token is persisted before the access token.

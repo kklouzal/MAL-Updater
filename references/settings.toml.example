@@ -71,12 +71,12 @@ other = 2
 
 [service]
 sync_every_seconds = 3600
-full_refresh_every_seconds = 604800  # weekly only for page-bounded Crunchyroll; HIDIVE unattended full refresh remains disabled
+full_refresh_every_seconds = 604800  # weekly page-bounded Crunchyroll full refresh; HIDIVE has no periodic full refresh (a hot run that misses its boundary escalates once)
 health_every_seconds = 3600
 mal_refresh_every_seconds = 3600  # lightweight token-refresh lane; distinct from the user-list network refresh
 mal_list_refresh_every_seconds = 28800  # 8h, within the conservative 6-12h user-list window; max pages is configured below
 recommendation_metadata_refresh_every_seconds = 43200  # 12h bounded seed/discovery hydration
-recommendation_full_harvest_every_seconds = 3600  # hourly two-source cold-path batches over public MAL userrecs aggregates
+recommendation_full_harvest_every_seconds = 3600  # hourly bounded batches over public MAL userrecs aggregates; batch size is task_execute_limits.recommend_full_harvest
 recommendation_full_harvest_stale_after_days = 120  # complete public userrecs LKG target; deterministic +/-15d, atomic staged publish, and force refresh still bypasses due checks
 provider_eligibility_refresh_every_seconds = 3600  # one separately budgeted provider-specific lane per credentialed provider
 provider_eligibility_refresh_target_days = 120  # 0 explicitly disables periodic lifecycle due dates
@@ -111,6 +111,7 @@ recommendations_webhook_push_every_seconds = 0  # disabled by default; set >0 to
 loop_sleep_seconds = 30
 startup_grace_seconds = 30  # applies only to long-lived service-run; manual service-run-once remains immediate
 lease_stale_after_seconds = 1800  # operator evidence threshold; kernel locks safely recover immediately when an owning process dies
+task_timeout_seconds = 900  # per-lane subprocess timeout
 crunchyroll_hourly_limit = 180  # legacy Crunchyroll-specific override
 source_provider_hourly_limit = 180
 source_provider_warn_backoff_floor_seconds = 0
@@ -152,7 +153,7 @@ recommend_metadata_refresh = 8
 recommend_full_harvest = 30  # conservative cold-start projection: 3 sources x the 10-attempt per-source budget; learned history may replace it
 recommend_provider_eligibility_crunchyroll = 28
 recommend_provider_eligibility_hidive = 8
-sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds
+# sync_fetch_crunchyroll = 12  # optional task-wide fallback/override when you want one Crunchyroll estimate outside mode-specific defaults; explicit task-wide values beat shipped mode seeds
 
 [service.task_projected_request_counts_by_mode.sync_fetch_crunchyroll]
 incremental = 4  # built-in default shown explicitly here; fresh installs now seed the ordinary Crunchyroll fetch path with a conservative non-zero cost
@@ -214,7 +215,3 @@ crunchyroll_password = "crunchyroll_password.txt"
 hidive_username = "hidive_username.txt"
 hidive_password = "hidive_password.txt"
 openclaw_hook_token = "openclaw_hook_token.txt"
-
-# MAL list refresh execution budget is configured under the existing
-# [service.execute_limits] mal_list_refresh_pages key. It counts every network
-# attempt (continuation and validation); 0 is a hard no-network/no-mutation run.

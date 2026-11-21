@@ -130,7 +130,7 @@ class MalUserAnimeListCacheDbTests(unittest.TestCase):
                 "005_recommendation_score_snapshots.sql",
                 "006_recommendation_eligibility_evidence.sql",
             ]:
-                conn.executescript((Path(__file__).resolve().parents[1] / "migrations" / migration).read_text(encoding="utf-8"))
+                conn.executescript((Path(__file__).resolve().parents[1] / "src" / "mal_updater" / "migrations" / migration).read_text(encoding="utf-8"))
                 conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (migration,))
             conn.commit()
             apply_migrations(conn)

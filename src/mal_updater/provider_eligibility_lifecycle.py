@@ -12,7 +12,6 @@ from typing import Any
 from .periodic_evidence_lifecycle import (
     DEFAULT_PERIODIC_EVIDENCE_REFRESH_JITTER_DAYS,
     DEFAULT_PERIODIC_EVIDENCE_REFRESH_TARGET_DAYS,
-    PERIODIC_EVIDENCE_SCHEDULE_VERSION,
     iso_utc,
     periodic_evidence_refresh_due_at,
     periodic_evidence_schedule_key,
@@ -69,21 +68,6 @@ class ProviderEligibilityProcessLease:
 
 def _iso(value: datetime) -> str:
     return iso_utc(value)
-
-
-def canonical_provider_eligibility_semantic_key(
-    *,
-    mal_anime_id: int,
-    provider: str,
-    provider_series_id: str,
-) -> str:
-    """Return the canonical, host- and runtime-independent semantic item key."""
-    payload: dict[str, Any] = {
-        "mal_anime_id": int(mal_anime_id),
-        "provider": str(provider).strip().lower(),
-        "provider_series_id": str(provider_series_id).strip(),
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def provider_eligibility_refresh_schedule_key(

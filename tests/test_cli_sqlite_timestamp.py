@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from mal_updater.cli import _age_seconds_from_timestamp, _parse_sqlite_timestamp, _stale_row_age_days
+from mal_updater.cli import _stale_row_age_days
+from mal_updater.health_report import age_seconds_from_timestamp
+from mal_updater.timestamps import parse_utc_timestamp as _parse_sqlite_timestamp
 
 
 class CliSqliteTimestampTests(unittest.TestCase):
@@ -26,7 +28,7 @@ class CliSqliteTimestampTests(unittest.TestCase):
             ),
             1.0,
         )
-        self.assertIsNotNone(_age_seconds_from_timestamp("2026-07-23T00:02:03Z"))
+        self.assertIsNotNone(age_seconds_from_timestamp("2026-07-23T00:02:03Z"))
 
 
 if __name__ == "__main__":

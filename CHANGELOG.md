@@ -4,6 +4,10 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ## [Unreleased]
 
+### Removed
+
+- Removed dead code and duplication: the unreferenced `maintenance_command_semantics` module, unused functions and evaluation stubs, alias re-export blocks, and the byte-identical root `migrations/` tree, root `mal_updater/` import shim and `MANIFEST.in` (migrations now live only in `src/mal_updater/migrations/`). Shared helpers replace seven timestamp parsers and duplicated health-command, review-queue, candidate-summary, timeout, sync-boundary and Crunchyroll session code. The lint gate now enforces all pyflakes rules.
+
 ### Added
 
 - Added password-free Crunchyroll account linking with a TV activation code (Settings **Link Crunchyroll account** and `mal-updater crunchyroll-link`); a linked session renews itself and counts as fully configured.
@@ -17,9 +21,11 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 - Added per-season sync for provider series spanning several seasons: episodes record their canonical provider season (migration 032; Crunchyroll dubs collapse onto the original-language season), each season resolves to its own MAL entry (migration 033), and unresolved seasons go to review with an `unresolved_season_mappings` health warning and a `season-mappings` command to list/approve them.
 - Added `apply-sync --provider` and `mal-refresh --force/--min-remaining-hours`.
 - Added the in-season episode position (migration 034; Crunchyroll `sequence_number`, HIDIVE per-season number). Each MAL target uses the provider's episode numbers when they fit the entry (one MAL entry spanning several provider seasons) and the in-season position otherwise, so a season numbered 60-87 syncs as 1-28 (then split across MAL Part 1/Part 2).
+- Added a provider season catalog (migrations 035/036): fetchers record each season's episode counts, first episode number and date window (Crunchyroll original air dates, HIDIVE publish dates) a few seasons per run, and season resolution matches those dates and counts against MAL entries in the series' franchise.
 
 ### Changed
 
+- Unattended `sync_apply` now ships disabled: the default `service.task_execute_limits.sync_apply` changed from 8 to 0, so unattended MAL writes need an explicit positive opt-in. Manual `apply-sync` is unchanged.
 - Lowered the default health-history retention from 90 to 30 days and raised its per-run prune batch from 100 to 1000 files.
 - Rotated the Crunchyroll OAuth client after the previous Android TV client was retired, and send the Android TV User-Agent that the token endpoint now requires.
 - Hardened provider session, boundary, and snapshot JSON writes through the shared restrictive atomic persistence implementation.
@@ -37,6 +43,8 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Fixed
 
+- `map-series` now matches season-split entries with in-season episode numbering, the same input the sync and review paths use.
+- HIDIVE no longer crashes when a saved sync boundary carries a non-numeric schema version; it is treated as absent, like Crunchyroll.
 - Made links in the dashboard PDF export recognizable (blue, underlined titles and seeds; linked provider badges) and noted which links each element carries; the Export PDF hint explains that the browser's Save as PDF keeps them clickable while system PDF printers drop them.
 - Fixed dashboard cover art never loading: the container CSP now allows images from `https://cdn.myanimelist.net`, and rows without cover art or genres (such as resume backlog) use the cached MAL metadata. Settings no longer requests a missing `/favicon.ico`.
 - Fixed public MAL user-recommendation harvests failing closed on titles nobody has recommended anything for; MAL's real empty page (its exact sentence, the title's make-recommendation link, no candidate rows, no next page) is now accepted, so those sources stop pausing for manual review.
@@ -59,7 +67,7 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Release status
 
-- These changes are unreleased and intentionally remain versioned as 0.2.9 in the dirty source tree. Existing 0.2.9 wheels, source archives, release bundles, and container images do **not** contain them; no publication or container-pin change is implied.
+- These changes (including schema migrations 020-036) are unreleased; `master` intentionally remains versioned as 0.2.9. Existing 0.2.9 wheels, source archives, release bundles, and container images do **not** contain them; no publication or container-pin change is implied.
 
 ## [0.2.9] - 2026-08-12
 

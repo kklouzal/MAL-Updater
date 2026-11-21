@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
@@ -407,15 +405,3 @@ def validate_snapshot_payload(payload: Any) -> ProviderSnapshot:
         raw=raw,
         fetch_provenance=validated_fetch_provenance,
     )
-
-
-def validate_snapshot_json_text(text: str) -> ProviderSnapshot:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise SnapshotValidationError(f"invalid JSON: {exc}") from exc
-    return validate_snapshot_payload(payload)
-
-
-def validate_snapshot_file(path: Path) -> ProviderSnapshot:
-    return validate_snapshot_json_text(path.read_text(encoding="utf-8"))

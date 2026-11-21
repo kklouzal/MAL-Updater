@@ -610,7 +610,7 @@ class BootstrapAuditCliTests(unittest.TestCase):
         self.assertEqual(["python3", "-m", "pip", "install", "-e", "."], transport_step["command_args"])
 
     def test_bootstrap_audit_does_not_treat_flock_as_a_required_runtime_dependency(self) -> None:
-        with patch("mal_updater.cli.shutil.which") as which:
+        with patch("mal_updater.bootstrap_guidance.shutil.which") as which:
             which.side_effect = lambda command: None if command == "flock" else f"/usr/bin/{command}"
             exit_code, stdout = self._run_bootstrap_audit_raw()
 

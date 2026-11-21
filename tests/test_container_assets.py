@@ -13,7 +13,7 @@ class ContainerAssetTests(unittest.TestCase):
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(" AS builder", text)
         self.assertIn(" AS runtime", text)
-        self.assertIn("python:3.13.7-slim-bookworm@sha256:", text)
+        self.assertIn("python:3.13.14-slim-bookworm@sha256:", text)
         self.assertIn("pip install -c ci.txt", text)
         self.assertIn("tini=0.19.0-1", text)
         self.assertIn('ENTRYPOINT ["/usr/bin/tini"', text)

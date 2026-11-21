@@ -144,12 +144,11 @@ class HidiveSnapshotTests(unittest.TestCase):
             raw={"supports": {"history": True, "watchlists": True}, "nested": {"value": 2}},
         )
 
-    def test_module_snapshot_serializer_matches_shared_exact_shape(self) -> None:
+    def test_snapshot_serializer_exact_shape(self) -> None:
         snapshot = self._sample_snapshot()
 
-        payload = hidive_snapshot.snapshot_to_dict(snapshot)
+        payload = shared_snapshot_to_dict(snapshot)
 
-        self.assertEqual(shared_snapshot_to_dict(snapshot), payload)
         self.assertEqual(
             ["contract_version", "generated_at", "provider", "account_id_hint", "series", "progress", "watchlist", "raw"],
             list(payload.keys()),

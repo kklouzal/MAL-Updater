@@ -45,20 +45,6 @@ def normalize_audio_locale(value: Any) -> str | None:
     return text
 
 
-def normalized_audio_locales(locales: Iterable[Any] | None) -> tuple[str, ...]:
-    if locales is None:
-        return ()
-    seen: set[str] = set()
-    normalized: list[str] = []
-    for value in locales:
-        locale = normalize_audio_locale(value)
-        if locale is None or locale in seen:
-            continue
-        seen.add(locale)
-        normalized.append(locale)
-    return tuple(normalized)
-
-
 def audio_locale_is_english(value: Any) -> bool:
     locale = normalize_audio_locale(value)
     return bool(locale == "en" or (locale is not None and locale.startswith("en-")))

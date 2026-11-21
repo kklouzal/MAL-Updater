@@ -19,6 +19,25 @@ from .container_lifecycle import backup as create_backup, inspect as inspect_bac
 from .redaction import sanitize_text
 
 
+# Compaction report fields surfaced in service status and its CLI summary.
+COMPACTION_REPORT_STATUS_FIELDS = (
+    "db_size_before",
+    "db_size_after",
+    "freelist_bytes",
+    "freelist_ratio",
+    "bytes_reclaimed",
+    "backup_archive",
+    "backup_archive_sha256",
+    "required_free_bytes",
+    "available_free_bytes",
+    "initial_available_free_bytes",
+    "post_backup_available_free_bytes",
+    "pruned_backup_archives",
+    "backup_prune_error_type",
+    "error_type",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class DatabaseCompactionReport:
     status: str
@@ -51,10 +70,6 @@ class DatabaseCompactionReport:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def database_lock_path(db_path: Path) -> Path:

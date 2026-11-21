@@ -19,8 +19,8 @@ from .db import (
     list_series_mappings,
     merge_mal_user_anime_list_cache_into_metadata,
 )
-from .mapping import normalize_title
-from .recommendation_actionability import is_strict_provider_eligibility_actionable, provider_audio_locales_have_english
+from .mapping import _ORDINAL_TO_NUMBER, _ROMAN_TO_NUMBER, normalize_title
+from .recommendation_actionability import is_strict_provider_eligibility_actionable
 from .sync_planner import ProviderSeriesState, load_provider_series_states
 
 _ENGLISH_DUB_RE = re.compile(r"\benglish dub\b|\(dub\)", re.IGNORECASE)
@@ -34,31 +34,6 @@ _FINAL_SEASON_RE = re.compile(r"\bfinal\s+season\b", re.IGNORECASE)
 _PART_RE = re.compile(r"\bpart\s*(\d+)\b", re.IGNORECASE)
 _ROMAN_END_RE = re.compile(r"\b([ivx]{1,5})\b(?=\s*(?:\(|$))", re.IGNORECASE)
 
-_ORDINALS = {
-    "first": 1,
-    "second": 2,
-    "third": 3,
-    "fourth": 4,
-    "fifth": 5,
-    "sixth": 6,
-    "seventh": 7,
-    "eighth": 8,
-    "ninth": 9,
-    "tenth": 10,
-}
-
-_ROMAN = {
-    "i": 1,
-    "ii": 2,
-    "iii": 3,
-    "iv": 4,
-    "v": 5,
-    "vi": 6,
-    "vii": 7,
-    "viii": 8,
-    "ix": 9,
-    "x": 10,
-}
 
 _FRESH_DUBBED_EPISODE_WINDOW_DAYS = 21
 _DISCOVERY_RECOMMENDATION_EDGE_LIMIT_PER_SEED = 15
@@ -75,8 +50,6 @@ _SEASON_ORDER = {
     "summer": 2,
     "fall": 3,
 }
-
-
 
 
 @dataclass(slots=True)
@@ -306,7 +279,6 @@ def _availability_priority_bonus(provider_count: int) -> int:
     if provider_count <= 1:
         return 0
     return min((provider_count - 1) * 3, 9)
-
 
 
 def _recommendation_sort_key(item: Recommendation) -> tuple[int, int, str, str]:
@@ -603,14 +575,6 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _provider_audio_locales_have_english(locales: list[Any]) -> bool:
-    return provider_audio_locales_have_english(locales)
-
-
-def _eligibility_is_actionable(evidence: RecommendationProviderEligibilityEvidence, *, now: str) -> bool:
-    return is_strict_provider_eligibility_actionable(evidence, now=now)
-
-
 def _provider_eligibility_evidence_by_mal_id(
     config: AppConfig,
     mal_anime_ids: set[int],
@@ -626,7 +590,7 @@ def _provider_eligibility_evidence_by_mal_id(
     )
     result: dict[int, list[RecommendationProviderEligibilityEvidence]] = defaultdict(list)
     for evidence in evidence_rows:
-        if actionable_only and not _eligibility_is_actionable(evidence, now=now):
+        if actionable_only and not is_strict_provider_eligibility_actionable(evidence, now=now):
             continue
         result[int(evidence.mal_anime_id)].append(evidence)
     return result
@@ -1470,8 +1434,6 @@ def _is_discovery_watchable_provider_state(state: ProviderSeriesState) -> bool:
     return state.watchlist_status not in {"fully_watched", "in_progress"}
 
 
-
-
 def _provider_state_completion_evidence(state: ProviderSeriesState) -> str | None:
     if state.watchlist_status in {"fully_watched", "completed"}:
         return f"provider watchlist status is {state.watchlist_status}"
@@ -1897,7 +1859,6 @@ def _build_discovery_recommendations(
                 availability_confidence_bonus = 0
         if primary_provider_evidence is not None:
             provider_title_for_why = primary_provider_evidence.provider_title
-            provider_url_for_why = primary_provider_evidence.provider_url
             item_provider = primary_provider_evidence.provider
             item_provider_series_id = primary_provider_evidence.provider_series_id
             item_title = primary_provider_evidence.provider_title or (meta.title if meta is not None else str(bucket.get("title") or f"MAL anime {target_id}"))
@@ -1905,7 +1866,6 @@ def _build_discovery_recommendations(
             english_dub_status = "present"
         else:
             provider_title_for_why = primary_available_state.title if primary_available_state is not None else None
-            provider_url_for_why = None
             item_provider = primary_available_state.provider if primary_available_state is not None else "mal"
             item_provider_series_id = primary_available_state.provider_series_id if primary_available_state is not None else f"mal:{target_id}"
             item_title = primary_available_state.title if primary_available_state is not None else (meta.title if meta is not None else str(bucket.get("title") or f"MAL anime {target_id}"))
@@ -2706,8 +2666,8 @@ def _series_installment_index(state: ProviderSeriesState) -> int | None:
         ordinal_match = _ORDINAL_SEASON_RE.search(text)
         if ordinal_match:
             raw = ordinal_match.group(1).lower()
-            if raw in _ORDINALS:
-                candidates.append(_ORDINALS[raw])
+            if raw in _ORDINAL_TO_NUMBER:
+                candidates.append(_ORDINAL_TO_NUMBER[raw])
             else:
                 digits = re.sub(r"\D+", "", raw)
                 if digits:
@@ -2717,7 +2677,7 @@ def _series_installment_index(state: ProviderSeriesState) -> int | None:
             candidates.append(int(part_match.group(1)))
         roman_match = _ROMAN_END_RE.search(text)
         if roman_match:
-            roman_value = _ROMAN.get(roman_match.group(1).lower())
+            roman_value = _ROMAN_TO_NUMBER.get(roman_match.group(1).lower())
             if roman_value:
                 candidates.append(roman_value)
     positive = [value for value in candidates if value > 0]

@@ -300,7 +300,6 @@ class MalUserAnimeListRefreshSummary:
         }
 
 
-
 @dataclass(slots=True)
 class ProviderTitleSearchCacheEntry:
     provider: str
@@ -1215,7 +1214,6 @@ def replace_review_queue_entries(
     return {"resolved": resolved, "inserted": inserted}
 
 
-
 def refresh_review_queue_entries(
     db_path: Path,
     *,
@@ -1931,13 +1929,6 @@ def _require_current_mal_user_list_refresh_generation(
         )
 
 
-def _active_mal_user_list_refresh_generation_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM mal_user_anime_list_refresh_generations WHERE status = 'active'"
-    ).fetchone()
-    return int(row["n"] or 0)
-
-
 def _require_single_active_mal_user_list_refresh_generation(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     active = conn.execute(
         "SELECT COUNT(*) AS n FROM mal_user_anime_list_refresh_generations WHERE status='active' AND account_id IS NULL"
@@ -2316,166 +2307,6 @@ def upsert_mal_user_anime_list_cache_generation(
     )
 
 
-def finish_mal_user_anime_list_cache_refresh(
-    db_path: Path,
-    *,
-    items: Iterable[dict[str, Any]],
-    refresh_run_id: str,
-    generation: int,
-    fetched_at: str,
-    proven_complete: bool,
-    delete_absent: bool = False,
-) -> MalUserAnimeListRefreshSummary:
-    """Atomically upsert rows and terminalize a refresh generation."""
-    run_id = _coerce_mal_user_list_refresh_run_id(refresh_run_id)
-    generation_id = _coerce_mal_user_list_refresh_generation(generation)
-    fetched = str(fetched_at).strip()
-    if not fetched:
-        raise ValueError("fetched_at is required")
-    if delete_absent and not proven_complete:
-        raise ValueError("delete_absent requires proven_complete=True")
-    prepared: list[tuple[Any, ...]] = []
-    seen_ids: set[int] = set()
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        row = _prepare_mal_user_list_cache_item(
-            item,
-            refresh_run_id=run_id,
-            generation=generation_id,
-            fetched_at=fetched,
-        )
-        if row is None:
-            continue
-        mal_anime_id = int(row[0])
-        if mal_anime_id in seen_ids:
-            continue
-        seen_ids.add(mal_anime_id)
-        prepared.append(row)
-    conn = connect(db_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        lifecycle = _require_active_mal_user_list_refresh_generation(
-            conn,
-            refresh_run_id=run_id,
-            generation=generation_id,
-            operation="finish refresh",
-        )
-        _require_current_mal_user_list_refresh_generation(
-            conn,
-            lifecycle,
-            operation="finish refresh",
-        )
-        changes_before = conn.total_changes
-        if prepared:
-            conn.executemany(
-                """
-                INSERT INTO mal_user_anime_list_cache (
-                    mal_anime_id, title, list_status, user_score, num_episodes_watched,
-                    start_date, finish_date, list_updated_at, priority, is_rewatching,
-                    num_times_rewatched, rewatch_value, tag_count, has_comments,
-                    node_json, list_status_json, raw_json, refresh_run_id,
-                    refresh_generation, fetched_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(mal_anime_id) DO UPDATE SET
-                    title = excluded.title,
-                    list_status = excluded.list_status,
-                    user_score = excluded.user_score,
-                    num_episodes_watched = excluded.num_episodes_watched,
-                    start_date = excluded.start_date,
-                    finish_date = excluded.finish_date,
-                    list_updated_at = excluded.list_updated_at,
-                    priority = excluded.priority,
-                    is_rewatching = excluded.is_rewatching,
-                    num_times_rewatched = excluded.num_times_rewatched,
-                    rewatch_value = excluded.rewatch_value,
-                    tag_count = excluded.tag_count,
-                    has_comments = excluded.has_comments,
-                    node_json = excluded.node_json,
-                    list_status_json = excluded.list_status_json,
-                    raw_json = excluded.raw_json,
-                    refresh_run_id = excluded.refresh_run_id,
-                    refresh_generation = excluded.refresh_generation,
-                    fetched_at = excluded.fetched_at,
-                    last_seen_at = excluded.last_seen_at,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE mal_user_anime_list_cache.refresh_generation <= excluded.refresh_generation
-                """,
-                prepared,
-            )
-        changed_rows = conn.total_changes - changes_before
-        current = conn.execute(
-            """
-            SELECT
-                list_status,
-                user_score,
-                priority,
-                is_rewatching,
-                num_times_rewatched,
-                rewatch_value,
-                tag_count,
-                has_comments
-            FROM mal_user_anime_list_cache
-            WHERE refresh_generation = ? AND refresh_run_id = ?
-            """,
-            (generation_id, run_id),
-        ).fetchall()
-        pruned = 0
-        if delete_absent:
-            pruned = conn.execute(
-                "DELETE FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
-                (generation_id,),
-            ).rowcount
-        preserved_absent = conn.execute(
-            "SELECT COUNT(*) AS n FROM mal_user_anime_list_cache WHERE refresh_generation < ?",
-            (generation_id,),
-        ).fetchone()["n"]
-        lifecycle_status = "completed" if proven_complete else "partial"
-        conn.execute(
-            """
-            UPDATE mal_user_anime_list_refresh_generations
-            SET status = ?,
-                completed_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP,
-                items = items + ?,
-                upserted = upserted + ?,
-                pruned = ?,
-                preserved_absent = ?
-            WHERE generation = ? AND refresh_run_id = ? AND status = 'active'
-            """,
-            (
-                lifecycle_status,
-                len(prepared),
-                int(changed_rows),
-                int(pruned or 0),
-                int(preserved_absent or 0),
-                generation_id,
-                run_id,
-            ),
-        )
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    by_status, scored, unscored, preference_counts = _summarize_mal_user_list_refresh_rows(current)
-    return MalUserAnimeListRefreshSummary(
-        status="ok" if proven_complete else "partial",
-        refresh_run_id=run_id,
-        generation=generation_id,
-        items=len(prepared),
-        upserted=int(changed_rows),
-        pruned=int(pruned or 0),
-        preserved_absent=int(preserved_absent or 0),
-        scored=scored,
-        unscored=unscored,
-        preference_counts=preference_counts,
-        by_status=by_status,
-        partial=not proven_complete,
-    )
-
-
 def finalize_mal_user_anime_list_cache_refresh(
     db_path: Path,
     *,
@@ -2841,61 +2672,6 @@ def count_mal_user_anime_list_cache(db_path: Path, *, statuses: Iterable[str] | 
     finally:
         conn.close()
     return int(row["n"] or 0)
-
-
-def get_mal_user_anime_list_cache_map(db_path: Path) -> dict[int, MalUserAnimeListCacheEntry]:
-    return {entry.mal_anime_id: entry for entry in list_mal_user_anime_list_cache(db_path)}
-
-
-def summarize_mal_user_anime_list_cache(db_path: Path) -> dict[str, Any]:
-    conn = connect(db_path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT list_status, COUNT(*) AS n, SUM(CASE WHEN user_score IS NOT NULL AND user_score > 0 THEN 1 ELSE 0 END) AS scored
-            FROM mal_user_anime_list_cache
-            GROUP BY list_status
-            ORDER BY list_status ASC
-            """
-        ).fetchall()
-        freshness = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                MAX(refresh_generation) AS generation,
-                MAX(last_seen_at) AS newest_seen_at,
-                MIN(last_seen_at) AS oldest_seen_at,
-                SUM(CASE WHEN priority IS NOT NULL THEN 1 ELSE 0 END) AS with_priority,
-                SUM(CASE WHEN is_rewatching IS NOT NULL THEN 1 ELSE 0 END) AS with_rewatching,
-                SUM(CASE WHEN num_times_rewatched IS NOT NULL THEN 1 ELSE 0 END) AS with_num_times_rewatched,
-                SUM(CASE WHEN rewatch_value IS NOT NULL THEN 1 ELSE 0 END) AS with_rewatch_value,
-                SUM(CASE WHEN tag_count > 0 THEN 1 ELSE 0 END) AS with_tags,
-                SUM(CASE WHEN has_comments > 0 THEN 1 ELSE 0 END) AS with_comments
-            FROM mal_user_anime_list_cache
-            """
-        ).fetchone()
-    finally:
-        conn.close()
-    by_status = {str(row["list_status"] or "unknown"): int(row["n"] or 0) for row in rows}
-    scored = sum(int(row["scored"] or 0) for row in rows)
-    total = int(freshness["total"] or 0)
-    return {
-        "total": total,
-        "by_status": by_status,
-        "scored": scored,
-        "unscored": max(total - scored, 0),
-        "generation": None if freshness["generation"] is None else int(freshness["generation"]),
-        "newest_seen_at": freshness["newest_seen_at"],
-        "oldest_seen_at": freshness["oldest_seen_at"],
-        "preference_counts": {
-            "with_priority": int(freshness["with_priority"] or 0),
-            "with_rewatching": int(freshness["with_rewatching"] or 0),
-            "with_num_times_rewatched": int(freshness["with_num_times_rewatched"] or 0),
-            "with_rewatch_value": int(freshness["with_rewatch_value"] or 0),
-            "with_tags": int(freshness["with_tags"] or 0),
-            "with_comments": int(freshness["with_comments"] or 0),
-        },
-    }
 
 
 def _my_list_status_from_cache_entry(entry: MalUserAnimeListCacheEntry) -> dict[str, Any]:
@@ -3723,13 +3499,6 @@ def _require_public_userrecs_claim(
         raise RuntimeError(f"public userrecs claim fence rejected {action}: claim expired")
     if expected_revision is not None and int(row["generation_revision"] or 0) != int(expected_revision):
         raise RuntimeError(f"public userrecs claim fence rejected {action}: generation revision changed")
-
-
-def _bump_public_userrecs_generation_revision(conn: sqlite3.Connection, generation_id: int) -> None:
-    conn.execute(
-        "UPDATE mal_public_userrecs_crawl_generations SET generation_revision = generation_revision + 1 WHERE generation_id = ?",
-        (int(generation_id),),
-    )
 
 
 def get_mal_public_userrecs_generation(
@@ -5839,6 +5608,21 @@ def get_public_userrecs_diagnostics(
     }
 
 
+MAL_RECOMMENDATION_HARVEST_SUMMARY_COUNTERS = (
+    "mapped_sources",
+    "watched_sources",
+    "positive_list_sources",
+    "confirmed_positive_sources",
+    "fresh",
+    "stale",
+    "failed",
+    "unharvested",
+    "complete_full_harvest_sources",
+    "official_detail_sources",
+    "total_edges",
+)
+
+
 def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: int = 14) -> dict[str, Any]:
     stale_after_days = max(int(stale_after_days), 0)
     with connect(db_path) as conn:
@@ -5912,19 +5696,7 @@ def get_mal_recommendation_harvest_coverage(db_path: Path, *, stale_after_days: 
             """
         ).fetchall()
     items: list[dict[str, Any]] = []
-    summary = {
-        "mapped_sources": 0,
-        "watched_sources": 0,
-        "positive_list_sources": 0,
-        "confirmed_positive_sources": 0,
-        "fresh": 0,
-        "stale": 0,
-        "failed": 0,
-        "unharvested": 0,
-        "complete_full_harvest_sources": 0,
-        "official_detail_sources": 0,
-        "total_edges": 0,
-    }
+    summary: dict[str, Any] = dict.fromkeys(MAL_RECOMMENDATION_HARVEST_SUMMARY_COUNTERS, 0)
     for row in rows:
         fetched_at = row["fetched_at"]
         stored_status = str(row["harvest_status"] or "")
@@ -6013,32 +5785,6 @@ def get_mal_recommendation_edges_map(db_path: Path) -> dict[int, list[MalRecomme
             )
         )
     return result
-
-
-def get_provider_series_title_map(
-    db_path: Path,
-    *,
-    provider: str,
-    provider_series_ids: Iterable[str],
-) -> dict[str, dict[str, str | None]]:
-    normalized_ids = sorted({value for value in provider_series_ids if isinstance(value, str) and value})
-    if not normalized_ids:
-        return {}
-    placeholders = ", ".join("?" for _ in normalized_ids)
-    query = f"""
-        SELECT provider_series_id, title, season_title
-        FROM provider_series
-        WHERE provider = ? AND provider_series_id IN ({placeholders})
-    """
-    with connect(db_path) as conn:
-        rows = conn.execute(query, [provider, *normalized_ids]).fetchall()
-    return {
-        str(row["provider_series_id"]): {
-            "title": row["title"],
-            "season_title": row["season_title"],
-        }
-        for row in rows
-    }
 
 
 def get_provider_series_title_map_by_keys(
@@ -6155,7 +5901,6 @@ def update_review_queue_entry_statuses(
         cursor = conn.execute(query, [status, status, *normalized_ids])
         conn.commit()
         return int(cursor.rowcount or 0)
-
 
 
 def get_operational_snapshot(db_path: Path) -> dict[str, Any]:

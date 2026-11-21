@@ -179,17 +179,6 @@ class MigrationCatalogTests(unittest.TestCase):
 
         self.assertEqual(db.MIGRATION_FILENAMES, tuple(row["version"] for row in rows))
 
-    def test_repository_compatibility_files_match_packaged_resources(self) -> None:
-        root_migrations = Path(__file__).resolve().parents[1] / "migrations"
-        self.assertTrue(root_migrations.is_dir())
-        for migration in db.MIGRATIONS:
-            root_file = root_migrations / migration.name
-            self.assertTrue(root_file.is_file(), root_file)
-            self.assertEqual(
-                root_file.read_text(encoding="utf-8"),
-                migration.read_text(encoding="utf-8"),
-            )
-
     def test_023_to_current_upgrade_applies_024_and_025_once_with_exact_constraints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "023-upgrade.sqlite3"

@@ -1,92 +1,45 @@
 # Architecture
 
-## Shape
+## Repository layout
 
-MAL-Updater is a **skill-first repository**:
+- `src/mal_updater/`: the Python application (CLI, scheduler, container control plane, provider integrations, SQLite migrations under `migrations/`).
+- `Dockerfile`, `compose.yaml`, `compose.build.yaml`, `docker-entrypoint.sh`: the container product; see `references/CONTAINERS.md`.
+- `SKILL.md`: OpenClaw skill entrypoint for native installs; the repo root is the skill package.
+- `references/`: operator and agent references.
+- `scripts/`: bootstrap, install, quality and distribution-check helpers.
+- `ops/systemd-user/`: portable user-systemd unit templates rendered at install time.
+- `tests/`: the full test suite, kept in the repo for third-party auditing.
 
-- `SKILL.md` at the repo root is the canonical skill entrypoint
-- `src/mal_updater/` contains the Python application, CLI, daemon runtime, and service management code
-- `references/` contains agent-facing bootstrap/operation references
-- `scripts/` contains deterministic wrappers/install helpers
-- `ops/systemd-user/` contains portable systemd templates
-- `tests/` remains bundled for auditability
-- `Dockerfile` and `compose.yaml` package one container product with dashboard and optional daemon components; see `references/CONTAINERS.md`
+## Runtime state
 
-## Runtime boundary
+Runtime state never lives in the repo tree. The container uses the `/data` volume (`MAL_UPDATER_RUNTIME_ROOT=/data`); native installs default to `.MAL-Updater/` in the workspace. Both contain:
 
-Live runtime state is external to the repo tree by default and resolves under `.MAL-Updater/` in the workspace:
-
-- `.MAL-Updater/config/`
-- `.MAL-Updater/secrets/`
-- `.MAL-Updater/data/`
-- `.MAL-Updater/state/`
-- `.MAL-Updater/cache/`
-
-Notable daemon/runtime files inside the external state tree include:
-
-- `.MAL-Updater/state/service-state.json`
-- `.MAL-Updater/state/logs/service.log`
-- `.MAL-Updater/state/api-request-events.jsonl`
-- `.MAL-Updater/state/health/latest-health-check.json`
+- `config/settings.toml`: non-secret settings (`references/settings.toml.example`)
+- `secrets/`: MAL and provider credentials/tokens (mode 0600)
+- `data/mal_updater.sqlite3`: the database; schema comes only from the migration runner (`init`, or container startup)
+- `state/`: `service-state.json`, `logs/service.log`, `api-request-events.jsonl`, `health/latest-health-check.json`, per-provider session and sync-boundary files, `backups/`
+- `cache/`: disposable provider snapshots
 
 ## Execution model
 
-### CLI
+- **Container:** `tini` runs a Python supervisor (`container_runtime.py`) that serves the trusted-LAN web UI and keeps the scheduler running whenever MAL setup is complete.
+- **Native:** a user-level systemd unit runs `python3 -m mal_updater.cli --project-root <repo-root> service-run`.
 
-Use the repo-local Python CLI for business logic and operator workflows.
+Either way the scheduler (`service_runtime.py`) owns recurring lanes: per-provider fetch and ingest, MAL token refresh, MAL list refresh, bounded exact-approved MAL apply, recommendation metadata, public MAL userrecs harvest, provider eligibility, recommendation snapshots, health checks, and housekeeping. Network lanes run as `mal_updater.cli` subprocesses under request budgets and backoff. Lane defaults are in `references/OPERATIONS.md`.
 
-### Daemon
+## Pipeline
 
-Native installs use a **long-lived user-level systemd daemon**. The container product uses a small Python supervisor and `tini` to run the same daemon beside the dashboard whenever required MAL prerequisites are present; incomplete setup is a blocked state rather than a user-disable mode.
+1. **Fetch:** provider modules (`providers/crunchyroll.py`, `providers/hidive.py`, registered in `provider_registry.py`) authenticate and emit a provider-neutral snapshot (`contracts/provider.py`, validated by `validation.py`). Fetchers also fill the provider season catalog (`season_catalog.py`).
+2. **Ingest:** `ingestion.py` persists series, per-episode progress (with canonical season identity), and watchlists.
+3. **Map:** `mapping.py` matches each provider series to MAL candidates; per-season matches (`season_mappings.py`) use catalog air dates, episode counts and the MAL franchise graph. Ambiguous results go to the review queue.
+4. **Plan and apply:** `sync_planner.py` proposes forward-only MAL changes per season; `apply-sync --execute` revalidates each against live MAL and writes only exact-approved, non-regressing updates.
+5. **Recommend:** `recommendations.py` and the dashboard build ranked continue/new-episode/discovery lists from MAL metadata, public userrecs and provider availability evidence.
 
-The installed unit runs:
-
-```bash
-python3 -m mal_updater.cli --project-root <repo-root> service-run
-```
-
-That foreground daemon owns internal recurring lanes for:
-
-- MAL token refresh
-- exact-approved sync passes
-- recurring health-check/report generation
-- API request logging and budget-aware gating
-
-### Transitional wrappers
-
-The exact-approved manual sync cycle now also has a repo-native CLI surface:
-
-- `python3 -m mal_updater.cli exact-approved-sync-cycle`
-
-`scripts/run_exact_approved_sync_cycle.sh` remains only as a thin compatibility wrapper around that CLI command.
-
-Health-cycle execution now also exists as a repo-native CLI command:
-
-- `python3 -m mal_updater.cli health-check-cycle`
-
-`scripts/run_health_check_cycle.sh` remains only as a thin compatibility wrapper around that CLI surface, not as the daemon's primary execution path.
-
-## Bootstrap model
-
-A new OpenClaw instance should be able to:
-
-1. inspect this repo as a skill package
-2. run `bootstrap-audit`
-3. detect missing dependencies and user-provided inputs
-4. guide the user through MAL app creation / redirect configuration
-5. stage secrets into the external runtime tree
-6. install the rendered long-lived user daemon when supported
-7. verify daemon health via `service-status` and `health-check`; reserve `service-run-once` for an explicit opt-in live daemon pass because it can run provider fetch, local ingest, and exact-approved MAL apply lanes
+The provider boundary assumes no particular auth style or paging shape; a new provider only has to emit the normalized snapshot contract (`references/JSON_CONTRACT.md`).
 
 ## Guardrails
 
-- keep sync conservative
-- keep runtime out of the skill tree
-- avoid host-specific assumptions in committed files
-- preserve full-repo auditability for third parties
-- prefer the daemon-first runtime model over ad-hoc timers or OpenClaw cron
-- because this repo is public, keep all tracked artifacts anonymized: no personal identities, personal emails, host-specific absolute paths, private workspace references, real account identifiers, or real secrets in code/references/tests/history
-
-### Container control plane security
-
-The container HTTP control plane (`container_runtime.py` + `container_web.py`) is intentionally credential-free on a trusted LAN: dashboard and Settings open directly, while MAL OAuth and provider credentials remain separate protected secret material. Mutations require a process-local synchronizer CSRF token and same-origin/cross-site checks. Trusted-host validation, bounded JSON bodies, content-type enforcement, CSP/security headers, atomic secret files, allowlisted settings, and explicit connection-test rate limits remain in place. The scheduler is always desired: it starts only when required MAL setup is complete, stops if those prerequisites are lost, and restarts automatically when they return. Provider lanes remain independently selected by their own credentials and readiness. See `references/CONTAINERS.md` for the threat model.
+- Keep sync conservative: missing-data-first, never decrease progress, never auto-resolve ambiguity (`references/DECISIONS.md`).
+- Keep runtime state out of the repo; avoid host-specific assumptions in committed files.
+- Because this repo is public, keep all tracked artifacts anonymized: no personal identities, personal emails, host-specific absolute paths, private workspace references, real account identifiers, or real secrets in code, references, tests or history.
+- Prefer the scheduler's own lanes over ad-hoc timers or OpenClaw cron.

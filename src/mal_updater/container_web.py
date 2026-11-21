@@ -203,10 +203,6 @@ class RateLimiter:
                 return False
             hits.append(now); self._hits[key] = hits
             return True
-    def clear(self, key: str) -> None:
-        with self._lock:
-            self._hits.pop(key, None)
-
 class ControlStore:
     SECRET_NAMES = {
         "mal_client_id": "mal_client_id.txt", "mal_client_secret": "mal_client_secret.txt",

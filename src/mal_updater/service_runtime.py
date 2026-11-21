@@ -32,6 +32,7 @@ from .hidive_auth import load_hidive_credentials
 from .mal_client import MalApiError, MalClient
 from .openclaw_delivery import OpenClawDeliveryError, deliver_recommendations_via_openclaw
 from .persistence import PersistentJsonError, atomic_write_json, read_json_dict_bounded
+from .health_report import latest_health_refresh_commands, provider_from_refresh_command_args
 from .redaction import sanitize_command, sanitize_text, sanitize_url, sanitize_value
 from .request_tracking import (
     begin_api_request_context,
@@ -599,7 +600,6 @@ def _available_source_providers(config: AppConfig) -> list[str]:
     return providers
 
 
-
 def _task_specs(config: AppConfig) -> list[TaskSpec]:
     specs = [TaskSpec("mal_refresh", config.service.mal_refresh_every_seconds, budget_provider="mal")]
     providers = _available_source_providers(config)
@@ -1036,7 +1036,6 @@ def run_maintenance_cycle(config: AppConfig, **kwargs: Any) -> dict[str, Any]:
         lease.release()
 
 
-
 def _provider_fetch_requires_full_refresh(config: AppConfig, task_state: dict[str, Any], *, now: float) -> bool:
     interval = int(config.service.full_refresh_every_seconds)
     if interval <= 0:
@@ -1047,50 +1046,17 @@ def _provider_fetch_requires_full_refresh(config: AppConfig, task_state: dict[st
     return float(now) - float(anchor_epoch) >= interval
 
 
-
-def _provider_from_refresh_command_args(command_args: object) -> str | None:
-    if not isinstance(command_args, list) or not command_args:
-        return None
-    if command_args[0] == "crunchyroll-fetch-snapshot":
-        return "crunchyroll"
-    if len(command_args) >= 2 and command_args[0] == "sync-source" and isinstance(command_args[1], str):
-        return str(command_args[1])
-    if command_args[0] == "provider-fetch-snapshot":
-        for index, part in enumerate(command_args[:-1]):
-            if part == "--provider" and isinstance(command_args[index + 1], str):
-                return str(command_args[index + 1])
-    return None
-
-
-
 def _provider_fetch_health_request(config: AppConfig, provider: str, task_state: dict[str, Any]) -> dict[str, Any] | None:
-    path = config.health_latest_json_path
-    try:
-        payload = read_json_dict_bounded(path, max_bytes=_SERVICE_STATE_MAX_BYTES)
-    except PersistentJsonError:
+    latest = latest_health_refresh_commands(config.health_latest_json_path)
+    if latest is None:
         return None
-    if payload is None:
-        return None
-    maintenance = payload.get("maintenance")
-    if not isinstance(maintenance, dict):
-        return None
-    commands = maintenance.get("recommended_commands")
-    if not isinstance(commands, list):
-        return None
-    try:
-        health_mtime = path.stat().st_mtime
-    except OSError:
-        return None
+    commands, health_mtime = latest
     last_handled_mtime = task_state.get("last_health_request_handled_mtime")
     if isinstance(last_handled_mtime, (int, float)) and float(last_handled_mtime) >= float(health_mtime):
         return None
     for command in commands:
-        if not isinstance(command, dict):
-            continue
         reason_code = command.get("reason_code")
-        if reason_code not in {"refresh_ingested_snapshot", "refresh_full_snapshot"}:
-            continue
-        if _provider_from_refresh_command_args(command.get("command_args")) != provider:
+        if provider_from_refresh_command_args(command.get("command_args")) != provider:
             continue
         if reason_code == "refresh_full_snapshot" and int(config.service.full_refresh_every_seconds) <= 0:
             continue
@@ -1104,7 +1070,6 @@ def _provider_fetch_health_request(config: AppConfig, provider: str, task_state:
             "health_mtime": float(health_mtime),
         }
     return None
-
 
 
 def _apply_sync_command(config: AppConfig, *, providers: list[str] | None = None) -> list[str]:
@@ -1456,7 +1421,6 @@ def _maybe_reset_task_projection_state_for_signature(
     _append_log(config, f"task={spec.name} status=reset reason=execution_signature_changed old={previous!r} new={signature!r}")
 
 
-
 def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str, Any], *, now: float) -> tuple[str | None, list[str], dict[str, Any] | None]:
     if not spec.name.startswith("sync_fetch_"):
         return None, [], None
@@ -1478,7 +1442,6 @@ def _planned_fetch_mode(config: AppConfig, spec: TaskSpec, task_state: dict[str,
     return ("full_refresh" if full_refresh_reasons else "hot"), full_refresh_reasons, health_request
 
 
-
 def _maybe_downgrade_fetch_mode_for_budget(
     config: AppConfig,
     spec: TaskSpec,
@@ -1497,7 +1460,6 @@ def _maybe_downgrade_fetch_mode_for_budget(
         return allowed, reason, usage, planned_fetch_mode, planned_full_refresh_reasons, None, hot_usage
     deferred_reason = "+".join(planned_full_refresh_reasons) if planned_full_refresh_reasons else "budget_deferred"
     return True, None, hot_usage, "hot", [], deferred_reason, hot_usage
-
 
 
 def _projected_request_policy_details(
@@ -1530,7 +1492,6 @@ def _projected_request_policy_details(
         details["projected_request_percentile"] = round(float(auto_percentile), 6)
         details["projected_request_percentile_source"] = "auto"
     return details
-
 
 
 def _projected_request_count(
@@ -1591,7 +1552,6 @@ def _projected_request_count(
     if configured is not None:
         return configured, configured_source
     return 0, None
-
 
 
 def _refresh_projected_request_state(

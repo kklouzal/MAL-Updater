@@ -1,8 +1,6 @@
 # MAL-Updater
 
-Container-first trusted-LAN control plane for conservative provider-to-MyAnimeList sync and recommendations.
-
-Periodic durable positive evidence uses a deterministic 120-day +/-15-day refresh window with stale-while-revalidate read/display semantics. Negative/no-match claims retain shorter cadences, provider-title search remains identity-only, and stale evidence never authorizes MAL/provider writes or strict availability by itself. Operational retention, auth/retry/backoff, health thresholds, backups, and explicit deletion remain separate policies.
+Container-first trusted-LAN control plane for conservative provider-to-MyAnimeList sync and recommendations. It reads Crunchyroll and HIDIVE watch history, maps each provider season to its MyAnimeList entry, and fills in missing MAL progress without overwriting meaningful MAL data.
 
 ## Quick start (container)
 
@@ -15,7 +13,13 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Open **http://localhost/** (or `http://<lan-host>/` if you changed the port) for the database-backed recommendations/operations dashboard. Use **Export PDF** to open the browser print dialog, then choose the browser's **Save as PDF** destination to share the currently displayed dashboard. Configuration controls are at **`/settings`**; both pages open directly and link to each other. There is no installation claim, dashboard account, password, or sign-in flow.
+Open **http://localhost/** (or `http://<lan-host>/` if you changed the port). The pages share one header:
+
+- **Dashboard** (`/`): recommendations with MyAnimeList cover art, title search, and **Export PDF** (opens the browser print dialog; choose **Save as PDF** to keep links clickable).
+- **Debug** (`/debug`): operational indicators, provider enrichment health, the public MAL userrecs crawl, and recent provider sync runs.
+- **Settings** (`/settings`): credentials, MAL OAuth, Crunchyroll account linking, and bounded operational limits.
+
+There is no installation claim, dashboard account, password, or sign-in flow.
 
 The image defaults to `ghcr.io/kklouzal/mal-updater:0.2.9`. For local development builds use:
 
@@ -28,18 +32,19 @@ docker compose -f compose.yaml -f compose.build.yaml up -d --build
 1. Open Settings and add MAL app credentials. Saving credentials never tests or calls MAL.
 2. Use **Test connection** explicitly when desired. Tests are user-triggered, rate-limited, timeout-bounded, and redact errors.
 3. Start MAL OAuth from Settings. Configure the MAL app callback as `http://localhost/oauth/mal/callback` for local access, or the exact trusted LAN/proxy URL you use.
-4. Add Crunchyroll/HIDIVE credentials and test them only when intentionally requested.
-5. Automation starts automatically after the MAL client ID and MAL OAuth tokens are present. Until then it remains safely blocked; removing either prerequisite stops it, and restoring the prerequisite starts it again without a toggle.
+4. Connect providers: **Link Crunchyroll account** (shows a TV activation code to approve at crunchyroll.com/activate; no password is stored) or Crunchyroll username/password, and HIDIVE username/password.
+5. The scheduler starts automatically once the MAL client ID and MAL OAuth tokens are present, and stops if either is removed. It then fetches providers, refreshes the MAL list, and builds recommendations.
+6. Unattended MAL writes stay off until you opt in: set **Per-run execution bounds → sync_apply** in Settings to a positive number of writes per run (for example 8), then restart the container. Review a dry run first (see `references/OPERATIONS.md`).
 
-Dashboard access is deliberately credential-free for this trusted-LAN-only product. MAL OAuth and provider authentication remain unchanged and their secrets remain outside the UI response surface.
+MAL OAuth and provider secrets stay outside every UI response.
 
 ## Security and LAN deployment
 
-Use this product only on a private trusted LAN or behind a trusted reverse proxy. Do not expose it directly to the WAN. If a reverse proxy is used, only enable forwarded headers with an explicit trusted proxy allowlist; otherwise Host/scheme are taken from the direct request. Because the dashboard has no user authentication, every LAN client that can reach it can view status and change settings.
+Use this product only on a private trusted LAN or behind a trusted reverse proxy. Do not expose it directly to the WAN. Forwarded headers are honored only from proxies listed in `MAL_UPDATER_TRUSTED_PROXY_CIDRS`; otherwise Host/scheme come from the direct request. Because the dashboard has no user authentication, every LAN client that can reach it can view status and change settings.
 
-Mutations require a process-local synchronizer CSRF token obtained by the dashboard through a same-origin request; explicit cross-origin and cross-site browser requests are rejected. This is CSRF protection, not an access credential. Trusted-host validation, 64 KiB JSON body limits, required JSON content types, CSP/security headers, connection-test rate limits, and secret redaction remain enforced.
+Mutations require a process-local synchronizer CSRF token obtained through a same-origin request; cross-origin and cross-site browser requests are rejected. Trusted-host validation, 64 KiB JSON body limits, required JSON content types, CSP/security headers, connection-test rate limits, and secret redaction are enforced. See `references/CONTAINERS.md` for the full threat model.
 
-Secrets live in the Docker volume under `/data/secrets` with restrictive permissions. The container runs non-root after startup, with a read-only root filesystem, no-new-privileges, a bounded tmpfs `/tmp`, and all capabilities dropped except the narrow startup set. `CAP_KILL` lets root `tini` forward shutdown signals to its different-UID child; the Python application remains UID/GID 10001 by default.
+Secrets live in the Docker volume under `/data/secrets` with restrictive permissions. The container runs non-root (UID/GID 10001 by default) with a read-only root filesystem, no-new-privileges, a bounded tmpfs `/tmp`, and all capabilities dropped except the narrow startup set.
 
 ## Container tools
 
@@ -54,45 +59,49 @@ docker compose --profile tools run --rm cli restore --yes /data/backups/manual.t
 docker compose --profile tools run --rm cli support-bundle /data/state/support/support.tar.gz
 ```
 
-Backups contain a SQLite-consistent DB copy, config, secrets, state, a manifest, and SHA-256 checksums. Keep production backup destinations under `/data`; lifecycle work is staged on that persistent destination volume rather than bounded `/tmp`, and the destination subtree is excluded from its own archive. Restore verifies first, requires `--yes`, and creates an automatic pre-restore backup. Support bundles are deliberately redacted and do not include secret contents, usernames, database rows, tokens, or logs.
+Backups contain a SQLite-consistent DB copy, config, secrets, state, a manifest, and SHA-256 checksums. Keep backup destinations under `/data`; lifecycle work is staged on that volume rather than the bounded `/tmp`, and the destination subtree is excluded from its own archive. Restore verifies first, requires `--yes`, and creates an automatic pre-restore backup. Support bundles are redacted and do not include secret contents, usernames, database rows, tokens, or logs.
+
+The application CLI (`references/cli-recipes.md`) runs inside the live container as the service user, for example `docker compose exec -u 10001:10001 mal-updater mal-updater health-check --format summary`.
 
 ## Upgrades and rollback
 
-Before upgrading, create and verify a backup. Pin the new image tag in `.env`, then run `docker compose pull && docker compose up -d`. Startup performs migrations before readiness turns green. Existing legacy `/data/secrets/container_auth.json` files are ignored and need not be removed. If startup fails, restore the pre-upgrade backup and pin the previous image tag. SQLite schema rollback requires restoring the backup taken before upgrade, not downgrading the live DB in place.
+Before upgrading, create and verify a backup. Pin the new image tag in `.env`, then run `docker compose pull && docker compose up -d`. Startup performs migrations before readiness turns green. If startup fails, restore the pre-upgrade backup and pin the previous image tag. SQLite schema rollback requires restoring the backup taken before the upgrade, not downgrading the live DB in place. After an upgrade that adds the per-season sync migrations (032 and later), run a full provider refresh; see `references/OPERATIONS.md`.
 
 ## Health semantics
 
 - `/healthz`: liveness; returns 200 when the web process can answer.
-- `/readyz`: readiness; returns 200 only while required MAL setup is complete and the automatically supervised scheduler is running. It returns 503 with blocked status while prerequisites are missing, startup is in progress, or the scheduler is degraded/restarting.
+- `/readyz`: readiness; returns 200 only while required MAL setup is complete and the supervised scheduler is running. It returns 503 with blocked status while prerequisites are missing, startup is in progress, or the scheduler is degraded/restarting.
 
-## Legacy/systemd advanced path
+## Native user-systemd path
 
-The historical user-systemd CLI path remains for advanced/manual installs from a source checkout. Container deployment is the supported product path for end users; do not mix the container volume with the host `.MAL-Updater` runtime.
+A source checkout can also run as a user-level systemd daemon (`references/AUTOMATION.md`; `SKILL.md` for OpenClaw hosts). The container is the supported end-user path; never mix the container volume with a host `.MAL-Updater` runtime.
 
 ## Troubleshooting
 
-- Dashboard/settings unavailable: check `docker compose logs --tail=200 mal-updater` and confirm the requested hostname is loopback, private-IP, or explicitly listed in `MAL_UPDATER_TRUSTED_HOSTS`.
-- Readiness degraded: complete MAL credentials/OAuth, or inspect logs if the automatically supervised scheduler is restarting.
+- Dashboard/settings unavailable: check `docker compose logs --tail=200 mal-updater` and confirm the requested hostname is loopback, private-IP, or listed in `MAL_UPDATER_TRUSTED_HOSTS`.
+- Readiness degraded: complete MAL credentials/OAuth, or inspect logs if the scheduler is restarting.
 - OAuth callback mismatch: update the MAL app callback to the exact browser URL plus `/oauth/mal/callback`.
 - UI mutation reports CSRF failure after a restart: reload the page to obtain the new process-local token.
-- Restart logs contain `Unexpected error when forwarding signal: 'Operation not permitted'`: upgrade to 0.2.6 or later. A healthy restart lets `tini` forward TERM to the non-root Python child and emits no `tini` fatal error.
+- Nothing is written to MAL: check that `sync_apply` is opted in (setup step 6), that no seasons wait in `season-mappings --unresolved`, and the `health-check` warnings.
+- Restart logs contain `Unexpected error when forwarding signal: 'Operation not permitted'`: upgrade to 0.2.6 or later.
+
+## Documentation map
+
+| Topic | File |
+| --- | --- |
+| Container architecture, threat model, settings API | `references/CONTAINERS.md` |
+| Scheduler lanes and defaults, housekeeping, sync and season behavior, MAL list/userrecs internals | `references/OPERATIONS.md` |
+| Native user-systemd daemon and `service-status` | `references/AUTOMATION.md` |
+| Command cookbook | `references/cli-recipes.md` |
+| Native MAL OAuth | `references/MAL_OAUTH.md` |
+| JSON contracts (snapshots, telemetry, command summaries) | `references/JSON_CONTRACT.md` |
+| Configuration reference | `references/settings.toml.example`, `references/env.example` |
+| Design decisions | `references/DECISIONS.md` |
+| Repository layout | `ARCHITECTURE.md` |
+| Quality gates | `references/QUALITY.md` |
 
 ## Release/support policy
 
-MAL-Updater remains alpha software. Version 0.2.9 finishes the recommendation dashboard title/provider-proof polish without changing provider/MAL behavior; version 0.2.8 introduced the broader dashboard presentation improvements. Provider/MAL authentication, conservative MAL-write controls, and the control-plane hardening described above remain intact. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history and known limitations.
+MAL-Updater is alpha software. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history; `master` carries the changes listed under `Unreleased`.
 
-### Complete public MAL user recommendations
-
-`recommend-refresh-full-userrecs` uses a durable strict-priority source queue and staged generations, with monotonic selection-sequence fairness and token/revision-fenced expiring claims. `max_pages` counts actual network attempts, including final revalidation of every staged page; orchestrated calls disable inner retries and zero returns before queue or generation mutation. Drift, truncation, unsafe/conflicting pagination, cross-page overlap, stale claims, or insufficient validation budget preserve last-known-good edges. Empty publication requires dedicated structural MAL empty-state proof plus final validation. See `references/OPERATIONS.md`.
-
-### Durable MAL user-list refresh
-
-`mal-list-refresh` persists an account/query generation and a fair per-status traversal queue. Every parsed page, staged row set, opaque same-origin cursor, ordered fingerprint, and anchor commits atomically. Bounded runs resume the exact cursor; they publish/prune only after every requested partition has explicit terminal proof and page-1/final-boundary revalidation. MAL exposes offset/rank-relative pagination, not immutable snapshot tokens, so concurrent insertion/deletion/reorder is detected and failed closed rather than silently accepted. Pages request `limit=1000` (MAL's documented maximum; one request for lists up to 1000 entries), and fingerprints cover only retained semantic fields (node id/title/num_episodes/media_type/status and `list_status`), never presentation fields such as `main_picture`. Drift restarts a fresh snapshot up to 3 times per run, then ends the run as a non-quarantined partial that the next run retries; only contract violations (malformed rows/cursors, unsupported statuses) quarantine and need `mal-list-reinitialize`. Drift quarantines left by pre-v4 logic are resumed automatically. The published list remains last-known-good throughout. `--max-pages 0` performs no network call and no refresh-state mutation.
-
-### Manual MAL suggestions shadow audit
-
-`mal-updater recommend-suggestions-audit [--limit 100] [--output report.json]` makes one explicitly invoked OAuth `GET /v2/anime/suggestions` request and never follows pagination. It reads the initialized operational SQLite database in query-only mode, does not migrate or persist recommendation candidates, and emits only cohort sizes, overlap/novelty counts and ratios, and bounded aggregate quality distributions. The artifact deliberately excludes suggestion IDs, titles, ranks, cursors, and the raw personalized payload. A configured MAL OAuth access token and an existing current-schema operational database are required. This comparison lane is descriptive evidence only and is not coupled to production ranking or maintenance automation.
-
-### Manual Crunchyroll recommendation shadow audit
-
-`MAL_UPDATER_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED=true mal-updater crunchyroll-recommendation-shadow-audit --access-token-file TOKEN --account-id-file ACCOUNT --output report.json` explicitly invokes bounded GET-only native-recommendation and home-feed probes. Both ephemeral input files must be mode `0600`. The audit opens the operational SQLite database query-only, verifies its bytes are unchanged, persists no candidates, and emits aggregate counts only. Home-feed rows with both attribution fields absent or both set to Crunchyroll's empty-string sentinel are counted as generic; partial, mixed, or malformed attribution remains a fail-closed schema error. This manual diagnostic is not part of provider refresh, ranking, or maintenance automation.
+Report bugs and feature requests at <https://github.com/kklouzal/MAL-Updater/issues>.

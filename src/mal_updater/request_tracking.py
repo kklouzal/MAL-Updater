@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .timestamps import parse_utc_timestamp
 from .config import AppConfig, load_config
 from .persistence import DEFAULT_JSONL_MAX_LINE_BYTES, atomic_writer, iter_json_lines
 from .redaction import sanitize_text, sanitize_url
@@ -149,18 +150,6 @@ def _event_file_lock(path: Path, *, exclusive: bool):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _parse_event_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        # Historical telemetry may be naive. Treat it as UTC so one legacy
-        # record cannot break pruning, budgets, or scheduler comparisons.
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-    except (ValueError, OverflowError, OSError):
-        return None
-
-
 def _iter_events(config: AppConfig | None = None) -> Iterator[dict[str, Any]]:
     path = _events_path(config)
     if not path.exists():
@@ -212,7 +201,7 @@ def _recent_provider_event_times(
         if task is not None and event.get("task") != task:
             if not (include_legacy_in_task and event.get("task") is None and event.get("run_id") is None):
                 continue
-        at = _parse_event_timestamp(event.get("at"))
+        at = parse_utc_timestamp(event.get("at"))
         if at is not None and at >= cutoff:
             event_times.append(at)
     event_times.sort()
@@ -274,7 +263,7 @@ def summarize_recent_api_usage(
         if run_id is not None and event.get("run_id") != run_id:
             continue
         at_raw = event.get("at")
-        at = _parse_event_timestamp(at_raw)
+        at = parse_utc_timestamp(at_raw)
         if at is None or at < cutoff:
             continue
         request_count += 1
@@ -358,7 +347,7 @@ def prune_api_request_events_with_diagnostics(*, retention_days: int = 14, confi
             if not isinstance(event, dict):
                 corrupt_records += 1
                 continue
-            at = _parse_event_timestamp(event.get("at"))
+            at = parse_utc_timestamp(event.get("at"))
             if at is None:
                 corrupt_records += 1
                 continue
@@ -397,7 +386,7 @@ def prune_api_request_events_with_diagnostics(*, retention_days: int = 14, confi
                 event = record.value
                 if record.error is not None or not isinstance(event, dict):
                     raise RuntimeError("api_request_events_changed_during_locked_prune")
-                at = _parse_event_timestamp(event.get("at"))
+                at = parse_utc_timestamp(event.get("at"))
                 if at is None:
                     raise RuntimeError("api_request_events_changed_during_locked_prune")
                 if at >= cutoff:

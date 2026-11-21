@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
-ARG PYTHON_IMAGE=python:3.13.7-slim-bookworm@sha256:67a1e1f215ccda113cfc024e8639049257e88f273898f595b61476d128d387e8
+ARG PYTHON_IMAGE=python:3.13.14-slim-bookworm@sha256:67a1e1f215ccda113cfc024e8639049257e88f273898f595b61476d128d387e8
 
 FROM ${PYTHON_IMAGE} AS builder
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 WORKDIR /build
-COPY pyproject.toml README.md LICENSE MANIFEST.in ./
+COPY pyproject.toml README.md LICENSE ./
 COPY constraints/ci.txt ./ci.txt
 COPY src ./src
 RUN python -m venv /opt/venv \

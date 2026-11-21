@@ -57,9 +57,9 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
                 "004_provider_search_cache.sql",
                 "004_mal_recommendation_harvest_status.sql",
             ]:
-                conn.executescript((Path(__file__).resolve().parents[1] / "migrations" / migration).read_text(encoding="utf-8"))
+                conn.executescript((Path(__file__).resolve().parents[1] / "src" / "mal_updater" / "migrations" / migration).read_text(encoding="utf-8"))
                 conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (migration,))
-            conn.executescript((Path(__file__).resolve().parents[1] / "migrations" / "005_recommendation_score_snapshots.sql").read_text(encoding="utf-8"))
+            conn.executescript((Path(__file__).resolve().parents[1] / "src" / "mal_updater" / "migrations" / "005_recommendation_score_snapshots.sql").read_text(encoding="utf-8"))
             conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", ("005_recommendation_score_snapshots.sql",))
             conn.commit()
             apply_migrations(conn)

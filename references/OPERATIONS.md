@@ -1,256 +1,144 @@
 # Operations
 
-Cache operations: normal maintenance skips fresh complete MAL/provider evidence. Durable positive MAL search/detail, provider detail, recommendation metadata/harvest, complete public userrecs, and provider-eligibility evidence use a 120-day deterministic per-key +/-15-day refresh target where applicable. Refresh due is separate from usability: read/display last-known-good data survives a due or failed refresh, but malformed JSON, logic/identity mismatch, auth failure, or unverified evidence never becomes usable. Negative/no-match MAL search stays a short 3-day claim and TTL 0 preserves cache-disable behavior. Use `recommend-refresh-metadata --force-refresh` only for explicit repair/upstream verification of official MAL metadata/detail rows; that official anime-detail surface exposes only a practical top-10 `recommendations` set and must not overwrite a complete public userrecs harvest. Use `recommend-refresh-full-userrecs` for the bounded complete aggregate public MAL `/userrecs` cold path. A 365-day provider title-search hit remains identity-only and never creates availability; availability is governed by independent eligibility evidence. Only successful contradictory evidence or explicit semantic invalidation revokes a positive state.
+Commands are written as `mal-updater <command>`. From a source checkout run `PYTHONPATH=src python3 -m mal_updater.cli <command>` in the repo root; in the container run `docker compose exec -u 10001:10001 mal-updater mal-updater <command>`. The full command list is in `references/cli-recipes.md`.
 
-Effective daemon ownership defaults are intentionally separated: provider hot/incremental fetch hourly; MAL token refresh checked hourly but renewed only when the recorded access-token expiry is within 7 days or unknown (`mal-refresh --force` renews immediately); bounded MAL user-list refresh every 8 hours (10 network attempts and a matching 10-request cold projection against a 14-request task-hour cap, `limit=1000` pages, with durable partial pagination; the service passes `--complete`, so rows removed on MAL are pruned only after a traversal reaches its terminal page within the budget); recommendation metadata every 12 hours (3 seed rows plus 5 discovery targets); complete public MAL userrecs cold harvest hourly (3 source titles, 10 network attempts per source per run including final revalidation, resumable staging, deterministic 120 +/-15-day complete-refresh horizon); provider eligibility hourly in one credentialed-provider-specific lane (5 candidates, strict uncovered-first with refresh only when uncovered cannot fill capacity, 1 alias each, 5 returned matches); and DB/local recommendation snapshot/health hourly. The full-userrecs cold-start projection is 30 requests (3 x 10) against a 40-request task-hour cap, leaving it below the 0.8 warning gate while retaining the 120/hour global MAL budget, pacing, and learned-history gate. Unattended `sync_apply` ships disabled with execution limit `0`; an explicit positive config opt-in is required. Once enabled, each apply run is limited (`apply-sync --provider ...`) to providers whose fetch lane has succeeded since the previous apply (fetch lanes run on independent cadences, so no shared scheduler cycle is required); with no fresh provider the run is skipped (`fresh_provider_fetch_required`), so an old provider cache cannot authorize writes merely because the apply task is due. Per-item MAL failures make the apply run exit non-zero, which feeds the task failure backoff (capped at the task cadence) and the repeated-failure health warning. Eligibility lanes and the full-userrecs lane use both their task budget and the provider-global MAL/provider budget. Crunchyroll cold/full refresh is weekly and capped at 10 history + 2 watchlist pages; HIDIVE has no unattended periodic full refresh, but a hot run that cannot reach its stored history boundary within 20 history pages (`rpp=25`) escalates to a full refresh in the same run. Service configuration is process-start state: restart `mal-updater.service` after edits before trusting `service-status` as the effective-policy view.
+## Scheduler lanes and defaults
 
-Inspect the exact loaded policy and cache horizons with `service-status` (`niceness_policy` in JSON, `niceness_*` / `cache_*` in summary). These budgets and request-spacing values are local safety controls, not claims about provider limits.
+Service configuration is read at process start: restart the container (or `mal-updater.service`) after editing settings before trusting `service-status` as the effective-policy view. Inspect the loaded policy with `service-status` (`niceness_policy` in JSON, `niceness_*` / `cache_*` in summary). Budgets and request spacing are local safety controls, not claims about provider limits.
 
-Run commands from the repo root.
+| Lane | Default cadence and bounds |
+| --- | --- |
+| Provider fetch (`sync_fetch_<provider>`) | Hourly hot/incremental fetch per credentialed provider. Crunchyroll full refresh weekly, capped at 10 history + 2 watchlist pages. HIDIVE has no periodic full refresh; a hot run that cannot reach its stored history boundary within 20 history pages (`rpp=25`) escalates to a full refresh in the same run. A due full refresh that is over budget falls back to an incremental fetch and stays due. |
+| MAL token refresh (`mal_refresh`) | Checked hourly; renews only when the recorded access-token expiry is within 7 days or unknown (`mal-refresh --force` renews immediately). |
+| MAL list refresh (`mal_list_refresh`) | Every 8 hours; 10 network attempts per run against a 14-request task-hour cap, `limit=1000` pages. The service passes `--complete`, so rows removed on MAL are pruned only after a traversal reaches its terminal page. |
+| MAL apply (`sync_apply`) | **Disabled by default** (`service.task_execute_limits.sync_apply = 0`). With a positive opt-in, each run writes at most that many entries and applies only providers whose fetch lane succeeded since the previous apply (`apply-sync --provider ...`); with no fresh provider the run is skipped (`fresh_provider_fetch_required`). Per-item MAL failures make the run exit non-zero, which feeds failure backoff and the `scheduled_task_failures_repeated` health warning. |
+| Recommendation metadata | Every 12 hours; 3 seed rows plus 5 discovery targets. |
+| Public MAL userrecs harvest (`recommend_full_harvest`) | Hourly; 3 source titles, 10 network attempts per source per run including final revalidation, 120 +/-15-day refresh horizon; 30-request cold projection against a 40-request task-hour cap. |
+| Provider eligibility | Hourly, one lane per credentialed provider; 5 candidates (uncovered first), 1 alias query each, 5 returned matches. |
+| Recommendation snapshot and health | Hourly, DB/local only. |
+| Housekeeping | See the table below. |
 
-## Runtime layout
+All MAL lanes also share the 120-request/hour global MAL budget, request pacing, and learned-history projection gates. Eligibility and userrecs lanes are bounded by both their task budget and the provider-global budget.
 
-MAL-Updater keeps runtime state outside the skill tree under `.MAL-Updater/` by default.
+## Cache and evidence freshness
 
-Because this repository is public, only external runtime state may contain operator-specific secrets or machine-local residue. Anything tracked in git must stay anonymized and safe to publish.
+Normal maintenance skips fresh complete MAL/provider evidence. Durable positive evidence (MAL search/detail, provider detail, recommendation metadata, complete public userrecs, provider eligibility) uses a deterministic per-key 120-day +/-15-day refresh target. Refresh due is separate from usability: last-known-good data stays readable through a due or failed refresh, but malformed JSON, logic/identity mismatch, auth failure, or unverified evidence never becomes usable. Negative/no-match MAL search is a short 3-day claim; TTL 0 disables cache reuse. Only successful contradictory evidence or explicit semantic invalidation revokes a positive state, and stale evidence never authorizes MAL/provider writes or strict availability by itself.
 
-MAL-Updater runtime state lives under:
+Use `recommend-refresh-metadata --force-refresh` only for explicit repair of official MAL metadata rows; that API exposes only a top-10 `recommendations` set and must not overwrite a complete public userrecs harvest. A 365-day provider title-search hit is identity-only and never creates availability; availability comes from independent eligibility evidence, whose refresh records carry an `ok`/`failed` lifecycle with bounded exponential retry.
 
-- `.MAL-Updater/config/`
-- `.MAL-Updater/secrets/`
-- `.MAL-Updater/data/`
-- `.MAL-Updater/state/`
-- `.MAL-Updater/cache/`
+## Runtime layout and configuration
 
-Use `bootstrap-audit` or `status` to see the resolved paths for the current install.
+The runtime root is `/data` in the container and `.MAL-Updater/` in the workspace for native installs (layout in `ARCHITECTURE.md`; `status` or `bootstrap-audit` prints the resolved paths). Settings load from `MAL_UPDATER_SETTINGS_PATH` when set, otherwise `<runtime root>/config/settings.toml`; relative paths in it resolve against the settings file. All settings and environment overrides are listed in `references/settings.toml.example` and `references/env.example`. Only runtime state may contain operator secrets; everything tracked in git stays anonymized.
 
 ## First-line inspection
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit
-PYTHONPATH=src python3 -m mal_updater.cli bootstrap-audit --summary
-PYTHONPATH=src python3 -m mal_updater.cli status
-PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit
-PYTHONPATH=src python3 -m mal_updater.cli runtime-retention-audit --format summary
-PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
-PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
-PYTHONPATH=src python3 -m mal_updater.cli health-check
-PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
+mal-updater status
+mal-updater bootstrap-audit --summary
+mal-updater service-status --format summary
+mal-updater service-status --strict --format summary
+mal-updater health-check --format summary
+mal-updater runtime-retention-audit --format summary
 ```
 
-`runtime-retention-audit` is diagnostic-only. It validates the configured runtime root for nested `.MAL-Updater` markers, repo/source overlap, symlink escapes, and missing/non-directory managed top-level paths, then reports bounded aggregate retention inventory for DB backups, health snapshots, logs/request events, tmp, cache, and artifacts. It does not enumerate secret filenames or contents and does not produce archive/delete/prune/chmod/move commands. Use `--strict` only when layout errors should fail an automation gate; old retained files and threshold review candidates stay warning-only, and scan/threshold caps are tunable with the `--max-*` and `--warn-*` options.
+`runtime-retention-audit` is diagnostic-only. It checks the runtime root for nested `.MAL-Updater` markers, repo/source overlap, symlink escapes, and missing managed paths, then reports bounded aggregate inventory for DB backups, health snapshots, logs/request events, tmp, cache, and artifacts. It never lists secret names or contents and never deletes anything. `--strict` fails only on layout errors; scan and warning thresholds are tunable with the `--max-*` and `--warn-*` options.
 
-### Housekeeping and retention inventory
+## Housekeeping and retention
 
-| Surface | Cadence | Current policy |
+| Surface | Cadence | Policy |
 | --- | --- | --- |
-| Recommendation score snapshots | Every scheduler pass (normally hourly) | Logical deletion only: 14-day horizon, newest 30 runs/kind protected, 10,000-row cap per pass; never triggers hourly `VACUUM`. |
-| Recommendation decision ledger | Every scheduler pass (normally hourly) | Logical deletion of whole runs (run plus its items) older than 30 days, at most 25 runs per pass in one transaction; SQL triggers reject deletes of rows younger than 7 days and the configured retention is floored there. |
-| API request telemetry (`api-request-events.jsonl`) | Every scheduler pass (normally hourly) | Atomic, fail-closed pruning of events older than 14 days; malformed telemetry blocks pruning and preserves the original file. |
-| SQLite physical compaction | Checked weekly; successful runs at least 30 days apart | Requires both 128 MiB and 10% freelist, verified fresh backup, pre/post-backup free-space gates, and writer exclusion. |
-| Health artifacts | Health task normally hourly; retention daily | `latest-health-check.json` is never deleted. Timestamped JSON history keeps 30 days and at least the newest 168 snapshots, deleting at most 1,000 safe-name regular files/pass; any unsafe name, symlink, or filesystem error blocks the pass. |
-| Service logs | Written continuously; checked before every append | `service.log` rotates before an append would exceed 16 MiB and retains five numbered generations. Symlinks/special files block appends; failures are not recursively logged. |
-| Database backups | Created by operators and before compaction/restore; audited weekly | After each successful compaction, `db_compaction` deletes its own `mal-updater-pre-vacuum-<epoch>.tar.gz` archives older than 30 days (never the archive it just wrote). All other backups are manual retention only: the read-only runtime inventory reports review candidates, and removal requires an explicit owner decision. |
-| Other runtime families (auth/provider data, tmp, cache, artifacts, ambiguous files) | Audited weekly | Automatic bounded read-only inventory only. Any archive/prune/delete action remains explicit and human-gated; the audit never mutates these families. |
+| Recommendation score snapshots | Every scheduler pass | Logical deletion: 14-day horizon, newest 30 runs per kind protected, at most 10,000 rows per pass; never VACUUMs. Reported as `recommendation_snapshot_retention` in service state. |
+| Recommendation decision ledger | Every scheduler pass | Whole runs older than 30 days, at most 25 runs per pass; SQL triggers reject deleting rows younger than 7 days, and the configured retention is floored there. |
+| API request telemetry (`api-request-events.jsonl`) | Every scheduler pass | Atomic pruning of events older than 14 days; malformed telemetry blocks pruning and preserves the file. |
+| SQLite compaction (`db_compaction`) | Checked weekly; successful runs at least 30 days apart | Details below. |
+| Health artifacts | Retention daily | `latest-health-check.json` is never deleted. Timestamped history keeps 30 days and at least the newest 168 snapshots, deleting at most 1,000 files per pass; unsafe names, symlinks or filesystem errors block the pass. |
+| Service log | Before every append | `service.log` rotates before an append would exceed 16 MiB; five generations are kept. |
+| Database backups | Weekly audit | `db_compaction` deletes its own `mal-updater-pre-vacuum-<epoch>.tar.gz` archives older than 30 days (never the one it just wrote). Other backups are removed only by an explicit operator decision. |
+| Other runtime families | Weekly audit | Read-only inventory; any archive/prune/delete is human-gated. |
 
-Every listed surface now has recurring automatic maintenance or a recurring
-read-only audit with explicit human-gated action. Automatic deletion remains
-limited to established telemetry/snapshot/decision-ledger policy, safe timestamped
-health history, and expired automatic pre-vacuum archives; other backups,
-auth/provider data, ambiguous mappings, and arbitrary files are never selected
-by these housekeeping lanes.
+Deleting rows does not shrink the SQLite file. `db_compaction` VACUUMs only when every gate passes: the last successful compaction is at least 30 days old; the freelist is at least 128 MiB and at least 10% of pages; the scheduler singleton and the shared DB writer lock are held; the DB volume has room for a rewrite plus margin; and a fresh backup under `<runtime root>/state/backups/` verifies by manifest and checksum. Free space is checked again after that backup and immediately before VACUUM. VACUUM runs in a child process with its temporary files on the database volume (not a small `/tmp` tmpfs); a failure is reported as a task error with failure backoff. VACUUM holds an exclusive lock, so expect a pause while it runs; stop non-repo SQLite writers first or disable it with `service.db_compaction_every_seconds = 0`. `service-status` shows cadence, last result, backup path, bytes reclaimed, skip/block reason, and next due.
 
-## Initialize runtime / DB
+## Provider auth and fetch
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli init
+mal-updater provider-auth-login --provider crunchyroll
+mal-updater crunchyroll-link
+mal-updater provider-auth-login --provider hidive
+mal-updater provider-fetch-snapshot --provider crunchyroll --ingest
+mal-updater provider-fetch-snapshot --provider crunchyroll --full-refresh --ingest
+mal-updater provider-fetch-snapshot --provider hidive --ingest
 ```
 
-## MAL auth
+`provider-auth-login` logs in and writes local token/session state. `crunchyroll-link` is the password-free alternative: it prints a TV activation code to approve at crunchyroll.com/activate, and the linked session renews itself. `provider-fetch-snapshot` reads the provider and writes local snapshot/boundary state; `--ingest` also updates the local SQLite provider cache (never MAL). Crunchyroll accepts the page chunk flags `--max-history-pages`, `--max-watchlist-pages`, `--history-start-page` and `--watchlist-start`; HIDIVE rejects them. HIDIVE surfaces and health rules are in `references/hidive-provider-recon.md`.
+
+Request spacing and retry caps live in `[mal]`, `[crunchyroll]` and `[hidive]`, separate from hourly budgets. Request starts are coordinated per provider across processes through `<runtime root>/state/provider-request-gates/`. Retries apply only to safe GET/read requests; MAL authorization-code/refresh POSTs, Crunchyroll and HIDIVE login/token POSTs, and MAL PUT writes are always single-attempt. Investigate an ambiguous timeout before authenticating or applying again.
+
+## Review, sync and seasons
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli mal-auth-url
-PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
-PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
-PYTHONPATH=src python3 -m mal_updater.cli mal-whoami
+mal-updater review-mappings --limit 0 --mapping-limit 5 --persist-review-queue
+mal-updater list-review-queue --summary --issue-type mapping_review
+mal-updater dry-run-sync --limit 20 --approved-mappings-only
+mal-updater apply-sync --limit 8 --exact-approved-only
+mal-updater apply-sync --limit 8 --exact-approved-only --execute
+mal-updater season-mappings --unresolved
+mal-updater season-mappings --approve --provider crunchyroll --provider-series-id <id> --provider-season-key <key> --mal-anime-id <mal-id>
 ```
 
-## Provider auth / fetch
+`dry-run-sync`, queue listing/worklist commands and mapping review are local planning surfaces. `apply-sync` without `--execute` revalidates and prints what it would write; `--execute` is the only MAL-mutating path. It plans every approved series from cached MAL state; `--limit` bounds the live revalidations/writes (0 means unbounded), most recently watched first, and the remainder is reported as `deferred` for later runs. `--provider` (repeatable) restricts it to evidence from the named providers. It exits non-zero when any item failed.
+
+A provider series whose progress spans several canonical seasons (Crunchyroll dubs collapse onto their original-language season) is planned per season, because MAL lists each season as its own entry. Seasons are matched by the provider season catalog's air/publish dates and episode counts against MAL entries in the series' franchise, with the series mapping engine's auto-approval rules; at most `--mapping-limit` new searches run per pass and unresolved seasons are retried weekly. Seasons that cannot be matched are never written: they go to review and raise the `unresolved_season_mappings` health warning until approved with `season-mappings --approve`. Each MAL entry uses the provider's episode numbers when an earlier provider season maps to the same entry, and the in-season position otherwise; split-cour seasons are divided between MAL Part 1 and Part 2. Unnumbered items (PVs, recaps, OVAs, movies inside a series) do not count as episodes.
+
+Upgrade note (migrations 032 and later): progress rows ingested before season capture carry no season key, and once a series has keyed rows its unkeyed rows are ignored. Right after upgrading, run `provider-fetch-snapshot --provider crunchyroll --full-refresh --max-history-pages 100 --ingest` (repeat until history is complete) and the same full refresh for `hidive`, so every row is re-observed with its season.
+
+## MAL user-list refresh
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
-PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --full-refresh
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest
-PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --full-refresh
-
-Provider eligibility refresh evidence carries a versioned `ok`/`failed` lifecycle with bounded exponential retry timestamps; a successful refresh resets the failure count and retry timestamp, while a failed expired refresh remains non-actionable until its next retry window.
-
-Provider request spacing and retry caps live in `[mal]`, `[crunchyroll]`, and
-`[hidive]`. They are local niceness policy, separate from daemon hourly budgets
-and not representations of provider-published limits. Request starts coordinate
-through `.MAL-Updater/state/provider-request-gates/` across client instances and
-processes. Retry telemetry counts each network attempt. Retries are restricted
-to safe GET/read requests: MAL authorization-code/refresh POSTs, Crunchyroll
-login/token POSTs, HIDIVE login/refresh POSTs, and MAL PUT writes are always
-single-attempt. Investigate an ambiguous timeout before authenticating or
-applying again; recoverable token/credential state is left in place.
+mal-updater mal-list-refresh --max-pages 10
 ```
 
-`provider-auth-login` is live/provider-auth-mutating for the named provider because it logs in and writes local token/session state. `provider-fetch-snapshot` is live/provider-read and may write local cache/state; adding `--ingest` also mutates the local SQLite provider cache. HIDIVE auth/session state plus account history, Continue Watching, favourites-as-watchlist, and custom-list collection/detail snapshots are supported; HIDIVE recommendation enrichment/title lookup remains bounded to specific-title search, and HIDIVE full refresh is manual/non-chunked. Crunchyroll additionally supports the page chunk/resume flags documented in CLI help.
+`mal-list-refresh` persists an account/query generation and a fair per-status traversal queue (never-started, resumable, retry-due, then routine refresh). Every parsed page, staged row set, opaque same-origin cursor, fingerprint and anchor commits atomically, and bounded runs resume the exact cursor. `--max-pages` is a request-attempt budget over every MAL call, including the authenticated identity lookup, continuation, revalidation and the pre-publication identity recheck; `--max-pages 0` makes no network call and changes no refresh state. Pages request `limit=1000` (MAL's maximum). Fingerprints cover only retained semantic fields (node id/title/num_episodes/media_type/status and `list_status`), never presentation fields such as `main_picture`.
 
-## Review / sync
+Publication is generation-wide and atomic. It requires a revalidated account identity, unchanged query/logic identity, complete `data` + `paging` structure, strict offset cursor progression, an explicit terminal state for every partition, no duplicate MAL IDs, and current fingerprints for every staged page. `paging.next` may be absent only on a validated short terminal page. A per-account publication epoch prevents an older generation from overwriting a newer one. Only the canonical `all` query can prune globally; a status subset prunes only its own statuses.
+
+MAL exposes offset pagination, not snapshot tokens, so concurrent insertion/deletion/reorder is detected rather than accepted: drift restarts a fresh generation up to 3 times per run, then ends the run as a resumable partial. Auth (401/403) and network failures retry on a later run. Only contract violations (malformed rows/cursors, unsupported statuses) quarantine. The published list stays last-known-good throughout. Inspect the JSON `traversal` object (`references/JSON_CONTRACT.md`) for queue, cursor, request, drift and validation state.
+
+## Public MAL userrecs harvest
 
 ```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli review-mappings --limit 0 --mapping-limit 5 --persist-review-queue
-PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --summary --issue-type mapping_review
-PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --limit 20 --approved-mappings-only
-PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute
-PYTHONPATH=src python3 -m mal_updater.cli season-mappings --unresolved
-PYTHONPATH=src python3 -m mal_updater.cli season-mappings --approve --provider crunchyroll --provider-series-id <id> --provider-season-key <key> --mal-anime-id <mal-id>
+mal-updater recommend-refresh-full-userrecs --limit 3 --max-pages 10
+mal-updater recommend-refresh-full-userrecs --limit 5 --force-refresh --format summary
+mal-updater recommend-coverage
 ```
 
-`dry-run-sync`, queue listing/worklist commands, and mapping review generation are local planning/diagnostic surfaces. `apply-sync --execute` is the live MAL-mutating path; keep it exact-approved and bounded unless an operator explicitly approves broader catch-up. `apply-sync` plans every approved series from cached MAL state and `--limit` bounds only the live revalidations/writes, most recently watched first; the remainder is reported as one `deferred` result and picked up by later runs. It exits non-zero when any item failed.
+Seeds are the cached MAL `@me` list entries that count as watched-positive (`completed`, `watching`, `on_hold`); `dropped`, `plan_to_watch` and provider-only mappings are excluded. The client reads public HTML from `mal.public_base_url`, accepts only the same HTTPS origin, the source anime `/userrecs` path and a positive-integer `p` cursor, follows only advertised same-origin next links, and stores only target MAL ID, title and recommender count; prose and usernames are not retained.
 
-A provider series whose progress spans several canonical seasons (Crunchyroll dubs collapse onto their original-language season) is planned per season, because MAL lists each season as its own entry. Each season is matched with the series mapping engine and auto-approval rules (at most `--mapping-limit` new searches per run, unresolved seasons retried weekly); seasons that cannot be matched are never written, go to review, and raise the `unresolved_season_mappings` health warning until approved with `season-mappings --approve`. Unnumbered items (PVs, recaps, OVAs, movies inside a series) do not count as episodes, and watched counts above the MAL episode count are rebased on the first observed episode number or sent to review.
+Pages are staged in an open generation and stay non-authoritative until a complete recognized document, unambiguous pagination, a coherent terminal chain, and immediate revalidation of every staged page prove the exact staged revision; publication then replaces the source's graph in one transaction. `--max-pages` counts every network attempt including resume and final revalidation; exhaustion pauses rather than publishing, and zero returns before any queue or generation mutation. Malformed or truncated HTML, unsafe or conflicting next links, loops, drift, oversize bodies and transient HTTP failures preserve the previous edges. MAL's real empty page (its exact empty-state sentence, the title's make-recommendation link, no rows and no next page) publishes an empty source after final revalidation.
 
-Upgrade note (migrations 032/033): progress rows ingested before season capture carry no season key, and once a series has keyed rows its unkeyed rows are ignored by sync planning. Run a full provider refresh right after upgrading (`provider-fetch-snapshot --provider crunchyroll --full-refresh --ingest`, repeated until history is complete, and the same for `hidive`) so every row is re-observed with its season instead of waiting for the weekly Crunchyroll full refresh.
+Source scheduling is durable and strict uncovered-first: never started, resumable, retry-due, then routine refresh, with a monotonic selection sequence for fairness. A source claim is an expiring lease; its token, expiry, source/generation identity and revision fence every mutation and publication.
 
-## Recommendation full userrecs harvest
+## Quarantine recovery
 
-```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli mal-list-refresh --max-pages 10
-PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 3 --max-pages 10
-PYTHONPATH=src python3 -m mal_updater.cli recommend-refresh-full-userrecs --limit 5 --force-refresh --format summary
-PYTHONPATH=src python3 -m mal_updater.cli recommend-coverage
-```
-
-`recommend-refresh-full-userrecs` seeds only from the cached official MAL `@me` anime list statuses that count as watched-positive for recommendation semantics: `completed`, `watching`, and `on_hold`. It intentionally excludes `dropped` and `plan_to_watch` and does not use provider-only mappings as full-harvest seeds. The client reads public MAL HTML from the configured `mal.public_base_url`, validates same HTTPS origin plus the source anime `/userrecs` path and its positive-integer `p` page cursor, follows only advertised same-origin next links, dedupes target MAL IDs deterministically, and stores only target MAL ID/title plus aggregate recommender count. Recommendation prose and usernames are not retained.
-
-Atomicity guarantee: fetched pages/edges are staged in an open generation and remain non-authoritative until a complete recognized userrecs document, unambiguous validated pagination, a coherent terminal chain, and immediate revalidation of every staged page prove the exact staged revision. Publication then replaces the source's recommendation graph in one transaction. `--max-pages` counts every actual network attempt, including resume and all final revalidations; orchestrated calls disable inner retries. Exhaustion pauses rather than publishing, and zero returns before queue sync/claim/fairness or outcome mutation. Malformed/truncated HTML, any unsafe or conflicting next candidate, loops/drift, oversize bodies, and transient HTTP failures preserve previous edges.
-
-Source scheduling is durable and strict uncovered-first. Capacity is filled by class in this order: **never started**, resumable incomplete generation, retry-due failure, then routine stale/expiry refresh. Fairness inside a class uses a durable collision-free monotonic selection sequence, not second-resolution timestamps. A source claim is an expiring CAS lease; token, live expiry, source/generation identity, and generation revision fence every orchestrated mutation and publication. Long crawls renew only at safe request boundaries. Retry generation/queue timing and class are committed together.
-
-MAL exposes no immutable userrecs snapshot token. Every resumed generation and every same-run terminal generation therefore re-fetches and fingerprints every staged page before publication. This costs one request per staged page; insufficient validation budget pauses fail-closed. Duplicate targets, cursor fallback, unsafe/conflicting links, repeated/backward/skipped ranges, syntactic truncation, or unexpectedly shortened chains fail closed. Validation is persisted against the exact staged revision. Empty publication additionally requires a dedicated MAL empty-state container, recognized userrecs surface, complete document, zero rows/cursors, and final revalidation; ordinary paragraph text is diagnostic/manual-review only.
-
-## User-systemd daemon
-
-The scheduler also bounds `recommendation_score_snapshots` during each task
-pass. By default it deletes at most 10,000 rows older than 14 days while always
-preserving the newest 30 distinct runs for each recommendation kind (including
-the current dashboard run). Fourteen days is the bounded operational history
-horizon; the independent run floor protects sparse kinds and immediately makes
-older high-volume history eligible instead of waiting through a growth-prone
-90-day window. The result is recorded in service state as
-`recommendation_snapshot_retention`, including deleted/remaining eligible rows
-and SQLite page/freelist counts. Configure the three
-`service.recommendation_snapshot_*` settings shown in
-`references/settings.toml.example` if the defaults need adjustment.
-
-Deletion bounds future logical growth but SQLite does not shrink the database
-file automatically. Physical compaction is a separate low-frequency housekeeping
-lane named `db_compaction`, not part of the hourly logical snapshot prune. By
-default the daemon checks weekly but VACUUMs only when all fail-closed gates pass:
-the previous successful compaction is at least 30 days old, SQLite freelist bytes
-are at least 128 MiB and at least 10% of pages, the scheduler singleton is held,
-repo-native DB writers are excluded by the shared DB lock, the DB volume has
-space for a SQLite rewrite plus margin, and a fresh container-native backup under
-`.MAL-Updater/state/backups/` verifies by manifest/checksum. Free space is checked
-again after retaining that archive and immediately before `VACUUM`. The 128 MiB
-and 10% defaults deliberately qualify the observed 175.3 MiB / 14.43% steady-state
-freelist while still requiring both meaningful absolute and proportional waste. After a successful `VACUUM` this lane
-deletes only its own pre-vacuum archives older than 30 days, always keeping the
-one it just wrote; `pruned_backup_archives` and `backup_prune_error_type` report
-the result. Other backups remain manual-policy.
-
-SQLite `VACUUM` takes an exclusive database lock and rewrites the database file,
-so expect a maintenance pause while `db_compaction` is running. It is safe to
-leave enabled for the repo-native daemon because normal scheduler tasks cannot
-race it; if non-repo/manual SQLite writers are active, stop them first or disable
-`service.db_compaction_every_seconds`. Inspect cadence, last result, backup path,
-bytes reclaimed, skip/block reason, and next due through `service-status` (JSON
-or summary) before and after rollout.
-
-```bash
-cd <repo-root>
-scripts/install_user_systemd_units.sh
-PYTHONPATH=src python3 -m mal_updater.cli service-status
-PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
-PYTHONPATH=src python3 -m mal_updater.cli service-status --strict --format summary
-PYTHONPATH=src python3 -m mal_updater.cli restart-service
-```
-
-`service-run-once` is a live/mutating-capable manual daemon pass, not a routine inspection command. It can run due provider fetches, local ingest, and exact-approved MAL apply lanes; use it only after explicit operator intent, and use `service-status` / `health-check` for read-only verification.
-
-Use one install path, not both, for routine setup. Prefer `scripts/install_user_systemd_units.sh` for production bootstrap because it renders the host-specific `mal-updater.service` from the repo template under `ops/systemd-user/` and preserves/installs the service env file. The CLI `install-service` path is a compatibility/direct service-manager path for targeted repair or tests. The tracked daemon unit uses conservative user-service sandboxing (`UMask=0077`, `NoNewPrivileges=true`, `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, and a narrow address-family allowlist) while allowing the resolved MAL-Updater runtime/config/secrets/data/state/cache/DB directories to remain writable for SQLite, logs, token refreshes, and service state through a de-duplicated `ReadWritePaths` allowlist. The deterministic renderer intentionally supports absolute systemd paths without whitespace/control characters and fails fast on unsupported path values instead of emitting ambiguous unit syntax.
-
-The optional dashboard unit `mal-updater-dashboard.service` is also tracked and rendered by the same installer, but it is not installed or enabled unless explicitly requested. Use `scripts/install_user_systemd_units.sh --install-dashboard` to render it without enabling it, or `--enable-dashboard` to opt in to enablement. Its template runs `dashboard-serve --host 127.0.0.1` through the repo venv and the same service env file; do not change it to a non-loopback bind unless you are deliberately reviewing a separate exposure decision. `--start-service` restarts only the main daemon, not the optional dashboard.
-
-`service-status` remains a non-failing inspection command by default. Add `--strict` for automation gates; strict mode exits 2 when the main daemon unit/env/systemctl/runtime parse status is not automation-ready. A stopped, disabled, or absent optional dashboard is not considered a main-daemon failure.
-
-### Request budgets and telemetry
-
-Every outbound MAL, Crunchyroll, and HIDIVE attempt made by the supported clients—including auth helpers, retries/timeouts, and HIDIVE Algolia title search—is written to `.MAL-Updater/state/api-request-events.jsonl`. Daemon subprocesses inherit task/run attribution; direct CLI commands create their own CLI run context. Query values, credential material, request headers, and request bodies are not logged.
-
-Daemon learned projections count events attributed to the exact run rather than subtracting two rolling-window totals, so events aging out during a long run cannot erase new attempts. Task-specific hourly limits are enforced in addition to the provider-global limit, never instead of it. Legacy unattributed telemetry remains globally budgeted and is included conservatively in task gates. `service-status` exposes the resulting request delta/projection and global/task counts; stop the daemon and inspect malformed JSONL manually rather than editing live telemetry under an active service.
-
-## MAL redirect configuration
-
-Use the redirect URI reported by:
-
-```bash
-cd <repo-root>
-PYTHONPATH=src python3 -m mal_updater.cli status
-```
-
-Specifically use the `mal.redirect_uri` value when creating/configuring the MAL app.
-
-## Issue reporting / feedback
-
-If MAL-Updater misbehaves during real usage — whether in the OpenClaw skill flow or the Python back-end daemon/runtime — report it upstream via:
-
-- <https://github.com/kklouzal/MAL-Updater/issues>
-
-Use GitHub issues for bugs, regressions, portability problems, onboarding friction, and feature requests so upstream maintenance stays informed by real-world usage.
-
-## Tests
-
-```bash
-cd <repo-root>
-QUALITY_TMP="$(mktemp -d /tmp/mal-updater-quality.XXXXXX)"
-mkdir -p "$QUALITY_TMP/home" "$QUALITY_TMP/tmp" "$QUALITY_TMP/runtime/config"
-HOME="$QUALITY_TMP/home" \
-TMPDIR="$QUALITY_TMP/tmp" \
-MAL_UPDATER_RUNTIME_ROOT="$QUALITY_TMP/runtime" \
-MAL_UPDATER_RUNTIME_DIR="$QUALITY_TMP/runtime" \
-MAL_UPDATER_SETTINGS_PATH="$QUALITY_TMP/runtime/config/settings.toml" \
-MAL_UPDATER_CONFIG="$QUALITY_TMP/runtime/config/settings.toml" \
-MAL_UPDATER_QUALITY_TMP="$QUALITY_TMP" \
-scripts/quality.sh
-```
-
-### Durable MAL user-list pagination runbook
-
-`mal-list-refresh --status ... --max-pages N` retains its compatible option name but is a request-attempt budget over every MAL invocation, including authenticated `get_my_user`, continuation, every-page snapshot revalidation, and the pre-publication identity recheck. Orchestrated GETs disable inner retries and record each attempt before invocation. Requested statuses rotate fairly: never-started first, then resumable, retry-due, and routine refresh. An exhausted budget returns `partial`; rerunning with the same account/query resumes the persisted opaque cursor. `--max-pages 0` is read-only/no-network/no refresh-state mutation.
-
-Publication is generation-wide and atomic. It requires authenticated account identity revalidated before publication, unchanged query/logic identity, complete `data` + `paging` structure, full nonterminal pages with strict expected-offset cursor progression, explicit terminal state for every partition, no duplicate staged MAL IDs, current fingerprints/anchors for every staged page, and strong empty proof where applicable. `paging.next` may be omitted only on a validated short terminal page (including an empty page), where it is canonicalized to `null`; a full page without `next`, malformed present `next`, or a short page with a non-null `next` fails closed. Validation hashes the exact stored page/row JSON bytes plus all publication-relevant cursor, counter, partition, terminal, account-epoch, generation-revision, and one-use local identity-assertion state; any post-validation mutation rejects in the publication transaction. A per-account publication epoch/current-generation fence prevents an older/different page-size or query generation from reusing a later assertion or overwriting a newer publication. Pruning scope is derived from persisted validated partitions: only the canonical `all` query can prune globally, while a subset may prune only its exact MAL statuses and always preserves unknown/out-of-scope rows. Only contract violations are quarantined terminally and cannot be selected or ordinarily reclaimed until explicit safe reinitialization; auth (401/403) and network failures retry on a later run, and snapshot drift restarts a fresh generation up to 3 times per run before ending the run as a resumable partial. Drift quarantines recorded by pre-v4 logic are resumed automatically. Publication SQL failure rolls back LKG/staging changes and releases the lease for a recoverable retry. Inspect the additive JSON `traversal` object for queue classes, cursors, revisions/claims, request counts, retry/drift/quarantine state, validation, and empty proof. MAL has no immutable list snapshot token; repeated upstream churn can therefore delay publication indefinitely by design while LKG remains published.
-### Explicit MAL quarantine recovery
-
-Quarantine is durable: ordinary list/userrecs runs and queue synchronization never clear it. After an operator verifies the exact account/query or public source provenance, use one of these audited, narrowly scoped maintenance commands:
+Quarantine is durable; ordinary runs never clear it. After verifying the account/query or public source, use the audited reinitialize commands:
 
 ```bash
 mal-updater mal-list-reinitialize --status all --page-size 1000 --reason "<review/ticket and operator rationale>"
 mal-updater recommend-reinitialize-full-userrecs --source-mal-anime-id 1 --source-url https://myanimelist.net/anime/1/Cowboy_Bebop/userrecs --reason "<review/ticket and operator rationale>"
 ```
 
-Both commands preserve published last-known-good rows and all prior generation history. They only create a fresh fenced generation; they do not fetch list/userrecs pages or publish data. The MAL-list command performs one authenticated identity lookup and requires an exact match to the quarantined account/query authority. Reinitialization always creates a generation under the current list logic version and replaces the latest quarantined generation of the same account/status lineage, whatever its earlier logic version or page size; ordinary refreshes never clear a contract quarantine automatically.
+Both keep published last-known-good rows and prior generation history and only create a fresh fenced generation; they fetch and publish nothing. The MAL-list command makes one authenticated identity lookup that must match the quarantined account/query, and replaces the latest quarantined generation of that account/status lineage under the current list logic version.
+
+## Manual shadow audits
+
+These are descriptive diagnostics, not part of ranking or automation:
+
+- `recommend-suggestions-audit [--limit 100] [--output report.json]` makes one OAuth `GET /v2/anime/suggestions` request (no pagination), reads the database query-only, and emits only cohort sizes, overlap/novelty counts and aggregate quality distributions; no suggestion IDs, titles, ranks or raw payload.
+- `MAL_UPDATER_CRUNCHYROLL_RECOMMENDATION_SHADOW_ENABLED=true mal-updater crunchyroll-recommendation-shadow-audit --access-token-file TOKEN --account-id-file ACCOUNT --output report.json` makes bounded GET-only native-recommendation and home-feed probes. Both input files must be mode `0600`; the database is opened query-only and verified unchanged; output is aggregate counts only.
+
+## Request budgets and telemetry
+
+Every outbound MAL, Crunchyroll and HIDIVE attempt (including auth helpers, retries/timeouts and HIDIVE Algolia title search) is written to `<runtime root>/state/api-request-events.jsonl` with task/run attribution. Query values, credentials, headers and bodies are never logged (format in `references/JSON_CONTRACT.md`). Learned projections count events attributed to the exact run. Task hourly limits apply in addition to the provider-global limit, never instead of it; legacy unattributed events count toward both. Stop the scheduler before inspecting malformed telemetry by hand rather than editing the live file.
+
+## Tests
+
+See `references/QUALITY.md`.

@@ -97,15 +97,12 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
             )
         )
 
-    def test_migration_catalog_and_repository_package_parity_for_015(self) -> None:
+    def test_migration_catalog_orders_and_applies_015(self) -> None:
         self.assertIn(db.PUBLIC_USERRECS_STAGING_MIGRATION, db.MIGRATION_FILENAMES)
         self.assertLess(
             db.MIGRATION_FILENAMES.index(db.PUBLIC_USERRECS_STAGING_MIGRATION),
             db.MIGRATION_FILENAMES.index(db.PROVIDER_WATCHLIST_MEMBERSHIP_MIGRATION),
         )
-        root_file = Path(__file__).resolve().parents[1] / "migrations" / db.PUBLIC_USERRECS_STAGING_MIGRATION
-        packaged = next(migration for migration in db.MIGRATIONS if migration.name == db.PUBLIC_USERRECS_STAGING_MIGRATION)
-        self.assertEqual(root_file.read_text(encoding="utf-8"), packaged.read_text(encoding="utf-8"))
         with connect(self.db_path) as conn:
             self.assertIsNotNone(
                 conn.execute(
@@ -271,6 +268,7 @@ class PublicUserRecsStagingDbTests(unittest.TestCase):
         claimed = claim_mal_public_userrecs_sources(
             self.db_path, limit=1, claim_token="worker-a", claim_seconds=60
         )[0]
+        self.assertEqual(1, claimed.source_mal_anime_id)
         generation = create_or_get_active_mal_public_userrecs_generation(
             self.db_path, source_mal_anime_id=1, source_url=SOURCE_URL, claim_token="worker-a"
         )

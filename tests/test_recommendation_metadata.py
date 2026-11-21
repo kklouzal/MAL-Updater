@@ -20,7 +20,6 @@ from mal_updater.db import (
     mark_mal_public_userrecs_generation_ready,
     replace_mal_public_userrecs_recommendation_edges,
     replace_mal_public_userrecs_staged_page,
-    replace_mal_recommendation_edges,
     replace_mal_user_anime_list_cache_generation,
     upsert_mal_anime_metadata,
     upsert_series_mapping,

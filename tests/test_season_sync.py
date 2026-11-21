@@ -836,7 +836,6 @@ class SeasonMappingCliAndHealthTests(unittest.TestCase):
             self.assertNotIn("unresolved_season_mappings", codes)
 
 
-
 class SeasonCatalogDateResolutionTests(unittest.TestCase):
     """Matching by season date windows (probed 2026-11-18 on the unresolved seasons)."""
 

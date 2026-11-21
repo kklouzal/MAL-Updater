@@ -26,7 +26,7 @@ Use `--summary` for terse line-oriented output.
 
 ## What bootstrap-audit tells you
 
-The default JSON output is intended to be automation-friendly: it includes per-provider readiness, per-provider operation-mode guidance/next-command hints, runtime-initialization readiness, secrets-dir permission posture, missing capability buckets, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts so partial installs are distinguishable from untouched ones, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action. MAL/provider `operation_guidance` now also preserves the same machine-readable next-command metadata used by the top-level recommendation list (`next_command_reason_code`, automation-safe posture, auth-interaction posture, and auth-remediation classification where relevant), so consumers that care about one lane do not have to rediscover that metadata elsewhere. It now also treats staged provider auth conservatively: if session residue or repeated unattended auth-style failures already indicate degradation, `bootstrap-audit` surfaces that as a re-bootstrap posture instead of claiming the provider is ready merely because token files are present.
+The default JSON output is intended to be automation-friendly: it includes per-provider readiness, per-provider operation-mode guidance/next-command hints, runtime-initialization readiness, secrets-dir permission posture, missing capability buckets, explicit manual-vs-daemon operation expectations, provider-intent/partial-bootstrap counts so partial installs are distinguishable from untouched ones, blocking vs non-blocking onboarding counts, and explicit `recommended_commands` entries when MAL-Updater can suggest an exact next CLI action. MAL/provider `operation_guidance` also preserves the same machine-readable next-command metadata used by the top-level recommendation list (`next_command_reason_code`, automation-safe posture, auth-interaction posture, and auth-remediation classification where relevant), so consumers that care about one lane do not have to rediscover that metadata elsewhere. It treats staged provider auth conservatively: if session residue or repeated unattended auth-style failures already indicate degradation, `bootstrap-audit` surfaces that as a re-bootstrap posture instead of claiming the provider is ready merely because token files are present.
 
 - resolved skill root, workspace root, and runtime root
 - runtime path layout
@@ -42,7 +42,7 @@ The default JSON output is intended to be automation-friendly: it includes per-p
 ### 1. Dependency check
 
 - Require `python3`
-- Treat `curl_cffi` as strongly recommended for live Crunchyroll auth/fetch reliability
+- `curl_cffi` and `requests` are package dependencies (`pip install .`, or `scripts/bootstrap.sh` which creates `.venv`); `curl_cffi` provides the browser-TLS transport for Crunchyroll
 - Treat `systemctl` as required only for the unattended user-systemd daemon path
 - Treat compatibility wrapper scripts as optional operator conveniences, not bootstrap blockers for the repo-native daemon/runtime flow
 
@@ -86,25 +86,25 @@ This persists MAL access/refresh tokens under the runtime secrets dir.
 
 Before staging secrets, verify the runtime secrets dir is outside version control and has appropriately restrictive local permissions for the user account.
 
-Prompt for source-provider credentials only when that provider is actually being enabled. The repo bootstrap helper asks per provider interactively; for non-interactive runs use `MAL_UPDATER_BOOTSTRAP_PROVIDERS=crunchyroll,hidive`, `all`, or `none` (alias: `MAL_UPDATER_BOOTSTRAP_SOURCE_PROVIDERS`). `MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS=yes|no|prompt` controls whether selected live auth bootstraps run; unselected provider credential files are neither required nor modified.
+Prompt for source-provider credentials only when that provider is actually being enabled. The repo bootstrap helper `scripts/bootstrap.sh` asks per provider interactively; for non-interactive runs use `MAL_UPDATER_BOOTSTRAP_PROVIDERS=crunchyroll,hidive`, `all`, or `none` (alias: `MAL_UPDATER_BOOTSTRAP_SOURCE_PROVIDERS`). `MAL_UPDATER_BOOTSTRAP_RUN_AUTH_STEPS=yes|no|prompt` controls whether selected live auth bootstraps run; unselected provider credential files are neither required nor modified.
 
 #### Crunchyroll
 
-Stage the user’s Crunchyroll username/password in the runtime secrets dir, then run:
+Either link the account without a password (prints a TV activation code for the user to approve at crunchyroll.com/activate):
+
+```bash
+cd {baseDir}
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-link
+```
+
+or stage the user’s Crunchyroll username/password in the runtime secrets dir and run:
 
 ```bash
 cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
 ```
 
-Compatibility wrapper still exists:
-
-```bash
-cd {baseDir}
-PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-auth-login
-```
-
-This creates the staged Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`.
+Both create the Crunchyroll auth state under `.MAL-Updater/state/crunchyroll/<profile>/`; a linked session counts as fully configured.
 
 #### HIDIVE
 
@@ -138,18 +138,11 @@ PYTHONPATH=src python3 -m mal_updater.cli health-check --format summary
 
 Do not use `service-run-once` as a routine/read-only verification step. It is a live/mutating-capable manual daemon pass that can run due provider fetches, local ingest, and bounded exact-approved MAL apply work; run it only after explicit operator intent.
 
-On a fully bootstrapped install, normal background operation now means:
-- one provider fetch lane per credentialed source provider
-- one shared aggregate MAL apply lane
-- provider usage gated by credential/runtime state rather than hardcoded enable flags
+On a fully bootstrapped install, background operation means one fetch lane per credentialed provider plus the MAL list, recommendation and housekeeping lanes. The shared MAL apply lane (`sync_apply`) stays disabled until the operator sets `service.task_execute_limits.sync_apply` to a positive value and restarts the service; ask before doing that.
 
 ## Issue reporting / feedback
 
-If a third-party install hits bugs, missing dependencies, confusing bootstrap behavior, daemon/runtime failures, or other rough edges, report them upstream via:
-
-- <https://github.com/kklouzal/MAL-Updater/issues>
-
-That issue tracker is the authoritative place for bug reports and feature requests affecting either the OpenClaw skill experience or the Python back-end.
+Report bugs, missing dependencies, confusing bootstrap behavior and feature requests at <https://github.com/kklouzal/MAL-Updater/issues>.
 
 ## Non-goals
 

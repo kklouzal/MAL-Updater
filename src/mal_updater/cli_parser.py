@@ -375,8 +375,8 @@ def build_parser() -> argparse.ArgumentParser:
     reopen_review_queue.add_argument("--fix-strategy-family", default=None, help="Only reopen rows whose normalized decision+reason-family strategy exactly matches this value")
     reopen_review_queue.add_argument("--cluster-strategy-family", default=None, help="Only reopen rows whose combined franchise/fix-strategy-family bucket exactly matches this value")
     apply_sync = subparsers.add_parser("apply-sync", help="Guarded MAL executor that only operates on approved mappings and forward-safe proposals")
-    apply_sync.add_argument("--limit", type=int, default=20, help="How many ingested series to inspect")
-    apply_sync.add_argument("--mapping-limit", type=int, default=5, help="Reserved for parity with dry-run planning")
+    apply_sync.add_argument("--limit", type=int, default=20, help="Maximum live MAL revalidations/writes this run (0 = no limit)")
+    apply_sync.add_argument("--mapping-limit", type=int, default=5, help="Maximum new MAL season searches this run")
     apply_sync.add_argument(
         "--exact-approved-only",
         action="store_true",

@@ -437,7 +437,6 @@ class ProviderCliTests(unittest.TestCase):
         enrich_args = parser.parse_args(["recommend-enrich-provider-availability"])
         self.assertEqual(5, enrich_args.limit)
 
-        command_parsers = _command_parsers()
         command_help = _command_help_map()
         self.assertEqual("service-run-once", parser.parse_args(["service-run-once"]).command)
         self.assertIn("Run one MAL-Updater daemon loop pass and exit", command_help["service-run-once"])

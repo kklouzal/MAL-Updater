@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urljoin
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import AppConfig
-from .mal_client import MalApiError, _read_http_error_detail
+from .mal_client import MalApiError, _read_http_error_detail, is_timeout_error
 from .provider_niceness import ProviderRequestGate, retry_delay_seconds
 from .request_tracking import record_api_request_event
 
@@ -784,17 +784,6 @@ class PublicMalUserRecommendationsClient:
             terminal_evidence=parsed.terminal_evidence,
         )
 
-    def _is_timeout_error(self, exc: BaseException) -> bool:
-        if isinstance(exc, (TimeoutError, SocketTimeout)):
-            return True
-        if isinstance(exc, URLError):
-            reason = exc.reason
-            if isinstance(reason, (TimeoutError, SocketTimeout)):
-                return True
-            reason_text = str(reason).lower()
-            return "timed out" in reason_text or "timeout" in reason_text
-        return False
-
     def _fetch_html(
         self,
         url: str,
@@ -915,7 +904,7 @@ class PublicMalUserRecommendationsClient:
                         f"public MAL userrecs request failed: HTTP {exc.code}: {detail}"
                     ) from exc
                 except (URLError, TimeoutError, SocketTimeout) as exc:
-                    outcome = "timeout" if self._is_timeout_error(exc) else "url_error"
+                    outcome = "timeout" if is_timeout_error(exc) else "url_error"
                     record_api_request_event(
                         "mal",
                         "public_userrecs",
@@ -925,7 +914,7 @@ class PublicMalUserRecommendationsClient:
                         error=type(exc).__name__,
                         config=self.config,
                     )
-                    if self._is_timeout_error(exc) and attempt < attempts:
+                    if is_timeout_error(exc) and attempt < attempts:
                         delay = retry_delay_seconds(
                             attempt,
                             base_seconds=self.config.mal.retry_backoff_base_seconds,

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
+from .timestamps import parse_utc_timestamp
 from .config import AppConfig, load_mal_secrets
 from .db import (
     MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
@@ -21,8 +22,6 @@ from .db import (
     MalUserAnimeListRefreshSummary,
     MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
     MalUserListSnapshotDriftError,
-    abort_mal_user_anime_list_cache_refresh,
-    begin_mal_user_anime_list_cache_refresh,
     connect,
     count_mal_user_anime_list_cache,
     create_or_get_active_mal_public_userrecs_generation,
@@ -30,7 +29,6 @@ from .db import (
     claim_or_create_mal_user_anime_list_traversal,
     checkpoint_mal_user_anime_list_page,
     checkpoint_mal_user_anime_list_revalidation,
-    finish_mal_user_anime_list_cache_refresh,
     get_active_mal_public_userrecs_generation,
     get_mal_user_anime_list_refresh_diagnostics,
     get_mal_user_anime_list_traversal,
@@ -331,23 +329,8 @@ class FullUserRecommendationHarvestSummary:
         }
 
 
-def _parse_timestamp(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
 def _is_stale(fetched_at: str | None, *, stale_after_days: int) -> bool:
-    parsed = _parse_timestamp(fetched_at)
+    parsed = parse_utc_timestamp(fetched_at)
     if parsed is None:
         return True
     threshold = datetime.now(timezone.utc) - timedelta(days=max(int(stale_after_days), 0))
@@ -360,7 +343,7 @@ def _metadata_age_sort_value(fetched_at: str | None) -> tuple[int, str]:
     value = str(fetched_at).strip()
     if not value:
         return (0, "")
-    parsed = _parse_timestamp(value)
+    parsed = parse_utc_timestamp(value)
     if parsed is None:
         return (1, value)
     return (1, parsed.isoformat())
@@ -560,19 +543,8 @@ def _record_target_skip(target_hydration_skip_reasons: dict[str, int], reason: s
     target_hydration_skip_reasons[reason] = target_hydration_skip_reasons.get(reason, 0) + 1
 
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _payload_has_next_page(payload: dict[str, Any] | None) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    paging = payload.get("paging")
-    if not isinstance(paging, dict):
-        return False
-    next_url = paging.get("next")
-    return isinstance(next_url, str) and bool(next_url.strip())
 
 
 def _normalized_user_list_statuses(statuses: list[str] | tuple[str, ...] | None) -> list[str | None]:
@@ -974,20 +946,6 @@ def _full_harvest_candidate_status(
         target_days=stale_after_days,
         jitter_days=min(15, stale_after_days),
     ) else "fresh"
-
-
-def _full_harvest_rank_key(entry: Any, status_row: dict[str, Any] | None, *, stale_after_days: int) -> tuple[int, tuple[int, str], int]:
-    status = _full_harvest_candidate_status(
-        status_row,
-        stale_after_days=stale_after_days,
-        source_mal_anime_id=int(entry.mal_anime_id),
-    )
-    status_order = {"unharvested": 0, "failed": 1, "stale": 2, "fresh": 3}.get(status, 4)
-    if status == "failed":
-        age = _metadata_age_sort_value(status_row.get("last_attempted_at") if status_row else None)
-    else:
-        age = _metadata_age_sort_value(status_row.get("fetched_at") if status_row else None)
-    return (status_order, age, int(entry.mal_anime_id))
 
 
 def _full_userrecs_start_url(config: AppConfig, *, source_mal_anime_id: int, source_title: str | None) -> str:

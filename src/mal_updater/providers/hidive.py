@@ -15,6 +15,7 @@ from ..config import AppConfig
 from ..contracts import ProviderSnapshot
 from ..hidive_urls import canonical_hidive_series_url
 from ..hidive_snapshot import fetch_snapshot as fetch_hidive_snapshot
+from ..hidive_snapshot import localized_content_title
 from ..hidive_snapshot import write_snapshot_file as write_hidive_snapshot_file
 from ..provider_registry import register_provider
 from ..provider_types import ProviderCapabilities, ProviderFetchResult, ProviderSearchResult
@@ -113,18 +114,6 @@ provider = HidiveProvider()
 register_provider(provider)
 
 
-def _localized_title(hit: dict) -> str | None:
-    localisations = hit.get("localisations")
-    if isinstance(localisations, dict):
-        for key in ("en_US", "en-US", "en", "en_us"):
-            value = localisations.get(key)
-            if isinstance(value, dict):
-                title = value.get("title") or value.get("name")
-                if title:
-                    return str(title)
-    title = hit.get("title") or hit.get("name")
-    return str(title) if title else None
-
 
 def _normalize_hidive_audio_tag_language(language: str) -> str | None:
     normalized = " ".join(language.strip().replace("_", "-").split()).lower()
@@ -157,7 +146,7 @@ def _series_from_algolia_hit(hit: dict) -> ProviderSearchResult | None:
     if not isinstance(hit, dict) or hit.get("type") != "VOD_SERIES":
         return None
     provider_series_id = hit.get("id") or str(hit.get("objectID") or "").removeprefix("VOD_SERIES_")
-    title = _localized_title(hit)
+    title = localized_content_title(hit)
     if not provider_series_id or not title:
         return None
     # HIDIVE frontend routes generic VOD_SERIES/title hits through /series/{id};

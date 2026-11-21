@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from mal_updater.cli import _cmd_provider_fetch_snapshot
 from mal_updater.config import load_config
-from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, FetchProvenance, ProviderSnapshot, SeriesRef, WatchlistEntry
+from mal_updater.contracts import CrunchyrollSnapshot, EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from mal_updater.contracts.crunchyroll import CrunchyrollSnapshot as CrunchyrollSnapshotCompatAlias
 from mal_updater.db import bootstrap_database
 from mal_updater.hidive_auth import HidiveSession, HidiveStatePaths, HidiveTokenSet

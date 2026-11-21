@@ -54,10 +54,11 @@ For the most common operator/data tasks, use the repo-local CLI from `{baseDir}`
 - `PYTHONPATH=src python3 -m mal_updater.cli review-queue-next --issue-type mapping_review`
 - `PYTHONPATH=src python3 -m mal_updater.cli review-queue-worklist --issue-type mapping_review --limit 5`
 - `PYTHONPATH=src python3 -m mal_updater.cli list-mappings`
+- `PYTHONPATH=src python3 -m mal_updater.cli season-mappings --unresolved`
 
 ### Sync planning / guarded execution
 - `PYTHONPATH=src python3 -m mal_updater.cli dry-run-sync --provider all --limit 20 --approved-mappings-only`
-- `PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 0 --exact-approved-only --execute`
+- `PYTHONPATH=src python3 -m mal_updater.cli apply-sync --limit 8 --exact-approved-only --execute`
 - `PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider crunchyroll --out .MAL-Updater/cache/live-crunchyroll-snapshot.json --ingest`
 - `PYTHONPATH=src python3 -m mal_updater.cli provider-fetch-snapshot --provider hidive --out .MAL-Updater/cache/live-hidive-snapshot.json --ingest`
 
@@ -73,6 +74,7 @@ Read-only first:
 - `list-mappings`
 - `list-review-queue --summary`
 - `dry-run-sync`
+- `season-mappings --unresolved`
 - `recommend`
 
 Treat these as state-changing:
@@ -80,8 +82,10 @@ Treat these as state-changing:
 - `mal-refresh`
 - `provider-auth-login --provider crunchyroll`
 - `provider-auth-login --provider hidive`
+- `crunchyroll-link` (password-free TV activation-code login)
 - `provider-fetch-snapshot --provider <provider> --ingest`
 - `apply-sync --execute`
+- `season-mappings --approve ...`
 - `scripts/install_user_systemd_units.sh`
 - `install-service`
 - `restart-service`
@@ -97,6 +101,7 @@ Treat these as state-changing:
 
 - Keep sync behavior conservative; do not invent broader write scope than the CLI already supports.
 - Prefer `dry-run-sync` before `apply-sync --execute` unless the task explicitly asks for a live apply.
+- Unattended MAL writes are off by default (`service.task_execute_limits.sync_apply = 0`); enable them only with explicit operator consent.
 - Treat Crunchyroll auth/fetch instability as real residue; document it plainly.
 - Treat staged provider credentials and long-lived tokens as sensitive local files; keep them out of version control and prefer restrictive local permissions.
 - When a host cannot satisfy the unattended daemon path, say so clearly instead of silently skipping service setup.

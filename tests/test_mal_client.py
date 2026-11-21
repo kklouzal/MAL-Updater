@@ -743,7 +743,7 @@ class MalClientTests(unittest.TestCase):
                     client.search_anime("valid", force_refresh=True)
                 with self.assertRaisesRegex(MalApiError, "identity"):
                     client.get_anime_details(7, fields="id,title,related_anime", force_refresh=True)
-            from mal_updater.db import get_mal_anime_search_cache, get_mal_anime_detail_cache
+            from mal_updater.db import get_mal_anime_detail_cache
             self.assertIsNone(get_mal_anime_detail_cache(config.db_path, mal_anime_id=7, fields_key="id,related_anime,title", logic_version=MAL_DETAIL_CACHE_LOGIC_VERSION))
 
     def test_detail_requires_matching_id_title_and_requested_container_types(self) -> None:

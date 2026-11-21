@@ -162,7 +162,6 @@ def classify_auth_style_failure(
     return None
 
 
-
 def auth_failure_remediation(kind_payload: Mapping[str, object] | None) -> dict[str, str]:
     kind = kind_payload.get("kind") if isinstance(kind_payload, Mapping) else None
     if isinstance(kind, str):
@@ -170,7 +169,6 @@ def auth_failure_remediation(kind_payload: Mapping[str, object] | None) -> dict[
         if isinstance(remediation, dict):
             return dict(remediation)
     return dict(AUTH_FAILURE_REMEDIATION["generic_auth"])
-
 
 
 def looks_auth_style_failure(reason: str, *, session_residue: Mapping[str, object] | None = None) -> bool:

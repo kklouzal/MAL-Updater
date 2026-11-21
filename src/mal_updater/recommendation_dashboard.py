@@ -14,6 +14,7 @@ from .config import AppConfig, DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE
 from .crunchyroll_auth import crunchyroll_auth_material_present
 from .web_shell import FAVICON_LINK, SHELL_CSS, top_bar
 from .db import (
+    MAL_RECOMMENDATION_HARVEST_SUMMARY_COUNTERS,
     bootstrap_database,
     connect,
     get_mal_recommendation_harvest_coverage,
@@ -832,20 +833,7 @@ def _empty_operational_snapshot() -> dict[str, Any]:
 
 def _empty_mal_recommendation_harvest_coverage() -> dict[str, Any]:
     return {
-        "summary": {
-            "mapped_sources": 0,
-            "watched_sources": 0,
-            "positive_list_sources": 0,
-            "confirmed_positive_sources": 0,
-            "fresh": 0,
-            "stale": 0,
-            "failed": 0,
-            "unharvested": 0,
-            "complete_full_harvest_sources": 0,
-            "official_detail_sources": 0,
-            "total_edges": 0,
-            "fresh_coverage_ratio": None,
-        },
+        "summary": {**dict.fromkeys(MAL_RECOMMENDATION_HARVEST_SUMMARY_COUNTERS, 0), "fresh_coverage_ratio": None},
         "sources": [],
         "public_userrecs": unknown_public_userrecs_diagnostics(reason="dashboard_schema_unavailable"),
     }
@@ -942,16 +930,12 @@ def normalize_dashboard_limit(value: Any, *, default: int = DASHBOARD_DEFAULT_RE
     return min(DASHBOARD_MAX_RECOMMENDATION_LIMIT, max(DASHBOARD_MIN_RECOMMENDATION_LIMIT, candidate))
 
 
-def _section_display_budget(limit: int) -> int:
-    return normalize_dashboard_limit(limit)
-
-
 def _cap_sections(
     sections: list[tuple[dict[str, str], list[dict[str, Any]], int]], *, limit: int | None
 ) -> list[tuple[dict[str, str], list[dict[str, Any]], int]]:
     if limit is None:
         return sections
-    budget = _section_display_budget(limit)
+    budget = normalize_dashboard_limit(limit)
     return [(meta, rows[:budget], total) for meta, rows, total in sections]
 
 

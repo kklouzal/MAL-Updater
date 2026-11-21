@@ -30,11 +30,9 @@ from .season_catalog import (
     upsert_provider_season_catalog,
 )
 from .fetch_provenance import FetchProvenance
-from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
+from .provider_snapshot import read_sync_boundary_payload
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .crunchyroll_auth import (
-    CRUNCHYROLL_ANDROIDTV_USER_AGENT,
-    CRUNCHYROLL_BASIC_AUTH_TOKEN,
     CRUNCHYROLL_ME_URL,
     CRUNCHYROLL_TOKEN_URL,
     CrunchyrollAuthError,
@@ -42,8 +40,10 @@ from .crunchyroll_auth import (
     CrunchyrollStatePaths,
     crunchyroll_login_with_credentials,
     crunchyroll_token_error_message,
+    crunchyroll_token_headers,
     resolve_crunchyroll_state_paths,
 )
+from .crunchyroll_auth import _write_session_state
 
 
 class CrunchyrollSnapshotError(RuntimeError):
@@ -278,7 +278,6 @@ class _CrunchyrollAuthSession:
         self.credential_rebootstrap_attempted = True
 
 
-
 def _now_string() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -315,32 +314,6 @@ def _http_get(url: str, *, headers: dict[str, str], timeout_seconds: float, conf
         raise
 
 
-def _write_session_state(
-    *,
-    state_paths: CrunchyrollStatePaths,
-    profile: str,
-    locale: str,
-    device_type: str,
-    account_id: str | None,
-    last_error: str | None,
-    success: bool,
-    phase: str,
-) -> None:
-    state_paths.root.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "profile": profile,
-        "locale": locale,
-        "refresh_token_present": state_paths.refresh_token_path.exists(),
-        "device_id_present": state_paths.device_id_path.exists(),
-        "device_type_hint": device_type,
-        "last_login_attempt_at": _now_string(),
-        "last_login_success_at": _now_string() if success else None,
-        "last_account_id_hint": account_id,
-        "last_error": last_error,
-        "crunchyroll_phase": phase,
-    }
-    atomic_write_json(state_paths.session_state_path, payload, indent=2)
-
 
 def _read_device_id(state_paths: CrunchyrollStatePaths) -> str:
     return _read_secret_file(state_paths.device_id_path) or str(uuid.uuid4())
@@ -368,12 +341,7 @@ def refresh_access_token(
         "device_id": device_id,
         "device_type": device_type,
     }
-    headers = {
-        "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "ETP-Anonymous-ID": device_id,
-        "User-Agent": CRUNCHYROLL_ANDROIDTV_USER_AGENT,
-    }
+    headers = crunchyroll_token_headers(device_id)
     # Refresh tokens may be rotated even when the response is lost or transient;
     # never replay this credential POST automatically.
     attempts = 1
@@ -911,20 +879,8 @@ def _watchlist_entry_fingerprint(entry: dict[str, Any]) -> str | None:
 
 
 def _load_sync_boundary(state_paths: CrunchyrollStatePaths) -> _SyncBoundary | None:
-    path = state_paths.sync_boundary_path
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    try:
-        schema_version = int(payload.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        return None
-    if schema_version != SYNC_BOUNDARY_SCHEMA_VERSION:
+    payload = read_sync_boundary_payload(state_paths.sync_boundary_path, schema_version=SYNC_BOUNDARY_SCHEMA_VERSION)
+    if payload is None:
         return None
     history = payload.get("history") if isinstance(payload.get("history"), dict) else {}
     watchlist = payload.get("watchlist") if isinstance(payload.get("watchlist"), dict) else {}
@@ -1583,10 +1539,6 @@ def fetch_snapshot(
         history_start_page=history_start_page,
         watchlist_start=watchlist_start,
     )
-
-
-def snapshot_to_dict(snapshot: CrunchyrollSnapshot) -> dict[str, Any]:
-    return _snapshot_to_dict(snapshot)
 
 
 def write_snapshot_file(path: Path, snapshot: CrunchyrollSnapshot) -> Path:

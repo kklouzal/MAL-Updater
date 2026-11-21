@@ -2060,8 +2060,6 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertTrue(any(item["level"] == "warning" for item in payload["indicators"]))
 
 
-
-
 class DashboardUiPayloadTests(unittest.TestCase):
     def _row(self, **overrides):
         row = {

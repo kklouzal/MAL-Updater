@@ -31,11 +31,6 @@ def get_provider(slug: str) -> ProviderModule:
         raise KeyError(f"unknown provider '{slug}' (available: {available})") from exc
 
 
-def list_providers() -> list[ProviderModule]:
-    ensure_builtin_providers_registered()
-    return [_PROVIDER_REGISTRY[key] for key in sorted(_PROVIDER_REGISTRY)]
-
-
 def list_provider_slugs() -> Iterable[str]:
     ensure_builtin_providers_registered()
     return sorted(_PROVIDER_REGISTRY)

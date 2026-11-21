@@ -98,14 +98,8 @@ class AuthRemediationDescriptor:
     def command(self) -> str:
         return self.bootstrap_command
 
-    def command_args_list(self) -> list[str]:
-        return list(self.command_args)
-
     def maintenance_command_args(self) -> list[str]:
         return list(self.command_args)
-
-    def cli_command_args(self) -> list[str]:
-        return self.bootstrap_command_args
 
     def health_detail(self) -> str:
         if self.target == "mal":
@@ -295,22 +289,6 @@ def provider_rebootstrap_auth_descriptor(provider: str, auth_issue: Mapping[str,
     )
 
 
-# Private compatibility aliases for the in-flight health/bootstrap extraction.
-AuthRemediationCommand = AuthRemediationDescriptor
-
-
-def build_mal_auth_login_descriptor() -> AuthRemediationDescriptor:
-    return mal_missing_auth_descriptor()
-
-
-def build_crunchyroll_auth_login_descriptor() -> AuthRemediationDescriptor:
-    return provider_missing_state_descriptor("crunchyroll")
-
-
-def build_hidive_auth_login_descriptor() -> AuthRemediationDescriptor:
-    return provider_missing_state_descriptor("hidive")
-
-
 def guidance_command_fields(
     *,
     command: str | None,
@@ -337,11 +315,7 @@ def guidance_command_fields(
 
 
 __all__ = [
-    "AuthRemediationCommand",
     "AuthRemediationDescriptor",
-    "build_crunchyroll_auth_login_descriptor",
-    "build_hidive_auth_login_descriptor",
-    "build_mal_auth_login_descriptor",
     "guidance_command_fields",
     "mal_missing_auth_descriptor",
     "mal_rebootstrap_auth_descriptor",

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mal_updater.cli import _render_systemd_unit_template
+from mal_updater.service_units import render_systemd_unit_template_file as _render_systemd_unit_template
 from mal_updater.config import load_config
 from mal_updater.service_units import render_systemd_unit_template, systemd_unit_path_context
 

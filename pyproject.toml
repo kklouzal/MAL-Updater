@@ -89,10 +89,9 @@ line-length = 140
 target-version = "py310"
 
 [tool.ruff.lint]
-# Repo-wide default ruff currently has existing unused-import/unused-variable
-# debt. Keep the blocking CI lint non-fake by checking parse/runtime-critical
-# pyflakes/pycodestyle families until the broader cleanup is scheduled.
-select = ["E9", "F63", "F7", "F82"]
+# Syntax errors plus all of pyflakes (undefined names, unused imports and
+# variables, shadowing). Style rules are not enforced.
+select = ["E9", "F"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -111,7 +110,6 @@ files = [
   "src/mal_updater/hidive_auth.py",
   "src/mal_updater/hidive_urls.py",
   "src/mal_updater/ingestion.py",
-  "src/mal_updater/maintenance_command_semantics.py",
   "src/mal_updater/mal_user_recommendations.py",
   "src/mal_updater/persistence.py",
   "src/mal_updater/provider_niceness.py",

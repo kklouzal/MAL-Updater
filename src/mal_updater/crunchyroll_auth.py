@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 import uuid
@@ -152,6 +151,7 @@ def _write_session_state(
     account_id: str | None,
     last_error: str | None,
     success: bool,
+    phase: str | None = None,
 ) -> None:
     state_paths.root.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -163,7 +163,7 @@ def _write_session_state(
         **login_session_timestamps(success, now_string=_now_string),
         "last_account_id_hint": account_id,
         "last_error": last_error,
-        "crunchyroll_phase": "ready" if success else "auth_failed",
+        "crunchyroll_phase": phase or ("ready" if success else "auth_failed"),
     }
     atomic_write_json(state_paths.session_state_path, payload, indent=2)
 
@@ -269,12 +269,7 @@ def crunchyroll_login_with_credentials(
         "device_id": device_id,
         "device_type": device_type,
     }
-    headers = {
-        "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "ETP-Anonymous-ID": device_id,
-        "User-Agent": CRUNCHYROLL_ANDROIDTV_USER_AGENT,
-    }
+    headers = crunchyroll_token_headers(device_id)
 
     response = _http_post(CRUNCHYROLL_TOKEN_URL, data=body, headers=headers, timeout_seconds=timeout_seconds, config=config, pacer=pacer)
     if response.status_code >= 400:
@@ -404,7 +399,8 @@ class CrunchyrollDeviceCode:
     verification_url: str
 
 
-def _device_flow_headers(device_id: str, content_type: str) -> dict[str, str]:
+def crunchyroll_token_headers(device_id: str, content_type: str = "application/x-www-form-urlencoded") -> dict[str, str]:
+    """Headers for Crunchyroll's Android TV client token and device-code endpoints."""
     return {
         "Authorization": f"Basic {CRUNCHYROLL_BASIC_AUTH_TOKEN}",
         "Content-Type": content_type,
@@ -429,7 +425,7 @@ def crunchyroll_request_device_code(
     response = _http_post(
         CRUNCHYROLL_DEVICE_CODE_URL,
         data={"device_id": device_id, "device_type": DEFAULT_CRUNCHYROLL_DEVICE_TYPE, "device_name": CRUNCHYROLL_DEVICE_NAME},
-        headers=_device_flow_headers(device_id, "application/x-www-form-urlencoded"),
+        headers=crunchyroll_token_headers(device_id, "application/x-www-form-urlencoded"),
         timeout_seconds=timeout_seconds,
         config=config,
         pacer=_UnpacedRequests(),
@@ -471,7 +467,7 @@ def crunchyroll_poll_device_code(
     response = _http_post(
         CRUNCHYROLL_DEVICE_TOKEN_URL,
         json_body={"device_id": code.device_id, "device_code": code.device_code},
-        headers=_device_flow_headers(code.device_id, "application/json"),
+        headers=crunchyroll_token_headers(code.device_id, "application/json"),
         timeout_seconds=timeout_seconds,
         config=config,
         pacer=_UnpacedRequests(),

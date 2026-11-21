@@ -71,11 +71,13 @@ PYTHONPATH=src python3 -m mal_updater.cli list-review-queue --summary
 PYTHONPATH=src python3 -m mal_updater.cli review-queue-next --issue-type mapping_review
 PYTHONPATH=src python3 -m mal_updater.cli review-queue-worklist --issue-type mapping_review --limit 5
 PYTHONPATH=src python3 -m mal_updater.cli list-mappings --provider all
+PYTHONPATH=src python3 -m mal_updater.cli season-mappings --unresolved
 ```
 
 Use this surface when the user wants:
 - mapping backlog state
 - next recommended mapping-review slice
+- provider seasons that have no MAL entry yet (`season-mappings --unresolved`; these are never written and raise the `unresolved_season_mappings` health warning)
 - grouped review worklists
 - mapping inventory / approved coverage context across all currently supported providers, with optional per-provider filtering via `--provider`; health coverage splits persisted inventory from catalog-only discovery rows and uses only account-observed (`account_observed_at IS NOT NULL`) series as the mapping-eligible denominator
 - `health-check` mapping coverage exposes `persisted_provider_series_count`, `catalog_only_series_count`, `mapping_eligible_series_count`, eligible approved/unmapped counts, and `eligible_approved_coverage_ratio`; compatibility aliases remain in JSON, but `approved_mapping_count`, `unmapped_series_count`, and `approved_coverage_ratio` now follow the eligible population while `provider_series_count` remains total persisted inventory
@@ -108,13 +110,14 @@ cd {baseDir}
 PYTHONPATH=src python3 -m mal_updater.cli mal-auth-login
 PYTHONPATH=src python3 -m mal_updater.cli mal-refresh
 PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider crunchyroll
+PYTHONPATH=src python3 -m mal_updater.cli crunchyroll-link
 PYTHONPATH=src python3 -m mal_updater.cli provider-auth-login --provider hidive
 ```
 
 Use this surface when the user wants:
 - MAL OAuth bootstrap
 - MAL token refresh
-- Crunchyroll or HIDIVE staged auth bootstrap
+- Crunchyroll or HIDIVE staged auth bootstrap (`crunchyroll-link` links Crunchyroll by TV activation code without a password)
 
 ## General rule
 

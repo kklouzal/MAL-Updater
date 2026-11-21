@@ -206,6 +206,19 @@ def _sanitize_anime_search_query(query: str) -> str:
     return " ".join(cleaned.split()).strip()
 
 
+def is_timeout_error(exc: BaseException) -> bool:
+    """Whether a urllib failure was a timeout (raised directly or wrapped in URLError)."""
+    if isinstance(exc, (TimeoutError, SocketTimeout)):
+        return True
+    if isinstance(exc, URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, SocketTimeout)):
+            return True
+        reason_text = str(reason).lower()
+        return "timed out" in reason_text or "timeout" in reason_text
+    return False
+
+
 def _read_http_error_detail(exc: HTTPError) -> str:
     """Read and close urllib HTTPError bodies so failing calls do not leak files."""
     try:
@@ -332,17 +345,6 @@ class MalClient:
     def _pace_request(self) -> None:
         self._request_gate.wait_turn()
 
-    def _is_timeout_error(self, exc: BaseException) -> bool:
-        if isinstance(exc, (TimeoutError, SocketTimeout)):
-            return True
-        if isinstance(exc, URLError):
-            reason = exc.reason
-            if isinstance(reason, (TimeoutError, SocketTimeout)):
-                return True
-            reason_text = str(reason).lower()
-            return "timed out" in reason_text or "timeout" in reason_text
-        return False
-
     def _format_timeout_message(self, error_context: str, exc: BaseException, *, attempts: int = _TIMEOUT_RETRY_ATTEMPTS) -> str:
         return f"{error_context}: timeout after {attempts} attempts"
 
@@ -387,9 +389,9 @@ class MalClient:
                     continue
                 raise
             except (URLError, TimeoutError, SocketTimeout) as exc:
-                outcome = "timeout" if self._is_timeout_error(exc) else "url_error"
+                outcome = "timeout" if is_timeout_error(exc) else "url_error"
                 record_api_request_event("mal", operation, url=url, method=method, outcome=outcome, error=type(exc).__name__, config=self.config)
-                if self._is_timeout_error(exc):
+                if is_timeout_error(exc):
                     last_exc = exc
                     if attempt < attempts:
                         delay = retry_delay_seconds(
@@ -465,7 +467,7 @@ class MalClient:
         if not token:
             raise MalApiError("MAL access_token is not configured")
         return self._get_json(
-            f"/users/@me",
+            "/users/@me",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
@@ -685,15 +687,6 @@ class MalClient:
                 next_path = _path_query_from_mal_api_url(next_url.strip(), self.config.mal.base_url)
             else:
                 next_path = None
-
-    def get_my_anime_list_page(
-        self,
-        *,
-        status: str | None = None,
-        limit: int = MAL_ANIME_LIST_MAX_LIMIT,
-        fields: str = "list_status,num_episodes,media_type,status",
-    ) -> dict[str, Any]:
-        return next(self.iter_my_anime_list_pages(status=status, limit=limit, fields=fields, max_pages=1))
 
     def update_my_list_status(
         self,

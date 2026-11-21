@@ -1867,7 +1867,6 @@ def _verified_aggregate_shell_candidates(
     return verified
 
 
-
 def _candidate_mal_id(item: Recommendation) -> int | None:
     value = item.context.get("mal_anime_id")
     return value if isinstance(value, int) else None

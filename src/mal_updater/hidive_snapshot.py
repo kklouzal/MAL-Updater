@@ -13,7 +13,7 @@ from .config import AppConfig
 from .persistence import atomic_write_json
 from .contracts import EpisodeProgress, ProviderSnapshot, SeriesRef, WatchlistEntry
 from .fetch_provenance import FetchProvenance
-from .provider_snapshot import snapshot_to_dict as _snapshot_to_dict
+from .provider_snapshot import read_sync_boundary_payload
 from .provider_snapshot import write_snapshot_file as _write_snapshot_file
 from .hidive_auth import HidiveAuthError, HidiveSession, HidiveStatePaths, start_hidive_session
 from .season_catalog import (
@@ -321,16 +321,8 @@ def _paging_last_seen(payload: dict[str, Any]) -> tuple[bool, Any]:
 
 
 def _load_sync_boundary(state_paths: HidiveStatePaths) -> _SyncBoundary | None:
-    path = state_paths.sync_boundary_path
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if int(payload.get("schema_version") or 0) != SYNC_BOUNDARY_SCHEMA_VERSION:
+    payload = read_sync_boundary_payload(state_paths.sync_boundary_path, schema_version=SYNC_BOUNDARY_SCHEMA_VERSION)
+    if payload is None:
         return None
     history = payload.get("history") if isinstance(payload.get("history"), dict) else {}
     continue_watching = payload.get("continue_watching") if isinstance(payload.get("continue_watching"), dict) else {}
@@ -812,7 +804,8 @@ def _custom_watchlist_kind(item: dict[str, Any]) -> str:
     return "custom"
 
 
-def _localized_content_title(item: dict[str, Any]) -> str | None:
+def localized_content_title(item: dict[str, Any]) -> str | None:
+    """English title from HIDIVE localisations, else the item's own title or name."""
     localisations = item.get("localisations")
     if isinstance(localisations, dict):
         for key in ("en_US", "en-US", "en", "en_us"):
@@ -849,10 +842,10 @@ def _custom_content_series_id(item: dict[str, Any]) -> str | None:
 def _custom_content_series_title(item: dict[str, Any]) -> str | None:
     series = item.get("series") if isinstance(item.get("series"), dict) else {}
     if isinstance(series, dict):
-        title = _localized_content_title(series)
+        title = localized_content_title(series)
         if title:
             return title
-    return _localized_content_title(item)
+    return localized_content_title(item)
 
 
 def _custom_content_item_type(item: dict[str, Any]) -> str:
@@ -878,7 +871,7 @@ def _custom_content_to_series(item: dict[str, Any]) -> SeriesRef | None:
     return SeriesRef(
         provider_series_id=provider_series_id,
         title=title,
-        season_title=_localized_content_title(item),
+        season_title=localized_content_title(item),
         season_number=_safe_int(item.get("seasonNumber") or item.get("season")),
     )
 
@@ -1219,7 +1212,7 @@ def _fetch_snapshot(
             continue_items, continue_stopped_early, continue_metadata = _fetch_continue_items(session)
             favourite_items, favourite_backfill_items, favourite_pages_fetched, favourite_backfill_pages_fetched, favourite_stopped_early, favourite_backfill_exhausted = _fetch_favourite_items(session)
             custom_series, custom_watchlist_entries, custom_watchlist_metadata, custom_watchlist_diagnostics, custom_watchlist_partial = _fetch_custom_watchlist_items(session)
-    except HidiveAuthError as exc:
+    except HidiveAuthError:
         raise
     except Exception as exc:
         raise HidiveSnapshotError(str(exc)) from exc
@@ -1413,10 +1406,6 @@ def _bind_fetch_authority(fetch_impl):
 
 fetch_snapshot, has_hidive_snapshot_authority = _bind_fetch_authority(_fetch_snapshot)
 del _bind_fetch_authority
-
-
-def snapshot_to_dict(snapshot: ProviderSnapshot) -> dict[str, Any]:
-    return _snapshot_to_dict(snapshot)
 
 
 def write_snapshot_file(path: Path, snapshot: ProviderSnapshot) -> Path:

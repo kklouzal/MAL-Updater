@@ -525,7 +525,6 @@ class PublicMalUserRecommendationsDbTests(unittest.TestCase):
         self.assertEqual(1, status["is_complete"])
 
 
-
 class MalEmptyUserRecommendationsPageTests(unittest.TestCase):
     """Real MAL markup for a title nobody has recommended anything for (probed 2026-11-20)."""
 
