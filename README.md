@@ -14,6 +14,7 @@
 <p align="center">
   <b><a href="#-download">Download</a></b> ·
   <b><a href="#-features">Features</a></b> ·
+  <b><a href="#-screenshots">Screenshots</a></b> ·
   <b><a href="#-quick-start">Quick start</a></b> ·
   <b><a href="#-how-it-works">How it works</a></b> ·
   <b><a href="#-documentation">Docs</a></b>
@@ -27,7 +28,9 @@ No streaming service? No problem. With just a MAL account it still ranks recomme
 
 It runs **entirely on your machine** as a desktop app or a container. Your passwords, tokens and history never leave it.
 
-<!-- screenshots:hero -->
+<p align="center">
+  <img src="docs/assets/dashboard-dark.png" alt="The MAL-Updater dashboard: a genre affinity chart above Continue a franchise recommendations with cover art." width="100%">
+</p>
 
 ## ⬇ Download
 
@@ -98,7 +101,19 @@ Prefer an always-on install on a server or NAS? Use the [container](#-container)
   </tr>
 </table>
 
-<!-- screenshots:gallery -->
+## 📸 Screenshots
+
+<p align="center">
+  <img src="docs/assets/recommendation-detail.png" alt="An expanded recommendation: Parasyte -the maxim- with a score breakdown (consensus, affinity, quality, confidence) and the watched titles that recommend it." width="100%">
+  <br><sub><b>Every pick explains itself:</b> why it's recommended, a score breakdown, and the titles you watched that point to it</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="66%" valign="top"><img src="docs/assets/settings.png" alt="The Settings page: setup status, connections, and MyAnimeList, Crunchyroll and HIDIVE credentials."><p align="center"><sub><b>Settings:</b> connect MAL and link Crunchyroll right in the browser</sub></p></td>
+    <td width="34%" valign="top"><img src="docs/assets/mobile.png" alt="The dashboard on a phone, showing recommendation cards."><p align="center"><sub><b>Works on your phone</b></sub></p></td>
+  </tr>
+</table>
 
 ## 🚀 Quick start
 
@@ -110,6 +125,8 @@ Prefer an always-on install on a server or NAS? Use the [container](#-container)
    http://127.0.0.1:8765/oauth/mal/callback
    ```
 3. In **Settings**, paste the client ID, click **Connect MAL account**, then optionally **Link Crunchyroll account** or add HIDIVE.
+
+<p align="center"><img src="docs/assets/desktop-window.png" alt="The desktop app's control window: MAL-Updater is running, with Open dashboard, Open data folder and Quit buttons." width="400"></p>
 
 That's it. Syncing and recommendation refreshes run while the app is open, and anything overdue catches up shortly after you start it again. Your data lives in the usual per-user app-data folder ([details](references/DESKTOP.md#where-data-is-kept)).
 
