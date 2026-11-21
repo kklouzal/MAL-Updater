@@ -32,7 +32,7 @@ class HttpTests(unittest.TestCase):
  def test_dashboard_routes_are_db_backed_and_settings_is_the_control_page(self):
   for path in ('/','/dashboard'):
    with urllib.request.urlopen(self.base+path,timeout=5) as r:
-    html=r.read().decode(); self.assertEqual('nosniff',r.headers['X-Content-Type-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
+    html=r.read().decode(); self.assertEqual('nosniff',r.headers['X-Content-Type-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy']); self.assertIn("img-src 'self' https://cdn.myanimelist.net;",r.headers['Content-Security-Policy'])
    self.assertIn('MAL-Updater live dashboard',html); self.assertIn('/api/dashboard',html); self.assertIn('href="/debug"',html); self.assertIn('href="/settings"',html); self.assertIn('id="export-pdf"',html); self.assertIn('window.print();',html); self.assertIn('@media print',html); self.assertIn('id="genre-menu-trigger"',html); self.assertIn('Add genre filter',html); self.assertNotIn('<h2>Indicators</h2>',html); self.assertNotIn('Provider enrichment health',html); self.assertNotIn('Trusted LAN control plane',html)
   with urllib.request.urlopen(self.base+'/debug',timeout=5) as r:
    debug_html=r.read().decode(); self.assertEqual('no-store',r.headers['Cache-Control']); self.assertEqual('DENY',r.headers['X-Frame-Options']); self.assertIn("default-src 'self'",r.headers['Content-Security-Policy'])
@@ -45,6 +45,7 @@ class HttpTests(unittest.TestCase):
   enrichment=dashboard['operational']['provider_enrichment']
   self.assertNotIn('dashboard_config_unavailable',enrichment['reason_codes']); self.assertEqual(['no_configured_credentialed_providers'],enrichment['reason_codes'])
   with urllib.request.urlopen(self.base+'/settings',timeout=5) as r: settings_html=r.read().decode()
+  self.assertIn('<link rel="icon" href="/favicon.svg"',settings_html); self.assertIn('href="/settings" aria-current="page">Settings</a>',settings_html); self.assertIn('href="/debug">Debug</a>',settings_html); self.assertEqual(4,settings_html.count('<form '))
   self.assertIn('Trusted LAN control plane',settings_html); self.assertIn('aria-live',settings_html); self.assertIn('href="/"',settings_html); self.assertNotIn('Claim installation',settings_html); self.assertNotIn('Sign in',settings_html)
   self.assertNotIn('Enable automation',settings_html); self.assertNotIn('Disable automation',settings_html); self.assertNotIn('/api/daemon',settings_html)
   self.assertIn("api('/api/status')",settings_html)

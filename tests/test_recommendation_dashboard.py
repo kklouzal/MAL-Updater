@@ -184,19 +184,15 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn('function genreAffinitySection(model)', html)
         self.assertIn('id="genre-affinity"', html)
         self.assertIn('role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"', html)
-        self.assertIn('viewBox="0 0 480 440"', html)
-        self.assertIn('class="affinity-chart-wrap"', html)
+        # Labels sit outside the 480-wide plot; the viewBox leaves room for long genre names.
+        self.assertIn('viewBox="-60 0 600 440"', html)
         self.assertIn('class="affinity-label"', html)
-        self.assertIn('text-anchor="${anchor}" dominant-baseline="${baseline}">${esc(axis.genre)}</text>', html)
-        self.assertIn("horizontal > 0.25 ? 'start' : horizontal < -0.25 ? 'end' : 'middle'", html)
         self.assertIn('const radialScale = axis => Math.sqrt(Math.max(0, Math.min(100, Number(axis.normalized || 0))) / 100);', html)
         self.assertIn('point(index, radialScale(axis))', html)
-        self.assertNotIn('point(index, Number(axis.normalized || 0) / 100)', html)
-        self.assertIn('· ${esc(axis.normalized)}%</li>', html)
         self.assertIn('Exact values', html)
-        self.assertNotIn('represented genres. Completed titles count', html)
+        self.assertIn('class="affinity-list"', html)
         self.assertIn('Not enough completed/currently-watching titles with genre metadata', html)
-        self.assertLess(html.index('${genreAffinitySection(data.genre_affinity)}'), html.index('<section><h2>Recommendations</h2>'))
+        self.assertLess(html.index('id="affinity"'), html.index('id="recommendations-title"'))
 
     def test_live_dashboard_genre_axis_labels_escape_untrusted_names(self) -> None:
         html = render_dynamic_dashboard_html()
@@ -1608,46 +1604,31 @@ class RecommendationDashboardTests(unittest.TestCase):
             merge_mock.assert_not_called()
             self.assertEqual(before_bytes, config.db_path.read_bytes())
 
-    def test_live_dashboard_recommendation_table_combines_provider_with_title_and_omits_removed_columns(self) -> None:
+    def test_live_dashboard_recommendation_table_shows_mal_cover_art_and_structured_columns(self) -> None:
         html = render_dynamic_dashboard_html()
 
         self.assertIn("const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'", html)
-        progress_headings = "['Pri', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']"
-        ordinary_headings = "['Pri', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']"
-        self.assertIn(progress_headings, html)
-        self.assertIn(ordinary_headings, html)
-        self.assertNotIn("['Priority', 'Image', 'Title'", html)
-        self.assertIn('<td>${esc(r.priority ?? r.score)}</td><th scope="row">', html)
-        self.assertIn('${episodeTotal}</th><td>${image}</td>${details}${action}</tr>', html)
-        self.assertIn("const episodeTotal = progressSection ? '' :", html)
-        self.assertIn('Episodes: ${esc(r.episode_total ?? \'?\')}', html)
-        self.assertIn('class="recommendation-art"', html)
-        self.assertIn('class="provider-star-rating"', html)
-        self.assertIn('class="provider-maturity-rating"', html)
-        self.assertIn("b.star_rating", html)
-        self.assertIn("b.maturity_rating", html)
-        self.assertIn('alt="${esc(`${rawTitle} cover art`)}"', html)
-        self.assertNotIn('alt=""', html)
-        self.assertIn('No cover art available', html)
-        self.assertIn('.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;', html)
-        self.assertNotIn('object-fit:cover', html)
-        self.assertIn('${esc(provider)} user rating: ${esc(b.star_rating)}', html)
-        self.assertIn('Maturity: ${esc(b.maturity_rating)}', html)
-        self.assertNotIn("b.rating", html)
-        self.assertNotIn("Identity/review/catalog", html)
-        self.assertNotIn("Freshness/expiry", html)
-        self.assertNotIn("r.verification || e.verification_label", html)
-        self.assertNotIn("r.evidence_freshness || e.evidence_freshness_label", html)
-        self.assertNotIn("${titleLabel} / provider proof", html)
-        self.assertIn('class="title-providers" aria-label="Provider proof"', html)
-        self.assertIn('scope="row"', html)
-        self.assertIn('class="table-scroll" tabindex="0" role="region"', html)
-        self.assertIn('class=\"provider-link\"', html)
-        self.assertIn('aria-label=\"${esc(`Open ${provider} provider proof`)}\"', html)
-        self.assertNotIn("const title = b.title", html)
-        for heading in ("English dub", "Provider progress", "MAL watch status"):
-            self.assertNotIn(f"<th>{heading}</th>", html)
-        self.assertNotIn("const progress = r =>", html)
+        for column in ("['rank', 'Priority']", "['title', 'Title']", "['progress', 'Progress']", "['why', 'Why recommended']",
+                       "['score', 'Score']", "['seeds', 'Top watched seeds']", "['genres', 'Genres']"):
+            self.assertIn(column, html)
+        self.assertIn('<th scope="row" class="c-title">', html)
+        # Cover art is MAL's main picture, linked to the MAL entry; a failed
+        # image falls back to a placeholder instead of a broken image.
+        self.assertIn('const malUrl = id => `https://myanimelist.net/anime/', html)
+        self.assertIn('<img src="${esc(src)}" alt="" width="225" height="318" loading="lazy"', html)
+        # Payload URLs reach href/src only with an http(s) scheme.
+        self.assertIn("const src = webUrl(r.image_url);", html)
+        self.assertIn("const url = webUrl(b.url);", html)
+        self.assertIn("/^https?:\\/\\//i.test(text)", html)
+        self.assertIn("tabindex=\"-1\" aria-hidden=\"true\"", html)
+        self.assertIn("image.parentElement.classList.add('cover-missing')", html)
+        self.assertIn('rel="noopener noreferrer"', html)
+        # Untrusted payload text is escaped on the way into markup.
+        for escaped in ("${esc(rawTitle)}", "${esc(name)}", "${esc(point)}", "${esc(genre)}", "esc(seed.title || 'MAL title')"):
+            self.assertIn(escaped, html)
+        self.assertIn('aria-label="Where to watch"', html)
+        self.assertIn('data-label="Why recommended"', html)
+        self.assertIn("@media screen and (max-width:62rem)", html)
 
     def test_live_dashboard_multi_genre_filter_menu_is_payload_derived_and_client_side(self) -> None:
         html = render_dynamic_dashboard_html()
@@ -1672,27 +1653,26 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn('class="genre-remove"', html)
         self.assertIn("Remove ${genre} genre filter", html)
         self.assertIn("selectedGenres = selectedGenres.filter", html)
-        self.assertIn("event.key !== 'Escape'", html)
-        self.assertIn("event.target.closest('[data-genre-control]')", html)
+        self.assertIn("event.key === 'Escape' && genreMenuOpen", html)
+        self.assertIn("event.composedPath().some(node => node instanceof Element && node.matches('[data-genre-control]'))", html)
         self.assertIn("No recommendations match the current filters in this section.", html)
 
-    def test_live_dashboard_hidden_titles_persist_and_compose_with_multi_genre_filter(self) -> None:
+    def test_live_dashboard_hidden_titles_persist_and_compose_with_genre_and_title_filters(self) -> None:
         html = render_dynamic_dashboard_html()
 
+        # The storage key and identity format are unchanged so earlier hidden titles stay hidden.
+        self.assertIn("const dismissedTitlesKey = ['malupdater', 'dismissedTitles', 'v1'].join('.');", html)
         self.assertIn("localStorage.getItem(dismissedTitlesKey)", html)
         self.assertIn("localStorage.setItem(dismissedTitlesKey", html)
         self.assertIn('id="show-hidden-titles" type="checkbox"', html)
-        self.assertIn("selectedGenres.length ? rows.filter", html)
-        self.assertIn("showHiddenTitles ? genreRows : genreRows.filter", html)
-        self.assertIn("hiddenTitles.has(recommendationIdentity(r))", html)
+        self.assertIn("selectedGenres.every(genre => r.genres.includes(genre))", html)
+        self.assertIn("if (!showHiddenTitles && hiddenTitles.has(recommendationIdentity(r))) return false;", html)
+        self.assertIn('id="title-search" type="search"', html)
         self.assertIn("hiddenTitles.delete(identity)", html)
         self.assertIn("hiddenTitles.add(identity)", html)
         self.assertIn("hidden ? 'Unhide' : 'Hide'", html)
+        self.assertIn('aria-pressed="${hidden}"', html)
         self.assertIn("hidden-recommendation", html)
-        self.assertIn("background:#29343d", html)
-        screen_css = html.split("@media print", 1)[0]
-        self.assertNotIn("hidden-recommendation:nth-child(even){background:#ff", screen_css)
-        self.assertNotIn("hidden-recommendation:hover{background:#ff", screen_css)
 
     def test_live_dashboard_hidden_identity_prefers_mal_then_canonical_provider_then_safe_fallback(self) -> None:
         html = render_dynamic_dashboard_html()
@@ -1707,13 +1687,12 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertLess(html.index(provider_identity), html.index(fallback_identity))
         self.assertIn('data-recommendation-id="${esc(identity)}"', html)
 
-    def test_live_dashboard_removes_duplicate_watchable_copy_but_keeps_green_banner(self) -> None:
+    def test_live_dashboard_describes_each_section_once(self) -> None:
         html = render_dynamic_dashboard_html()
 
-        duplicate = "Actionable discovery titles require fresh verified Crunchyroll or HIDIVE availability plus explicit English dub evidence."
-        self.assertNotIn(duplicate, html)
-        self.assertIn('<section class="banner good"><strong>Watchable now dashboard:</strong>', html)
-        self.assertIn("name !== 'discovery_available_now' && meta.description", html)
+        self.assertNotIn("Watchable now dashboard:", html)
+        self.assertIn('class="section-description"', html)
+        self.assertIn("Discovery only:", html)
 
     def test_debug_dashboard_does_not_enable_main_recommendation_controls(self) -> None:
         debug_html = render_dynamic_debug_html()
@@ -1725,17 +1704,12 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertNotIn("localStorage.getItem", debug_html)
         self.assertNotIn("renderDashboard(data)", debug_html)
 
-    def test_live_dashboard_scopes_wide_tables_and_wraps_recent_sync_runs(self) -> None:
+    def test_debug_page_wraps_long_values_and_scrolls_the_sync_table(self) -> None:
         html = render_dynamic_debug_html()
 
-        self.assertIn("table{border-collapse:collapse;width:100%;background:#161d24}", html)
-        self.assertIn(".table-scroll table{min-width:54rem}", html)
-        self.assertIn(".ordinary-table-scroll table{min-width:36rem}", html)
-        self.assertNotIn("table{border-collapse:collapse;width:100%;min-width:70rem", html)
-        self.assertIn(
-            'class=\"ordinary-table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Recent provider sync runs table\"',
-            html,
-        )
+        self.assertIn(".kv dd{margin:0;overflow-wrap:break-word;min-width:0", html)
+        self.assertIn(".table-scroll{overflow-x:auto}", html)
+        self.assertIn('class="table-scroll" tabindex="0" role="region" aria-label="Recent provider sync runs table"', html)
 
     def test_dashboard_overlays_provider_art_maturity_link_and_episode_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1933,45 +1907,34 @@ class RecommendationDashboardTests(unittest.TestCase):
             self.assertEqual("10/24", row["watched_progress"])
             self.assertEqual(24, row["episode_total"])
 
-    def test_live_dashboard_nested_operational_counts_render_without_object_stringification(self) -> None:
-        html = render_dynamic_dashboard_html()
+    def test_debug_nested_operational_counts_render_without_object_stringification(self) -> None:
+        html = render_dynamic_debug_html()
 
-        self.assertIn("const countValue = value =>", html)
-        self.assertIn("typeof value === 'object'", html)
-        self.assertIn("${countValue(v)}", html)
-        self.assertNotIn("${esc(v)}</div>", html)
+        self.assertIn("function formatValue(key, value)", html)
+        self.assertIn("if (typeof value === 'object')", html)
+        self.assertIn("${formatValue(k, v)}", html)
+        self.assertNotIn("${esc(value)}</dd>", html)
 
     def test_live_dashboard_pdf_export_uses_browser_print_with_intentional_print_layout(self) -> None:
         html = render_dynamic_dashboard_html(settings_href="/settings")
         debug_html = render_dynamic_debug_html(settings_href="/settings")
 
-        self.assertIn('<button type="button" id="export-pdf" class="export-pdf-button"', html)
+        self.assertIn('<button type="button" id="export-pdf" class="button primary export-pdf-button"', html)
         self.assertIn('aria-label="Export dashboard as PDF using the browser print dialog"', html)
-        self.assertIn('title="Open the browser print dialog to save this dashboard as a PDF">Export PDF</button>', html)
         self.assertIn('Dashboard report · Exported <time id="export-timestamp">when printed</time>', html)
         self.assertIn('View: <span id="export-filter-summary">All genres · Hidden titles excluded</span>', html)
         self.assertIn("function updateExportMetadata()", html)
-        self.assertIn("new Date().toISOString()", html)
         self.assertIn("Genres: ${selectedGenres.join(', ')}", html)
         self.assertIn("Hidden titles ${showHiddenTitles ? 'shown' : 'excluded'}", html)
         self.assertIn("window.addEventListener('beforeprint', updateExportMetadata)", html)
         self.assertIn("window.print();", html)
-        self.assertIn("@media print", html)
-        print_css = html.split("@media print", 1)[1].split("</style>", 1)[0]
-        self.assertIn("@page{size:landscape", print_css)
-        self.assertIn(".report-actions,.screen-intro,.recommendation-controls,.dashboard-interactive-only,.screen-only{display:none!important}", print_css)
-        self.assertIn("h2,h3{break-after:avoid}", print_css)
-        self.assertIn(".table-scroll{break-inside:avoid}", print_css)
-        self.assertIn("thead{display:table-header-group;break-inside:avoid;break-after:avoid}", print_css)
-        self.assertIn("tbody tr:first-child{break-before:avoid}", print_css)
-        self.assertIn(
-            "tbody tr,tbody tr:nth-child(even),tbody tr:hover,.table-scroll tbody tr.hidden-recommendation,"
-            ".table-scroll tbody tr.hidden-recommendation:nth-child(even),.table-scroll tbody tr.hidden-recommendation:hover"
-            "{background:#fff!important;color:#111!important}",
-            print_css,
-        )
-        self.assertIn("table-layout:fixed", print_css)
-        self.assertIn("overflow-wrap:anywhere", print_css)
+        print_css = html.split("@media print{\n@page", 1)[1].split("</style>", 1)[0]
+        self.assertIn("size:landscape", print_css)
+        self.assertIn(".page-status,.toolbar,.dashboard-interactive-only,.screen-only,.more summary{display:none!important}", print_css)
+        self.assertIn(".rec-table tr{break-inside:avoid}", print_css)
+        self.assertIn(".rec-table thead th{position:static", print_css)
+        # The phone card layout is screen-only, so a print page never turns the table into cards.
+        self.assertIn("@media screen and (max-width:62rem)", html)
         self.assertIn('class="dashboard-interactive-only"', html)
         self.assertNotIn("/api/pdf", html)
         self.assertNotIn('id="export-pdf"', debug_html)
@@ -1985,12 +1948,12 @@ class RecommendationDashboardTests(unittest.TestCase):
             debug_html = render_dynamic_debug_html(settings_href="/settings")
             self.assertIn('<link rel="icon" href="/favicon.svg" type="image/svg+xml">', html)
             self.assertIn('<link rel="icon" href="/favicon.svg" type="image/svg+xml">', debug_html)
-            self.assertIn("['Pri', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres']", html)
+            self.assertIn("['progress', 'Progress']", html)
             self.assertNotIn("Watched episodes / total episodes", html)
             self.assertIn("/api/dashboard", html)
             self.assertIn("Recommendations", html)
             self.assertIn("Top watched seeds", html)
-            self.assertIn("MAL vote", html)
+            self.assertIn("MAL recommendation vote", html)
             self.assertIn("section_metadata", html)
             self.assertIn("Array.isArray(r.genres)", html)
             self.assertNotIn("(r.genres || []).join(', ')", html)
@@ -2002,7 +1965,7 @@ class RecommendationDashboardTests(unittest.TestCase):
                 "Review queue",
                 "Public MAL userrecs crawl",
                 "Crawl coverage",
-                "Backlog/open",
+                "Backlog and open crawls",
                 "Hourly throughput",
                 "Source-start ETA",
                 "Completion ETA",
@@ -2011,8 +1974,11 @@ class RecommendationDashboardTests(unittest.TestCase):
                 self.assertNotIn(moved_section, html)
                 self.assertIn(moved_section, debug_html)
             self.assertIn('href="/debug">Debug</a>', html)
+            self.assertIn('href="/" aria-current="page">Dashboard</a>', html)
             self.assertIn('href="/">Dashboard</a>', debug_html)
+            self.assertIn('href="/debug" aria-current="page">Debug</a>', debug_html)
             self.assertIn('href="/settings">Settings</a>', debug_html)
+            self.assertNotIn('href="/settings"', html)
             self.assertNotIn("Provider enrichment health", html)
             self.assertNotIn("providerEnrichmentSection(data.operational?.provider_enrichment)", html)
             self.assertIn("Provider enrichment health", debug_html)
@@ -2068,14 +2034,12 @@ class RecommendationDashboardTests(unittest.TestCase):
         html = render_dynamic_dashboard_html()
 
         self.assertNotIn("<h2>Indicators</h2>", html)
-        self.assertIn("function failureSection(data)", html)
+        self.assertIn("function alertsHtml(data)", html)
         self.assertIn("filter(i => i.level === 'error')", html)
         self.assertIn("data.coverage?.summary?.failed", html)
-        self.assertIn("if (!failures.length) return ''", html)
-        self.assertNotIn("No stale/partial/failure indicators.", html)
         self.assertNotIn("Recommendation harvest coverage is stale, failed, or incomplete.", html)
-        self.assertIn('id="dashboard-failures" class="bad">Failures', html)
-        self.assertIn("Recommendation harvest failures: ${failedHarvests}.", html)
+        self.assertIn('id="dashboard-failures" class="bad">Needs attention', html)
+        self.assertIn("plural(failedHarvests, 'MAL recommendation source')", html)
 
     def test_dashboard_api_payload_contract_is_unchanged_by_presentation_split(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2090,6 +2054,119 @@ class RecommendationDashboardTests(unittest.TestCase):
         )
         self.assertIsInstance(payload["indicators"], list)
         self.assertTrue(any(item["level"] == "warning" for item in payload["indicators"]))
+
+
+
+
+class DashboardUiPayloadTests(unittest.TestCase):
+    def _row(self, **overrides):
+        row = {
+            "kind": "discovery_candidate", "priority": 223, "score": 95.26, "title": "86", "display_title": "86 Eighty-Six",
+            "english_title": "86 Eighty-Six", "mal_anime_id": 41457, "provider": "crunchyroll", "provider_series_id": "GVDHX8DM5",
+            "diagnostic_only": False, "image_url": "https://cdn.myanimelist.net/images/anime/1987/117507l.jpg", "episode_total": 26,
+            "watched_progress": "", "genres": ["Drama", "Mecha"], "provider_badges": [{"label": "Crunchyroll", "maturity_rating": "TV-14"}],
+            "provider_evidence": "Crunchyroll", "availability_providers": ["crunchyroll"], "reasons": [],
+            "why_recommended": "recommended from 9 watched seed title(s); 100 MAL recommendation vote(s); Spring 2021; MAL 8.35; watchable dubbed as 86 on Cr…",
+            "context": {"why_recommended": "recommended from 9 watched seed title(s); 100 MAL recommendation vote(s); Spring 2021; MAL 8.35; watchable dubbed as 86 EIGHTY-SIX on Crunchyroll.", "big": "x" * 5000},
+            "scorecard": {"total": 95.26, "components": {"consensus": 100.0, "quality": 77.0}, "features": {"mean": 8.35, "official_detail_features": {"x": "y" * 3000}}},
+            "evidence": {"top_supporting_seeds": [{"mal_anime_id": 16498, "title": "Shingeki no Kyojin", "num_recommendation_votes": 46}], "provider_eligibility_evidence": ["z" * 900]},
+        }
+        row.update(overrides)
+        return row
+
+    def test_ui_view_drops_duplicate_items_and_heavy_row_fields(self) -> None:
+        from mal_updater.recommendation_dashboard import dashboard_ui_payload
+
+        row = self._row()
+        payload = {"generated_at": "2026-11-21T00:00:00Z", "indicators": [], "recommendations": {"items": [row], "sections": {"discovery_available_now": [row]}, "coverage_state": {"strict_actionable_count": 1}}}
+        ui = dashboard_ui_payload(payload)
+
+        self.assertNotIn("items", ui["recommendations"])
+        self.assertEqual({"strict_actionable_count": 1}, ui["recommendations"]["coverage_state"])
+        slim = ui["recommendations"]["sections"]["discovery_available_now"][0]
+        for dropped in ("context", "scorecard", "evidence", "reasons", "why_recommended"):
+            self.assertNotIn(dropped, slim)
+        for kept in ("mal_anime_id", "provider", "provider_series_id", "kind", "display_title", "title", "image_url", "genres", "provider_badges"):
+            self.assertEqual(row[kept], slim[kept])
+        # Reasons come from the untruncated context text, one point per clause.
+        self.assertEqual(
+            ["recommended from 9 watched seed title(s)", "100 MAL recommendation vote(s)", "Spring 2021", "MAL 8.35", "watchable dubbed as 86 EIGHTY-SIX on Crunchyroll"],
+            slim["why_points"],
+        )
+        self.assertEqual(95.26, slim["score_total"])
+        self.assertEqual({"consensus": 100.0, "quality": 77.0}, slim["score_components"])
+        self.assertEqual("Shingeki no Kyojin", slim["seeds"][0]["title"])
+        self.assertLess(len(json.dumps(ui)), len(json.dumps(payload)) / 3)
+        # The full payload is left untouched for API consumers.
+        self.assertIn("items", payload["recommendations"])
+        self.assertIn("context", payload["recommendations"]["sections"]["discovery_available_now"][0])
+
+    def test_ui_view_prefers_the_complete_reason_list(self) -> None:
+        from mal_updater.recommendation_dashboard import dashboard_ui_payload
+
+        row = self._row(kind="resume_backlog", reasons=["English dub is available", "most recent watch activity: 2026-03-22T21:21:34Z", "MAL watch status: watching (8/175 MAL episodes watched)"], why_recommended="English dub is available; most recent…")
+        ui = dashboard_ui_payload({"recommendations": {"sections": {"resume_backlog": [row]}}})
+
+        self.assertEqual(row["reasons"], ui["recommendations"]["sections"]["resume_backlog"][0]["why_points"])
+
+    def test_ui_view_handles_locally_scored_diagnostic_rows(self) -> None:
+        from mal_updater.recommendation_dashboard import dashboard_ui_payload
+
+        # ``_row`` output: reasons joined into one string, scorecard only in context.
+        row = self._row(reasons="recommended from 9 watched seed title(s); 100 MAL recommendation vote(s)")
+        row["context"]["scorecard"] = row.pop("scorecard")
+        slim = dashboard_ui_payload({"recommendations": {"sections": {"discovery_high_confidence": [row]}}})["recommendations"]["sections"]["discovery_high_confidence"][0]
+
+        self.assertEqual("recommended from 9 watched seed title(s)", slim["why_points"][0])
+        self.assertTrue(all(len(point) > 1 for point in slim["why_points"]))
+        self.assertEqual(95.26, slim["score_total"])
+        self.assertEqual({"consensus": 100.0, "quality": 77.0}, slim["score_components"])
+
+    def test_handler_serves_the_ui_view_on_request_and_full_payload_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(db_path))
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                full = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard", timeout=5).read().decode("utf-8"))
+                ui = json.loads(urlopen(f"http://127.0.0.1:{server.server_port}/api/dashboard?view=ui", timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+        self.assertIn("items", full["recommendations"])
+        self.assertNotIn("items", ui["recommendations"])
+        self.assertEqual(set(full), set(ui))
+
+    def test_rows_without_cover_or_genres_get_cached_mal_values(self) -> None:
+        from mal_updater.recommendation_dashboard import _fill_missing_mal_metadata
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state.db"
+            bootstrap_database(db_path)
+            upsert_mal_anime_metadata(
+                db_path, mal_anime_id=6702, title="Fairy Tail", title_english=None, title_japanese=None, alternative_titles=[],
+                media_type="tv", status="finished_airing", num_episodes=175, mean=7.6, popularity=50, start_season=None,
+                raw={"id": 6702, "main_picture": {"medium": "https://cdn.myanimelist.net/images/anime/5/18179.jpg", "large": "https://cdn.myanimelist.net/images/anime/5/18179l.jpg"},
+                     "genres": [{"id": 1, "name": "Action"}, {"id": 10, "name": "Fantasy"}]},
+            )
+            resume = {"mal_anime_id": 6702, "image_url": "", "genres": []}
+            provider_art = {"mal_anime_id": 6702, "image_url": "https://example.invalid/provider.jpg", "genres": ["Comedy"]}
+            unknown = {"mal_anime_id": 999999, "image_url": "", "genres": []}
+            no_id = {"mal_anime_id": None, "image_url": "", "genres": []}
+            unknown_provider_art = {"mal_anime_id": 999999, "image_url": "https://example.invalid/other.jpg", "genres": []}
+            _fill_missing_mal_metadata(db_path, [resume, provider_art, unknown, no_id, unknown_provider_art])
+
+        self.assertEqual("https://cdn.myanimelist.net/images/anime/5/18179l.jpg", resume["image_url"])
+        self.assertEqual(["Action", "Fantasy"], resume["genres"])
+        # MAL covers win over provider art (the container CSP admits only the MAL CDN).
+        self.assertEqual("https://cdn.myanimelist.net/images/anime/5/18179l.jpg", provider_art["image_url"])
+        self.assertEqual("https://example.invalid/other.jpg", unknown_provider_art["image_url"])
+        self.assertEqual(["Comedy"], provider_art["genres"])
+        self.assertEqual("", unknown["image_url"])
+        self.assertEqual("", no_id["image_url"])
 
 
 if __name__ == "__main__":

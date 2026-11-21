@@ -136,7 +136,7 @@ def make_container_handler(config: AppConfig, daemon_ref: list[subprocess.Popen[
             print(json.dumps({"event": "http_request", "client": self.client_address[0], "method": self.command, "path": urlparse(self.path).path, "status": args[1] if len(args) > 1 else None}), flush=True)
         def _headers(self) -> None:
             self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Referrer-Policy", "no-referrer"); self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' https://cdn.myanimelist.net; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
             body = json.dumps(payload, sort_keys=True).encode(); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self._headers(); self.send_header("Content-Length", str(len(body))); self.end_headers()
             if self.command != "HEAD": self.wfile.write(body)

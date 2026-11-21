@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, DEFAULT_SERVICE_RECOMMENDATION_FULL_HARVEST_STALE_AFTER_DAYS, DEFAULT_SERVICE_TASK_EXECUTE_LIMITS, load_config
 from .crunchyroll_auth import crunchyroll_auth_material_present
+from .web_shell import FAVICON_LINK, SHELL_CSS, top_bar
 from .db import (
     bootstrap_database,
     connect,
@@ -1758,6 +1759,117 @@ def build_dashboard_payload(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_REC
         raise
 
 
+def _mal_cover_and_genres_from_raw(raw_json: Any) -> tuple[str, list[str]]:
+    try:
+        raw = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    except (TypeError, ValueError):
+        return "", []
+    if not isinstance(raw, dict):
+        return "", []
+    cover = ""
+    picture = raw.get("main_picture")
+    if isinstance(picture, dict):
+        for key in ("large", "medium"):
+            value = picture.get(key)
+            if isinstance(value, str) and value.startswith("https://"):
+                cover = value.strip()
+                break
+    genres = [
+        str(genre["name"]).strip()
+        for genre in raw.get("genres") or []
+        if isinstance(genre, dict) and isinstance(genre.get("name"), str) and genre["name"].strip()
+    ]
+    return cover, genres
+
+
+_MAL_CDN_PREFIX = "https://cdn.myanimelist.net/"
+
+
+def _lacks_mal_cover(row: dict[str, Any]) -> bool:
+    return not str(row.get("image_url") or "").startswith(_MAL_CDN_PREFIX)
+
+
+def _fill_missing_mal_metadata(db_path: Path, rows: list[dict[str, Any]]) -> None:
+    """Give rows without MAL cover art or genres (e.g. resume backlog) their cached MAL values.
+
+    Provider catalog art is replaced when MAL has a cover: the container CSP
+    only admits images from the MAL CDN, so provider hosts would not load.
+    """
+    missing: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        mal_id = _number(row.get("mal_anime_id"))
+        if (_lacks_mal_cover(row) or not row.get("genres")) and isinstance(mal_id, int) and mal_id > 0:
+            missing.setdefault(mal_id, []).append(row)
+    if not missing:
+        return
+    ids = sorted(missing)
+    with connect(db_path) as conn:
+        found = conn.execute(
+            f"SELECT mal_anime_id, raw_json FROM mal_anime_metadata WHERE mal_anime_id IN ({','.join('?' * len(ids))})",
+            ids,
+        ).fetchall()
+    for mal_id, raw_json in found:
+        cover, genres = _mal_cover_and_genres_from_raw(raw_json)
+        for row in missing.get(int(mal_id), []):
+            if cover and _lacks_mal_cover(row):
+                row["image_url"] = cover
+            if genres and not row.get("genres"):
+                row["genres"] = genres
+
+
+# Fields the live dashboard page reads from each recommendation row; the
+# default /api/dashboard payload stays complete for API consumers.
+_UI_ROW_FIELDS = (
+    "kind", "priority", "score", "title", "display_title", "english_title", "mal_anime_id", "provider",
+    "provider_series_id", "diagnostic_only", "image_url", "episode_total", "watched_progress", "genres",
+    "provider_badges", "provider_evidence", "availability_providers",
+)
+
+
+def _ui_why_points(row: dict[str, Any], context: dict[str, Any]) -> list[str]:
+    # Snapshot rows carry a reason list; locally scored diagnostic rows
+    # (``_row``) carry a joined string, so those fall back to the context text.
+    raw_reasons = row.get("reasons")
+    reasons = [str(value).strip() for value in raw_reasons if str(value).strip()] if isinstance(raw_reasons, list) else []
+    if not reasons:
+        text = str(context.get("why_recommended") or row.get("why_recommended") or "")
+        reasons = [part.strip() for part in text.split("; ") if part.strip()]
+    return [reason.rstrip(".") for reason in reasons]
+
+
+def _ui_recommendation_row(row: dict[str, Any]) -> dict[str, Any]:
+    slim = {key: row[key] for key in _UI_ROW_FIELDS if key in row}
+    context = row.get("context")
+    context = context if isinstance(context, dict) else {}
+    scorecard = row.get("scorecard")
+    if not isinstance(scorecard, dict):
+        scorecard = context.get("scorecard")
+    scorecard = scorecard if isinstance(scorecard, dict) else {}
+    components = scorecard.get("components")
+    evidence = row.get("evidence")
+    slim["why_points"] = _ui_why_points(row, context)
+    slim["score_total"] = scorecard.get("total")
+    slim["score_components"] = components if isinstance(components, dict) else {}
+    slim["seeds"] = (evidence.get("top_supporting_seeds") if isinstance(evidence, dict) else None) or []
+    return slim
+
+
+def dashboard_ui_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """The live page's view of a dashboard payload: only fields it renders.
+
+    The full payload repeats every row under ``items`` and carries each
+    row's complete scoring context (about 38 KB per row, 9 MB in total);
+    the page re-fetches every minute and uses a few fields per row.
+    """
+    recommendations = dict(payload.get("recommendations") or {})
+    recommendations.pop("items", None)
+    recommendations["sections"] = {
+        name: [_ui_recommendation_row(row) for row in rows]
+        for name, rows in (recommendations.get("sections") or {}).items()
+    }
+    return {**payload, "recommendations": recommendations}
+
+
 def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_limit: int, stale_after_days: int, config: AppConfig | None = None) -> dict[str, Any]:
     operational = get_operational_snapshot(db_path)
     operational["provider_enrichment"] = _provider_enrichment_diagnostics_for_dashboard(db_path, config=config)
@@ -1803,6 +1915,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
         section_totals[section_key] = section_totals.get(section_key, 0) + 1
         if len(sections.setdefault(section_key, [])) < display_limit:
             sections[section_key].append(row)
+    _fill_missing_mal_metadata(db_path, [row for section_rows in sections.values() for row in section_rows])
     eligibility_counts = _eligibility_coverage_counts(db_path)
     strict_actionable_count = section_totals.get("discovery_available_now", 0)
     dormant_count = section_totals.get("discovery_high_confidence", 0)
@@ -1849,64 +1962,236 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     }
 
 
-def _render_dynamic_dashboard_page(
-    *,
-    page: str,
-    title: str,
-    settings_href: str | None,
-    dashboard_href: str = "/",
-    debug_href: str = "/debug",
-) -> str:
-    template = """<!doctype html>
-<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\"><title>__TITLE__</title><style>
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0 auto;padding:1.5rem;max-width:110rem;background:#101418;color:#eef3f8;line-height:1.45}h1,h2,h3{line-height:1.2}a{color:#8cc8ff}.report-actions{float:right;display:flex;align-items:center;gap:.75rem;margin:.25rem 0 1rem 1rem}.top-nav{margin:0}.export-pdf-button{font:inherit;font-weight:700;color:#101418;background:#8cc8ff;border:1px solid #b9ddff;border-radius:.4rem;padding:.42rem .7rem;cursor:pointer}.export-pdf-button:hover{background:#b9ddff}.export-pdf-button:focus-visible{outline:3px solid #eef3f8;outline-offset:2px}.print-report-meta{display:none}.muted{color:#aebccc}.bad{color:#ff9b9b}.warn{color:#ffd37a}.good{color:#b9f6ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:1rem}.card,.banner,.empty-state{background:#161d24;border:1px solid #2b3642;border-radius:.6rem;padding:1rem}.banner{margin:1rem 0}.affinity-card{margin:1.25rem 0}.affinity-layout{display:grid;grid-template-columns:minmax(18rem,32rem) minmax(16rem,1fr);gap:1rem;align-items:center}.affinity-chart-wrap{max-width:32rem;overflow-x:auto}.affinity-chart{display:block;width:100%;min-width:28rem;height:auto}.affinity-grid{fill:none;stroke:#435363;stroke-width:1}.affinity-axis{stroke:#435363;stroke-width:1}.affinity-area{fill:#4b9fff55;stroke:#8cc8ff;stroke-width:2}.affinity-point{fill:#b9f6ca;stroke:#101418;stroke-width:1.5}.affinity-label{fill:#eef3f8;font-size:13px;font-weight:650}.affinity-details{columns:2;column-gap:1.5rem;margin:.5rem 0;padding-left:1.2rem}.affinity-details li{break-inside:avoid;margin:.25rem 0}.recommendation-controls{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem 1rem;margin:.8rem 0}.recommendation-controls label{font-weight:650}.genre-filter{position:relative}.genre-menu{position:absolute;z-index:3;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:18rem;overflow-y:auto;padding:.35rem;background:#161d24;border:1px solid #60778d;border-radius:.5rem;box-shadow:0 .5rem 1.5rem #0008}.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.42rem .55rem;border:0;border-radius:.3rem;color:#eef3f8;background:transparent;font:inherit}.genre-menu button:hover,.genre-menu button:focus-visible{background:#243f5a}.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}.genre-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .3rem .2rem .55rem;border:1px solid #60778d;border-radius:999px;background:#1d2935}.genre-chip button{display:inline-grid;place-items:center;width:1.4rem;height:1.4rem;padding:0;border:0;border-radius:50%;color:#eef3f8;background:#34495e;font:inherit;font-weight:700;line-height:1}.genre-menu-trigger,.row-visibility-button{font:inherit;color:#eef3f8;background:#243140;border:1px solid #60778d;border-radius:.35rem;padding:.28rem .5rem}.genre-menu-trigger:focus-visible,.genre-chip button:focus-visible,.row-visibility-button:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.table-scroll,.ordinary-table-scroll{overflow-x:auto;margin:.75rem 0 1.5rem;border:1px solid #2b3642;border-radius:.55rem}.table-scroll:focus-visible,.ordinary-table-scroll:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}table{border-collapse:collapse;width:100%;background:#161d24}.table-scroll table{min-width:54rem}.ordinary-table-scroll table{min-width:36rem}th,td{border-right:1px solid #2b3642;border-bottom:1px solid #2b3642;padding:.65rem .75rem;vertical-align:top;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child>*{border-bottom:0}.table-scroll thead th{position:sticky;top:0;z-index:1;background:#243140}.table-scroll tbody th{min-width:16rem;font-weight:650}tbody tr:nth-child(even){background:#121920}tbody tr:hover{background:#1c2732}.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even){background:#29343d;color:#c5d1dc}.table-scroll tbody tr.hidden-recommendation:hover{background:#33414c}.title-text{display:block}.title-providers{display:block;margin-top:.45rem;font-size:.88rem;font-weight:400}.title-episodes{display:block;margin-top:.3rem;font-size:.88rem;font-weight:400;color:#aebccc}.provider-star-rating,.provider-maturity-rating{display:block;margin:.18rem 0;color:#ffd37a}.provider-maturity-rating{color:#aebccc;margin-bottom:.3rem}.recommendation-art{display:block;width:128px;height:128px;max-width:128px;object-fit:contain;border-radius:.4rem;background:#243140}.provider-badge{display:inline-block;border:1px solid #4b9fff;border-radius:999px;padding:.08rem .5rem;font-weight:700;margin:.05rem .2rem .05rem 0}.provider-link{display:inline-block;border-radius:999px;text-decoration:none}.provider-link:hover .provider-badge{background:#243f5a}.provider-link:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}.diagnostic-row{opacity:.86}.diagnostic-label{color:#ffd37a;font-weight:700;margin-bottom:.25rem}.table-empty{text-align:center;color:#aebccc}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}code{white-space:pre-wrap}@media(max-width:48rem){body{padding:1rem}.report-actions{float:none;justify-content:space-between;margin:0 0 1rem}.card,.banner,.empty-state{padding:.8rem}.affinity-layout{grid-template-columns:1fr}.affinity-chart-wrap{max-width:100%}.affinity-chart{min-width:24rem}.affinity-details{columns:1}th,td{padding:.55rem .6rem}}@media print{@page{size:landscape;margin:.45in}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}html,body{background:#fff!important;color:#111!important}body{margin:0;padding:0;max-width:none;font-size:8.5pt}.report-actions,.screen-intro,.recommendation-controls,.dashboard-interactive-only,.screen-only{display:none!important}.print-report-meta{display:block;margin:0 0 1rem;color:#333}.card,.banner,.empty-state,table{background:#fff!important;color:#111!important;border-color:#aaa!important}.muted{color:#444!important}.bad{color:#8b0000!important}.warn{color:#704d00!important}.good{color:#075f25!important}a{color:#111!important;text-decoration:underline}h2,h3{break-after:avoid}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.card,.banner,.empty-state{padding:.55rem}.banner,.affinity-card{break-inside:avoid}.affinity-layout{grid-template-columns:minmax(15rem,24rem) minmax(12rem,1fr);gap:.5rem}.affinity-chart-wrap{max-width:24rem;overflow:visible}.affinity-chart{min-width:0;max-height:17rem}.affinity-label{fill:#111}.affinity-details{columns:2}.table-scroll,.ordinary-table-scroll{overflow:visible;border-color:#aaa!important}.table-scroll{break-inside:avoid}.table-scroll table,.ordinary-table-scroll table{min-width:0!important;width:100%;table-layout:fixed}thead{display:table-header-group;break-inside:avoid;break-after:avoid}tbody tr:first-child{break-before:avoid}.table-scroll thead th{position:static;background:#e8edf2!important}.table-scroll tbody th{min-width:0}tbody tr,tbody tr:nth-child(even),tbody tr:hover,.table-scroll tbody tr.hidden-recommendation,.table-scroll tbody tr.hidden-recommendation:nth-child(even),.table-scroll tbody tr.hidden-recommendation:hover{background:#fff!important;color:#111!important}th,td{padding:.28rem .35rem;border-color:#bbb!important;overflow-wrap:anywhere}tr,.card,.empty-state{break-inside:avoid}.recommendation-art{width:64px;height:64px;max-width:64px}.provider-badge{border-color:#555!important}.title-providers,.title-episodes,.provider-star-rating,.provider-maturity-rating{font-size:7.5pt}}
-</style></head><body>__REPORT_ACTIONS__<h1>__TITLE__</h1>__PRINT_METADATA__<p class=\"muted screen-intro\">__INTRO__ Data is fetched from <code>/api/dashboard</code> on load and every 60 seconds.</p><div id=\"app\">Loading…</div><script>
-const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
-const countValue = value => {
-  if (value == null) return '';
-  if (Array.isArray(value)) return value.length ? value.map(countValue).join(', ') : '<span class=\"muted\">none</span>';
-  if (typeof value === 'object') {
-    const entries = Object.entries(value);
-    return entries.length ? entries.map(([key, nested]) => `<span class=\"muted\">${esc(key)}:</span> ${countValue(nested)}`).join(' · ') : '<span class=\"muted\">none</span>';
+_COMMON_PAGE_CSS = r"""
+.page-status{margin:0;color:var(--muted);font-size:.9rem}
+.page-status.bad{color:var(--bad)}
+.print-report-meta{display:none}
+.card,.alert,.empty-state{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.15rem;min-width:0}
+.card h2,.card h3{font-size:1.05rem;margin-bottom:.6rem}
+.alert{margin:0 0 1rem;border-left:4px solid var(--warn)}
+.alert.bad{border-left-color:var(--bad)}
+.alert.good{border-left-color:var(--good)}
+.alert h2{font-size:1rem;margin-bottom:.35rem}
+.alert ul{margin:.25rem 0 0;padding-left:1.2rem}
+.alert p{margin:0}
+.empty-state{margin:0 0 1rem}
+.empty-state h2{font-size:1.1rem;margin-bottom:.5rem}
+.page-foot{margin:2rem 0 .5rem;color:var(--faint);font-size:.86rem}
+"""
+
+_PAGE_CSS = r"""
+.section-title{display:flex;align-items:baseline;gap:.6rem;margin:1.75rem 0 .35rem;font-size:1.3rem}
+.count{font-size:.85rem;font-weight:650;color:var(--muted);background:var(--surface-3);border-radius:999px;padding:.08rem .55rem}
+.section-description{margin:0 0 .75rem;color:var(--muted);max-width:60rem}
+/* genre affinity */
+.affinity-card{margin:0 0 1.5rem}
+.affinity-card h2{font-size:1.3rem;margin-bottom:.25rem}
+.affinity-layout{display:grid;grid-template-columns:minmax(16rem,24rem) minmax(0,46rem);gap:1.25rem 3rem;align-items:center}
+.affinity-chart{display:block;width:100%;height:auto}
+.affinity-grid{fill:none;stroke:#3a4757;stroke-width:1}
+.affinity-axis{stroke:#3a4757;stroke-width:1}
+.affinity-area{fill:#4b9fff40;stroke:var(--accent);stroke-width:2}
+.affinity-point{fill:var(--good);stroke:var(--bg);stroke-width:1.5}
+.affinity-label{fill:var(--text);font-size:13px;font-weight:650}
+.affinity-list{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:auto auto minmax(3rem,1fr) auto;align-items:center;gap:.45rem .75rem}
+.affinity-list li{display:contents}
+.affinity-rank{color:var(--faint);text-align:right;font-variant-numeric:tabular-nums}
+.affinity-name{font-weight:650}
+.affinity-numbers{color:var(--muted);font-size:.86rem;font-variant-numeric:tabular-nums;white-space:nowrap}
+.affinity-note{margin:.9rem 0 0;color:var(--muted);font-size:.88rem}
+.bar{position:relative;display:block;height:.5rem;border-radius:999px;background:var(--surface-3);overflow:hidden}
+.bar>span{position:absolute;inset:0 auto 0 0;border-radius:999px;background:var(--accent)}
+/* toolbar */
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem .9rem;margin:.75rem 0 .5rem}
+.search input{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border-strong);border-radius:.45rem;padding:.38rem .7rem;width:16rem;max-width:100%}
+.search input::placeholder{color:var(--faint)}
+.genre-filter{position:relative}
+.genre-menu{position:absolute;z-index:25;top:calc(100% + .35rem);left:0;min-width:13rem;max-height:20rem;overflow-y:auto;padding:.35rem;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:.55rem;box-shadow:0 .75rem 2rem #000a}
+.genre-menu button{display:block;width:100%;text-align:left;margin:0;padding:.4rem .6rem;border:0;border-radius:.35rem;color:var(--text);background:transparent;font:inherit;cursor:pointer}
+.genre-menu button:hover,.genre-menu button:focus-visible{background:var(--surface-3)}
+.genre-chips{display:flex;align-items:center;flex-wrap:wrap;gap:.35rem}
+.genre-chip{display:inline-flex;align-items:center;gap:.3rem;padding:.12rem .2rem .12rem .6rem;border:1px solid var(--border-strong);border-radius:999px;background:var(--surface-2);font-size:.9rem}
+.genre-chip button{display:inline-grid;place-items:center;width:1.3rem;height:1.3rem;padding:0;border:0;border-radius:50%;color:var(--text);background:var(--surface-3);font:inherit;font-weight:700;line-height:1;cursor:pointer}
+.toggle{display:inline-flex;align-items:center;gap:.4rem;color:var(--muted);cursor:pointer}
+.toggle input{accent-color:var(--accent);width:1rem;height:1rem}
+/* recommendation tables */
+.rec-table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:0 0 1rem}
+.rec-table thead th{position:sticky;top:var(--topbar-h);z-index:5;background:var(--surface-3);color:var(--muted);font-size:.78rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;text-align:left;padding:.6rem .75rem;border-bottom:1px solid var(--border)}
+.rec-table thead th:first-child{border-top-left-radius:var(--radius)}
+.rec-table thead th:last-child{border-top-right-radius:var(--radius)}
+.rec-table td,.rec-table tbody th{padding:.8rem .75rem;vertical-align:top;text-align:left;border-bottom:1px solid var(--border);overflow-wrap:break-word;font-weight:400}
+.rec-table tbody tr:last-child>*{border-bottom:0}
+.rec-table tbody tr:hover>*{background:#18202a}
+.rec-table tr.hidden-recommendation>*{background:#1d242d;color:var(--muted)}
+.rec-table tr.hidden-recommendation .cover{opacity:.45}
+.rec-table tr.diagnostic-row>*{background:#181b17}
+.col-rank{width:6rem}.col-cover{width:6.4rem}.col-title{width:17%}.col-why{width:21%}.col-score{width:12.5rem}
+.col-genres{width:8.5rem}.col-actions{width:5.6rem}.col-progress{width:10rem}
+.rank{display:inline-block;min-width:2.4rem;text-align:center;font-weight:750;font-variant-numeric:tabular-nums;background:var(--surface-3);border-radius:.4rem;padding:.12rem .4rem}
+.cover-link{display:block;width:4.9rem}
+.cover{position:relative;display:block;width:4.9rem;aspect-ratio:225/318;border-radius:.4rem;overflow:hidden;background:var(--surface-3)}
+.cover img{display:block;width:100%;height:100%;object-fit:cover}
+.cover-missing::after{content:"No cover";position:absolute;inset:0;display:grid;place-items:center;text-align:center;color:var(--faint);font-size:.72rem;padding:.3rem}
+.title-link{display:block;color:var(--text);font-weight:700;font-size:1.02rem;text-decoration:none;line-height:1.3}
+a.title-link:hover{color:var(--accent-strong);text-decoration:underline}
+.diagnostic-label{display:inline-block;margin-bottom:.3rem;color:var(--warn);font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em}
+.title-meta{margin:.3rem 0 .45rem;color:var(--muted);font-size:.86rem}
+.providers{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .45rem}
+.provider-badge{display:inline-block;border:1px solid #4b8fd6;color:var(--accent-strong);border-radius:999px;padding:.02rem .55rem;font-size:.8rem;font-weight:700}
+.provider-badge.unverified{border-color:var(--border-strong);color:var(--muted)}
+.provider-link{text-decoration:none;border-radius:999px}
+.provider-link:hover .provider-badge{background:#1d3550}
+.provider-rating{color:var(--warn);font-size:.82rem}
+.why{margin:0;padding:0;list-style:none;display:grid;gap:.3rem}
+.why li{position:relative;padding-left:.9rem}
+.why li::before{content:"";position:absolute;left:0;top:.62em;width:.32rem;height:.32rem;border-radius:50%;background:var(--faint)}
+.score{display:grid;gap:.12rem .9rem;align-content:start}
+.score-total{grid-column:1 / -1;margin-bottom:.3rem;font-size:1.35rem;font-weight:750;font-variant-numeric:tabular-nums;line-height:1}
+.score-total small{font-size:.75rem;font-weight:600;color:var(--muted)}
+.bar-row{display:grid;grid-template-columns:5.3rem minmax(2rem,1fr) 1.9rem;align-items:center;gap:.4rem;font-size:.8rem;line-height:1.45}
+.bar-label{color:var(--muted)}
+.bar-value{text-align:right;font-variant-numeric:tabular-nums}
+.seeds{margin:0;padding:0;list-style:none;display:grid;gap:.4rem}
+.seeds a{color:var(--text);text-decoration:none}
+.seeds a:hover{color:var(--accent-strong);text-decoration:underline}
+.seed-meta{display:block;color:var(--muted);font-size:.82rem}
+.more{margin-top:.4rem}
+.more summary{cursor:pointer;color:var(--accent);font-size:.86rem}
+.more .seeds{margin-top:.4rem}
+.tags{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;align-items:flex-start;gap:.25rem}
+.tags li{font-size:.82rem;line-height:1.25;background:var(--surface-3);border-radius:.35rem;padding:.12rem .45rem}
+.progress-text{font-weight:700;font-variant-numeric:tabular-nums}
+.progress-cell .bar{margin-top:.35rem}
+@media screen and (max-width:62rem){
+.affinity-layout{grid-template-columns:1fr}
+.affinity-chart-wrap{max-width:24rem;margin:0 auto;width:100%}
+.rec-table,.rec-table tbody{display:block;border:0;background:transparent}
+.rec-table colgroup,.rec-table thead{display:none}
+.rec-table tr{display:grid;grid-template-columns:4.9rem minmax(0,1fr) auto;gap:.55rem .9rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem;margin:0 0 .8rem}
+.rec-table td,.rec-table tbody th{display:block;padding:0;border:0;background:transparent!important}
+.rec-table .c-cover{grid-column:1;grid-row:1 / span 2}
+.rec-table .c-rank{grid-column:2;grid-row:1}
+.rec-table .c-actions{grid-column:3;grid-row:1}
+.rec-table .c-title{grid-column:2 / -1;grid-row:2}
+.rec-table .score{grid-template-columns:1fr 1fr}
+.rec-table .c-why,.rec-table .c-progress,.rec-table .c-score,.rec-table .c-seeds,.rec-table .c-genres{grid-column:1 / -1}
+.rec-table td[data-label]::before{content:attr(data-label);display:block;margin-bottom:.25rem;color:var(--faint);font-size:.72rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.rec-table .c-rank::before{display:inline!important;margin-right:.4rem}
+.tags{flex-direction:row;flex-wrap:wrap}
+.search input{width:100%}
+.search{flex:1 1 14rem}
+}
+@media screen and (max-width:40rem){.export-pdf-button{display:none}.affinity-list{grid-template-columns:auto auto minmax(0,1fr) auto;gap:.45rem .5rem}.affinity-numbers{white-space:normal;text-align:right}}
+@media screen and (max-width:24rem){.rec-table .score{grid-template-columns:1fr}}
+@media print{
+@page{size:landscape;margin:.45in}
+*{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+html,body{background:#fff!important;color:#111!important}
+body{font-size:8.5pt}
+.page{max-width:none;padding:0}
+.page-status,.toolbar,.dashboard-interactive-only,.screen-only,.more summary{display:none!important}
+.print-report-meta{display:block;margin:0 0 .8rem;color:#333}
+.card,.alert,.empty-state,.rec-table{background:#fff!important;color:#111!important;border-color:#aaa!important;box-shadow:none}
+.muted,.title-meta,.seed-meta,.bar-label,.affinity-numbers,.section-description,.count{color:#444!important}
+.count{background:#eee!important}
+.bad{color:#8b0000!important}.warn{color:#704d00!important}.good{color:#075f25!important}
+a,.title-link{color:#111!important}
+h2,h3{break-after:avoid}
+.affinity-card,.alert{break-inside:avoid}
+.affinity-layout{grid-template-columns:16rem minmax(0,1fr)}
+.affinity-label{fill:#111}
+.rec-table thead th{position:static;background:#e8edf2!important;color:#222!important}
+.rec-table tr,.rec-table tr>*{background:#fff!important;color:#111!important}
+.rec-table td,.rec-table tbody th{padding:.3rem .35rem;border-color:#bbb!important}
+.rec-table tr{break-inside:avoid}
+.col-rank{width:3rem}.col-cover{width:3.6rem}.col-title{width:16%}.col-why{width:19%}.col-score{width:10rem}
+.col-genres{width:6.5rem}.col-progress{width:7rem}.col-actions{width:0}
+.cover,.cover-link{width:2.8rem}
+.rank{min-width:0;padding:0 .2rem}
+.title-link{font-size:9.5pt}
+.title-meta,.seed-meta,.tags li,.provider-badge,.provider-rating,.more summary,.section-description{font-size:7.5pt}
+.bar-row{grid-template-columns:4.3rem minmax(1rem,1fr) 1.6rem;font-size:7pt}
+.tags li,.rank,.bar{background:#eee!important}
+.bar>span{background:#4a78a8!important}
+.provider-badge{color:#111!important;border-color:#555!important}
+.more[open] .seeds,.more .seeds{display:grid}
+.more{display:block}
+}
+"""
+
+_DEBUG_CSS = r"""
+.debug-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(17rem,100%),1fr));gap:1rem;margin:0 0 1.5rem}
+.debug-section-title{font-size:1.25rem;margin:1.75rem 0 .75rem}
+.kv{display:grid;grid-template-columns:fit-content(58%) minmax(0,1fr);gap:.3rem .9rem;margin:0;font-size:.9rem}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;overflow-wrap:break-word;min-width:0;font-variant-numeric:tabular-nums}
+.kv-inline{display:flex;flex-wrap:wrap;gap:.1rem .7rem}
+.kv-inline>span{min-width:0;overflow-wrap:break-word}
+.card h3.sub{margin-top:1rem}
+.status-chip{display:inline-block;border-radius:999px;padding:.02rem .55rem;font-size:.8rem;font-weight:700;background:var(--surface-3)}
+.status-chip.good{color:var(--good)}.status-chip.warn{color:var(--warn)}.status-chip.bad{color:var(--bad)}
+.data-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+.data-table th{background:var(--surface-3);color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;text-align:left;padding:.55rem .75rem}
+.data-table th:first-child{border-top-left-radius:var(--radius)}.data-table th:last-child{border-top-right-radius:var(--radius)}
+.data-table td{padding:.5rem .75rem;border-top:1px solid var(--border);font-variant-numeric:tabular-nums}
+.table-scroll{overflow-x:auto}
+.indicator-list{margin:0;padding-left:1.2rem}
+"""
+
+_COMMON_JS = r"""
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const plural = (n, word, many) => `${Number(n).toLocaleString()} ${Number(n) === 1 ? word : (many || `${word}s`)}`;
+const ISO_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/;
+function parseTime(value){
+  if (typeof value !== 'string' || !ISO_RE.test(value.trim())) return null;
+  let text = value.trim().replace(' ', 'T');
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(text)) text += 'Z';
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+const timeFormat = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'});
+const dateFormat = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium'});
+const formatTime = value => { const date = parseTime(value); return date ? timeFormat.format(date) : String(value ?? ''); };
+const timeTag = value => { const date = parseTime(value); return date ? `<time datetime="${esc(date.toISOString())}" title="${esc(date.toISOString())}">${esc(timeFormat.format(date))}</time>` : esc(value); };
+let lastSignature = null;
+function setPageStatus(text, level){ const el = document.getElementById('page-status'); if (!el) return; el.textContent = text; el.className = `page-status${level ? ` ${level}` : ''}`; }
+async function refresh(){
+  let data;
+  try {
+    const response = await fetch(DATA_URL, {cache: 'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    data = await response.json();
+  } catch (error) {
+    if (lastSignature === null) {
+      const app = document.getElementById('app');
+      app.innerHTML = `<div class="alert bad" role="alert"><p><strong>Could not load dashboard data.</strong> ${esc(error.message)}</p></div>`;
+      app.removeAttribute('aria-busy');
+    }
+    setPageStatus(`Refresh failed (${error.message}); retrying in a minute`, 'bad');
+    return;
   }
-  return esc(value);
-};
-const count = obj => Object.entries(obj || {}).map(([k,v]) => `<div><b>${esc(k)}:</b> ${countValue(v)}</div>`).join('') || '<span class=\"muted\">none</span>';
-const providerBadges = r => { const badges = r.provider_badges || r.evidence?.provider_badges || []; if (!badges.length) return esc(r.provider_evidence || r.evidence?.availability_provider_label || (r.availability_providers || []).join(', ') || 'unknown/unverified'); return badges.map(b => { const provider = b.label || b.provider; const badge = `<span class=\"provider-badge\">${esc(provider)}</span>`; const label = b.url ? `<a class=\"provider-link\" href=\"${esc(b.url)}\" rel=\"noreferrer noopener\" aria-label=\"${esc(`Open ${provider} provider proof`)}\">${badge}</a>` : badge; const starRating = b.star_rating ? `<span class=\"provider-star-rating\">${esc(provider)} user rating: ${esc(b.star_rating)}</span>` : ''; const maturityRating = b.maturity_rating ? `<span class=\"provider-maturity-rating\">Maturity: ${esc(b.maturity_rating)}</span>` : ''; return `${label}${starRating}${maturityRating}`; }).join('<br>'); };
-const seedDetails = e => (e?.top_supporting_seeds || []).map(s => { const bits = []; if (s.num_recommendation_votes != null) bits.push(`${s.num_recommendation_votes} MAL vote${s.num_recommendation_votes === 1 ? '' : 's'}`); if (s.user_score != null) bits.push(`score ${s.user_score}`); if (s.status) bits.push(s.status); return `${esc(s.title || s.mal_anime_id || 'MAL seed')}${bits.length ? ` <span class=\"muted\">(${esc(bits.join(', '))})</span>` : ''}`; }).join('<br>') || esc(e?.compact_seeds || '');
-const scorecard = r => esc(r.scorecard_summary || r.evidence?.scorecard_summary || '');
-const genreText = r => Array.isArray(r.genres) ? r.genres.join(', ') : (r.genres ?? '');
-const recommendationIdentity = r => {
-  if (r.mal_anime_id != null && String(r.mal_anime_id).trim()) return `mal:${String(r.mal_anime_id).trim()}`;
-  if (r.provider && r.provider_series_id) return `provider:${String(r.provider).trim().toLowerCase()}:${String(r.provider_series_id).trim()}`;
-  const title = String(r.display_title || r.english_title || r.title || 'untitled').trim().toLowerCase().replace(/\\s+/g, ' ');
-  return `fallback:${encodeURIComponent(`${r.kind || 'recommendation'}|${title}`)}`;
-};
-function recTable(rows, meta = {}){ const titleLabel = meta.title_label || 'Title'; const diag = meta.diagnostic_only === 'true' ? '<p class="warn"><strong>Discovery only:</strong> these rows lack strict provider+dub proof and are not watch-now eligible.</p>' : ''; if(!rows?.length) return `${diag}<p class="muted" role="status">No recommendations match the current filters in this section.</p>`; const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog'; const headings = progressSection ? ['Pri', 'Title', 'Image', 'Progress', 'Why recommended', 'Genres'] : ['Pri', 'Title', 'Image', 'Why recommended', 'Scorecard', 'Top watched seeds', 'Genres']; if (meta.enable_controls) headings.push('Visibility'); const head = headings.map(label => `<th scope="col"${label === 'Visibility' ? ' class="dashboard-interactive-only"' : ''}>${esc(label)}</th>`).join(''); const body = rows.map(r => { const e = r.evidence || {}; const identity = recommendationIdentity(r); const hidden = meta.hidden_titles?.has(identity); const diagnostic = r.diagnostic_only ? ' diagnostic-row' : ''; const hiddenClass = hidden ? ' hidden-recommendation' : ''; const diagnosticLabel = r.diagnostic_only ? '<div class="diagnostic-label">discovery only · unverified</div>' : ''; const rawTitle = r.display_title || r.english_title || r.title || 'Untitled'; const title = esc(rawTitle); const image = r.image_url ? `<img class="recommendation-art" src="${esc(r.image_url)}" alt="${esc(`${rawTitle} cover art`)}" width="128" height="128" loading="lazy">` : '<span class="muted">No cover art available</span>'; const action = meta.enable_controls ? `<td class="dashboard-interactive-only"><button type="button" class="row-visibility-button" data-recommendation-id="${esc(identity)}">${hidden ? 'Unhide' : 'Hide'}</button></td>` : ''; const episodeTotal = progressSection ? '' : `<div class="title-episodes">Episodes: ${esc(r.episode_total ?? '?')}</div>`; const details = progressSection ? `<td>${esc(r.watched_progress || '?/?')}</td><td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${esc(genreText(r))}</td>` : `<td>${esc(r.why_recommended || e.why_recommended || '')}</td><td>${scorecard(r)}</td><td>${seedDetails(e)}</td><td>${esc(genreText(r))}</td>`; return `<tr class="${diagnostic}${hiddenClass}" data-recommendation-id="${esc(identity)}"><td>${esc(r.priority ?? r.score)}</td><th scope="row">${diagnosticLabel}<span class="title-text">${title}</span><div class="title-providers" aria-label="Provider proof">${providerBadges(r)}</div>${episodeTotal}</th><td>${image}</td>${details}${action}</tr>`; }).join(''); return `${diag}<div class="table-scroll" tabindex="0" role="region" aria-label="${esc(titleLabel)} recommendations table"><table><caption class="sr-only">${esc(titleLabel)} recommendations; provider proof appears below each title.</caption><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`; }
-__PAGE_HELPERS__
-function emptyState(state){ if (!state || state.strict_actionable_count !== 0) return ''; return `<section class=\"empty-state\"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class=\"muted\">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`; }
-async function refresh(){ const res = await fetch('/api/dashboard', {cache:'no-store'}); const data = await res.json(); __PAGE_RENDER__ }
-refresh().catch(err => document.getElementById('app').innerHTML = `<p class=\"bad\">${esc(err.message)}</p>`); setInterval(refresh, 60000);
-</script></body></html>"""
-    if page == "debug":
-        navigation_links = [f'<a href="{escape(dashboard_href, quote=True)}">Dashboard</a>']
-        if settings_href:
-            navigation_links.append(f'<a href="{escape(settings_href, quote=True)}">Settings</a>')
-        page_helpers = """function providerEnrichmentSection(e){ const providers = e?.providers || {}; const cards = Object.entries(providers).map(([slug,p]) => { const c = p.candidates || {}; const d = p.due || {}; const a = p.attempts || {}; const cur = p.cursor || {}; const eta = d.selection_eta || {}; const complete = p.availability_completion_eta || {}; return `<section class="card"><h3>${esc(slug)}</h3>${count({status:p.status, reasons:p.reason_codes, candidates:c.ranked_total, metadata_coverage:c.metadata_coverage_ratio, due:d.total, due_by_class:d.by_class, selected_now:d.current_limit_selection_count, selection_eta_seconds:eta.eta_seconds, selection_eta_reason:eta.reason_code, cursor_mal_id:cur.cursor_mal_anime_id, cursor_generation:cur.cursor_generation, attempted_last_hour:a.distinct_candidates_attempted_last_hour, recent_outcomes:a.recent_24h_outcome_counts, availability_completion_eta:complete.reason_code})}</section>`; }).join(''); if(!cards) return `<section><h2>Provider enrichment health</h2><p class="muted">${esc(e?.reason_codes?.join(', ') || 'No configured credentialed provider enrichment lanes detected.')}</p></section>`; return `<section><h2>Provider enrichment health</h2><div class="grid">${cards}</div></section>`; }
-function syncTable(runs){ if(!runs?.length) return '<p class=\"muted\">No sync runs recorded.</p>'; return `<div class=\"ordinary-table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Recent provider sync runs table\"><table><thead><tr><th>ID</th><th>Provider</th><th>Mode</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.provider)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td><td>${esc(r.started_at)}</td><td>${esc(r.completed_at)}</td></tr>`).join('')}</tbody></table></div>`; }
-const etaText = (hours, reasons = []) => hours == null ? `unknown${reasons.length ? ` (${esc(reasons.join(', '))})` : ''}` : (hours === 0 ? 'ready now' : `~${esc(hours)}h`);
-function publicUserrecsSection(p){ if(!p) return ''; const c = p.coverage || {}; const o = p.open_generations || {}; const h = p.hourly_throughput || {}; const b = p.backlog || {}; const s = p.sustainability || {}; return `<section><h2>Public MAL userrecs crawl</h2><div class=\"grid\"><section class=\"card\"><h3>Crawl coverage</h3>${count({status:p.status, positive_seeds:p.positive_seed_count, complete:c.complete, fresh:c.fresh, stale:c.stale, failed:c.failed, unharvested:c.unharvested, fresh_ratio:c.fresh_ratio})}</section><section class=\"card\"><h3>Backlog/open</h3>${count({due_sources:b.due_sources, active:o.active, paused:o.paused, ready:o.ready, open_total:o.total, staged_pages:o.staged_pages, staged_edges:o.staged_edges})}</section><section class=\"card\"><h3>Hourly throughput</h3>${count({pages_fetched_last_hour:h.pages_fetched_last_hour, last_page:h.last_page_fetched_at, sources_started:h.sources_started_last_hour, sources_published:h.sources_published_last_hour})}</section><section class=\"card\"><h3>Source-start ETA</h3>${count({eta:etaText(b.conservative_source_start_eta_hours), authorized_per_hour:s.authorized_source_titles_per_hour, configured_per_hour:s.configured_source_titles_per_hour, within_authorized_rate:s.within_authorized_rate})}</section><section class=\"card\"><h3>Completion ETA</h3>${count({eta:etaText(b.completion_eta_hours, b.completion_eta_reason_codes || ['unknown_pages_per_source'])})}</section></div></section>`; }"""
-        page_render = """const state = data.recommendations?.coverage_state || {}; const indicators = (data.indicators || []).map(i => `<li class=\"${i.level === 'error' ? 'bad' : 'warn'}\">${esc(i.message)}</li>`).join('') || '<li class=\"muted\">No indicators.</li>'; document.getElementById('app').innerHTML = `<section><h2>Indicators</h2><ul>${indicators}</ul></section><div class=\"grid\"><section class=\"card\"><h2>Snapshot</h2><div><b>Run:</b> ${esc(data.snapshot?.run_id || 'none')}</div><div><b>Generated:</b> ${esc(data.snapshot?.generated_at || 'n/a')}</div><div><b>Items:</b> ${esc(data.snapshot?.item_count || 0)}</div></section><section class=\"card\"><h2>Strict coverage</h2>${count({watchable_now: state.strict_actionable_count, ranked_unverified_discovery: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count})}</section><section class=\"card\"><h2>MAL harvest coverage</h2>${count(data.coverage?.summary)}</section><section class=\"card\"><h2>Providers</h2>${count(data.operational?.provider_counts_by_provider)}<h3>HIDIVE progress evidence</h3>${count(data.operational?.hidive_progress_provenance)}</section><section class=\"card\"><h2>Review queue</h2>${count(data.operational?.review_queue)}</section></div>${providerEnrichmentSection(data.operational?.provider_enrichment)}${publicUserrecsSection(data.coverage?.public_userrecs)}<section><h2>Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)}<span class=\"screen-only\"> · <a href=\"/api/dashboard\">JSON</a></span></p>`;"""
-        intro = "Operational and diagnostic evidence view."
-    else:
-        navigation_links = [f'<a href="{escape(debug_href, quote=True)}">Debug</a>']
-        if settings_href:
-            navigation_links.append(f'<a href="{escape(settings_href, quote=True)}">Settings</a>')
-        page_helpers = """const dismissedTitlesKey = ['malupdater', 'dismissedTitles', 'v1'].join('.');
+  const signature = pageSignature(data);
+  if (signature !== lastSignature) {
+    lastSignature = signature;
+    renderPage(data);
+    document.getElementById('app').removeAttribute('aria-busy');
+  }
+  setPageStatus(`Updated ${formatTime(data.generated_at)} · refreshes every minute`);
+}
+"""
+
+_BOOT_JS = r"""
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+"""
+
+_DASHBOARD_JS = r"""
+const dismissedTitlesKey = ['malupdater', 'dismissedTitles', 'v1'].join('.');
 let selectedGenres = [];
 let genreMenuOpen = false;
 let showHiddenTitles = false;
+let titleQuery = '';
 let hiddenTitles = new Set();
 let latestDashboardData = null;
 try {
@@ -1914,15 +2199,170 @@ try {
   if (Array.isArray(storedHiddenTitles)) hiddenTitles = new Set(storedHiddenTitles.filter(value => typeof value === 'string'));
 } catch (_) { hiddenTitles = new Set(); }
 function persistHiddenTitles(){ try { localStorage.setItem(dismissedTitlesKey, JSON.stringify([...hiddenTitles].sort())); } catch (_) {} }
-function failureSection(data){ const failures = (data.indicators || []).filter(i => i.level === 'error').map(i => i.message); const failedHarvests = Number(data.coverage?.summary?.failed || 0); if (failedHarvests > 0) failures.push(`Recommendation harvest failures: ${failedHarvests}.`); if (!failures.length) return ''; return `<section class=\"banner\" aria-labelledby=\"dashboard-failures\"><h2 id=\"dashboard-failures\" class=\"bad\">Failures</h2><ul>${failures.map(message => `<li class=\"bad\">${esc(message)}</li>`).join('')}</ul></section>`; }
-function dashboardGenres(data){ return [...new Set(Object.values(data.recommendations?.sections || {}).flat().flatMap(r => Array.isArray(r.genres) ? r.genres : []).filter(g => typeof g === 'string' && g.trim()).map(g => g.trim()))].sort((a,b) => a.localeCompare(b)); }
-function recommendationControls(data){
-  const availableGenres = dashboardGenres(data).filter(genre => !selectedGenres.includes(genre));
-  const options = availableGenres.map(genre => `<button type=\"button\" role=\"menuitem\" class=\"genre-option\" data-genre=\"${esc(genre)}\">${esc(genre)}</button>`).join('') || '<span class=\"muted\" role=\"status\">All available genres are selected.</span>';
-  const menu = genreMenuOpen ? `<div id=\"genre-menu\" class=\"genre-menu\" role=\"menu\" aria-label=\"Available genres\">${options}</div>` : '';
-  const chips = selectedGenres.map(genre => `<span class=\"genre-chip\"><span>${esc(genre)}</span><button type=\"button\" class=\"genre-remove\" data-genre=\"${esc(genre)}\" aria-label=\"${esc(`Remove ${genre} genre filter`)}\">×</button></span>`).join('');
-  return `<div class=\"recommendation-controls\" data-genre-control><div class=\"genre-filter\"><button type=\"button\" id=\"genre-menu-trigger\" class=\"genre-menu-trigger\" aria-haspopup=\"menu\" aria-controls=\"genre-menu\" aria-expanded=\"${genreMenuOpen}\">Add genre filter</button>${menu}</div><div class=\"genre-chips\" aria-label=\"Selected genre filters\">${chips || '<span class=\"muted\">All genres</span>'}</div><label><input id=\"show-hidden-titles\" type=\"checkbox\"${showHiddenTitles ? ' checked' : ''}> Show hidden titles</label></div>`;
+const recommendationIdentity = r => {
+  if (r.mal_anime_id != null && String(r.mal_anime_id).trim()) return `mal:${String(r.mal_anime_id).trim()}`;
+  if (r.provider && r.provider_series_id) return `provider:${String(r.provider).trim().toLowerCase()}:${String(r.provider_series_id).trim()}`;
+  const title = String(r.display_title || r.english_title || r.title || 'untitled').trim().toLowerCase().replace(/\s+/g, ' ');
+  return `fallback:${encodeURIComponent(`${r.kind || 'recommendation'}|${title}`)}`;
+};
+const malUrl = id => `https://myanimelist.net/anime/${encodeURIComponent(String(id).trim())}`;
+// Payload URLs come from provider catalogs; only http(s) may reach href/src.
+const webUrl = value => { const text = String(value ?? '').trim(); return /^https?:\/\//i.test(text) ? text : ''; };
+const externalLink = (href, html, cls) => `<a${cls ? ` class="${cls}"` : ''} href="${esc(href)}" target="_blank" rel="noopener noreferrer">${html}</a>`;
+const SEASON_RE = /^(?:Winter|Spring|Summer|Fall) \d{4}$/;
+const MAL_SCORE_RE = /^MAL (\d+(?:\.\d+)?)$/;
+// Presentation wording for the recommendation engine's reason strings.
+const REASON_REWRITES = [
+  [/^recommended from (\d+) watched seed title\(s\)$/i, m => `Recommended by ${plural(m[1], 'title')} you watched`],
+  [/^(\d+) MAL recommendation vote\(s\)$/i, m => plural(m[1], 'MAL recommendation vote')],
+  [/^watchable dubbed as (.+) on ([^;]+)$/i, m => `English dub on ${m[2]} as “${m[1]}”`],
+  [/^watchable (?:dubbed )?on ([^;]+)$/i, m => `Watchable on ${m[1]}`],
+  [/^(\d+) contiguous episode\(s\) appear beyond your completed tail progress$/i, m => `${plural(m[1], 'more episode')} after where you stopped`],
+  [/^this looks more like a backlog continuation than a fresh release alert$/i, () => null],
+  [/^most recent watch activity: (.+)$/i, m => { const date = parseTime(m[1]); return date ? `Last watched ${dateFormat.format(date)}` : `Last watched ${m[1]}`; }],
+  [/^MAL watch status: ([\w ]+) \((\S+)\/(\S+) MAL episodes watched\)$/i, m => `On your MAL list: ${m[1].replace(/_/g, ' ')} (${m[2]}/${m[3]} episodes)`],
+  [/^MAL watch status: ([\w ]+)$/i, m => `On your MAL list: ${m[1].replace(/_/g, ' ')}`],
+];
+function tidyReason(text){
+  const value = String(text ?? '').trim().replace(/[.…]+$/, '');
+  if (!value) return null;
+  for (const [pattern, rewrite] of REASON_REWRITES) { const match = value.match(pattern); if (match) return rewrite(match); }
+  const generic = value.replace(/(\d+)(\D*?)\b(\w+)\(s\)/g, (_, n, middle, word) => `${n}${middle}${Number(n) === 1 ? word : `${word}s`}`);
+  return generic.charAt(0).toUpperCase() + generic.slice(1);
 }
+function rowPresentation(r){
+  const meta = [];
+  const why = [];
+  for (const point of (Array.isArray(r.why_points) ? r.why_points : [])) {
+    const text = String(point).trim();
+    if (SEASON_RE.test(text)) { meta.push(text); continue; }
+    const score = text.match(MAL_SCORE_RE);
+    if (score) { meta.push(`MAL ${score[1]}`); continue; }
+    const tidy = tidyReason(text);
+    if (tidy) why.push(tidy);
+  }
+  return {meta, why};
+}
+function providerBadges(r){
+  const badges = Array.isArray(r.provider_badges) ? r.provider_badges : [];
+  if (!badges.length) {
+    const label = r.provider_evidence || (r.availability_providers || []).join(', ');
+    return label ? `<span class="provider-badge unverified">${esc(label)}</span>` : '<span class="muted">Provider unverified</span>';
+  }
+  return badges.map(b => {
+    const name = b.label || b.provider;
+    const chip = `<span class="provider-badge">${esc(name)}</span>`;
+    const rating = b.star_rating ? `<span class="provider-rating" title="${esc(`${name} user rating`)}">★ ${esc(b.star_rating)}</span>` : '';
+    const url = webUrl(b.url);
+    return `${url ? `<a class="provider-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer" aria-label="${esc(`Open on ${name}`)}">${chip}</a>` : chip}${rating}`;
+  }).join('');
+}
+function coverCell(r){
+  const src = webUrl(r.image_url);
+  const image = src ? `<img src="${esc(src)}" alt="" width="225" height="318" loading="lazy" decoding="async">` : '';
+  const cover = `<span class="cover${image ? '' : ' cover-missing'}">${image}</span>`;
+  return r.mal_anime_id ? `<a class="cover-link" href="${esc(malUrl(r.mal_anime_id))}" target="_blank" rel="noopener noreferrer" tabindex="-1" aria-hidden="true">${cover}</a>` : cover;
+}
+function titleCell(r, extraMeta, progressSection){
+  const rawTitle = r.display_title || r.english_title || r.title || 'Untitled';
+  const name = r.mal_anime_id ? externalLink(malUrl(r.mal_anime_id), esc(rawTitle), 'title-link') : `<span class="title-link">${esc(rawTitle)}</span>`;
+  const maturity = [...new Set((r.provider_badges || []).map(b => b.maturity_rating).filter(Boolean))];
+  const meta = [...maturity];
+  if (!progressSection && r.episode_total) meta.push(plural(r.episode_total, 'episode'));
+  meta.push(...extraMeta);
+  const label = r.diagnostic_only ? '<span class="diagnostic-label">Discovery only · unverified</span>' : '';
+  return `${label}${name}${meta.length ? `<div class="title-meta">${esc(meta.join(' · '))}</div>` : ''}<div class="providers" aria-label="Where to watch">${providerBadges(r)}</div>`;
+}
+const SCORE_PARTS = [['consensus', 'Consensus'], ['affinity', 'Affinity'], ['quality', 'Quality'], ['availability', 'Availability'], ['dub_watchable', 'English dub'], ['confidence', 'Confidence']];
+function scoreCell(r){
+  const total = Number(r.score_total);
+  const parts = r.score_components || {};
+  const bars = SCORE_PARTS.filter(([key]) => parts[key] != null).map(([key, label]) => {
+    const value = Math.max(0, Math.min(100, Number(parts[key]) || 0));
+    return `<div class="bar-row"><span class="bar-label">${label}</span><span class="bar" aria-hidden="true"><span style="width:${value}%"></span></span><span class="bar-value">${Math.round(value)}</span></div>`;
+  }).join('');
+  if (!Number.isFinite(total) && !bars) return '<span class="muted">—</span>';
+  return `<div class="score">${Number.isFinite(total) ? `<div class="score-total">${esc(total.toFixed(1))} <small>/ 100</small></div>` : ''}${bars}</div>`;
+}
+function seedItem(seed){
+  const bits = [];
+  if (seed.num_recommendation_votes != null) bits.push(plural(seed.num_recommendation_votes, 'vote'));
+  if (seed.user_score != null) bits.push(`you scored ${seed.user_score}`);
+  if (seed.status) bits.push(String(seed.status).replace(/_/g, ' '));
+  const label = esc(seed.title || 'MAL title');
+  const name = seed.mal_anime_id ? externalLink(malUrl(seed.mal_anime_id), label) : label;
+  return `<li>${name}${bits.length ? `<span class="seed-meta">${esc(bits.join(' · '))}</span>` : ''}</li>`;
+}
+function seedsCell(r){
+  const seeds = Array.isArray(r.seeds) ? r.seeds : [];
+  if (!seeds.length) return '<span class="muted">—</span>';
+  const rest = seeds.slice(3);
+  return `<ul class="seeds">${seeds.slice(0, 3).map(seedItem).join('')}</ul>${rest.length ? `<details class="more"><summary>${esc(plural(rest.length, 'more title'))}</summary><ul class="seeds">${rest.map(seedItem).join('')}</ul></details>` : ''}`;
+}
+function progressCell(r){
+  const match = String(r.watched_progress || '').match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (!match) return `<span class="progress-text">${esc(r.watched_progress || '?/?')}</span>`;
+  const percent = Number(match[2]) > 0 ? Math.min(100, Math.round(Number(match[1]) / Number(match[2]) * 100)) : 0;
+  return `<div class="progress-cell"><span class="progress-text">${esc(match[1])} / ${esc(match[2])}</span> <span class="muted">episodes</span><span class="bar" aria-hidden="true"><span style="width:${percent}%"></span></span></div>`;
+}
+const genreList = r => { const genres = Array.isArray(r.genres) ? r.genres : []; return genres.length ? `<ul class="tags">${genres.map(genre => `<li>${esc(genre)}</li>`).join('')}</ul>` : '<span class="muted">—</span>'; };
+function recRow(r, progressSection){
+  const identity = recommendationIdentity(r);
+  const hidden = hiddenTitles.has(identity);
+  const {meta, why} = rowPresentation(r);
+  const classes = [r.diagnostic_only ? 'diagnostic-row' : '', hidden ? 'hidden-recommendation' : ''].filter(Boolean).join(' ');
+  const whyHtml = why.length ? `<ul class="why">${why.map(point => `<li>${esc(point)}</li>`).join('')}</ul>` : '<span class="muted">—</span>';
+  const cells = [
+    `<td class="c-rank" data-label="Priority"><span class="rank" title="Recommendation priority">${esc(r.priority ?? r.score ?? '')}</span></td>`,
+    `<td class="c-cover">${coverCell(r)}</td>`,
+    `<th scope="row" class="c-title">${titleCell(r, meta, progressSection)}</th>`,
+    progressSection ? `<td class="c-progress" data-label="Progress">${progressCell(r)}</td>` : '',
+    `<td class="c-why" data-label="Why recommended">${whyHtml}</td>`,
+    progressSection ? '' : `<td class="c-score" data-label="Score">${scoreCell(r)}</td><td class="c-seeds" data-label="Top watched seeds">${seedsCell(r)}</td>`,
+    `<td class="c-genres" data-label="Genres">${genreList(r)}</td>`,
+    `<td class="c-actions dashboard-interactive-only"><button type="button" class="button small row-visibility-button" data-recommendation-id="${esc(identity)}" aria-pressed="${hidden}">${hidden ? 'Unhide' : 'Hide'}</button></td>`,
+  ];
+  return `<tr${classes ? ` class="${classes}"` : ''} data-recommendation-id="${esc(identity)}">${cells.join('')}</tr>`;
+}
+function recTable(rows, meta){
+  const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog';
+  const columns = progressSection
+    ? [['rank', 'Priority'], ['cover', '<span class="sr-only">Cover</span>'], ['title', 'Title'], ['progress', 'Progress'], ['why', 'Why recommended'], ['genres', 'Genres'], ['actions', '<span class="sr-only">Visibility</span>']]
+    : [['rank', 'Priority'], ['cover', '<span class="sr-only">Cover</span>'], ['title', 'Title'], ['why', 'Why recommended'], ['score', 'Score'], ['seeds', 'Top watched seeds'], ['genres', 'Genres'], ['actions', '<span class="sr-only">Visibility</span>']];
+  const colgroup = columns.map(([key]) => `<col class="col-${key}">`).join('');
+  const head = columns.map(([key, label]) => `<th scope="col"${key === 'actions' ? ' class="dashboard-interactive-only"' : ''}>${label}</th>`).join('');
+  return `<table class="rec-table"><caption class="sr-only">${esc(meta.label || 'Recommendations')}</caption><colgroup>${colgroup}</colgroup><thead><tr>${head}</tr></thead><tbody>${rows.map(r => recRow(r, progressSection)).join('')}</tbody></table>`;
+}
+function visibleRows(rows){
+  const query = titleQuery.trim().toLowerCase();
+  return rows.filter(r => {
+    if (selectedGenres.length && !(Array.isArray(r.genres) && selectedGenres.every(genre => r.genres.includes(genre)))) return false;
+    if (!showHiddenTitles && hiddenTitles.has(recommendationIdentity(r))) return false;
+    if (query && ![r.display_title, r.english_title, r.title].some(value => String(value || '').toLowerCase().includes(query))) return false;
+    return true;
+  });
+}
+function sectionsHtml(data){
+  const sections = Object.entries(data.recommendations?.sections || {});
+  if (!sections.length) return '<p class="muted" role="status">No recommendations yet.</p>';
+  return sections.map(([name, rows]) => {
+    const meta = {kind: name, label: name, ...(data.recommendations?.section_metadata?.[name] || {})};
+    const shown = visibleRows(rows);
+    const countLabel = shown.length === rows.length ? `${rows.length}` : `${shown.length} of ${rows.length}`;
+    const description = meta.description ? `<p class="section-description">${esc(meta.description)}</p>` : '';
+    const diagnostic = meta.diagnostic_only === 'true' ? '<p class="alert"><strong>Discovery only:</strong> these titles lack verified provider and English-dub proof, so they are not watchable-now recommendations.</p>' : '';
+    const body = shown.length ? recTable(shown, meta) : '<p class="muted" role="status">No recommendations match the current filters in this section.</p>';
+    return `<section aria-labelledby="section-${esc(name)}"><h3 class="section-title" id="section-${esc(name)}">${esc(meta.label || name)} <span class="count">${esc(countLabel)}</span></h3>${description}${diagnostic}${body}</section>`;
+  }).join('');
+}
+function dashboardGenres(data){ return [...new Set(Object.values(data.recommendations?.sections || {}).flat().flatMap(r => Array.isArray(r.genres) ? r.genres : []).filter(g => typeof g === 'string' && g.trim()).map(g => g.trim()))].sort((a, b) => a.localeCompare(b)); }
+function genreControlsHtml(data){
+  const availableGenres = dashboardGenres(data).filter(genre => !selectedGenres.includes(genre));
+  const options = availableGenres.map(genre => `<button type="button" role="menuitem" class="genre-option" data-genre="${esc(genre)}">${esc(genre)}</button>`).join('') || '<span class="muted" role="status">All available genres are selected.</span>';
+  const menu = genreMenuOpen ? `<div id="genre-menu" class="genre-menu" role="menu" aria-label="Available genres">${options}</div>` : '';
+  return `<button type="button" id="genre-menu-trigger" class="button genre-menu-trigger" aria-haspopup="menu" aria-controls="genre-menu" aria-expanded="${genreMenuOpen}">Add genre filter</button>${menu}`;
+}
+const chipsHtml = () => selectedGenres.map(genre => `<span class="genre-chip"><span>${esc(genre)}</span><button type="button" class="genre-remove" data-genre="${esc(genre)}" aria-label="${esc(`Remove ${genre} genre filter`)}">×</button></span>`).join('');
 function genreAffinitySection(model){
   const axes = Array.isArray(model?.axes) ? model.axes : [];
   if (axes.length < 3) return `<section id="genre-affinity" class="card affinity-card"><h2>Genre affinity</h2><p class="muted" role="status">Not enough completed/currently-watching titles with genre metadata to draw a radar chart.</p></section>`;
@@ -1932,61 +2372,188 @@ function genreAffinitySection(model){
   const polygon = scale => axes.map((_, index) => point(index, scale).join(',')).join(' ');
   const radialScale = axis => Math.sqrt(Math.max(0, Math.min(100, Number(axis.normalized || 0))) / 100);
   const grid = [0.25, 0.5, 0.75, 1].map(scale => `<polygon class="affinity-grid" points="${polygon(scale)}"/>`).join('');
-  const axisLines = axes.map((_, index) => { const [x,y] = point(index); return `<line class="affinity-axis" x1="${centerX}" y1="${centerY}" x2="${x}" y2="${y}"/>`; }).join('');
-  const labels = axes.map((axis, index) => { const angle = angleFor(index); const [x,y] = point(index, 1.2); const horizontal = Math.cos(angle), vertical = Math.sin(angle); const anchor = horizontal > 0.25 ? 'start' : horizontal < -0.25 ? 'end' : 'middle'; const baseline = vertical > 0.4 ? 'hanging' : vertical < -0.4 ? 'auto' : 'middle'; return `<text class="affinity-label" x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="${baseline}">${esc(axis.genre)}</text>`; }).join('');
+  const axisLines = axes.map((_, index) => { const [x, y] = point(index); return `<line class="affinity-axis" x1="${centerX}" y1="${centerY}" x2="${x}" y2="${y}"/>`; }).join('');
+  const labels = axes.map((axis, index) => { const angle = angleFor(index); const [x, y] = point(index, 1.16); const horizontal = Math.cos(angle), vertical = Math.sin(angle); const anchor = horizontal > 0.25 ? 'start' : horizontal < -0.25 ? 'end' : 'middle'; const baseline = vertical > 0.4 ? 'hanging' : vertical < -0.4 ? 'auto' : 'middle'; return `<text class="affinity-label" x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="${baseline}">${esc(axis.genre)}</text>`; }).join('');
   const values = axes.map((axis, index) => point(index, radialScale(axis)).join(',')).join(' ');
-  const points = axes.map((axis, index) => { const [x,y] = point(index, radialScale(axis)); const detail = `${axis.genre}: ${axis.title_count} titles, ${axis.weighted_count} weighted`; return `<circle class="affinity-point" cx="${x}" cy="${y}" r="5"><title>${esc(detail)}</title></circle>`; }).join('');
-  const details = axes.map(axis => `<li><strong>${esc(axis.genre)}</strong>: ${esc(axis.title_count)} title${axis.title_count === 1 ? '' : 's'} · ${esc(axis.weighted_count)} weighted · ${esc(axis.normalized)}%</li>`).join('');
-  return `<section id="genre-affinity" class="card affinity-card" aria-labelledby="genre-affinity-title"><h2 id="genre-affinity-title">Genre affinity</h2><div class="affinity-layout"><div class="affinity-chart-wrap"><svg class="affinity-chart" viewBox="0 0 480 440" role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"><title id="genre-affinity-svg-title">Genre affinity radar chart</title><desc id="genre-affinity-svg-desc">Normalized affinity for ${esc(axes.map(axis => axis.genre).join(', '))}. Exact values follow the chart.</desc>${grid}${axisLines}<polygon class="affinity-area" points="${values}"/>${points}${labels}</svg></div><div><h3>Exact values</h3><ol class="affinity-details">${details}</ol><p class="muted">${esc(model.represented_title_count)} unique watched titles contributed genre metadata.</p></div></div></section>`;
+  const points = axes.map((axis, index) => { const [x, y] = point(index, radialScale(axis)); return `<circle class="affinity-point" cx="${x}" cy="${y}" r="5"><title>${esc(`${axis.genre}: ${axis.title_count} titles, ${axis.weighted_count} weighted`)}</title></circle>`; }).join('');
+  const list = axes.map((axis, index) => `<li><span class="affinity-rank">${index + 1}</span><span class="affinity-name">${esc(axis.genre)}</span><span class="bar" aria-hidden="true"><span style="width:${Math.max(0, Math.min(100, Number(axis.normalized) || 0))}%"></span></span><span class="affinity-numbers">${esc(plural(axis.title_count, 'title'))} · ${esc(axis.normalized)}%</span></li>`).join('');
+  const watchingWeight = Number(model.watching_weight);
+  const weighting = Number.isFinite(watchingWeight) && watchingWeight !== 1 ? ` Titles you are still watching count ${watchingWeight === 0.5 ? 'half' : `×${watchingWeight}`}; percentages are relative to your top genre.` : '';
+  return `<section id="genre-affinity" class="card affinity-card" aria-labelledby="genre-affinity-title"><h2 id="genre-affinity-title">Genre affinity</h2><div class="affinity-layout"><div class="affinity-chart-wrap"><svg class="affinity-chart" viewBox="-60 0 600 440" role="img" aria-labelledby="genre-affinity-svg-title genre-affinity-svg-desc"><title id="genre-affinity-svg-title">Genre affinity radar chart</title><desc id="genre-affinity-svg-desc">Normalized affinity for ${esc(axes.map(axis => axis.genre).join(', '))}. Exact values follow the chart.</desc>${grid}${axisLines}<polygon class="affinity-area" points="${values}"/>${points}${labels}</svg></div><div><h3 class="sr-only">Exact values</h3><ol class="affinity-list">${list}</ol><p class="affinity-note">${esc(plural(model.represented_title_count, 'watched title'))} contributed genre data.${esc(weighting)}</p></div></div></section>`;
 }
-function renderDashboard(data){
+function alertsHtml(data){
+  const errors = (data.indicators || []).filter(i => i.level === 'error').map(i => i.message);
+  const failedHarvests = Number(data.coverage?.summary?.failed || 0);
+  let html = '';
+  if (errors.length) html += `<section class="alert bad" role="alert" aria-labelledby="dashboard-failures"><h2 id="dashboard-failures" class="bad">Needs attention</h2><ul>${errors.map(message => `<li>${esc(message)}</li>`).join('')}</ul></section>`;
+  if (failedHarvests > 0) html += `<section class="alert"><p><strong>${esc(plural(failedHarvests, 'MAL recommendation source'))} failed to harvest.</strong> They are retried automatically; see <a href="${esc(DEBUG_HREF)}">Debug</a> for details.</p></section>`;
+  if (data.recommendations?.mode === 'diagnostic_snapshot') html += '<section class="alert"><p><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown or unverified provider and dub evidence; only Watchable now is actionable.</p></section>';
+  return html;
+}
+function emptyState(state){
+  if (!state || state.strict_actionable_count !== 0) return '';
+  return `<section class="empty-state"><h2>No Watchable now discovery titles</h2><p>${esc(state.message)}</p><ul><li>Ranked discovery recommendations shown as unverified: ${esc(state.dormant_candidate_count)}</li><li>Evidence pending review: ${esc(state.evidence_pending_review_count)}</li><li>Stale/expired evidence: ${esc(state.stale_evidence_count)}</li></ul><p class="muted">Bounded next diagnostic command: <code>${esc(state.next_diagnostic_command)}</code></p></section>`;
+}
+function renderControls(){
+  const data = latestDashboardData;
+  document.getElementById('genre-filter').innerHTML = genreControlsHtml(data);
+  document.getElementById('genre-chips').innerHTML = chipsHtml();
+  const hiddenCount = Object.values(data.recommendations?.sections || {}).flat().filter(r => hiddenTitles.has(recommendationIdentity(r))).length;
+  document.getElementById('hidden-count').textContent = hiddenCount ? ` (${hiddenCount})` : '';
+  document.getElementById('clear-filters').hidden = !(selectedGenres.length || titleQuery);
+}
+function renderSections(){ document.getElementById('sections').innerHTML = sectionsHtml(latestDashboardData); }
+function renderPage(data){
   latestDashboardData = data;
-  const state = data.recommendations?.coverage_state || {};
-  const mode = data.recommendations?.mode === 'diagnostic_snapshot' ? '<section class=\"banner warn\"><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown/unverified provider or dub evidence; only Watchable now is actionable.</section>' : '<section class=\"banner good\"><strong>Watchable now dashboard:</strong> actionable discovery rows require verified current Crunchyroll/HIDIVE identity/catalog presence plus explicit English-dub evidence.</section>';
-  const sectionHtml = Object.entries(data.recommendations?.sections || {}).map(([name, rows]) => {
-    const meta = data.recommendations?.section_metadata?.[name] || {label:name, description:''};
-    const genreRows = selectedGenres.length ? rows.filter(r => Array.isArray(r.genres) && selectedGenres.every(genre => r.genres.includes(genre))) : rows;
-    const visibleRows = showHiddenTitles ? genreRows : genreRows.filter(r => !hiddenTitles.has(recommendationIdentity(r)));
-    const description = name !== 'discovery_available_now' && meta.description ? `<p class=\"muted\">${esc(meta.description)}</p>` : '';
-    return `<h3>${esc(meta.label || name)} (${esc(visibleRows.length)})</h3>${description}${recTable(visibleRows, {...meta, enable_controls:true, hidden_titles:hiddenTitles})}`;
-  }).join('') || recTable([], {enable_controls:true, hidden_titles:hiddenTitles});
-  document.getElementById('app').innerHTML = `${failureSection(data)}${mode}${emptyState(state)}${genreAffinitySection(data.genre_affinity)}<section><h2>Recommendations</h2>${recommendationControls(data)}${sectionHtml}</section><p class=\"muted\">Last refreshed ${esc(data.generated_at)}<span class=\"screen-only\"> · <a href=\"/api/dashboard\">JSON</a></span></p>`;
-  document.getElementById('genre-menu-trigger')?.addEventListener('click', () => { genreMenuOpen = !genreMenuOpen; renderDashboard(data); const focusTarget = genreMenuOpen ? document.querySelector('.genre-option') : document.getElementById('genre-menu-trigger'); focusTarget?.focus(); });
-  document.querySelectorAll('.genre-option').forEach(button => button.addEventListener('click', () => { const genre = button.dataset.genre; if (genre && !selectedGenres.includes(genre)) selectedGenres = [...selectedGenres, genre]; genreMenuOpen = false; renderDashboard(data); document.getElementById('genre-menu-trigger')?.focus(); }));
-  document.querySelectorAll('.genre-remove').forEach(button => button.addEventListener('click', () => { selectedGenres = selectedGenres.filter(genre => genre !== button.dataset.genre); renderDashboard(data); document.getElementById('genre-menu-trigger')?.focus(); }));
-  document.getElementById('show-hidden-titles')?.addEventListener('change', event => { showHiddenTitles = event.target.checked; renderDashboard(data); });
-  document.querySelectorAll('.row-visibility-button').forEach(button => button.addEventListener('click', () => { const identity = button.dataset.recommendationId; if (!identity) return; if (hiddenTitles.has(identity)) hiddenTitles.delete(identity); else hiddenTitles.add(identity); persistHiddenTitles(); renderDashboard(data); }));
+  const app = document.getElementById('app');
+  if (!document.getElementById('sections')) {
+    app.innerHTML = `<div id="alerts"></div><div id="empty"></div><div id="affinity"></div><section aria-labelledby="recommendations-title"><h2 id="recommendations-title" class="section-title">Recommendations</h2><div class="toolbar"><label class="search"><span class="sr-only">Search titles</span><input id="title-search" type="search" placeholder="Search titles" autocomplete="off"></label><div class="genre-filter" id="genre-filter" data-genre-control></div><div class="genre-chips" id="genre-chips" aria-label="Selected genre filters"></div><label class="toggle"><input id="show-hidden-titles" type="checkbox"> Show hidden titles<span id="hidden-count"></span></label><button type="button" id="clear-filters" class="button small" hidden>Clear filters</button></div><div id="sections"></div></section><p class="page-foot screen-only">Raw data: <a href="/api/dashboard">dashboard JSON</a></p>`;
+    bindDashboardEvents();
+  }
+  document.getElementById('alerts').innerHTML = alertsHtml(data);
+  document.getElementById('empty').innerHTML = emptyState(data.recommendations?.coverage_state);
+  document.getElementById('affinity').innerHTML = genreAffinitySection(data.genre_affinity);
+  renderControls();
+  renderSections();
 }
-function updateExportMetadata(){ const timestamp = document.getElementById('export-timestamp'); if (timestamp) timestamp.textContent = new Date().toISOString(); const summary = document.getElementById('export-filter-summary'); if (summary) summary.textContent = `${selectedGenres.length ? `Genres: ${selectedGenres.join(', ')}` : 'All genres'} · Hidden titles ${showHiddenTitles ? 'shown' : 'excluded'}`; }
-document.getElementById('export-pdf')?.addEventListener('click', () => { genreMenuOpen = false; if (latestDashboardData) renderDashboard(latestDashboardData); updateExportMetadata(); window.print(); });
+function closeGenreMenu(focusTrigger){ if (!genreMenuOpen) return; genreMenuOpen = false; renderControls(); if (focusTrigger) document.getElementById('genre-menu-trigger')?.focus(); }
+function bindDashboardEvents(){
+  const app = document.getElementById('app');
+  app.addEventListener('click', event => {
+    const target = event.target.closest('button');
+    if (!target) return;
+    if (target.id === 'genre-menu-trigger') { genreMenuOpen = !genreMenuOpen; renderControls(); (genreMenuOpen ? document.querySelector('.genre-option') : document.getElementById('genre-menu-trigger'))?.focus(); return; }
+    if (target.classList.contains('genre-option')) { const genre = target.dataset.genre; if (genre && !selectedGenres.includes(genre)) selectedGenres = [...selectedGenres, genre]; genreMenuOpen = false; renderControls(); renderSections(); document.getElementById('genre-menu-trigger')?.focus(); return; }
+    if (target.classList.contains('genre-remove')) { selectedGenres = selectedGenres.filter(genre => genre !== target.dataset.genre); renderControls(); renderSections(); document.getElementById('genre-menu-trigger')?.focus(); return; }
+    if (target.id === 'clear-filters') { selectedGenres = []; titleQuery = ''; document.getElementById('title-search').value = ''; renderControls(); renderSections(); document.getElementById('title-search').focus(); return; }
+    if (target.classList.contains('row-visibility-button')) {
+      const identity = target.dataset.recommendationId;
+      if (!identity) return;
+      if (hiddenTitles.has(identity)) hiddenTitles.delete(identity); else hiddenTitles.add(identity);
+      persistHiddenTitles();
+      renderControls();
+      renderSections();
+    }
+  });
+  document.getElementById('title-search').addEventListener('input', event => { titleQuery = event.target.value; renderControls(); renderSections(); });
+  document.getElementById('show-hidden-titles').addEventListener('change', event => { showHiddenTitles = event.target.checked; renderSections(); });
+  app.addEventListener('keydown', event => {
+    if (!genreMenuOpen || !event.target.classList?.contains('genre-option') || !['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+    const options = [...document.querySelectorAll('.genre-option')];
+    const index = options.indexOf(event.target);
+    options[(index + (event.key === 'ArrowDown' ? 1 : options.length - 1)) % options.length]?.focus();
+    event.preventDefault();
+  });
+}
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && genreMenuOpen) closeGenreMenu(true); });
+// composedPath() is captured at dispatch, so it still holds the genre control
+// when the click re-rendered (detached) the button that was clicked.
+document.addEventListener('click', event => { if (genreMenuOpen && !event.composedPath().some(node => node instanceof Element && node.matches('[data-genre-control]'))) closeGenreMenu(false); });
+document.addEventListener('error', event => { const image = event.target; if (image instanceof HTMLImageElement && image.parentElement?.classList.contains('cover')) { image.parentElement.classList.add('cover-missing'); image.remove(); } }, true);
+function pageSignature(data){ return JSON.stringify([data.recommendations, data.genre_affinity, data.indicators, data.coverage?.summary?.failed]); }
+function updateExportMetadata(){
+  const timestamp = document.getElementById('export-timestamp');
+  if (timestamp) timestamp.textContent = timeFormat.format(new Date());
+  const summary = document.getElementById('export-filter-summary');
+  if (summary) summary.textContent = [selectedGenres.length ? `Genres: ${selectedGenres.join(', ')}` : 'All genres', titleQuery ? `Search: “${titleQuery}”` : '', `Hidden titles ${showHiddenTitles ? 'shown' : 'excluded'}`].filter(Boolean).join(' · ');
+}
+document.getElementById('export-pdf')?.addEventListener('click', () => { closeGenreMenu(false); document.querySelectorAll('details.more').forEach(details => { details.open = true; }); updateExportMetadata(); window.print(); });
 window.addEventListener('beforeprint', updateExportMetadata);
-document.addEventListener('keydown', event => { if (event.key !== 'Escape' || !genreMenuOpen || !latestDashboardData) return; genreMenuOpen = false; renderDashboard(latestDashboardData); document.getElementById('genre-menu-trigger')?.focus(); });
-document.addEventListener('click', event => { if (!genreMenuOpen || !latestDashboardData || event.target.closest('[data-genre-control]')) return; genreMenuOpen = false; renderDashboard(latestDashboardData); });"""
-        page_render = """renderDashboard(data);"""
-        intro = "Live local recommendation view."
-    navigation = f'<nav class="top-nav" aria-label="Dashboard navigation">{" · ".join(navigation_links)}</nav>'
+"""
+
+_DEBUG_JS = r"""
+const PROVIDER_NAMES = {crunchyroll: 'Crunchyroll', hidive: 'HIDIVE', mal: 'MyAnimeList'};
+const humanKey = key => { const text = String(key).replace(/_/g, ' ').trim(); return text.charAt(0).toUpperCase() + text.slice(1); };
+function formatValue(key, value){
+  if (value == null || value === '') return '<span class="muted">—</span>';
+  if (typeof value === 'boolean') return value ? 'yes' : 'no';
+  if (typeof value === 'number') return /ratio|coverage/i.test(key) && value >= 0 && value <= 1 ? `${(value * 100).toFixed(1)}%` : esc(value.toLocaleString());
+  if (Array.isArray(value)) return value.length ? value.map(item => formatValue(key, item)).join(', ') : '<span class="muted">none</span>';
+  if (typeof value === 'object') { const entries = Object.entries(value); return entries.length ? `<span class="kv-inline">${entries.map(([k, v]) => `<span><span class="muted">${esc(humanKey(PROVIDER_NAMES[k] || k))}</span> ${formatValue(k, v)}</span>`).join('')}</span>` : '<span class="muted">none</span>'; }
+  const text = String(value);
+  if (parseTime(text)) return timeTag(text);
+  if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(text)) return esc(text.replace(/_/g, ' '));
+  return esc(text);
+}
+const kv = object => { const entries = Object.entries(object || {}); return entries.length ? `<dl class="kv">${entries.map(([key, value]) => `<dt>${esc(humanKey(PROVIDER_NAMES[key] || key))}</dt><dd>${formatValue(key, value)}</dd>`).join('')}</dl>` : '<p class="muted">None</p>'; };
+const card = (title, body, level = 'h3') => `<section class="card"><${level}>${esc(title)}</${level}>${body}</section>`;
+function providerEnrichmentSection(e){
+  const providers = e?.providers || {};
+  const cards = Object.entries(providers).map(([slug, p]) => {
+    const c = p.candidates || {}, d = p.due || {}, a = p.attempts || {}, cur = p.cursor || {}, eta = d.selection_eta || {}, complete = p.availability_completion_eta || {};
+    return card(PROVIDER_NAMES[slug] || slug, kv({status: p.status, reasons: p.reason_codes, candidates: c.ranked_total, metadata_coverage: c.metadata_coverage_ratio, due: d.total, due_by_class: d.by_class, selected_now: d.current_limit_selection_count, selection_eta_seconds: eta.eta_seconds, selection_eta_reason: eta.reason_code, cursor_mal_id: cur.cursor_mal_anime_id, cursor_generation: cur.cursor_generation, attempted_last_hour: a.distinct_candidates_attempted_last_hour, recent_outcomes: a.recent_24h_outcome_counts, availability_completion_eta: complete.reason_code}));
+  }).join('');
+  const body = cards ? `<div class="debug-grid">${cards}</div>` : `<p class="muted">${esc(e?.reason_codes?.join(', ') || 'No configured credentialed provider enrichment lanes detected.')}</p>`;
+  return `<section><h2 class="debug-section-title">Provider enrichment health</h2>${body}</section>`;
+}
+const etaText = (hours, reasons = []) => hours == null ? `unknown${reasons.length ? ` (${reasons.join(', ').replace(/_/g, ' ')})` : ''}` : (hours === 0 ? 'ready now' : `~${hours}h`);
+function publicUserrecsSection(p){
+  if (!p) return '';
+  const c = p.coverage || {}, o = p.open_generations || {}, h = p.hourly_throughput || {}, b = p.backlog || {}, s = p.sustainability || {};
+  return `<section><h2 class="debug-section-title">Public MAL userrecs crawl</h2><div class="debug-grid">${card('Crawl coverage', kv({status: p.status, positive_seeds: p.positive_seed_count, complete: c.complete, fresh: c.fresh, stale: c.stale, failed: c.failed, unharvested: c.unharvested, fresh_ratio: c.fresh_ratio}))}${card('Backlog and open crawls', kv({due_sources: b.due_sources, active: o.active, paused: o.paused, ready: o.ready, open_total: o.total, staged_pages: o.staged_pages, staged_edges: o.staged_edges}))}${card('Hourly throughput', kv({pages_fetched_last_hour: h.pages_fetched_last_hour, last_page: h.last_page_fetched_at, sources_started: h.sources_started_last_hour, sources_published: h.sources_published_last_hour}))}${card('Source-start ETA', kv({eta: etaText(b.conservative_source_start_eta_hours), authorized_per_hour: s.authorized_source_titles_per_hour, configured_per_hour: s.configured_source_titles_per_hour, within_authorized_rate: s.within_authorized_rate}))}${card('Completion ETA', kv({eta: etaText(b.completion_eta_hours, b.completion_eta_reason_codes || ['unknown_pages_per_source'])}))}</div></section>`;
+}
+const statusChip = status => { const text = String(status || 'unknown'); const level = text === 'completed' ? 'good' : /fail|error/.test(text) ? 'bad' : 'warn'; return `<span class="status-chip ${level}">${esc(text.replace(/_/g, ' '))}</span>`; };
+function syncTable(runs){
+  if (!runs?.length) return '<p class="muted">No sync runs recorded.</p>';
+  return `<div class="table-scroll" tabindex="0" role="region" aria-label="Recent provider sync runs table"><table class="data-table"><thead><tr><th scope="col">ID</th><th scope="col">Provider</th><th scope="col">Mode</th><th scope="col">Status</th><th scope="col">Started</th><th scope="col">Completed</th></tr></thead><tbody>${runs.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(PROVIDER_NAMES[r.provider] || r.provider)}</td><td>${esc(r.mode)}</td><td>${statusChip(r.status)}</td><td>${timeTag(r.started_at)}</td><td>${timeTag(r.completed_at)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function pageSignature(data){ const {generated_at, ...rest} = data; return JSON.stringify(rest); }
+function renderPage(data){
+  const state = data.recommendations?.coverage_state || {};
+  const indicators = (data.indicators || []).map(i => `<li class="${i.level === 'error' ? 'bad' : 'warn'}">${esc(i.message)}</li>`).join('') || '<li class="muted">No indicators.</li>';
+  const snapshot = data.snapshot || {};
+  const overview = [
+    card('Snapshot', kv({run: snapshot.run_id || 'none', generated: snapshot.generated_at, items: snapshot.item_count || 0}), 'h2'),
+    card('Strict coverage', kv({watchable_now: state.strict_actionable_count, ranked_unverified_discovery: state.dormant_candidate_count, pending_review: state.evidence_pending_review_count, stale_or_expired: state.stale_evidence_count}), 'h2'),
+    card('MAL harvest coverage', kv(data.coverage?.summary), 'h2'),
+    `<section class="card"><h2>Providers</h2>${kv(data.operational?.provider_counts_by_provider)}<h3 class="sub">HIDIVE progress evidence</h3>${kv(data.operational?.hidive_progress_provenance)}</section>`,
+    card('Review queue', kv(data.operational?.review_queue), 'h2'),
+  ].join('');
+  document.getElementById('app').innerHTML = `<section class="card alert"><h2>Indicators</h2><ul class="indicator-list">${indicators}</ul></section><div class="debug-grid">${overview}</div>${providerEnrichmentSection(data.operational?.provider_enrichment)}${publicUserrecsSection(data.coverage?.public_userrecs)}<section><h2 class="debug-section-title">Recent provider sync runs</h2>${syncTable(data.recent_sync_runs)}</section><p class="page-foot">Raw data: <a href="/api/dashboard">dashboard JSON</a></p>`;
+}
+"""
+
+
+def _render_dynamic_dashboard_page(
+    *,
+    page: str,
+    title: str,
+    settings_href: str | None,
+    dashboard_href: str = "/",
+    debug_href: str = "/debug",
+) -> str:
+    is_dashboard = page == "dashboard"
     export_control = (
-        '<button type="button" id="export-pdf" class="export-pdf-button" '
+        '<button type="button" id="export-pdf" class="button primary export-pdf-button" '
         'aria-label="Export dashboard as PDF using the browser print dialog" '
         'title="Open the browser print dialog to save this dashboard as a PDF">Export PDF</button>'
-        if page == "dashboard"
+        if is_dashboard
         else ""
     )
-    report_actions = f'<div class="report-actions">{navigation}{export_control}</div>'
-    if page == "dashboard":
-        print_metadata = (
-            '<p class="print-report-meta">Dashboard report · Exported <time id="export-timestamp">when printed</time><br>'
-            'View: <span id="export-filter-summary">All genres · Hidden titles excluded</span></p>'
-        )
-    else:
-        print_metadata = ""
+    header = top_bar(
+        "dashboard" if is_dashboard else "debug",
+        dashboard_href=dashboard_href,
+        debug_href=debug_href,
+        settings_href=settings_href,
+        actions=export_control,
+    )
+    print_metadata = (
+        '<p class="print-report-meta">Dashboard report · Exported <time id="export-timestamp">when printed</time><br>'
+        'View: <span id="export-filter-summary">All genres · Hidden titles excluded</span></p>'
+        if is_dashboard
+        else ""
+    )
+    page_css = _PAGE_CSS if is_dashboard else _DEBUG_CSS
+    page_js = _DASHBOARD_JS if is_dashboard else _DEBUG_JS
+    config_js = f"const DATA_URL = '/api/dashboard?view=ui';\nconst DEBUG_HREF = {json.dumps(debug_href)};\n"
     return (
-        template.replace("__TITLE__", escape(title))
-        .replace("__REPORT_ACTIONS__", report_actions)
-        .replace("__PRINT_METADATA__", print_metadata)
-        .replace("__INTRO__", intro)
-        .replace("__PAGE_HELPERS__", page_helpers)
-        .replace("__PAGE_RENDER__", page_render)
+        '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">'
+        f"{FAVICON_LINK}<title>{escape(title)}</title><style>{SHELL_CSS}{_COMMON_PAGE_CSS}{page_css}</style></head><body>"
+        f"{header}<main class=\"page\" id=\"main\"><div class=\"page-head\"><h1>{escape(title)}</h1>"
+        '<p class="page-status" id="page-status">Loading…</p></div>'
+        f'{print_metadata}<div id="app" aria-busy="true"><p class="muted">Loading…</p></div></main>'
+        f"<script>\n{config_js}{_COMMON_JS}{page_js}{_BOOT_JS}</script></body></html>"
     )
 
 
@@ -2046,7 +2613,10 @@ def make_dashboard_handler(db_path: Path, *, limit: int = DASHBOARD_DEFAULT_RECO
                 self._send_favicon()
                 return
             if parsed.path == "/api/dashboard":
-                self._send_json(build_dashboard_payload(db_path, limit=request_limit, stale_after_days=stale_after_days, config=config))
+                payload = build_dashboard_payload(db_path, limit=request_limit, stale_after_days=stale_after_days, config=config)
+                if query.get("view", [""])[0] == "ui":
+                    payload = dashboard_ui_payload(payload)
+                self._send_json(payload)
                 return
             self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
 
