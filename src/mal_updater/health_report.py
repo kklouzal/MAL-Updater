@@ -878,6 +878,39 @@ def _repeated_task_failure_warnings(
     return warnings
 
 
+def _oversized_task_run_warnings(
+    service_state: dict[str, object] | None, *, exclude: set[str]
+) -> list[dict[str, object]]:
+    """Tasks whose projected run alone reaches the warn share of their hourly budget.
+
+    The scheduler still runs them, but only once their budget window is idle,
+    so they run less often than their cadence; the per-run execute limits and
+    the hourly budget disagree and one of them should be adjusted.
+    """
+    tasks = service_state.get("tasks") if isinstance(service_state, dict) else None
+    if not isinstance(tasks, dict):
+        return []
+    warnings: list[dict[str, object]] = []
+    for task_name in sorted(tasks):
+        task_state = tasks[task_name]
+        if task_name in exclude or not isinstance(task_state, dict) or task_state.get("projected_exceeds_budget") is not True:
+            continue
+        warnings.append(
+            {
+                "code": "scheduled_task_run_exceeds_hourly_budget",
+                "detail": (
+                    f"Scheduled task {task_name} is projected to make {task_state.get('projected_request_count')} requests per run, "
+                    "at or above the warn share of its hourly budget; it only runs once its budget window is idle. "
+                    "Raise its hourly limit or lower its per-run limits."
+                ),
+                "task": task_name,
+                "projected_request_count": task_state.get("projected_request_count"),
+                "health_posture": "operator_visible",
+            }
+        )
+    return warnings
+
+
 def build_health_report(
     config: AppConfig,
     *,
@@ -1164,6 +1197,7 @@ def build_health_report(
     if isinstance(mal_auth_failure, dict):
         auth_reported_tasks.add("mal_refresh")
     warnings.extend(_repeated_task_failure_warnings(service_state, exclude=auth_reported_tasks))
+    warnings.extend(_oversized_task_run_warnings(service_state, exclude=unscheduled_provider_tasks))
     unresolved_seasons = count_unresolved_provider_season_mappings(config.db_path)
     if unresolved_seasons:
         warnings.append(

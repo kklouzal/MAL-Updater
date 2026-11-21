@@ -744,6 +744,20 @@ class HealthCheckCliTests(unittest.TestCase):
         self.assertEqual(1, len(hidive))
         self.assertEqual("login_failure", hidive[0]["auth_failure_kind"])
 
+    def test_health_check_surfaces_task_runs_that_exceed_their_hourly_budget(self) -> None:
+        self.config.service_state_path.write_text(
+            json.dumps({"tasks": {"recommend_metadata_refresh": {"projected_exceeds_budget": True, "projected_request_count": 15}}}),
+            encoding="utf-8",
+        )
+
+        _, payload = self._run_health_check()
+
+        warning = next(item for item in payload["warnings"] if item["code"] == "scheduled_task_run_exceeds_hourly_budget")
+        self.assertEqual("recommend_metadata_refresh", warning["task"])
+        self.assertEqual(15, warning["projected_request_count"])
+        # Visible, not unhealthy: the task still runs once its window is idle.
+        self.assertEqual("operator_visible", warning["health_posture"])
+
     def test_health_check_ignores_stale_task_state_of_disconnected_providers(self) -> None:
         # Provider removed after it failed: its lanes and sync_apply are no longer scheduled.
         with connect(self.config.db_path) as conn:

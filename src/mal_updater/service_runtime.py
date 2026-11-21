@@ -1689,7 +1689,21 @@ def _budget_gate(
     usage["global_warn_recovery_seconds"] = global_warn_recovery_seconds
     usage["global_recovery_seconds"] = global_critical_recovery_seconds
     # A task override narrows the lane but never exempts it from the provider-global cap.
-    if task_override and (global_ratio >= config.service.critical_ratio or (projected_request_count > 0 and global_projected_ratio >= config.service.critical_ratio)):
+    # A run that alone reaches the warn share of the global cap can never fit under
+    # it, so, as in the lane check below, it waits for the global window to go idle.
+    global_projected_exceeds = task_override and global_limit > 0 and projected_request_count / float(global_limit) >= config.service.warn_ratio
+    if global_projected_exceeds:
+        usage["projected_exceeds_budget"] = True
+        if int(global_usage.get("request_count", 0)) > 0:
+            idle_seconds = estimate_budget_recovery_seconds_for_ratio(
+                provider=provider, limit=global_limit, target_ratio=0.0,
+                window_seconds=_BUDGET_GATE_WINDOW_SECONDS, config=config,
+            )
+            usage["backoff_level"] = "warn"
+            usage["cooldown_seconds"] = idle_seconds
+            usage["cooldown_source"] = "projected_run_exceeds_global_budget_waiting_for_idle_window"
+            return False, f"{provider}_global_budget_projected_exceeds_limit projected_requests={projected_request_count} limit={global_limit} cooldown={idle_seconds}s", usage
+    if task_override and (global_ratio >= config.service.critical_ratio or (not global_projected_exceeds and projected_request_count > 0 and global_projected_ratio >= config.service.critical_ratio)):
         usage["backoff_level"] = "critical"
         usage["cooldown_seconds"] = global_critical_cooldown_seconds
         global_floor = config.service.backoff_floor_seconds_for(provider, level="critical")
@@ -1697,7 +1711,7 @@ def _budget_gate(
         if global_floor > global_critical_recovery_seconds:
             usage["cooldown_source"] = "provider_global_floor"
         return False, f"{provider}_global_budget_critical ratio={global_ratio:.3f} projected_ratio={global_projected_ratio:.3f} cooldown={global_critical_cooldown_seconds}s", usage
-    if task_override and (global_ratio >= config.service.warn_ratio or (projected_request_count > 0 and global_projected_ratio >= config.service.warn_ratio)) and global_warn_cooldown_seconds > 0:
+    if task_override and (global_ratio >= config.service.warn_ratio or (not global_projected_exceeds and projected_request_count > 0 and global_projected_ratio >= config.service.warn_ratio)) and global_warn_cooldown_seconds > 0:
         usage["backoff_level"] = "warn"
         usage["cooldown_seconds"] = global_warn_cooldown_seconds
         global_floor = config.service.backoff_floor_seconds_for(provider, level="warn")
@@ -1711,6 +1725,27 @@ def _budget_gate(
         if critical_floor_seconds > recovery_seconds:
             usage["cooldown_source"] = f"{budget_scope}_floor"
         return False, f"{provider}_budget_critical ratio={ratio:.3f} cooldown={critical_cooldown_seconds}s", usage
+    # When the projected run alone reaches the warn threshold, no amount of
+    # waiting brings usage + projection under it, and the projection only
+    # relearns after a run, so the lane would never run again. Such a run
+    # instead waits for its budget window to drain completely and then runs.
+    if limit > 0 and projected_request_count / float(limit) >= config.service.warn_ratio:
+        usage["projected_exceeds_budget"] = True
+        if int(usage.get("request_count", 0)) > 0:
+            idle_seconds = estimate_budget_recovery_seconds_for_ratio(
+                provider=provider,
+                limit=limit,
+                target_ratio=0.0,
+                window_seconds=_BUDGET_GATE_WINDOW_SECONDS,
+                task=recovery_task,
+                include_legacy_in_task=task_override,
+                config=config,
+            )
+            usage["backoff_level"] = "warn"
+            usage["cooldown_seconds"] = idle_seconds
+            usage["cooldown_source"] = "projected_run_exceeds_budget_waiting_for_idle_window"
+            return False, f"{provider}_budget_projected_exceeds_limit projected_requests={projected_request_count} limit={limit} cooldown={idle_seconds}s", usage
+        return True, None, usage
     if projected_request_count > 0 and projected_ratio >= config.service.critical_ratio:
         usage["backoff_level"] = "critical"
         usage["cooldown_seconds"] = projected_critical_cooldown_seconds
@@ -2142,6 +2177,7 @@ def _run_pending_tasks_unlocked(config: AppConfig) -> dict[str, Any]:
                 "projected_request_history_sample_count",
                 "projected_request_percentile",
                 "projected_request_percentile_source",
+                "projected_exceeds_budget",
             ):
                 value = usage.get(field)
                 if value is not None:

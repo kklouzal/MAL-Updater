@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from mal_updater.db import (
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
     MAL_USER_LIST_PAGINATION_LOGIC_VERSION,
     bootstrap_database,
+    clear_mal_metadata_target_failure,
     connect,
     create_or_get_active_mal_public_userrecs_generation,
     get_active_mal_public_userrecs_generation,
@@ -17,7 +19,9 @@ from mal_updater.db import (
     get_mal_anime_metadata_map,
     get_mal_recommendation_edges_map,
     list_mal_user_anime_list_cache,
+    mal_metadata_targets_in_failure_backoff,
     mark_mal_public_userrecs_generation_ready,
+    record_mal_metadata_target_failure,
     replace_mal_public_userrecs_recommendation_edges,
     replace_mal_public_userrecs_staged_page,
     replace_mal_user_anime_list_cache_generation,
@@ -707,6 +711,46 @@ class RecommendationMetadataRefreshTests(unittest.TestCase):
         # The airing sequel's re-check must reach MAL rather than the detail cache.
         self.assertIn((201, True), calls)
         self.assertEqual("finished_airing", get_mal_anime_metadata_map(self.config.db_path)[201].status)
+
+
+    def test_title_specific_target_failures_back_off_but_outages_do_not(self) -> None:
+        replace_mal_user_anime_list_cache_generation(
+            self.config.db_path,
+            items=[self._list_item(100, "Seed 100", "completed", score=9)],
+            refresh_run_id="list",
+            fetched_at="2026-11-01T00:00:00Z",
+            prune_absent=True,
+        )
+        seed = self._seed_detail(100, recommendations=[])
+        seed["related_anime"] = [{"node": {"id": target_id, "title": f"Sequel {target_id}"}, "relation_type": "sequel"} for target_id in (200, 201)]
+        calls: list[int] = []
+
+        def fake_get_anime_details(anime_id: int, *, fields: str = "", force_refresh: bool = False) -> dict:
+            calls.append(anime_id)
+            if anime_id == 200:
+                raise MalApiError("MAL anime detail request failed: HTTP 404")
+            if anime_id == 201:
+                raise MalApiError("MAL anime detail request failed: network error")
+            return seed
+
+        def run() -> None:
+            calls.clear()
+            with patch("mal_updater.recommendation_metadata.MalClient.get_anime_details", side_effect=fake_get_anime_details):
+                refresh_recommendation_metadata(self.config, limit=1, include_discovery_targets=True, discovery_target_limit=4, force_refresh=True)
+
+        run()
+        self.assertEqual([100, 200, 201], calls)
+        # The 404 (gone from MAL) is backed off; the outage says nothing about 201.
+        run()
+        self.assertEqual([100, 201], calls)
+        self.assertEqual({200}, mal_metadata_targets_in_failure_backoff(self.config.db_path))
+        self.assertEqual(set(), mal_metadata_targets_in_failure_backoff(self.config.db_path, now=datetime.now(timezone.utc) + timedelta(days=2)))
+
+        record_mal_metadata_target_failure(self.config.db_path, mal_anime_id=200, error="HTTP 404", now=datetime.now(timezone.utc) - timedelta(days=1, hours=1))
+        # A second failure in a row doubles the wait to 2 days (a single one would have expired); a success clears it.
+        self.assertIn(200, mal_metadata_targets_in_failure_backoff(self.config.db_path))
+        clear_mal_metadata_target_failure(self.config.db_path, mal_anime_id=200)
+        self.assertEqual(set(), mal_metadata_targets_in_failure_backoff(self.config.db_path))
 
 
 class FullUserRecommendationHarvestResumableTests(unittest.TestCase):

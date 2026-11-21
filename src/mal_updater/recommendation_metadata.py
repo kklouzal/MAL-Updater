@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -14,6 +15,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from .timestamps import parse_utc_timestamp
 from .config import AppConfig, load_mal_secrets
 from .db import (
+    clear_mal_metadata_target_failure,
+    mal_metadata_targets_in_failure_backoff,
+    record_mal_metadata_target_failure,
     get_mal_anime_relations_map,
     MAL_RECOMMENDATION_SOURCE_OFFICIAL_DETAIL,
     MAL_RECOMMENDATION_SOURCE_PUBLIC_USERRECS,
@@ -1900,6 +1904,49 @@ def refresh_full_user_recommendation_harvest(
     )
 
 SEQUEL_TARGET_UNFINISHED_REFRESH_DAYS = 14
+_HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
+# Only failures that can concern nothing but the requested title. A request-shape
+# problem (400, a missing requested field) would fail every title at once and
+# must not back them all off.
+_TARGET_GONE_HTTP_STATUSES = frozenset({404, 410})
+_TARGET_SPECIFIC_DETAIL_ERRORS = (
+    "MAL anime detail response identity does not match the request",
+    "MAL anime detail response lacks a usable title",
+)
+
+
+def _is_target_specific_failure(exc: Exception) -> bool:
+    """True when a detail fetch failed because of the title itself (gone or unusable)."""
+    if not isinstance(exc, MalApiError):
+        return False
+    message = str(exc)
+    status = _HTTP_STATUS_RE.search(message)
+    if status is not None:
+        return int(status.group(1)) in _TARGET_GONE_HTTP_STATUSES
+    return message.startswith(_TARGET_SPECIFIC_DETAIL_ERRORS)
+
+
+def _fetch_metadata_target(
+    config: AppConfig,
+    client: MalClient,
+    target_id: int,
+    *,
+    stage: str,
+    failures: list[MetadataRefreshFailure],
+    force_refresh: bool = False,
+) -> bool:
+    """Fetch and store one discovery/sequel target, keeping its failure backoff current."""
+    try:
+        refresh = {"force_refresh": True} if force_refresh else {}
+        details = client.get_anime_details(target_id, fields=DISCOVERY_DETAIL_FIELDS, **refresh)
+    except (MalApiError, TimeoutError) as exc:
+        failures.append(MetadataRefreshFailure(mal_anime_id=target_id, stage=stage, error=str(exc)))
+        if _is_target_specific_failure(exc):
+            record_mal_metadata_target_failure(config.db_path, mal_anime_id=target_id, error=str(exc))
+        return False
+    _metadata_payload_from_details(config.db_path, mal_anime_id=target_id, details=details)
+    clear_mal_metadata_target_failure(config.db_path, mal_anime_id=target_id)
+    return True
 
 
 def _due_sequel_target_ids(config: AppConfig, entries: list[Any], metadata_by_id: dict[int, Any]) -> list[tuple[int, bool]]:
@@ -1911,7 +1958,10 @@ def _due_sequel_target_ids(config: AppConfig, entries: list[Any], metadata_by_id
     """
     missing: list[int] = []
     unfinished: list[tuple[str, int]] = []
+    backed_off = mal_metadata_targets_in_failure_backoff(config.db_path)
     for target_id in sorted(mal_sequel_target_ids(entries, get_mal_anime_relations_map(config.db_path))):
+        if target_id in backed_off:
+            continue
         meta = metadata_by_id.get(target_id)
         if meta is None:
             missing.append(target_id)
@@ -2072,7 +2122,11 @@ def refresh_recommendation_metadata(
             ),
         )
         hydratable_targets: list[tuple[int, _DiscoveredTargetStats]] = []
+        backed_off_targets = mal_metadata_targets_in_failure_backoff(config.db_path)
         for target_id, info in ranked_targets:
+            if target_id in backed_off_targets:
+                _record_target_skip(target_hydration_skip_reasons, "failure_backoff")
+                continue
             if target_id in seed_anime_ids:
                 _record_target_skip(target_hydration_skip_reasons, "already_mapped")
                 continue
@@ -2084,28 +2138,15 @@ def refresh_recommendation_metadata(
             hydratable_targets = hydratable_targets[: target_budget - min(len(sequel_due), (target_budget + 1) // 2)]
         discovery_considered = len(hydratable_targets)
         for target_id, _info in hydratable_targets:
-            try:
-                details = client.get_anime_details(
-                    target_id,
-                    fields=DISCOVERY_DETAIL_FIELDS,
-                )
-            except (MalApiError, TimeoutError) as exc:
-                failures.append(MetadataRefreshFailure(mal_anime_id=target_id, stage="discovery_metadata", error=str(exc)))
-                continue
-            _metadata_payload_from_details(config.db_path, mal_anime_id=target_id, details=details)
-            discovery_refreshed += 1
+            if _fetch_metadata_target(config, client, target_id, stage="discovery_metadata", failures=failures):
+                discovery_refreshed += 1
     sequel_targets = sequel_due if target_budget is None else sequel_due[: target_budget - discovery_considered]
     sequel_considered = len(sequel_targets)
     sequel_refreshed = 0
     for target_id, recheck in sequel_targets:
-        try:
-            # A re-check must reach MAL: the detail cache outlives the re-check interval.
-            details = client.get_anime_details(target_id, fields=DISCOVERY_DETAIL_FIELDS, force_refresh=recheck)
-        except (MalApiError, TimeoutError) as exc:
-            failures.append(MetadataRefreshFailure(mal_anime_id=target_id, stage="sequel_metadata", error=str(exc)))
-            continue
-        _metadata_payload_from_details(config.db_path, mal_anime_id=target_id, details=details)
-        sequel_refreshed += 1
+        # A re-check must reach MAL: the detail cache outlives the re-check interval.
+        if _fetch_metadata_target(config, client, target_id, stage="sequel_metadata", failures=failures, force_refresh=recheck):
+            sequel_refreshed += 1
     merge_mal_user_anime_list_cache_into_metadata(config.db_path)
     return MetadataRefreshSummary(
         considered=len(anime_ids),

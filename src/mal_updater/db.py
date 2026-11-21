@@ -72,6 +72,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "034_provider_episode_season_ordinal.sql",
     "035_provider_season_catalog.sql",
     "036_provider_season_catalog_first_episode.sql",
+    "037_mal_metadata_target_failures.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -3076,6 +3077,56 @@ def replace_mal_recommendation_edges(
         )
         conn.commit()
     return True
+
+
+MAL_METADATA_TARGET_FAILURE_MAX_BACKOFF_DAYS = 30
+
+
+def record_mal_metadata_target_failure(db_path: Path, *, mal_anime_id: int, error: str | None, now: datetime | None = None) -> None:
+    """Record a failed metadata-target fetch; the retry waits 1, 2, 4 ... up to 30 days."""
+    failed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT consecutive_failures FROM mal_metadata_target_failures WHERE mal_anime_id = ?", (int(mal_anime_id),)
+        ).fetchone()
+        failures = (int(row[0]) if row else 0) + 1
+        backoff_days = min(MAL_METADATA_TARGET_FAILURE_MAX_BACKOFF_DAYS, 2 ** min(failures - 1, 5))
+        conn.execute(
+            """
+            INSERT INTO mal_metadata_target_failures (mal_anime_id, consecutive_failures, last_failed_at, retry_after_at, last_error)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(mal_anime_id) DO UPDATE SET
+                consecutive_failures = excluded.consecutive_failures,
+                last_failed_at = excluded.last_failed_at,
+                retry_after_at = excluded.retry_after_at,
+                last_error = excluded.last_error
+            """,
+            (
+                int(mal_anime_id),
+                failures,
+                failed_at.isoformat().replace("+00:00", "Z"),
+                (failed_at + timedelta(days=backoff_days)).isoformat().replace("+00:00", "Z"),
+                str(error).strip()[:1000] if error else None,
+            ),
+        )
+        conn.commit()
+
+
+def clear_mal_metadata_target_failure(db_path: Path, *, mal_anime_id: int) -> None:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM mal_metadata_target_failures WHERE mal_anime_id = ?", (int(mal_anime_id),))
+        conn.commit()
+
+
+def mal_metadata_targets_in_failure_backoff(db_path: Path, *, now: datetime | None = None) -> set[int]:
+    """Targets whose last fetch failed and whose retry time has not come yet."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT mal_anime_id FROM mal_metadata_target_failures WHERE retry_after_at > ?",
+            (current.isoformat().replace("+00:00", "Z"),),
+        ).fetchall()
+    return {int(row[0]) for row in rows}
 
 
 def record_mal_recommendation_harvest_failure(

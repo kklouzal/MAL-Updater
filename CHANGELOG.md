@@ -46,6 +46,9 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Fixed
 
+- Fixed a scheduler lock-up: a task whose projected run alone reached the warn share of its hourly budget (or, for a lane with its own limit, of the provider-wide budget) was blocked even with no recent requests, and because the projection only relearns after a run, it never ran again. Such a run now waits for its budget window to drain and then runs; health reports `scheduled_task_run_exceeds_hourly_budget` (operator-visible, not unhealthy) so the per-run limits or the hourly budget can be adjusted.
+- Fixed metadata-refresh targets (discovery and sequel titles) that fail because of the title itself (HTTP 404/410, or a response for the wrong or an untitled entry), being retried at the front of the queue on every run. They now back off 1, 2, 4 … up to 30 days (migration 037); outages, throttling, auth and request-shape failures do not trigger the backoff, and a success clears it.
+
 - `map-series` now matches season-split entries with in-season episode numbering, the same input the sync and review paths use.
 - HIDIVE no longer crashes when a saved sync boundary carries a non-numeric schema version; it is treated as absent, like Crunchyroll.
 - Made links in the dashboard PDF export recognizable (blue, underlined titles and seeds; linked provider badges) and noted which links each element carries; the Export PDF hint explains that the browser's Save as PDF keeps them clickable while system PDF printers drop them.

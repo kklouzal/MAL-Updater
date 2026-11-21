@@ -57,6 +57,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "034_provider_episode_season_ordinal.sql",
                 "035_provider_season_catalog.sql",
                 "036_provider_season_catalog_first_episode.sql",
+                "037_mal_metadata_target_failures.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -121,6 +122,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "034_provider_episode_season_ordinal.sql",
                     "035_provider_season_catalog.sql",
                     "036_provider_season_catalog_first_episode.sql",
+                    "037_mal_metadata_target_failures.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -164,6 +166,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "034_provider_episode_season_ordinal.sql",
                     "035_provider_season_catalog.sql",
                     "036_provider_season_catalog_first_episode.sql",
+                    "037_mal_metadata_target_failures.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )

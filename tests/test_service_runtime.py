@@ -1326,6 +1326,59 @@ class ServiceRuntimeBudgetBackoffTests(unittest.TestCase):
         self.assertEqual(2, usage["task_request_count"])
         self.assertEqual(2, usage["global_request_count"])
 
+    def test_run_projected_above_its_budget_waits_for_idle_window_instead_of_never_running(self) -> None:
+        # Regression: a run projected at or above the warn share of its hourly
+        # budget was blocked even with an empty window, and the projection only
+        # relearns after a run, so the lane stopped for good.
+        self.config.service.task_hourly_limits["recommend_metadata_refresh"] = 12
+        spec = TaskSpec("recommend_metadata_refresh", 3600, budget_provider="mal")
+        task_state = {"last_request_delta_history": [15, 15, 15, 15, 15]}
+
+        allowed, reason, usage = _budget_gate(self.config, spec, task_state, fetch_mode=None)
+
+        self.assertTrue(allowed, reason)
+        self.assertTrue(usage["projected_exceeds_budget"])
+        self.assertEqual(15, usage["projected_request_count"])
+
+        token = begin_api_request_context(task="recommend_metadata_refresh", run_id="earlier-run")
+        try:
+            record_api_request_event("mal", "detail", url="https://example.invalid/1", method="GET", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        allowed, reason, usage = _budget_gate(self.config, spec, task_state, fetch_mode=None)
+
+        self.assertFalse(allowed)
+        self.assertIn("mal_budget_projected_exceeds_limit", reason or "")
+        self.assertEqual("projected_run_exceeds_budget_waiting_for_idle_window", usage["cooldown_source"])
+        self.assertGreater(usage["cooldown_seconds"], 3500)
+        self.assertLessEqual(usage["cooldown_seconds"], 3600)
+
+    def test_lane_run_projected_above_the_global_cap_waits_for_idle_global_window(self) -> None:
+        # The provider-global cap check for task-override lanes had the same
+        # lock-up: a projection at or above its warn share blocked every run.
+        self.config.service.task_hourly_limits["recommend_metadata_refresh"] = 12
+        spec = TaskSpec("recommend_metadata_refresh", 3600, budget_provider="mal")
+        task_state = {"last_request_delta_history": [118, 118, 118, 118, 118]}
+
+        allowed, reason, usage = _budget_gate(self.config, spec, task_state, fetch_mode=None)
+
+        self.assertTrue(allowed, reason)
+        self.assertTrue(usage["projected_exceeds_budget"])
+
+        token = begin_api_request_context(task="sync_apply", run_id="other-lane")
+        try:
+            record_api_request_event("mal", "detail", url="https://example.invalid/1", method="GET", outcome="ok", config=self.config)
+        finally:
+            end_api_request_context(token)
+
+        allowed, reason, usage = _budget_gate(self.config, spec, task_state, fetch_mode=None)
+
+        self.assertFalse(allowed)
+        self.assertIn("mal_global_budget_projected_exceeds_limit", reason or "")
+        self.assertEqual("projected_run_exceeds_global_budget_waiting_for_idle_window", usage["cooldown_source"])
+        self.assertGreater(usage["cooldown_seconds"], 3500)
+
     def test_recommend_full_harvest_cold_start_projection_fits_default_task_budget(self) -> None:
         spec = TaskSpec("recommend_full_harvest", self.config.service.recommendation_full_harvest_every_seconds, budget_provider="mal")
 
