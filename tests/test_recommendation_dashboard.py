@@ -1933,6 +1933,10 @@ class RecommendationDashboardTests(unittest.TestCase):
         self.assertIn(".page-status,.toolbar,.dashboard-interactive-only,.screen-only,.more summary{display:none!important}", print_css)
         self.assertIn(".rec-table tr{break-inside:avoid}", print_css)
         self.assertIn(".rec-table thead th{position:static", print_css)
+        # Links stay recognizable (and clickable in a Save as PDF export).
+        self.assertIn("a{color:#1a4f9c!important}", print_css)
+        self.assertIn("a.title-link,.seeds a,.page-foot a{text-decoration:underline", print_css)
+        self.assertIn("Choose Save as PDF as the destination to keep links clickable", html)
         # The phone card layout is screen-only, so a print page never turns the table into cards.
         self.assertIn("@media screen and (max-width:62rem)", html)
         self.assertIn('class="dashboard-interactive-only"', html)

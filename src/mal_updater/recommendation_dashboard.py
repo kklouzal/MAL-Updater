@@ -2095,7 +2095,9 @@ body{font-size:8.5pt}
 .muted,.title-meta,.seed-meta,.bar-label,.affinity-numbers,.section-description,.count{color:#444!important}
 .count{background:#eee!important}
 .bad{color:#8b0000!important}.warn{color:#704d00!important}.good{color:#075f25!important}
-a,.title-link{color:#111!important}
+a{color:#1a4f9c!important}
+span.title-link{color:#111!important}
+a.title-link,.seeds a,.page-foot a{text-decoration:underline;text-decoration-thickness:.5pt;text-underline-offset:1.5pt}
 h2,h3{break-after:avoid}
 .affinity-card,.alert{break-inside:avoid}
 .affinity-layout{grid-template-columns:16rem minmax(0,1fr)}
@@ -2114,6 +2116,7 @@ h2,h3{break-after:avoid}
 .tags li,.rank,.bar{background:#eee!important}
 .bar>span{background:#4a78a8!important}
 .provider-badge{color:#111!important;border-color:#555!important}
+.provider-link .provider-badge{color:#1a4f9c!important;border-color:#1a4f9c!important}
 .more[open] .seeds,.more .seeds{display:grid}
 .more{display:block}
 }
@@ -2526,7 +2529,7 @@ def _render_dynamic_dashboard_page(
     export_control = (
         '<button type="button" id="export-pdf" class="button primary export-pdf-button" '
         'aria-label="Export dashboard as PDF using the browser print dialog" '
-        'title="Open the browser print dialog to save this dashboard as a PDF">Export PDF</button>'
+        'title="Opens the print dialog. Choose Save as PDF as the destination to keep links clickable; system PDF printers such as Microsoft Print to PDF drop them.">Export PDF</button>'
         if is_dashboard
         else ""
     )
@@ -2539,7 +2542,8 @@ def _render_dynamic_dashboard_page(
     )
     print_metadata = (
         '<p class="print-report-meta">Dashboard report · Exported <time id="export-timestamp">when printed</time><br>'
-        'View: <span id="export-filter-summary">All genres · Hidden titles excluded</span></p>'
+        'View: <span id="export-filter-summary">All genres · Hidden titles excluded</span><br>'
+        'Titles, covers and seed titles link to MyAnimeList; provider badges link to Crunchyroll or HIDIVE.</p>'
         if is_dashboard
         else ""
     )

@@ -37,6 +37,7 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ### Fixed
 
+- Made links in the dashboard PDF export recognizable (blue, underlined titles and seeds; linked provider badges) and noted which links each element carries; the Export PDF hint explains that the browser's Save as PDF keeps them clickable while system PDF printers drop them.
 - Fixed dashboard cover art never loading: the container CSP now allows images from `https://cdn.myanimelist.net`, and rows without cover art or genres (such as resume backlog) use the cached MAL metadata. Settings no longer requests a missing `/favicon.ico`.
 - Fixed public MAL user-recommendation harvests failing closed on titles nobody has recommended anything for; MAL's real empty page (its exact sentence, the title's make-recommendation link, no candidate rows, no next page) is now accepted, so those sources stop pausing for manual review.
 - Fixed database compaction failing with "database or disk is full" when the process temp directory is a small tmpfs: VACUUM now runs in a child process (sharing the writer lock) with its rewrite copy on the database volume, and a VACUUM failure is reported as a task error with failure backoff instead of stopping the service loop.
