@@ -14,7 +14,9 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent
 _SRC_ROOT = _REPO_ROOT / "src"
 _CANONICAL_RUNTIME_ROOT = (_REPO_ROOT / ".MAL-Updater").resolve()
-_PYTEST_SESSION_ROOT = Path(tempfile.mkdtemp(prefix="mal-updater-pytest-", dir="/tmp")).resolve()
+# /tmp on POSIX; Windows has none, so its temp folder (the desktop workflow runs the portable tests there).
+_SYSTEM_TMP = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+_PYTEST_SESSION_ROOT = Path(tempfile.mkdtemp(prefix="mal-updater-pytest-", dir=_SYSTEM_TMP)).resolve()
 _PYTEST_RUNTIME_ROOT = (_PYTEST_SESSION_ROOT / ".MAL-Updater").resolve()
 _PYTEST_SETTINGS_PATH = _PYTEST_RUNTIME_ROOT / "config" / "settings.toml"
 _RUNTIME_ENV_NAMES = ("MAL_UPDATER_RUNTIME_ROOT", "MAL_UPDATER_RUNTIME_DIR")
@@ -113,4 +115,4 @@ def _isolate_runtime_per_test(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setenv("MAL_UPDATER_PYTEST_FALLBACK_RUNTIME_ROOT", str(runtime_root))
     monkeypatch.delenv("MAL_UPDATER_RUNTIME_DIR", raising=False)
     monkeypatch.delenv("MAL_UPDATER_CONFIG", raising=False)
-    monkeypatch.setenv("TMPDIR", "/tmp")
+    monkeypatch.setenv("TMPDIR", _SYSTEM_TMP)

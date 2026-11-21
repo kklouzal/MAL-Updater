@@ -250,10 +250,12 @@ def _open_folder(path: Path) -> None:
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
 
 
-def _show_error(message: str, console: IO[str] | None) -> None:
+def _show_error(message: str, console: IO[str] | None, *, dialog: bool) -> None:
     print(f"{APP_NAME}: {message}", file=sys.stderr)
     if console is not None:
         print(f"{APP_NAME}: {message}", file=console, flush=True)
+    if not dialog:
+        return
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -304,7 +306,7 @@ def main(argv: Sequence[str] | None = None, *, open_browser: Callable[[str], Any
     try:
         runtime = ContainerRuntime(project_root=home, host=_HOST, port=args.port, popen=tree.popen)
     except OSError as exc:
-        _show_error(f"Could not listen on {url} ({exc.strerror or exc}). Another program may be using port {args.port}; start with --port <number> to pick another.", console)
+        _show_error(f"Could not listen on {url} ({exc.strerror or exc}). Another program may be using port {args.port}; start with --port <number> to pick another.", console, dialog=not args.no_window)
         return 1
     print(json.dumps({"event": "desktop_started", "url": url, "data_dir": str(home)}), file=log, flush=True)
     stop = threading.Event()

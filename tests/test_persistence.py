@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -7,6 +8,9 @@ import unittest
 from unittest.mock import patch
 
 from mal_updater.persistence import PersistentJsonError, PersistentWriteError, atomic_write_text, read_json_bounded, read_json_dict_bounded
+
+
+_POSIX_ONLY = unittest.skipIf(os.name == "nt", "POSIX permission bits and unprivileged symlinks")
 
 
 class PersistenceTests(unittest.TestCase):
@@ -57,6 +61,7 @@ class PersistenceTests(unittest.TestCase):
         self.assertNotIn(str(self.root.parent), os_message)
         self.assertTrue(os_error.exception.__suppress_context__)
 
+    @_POSIX_ONLY
     def test_atomic_write_caps_permissive_modes_and_preserves_restrictive_modes(self) -> None:
         permissive = self.root / "permissive.json"
         permissive.write_text("old", encoding="utf-8")
@@ -72,6 +77,7 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual("new", restrictive.read_text(encoding="utf-8"))
         self.assertEqual(0o400, stat.S_IMODE(restrictive.stat().st_mode))
 
+    @_POSIX_ONLY
     def test_atomic_write_creates_missing_parents_conservatively(self) -> None:
         path = self.root / "new" / "nested" / "state.json"
         atomic_write_text(path, "{}")
@@ -110,6 +116,7 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual("original", path.read_text(encoding="utf-8"))
         self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
 
+    @_POSIX_ONLY
     def test_atomic_write_replaces_symlink_without_following_it(self) -> None:
         referent = self.root / "referent.json"
         referent.write_text("sensitive", encoding="utf-8")
