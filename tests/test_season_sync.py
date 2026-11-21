@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mal_updater.config import load_config
 from mal_updater.db import bootstrap_database, upsert_series_mapping
@@ -1089,6 +1089,37 @@ class SeasonCatalogDateResolutionTests(unittest.TestCase):
         entries = {100: ("tv", 10, "2016-01-14", "2016-03-17"), 960: ("movie", 1, "2019-08-30", "2019-08-30")}
         target = self._resolve("crunchyroll", {"kind": "original_air", "first": "2020-03-25", "last": "2020-03-25", "count": 0, "total": 1}, entries)
         self.assertIsNone(target.mal_anime_id)
+
+    def test_dub_dated_film_keeps_its_earlier_movie_match(self) -> None:
+        # Production case: SAO Progressive "Scherzo of Deep Night (English
+        # Dub)", dated 2024-02-14 by the dub; the movie premiered 2022-10-22
+        # and the franchise has a second movie, so only the kept rule applies.
+        self._seed("crunchyroll", "Scherzo of Deep Night (English Dub)", relations={100: [(500, "sequel")], 500: [(100, "prequel")]})
+        upsert_provider_season_mapping(
+            self.config.db_path, provider="crunchyroll", provider_series_id="ser-1", provider_season_key="SX",
+            mal_anime_id=500, mapping_source="auto_exact", confidence=1.0, season_title="Scherzo", season_number=2,
+            resolver_version="older",
+        )
+        entries = {100: ("movie", 1, "2021-10-30", "2021-10-30"), 500: ("movie", 1, "2022-10-22", "2022-10-22")}
+        film = {"kind": "original_air", "first": "2024-02-14", "last": "2024-02-14", "count": 0, "total": 1}
+        target = self._resolve("crunchyroll", film, entries, engine_choice=500)
+        self.assertEqual(500, target.mal_anime_id)
+        self.assertIn("season_mapping_reresolve_unconfirmed_kept", target.reasons)
+
+    def test_film_dated_before_the_movie_premiere_is_still_vetoed(self) -> None:
+        from mal_updater.season_catalog import ProviderSeasonCatalog
+        from mal_updater.sync_planner import _catalog_contradicts
+
+        def film(day: str) -> ProviderSeasonCatalog:
+            return ProviderSeasonCatalog(provider="crunchyroll", provider_season_key="SX", title=None, numbered_episode_count=0,
+                                         total_episode_count=1, first_date=day, last_date=day, date_kind="original_air",
+                                         complete=True, fetched_at="")
+
+        client = MagicMock()
+        client.get_anime_details.return_value = {"id": 500, "media_type": "movie", "num_episodes": 1,
+                                                 "start_date": "2022-10-22", "end_date": "2022-10-22"}
+        self.assertTrue(_catalog_contradicts(client, film("2019-08-30"), 500))
+        self.assertFalse(_catalog_contradicts(client, film("2024-02-14"), 500))
 
     def test_earlier_tv_match_of_an_extras_season_is_not_kept(self) -> None:
         self._seed("crunchyroll", "OVAs", relations={100: []})

@@ -1465,7 +1465,11 @@ def _catalog_contradicts(client: MalClient, catalog: Any, mal_anime_id: int) -> 
 
     A multi-episode season whose episodes all carry one date is a batch drop
     (e.g. a dub catalog dated by its release, The Promised Neverland season 2
-    is all 2022-03-01), not a broadcast window, so it vetoes nothing.
+    is all 2022-03-01), not a broadcast window, so it vetoes nothing. A film
+    (one item, no numbered episodes) has a single date that can likewise be
+    its dub or streaming release (SAO Progressive "Scherzo of Deep Night
+    (English Dub)": 2024-02-14 for a 2022-10-22 movie); such a release never
+    precedes the premiere, so only a date before the entry's start vetoes it.
     """
     if catalog is None or catalog.date_kind != "original_air":
         return False
@@ -1483,6 +1487,8 @@ def _catalog_contradicts(client: MalClient, catalog: Any, mal_anime_id: int) -> 
     span_start = entry.start - margin
     span_end = (entry.end or entry.start) + margin
     last = _parse_day(catalog.last_date) or first
+    if not catalog.numbered_episode_count and catalog.total_episode_count == 1:
+        return last < span_start
     return not (span_start <= first <= span_end or span_start <= last <= span_end)
 
 
