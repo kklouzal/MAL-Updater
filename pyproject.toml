@@ -57,6 +57,7 @@ Documentation = "https://github.com/kklouzal/MAL-Updater#readme"
 
 [project.optional-dependencies]
 desktop = [
+  "pillow>=10",  # converts the PNG icon to .ico/.icns at build time
   "pyinstaller>=6.10,<7"
 ]
 dev = [

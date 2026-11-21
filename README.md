@@ -4,7 +4,20 @@ Container-first trusted-LAN control plane for conservative provider-to-MyAnimeLi
 
 Crunchyroll and HIDIVE are optional. With only a MAL account connected (MAL-only mode), MAL-Updater still refreshes your MAL list, harvests MAL community recommendations, ranks recommendations from your list, suggests sequels of titles you completed (**Continue a franchise**), and serves the dashboard, genre affinity and PDF export. What needs a provider is watch-history sync to MAL and the **Watchable now** check (verified streaming availability plus English dub).
 
+## Quick start (desktop app)
+
+No Docker or Python needed: download the app for your system, start it, and the dashboard opens in your browser. Close its window to stop it; nothing keeps running in the background.
+
+| Windows (x64) | macOS (Apple silicon) | macOS (Intel) | Linux (x64) |
+| --- | --- | --- | --- |
+| [MAL-Updater-windows-x64.zip](https://github.com/kklouzal/MAL-Updater/releases/latest/download/MAL-Updater-windows-x64.zip) | [MAL-Updater-macos-arm64.dmg](https://github.com/kklouzal/MAL-Updater/releases/latest/download/MAL-Updater-macos-arm64.dmg) | [MAL-Updater-macos-x64.dmg](https://github.com/kklouzal/MAL-Updater/releases/latest/download/MAL-Updater-macos-x64.dmg) | [MAL-Updater-linux-x64.tar.gz](https://github.com/kklouzal/MAL-Updater/releases/latest/download/MAL-Updater-linux-x64.tar.gz) |
+
+The app runs at **http://127.0.0.1:8765/**; set your MAL app's redirect URL to `http://127.0.0.1:8765/oauth/mal/callback`. Syncing runs only while the app is open. The builds are not code-signed, so Windows and macOS ask for confirmation the first time; see `references/DESKTOP.md` for that, where data is kept, and options.
+
 ## Quick start (container)
+
+For an always-on install on a server or NAS:
+
 
 ```bash
 mkdir mal-updater && cd mal-updater
@@ -91,6 +104,7 @@ A source checkout can also run as a user-level systemd daemon (`references/AUTOM
 
 | Topic | File |
 | --- | --- |
+| Desktop app: downloads, first start, data folder, building | `references/DESKTOP.md` |
 | Container architecture, threat model, settings API | `references/CONTAINERS.md` |
 | Scheduler lanes and defaults, housekeeping, sync and season behavior, MAL list/userrecs internals | `references/OPERATIONS.md` |
 | Native user-systemd daemon and `service-status` | `references/AUTOMATION.md` |
@@ -104,6 +118,6 @@ A source checkout can also run as a user-level systemd daemon (`references/AUTOM
 
 ## Release/support policy
 
-MAL-Updater is alpha software. Semver tags build multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history; `master` carries the changes listed under `Unreleased`.
+MAL-Updater is alpha software. Semver tags build the desktop apps for Windows, macOS and Linux, multi-arch GHCR images, wheels/sdists, checksums, provenance/SBOM, a keyless Sigstore signature, and a curated release bundle. Back up before every upgrade. See `CHANGELOG.md` for release history; `master` carries the changes listed under `Unreleased`.
 
 Report bugs and feature requests at <https://github.com/kklouzal/MAL-Updater/issues>.

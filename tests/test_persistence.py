@@ -54,7 +54,8 @@ class PersistenceTests(unittest.TestCase):
         with self.assertRaises(PersistentJsonError) as os_error:
             read_json_bounded(self.root)
         os_message = str(os_error.exception)
-        self.assertIn("type=IsADirectoryError", os_message)
+        # Windows reports opening a directory as a permission error.
+        self.assertIn("type=PermissionError" if os.name == "nt" else "type=IsADirectoryError", os_message)
         self.assertIn("operation=read", os_message)
         self.assertIn(f"file={self.root.name}", os_message)
         self.assertIn("errno=", os_message)

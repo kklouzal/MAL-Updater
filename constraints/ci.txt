@@ -23,5 +23,6 @@ ruff==0.16.5
 mypy==2.3.1
 
 # Desktop app packaging (.github/workflows/desktop.yml).
+pillow==13.0.0
 pyinstaller==6.22.3
 pyinstaller-hooks-contrib==2026.10

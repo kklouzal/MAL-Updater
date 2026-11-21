@@ -4,12 +4,17 @@ All notable product releases are documented here. MAL-Updater follows Semantic V
 
 ## [Unreleased]
 
+### Changed
+
+- File locks, atomic file writes and the audit log now also work on Windows (`file_locks` uses `LockFileEx` there instead of `flock`), and health-check auto-remediation runs the current Python interpreter instead of whatever `python3` is on `PATH`.
+
 ### Removed
 
 - Removed dead code and duplication: the unreferenced `maintenance_command_semantics` module, unused functions and evaluation stubs, alias re-export blocks, and the byte-identical root `migrations/` tree, root `mal_updater/` import shim and `MANIFEST.in` (migrations now live only in `src/mal_updater/migrations/`). Shared helpers replace seven timestamp parsers and duplicated health-command, review-queue, candidate-summary, timeout, sync-boundary and Crunchyroll session code. The lint gate now enforces all pyflakes rules.
 
 ### Added
 
+- Added a standalone desktop app for Windows, macOS (Apple silicon and Intel) and Linux that needs no Docker or Python: it serves the usual dashboard and scheduler on `http://127.0.0.1:8765/`, keeps data in the per-user app-data folder, shows a small window with the scheduler status, and stops everything (including running tasks) when closed. Release tags attach the builds; the new `desktop` workflow builds, tests and smoke-tests each one on its own OS. `pip install .` also provides it as `mal-updater-desktop`. See `references/DESKTOP.md`.
 - Added **Continue a franchise** recommendations (`mal_sequel`): MAL sequels of titles you completed (and did not score 5 or lower) that are not on your MAL list yet, limited to TV, ONA, movies and multi-episode OVAs that are airing or finished. They need no provider and skip titles already offered as provider continuations. The metadata refresh fetches details for these sequels within its per-run discovery-target limit (due sequels take up to half of it, so a run makes no more MAL requests than before) and re-checks unaired or airing ones against MAL every two weeks. The dashboard lists them first among recommendations (the page now receives an explicit `section_order`) and the webhook adds a `continue_franchise` digest section.
 - `recommend --persist-snapshot` now caps rows per recommendation kind instead of overall, so the large discovery list can no longer crowd other kinds out of the snapshot.
 - Added MAL-only operation: Crunchyroll and HIDIVE are optional. Without a connected provider, `recommend` (and the persisted snapshot, dashboard and webhook) ranks discovery from the MAL list and MAL recommendation graph instead of returning nothing; the dashboard explains MAL-only mode instead of warning about missing Crunchyroll/HIDIVE evidence and hides per-row provider placeholders; `health-check` no longer warns about an unconfigured Crunchyroll, a missing or failed provider ingest, or leftover task failures of a provider that is no longer connected; `bootstrap-audit` treats MAL auth alone as ready for unattended operation and only lists provider steps for a provider that has been started; the scheduler and maintenance cycle skip `sync_apply`, mapping review and provider-eligibility steps; `recommend-enrich-provider-availability` defaults to connected providers. Settings marks both providers optional.
