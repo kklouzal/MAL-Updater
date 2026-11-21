@@ -196,7 +196,7 @@ def check_distribution(repo_root: Path, dist_dir: Path) -> int:
     print(f"source migrations: {sql_count} SQL files")
     print(f"wheel migrations: {wheel_path.name}: {sql_count} SQL files")
     print(f"sdist migrations: {sdist_path.name}: {sql_count} SQL files")
-    print("wheel entry points: mal-updater, mal-updater-container, mal-updater-tools")
+    print("wheel entry points: mal-updater, mal-updater-container, mal-updater-tools, mal-updater-desktop")
     print("package metadata: MIT license expression/file, project URLs, classifiers, and keywords")
     return 0
 

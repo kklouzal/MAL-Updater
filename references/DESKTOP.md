@@ -65,8 +65,8 @@ The app listens on 127.0.0.1 only, so other computers cannot reach it. Like the 
 ## How it works
 
 - `mal_updater.desktop` points the runtime at the data folder (the same variables the container image sets), starts `ContainerRuntime` (the container's web server and scheduler supervisor) on 127.0.0.1 in a background thread, and runs the control window on the main thread.
-- The scheduler starts each task as `<executable> -m mal_updater.cli …` and database compaction as `<executable> -I -c …`. A packaged build has no Python interpreter, so its executable accepts exactly these two forms itself (`frozen_python_dispatch`).
-- Everything the scheduler starts is stopped with the app: on macOS and Linux the scheduler runs in its own process group, which the app signals on exit; on Windows the app places itself in a kill-on-close job object, so its tasks end with it even after a crash.
+- The scheduler starts each task as `<executable> -m mal_updater.cli …` and database compaction as `<executable> -I -c …`. A packaged build has no Python interpreter, so its executable accepts exactly these two forms itself (`frozen_python_dispatch`); like Python, an uncaught error prints a traceback and exits with status 1.
+- Everything the scheduler starts is stopped with the app: on macOS and Linux the scheduler runs in its own process group, which the app signals on exit; on Windows the scheduler runs in a kill-on-close job object, so its tasks end with the app even after a crash. The browser and file manager the app opens are not part of either and keep running.
 - File locks use `flock` on macOS and Linux and `LockFileEx` on Windows (`mal_updater.file_locks`). One difference: on Windows a lock cannot be handed to a child process, so if the scheduler itself is killed while a task runs, a restarted scheduler may start the same task again. Closing the app ends both, so this matters only after a crash.
 
 ## Building it yourself

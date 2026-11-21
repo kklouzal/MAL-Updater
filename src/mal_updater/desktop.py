@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import threading
+import traceback
 import webbrowser
 from importlib import resources
 from pathlib import Path
@@ -31,32 +32,37 @@ from urllib.request import urlopen
 APP_NAME = "MAL-Updater"
 DEFAULT_PORT = 8765
 _HOST = "127.0.0.1"
-_DISPATCH_MODULES = {"mal_updater.cli", "mal_updater.container_runtime"}
+_CLI_MODULE = "mal_updater.cli"
 
 
 def frozen_python_dispatch(argv: Sequence[str]) -> int | None:
-    """Run ``-m <module> ...`` / ``[-I] -c <code> ...`` the way Python would, or return None."""
+    """Run ``-m mal_updater.cli ...`` / ``[-I] -c <code> ...`` the way Python would, or return None.
+
+    As with Python, an uncaught exception prints its traceback on stderr and
+    exits with status 1. Letting it escape instead would make a windowed build
+    show a modal error dialog, stalling the unattended task until someone
+    dismisses it.
+    """
     args = list(argv)
     while args and args[0] == "-I":
         args.pop(0)
-    if len(args) >= 2 and args[0] == "-m":
-        module, rest = args[1], args[2:]
-        if module not in _DISPATCH_MODULES:
-            print(f"{APP_NAME}: module {module!r} is not available in this build", file=sys.stderr)
-            return 2
-        sys.argv = [module, *rest]
-        if module == "mal_updater.cli":
+    if len(args) < 2 or args[0] not in {"-m", "-c"}:
+        return None
+    if args[0] == "-m" and args[1] != _CLI_MODULE:
+        print(f"{APP_NAME}: module {args[1]!r} is not available in this build", file=sys.stderr)
+        return 2
+    try:
+        if args[0] == "-m":
+            sys.argv = [_CLI_MODULE, *args[2:]]
             from .cli import main as cli_main
 
             return int(cli_main() or 0)
-        from .container_runtime import main as container_main
-
-        return int(container_main(rest) or 0)
-    if len(args) >= 2 and args[0] == "-c":
         sys.argv = ["-c", *args[2:]]
         exec(compile(args[1], "<string>", "exec"), {"__name__": "__main__"})
         return 0
-    return None
+    except Exception:
+        traceback.print_exc()
+        return 1
 
 
 def default_data_dir() -> Path:
@@ -110,85 +116,142 @@ def _open_log(home: Path) -> IO[str]:
 class _ProcessTree:
     """Stops everything the scheduler started when the app exits.
 
-    The container gets this from its PID namespace. POSIX: the scheduler runs in
-    its own session, and its process group is signalled at exit. Windows: the app
-    joins a kill-on-close job object, so every descendant ends with it, even
-    after a crash.
+    The container gets this from its PID namespace. Only the scheduler and its
+    descendants are covered, not the browser or file manager the app opens.
+    POSIX: each scheduler runs in its own session, and its process group is
+    signalled at exit. Windows: each scheduler is placed in a kill-on-close job
+    object right after it starts (its first task starts after interpreter
+    start-up and the scheduler's start-up grace), so all of them end when the
+    app exits, even after a crash.
     """
 
     def __init__(self, log: IO[str]) -> None:
         self.log = log
-        self.groups: list[int] = []
+        self._groups: list[int] = []
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
         self._job: Any = None
         if sys.platform == "win32":
             try:
-                self._job = _kill_on_close_job()
+                self._job = _KillOnCloseJob()
             except OSError as exc:  # e.g. started inside a job that forbids nesting
-                print(json.dumps({"event": "desktop_job_object_unavailable", "error": str(exc)[:200]}), file=log, flush=True)
+                self._log_event("desktop_job_object_unavailable", exc)
+        else:
+            threading.Thread(target=self._forget_ended_groups, name="mal-updater-process-groups", daemon=True).start()
+
+    def _log_event(self, event: str, exc: OSError) -> None:
+        print(json.dumps({"event": event, "error": str(exc)[:200]}), file=self.log, flush=True)
 
     def popen(self, command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
         kwargs["start_new_session"] = sys.platform != "win32"
         process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, **kwargs)
-        if sys.platform != "win32":
-            self.groups.append(process.pid)
+        if sys.platform == "win32":
+            if self._job is not None:
+                try:
+                    self._job.add(process.pid)
+                except OSError as exc:
+                    self._log_event("desktop_job_assignment_failed", exc)
+        else:
+            with self._lock:
+                self._groups.append(process.pid)
         return process
 
+    def _forget_ended_groups(self) -> None:
+        # A process group ID can be reused only after the group is empty. Dropping
+        # empty groups every second keeps stop() from signalling an unrelated group
+        # that later received a recycled ID.
+        while not self._stopped.wait(1):
+            with self._lock:
+                self._groups = [group for group in self._groups if _group_exists(group)]
+
     def stop(self) -> None:
+        self._stopped.set()
         if sys.platform == "win32":
-            return
-        for group in self.groups:
-            try:
-                os.killpg(group, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-        self.groups.clear()
+            return  # the job object ends the processes when the app exits
+        with self._lock:
+            for group in self._groups:
+                try:
+                    os.killpg(group, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            self._groups.clear()
+
+
+def _group_exists(group: int) -> bool:
+    if sys.platform == "win32":
+        raise NotImplementedError("process groups are POSIX-only")
+    try:
+        os.killpg(group, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
 
-    def _kill_on_close_job() -> Any:
-        import ctypes
-        from ctypes import wintypes
+    class _BasicLimits(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
 
-        class _BasicLimits(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_int64),
-                ("PerJobUserTimeLimit", ctypes.c_int64),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
+    class _ExtendedLimits(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimits),
+            ("IoInfo", ctypes.c_uint64 * 6),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
 
-        class _ExtendedLimits(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", _BasicLimits),
-                ("IoInfo", ctypes.c_uint64 * 6),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
+    class _KillOnCloseJob:
+        """A job object whose processes all end when its last handle closes, i.e. when the app exits."""
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        job = kernel32.CreateJobObjectW(None, None)
-        if not job:
-            raise ctypes.WinError(ctypes.get_last_error())
-        limits = _ExtendedLimits()
-        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):  # JobObjectExtendedLimitInformation
-            raise ctypes.WinError(ctypes.get_last_error())
-        if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return job  # the handle stays open for the life of the process
+        def __init__(self) -> None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            self._kernel32 = kernel32
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                raise ctypes.WinError(ctypes.get_last_error())
+            limits = _ExtendedLimits()
+            limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):  # JobObjectExtendedLimitInformation
+                error = ctypes.get_last_error()
+                kernel32.CloseHandle(job)
+                raise ctypes.WinError(error)
+            self._handle = job  # stays open for the life of the app
+
+        def add(self, pid: int) -> None:
+            # PROCESS_SET_QUOTA | PROCESS_TERMINATE, as AssignProcessToJobObject requires.
+            # The caller's Popen keeps the process handle open, so the PID cannot be reused here.
+            process = self._kernel32.OpenProcess(0x0100 | 0x0001, False, pid)
+            if not process:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                if not self._kernel32.AssignProcessToJobObject(self._handle, process):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            finally:
+                self._kernel32.CloseHandle(process)
 
 
 def _scheduler_summary(runtime: Any) -> str:
@@ -270,7 +333,7 @@ def _show_error(message: str, console: IO[str] | None, *, dialog: bool) -> None:
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mal-updater-desktop", description="Run MAL-Updater as a desktop app (stops when closed).")
-    parser.add_argument("--port", type=int, default=int(os.getenv("MAL_UPDATER_DESKTOP_PORT", DEFAULT_PORT)), help=f"local port (default {DEFAULT_PORT}); the MAL app redirect URL must use the same port")
+    parser.add_argument("--port", type=int, default=os.getenv("MAL_UPDATER_DESKTOP_PORT", str(DEFAULT_PORT)), help=f"local port (default {DEFAULT_PORT}); the MAL app redirect URL must use the same port")
     parser.add_argument("--data-dir", type=Path, default=None, help="where settings, secrets and the database are kept")
     parser.add_argument("--no-window", action="store_true", help="run without the control window (stop with Ctrl+C)")
     parser.add_argument("--no-browser", action="store_true", help="do not open the dashboard on start")

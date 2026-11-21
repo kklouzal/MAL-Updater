@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import urlopen
@@ -52,9 +52,18 @@ class FrozenDispatchTests(unittest.TestCase):
             self.assertEqual(0, desktop.frozen_python_dispatch(["-I", "-c", code, str(target), "extra"]))
             self.assertEqual(["-c", str(target), "extra"], json.loads(target.read_text()))
 
+    def test_uncaught_errors_exit_1_with_a_traceback_like_python(self) -> None:
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(1, desktop.frozen_python_dispatch(["-I", "-c", "raise RuntimeError('boom')"]))
+        self.assertIn("RuntimeError: boom", err.getvalue())
+        with patch("mal_updater.cli.main", side_effect=OSError("disk gone")), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(1, desktop.frozen_python_dispatch(["-m", "mal_updater.cli", "health-check"]))
+        self.assertIn("OSError: disk gone", err.getvalue())
+
     def test_refuses_unknown_modules_and_ignores_launcher_arguments(self) -> None:
         with patch("sys.stderr", io.StringIO()):
             self.assertEqual(2, desktop.frozen_python_dispatch(["-m", "http.server"]))
+            self.assertEqual(2, desktop.frozen_python_dispatch(["-m", "mal_updater.container_runtime"]))
         self.assertIsNone(desktop.frozen_python_dispatch(["--port", "9000"]))
         self.assertIsNone(desktop.frozen_python_dispatch([]))
 
@@ -87,6 +96,28 @@ class DataDirectoryTests(unittest.TestCase):
             self.assertEqual(str(home / "config" / "settings.toml"), os.environ["MAL_UPDATER_SETTINGS_PATH"])
             if os.name != "nt":
                 self.assertEqual(0o700, home.stat().st_mode & 0o777)
+
+
+@unittest.skipIf(os.name == "nt", "process groups are POSIX; Windows uses the job object")
+class ProcessTreeTests(unittest.TestCase):
+    def test_signals_live_groups_and_forgets_ended_ones(self) -> None:
+        with tempfile.TemporaryFile("w+", encoding="utf-8") as log:
+            tree = desktop._ProcessTree(log)
+            self.addCleanup(tree.stop)
+            ended = tree.popen([sys.executable, "-c", "pass"])
+            ended.wait(timeout=30)
+            # A task left behind in a scheduler's group, as a crashed scheduler would leave it.
+            leader = tree.popen([sys.executable, "-c", "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])"])
+            leader.wait(timeout=30)
+            deadline = time.monotonic() + 10
+            while ended.pid in tree._groups and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertEqual([leader.pid], tree._groups)
+            tree.stop()
+            deadline = time.monotonic() + 10
+            while desktop._group_exists(leader.pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertFalse(desktop._group_exists(leader.pid), "the left-behind task survived stop()")
 
 
 class DesktopProcessTests(unittest.TestCase):

@@ -191,12 +191,14 @@ def _vacuum_on_database_volume(db_path: Path, *, lock_handle: Any) -> None:
     often a small tmpfs (64 MB in production), far below the copy of a
     multi-GB database ("database or disk is full"), and the free-space
     precheck measures the database volume. A child process therefore runs the
-    VACUUM with its temp directory beside the database. The child inherits the
-    caller's repo writer lock descriptor, so the lock stays held for as long as
-    the VACUUM runs, even if the caller dies first.
+    VACUUM with its temp directory beside the database (SQLite reads
+    SQLITE_TMPDIR/TMPDIR on POSIX and TMP/TEMP on Windows). On POSIX the child
+    inherits the caller's repo writer lock descriptor, so the lock stays held
+    for as long as the VACUUM runs, even if the caller dies first; Windows
+    cannot pass it, so there the caller holds it until the child exits.
     """
     with tempfile.TemporaryDirectory(prefix=".vacuum-tmp-", dir=db_path.parent) as temp_dir:
-        env = {**os.environ, "SQLITE_TMPDIR": temp_dir, "TMPDIR": temp_dir}
+        env = {**os.environ, "SQLITE_TMPDIR": temp_dir, "TMPDIR": temp_dir, "TMP": temp_dir, "TEMP": temp_dir}
         completed = subprocess.run(
             [sys.executable, "-I", "-c", _VACUUM_SCRIPT, str(db_path)],
             env=env,
