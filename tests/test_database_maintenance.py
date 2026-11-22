@@ -184,6 +184,9 @@ class DatabaseMaintenanceTests(unittest.TestCase):
 
     def test_scheduler_projects_compaction_status_and_next_due(self) -> None:
         self.config.service.db_compaction_every_seconds = 60
+        # Pin the skip: a freshly migrated database may hold a few free pages
+        # (table-rebuild migrations), which is not what this test is about.
+        self.config.service.db_compaction_min_freelist_bytes = 10**12
         self.config.service.sync_every_seconds = 0
         self.config.service.health_every_seconds = 3600
         self.config.service_state_path.write_text(json.dumps({"tasks": {"db_compaction": {"last_run_epoch": 1}}}), encoding="utf-8")

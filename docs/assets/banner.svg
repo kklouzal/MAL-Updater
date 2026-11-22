@@ -83,9 +83,9 @@
         <text x="38" y="25" fill="#e8edf3">Continue a franchise</text>
       </g>
       <g transform="translate(668 322)" filter="url(#soft)">
-        <rect width="214" height="40" rx="20" fill="#151b23" stroke="#2a3542"/>
+        <rect width="262" height="40" rx="20" fill="#151b23" stroke="#2a3542"/>
         <circle cx="22" cy="20" r="6" fill="#ffd37a"/>
-        <text x="38" y="25" fill="#e8edf3">Watchable now · dub</text>
+        <text x="38" y="25" fill="#e8edf3">Watchable now · any audio</text>
       </g>
     </g>
 

@@ -450,6 +450,26 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("series-1", item.provider_series_id)
         self.assertEqual(1, item.context["contiguous_tail_gap"])
 
+    def test_new_episode_follows_any_watched_version_and_reports_its_audio(self) -> None:
+        # No dub marker in the titles: a subtitled viewer gets the same follow-up,
+        # labelled with the audio of the episodes they played.
+        self._insert_series("series-sub", title="Sub Show", season_title="Sub Show Season 2", season_number=2, watchlist_status="in_progress")
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._insert_progress("series-sub", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent, audio_locale="ja-JP")
+        self._insert_progress("series-sub", "ep-2", episode_number=2, completion_ratio=1.0, last_watched_at=recent, audio_locale="ja-JP")
+        self._insert_progress("series-sub", "ep-3", episode_number=3, completion_ratio=0.2, last_watched_at=recent)
+
+        results = build_recommendations(
+            self.config,
+            limit=0,
+            require_provider_availability=False,
+            include_discovery_candidates_without_actionable_provider_evidence=True,
+        )
+
+        self.assertEqual(["new_episode"], [item.kind for item in results])
+        self.assertEqual(["ja-JP"], results[0].context["audio_locales"])
+        self.assertNotIn("English dub is available", results[0].reasons)
+
     def test_discovery_seed_uses_privacy_safe_preference_signals_without_leaking_text(self) -> None:
         replace_mal_user_anime_list_cache_generation(
             self.config.db_path,

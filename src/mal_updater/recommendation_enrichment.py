@@ -953,8 +953,6 @@ def _coalesce_discovery_review_entries(entries: list[dict[str, Any]]) -> list[di
     return filtered
 
 
-
-
 def _catalog_status_from_match(match: dict[str, Any]) -> str:
     status = str(match.get("catalog_status") or "").strip().lower()
     if status in {"present", "absent"}:

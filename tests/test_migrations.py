@@ -369,6 +369,11 @@ class MigrationCatalogTests(unittest.TestCase):
                     VALUES ('run-legacy', 'new_dubbed_episode', 'crunchyroll', 'Legacy Episode', 'legacy-series', 'present')
                     """
                 )
+                # A pruned highest id must stay retired across the table rebuild.
+                pruned_id = conn.execute(
+                    "INSERT INTO recommendation_score_snapshots (run_id, kind, title) VALUES ('run-pruned', 'new_season', 'Pruned')"
+                ).lastrowid
+                conn.execute("DELETE FROM recommendation_score_snapshots WHERE id = ?", (pruned_id,))
                 conn.commit()
 
             bootstrap_database(db_path)
@@ -380,6 +385,11 @@ class MigrationCatalogTests(unittest.TestCase):
                 evidence_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_eligibility_evidence)")}
                 snapshot_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_score_snapshots)")}
                 snapshot_kinds = [row["kind"] for row in conn.execute("SELECT kind FROM recommendation_score_snapshots")]
+                next_snapshot_id = conn.execute(
+                    "INSERT INTO recommendation_score_snapshots (run_id, kind, title) VALUES ('run-next', 'new_season', 'Next')"
+                ).lastrowid
+                leftover_tables = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%\\_new' ESCAPE '\\'").fetchone()[0]
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
                 index_sql = conn.execute(
                     "SELECT sql FROM sqlite_master WHERE name = 'idx_recommendation_provider_eligibility_actionable'"
                 ).fetchone()["sql"]
@@ -419,6 +429,9 @@ class MigrationCatalogTests(unittest.TestCase):
         self.assertFalse({"english_dub_status", "explicit_dub_evidence_source"} & evidence_columns)
         self.assertNotIn("dub_signal", snapshot_columns)
         self.assertEqual(["new_episode"], snapshot_kinds)
+        self.assertGreater(next_snapshot_id, pruned_id)
+        self.assertEqual(0, leftover_tables)
+        self.assertEqual("ok", integrity)
         self.assertNotIn("english_dub_status", index_sql)
         self.assertEqual(1, marker_count)
 

@@ -76,7 +76,7 @@ Prefer an always-on install on a server or NAS? Use the [container](#-container)
     </td>
     <td valign="top">
       <h3>📺 Watchable now</h3>
-      New seasons and fresh episodes of shows you follow, plus recommendations checked against what Crunchyroll and HIDIVE actually stream. Every title lists its audio languages, sub or dub, and one click filters to the language you watch in.
+      New seasons and fresh episodes of shows you follow, plus recommendations checked against what Crunchyroll and HIDIVE actually stream. Titles list the audio languages the provider reports, and the Audio filter narrows the list to the language you watch in.
     </td>
   </tr>
   <tr>

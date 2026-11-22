@@ -30,7 +30,7 @@ from .recommendation_actionability import (
     is_strict_provider_eligibility_actionable,
     strict_provider_actionability_failure_reasons,
 )
-from .recommendations import Recommendation, build_recommendations
+from .recommendations import Recommendation, audio_locale_union, build_recommendations
 from .recommendation_enrichment import build_provider_enrichment_diagnostics, unknown_provider_enrichment_diagnostics
 
 DASHBOARD_MIN_RECOMMENDATION_LIMIT = 1
@@ -483,8 +483,7 @@ def _row_audio_locales(context: dict[str, Any], eligibility_details: list[dict[s
     """Audio languages for a row: the context's list (provider languages for
     discovery, the watched version for provider progress), else the evidence's."""
     raw = context.get("audio_locales")
-    lists = [raw] if isinstance(raw, list) else [item.get("audio_locales") for item in eligibility_details]
-    return sorted({str(value) for values in lists if isinstance(values, list) for value in values if isinstance(value, str) and value.strip()})
+    return audio_locale_union([raw] if isinstance(raw, list) else (item.get("audio_locales") for item in eligibility_details))
 
 
 def _review_needed(context: dict[str, Any]) -> bool:
@@ -2005,6 +2004,7 @@ _PAGE_CSS = r"""
 .genre-chip button{display:inline-grid;place-items:center;width:1.3rem;height:1.3rem;padding:0;border:0;border-radius:50%;color:var(--text);background:var(--surface-3);font:inherit;font-weight:700;line-height:1;cursor:pointer}
 .toggle{display:inline-flex;align-items:center;gap:.4rem;color:var(--muted);cursor:pointer}
 .audio-filter{display:inline-flex;align-items:center;gap:.4rem;color:var(--muted)}
+.audio-filter[hidden]{display:none}
 .audio-filter select{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border-strong);border-radius:.45rem;padding:.32rem .5rem}
 .audio-languages{margin:.35rem 0 0;color:var(--muted);font-size:.8rem}
 .audio-languages .match{color:var(--good);font-weight:700}
@@ -2407,6 +2407,8 @@ function genreControlsHtml(data){
 function audioControlHtml(data){
   const languages = dashboardLanguages(data);
   languageLabels = new Map(languages);
+  // Nothing to filter by (e.g. MAL-only mode, or no provider reported audio).
+  if (!languages.length) return '';
   const options = [['', 'Any language'], ...languages].map(([value, name]) => `<option value="${esc(value)}"${value === audioLanguage ? ' selected' : ''}>${esc(name)}</option>`).join('');
   return `<span>Audio</span><select id="audio-language" aria-label="Audio language">${options}</select>`;
 }
@@ -2447,7 +2449,9 @@ function renderControls(){
   const data = latestDashboardData;
   document.getElementById('genre-filter').innerHTML = genreControlsHtml(data);
   document.getElementById('genre-chips').innerHTML = chipsHtml();
-  document.getElementById('audio-filter').innerHTML = audioControlHtml(data);
+  const audioFilter = document.getElementById('audio-filter');
+  audioFilter.innerHTML = audioControlHtml(data);
+  audioFilter.hidden = !audioFilter.innerHTML;
   const hiddenCount = Object.values(data.recommendations?.sections || {}).flat().filter(r => hiddenTitles.has(recommendationIdentity(r))).length;
   document.getElementById('hidden-count').textContent = hiddenCount ? ` (${hiddenCount})` : '';
   document.getElementById('clear-filters').hidden = !(selectedGenres.length || titleQuery || audioLanguage);

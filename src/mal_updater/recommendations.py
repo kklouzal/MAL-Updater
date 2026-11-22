@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -773,9 +774,11 @@ def _select_primary_provider_evidence(evidence_rows: list[RecommendationProvider
     )[0]
 
 
-def _audio_locale_union(locale_lists: Any) -> list[str]:
-    """Audio languages reported for a title, as the providers name them (e.g. "ja-JP", "es-419")."""
-    return sorted({str(locale) for locales in locale_lists for locale in locales or () if isinstance(locale, str) and locale.strip()})
+def audio_locale_union(locale_lists: Iterable[Any]) -> list[str]:
+    """Audio languages reported for a title, as the providers name them (e.g. "ja-JP", "es-419").
+
+    Non-list entries are not language lists and are skipped."""
+    return sorted({locale for locales in locale_lists if isinstance(locales, list) for locale in locales if isinstance(locale, str) and locale.strip()})
 
 
 def _freshness_boost(last_watched_at: str | None, kind: str) -> int:
@@ -865,7 +868,7 @@ def _merge_cross_provider_recommendations(
         merged_context["cross_provider_merged"] = True
         merged_context["cross_provider_reconciliation_status"] = "trusted"
         merged_context["available_via_providers"] = available_via_providers
-        merged_context["audio_locales"] = _audio_locale_union(item.context.get("audio_locales") for item in bucket)
+        merged_context["audio_locales"] = audio_locale_union(item.context.get("audio_locales") for item in bucket)
         merged_context["availability_priority_bonus"] = availability_priority_bonus
         merged_context["alternate_provider_series"] = [
             {
@@ -1956,7 +1959,6 @@ def _build_discovery_recommendations(
         if require_provider_availability and not actionable_provider_evidence:
             continue
         if require_provider_availability:
-            provider_available_states = []
             primary_available_state = None
             primary_provider_evidence = _select_primary_provider_evidence(actionable_provider_evidence)
             available_via_providers = sorted({evidence.provider for evidence in actionable_provider_evidence})
@@ -2306,7 +2308,7 @@ def _build_discovery_recommendations(
             _serialize_provider_eligibility_evidence(evidence)
             for evidence in context_provider_evidence
         ]
-        audio_locales = _audio_locale_union(evidence["audio_locales"] for evidence in provider_evidence_chain)
+        audio_locales = audio_locale_union(evidence["audio_locales"] for evidence in provider_evidence_chain)
         supporting_seed_details = _supporting_seed_details(
             supporting_source_ids=set(bucket["supporting_sources"]),
             votes_by_source={int(k): int(v) for k, v in (bucket.get("votes_by_source") or {}).items() if isinstance(k, int)},
