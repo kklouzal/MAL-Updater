@@ -399,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend.add_argument(
         "--include-dormant",
         action="store_true",
-        help="Operator diagnostic: include dormant/internal discovery candidates without actionable verified provider+dub eligibility",
+        help="Operator diagnostic: include dormant/internal discovery candidates without verified provider availability",
     )
     recommend.add_argument(
         "--persist-snapshot",
@@ -454,7 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_dashboard.add_argument(
         "--include-dormant",
         action="store_true",
-        help="Operator diagnostic: include dormant/internal discovery candidates without actionable verified provider+dub eligibility",
+        help="Operator diagnostic: include dormant/internal discovery candidates without verified provider availability",
     )
     dashboard_serve = subparsers.add_parser(
         "dashboard-serve",

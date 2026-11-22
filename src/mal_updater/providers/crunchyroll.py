@@ -357,7 +357,7 @@ def _fetch_search_result_detail(config: AppConfig, match: Any, *, session=None):
 
     Crunchyroll discover search sometimes omits audio locales from grouped search
     hits. The CMS series object is still read-only/account-authenticated and
-    exposes the explicit ``audio_locales`` field needed for English-dub evidence.
+    exposes the explicit ``audio_locales`` field (the title's audio languages).
     """
     from ..crunchyroll_snapshot import _build_request_pacer, _start_auth_session
 

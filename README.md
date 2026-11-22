@@ -76,7 +76,7 @@ Prefer an always-on install on a server or NAS? Use the [container](#-container)
     </td>
     <td valign="top">
       <h3>📺 Watchable now</h3>
-      New seasons and freshly dubbed episodes of shows you follow, checked against what Crunchyroll and HIDIVE actually stream, with English-dub evidence. No more "wait, is this even on my service?"
+      New seasons and fresh episodes of shows you follow, plus recommendations checked against what Crunchyroll and HIDIVE actually stream. Every title lists its audio languages, sub or dub, and one click filters to the language you watch in.
     </td>
   </tr>
   <tr>
@@ -86,7 +86,7 @@ Prefer an always-on install on a server or NAS? Use the [container](#-container)
     </td>
     <td valign="top">
       <h3>📊 Your taste, charted</h3>
-      A genre affinity chart built from your completed and in-progress titles, a searchable dashboard with cover art, and <b>Export PDF</b> for a printable report with clickable links.
+      A genre affinity chart built from your completed and in-progress titles, a dashboard with cover art and title, genre and audio-language filters, and <b>Export PDF</b> for a printable report with clickable links.
     </td>
   </tr>
   <tr>
@@ -250,6 +250,9 @@ It's built not to. It only fills in data that's missing, never lowers progress, 
 
 **Do I need Crunchyroll or HIDIVE?**<br>
 No. With only a MAL account you get recommendations, Continue a franchise, the genre chart and PDF export. A provider adds watch-history sync and the *Watchable now* check.
+
+**Sub or dub? Which languages?**<br>
+Any. Recommendations don't prefer a language: each title shows the audio languages Crunchyroll or HIDIVE report, and new episodes follow the version you're watching. To see only titles you can watch in a particular dub, pick it in the dashboard's **Audio** filter; your browser remembers the choice.
 
 **Does it store my Crunchyroll password?**<br>
 Not if you use **Link Crunchyroll account**, which uses a TV activation code. Username and password login is available as an alternative and is stored only in your local secrets folder.

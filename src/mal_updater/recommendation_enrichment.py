@@ -36,7 +36,6 @@ from .recommendation_actionability import (
     PROVIDER_TITLE_SEARCH_EXACT_IDENTITY_KIND,
     STRICT_PROVIDER_ELIGIBILITY_PROVIDERS,
     is_strict_provider_eligibility_actionable,
-    provider_audio_locales_have_english,
     strict_provider_last_verified_at_for_persistence,
 )
 from .recommendations import Recommendation, build_recommendations
@@ -783,38 +782,11 @@ def _match_with_aggregate_shell_evidence(match: dict[str, Any], verification: Ag
     return enriched
 
 
-def _is_english_dub_match(match: dict[str, Any]) -> bool:
-    """Return True only for explicit provider audio-locale evidence.
-
-    Provider search/title fields are not reliable dub evidence: HIDIVE Algolia
-    currently exposes no audio/dub contract, and Crunchyroll discover search can
-    return empty audio_locales. Keep title-only markers such as "English Dub"
-    out of availability gating so unknown rows are not promoted as dubbed.
-    """
-    return provider_audio_locales_have_english(_audio_locales(match))
-
-
 def _audio_locales(match: dict[str, Any]) -> list[Any]:
+    """Audio languages from the provider's own audio contract (Crunchyroll
+    audio_locales, HIDIVE Audio|... tags); title markers such as "(Dub)" are
+    never read as language evidence. Empty means not reported."""
     return match.get("audio_locales") if isinstance(match.get("audio_locales"), list) else []
-
-
-def _explicit_dub_evidence_source(provider: str, match: dict[str, Any]) -> str | None:
-    if not _is_english_dub_match(match):
-        return None
-    return "provider_audio_locale" if provider == "crunchyroll" else "provider_audio_tag"
-
-
-def _english_dub_status_from_match(provider: str, match: dict[str, Any]) -> str:
-    if _explicit_dub_evidence_source(provider, match) is not None:
-        return "present"
-    # Crunchyroll CMS/search audio_locales and HIDIVE Algolia Audio|... tags are
-    # explicit provider audio contracts. If one of those contracts is present but
-    # lacks English, record a conservative negative instead of pretending no
-    # provider evidence was checked. Empty/missing contracts remain unknown.
-    locales = _audio_locales(match)
-    if locales:
-        return "absent"
-    return "unknown"
 
 
 def _identity_text(value: Any) -> str:
@@ -885,7 +857,7 @@ def _merge_audio_locales(existing: list[Any], incoming: list[Any]) -> list[Any]:
     return merged
 
 
-def _preferred_english_dub_status(existing: Any, incoming: Any) -> Any:
+def _preferred_status(existing: Any, incoming: Any) -> Any:
     rank = {"unknown": 1, "absent": 2, "present": 3}
     return incoming if rank.get(str(incoming), 0) > rank.get(str(existing), 0) else existing
 
@@ -911,12 +883,6 @@ def _merge_duplicate_discovery_review_entry(existing: dict[str, Any], duplicate:
             existing_payload.get("audio_locales") if isinstance(existing_payload.get("audio_locales"), list) else [],
             duplicate_payload.get("audio_locales") if isinstance(duplicate_payload.get("audio_locales"), list) else [],
         )
-    if "english_dub_status" in existing_payload or "english_dub_status" in duplicate_payload:
-        existing_payload["english_dub_status"] = _preferred_english_dub_status(
-            existing_payload.get("english_dub_status"), duplicate_payload.get("english_dub_status")
-        )
-    if not existing_payload.get("explicit_dub_evidence_source") and duplicate_payload.get("explicit_dub_evidence_source"):
-        existing_payload["explicit_dub_evidence_source"] = duplicate_payload["explicit_dub_evidence_source"]
     _merge_selected_match_evidence(existing_payload.get("match"), duplicate_payload.get("match"))
     _merge_selected_match_evidence(existing_payload.get("matches"), duplicate_payload.get("matches"))
 
@@ -987,12 +953,6 @@ def _coalesce_discovery_review_entries(entries: list[dict[str, Any]]) -> list[di
     return filtered
 
 
-def _discovery_review_dub_payload(provider: str, match: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "english_dub_status": _english_dub_status_from_match(provider, match),
-        "audio_locales": list(_audio_locales(match)),
-        "explicit_dub_evidence_source": _explicit_dub_evidence_source(provider, match),
-    }
 
 
 def _catalog_status_from_match(match: dict[str, Any]) -> str:
@@ -1101,9 +1061,7 @@ def _upsert_search_eligibility_evidence(
     verified_search_identity = search_identity_match_kind in VERIFIED_PROVIDER_SEARCH_IDENTITY_KINDS
     identity_match_kind = "approved_mapping" if approved_identity else search_identity_match_kind
     match_confidence = getattr(mapping, "confidence", None) if approved_identity else PROVIDER_SEARCH_IDENTITY_CONFIDENCE.get(search_identity_match_kind)
-    explicit_source = _explicit_dub_evidence_source(provider, match)
     catalog_status = _catalog_status_from_match(match)
-    english_dub_status = _english_dub_status_from_match(provider, match)
     verified_identity = approved_identity or verified_search_identity
     audio_locales = match.get("audio_locales") if isinstance(match.get("audio_locales"), list) else []
     evidence_candidate = {
@@ -1111,8 +1069,6 @@ def _upsert_search_eligibility_evidence(
         "identity_match_kind": identity_match_kind,
         "review_status": "verified" if verified_identity else "review-needed",
         "catalog_status": catalog_status,
-        "english_dub_status": english_dub_status,
-        "audio_locales": audio_locales,
         "expires_at": expires_at,
     }
     last_verified_at = strict_provider_last_verified_at_for_persistence(evidence_candidate, verified_at=fetched_at, now=fetched_at)
@@ -1125,18 +1081,9 @@ def _upsert_search_eligibility_evidence(
         provider_series_id=str(provider_series_id),
     )
     if verified_identity and existing is not None and existing.fetched_at == fetched_at:
-        catalog_status = _preferred_english_dub_status(existing.catalog_status, catalog_status)
-        english_dub_status = _preferred_english_dub_status(existing.english_dub_status, english_dub_status)
+        catalog_status = _preferred_status(existing.catalog_status, catalog_status)
         audio_locales = _merge_audio_locales(existing.audio_locales, audio_locales)
-        if explicit_source is None:
-            explicit_source = existing.explicit_dub_evidence_source
-        evidence_candidate.update(
-            {
-                "catalog_status": catalog_status,
-                "english_dub_status": english_dub_status,
-                "audio_locales": audio_locales,
-            }
-        )
+        evidence_candidate["catalog_status"] = catalog_status
         last_verified_at = strict_provider_last_verified_at_for_persistence(evidence_candidate, verified_at=fetched_at, now=fetched_at)
         if last_verified_at is None and is_strict_provider_eligibility_actionable(existing, now=fetched_at):
             last_verified_at = existing.last_verified_at
@@ -1152,8 +1099,6 @@ def _upsert_search_eligibility_evidence(
         match_confidence=match_confidence,
         review_status="verified" if verified_identity else "review-needed",
         catalog_status=catalog_status,
-        english_dub_status=english_dub_status,
-        explicit_dub_evidence_source=explicit_source,
         audio_locales=audio_locales,
         source_evidence={
             "source": "bounded_provider_title_search",
@@ -1166,8 +1111,6 @@ def _upsert_search_eligibility_evidence(
             "approved_mapping": bool(approved_identity),
             "catalog_status": catalog_status,
             "catalog_evidence_source": match.get("detail_evidence_source") or ("provider_title_search_result" if catalog_status == "present" else "provider_title_search_result_negative"),
-            "english_dub_status": english_dub_status,
-            "explicit_dub_evidence_source": explicit_source,
             "mapping_source": getattr(mapping, "mapping_source", None) if mapping is not None else None,
             "mapping_confidence": getattr(mapping, "confidence", None) if mapping is not None else None,
             "search_identity_match_kind": search_identity_match_kind,
@@ -1223,8 +1166,6 @@ def _record_eligibility_refresh_failure(
         match_confidence=evidence.match_confidence,
         review_status=evidence.review_status,
         catalog_status=evidence.catalog_status,
-        english_dub_status=evidence.english_dub_status,
-        explicit_dub_evidence_source=evidence.explicit_dub_evidence_source,
         audio_locales=evidence.audio_locales,
         source_evidence=evidence.source_evidence,
         fetched_at=evidence.fetched_at,
@@ -1319,8 +1260,6 @@ def _current_provider_eligibility_rows_for_reconciliation(
                 "match_confidence": None if row["match_confidence"] is None else float(row["match_confidence"]),
                 "review_status": str(row["review_status"]),
                 "catalog_status": str(row["catalog_status"]),
-                "english_dub_status": str(row["english_dub_status"]),
-                "explicit_dub_evidence_source": row["explicit_dub_evidence_source"],
                 "audio_locales": _decode_json_list(row["audio_locales_json"]),
                 "source_evidence": _decode_json_object(row["source_evidence_json"]),
                 "fetched_at": str(row["fetched_at"]),
@@ -1454,8 +1393,6 @@ def _rewrite_legacy_provider_eligibility_row_as_approved_mapping(
         match_confidence=getattr(mapping, "confidence", None) if getattr(mapping, "confidence", None) is not None else row.get("match_confidence"),
         review_status="verified",
         catalog_status=str(row.get("catalog_status") or "unknown"),
-        english_dub_status=str(row.get("english_dub_status") or "unknown"),
-        explicit_dub_evidence_source=row.get("explicit_dub_evidence_source"),
         audio_locales=list(row.get("audio_locales") or []),
         source_evidence=dict(row.get("source_evidence") or {}),
         fetched_at=str(row["fetched_at"]),
@@ -1548,9 +1485,8 @@ def _provider_result_identity(match: dict[str, Any]) -> str:
     return "|".join(_match_identity(match))
 
 
-def _provider_match_preference(match: dict[str, Any]) -> tuple[int, int, int]:
+def _provider_match_preference(match: dict[str, Any]) -> tuple[int, int]:
     return (
-        1 if _is_english_dub_match(match) else 0,
         len(_audio_locales(match)),
         1 if _catalog_status_from_match(match) == "present" else 0,
     )
@@ -1719,7 +1655,7 @@ def _append_provider_search_review_entry(
             "match": match,
             "decision": "strong_provider_search_candidate_no_auto_link",
             "provider_search_match_reasons": list(decision.reasons),
-            **_discovery_review_dub_payload(provider, match),
+            "audio_locales": list(_audio_locales(match)),
         },
     })
 
@@ -1928,7 +1864,7 @@ def _candidate_rank_key(item: Recommendation, *, mal_id: int, rank: int) -> dict
 def _evidence_is_stale(evidence: Any) -> bool:
     return any(
         str(getattr(evidence, field_name, "")).strip().lower() == "stale"
-        for field_name in ("review_status", "catalog_status", "english_dub_status")
+        for field_name in ("review_status", "catalog_status")
     )
 
 

@@ -148,6 +148,22 @@ class MappingTests(unittest.TestCase):
             "bofuri i don t want to get hurt so i ll max out my defense",
         )
 
+    def test_normalize_title_strips_dub_markers_in_any_language(self) -> None:
+        for marked in (
+            "Frieren (English Dub)",
+            "Frieren (Spanish Dub)",
+            "Frieren (Castilian Dub)",
+            "Frieren (Latin American Spanish Dub)",
+            "Frieren (Portuguese Dub)",
+            "Frieren [German Dub]",
+            "Frieren (Dub)",
+            "Frieren French Dub",
+        ):
+            with self.subTest(marked=marked):
+                self.assertEqual("frieren", normalize_title(marked))
+        # "Dub" inside a real title word is not a version marker.
+        self.assertEqual("dubai detective", normalize_title("Dubai Detective"))
+
     def test_normalize_title_splits_letter_digit_boundaries(self) -> None:
         self.assertEqual(normalize_title("PERSONA5 the Animation"), "persona 5 the animation")
         self.assertEqual(normalize_title("Ver1.1a"), "ver 1 1 a")
@@ -7272,7 +7288,6 @@ class DryRunPlannerTests(unittest.TestCase):
                 match_confidence=0.9,
                 review_status="verified",
                 catalog_status="present",
-                english_dub_status="present",
                 fetched_at="2026-07-24T00:00:00Z",
                 expires_at="2026-07-31T00:00:00Z",
                 source_evidence={"identity_evidence": None},
@@ -7353,7 +7368,6 @@ class DryRunPlannerTests(unittest.TestCase):
                 match_confidence=0.88,
                 review_status="verified",
                 catalog_status="present",
-                english_dub_status="present",
                 fetched_at="2026-07-24T00:00:00Z",
                 expires_at="2026-07-31T00:00:00Z",
                 source_evidence={"identity_evidence": identity_evidence},
@@ -7972,7 +7986,6 @@ class DryRunPlannerTests(unittest.TestCase):
                 match_confidence=0.9,
                 review_status="verified",
                 catalog_status="present",
-                english_dub_status="present",
                 fetched_at="2026-07-24T00:00:00Z",
                 expires_at="2026-07-31T00:00:00Z",
                 source_evidence={"identity_evidence": None},
@@ -8058,7 +8071,6 @@ class DryRunPlannerTests(unittest.TestCase):
                 match_confidence=0.88,
                 review_status="verified",
                 catalog_status="present",
-                english_dub_status="present",
                 fetched_at="2026-07-24T00:00:00Z",
                 expires_at="2026-07-31T00:00:00Z",
                 source_evidence={"identity_evidence": identity_evidence},
@@ -8128,7 +8140,6 @@ class DryRunPlannerTests(unittest.TestCase):
                 match_confidence=0.9,
                 review_status="verified",
                 catalog_status="present",
-                english_dub_status="present",
                 fetched_at="2026-07-24T00:00:00Z",
                 expires_at="2026-07-31T00:00:00Z",
                 source_evidence={"identity_evidence": None},

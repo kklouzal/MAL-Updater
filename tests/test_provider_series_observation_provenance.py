@@ -250,8 +250,6 @@ class ProviderSeriesObservationProvenanceTests(unittest.TestCase):
                 match_confidence=0.9,
                 review_status="verified",
                 catalog_status="present",
-                english_dub_status="present",
-                explicit_dub_evidence_source="provider_audio_locale",
                 audio_locales=["en-US", "ja-JP"],
                 source_evidence={"source": "catalog_only_test"},
                 fetched_at="2026-07-19T00:00:00Z",

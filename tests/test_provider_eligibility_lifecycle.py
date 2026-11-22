@@ -95,7 +95,6 @@ class ProviderEligibilityLifecycleTests(unittest.TestCase):
             identity_match_kind="provider_title_search_exact",
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
             audio_locales=["en-US"],
             fetched_at=verified_at,
             expires_at="2026-01-08T00:00:00Z",

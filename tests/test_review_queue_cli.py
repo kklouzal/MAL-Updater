@@ -919,7 +919,6 @@ class ReviewQueueCliTests(unittest.TestCase):
             match_confidence=0.9,
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
             fetched_at="2026-07-24T00:00:00Z",
             expires_at="2026-07-31T00:00:00Z",
             source_evidence={"identity_evidence": None},
@@ -2361,10 +2360,6 @@ class ReviewQueueCliTests(unittest.TestCase):
             sorted(build_review.call_args.kwargs["provider_series_ids"]),
         )
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_list_review_queue_accepts_format_summary_alias(self) -> None:
         replace_review_queue_entries(
             self.config.db_path,
@@ -2437,7 +2432,7 @@ if __name__ == "__main__":
                     "score": 7.5,
                     "priority": 10,
                     "reasons": ["available_now"],
-                    "context": {"available_via_providers": ["crunchyroll"], "dub_signal": "dubbed", "availability_confidence": 0.8},
+                    "context": {"available_via_providers": ["crunchyroll"], "audio_locales": ["ja-JP", "en-US"], "availability_confidence": 0.8},
                 }
             ],
             run_id="run-format",
@@ -2459,9 +2454,9 @@ if __name__ == "__main__":
         payload = json.loads(stdout.getvalue())
         self.assertEqual("run-format", payload[0]["run_id"])
         self.assertEqual(["crunchyroll"], payload[0]["providers"])
-        self.assertEqual("dubbed", payload[0]["dub_signal"])
+        self.assertEqual(["en-US", "ja-JP"], payload[0]["availability"]["audio_locales"])
         self.assertEqual(0.8, payload[0]["availability_confidence"])
-        self.assertEqual("dubbed", payload[0]["context"]["dub_signal"])
+        self.assertNotIn("dub_signal", payload[0])
 
     def test_review_queue_refresh_worklist_accepts_format_json_without_selection(self) -> None:
         argv = [
@@ -2482,3 +2477,7 @@ if __name__ == "__main__":
         self.assertEqual("mapping_review", payload["issue_type_filter"])
         self.assertEqual([], payload["selected_provider_series_ids"])
         self.assertEqual({"resolved": 0, "inserted": 0}, payload["refresh"]["review_queue"])
+
+
+if __name__ == "__main__":
+    unittest.main()

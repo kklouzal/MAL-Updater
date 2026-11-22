@@ -54,7 +54,7 @@ recommendations_webhook_delivery_mode = "fresh"
 
 [openclaw.recommendations_webhook_section_limits]
 continue_next = 5
-fresh_dubbed_episodes = 5
+fresh_episodes = 5
 discovery_candidates = 3
 resume_backlog = 2
 

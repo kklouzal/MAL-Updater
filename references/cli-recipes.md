@@ -123,7 +123,7 @@ PYTHONPATH=src python3 -m mal_updater.cli dashboard-serve --limit 16
 PYTHONPATH=src python3 -m mal_updater.cli service-status --format summary
 ```
 
-Without `--include-dormant`, discovery requires verified Crunchyroll/HIDIVE availability plus English-dub evidence. With no source provider connected (MAL-only), that proof cannot exist, so the default ranks from the MAL list and MAL recommendation graph with availability marked unknown, exactly as `--include-dormant` does.
+Without `--include-dormant`, discovery requires verified Crunchyroll/HIDIVE availability (in any audio language; each row lists `context.audio_locales`). With no source provider connected (MAL-only), that proof cannot exist, so the default ranks from the MAL list and MAL recommendation graph with availability marked unknown, exactly as `--include-dormant` does.
 
 `dashboard-serve` is local/read-only (default `127.0.0.1:8766`) and serves the latest persisted recommendation snapshot with the same pages as the container (`/`, `/debug`) and JSON at `/api/dashboard` (`?limit=N` per-request override, default 120 rows per section; `?view=ui` is the slim payload the pages use).
 

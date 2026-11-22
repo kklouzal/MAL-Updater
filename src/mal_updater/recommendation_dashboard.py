@@ -50,12 +50,12 @@ _PROVIDER_LABELS = {"crunchyroll": "Crunchyroll", "hidive": "HIDIVE", "mal": "My
 _SECTION_METADATA: dict[str, dict[str, str]] = {
     "discovery_available_now": {
         "label": "Watchable now",
-        "description": "Actionable discovery titles require fresh verified Crunchyroll or HIDIVE availability plus explicit English dub evidence.",
+        "description": "Recommended titles verified as currently streaming on your Crunchyroll or HIDIVE account. Use the Audio filter to show a dub language.",
         "title_label": "English title",
     },
     "discovery_high_confidence": {
         "label": "Ranked discovery recommendations",
-        "description": "Ranked MAL recommendation-graph discovery candidates. Provider availability and English-dub evidence may be unknown or unverified; these rows are not watch-now/actionable unless they also appear in Watchable now.",
+        "description": "Ranked MAL recommendation-graph discovery candidates. Provider availability may be unknown or unverified; these rows are not watch-now/actionable unless they also appear in Watchable now.",
         "title_label": "English title",
         "diagnostic_only": "true",
     },
@@ -69,6 +69,16 @@ _SECTION_METADATA: dict[str, dict[str, str]] = {
         "description": "Sequels of titles you completed on MAL that are not on your MAL list yet. Specials, recaps and unaired entries are left out; where they stream is not checked.",
         "title_label": "Title",
     },
+    "new_season": {
+        "label": "New seasons",
+        "description": "Later seasons of shows you finished on your provider.",
+        "title_label": "Title",
+    },
+    "new_episode": {
+        "label": "New episodes",
+        "description": "New episodes after your progress in shows you watched recently, in the version (sub or dub) you watch.",
+        "title_label": "Title",
+    },
     "resume_backlog": {
         "label": "Resume backlog",
         "description": "Known provider or MAL-list titles that look ready to resume from existing watch progress.",
@@ -79,7 +89,7 @@ _SECTION_METADATA: dict[str, dict[str, str]] = {
 _MAL_ONLY_SECTION_METADATA: dict[str, dict[str, str]] = {
     "discovery_high_confidence": {
         "label": "Recommended from your MAL list",
-        "description": "Ranked from your MAL list and MAL community recommendations. No streaming provider is connected, so where each title streams and whether it has an English dub are not checked.",
+        "description": "Ranked from your MAL list and MAL community recommendations. No streaming provider is connected, so where each title streams and in which languages are not checked.",
         "title_label": "English title",
     },
 }
@@ -165,7 +175,7 @@ def _format_scorecard(scorecard: Any) -> str:
         parts.append(f"total {total:g}")
     components = scorecard.get("components")
     if isinstance(components, dict):
-        for key in ("consensus", "affinity", "quality", "availability", "dub_watchable", "confidence"):
+        for key in ("consensus", "affinity", "quality", "availability", "confidence"):
             value = components.get(key)
             if isinstance(value, int | float) and not isinstance(value, bool):
                 parts.append(f"{key.replace('_', ' ')} {value:g}")
@@ -233,8 +243,7 @@ def _availability_evidence_details(context: dict[str, Any]) -> list[dict[str, An
                 "match_confidence": item.get("match_confidence"),
                 "review_status": item.get("review_status"),
                 "catalog_status": item.get("catalog_status"),
-                "english_dub_status": item.get("english_dub_status"),
-                "explicit_dub_evidence_source": item.get("explicit_dub_evidence_source"),
+                "audio_locales": item.get("audio_locales") if isinstance(item.get("audio_locales"), list) else [],
                 "fetched_at": item.get("fetched_at"),
                 "last_verified_at": item.get("last_verified_at"),
                 "expires_at": item.get("expires_at"),
@@ -309,7 +318,6 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
     match_confidences = _compact_list([series.get("mapping_confidence") for series in provider_series if isinstance(series, dict)])
     if not match_confidences and eligibility_details:
         match_confidences = _compact_list([item.get("match_confidence") for item in eligibility_details])
-    dub_status = _dub_status(row.get("dub_signal") or merged.get("english_dub") or merged.get("dub_signal") or merged.get("english_dub_signal"))
     review_needed = _review_needed(merged)
     provider_badges = [
         {
@@ -325,20 +333,12 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
     identity_label = ", ".join(str(value) for value in match_kinds)
     review_labels = _compact_list([item.get("review_status") for item in eligibility_details])
     catalog_labels = _compact_list([item.get("catalog_status") for item in eligibility_details])
-    english_dub_labels = _compact_list([item.get("english_dub_status") for item in eligibility_details])
-    if dub_status == "unknown" and english_dub_labels:
-        normalized_dub_labels = {str(value).strip().lower() for value in english_dub_labels}
-        if "present" in normalized_dub_labels:
-            dub_status = "present"
-        elif normalized_dub_labels <= {"absent", "none"}:
-            dub_status = "none"
     verification_label = "; ".join(
         part
         for part in (
             f"identity {identity_label}" if identity_label else "",
             f"review {', '.join(str(value) for value in review_labels)}" if review_labels else "",
             f"catalog {', '.join(str(value) for value in catalog_labels)}" if catalog_labels else "",
-            f"English dub {', '.join(str(value) for value in english_dub_labels)}" if english_dub_labels else "",
         )
         if part
     )
@@ -365,9 +365,7 @@ def _snapshot_evidence(row: dict[str, Any]) -> dict[str, Any]:
         "provider_eligibility_evidence": eligibility_details,
         "verification_label": verification_label,
         "evidence_freshness_label": _format_evidence_freshness(eligibility_details),
-        "dub_signal": dub_status,
-        "dub_status": dub_status,
-        "english_dub_present": dub_status == "present",
+        "audio_locales": _row_audio_locales(merged, eligibility_details),
         "review_needed": review_needed,
         "review_label": "review needed" if review_needed else "",
         "mal_watch_status": _watch_status_from_context(merged),
@@ -454,11 +452,11 @@ def _mark_discovery_row_visibility(row: dict[str, Any]) -> dict[str, Any]:
     row["actionable"] = actionable
     row["diagnostic_only"] = not actionable
     if actionable:
-        row["visibility_label"] = "Watchable now — verified provider+dub proof"
+        row["visibility_label"] = "Watchable now — verified provider availability"
         row["strict_actionability"] = {"eligible": True, "missing": []}
     else:
         missing = _strict_actionability_failure_reasons(row)
-        row["visibility_label"] = "Discovery only — provider/dub unverified; not actionable"
+        row["visibility_label"] = "Discovery only — provider availability unverified; not actionable"
         row["strict_actionability"] = {"eligible": False, "missing": missing}
         row["unverified_evidence_label"] = "; ".join(missing)
         if row.get("provider_evidence"):
@@ -478,22 +476,15 @@ def _mark_discovery_row_visibility(row: dict[str, Any]) -> dict[str, Any]:
             evidence = row.get("evidence")
             if isinstance(evidence, dict):
                 evidence["provider_badges"] = unverified_badges
-        if row.get("english_dub_evidence") in (None, "", "unknown"):
-            row["english_dub_evidence"] = "unknown/unverified"
-        elif row.get("english_dub_evidence") == "present":
-            row["english_dub_evidence"] = "present (unverified)"
     return row
 
 
-def _dub_status(value: Any) -> str:
-    if isinstance(value, bool):
-        return "present" if value else "none"
-    normalized = str(value or "").strip().lower()
-    if normalized in {"present", "yes", "true", "english dub", "dubbed"}:
-        return "present"
-    if normalized in {"none", "no", "false", "subonly", "sub only"}:
-        return "none"
-    return "unknown"
+def _row_audio_locales(context: dict[str, Any], eligibility_details: list[dict[str, Any]]) -> list[str]:
+    """Audio languages for a row: the context's list (provider languages for
+    discovery, the watched version for provider progress), else the evidence's."""
+    raw = context.get("audio_locales")
+    lists = [raw] if isinstance(raw, list) else [item.get("audio_locales") for item in eligibility_details]
+    return sorted({str(value) for values in lists if isinstance(values, list) for value in values if isinstance(value, str) and value.strip()})
 
 
 def _review_needed(context: dict[str, Any]) -> bool:
@@ -508,20 +499,6 @@ def _review_needed(context: dict[str, Any]) -> bool:
 def _truthy_provider(providers: Iterable[str], name: str) -> str:
     normalized = {value.strip().lower() for value in providers if isinstance(value, str)}
     return "yes" if name.lower() in normalized else ""
-
-
-def _english_dub_status(item: Recommendation) -> str:
-    raw = item.context.get("english_dub")
-    signal = item.context.get("english_dub_signal")
-    if isinstance(raw, bool):
-        return "yes" if raw else ""
-    normalized_signal = str(signal).strip().lower()
-    if normalized_signal in {"present", "yes", "true", "english dub"}:
-        return "yes"
-    if normalized_signal == "unknown":
-        return "unknown"
-    haystack = " ".join(value for value in (item.title, item.season_title or "") if value)
-    return "yes" if "english dub" in haystack.lower() or "(dub)" in haystack.lower() else ""
 
 
 def _availability_details(context: dict[str, Any]) -> dict[str, str]:
@@ -721,7 +698,6 @@ def _row(item: Recommendation) -> dict[str, Any]:
             "availability_providers": context.get("available_via_providers") if isinstance(context.get("available_via_providers"), list) else [],
         }
     )
-    dub_status = str(snapshot_evidence.get("dub_status") or _dub_status(context.get("english_dub_signal") or context.get("english_dub")))
     row = {
         "title": display_title,
         "score": item.priority,
@@ -729,12 +705,10 @@ def _row(item: Recommendation) -> dict[str, Any]:
         "total_votes": total_votes,
         "crunchyroll": _truthy_provider(providers, "crunchyroll"),
         "hidive": _truthy_provider(providers, "hidive"),
-        "english_dub": _english_dub_status(item),
-        "dub_status": dub_status,
+        "audio_locales": snapshot_evidence["audio_locales"],
         "provider_evidence": "; ".join(str(badge.get("label")) for badge in provider_badges),
         "provider_evidence_html": _provider_evidence_html(provider_badges),
         "provider_badges": provider_badges,
-        "english_dub_evidence": "present" if dub_status == "present" else dub_status,
         "verification": verification_label,
         "evidence_freshness": _format_evidence_freshness(provider_evidence),
         "why_recommended": why_recommended,
@@ -762,8 +736,8 @@ def _row(item: Recommendation) -> dict[str, Any]:
     return _mark_discovery_row_visibility(row)
 
 
-# Presentation-only columns. Provider proof is rendered beneath the title; dub,
-# provider-progress, and MAL-watch fields remain available in row/JSON evidence.
+# Presentation-only columns. Provider proof is rendered beneath the title; audio
+# languages, provider-progress, and MAL-watch fields remain available in row/JSON evidence.
 _DASHBOARD_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("title", "Title", "text"),
     ("score", "Score", "number"),
@@ -1025,11 +999,11 @@ def _dashboard_mode_banner(*, diagnostic_mode: bool) -> str:
         return (
             '<section class="banner warn"><strong>Diagnostic mode:</strong> '
             'Ranked discovery recommendations are included for operator inspection only. '
-            'Rows without verified current Crunchyroll/HIDIVE availability plus explicit English-dub evidence are not actionable.</section>'
+            'Rows without verified current Crunchyroll/HIDIVE availability are not actionable.</section>'
         )
     return (
         '<section class="banner good"><strong>Watchable now dashboard:</strong> '
-        'Actionable discovery rows require fresh verified Crunchyroll/HIDIVE identity/catalog presence and explicit English-dub evidence. '
+        'Actionable discovery rows require fresh verified Crunchyroll/HIDIVE identity and catalog presence. '
         'Use <code>--include-dormant</code> only for diagnostics.</section>'
     )
 
@@ -1037,7 +1011,7 @@ def _dashboard_mode_banner(*, diagnostic_mode: bool) -> str:
 def _strict_empty_state_html(*, dormant_count: int = 0, pending_review_count: int = 0, stale_count: int = 0) -> str:
     return (
         '<section class="empty-state"><h2>No Watchable now discovery titles</h2>'
-        '<p>Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence.</p>'
+        '<p>Zero titles currently have verified current Crunchyroll/HIDIVE availability.</p>'
         f'<ul><li>Ranked unverified discovery candidates visible in diagnostics: {escape(str(dormant_count))}</li>'
         f'<li>Provider evidence pending review: {escape(str(pending_review_count))}</li>'
         f'<li>Stale or expired provider evidence: {escape(str(stale_count))}</li></ul>'
@@ -1060,14 +1034,14 @@ def render_recommendation_dashboard(items: Iterable[Recommendation], *, title: s
         for index, (meta, section_rows, total_rows) in enumerate(_cap_sections(_static_sections(rows), limit=limit), start=1):
             description = f'<p class="meta">{escape(meta["description"])}</p>' if meta.get("description") else ""
             if meta.get("diagnostic_only") == "true":
-                description += '<p class="warn"><strong>Discovery only:</strong> these rows lack strict actionable provider+dub proof and are not watch-now eligible.</p>'
+                description += '<p class="warn"><strong>Discovery only:</strong> these rows lack strict actionable provider availability proof and are not watch-now eligible.</p>'
             count_label = _section_count_label(len(section_rows), total_rows)
             table_or_empty = (
                 _recommendation_table(
                     section_rows,
                     f"recommendations-{index}",
                     title_label=meta.get("title_label", "Title"),
-                    progress_section=meta.get("kind") in {"new_dubbed_episode", "resume_backlog"},
+                    progress_section=meta.get("kind") in {"new_episode", "resume_backlog"},
                 )
                 if section_rows
                 else '<p class="muted" role="status">No recommendations in this section.</p>'
@@ -1184,7 +1158,6 @@ def recommendation_snapshot_row_base_payload(row: Any, *, collapse_discovery_can
         "scorecard": row.scorecard,
         "context": row.context,
         "availability_providers": row.availability_providers,
-        "dub_signal": row.dub_signal,
         "availability_confidence": row.availability_confidence,
         "availability_confidence_label": _availability_confidence_label(row, context),
     }
@@ -1197,7 +1170,7 @@ def recommendation_snapshot_availability_payload(row: Any, *, evidence: dict[str
         match_kinds = evidence.get("availability_match_kinds", [])
         match_sources = evidence.get("availability_match_sources", [])
         match_confidences = evidence.get("availability_match_confidences", [])
-        dub_status = evidence.get("dub_status", "unknown")
+        audio_locales = evidence.get("audio_locales", [])
         review_needed = evidence.get("review_needed", False)
     else:
         provider_series = context.get("available_provider_series") if isinstance(context.get("available_provider_series"), list) else []
@@ -1207,7 +1180,7 @@ def recommendation_snapshot_availability_payload(row: Any, *, evidence: dict[str
         match_sources = [series.get("mapping_source") for series in provider_series if isinstance(series, dict) and series.get("mapping_source")]
         match_confidences = [series.get("mapping_confidence") for series in provider_series if isinstance(series, dict) and series.get("mapping_confidence") is not None]
         providers = getattr(row, "availability_providers", [])
-        dub_status = _dub_status(getattr(row, "dub_signal", None) or context.get("english_dub_signal") or context.get("english_dub"))
+        audio_locales = _row_audio_locales(context, _availability_evidence_details(context))
         review_needed = _review_needed(context)
     return {
         "providers": providers,
@@ -1216,7 +1189,7 @@ def recommendation_snapshot_availability_payload(row: Any, *, evidence: dict[str
         "match_confidences": match_confidences,
         "confidence": getattr(row, "availability_confidence", None),
         "confidence_label": _availability_confidence_label(row, context),
-        "dub_status": dub_status,
+        "audio_locales": audio_locales,
         "review_needed": review_needed,
     }
 
@@ -1245,7 +1218,7 @@ def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
         maturity_ratings=payload["provider_maturity_ratings"],
     )
     payload["provider_evidence"] = payload["evidence"].get("availability_provider_label", "")
-    payload["english_dub_evidence"] = "present" if payload["evidence"].get("english_dub_present") else payload["evidence"].get("dub_status", "unknown")
+    payload["audio_locales"] = payload["evidence"].get("audio_locales", [])
     payload["verification"] = payload["evidence"].get("verification_label", "")
     payload["evidence_freshness"] = payload["evidence"].get("evidence_freshness_label", "")
     payload["why_recommended"] = payload["evidence"].get("why_recommended", "")
@@ -1478,25 +1451,19 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
     with connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT provider, identity_match_kind, review_status, catalog_status, english_dub_status,
-                   audio_locales_json, fetched_at, expires_at, last_verified_at,
+            SELECT provider, identity_match_kind, review_status, catalog_status,
+                   fetched_at, expires_at, last_verified_at,
                    last_successful_positive_at, invalidated_at
             FROM recommendation_provider_eligibility_evidence
             """
         ).fetchall()
     counts = {"total": len(rows), "strict_current": 0, "pending_review": 0, "stale": 0}
     for row in rows:
-        try:
-            audio_locales = json.loads(row["audio_locales_json"] or "[]")
-        except json.JSONDecodeError:
-            audio_locales = []
         evidence = {
             "provider": row["provider"],
             "identity_match_kind": row["identity_match_kind"],
             "review_status": row["review_status"],
             "catalog_status": row["catalog_status"],
-            "english_dub_status": row["english_dub_status"],
-            "audio_locales": audio_locales if isinstance(audio_locales, list) else [],
             "fetched_at": row["fetched_at"],
             "expires_at": row["expires_at"],
             "last_verified_at": row["last_verified_at"],
@@ -1505,7 +1472,7 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
         }
         if is_strict_provider_eligibility_actionable(evidence):
             counts["strict_current"] += 1
-        if row["review_status"] in {"unknown", "review-needed"} or row["catalog_status"] in {"unknown", "review-needed"} or row["english_dub_status"] in {"unknown", "review-needed"}:
+        if row["review_status"] in {"unknown", "review-needed"} or row["catalog_status"] in {"unknown", "review-needed"}:
             counts["pending_review"] += 1
         reasons = strict_provider_actionability_failure_reasons([evidence])
         expires_at = str(row["expires_at"] or "").strip().replace("Z", "+00:00")
@@ -1520,7 +1487,7 @@ def _eligibility_coverage_counts(db_path: Path) -> dict[str, int]:
                 expired = False
         verification_only_stale = reasons == ["current provider verification stale or missing"]
         last_known_positive = bool(row["last_successful_positive_at"] and not row["invalidated_at"])
-        if row["review_status"] == "stale" or row["catalog_status"] == "stale" or row["english_dub_status"] == "stale" or ((expired or verification_only_stale) and not last_known_positive):
+        if row["review_status"] == "stale" or row["catalog_status"] == "stale" or ((expired or verification_only_stale) and not last_known_positive):
             counts["stale"] += 1
     return counts
 
@@ -1818,7 +1785,7 @@ def _fill_missing_mal_metadata(db_path: Path, rows: list[dict[str, Any]]) -> Non
 _UI_ROW_FIELDS = (
     "kind", "priority", "score", "title", "display_title", "english_title", "mal_anime_id", "provider",
     "provider_series_id", "diagnostic_only", "image_url", "episode_total", "watched_progress", "genres",
-    "provider_badges", "provider_evidence", "availability_providers",
+    "provider_badges", "provider_evidence", "availability_providers", "audio_locales",
 )
 
 
@@ -1835,7 +1802,7 @@ def _ui_why_points(row: dict[str, Any], context: dict[str, Any]) -> list[str]:
 
 # Without a connected provider these are constant placeholders on every row.
 _MAL_ONLY_HIDDEN_ROW_FIELDS = ("diagnostic_only", "provider_evidence", "availability_providers")
-_MAL_ONLY_HIDDEN_SCORE_COMPONENTS = ("availability", "dub_watchable")
+_MAL_ONLY_HIDDEN_SCORE_COMPONENTS = ("availability",)
 
 
 def _ui_recommendation_row(row: dict[str, Any], *, mal_only: bool = False) -> dict[str, Any]:
@@ -1913,7 +1880,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
                     row["force_diagnostic_only"] = True
                     row["actionable"] = False
                     row["diagnostic_only"] = True
-                    row["visibility_label"] = "Discovery only — provider/dub unverified; not actionable"
+                    row["visibility_label"] = "Discovery only — provider availability unverified; not actionable"
                     row["strict_actionability"] = {"eligible": False, "missing": ["not present in latest strict snapshot"]}
                     rows.append(row)
     sections: dict[str, list[dict[str, Any]]] = {}
@@ -1937,7 +1904,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
         "evidence_pending_review_count": eligibility_counts["pending_review"],
         "stale_evidence_count": eligibility_counts["stale"],
         "strict_current_evidence_count": eligibility_counts["strict_current"],
-        "message": "Zero titles currently have verified current Crunchyroll/HIDIVE + English-dub evidence." if strict_actionable_count == 0 else "Strict actionable discovery is populated from verified current provider+dub evidence.",
+        "message": "Zero titles currently have verified current Crunchyroll/HIDIVE availability." if strict_actionable_count == 0 else "Strict actionable discovery is populated from verified current provider availability.",
         "next_diagnostic_command": STRICT_DISCOVERY_DIAGNOSTIC_COMMAND,
     }
     source_providers = _dashboard_source_providers(_dashboard_config(db_path, config))
@@ -1962,7 +1929,7 @@ def _build_dashboard_payload_from_initialized_schema(db_path: Path, *, display_l
     elif strict_actionable_count == 0:
         indicators.append({"level": "warning", "message": coverage_state["message"]})
     if dormant_count and not mal_only:
-        indicators.append({"level": "warning", "message": "Dormant discovery diagnostic rows are present; they are not actionable without strict provider+dub proof."})
+        indicators.append({"level": "warning", "message": "Dormant discovery diagnostic rows are present; they are not actionable without verified provider availability."})
     if not mal_only and diagnostic_source_snapshot is not None and diagnostic_source_snapshot.get("run_id") != latest_run_id:
         if diagnostic_source_snapshot.get("run_id") == "local-diagnostic-current":
             message = "Ranked discovery recommendations are sourced from current local diagnostic scorer output, not persisted diagnostic data or the latest strict snapshot."
@@ -2037,6 +2004,10 @@ _PAGE_CSS = r"""
 .genre-chip{display:inline-flex;align-items:center;gap:.3rem;padding:.12rem .2rem .12rem .6rem;border:1px solid var(--border-strong);border-radius:999px;background:var(--surface-2);font-size:.9rem}
 .genre-chip button{display:inline-grid;place-items:center;width:1.3rem;height:1.3rem;padding:0;border:0;border-radius:50%;color:var(--text);background:var(--surface-3);font:inherit;font-weight:700;line-height:1;cursor:pointer}
 .toggle{display:inline-flex;align-items:center;gap:.4rem;color:var(--muted);cursor:pointer}
+.audio-filter{display:inline-flex;align-items:center;gap:.4rem;color:var(--muted)}
+.audio-filter select{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border-strong);border-radius:.45rem;padding:.32rem .5rem}
+.audio-languages{margin:.35rem 0 0;color:var(--muted);font-size:.8rem}
+.audio-languages .match{color:var(--good);font-weight:700}
 .toggle input{accent-color:var(--accent);width:1rem;height:1rem}
 /* recommendation tables */
 .rec-table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:0 0 1rem}
@@ -2217,7 +2188,11 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) refr
 
 _DASHBOARD_JS = r"""
 const dismissedTitlesKey = ['malupdater', 'dismissedTitles', 'v1'].join('.');
+const audioLanguageKey = ['malupdater', 'audioLanguage', 'v1'].join('.');
 let selectedGenres = [];
+let audioLanguage = '';
+try { audioLanguage = String(localStorage.getItem(audioLanguageKey) || ''); } catch (_) { audioLanguage = ''; }
+function persistAudioLanguage(){ try { if (audioLanguage) localStorage.setItem(audioLanguageKey, audioLanguage); else localStorage.removeItem(audioLanguageKey); } catch (_) {} }
 let genreMenuOpen = false;
 let showHiddenTitles = false;
 let titleQuery = '';
@@ -2244,8 +2219,8 @@ const MAL_SCORE_RE = /^MAL (\d+(?:\.\d+)?)$/;
 const REASON_REWRITES = [
   [/^recommended from (\d+) watched seed title\(s\)$/i, m => `Recommended by ${plural(m[1], 'title')} you watched`],
   [/^(\d+) MAL recommendation vote\(s\)$/i, m => plural(m[1], 'MAL recommendation vote')],
-  [/^watchable dubbed as (.+) on ([^;]+)$/i, m => `English dub on ${m[2]} as “${m[1]}”`],
-  [/^watchable (?:dubbed )?on ([^;]+)$/i, m => `Watchable on ${m[1]}`],
+  [/^watchable as (.+) on ([^;]+)$/i, m => `Watchable on ${m[2]} as “${m[1]}”`],
+  [/^watchable on ([^;]+)$/i, m => `Watchable on ${m[1]}`],
   [/^(\d+) contiguous episode\(s\) appear beyond your completed tail progress$/i, m => `${plural(m[1], 'more episode')} after where you stopped`],
   [/^this looks more like a backlog continuation than a fresh release alert$/i, () => null],
   [/^most recent watch activity: (.+)$/i, m => { const date = parseTime(m[1]); return date ? `Last watched ${dateFormat.format(date)}` : `Last watched ${m[1]}`; }],
@@ -2292,6 +2267,34 @@ function coverCell(r){
   const cover = `<span class="cover${image ? '' : ' cover-missing'}">${image}</span>`;
   return r.mal_anime_id ? `<a class="cover-link" href="${esc(malUrl(r.mal_anime_id))}" target="_blank" rel="noopener noreferrer" tabindex="-1" aria-hidden="true">${cover}</a>` : cover;
 }
+// Audio languages as the providers report them (BCP 47, e.g. ja-JP, es-419).
+let languageNames = null;
+try { languageNames = new Intl.DisplayNames(undefined, {type: 'language'}); } catch (_) { languageNames = null; }
+const baseLanguage = locale => String(locale).split('-')[0].toLowerCase();
+const rowLanguages = r => Array.isArray(r.audio_locales) ? r.audio_locales.filter(value => typeof value === 'string' && value.trim()) : [];
+function displayLanguage(locale, ambiguousBases){
+  let name = null;
+  try { name = languageNames?.of(ambiguousBases?.has(baseLanguage(locale)) ? locale : baseLanguage(locale)); } catch (_) { name = null; }
+  return name || locale;
+}
+function dashboardLanguages(data){
+  const locales = new Set(Object.values(data.recommendations?.sections || {}).flat().flatMap(rowLanguages));
+  if (audioLanguage) locales.add(audioLanguage);
+  const variants = new Map();
+  for (const locale of locales) variants.set(baseLanguage(locale), (variants.get(baseLanguage(locale)) || 0) + 1);
+  const ambiguous = new Set([...variants].filter(([, count]) => count > 1).map(([base]) => base));
+  return [...locales].map(locale => [locale, displayLanguage(locale, ambiguous)]).sort((a, b) => a[1].localeCompare(b[1]));
+}
+let languageLabels = new Map();
+const languageLabel = locale => languageLabels.get(locale) || displayLanguage(locale);
+function audioLine(r){
+  const languages = rowLanguages(r);
+  if (!languages.length) return audioLanguage && r.kind !== 'mal_sequel' && !latestDashboardData?.recommendations?.coverage_state?.mal_only ? '<div class="audio-languages">Audio not checked</div>' : '';
+  const label = r.kind === 'new_episode' || r.kind === 'resume_backlog' ? 'You watch in' : 'Audio';
+  const names = languages.map(locale => [locale, languageLabel(locale)]).sort((a, b) => a[1].localeCompare(b[1]))
+    .map(([locale, name]) => locale === audioLanguage ? `<span class="match">${esc(name)}</span>` : esc(name));
+  return `<div class="audio-languages">${label}: ${names.join(' · ')}</div>`;
+}
 function titleCell(r, extraMeta, progressSection){
   const rawTitle = r.display_title || r.english_title || r.title || 'Untitled';
   const name = r.mal_anime_id ? externalLink(malUrl(r.mal_anime_id), esc(rawTitle), 'title-link') : `<span class="title-link">${esc(rawTitle)}</span>`;
@@ -2301,9 +2304,9 @@ function titleCell(r, extraMeta, progressSection){
   meta.push(...extraMeta);
   const label = r.diagnostic_only ? '<span class="diagnostic-label">Discovery only · unverified</span>' : '';
   const providers = latestDashboardData?.recommendations?.coverage_state?.mal_only || r.kind === 'mal_sequel' ? '' : `<div class="providers" aria-label="Where to watch">${providerBadges(r)}</div>`;
-  return `${label}${name}${meta.length ? `<div class="title-meta">${esc(meta.join(' · '))}</div>` : ''}${providers}`;
+  return `${label}${name}${meta.length ? `<div class="title-meta">${esc(meta.join(' · '))}</div>` : ''}${providers}${audioLine(r)}`;
 }
-const SCORE_PARTS = [['consensus', 'Consensus'], ['affinity', 'Affinity'], ['quality', 'Quality'], ['availability', 'Availability'], ['dub_watchable', 'English dub'], ['confidence', 'Confidence']];
+const SCORE_PARTS = [['consensus', 'Consensus'], ['affinity', 'Affinity'], ['quality', 'Quality'], ['availability', 'Availability'], ['confidence', 'Confidence']];
 function scoreCell(r){
   const total = Number(r.score_total);
   const parts = r.score_components || {};
@@ -2355,7 +2358,7 @@ function recRow(r, progressSection, sequelSection = false){
   return `<tr${classes ? ` class="${classes}"` : ''} data-recommendation-id="${esc(identity)}">${cells.join('')}</tr>`;
 }
 function recTable(rows, meta){
-  const progressSection = meta.kind === 'new_dubbed_episode' || meta.kind === 'resume_backlog';
+  const progressSection = meta.kind === 'new_episode' || meta.kind === 'resume_backlog';
   const sequelSection = meta.kind === 'mal_sequel';
   const columns = progressSection
     ? [['rank', 'Priority'], ['cover', '<span class="sr-only">Cover</span>'], ['title', 'Title'], ['progress', 'Progress'], ['why', 'Why recommended'], ['genres', 'Genres'], ['actions', '<span class="sr-only">Visibility</span>']]
@@ -2371,6 +2374,8 @@ function visibleRows(rows){
   const query = titleQuery.trim().toLowerCase();
   return rows.filter(r => {
     if (selectedGenres.length && !(Array.isArray(r.genres) && selectedGenres.every(genre => r.genres.includes(genre)))) return false;
+    // Titles whose audio languages were not reported stay visible (labelled "Audio not checked").
+    if (audioLanguage && rowLanguages(r).length && !rowLanguages(r).includes(audioLanguage)) return false;
     if (!showHiddenTitles && hiddenTitles.has(recommendationIdentity(r))) return false;
     if (query && ![r.display_title, r.english_title, r.title].some(value => String(value || '').toLowerCase().includes(query))) return false;
     return true;
@@ -2387,7 +2392,7 @@ function sectionsHtml(data){
     const shown = visibleRows(rows);
     const countLabel = shown.length === rows.length ? `${rows.length}` : `${shown.length} of ${rows.length}`;
     const description = meta.description ? `<p class="section-description">${esc(meta.description)}</p>` : '';
-    const diagnostic = meta.diagnostic_only === 'true' ? '<p class="alert"><strong>Discovery only:</strong> these titles lack verified provider and English-dub proof, so they are not watchable-now recommendations.</p>' : '';
+    const diagnostic = meta.diagnostic_only === 'true' ? '<p class="alert"><strong>Discovery only:</strong> these titles lack verified provider availability, so they are not watchable-now recommendations.</p>' : '';
     const body = shown.length ? recTable(shown, meta) : '<p class="muted" role="status">No recommendations match the current filters in this section.</p>';
     return `<section aria-labelledby="section-${esc(name)}"><h3 class="section-title" id="section-${esc(name)}">${esc(meta.label || name)} <span class="count">${esc(countLabel)}</span></h3>${description}${diagnostic}${body}</section>`;
   }).join('');
@@ -2398,6 +2403,12 @@ function genreControlsHtml(data){
   const options = availableGenres.map(genre => `<button type="button" role="menuitem" class="genre-option" data-genre="${esc(genre)}">${esc(genre)}</button>`).join('') || '<span class="muted" role="status">All available genres are selected.</span>';
   const menu = genreMenuOpen ? `<div id="genre-menu" class="genre-menu" role="menu" aria-label="Available genres">${options}</div>` : '';
   return `<button type="button" id="genre-menu-trigger" class="button genre-menu-trigger" aria-haspopup="menu" aria-controls="genre-menu" aria-expanded="${genreMenuOpen}">Add genre filter</button>${menu}`;
+}
+function audioControlHtml(data){
+  const languages = dashboardLanguages(data);
+  languageLabels = new Map(languages);
+  const options = [['', 'Any language'], ...languages].map(([value, name]) => `<option value="${esc(value)}"${value === audioLanguage ? ' selected' : ''}>${esc(name)}</option>`).join('');
+  return `<span>Audio</span><select id="audio-language" aria-label="Audio language">${options}</select>`;
 }
 const chipsHtml = () => selectedGenres.map(genre => `<span class="genre-chip"><span>${esc(genre)}</span><button type="button" class="genre-remove" data-genre="${esc(genre)}" aria-label="${esc(`Remove ${genre} genre filter`)}">×</button></span>`).join('');
 function genreAffinitySection(model){
@@ -2425,7 +2436,7 @@ function alertsHtml(data){
   if (errors.length) html += `<section class="alert bad" role="alert" aria-labelledby="dashboard-failures"><h2 id="dashboard-failures" class="bad">Needs attention</h2><ul>${errors.map(message => `<li>${esc(message)}</li>`).join('')}</ul></section>`;
   if (failedHarvests > 0) html += `<section class="alert"><p><strong>${esc(plural(failedHarvests, 'MAL recommendation source'))} failed to harvest.</strong> They are retried automatically; see <a href="${esc(DEBUG_HREF)}">Debug</a> for details.</p></section>`;
   if (data.recommendations?.coverage_state?.mal_only) html += `<section class="alert info"><p><strong>MAL-only mode.</strong> ${esc(data.recommendations.coverage_state.message)} ${SETTINGS_HREF ? `Connect an account in <a href="${esc(SETTINGS_HREF)}">Settings</a> to see what you can watch now.` : ''}</p></section>`;
-  else if (data.recommendations?.mode === 'diagnostic_snapshot') html += '<section class="alert"><p><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown or unverified provider and dub evidence; only Watchable now is actionable.</p></section>';
+  else if (data.recommendations?.mode === 'diagnostic_snapshot') html += '<section class="alert"><p><strong>Discovery visibility enabled:</strong> ranked recommendations may be shown with unknown or unverified provider availability; only Watchable now is actionable.</p></section>';
   return html;
 }
 function emptyState(state){
@@ -2436,16 +2447,17 @@ function renderControls(){
   const data = latestDashboardData;
   document.getElementById('genre-filter').innerHTML = genreControlsHtml(data);
   document.getElementById('genre-chips').innerHTML = chipsHtml();
+  document.getElementById('audio-filter').innerHTML = audioControlHtml(data);
   const hiddenCount = Object.values(data.recommendations?.sections || {}).flat().filter(r => hiddenTitles.has(recommendationIdentity(r))).length;
   document.getElementById('hidden-count').textContent = hiddenCount ? ` (${hiddenCount})` : '';
-  document.getElementById('clear-filters').hidden = !(selectedGenres.length || titleQuery);
+  document.getElementById('clear-filters').hidden = !(selectedGenres.length || titleQuery || audioLanguage);
 }
 function renderSections(){ document.getElementById('sections').innerHTML = sectionsHtml(latestDashboardData); }
 function renderPage(data){
   latestDashboardData = data;
   const app = document.getElementById('app');
   if (!document.getElementById('sections')) {
-    app.innerHTML = `<div id="alerts"></div><div id="empty"></div><div id="affinity"></div><section aria-labelledby="recommendations-title"><h2 id="recommendations-title" class="section-title">Recommendations</h2><div class="toolbar"><label class="search"><span class="sr-only">Search titles</span><input id="title-search" type="search" placeholder="Search titles" autocomplete="off"></label><div class="genre-filter" id="genre-filter" data-genre-control></div><div class="genre-chips" id="genre-chips" aria-label="Selected genre filters"></div><label class="toggle"><input id="show-hidden-titles" type="checkbox"> Show hidden titles<span id="hidden-count"></span></label><button type="button" id="clear-filters" class="button small" hidden>Clear filters</button></div><div id="sections"></div></section><p class="page-foot screen-only">Raw data: <a href="/api/dashboard">dashboard JSON</a></p>`;
+    app.innerHTML = `<div id="alerts"></div><div id="empty"></div><div id="affinity"></div><section aria-labelledby="recommendations-title"><h2 id="recommendations-title" class="section-title">Recommendations</h2><div class="toolbar"><label class="search"><span class="sr-only">Search titles</span><input id="title-search" type="search" placeholder="Search titles" autocomplete="off"></label><div class="genre-filter" id="genre-filter" data-genre-control></div><div class="genre-chips" id="genre-chips" aria-label="Selected genre filters"></div><label class="audio-filter" id="audio-filter"></label><label class="toggle"><input id="show-hidden-titles" type="checkbox"> Show hidden titles<span id="hidden-count"></span></label><button type="button" id="clear-filters" class="button small" hidden>Clear filters</button></div><div id="sections"></div></section><p class="page-foot screen-only">Raw data: <a href="/api/dashboard">dashboard JSON</a></p>`;
     bindDashboardEvents();
   }
   document.getElementById('alerts').innerHTML = alertsHtml(data);
@@ -2463,7 +2475,7 @@ function bindDashboardEvents(){
     if (target.id === 'genre-menu-trigger') { genreMenuOpen = !genreMenuOpen; renderControls(); (genreMenuOpen ? document.querySelector('.genre-option') : document.getElementById('genre-menu-trigger'))?.focus(); return; }
     if (target.classList.contains('genre-option')) { const genre = target.dataset.genre; if (genre && !selectedGenres.includes(genre)) selectedGenres = [...selectedGenres, genre]; genreMenuOpen = false; renderControls(); renderSections(); document.getElementById('genre-menu-trigger')?.focus(); return; }
     if (target.classList.contains('genre-remove')) { selectedGenres = selectedGenres.filter(genre => genre !== target.dataset.genre); renderControls(); renderSections(); document.getElementById('genre-menu-trigger')?.focus(); return; }
-    if (target.id === 'clear-filters') { selectedGenres = []; titleQuery = ''; document.getElementById('title-search').value = ''; renderControls(); renderSections(); document.getElementById('title-search').focus(); return; }
+    if (target.id === 'clear-filters') { selectedGenres = []; titleQuery = ''; audioLanguage = ''; persistAudioLanguage(); document.getElementById('title-search').value = ''; renderControls(); renderSections(); document.getElementById('title-search').focus(); return; }
     if (target.classList.contains('row-visibility-button')) {
       const identity = target.dataset.recommendationId;
       if (!identity) return;
@@ -2475,6 +2487,7 @@ function bindDashboardEvents(){
   });
   document.getElementById('title-search').addEventListener('input', event => { titleQuery = event.target.value; renderControls(); renderSections(); });
   document.getElementById('show-hidden-titles').addEventListener('change', event => { showHiddenTitles = event.target.checked; renderSections(); });
+  app.addEventListener('change', event => { if (event.target.id !== 'audio-language') return; audioLanguage = event.target.value; persistAudioLanguage(); renderControls(); renderSections(); document.getElementById('audio-language')?.focus(); });
   app.addEventListener('keydown', event => {
     if (!genreMenuOpen || !event.target.classList?.contains('genre-option') || !['ArrowDown', 'ArrowUp'].includes(event.key)) return;
     const options = [...document.querySelectorAll('.genre-option')];
@@ -2493,7 +2506,7 @@ function updateExportMetadata(){
   const timestamp = document.getElementById('export-timestamp');
   if (timestamp) timestamp.textContent = timeFormat.format(new Date());
   const summary = document.getElementById('export-filter-summary');
-  if (summary) summary.textContent = [selectedGenres.length ? `Genres: ${selectedGenres.join(', ')}` : 'All genres', titleQuery ? `Search: “${titleQuery}”` : '', `Hidden titles ${showHiddenTitles ? 'shown' : 'excluded'}`].filter(Boolean).join(' · ');
+  if (summary) summary.textContent = [selectedGenres.length ? `Genres: ${selectedGenres.join(', ')}` : 'All genres', audioLanguage ? `Audio: ${languageLabel(audioLanguage)}` : 'Any audio language', titleQuery ? `Search: “${titleQuery}”` : '', `Hidden titles ${showHiddenTitles ? 'shown' : 'excluded'}`].filter(Boolean).join(' · ');
 }
 document.getElementById('export-pdf')?.addEventListener('click', () => { closeGenreMenu(false); document.querySelectorAll('details.more').forEach(details => { details.open = true; }); updateExportMetadata(); window.print(); });
 window.addEventListener('beforeprint', updateExportMetadata);

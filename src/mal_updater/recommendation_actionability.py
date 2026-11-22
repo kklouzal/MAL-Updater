@@ -25,33 +25,14 @@ STRICT_PROVIDER_IDENTITY_MATCH_KINDS = frozenset(
     }
 )
 
-_NO_PROVIDER_EVIDENCE_REASONS = (
-    "provider availability unverified",
-    "English-dub evidence unknown",
-)
-_GENERIC_INCOMPLETE_REASON = "strict provider+dub proof incomplete"
+_NO_PROVIDER_EVIDENCE_REASONS = ("provider availability unverified",)
+_GENERIC_INCOMPLETE_REASON = "strict provider availability proof incomplete"
 
 
 @dataclass(frozen=True, slots=True)
 class StrictProviderActionability:
     eligible: bool
     missing: tuple[str, ...] = ()
-
-
-def normalize_audio_locale(value: Any) -> str | None:
-    text = str(value or "").strip().lower().replace("_", "-")
-    if not text:
-        return None
-    return text
-
-
-def audio_locale_is_english(value: Any) -> bool:
-    locale = normalize_audio_locale(value)
-    return bool(locale == "en" or (locale is not None and locale.startswith("en-")))
-
-
-def provider_audio_locales_have_english(locales: Iterable[Any] | None) -> bool:
-    return any(audio_locale_is_english(value) for value in locales or ())
 
 
 def _value(source: Any, key: str, default: Any = None) -> Any:
@@ -130,14 +111,6 @@ def strict_provider_eligibility_actionability(evidence: Any, *, now: Any = None)
     if _normalized_text(_value(evidence, "catalog_status")) != "present":
         missing.append("current provider catalog presence unverified")
 
-    if _normalized_text(_value(evidence, "english_dub_status")) != "present":
-        missing.append("English-dub evidence unknown")
-
-    raw_locales = _value(evidence, "audio_locales")
-    locales = raw_locales if isinstance(raw_locales, Iterable) and not isinstance(raw_locales, (str, bytes, dict)) else ()
-    if not provider_audio_locales_have_english(locales):
-        missing.append("English audio-locales missing/unverified")
-
     if not _has_non_stale_last_verified_at(evidence, now=current):
         missing.append("current provider verification stale or missing")
 
@@ -161,8 +134,6 @@ def strict_provider_last_verified_at_for_persistence(evidence: Any, *, verified_
                 "identity_match_kind",
                 "review_status",
                 "catalog_status",
-                "english_dub_status",
-                "audio_locales",
                 "expires_at",
                 "fresh",
                 "expired",

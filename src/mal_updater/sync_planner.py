@@ -108,6 +108,9 @@ class ProviderSeriesState:
     numbering_hint: str | None = None
     completed_episode_numbers: tuple[int, ...] = ()
     ordinal_completed_episode_numbers: tuple[int, ...] | None = None
+    # Audio languages of the episodes the user played (Crunchyroll reports one
+    # per episode; HIDIVE does not), i.e. the version they follow.
+    watched_audio_locales: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -130,6 +133,7 @@ class EpisodeProgressState:
     episode_label: str | None = None
     fully_watched: bool | None = None
     season_episode_ordinal: int | None = None
+    audio_locale: str | None = None
 
 
 @dataclass(slots=True)
@@ -302,7 +306,8 @@ def load_provider_series_states(
             season_title,
             episode_label,
             fully_watched,
-            season_episode_ordinal
+            season_episode_ordinal,
+            audio_locale
         FROM provider_episode_progress
         WHERE 1=1
     """
@@ -381,6 +386,7 @@ def load_provider_series_states(
                 episode_label=row["episode_label"],
                 fully_watched=None if row["fully_watched"] is None else bool(row["fully_watched"]),
                 season_episode_ordinal=None if is_special else row["season_episode_ordinal"],
+                audio_locale=row["audio_locale"],
             )
         )
 
@@ -490,6 +496,7 @@ def load_provider_series_states(
                         ordinal_min_episode_number=ordinal_summary["min_episode_number"] if ordinal_summary else None,
                         completed_episode_numbers=summary["completed_episode_numbers"],
                         ordinal_completed_episode_numbers=ordinal_summary["completed_episode_numbers"] if ordinal_summary else None,
+                        watched_audio_locales=tuple(sorted({progress.audio_locale for progress in unit_progress if progress.audio_locale})),
                     ),
                 )
             )

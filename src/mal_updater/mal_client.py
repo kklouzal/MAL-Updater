@@ -192,7 +192,7 @@ _ANIME_SEARCH_NOISE_PATTERNS = (
     # MAL rejects as noisy/invalid search text. Keep this suffix-oriented and
     # bracket-scoped so title words are not stripped in the middle of a query.
     re.compile(r"[\[(]\s*[^\])()]{0,80}\b(?:dub|sub)\s*[\])]", re.IGNORECASE),
-    re.compile(r"\b(?:english|french|spanish|german|portuguese|castilian|latin\s+american\s+spanish)\s+(?:dub|sub)\b", re.IGNORECASE),
+    re.compile(r"\b(?:english|french|spanish|castilian|latin\s+american\s+spanish|german|portuguese|italian|russian|arabic|hindi|tamil|telugu|korean)\s+(?:dub|sub)\b", re.IGNORECASE),
 )
 
 

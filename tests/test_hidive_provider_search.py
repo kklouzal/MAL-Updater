@@ -69,6 +69,24 @@ class HidiveProviderSearchTests(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual(results[0].audio_locales, ["ja-JP"])
 
+    def test_non_english_audio_tags_map_to_language_codes(self) -> None:
+        payload = {
+            "hits": [
+                {
+                    "objectID": "VOD_SERIES_102",
+                    "type": "VOD_SERIES",
+                    "title": "Multilingual Show",
+                    "tags": ["Audio|Japanese", "Audio|Spanish", "AUDIO|portuguese", "Audio|Korean", "Audio|Klingon", "SUBTITLES|French"],
+                }
+            ]
+        }
+
+        results = hidive._normalize_algolia_hits(payload, limit=10)
+
+        self.assertEqual(1, len(results))
+        # Unrecognized languages are dropped rather than guessed; subtitles are not audio.
+        self.assertEqual(["ja-JP", "es", "pt", "ko"], results[0].audio_locales)
+
     def test_malformed_tags_do_not_create_audio_locales(self) -> None:
         payload = {"hits": [{"objectID": "VOD_SERIES_101", "type": "VOD_SERIES", "title": "Malformed", "tags": "AUDIO|English"}]}
 

@@ -77,10 +77,10 @@ The real local dataset showed that a blind `0.90` ratio threshold was too hand-w
 
 ### Highest priority alerts
 1. New season released for an anime the user has completed.
-2. New dubbed episode released for an in-progress anime the user is currently following.
+2. New episode released for an in-progress anime the user is currently following.
 
-### Hard recommendation filter
-- Do not recommend anime or new episodes that lack English dubs.
+### Hard recommendation filter (superseded 2026-11-22)
+- ~~Do not recommend anime or new episodes that lack English dubs.~~ Replaced by language-neutral recommendations; see *2026-11-22 - Language-neutral recommendations*.
 
 ## 2026-03-14 / 2026-03-20 - Repo posture
 
@@ -850,3 +850,18 @@ When an unattended provider fetch is due for `full_refresh` because of cadence o
 - a heavy overdue full refresh should not starve the entire fetch lane when a cheaper incremental pass would still keep fresh progress/watchlist data moving
 - fetch-mode-specific projected-cost defaults are only truly useful if the daemon can act differently on them instead of turning every overdue full refresh into repeated no-op skips
 - preserving the overdue full-refresh anchor/reason keeps the behavior conservative and explainable instead of silently forgetting that a broader resweep is still needed
+
+## 2026-11-22 - Language-neutral recommendations
+
+### Decision
+Recommendations do not prefer any audio language. Users filter by audio language in the dashboard.
+
+### Rules
+- Provider eligibility (Watchable now) needs a verified identity, current catalog presence and a current verification; audio languages are recorded (`audio_locales`) but never gate eligibility or ranking.
+- New-episode, new-season and backlog recommendations follow the version the user watches: their episodes come from the user's own provider progress, whatever its language. `context.audio_locales` is the watched audio for these kinds and the provider-reported audio for discovery.
+- Title markers such as "(English Dub)" or "(Spanish Dub)" name an audio version: they are stripped for title matching and never read as language evidence.
+- The dashboard's Audio filter hides titles whose reported languages exclude the chosen one; titles with no reported languages stay visible and say so.
+
+### Why
+The English-dub rule was the original owner's preference. A wide audience watches subtitled and other-language dubs; with the rule, a sub-only viewer received no new-episode, new-season or Watchable now recommendations at all.
+

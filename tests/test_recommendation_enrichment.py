@@ -181,7 +181,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         mal_id: int,
         provider_series_id: str,
         title: str,
-        english_dub_status: str,
         audio_locales: list[str],
         identity_match_kind: str = "provider_title_search",
         review_status: str = "review-needed",
@@ -200,8 +199,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             match_confidence=0.42,
             review_status=review_status,
             catalog_status="present",
-            english_dub_status=english_dub_status,
-            explicit_dub_evidence_source="provider_audio_locale" if english_dub_status == "present" else None,
             audio_locales=list(audio_locales),
             source_evidence=source_evidence or {"source": "legacy_provider_eligibility_test"},
             fetched_at="2026-07-01T00:00:00Z",
@@ -316,8 +313,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
 
     def _review_entry(self, *, decision="strong_provider_search_candidate_no_auto_link", query="Merge Show", audio_locales=None, **match_overrides):
         match = self._provider_match(audio_locales=audio_locales, **match_overrides)
-        status = enrichment._english_dub_status_from_match("crunchyroll", match)
-        source = enrichment._explicit_dub_evidence_source("crunchyroll", match)
         return {
             "provider": "crunchyroll",
             "provider_series_id": match["provider_series_id"],
@@ -328,9 +323,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
                 "query": query,
                 "match": match,
                 "decision": decision,
-                "english_dub_status": status,
                 "audio_locales": list(audio_locales or []),
-                "explicit_dub_evidence_source": source,
             },
         }
 
@@ -688,7 +681,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             identity_match_kind="provider_title_search_exact",
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
             audio_locales=["en-US"],
             fetched_at="2026-02-01T00:00:00Z",
             expires_at="2026-02-08T00:00:00Z",
@@ -742,7 +734,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config.db_path, mal_anime_id=920, provider="crunchyroll",
             provider_series_id="old", fetched_at="2026-01-01T00:00:00Z",
             expires_at="2026-01-02T00:00:00Z", identity_match_kind="provider_title_search_exact",
-            review_status="verified", catalog_status="absent", english_dub_status="absent",
+            review_status="verified", catalog_status="absent",
             logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
         )
         provider = FakeProvider([])
@@ -763,7 +755,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             self.config.db_path, mal_anime_id=922, provider="crunchyroll",
             provider_series_id="due", fetched_at="2026-01-01T00:00:00Z",
             expires_at="2026-01-08T00:00:00Z", identity_match_kind="provider_title_search_exact",
-            review_status="verified", catalog_status="present", english_dub_status="present",
+            review_status="verified", catalog_status="present",
             audio_locales=["en-US"], last_verified_at="2026-01-01T00:00:00Z",
             refresh_due_at="2026-02-01T00:00:00Z",
             logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
@@ -885,7 +877,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             identity_match_kind="provider_title_search_exact",
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
             audio_locales=["en-US"],
             fetched_at="2026-01-01T00:00:00Z",
             expires_at="2026-01-08T00:00:00Z",
@@ -999,7 +990,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             mal_id=mal_id,
             provider_series_id=provider_series_id,
             title=title,
-            english_dub_status="present",
             audio_locales=["en-US", "ja-JP"],
             source_evidence={
                 "source": "legacy_provider_eligibility_test",
@@ -1029,55 +1019,12 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual(mapping.confidence, evidence.match_confidence)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual(["en-US", "ja-JP"], evidence.audio_locales)
         self.assertEqual(original.source_evidence, evidence.source_evidence)
         self.assertEqual(original.fetched_at, evidence.fetched_at)
         self.assertEqual(original.expires_at, evidence.expires_at)
         self.assertIsNone(evidence.last_verified_at)
         self.assertEqual(enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION, evidence.logic_version)
-
-    def test_legacy_same_target_explicit_dub_absent_reconciles_verified_but_non_actionable(self):
-        mal_id = 931
-        provider_series_id = "cr-legacy-single-absent"
-        title = "Legacy Single Absent"
-        self._prepare_approved_exact_provider_mapping(
-            mal_id=mal_id,
-            provider_series_id=provider_series_id,
-            title=title,
-            provider_raw={"episode_count": 12, "season_count": 1},
-            target_episode_count=12,
-        )
-        self._insert_legacy_provider_eligibility(
-            mal_id=mal_id,
-            provider_series_id=provider_series_id,
-            title=title,
-            english_dub_status="absent",
-            audio_locales=["ja-JP"],
-        )
-        self._recommendations()
-
-        summary = enrichment.enrich_discovery_provider_availability(
-            self.config,
-            providers=[],
-            now=datetime(2026, 7, 2, tzinfo=timezone.utc),
-        )
-
-        evidence = get_recommendation_provider_eligibility_evidence(
-            self.config.db_path,
-            mal_anime_id=mal_id,
-            provider="crunchyroll",
-            provider_series_id=provider_series_id,
-        )
-        self.assertEqual(1, summary.legacy_eligibility_rows_reconciled)
-        self.assertIsNotNone(evidence)
-        assert evidence is not None
-        self.assertEqual("approved_mapping", evidence.identity_match_kind)
-        self.assertEqual("verified", evidence.review_status)
-        self.assertEqual("absent", evidence.english_dub_status)
-        self.assertEqual(["ja-JP"], evidence.audio_locales)
-        self.assertIsNone(evidence.last_verified_at)
-        self.assertFalse(is_strict_provider_eligibility_actionable(evidence, now="2026-07-02T00:00:00Z"))
 
     def test_legacy_wrong_target_mapping_deletes_without_retargeting(self):
         stale_mal_id = 932
@@ -1096,7 +1043,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             mal_id=stale_mal_id,
             provider_series_id=provider_series_id,
             title=title,
-            english_dub_status="present",
             audio_locales=["en-US"],
         )
         self._recommendations()
@@ -1141,7 +1087,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             mal_id=mal_id,
             provider_series_id=provider_series_id,
             title=title,
-            english_dub_status="present",
             audio_locales=["en-US"],
             source_evidence={"source": "legacy_provider_eligibility_test", "match": {"provider_series_id": provider_series_id, "title": title, "raw": provider_raw}},
         )
@@ -1195,8 +1140,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             match_confidence=0.88,
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
-            explicit_dub_evidence_source="provider_audio_locale",
             audio_locales=["en-US", "ja-JP"],
             source_evidence=source_evidence,
             fetched_at="2026-07-01T00:00:00Z",
@@ -1251,8 +1194,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             match_confidence=0.99,
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
-            explicit_dub_evidence_source="provider_audio_locale",
             audio_locales=["en-US", "ja-JP"],
             source_evidence={"source": "current_approved_mapping_regression", "raw": provider_raw},
             fetched_at="2026-07-01T00:00:00Z",
@@ -1307,8 +1248,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             match_confidence=0.9,
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
-            explicit_dub_evidence_source="provider_audio_locale",
             audio_locales=["en-US"],
             source_evidence={"source": "current_detail_logic_regression"},
             fetched_at="2026-07-01T00:00:00Z",
@@ -1365,7 +1304,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             mal_id=mal_id,
             provider_series_id=provider_series_id,
             title=title,
-            english_dub_status="present",
             audio_locales=["en-US"],
             review_status="unknown",
             logic_version=enrichment.PROVIDER_ELIGIBILITY_LOGIC_VERSION,
@@ -1415,8 +1353,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             match_confidence=0.99,
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
-            explicit_dub_evidence_source="provider_audio_locale",
             audio_locales=["en-US"],
             source_evidence={"source": "wrong_target_current_verified_regression"},
             fetched_at="2026-07-01T00:00:00Z",
@@ -1457,7 +1393,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             mal_id=outside_mal_id,
             provider_series_id=provider_series_id,
             title=title,
-            english_dub_status="present",
             audio_locales=["en-US"],
         )
         self._insert_meta(inside_mal_id, english="Only Ranked Candidate")
@@ -1486,7 +1421,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("approved_mapping", evidence.identity_match_kind)
         self.assertEqual("verified", evidence.review_status)
 
-    def test_strong_exact_match_with_english_audio_coalesces_discovery_review_evidence(self):
+    def test_strong_exact_match_with_reported_audio_coalesces_discovery_review_evidence(self):
         self._insert_meta(202, english="Delicious in Dungeon")
         self._recommendations(202)
         provider = FakeProvider([
@@ -1525,9 +1460,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("present", evidence.english_dub_status)
-        self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
-        self.assertIn("en-US", evidence.audio_locales)
+        self.assertEqual(["en-US"], evidence.audio_locales)
         self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
         self.assertIsNone(get_series_mapping(self.config.db_path, "crunchyroll", "cr-dungeon"))
 
@@ -1574,7 +1507,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(1, len(review_entries))
         self.assertEqual("strong_provider_search_candidate_no_auto_link", review_entries[0]["payload"]["decision"])
 
-    def test_title_only_english_dub_marker_does_not_create_dub_evidence(self):
+    def test_title_only_dub_marker_is_not_audio_language_evidence(self):
         self._insert_meta(212, english="Dub Marker Only")
         self._recommendations(212)
         provider = FakeProvider([
@@ -1601,11 +1534,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
             info_rows = conn.execute(
                 "SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND severity = 'info'"
             ).fetchone()[0]
-            dub_rows = conn.execute(
-                "SELECT COUNT(*) FROM review_queue WHERE issue_type = 'discovery_provider_search_match_review' AND payload_json LIKE '%strong_english_dub_evidence%'"
-            ).fetchone()[0]
         self.assertEqual(info_rows, 0)
-        self.assertEqual(dub_rows, 0, "title-only English Dub labels are not explicit audio-locale evidence")
         self.assertEqual([], self._review_payloads(provider="crunchyroll"))
         evidence = get_recommendation_provider_eligibility_evidence(
             self.config.db_path,
@@ -1617,10 +1546,12 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         assert evidence is not None
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
-        self.assertEqual("unknown", evidence.english_dub_status)
+        # "(English Dub)" in the title is not a reported audio language.
         self.assertEqual([], evidence.audio_locales)
-        self.assertIsNone(evidence.explicit_dub_evidence_source)
-        self.assertIsNone(evidence.last_verified_at)
+        # Availability is language-neutral: verified identity + catalog presence is actionable.
+        self.assertEqual("present", evidence.catalog_status)
+        self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
+        self.assertTrue(is_strict_provider_eligibility_actionable(evidence, now="2026-01-01T00:00:00Z"))
         self.assertIsNone(get_series_mapping(self.config.db_path, "crunchyroll", "cr-title-only-dub"))
 
     def test_discovery_review_generation_deduplicates_same_candidate_query_key(self):
@@ -1653,7 +1584,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
         self.assertIsNotNone(evidence)
         assert evidence is not None
-        self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual(["ja-JP", "en-US"], evidence.audio_locales)
 
     def test_dedupe_discovery_review_entries_preserves_decision_query_and_evidence_semantics(self):
@@ -1670,10 +1600,9 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(3, len(deduped))
         merged_payload = deduped[0]["payload"]
         self.assertEqual("strong_provider_search_candidate_no_auto_link", merged_payload["decision"])
-        self.assertEqual("present", merged_payload["english_dub_status"])
         self.assertEqual(["ja-JP", "en-US"], merged_payload["audio_locales"])
         self.assertEqual(["ja-JP", "en-US"], merged_payload["match"]["audio_locales"])
-        self.assertEqual("provider_audio_locale", merged_payload["explicit_dub_evidence_source"])
+        self.assertNotIn("english_dub_status", merged_payload)
         self.assertEqual(
             ["strong_provider_search_candidate_no_auto_link", "manual_followup", "strong_provider_search_candidate_no_auto_link"],
             [entry["payload"]["decision"] for entry in deduped],
@@ -1703,7 +1632,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(1, len(deduped))
         self.assertEqual(["ja-JP", "en-US"], deduped[0]["audio_locales"])
 
-    def test_non_english_audio_evidence_stays_non_actionable(self):
+    def test_japanese_only_audio_evidence_is_actionable_and_keeps_reported_locales(self):
         self._insert_meta(214, english="Japanese Audio Only")
         self._recommendations(214)
         provider = FakeProvider([
@@ -1719,7 +1648,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual(1, summary.eligibility_evidence_upserted)
-        self.assertEqual(0, summary.verified_eligibility_evidence_upserted)
+        self.assertEqual(1, summary.verified_eligibility_evidence_upserted)
         self.assertEqual(1, summary.exact_verified_identities_no_review)
         self.assertEqual(0, summary.review_entries_written)
         self.assertEqual([], self._review_payloads(provider="crunchyroll"))
@@ -1733,13 +1662,12 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         assert evidence is not None
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
-        self.assertEqual("absent", evidence.english_dub_status)
         self.assertEqual(["ja-JP"], evidence.audio_locales)
-        self.assertIsNone(evidence.explicit_dub_evidence_source)
-        self.assertIsNone(evidence.last_verified_at)
+        self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
+        self.assertTrue(is_strict_provider_eligibility_actionable(evidence, now="2026-01-01T00:00:00Z"))
         self.assertIsNone(get_series_mapping(self.config.db_path, "crunchyroll", "cr-ja-only"))
 
-    def test_crunchyroll_detail_evidence_hydrates_review_needed_catalog_and_dub_status(self):
+    def test_crunchyroll_detail_evidence_hydrates_review_needed_catalog_and_audio_locales(self):
         self._insert_meta(222, english="Detail Needed")
         self._recommendations(222)
 
@@ -1787,8 +1715,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
         self.assertEqual(0.9, evidence.match_confidence)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("present", evidence.english_dub_status)
-        self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
+        self.assertEqual(["ja-JP", "en-US"], evidence.audio_locales)
         self.assertEqual("crunchyroll_cms_series", evidence.source_evidence["catalog_evidence_source"])
 
     def test_fresh_crunchyroll_detail_cache_does_not_construct_session(self):
@@ -1910,7 +1837,8 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         assert evidence is not None
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
-        self.assertEqual("absent", evidence.english_dub_status)
+        self.assertEqual(["ja-JP"], evidence.audio_locales)
+        self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
 
     def test_alias_metadata_rescues_by_the_grace_style_unique_exact_target_result(self):
         self._insert_meta(
@@ -1955,7 +1883,6 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertIsNotNone(evidence)
         assert evidence is not None
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
-        self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
 
     def test_ambiguous_provider_search_suppresses_unrelated_acronym_hits(self):
@@ -2026,8 +1953,8 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
         self.assertIsNotNone(evidence)
         assert evidence is not None
-        self.assertEqual("present", evidence.english_dub_status)
-        self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
+        self.assertEqual(["en-US", "ja-JP"], evidence.audio_locales)
+        self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
 
     def test_provider_series_shell_remains_review_not_auto_link(self):
         self._insert_meta(
@@ -2128,8 +2055,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_franchise_shell_child_match", evidence.identity_match_kind)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("present", evidence.english_dub_status)
-        self.assertEqual("provider_audio_locale", evidence.explicit_dub_evidence_source)
+        self.assertEqual(["en-US", "ja-JP"], evidence.audio_locales)
         self.assertEqual("2026-07-23T00:00:00Z", evidence.last_verified_at)
         self.assertEqual("Rascal Does Not Dream of Bunny Girl Senpai", evidence.source_evidence["identity_evidence"]["child_title"])
         child_identity = evidence.source_evidence["identity_evidence"]["child_identity"]
@@ -2383,7 +2309,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual(1, len(self._review_payloads(provider="crunchyroll")))
         self.assertIsNone(get_recommendation_provider_eligibility_evidence(self.config.db_path, mal_anime_id=815, provider="crunchyroll", provider_series_id="GYW4MG9G6"))
 
-    def test_franchise_shell_child_identity_without_english_dub_stays_non_actionable(self):
+    def test_franchise_shell_child_identity_with_japanese_only_audio_is_actionable(self):
         self._insert_meta(
             816,
             title="Seishun Buta Yarou wa Bunny Girl Senpai no Yume wo Minai",
@@ -2418,7 +2344,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(1, summary.franchise_shell_verified_matches)
         self.assertEqual(1, summary.eligibility_evidence_upserted)
-        self.assertEqual(0, summary.verified_eligibility_evidence_upserted)
+        self.assertEqual(1, summary.verified_eligibility_evidence_upserted)
         evidence = get_recommendation_provider_eligibility_evidence(
             self.config.db_path,
             mal_anime_id=816,
@@ -2429,9 +2355,9 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         assert evidence is not None
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_franchise_shell_child_match", evidence.identity_match_kind)
-        self.assertEqual("absent", evidence.english_dub_status)
         self.assertEqual(["ja-JP"], evidence.audio_locales)
-        self.assertIsNone(evidence.last_verified_at)
+        self.assertEqual("2026-07-23T00:00:00Z", evidence.last_verified_at)
+        self.assertTrue(is_strict_provider_eligibility_actionable(evidence, now="2026-07-23T00:00:00Z"))
 
     def test_franchise_shell_child_identity_accepts_generic_number_of_episodes(self):
         self._insert_meta(
@@ -2512,8 +2438,10 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertIsNotNone(evidence)
         assert evidence is not None
         self.assertEqual("verified", evidence.review_status)
-        self.assertEqual("unknown", evidence.english_dub_status)
-        self.assertIsNone(evidence.last_verified_at)
+        # HIDIVE reported no Audio|... tags: no audio languages, availability still verified.
+        self.assertEqual([], evidence.audio_locales)
+        self.assertEqual("present", evidence.catalog_status)
+        self.assertEqual("2026-01-01T00:00:00Z", evidence.last_verified_at)
         self.assertIsNone(get_series_mapping(self.config.db_path, "hidive", "2312"))
 
     def test_enrichment_persists_review_needed_then_verified_actionable_eligibility_evidence(self):
@@ -2552,8 +2480,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
         self.assertEqual(0.9, evidence.match_confidence)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("present", evidence.english_dub_status)
-        self.assertEqual("provider_audio_tag", evidence.explicit_dub_evidence_source)
+        self.assertEqual(["en-US", "ja-JP"], evidence.audio_locales)
         self.assertEqual("2026-07-26T00:00:00Z", evidence.expires_at)
 
         upsert_series_mapping(
@@ -2585,11 +2512,10 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("present", evidence.english_dub_status)
         self.assertEqual("2026-07-26T00:00:00Z", evidence.expires_at)
         self.assertEqual("2026-07-19T00:00:00Z", evidence.last_verified_at)
 
-    def test_enrichment_title_only_english_dub_without_audio_locales_is_not_strict_actionable(self):
+    def test_enrichment_foreign_dub_title_marker_without_audio_locales_is_actionable_without_language(self):
         self._insert_meta(708, english="Title Only Dub")
         self._recommendations(708)
 
@@ -2602,7 +2528,7 @@ class RecommendationEnrichmentTests(unittest.TestCase):
                     ProviderSearchResult(
                         provider_series_id="708",
                         title="Title Only Dub",
-                        season_title="Title Only Dub (English Dub)",
+                        season_title="Title Only Dub (Spanish Dub)",
                         url="https://example.test/title-only-dub",
                         audio_locales=[],
                     )
@@ -2622,15 +2548,16 @@ class RecommendationEnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual(1, summary.eligibility_evidence_upserted)
-        self.assertEqual(0, summary.verified_eligibility_evidence_upserted)
+        self.assertEqual(1, summary.verified_eligibility_evidence_upserted)
         self.assertIsNotNone(evidence)
         assert evidence is not None
         self.assertEqual("verified", evidence.review_status)
         self.assertEqual("provider_title_search_exact", evidence.identity_match_kind)
         self.assertEqual("present", evidence.catalog_status)
-        self.assertEqual("unknown", evidence.english_dub_status)
+        # A "(Spanish Dub)" season-title marker is not a reported audio language.
         self.assertEqual([], evidence.audio_locales)
-        self.assertIsNone(evidence.last_verified_at)
+        self.assertEqual("2026-07-19T00:00:00Z", evidence.last_verified_at)
+        self.assertTrue(is_strict_provider_eligibility_actionable(evidence, now="2026-07-19T00:00:00Z"))
 
     def test_provider_search_result_raw_catalog_evidence_survives_normalization(self):
         match = enrichment._match_to_dict(

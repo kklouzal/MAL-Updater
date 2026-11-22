@@ -23,6 +23,7 @@ PROVIDER_SERIES_OBSERVATION_PROVENANCE_MIGRATION = "017_provider_series_observat
 PROVIDER_TITLE_SEARCH_CACHE_FULL_KEY_MIGRATION = "018_provider_title_search_cache_full_key.sql"
 MAL_USER_ANIME_LIST_REFRESH_GENERATIONS_MIGRATION = "019_mal_user_anime_list_refresh_generations.sql"
 PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION = "020_provider_eligibility_refresh_lifecycle.sql"
+LANGUAGE_NEUTRAL_ELIGIBILITY_MIGRATION = "038_language_neutral_eligibility.sql"
 PUBLIC_USERRECS_DURABLE_QUEUE_MIGRATION = "021_public_userrecs_durable_queue_and_snapshot_guards.sql"
 MAL_USER_LIST_DURABLE_PAGINATION_MIGRATION = "022_mal_user_list_durable_pagination.sql"
 PUBLIC_USERRECS_INCREMENTAL_VALIDATION_MIGRATION = "023_public_userrecs_incremental_validation.sql"
@@ -73,6 +74,7 @@ MIGRATION_FILENAMES: tuple[str, ...] = (
     "035_provider_season_catalog.sql",
     "036_provider_season_catalog_first_episode.sql",
     "037_mal_metadata_target_failures.sql",
+    "038_language_neutral_eligibility.sql",
 )
 
 _MIGRATIONS_PACKAGE = "mal_updater.migrations"
@@ -462,7 +464,6 @@ class RecommendationSnapshotRow:
     scorecard: dict[str, Any] | None
     context: dict[str, Any] | None
     availability_providers: list[str]
-    dub_signal: str | None
     availability_confidence: float | None
     availability_confidence_label: str | None
 
@@ -478,8 +479,6 @@ class RecommendationProviderEligibilityEvidence:
     match_confidence: float | None
     review_status: str
     catalog_status: str
-    english_dub_status: str
-    explicit_dub_evidence_source: str | None
     audio_locales: list[Any]
     source_evidence: dict[str, Any]
     fetched_at: str
@@ -792,6 +791,42 @@ def _backfill_provider_eligibility_refresh_lifecycle(conn: sqlite3.Connection) -
         )
 
 
+def _schedule_language_neutral_positive_evidence(conn: sqlite3.Connection) -> None:
+    """Schedule the next refresh of evidence that migration 038 made positive."""
+    from .provider_eligibility_lifecycle import provider_eligibility_refresh_due_at
+
+    rows = conn.execute(
+        """
+        SELECT mal_anime_id, provider, provider_series_id, last_verified_at, refresh_schedule_version
+        FROM recommendation_provider_eligibility_evidence
+        WHERE verification_outcome = 'positive' AND refresh_due_at IS NULL AND last_verified_at IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        semantic = {
+            "mal_anime_id": int(row["mal_anime_id"]),
+            "provider": str(row["provider"]),
+            "provider_series_id": str(row["provider_series_id"]),
+        }
+        conn.execute(
+            """
+            UPDATE recommendation_provider_eligibility_evidence
+            SET refresh_due_at = ?
+            WHERE mal_anime_id = ? AND provider = ? AND provider_series_id = ?
+            """,
+            (
+                provider_eligibility_refresh_due_at(
+                    successful_verified_at=str(row["last_verified_at"]),
+                    schedule_version=str(row["refresh_schedule_version"]),
+                    **semantic,
+                ),
+                semantic["mal_anime_id"],
+                semantic["provider"],
+                semantic["provider_series_id"],
+            ),
+        )
+
+
 def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -819,6 +854,8 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
                 _repair_mal_anime_metadata_broadcast_columns(conn)
             if version == PROVIDER_ELIGIBILITY_REFRESH_LIFECYCLE_MIGRATION:
                 _backfill_provider_eligibility_refresh_lifecycle(conn)
+            if version == LANGUAGE_NEUTRAL_ELIGIBILITY_MIGRATION:
+                _schedule_language_neutral_positive_evidence(conn)
             conn.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
             conn.commit()
         except BaseException:
@@ -854,9 +891,6 @@ def insert_recommendation_snapshot_rows(
         if not isinstance(providers, list):
             providers = []
         providers = [p for p in providers if isinstance(p, str) and p.lower() != "mal"]
-        dub_signal = row.get("dub_signal")
-        if not dub_signal and isinstance(context, dict):
-            dub_signal = context.get("dub_signal") or context.get("english_dub_signal")
         availability_confidence_raw = row.get("availability_confidence")
         if availability_confidence_raw is None and isinstance(context, dict):
             availability_confidence_raw = context.get("availability_confidence")
@@ -881,7 +915,6 @@ def insert_recommendation_snapshot_rows(
                 json.dumps(scorecard, sort_keys=True) if scorecard is not None else None,
                 json.dumps(context, sort_keys=True) if context is not None else None,
                 json.dumps(providers, sort_keys=True),
-                dub_signal,
                 _coerce_float(availability_confidence_raw),
                 None if availability_confidence_label is None else str(availability_confidence_label),
             )
@@ -894,8 +927,8 @@ def insert_recommendation_snapshot_rows(
             INSERT INTO recommendation_score_snapshots (
                 run_id, generated_at, kind, provider, title, provider_series_id, mal_anime_id,
                 score, priority, reasons_json, scorecard_json, context_json,
-                availability_providers_json, dub_signal, availability_confidence, availability_confidence_label
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                availability_providers_json, availability_confidence, availability_confidence_label
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             prepared,
         )
@@ -1044,7 +1077,6 @@ def _recommendation_snapshot_row_from_db(row: sqlite3.Row) -> RecommendationSnap
         scorecard=_load_json_value(row["scorecard_json"], None),
         context=_load_json_value(row["context_json"], None),
         availability_providers=_load_json_value(row["availability_providers_json"], []),
-        dub_signal=row["dub_signal"],
         availability_confidence=row["availability_confidence"],
         availability_confidence_label=row["availability_confidence_label"],
     )
@@ -6859,8 +6891,6 @@ def _recommendation_provider_eligibility_from_db(row: sqlite3.Row) -> Recommenda
         match_confidence=None if row["match_confidence"] is None else float(row["match_confidence"]),
         review_status=str(row["review_status"]),
         catalog_status=str(row["catalog_status"]),
-        english_dub_status=str(row["english_dub_status"]),
-        explicit_dub_evidence_source=row["explicit_dub_evidence_source"],
         audio_locales=audio_locales if isinstance(audio_locales, list) else [],
         source_evidence=source_evidence if isinstance(source_evidence, dict) else {},
         fetched_at=str(row["fetched_at"]),
@@ -6896,8 +6926,6 @@ def upsert_recommendation_provider_eligibility_evidence(
     match_confidence: float | None = None,
     review_status: str = "unknown",
     catalog_status: str = "unknown",
-    english_dub_status: str = "unknown",
-    explicit_dub_evidence_source: str | None = None,
     audio_locales: list[Any] | None = None,
     source_evidence: dict[str, Any] | None = None,
     last_verified_at: str | None = None,
@@ -6916,18 +6944,14 @@ def upsert_recommendation_provider_eligibility_evidence(
     normalized_provider = _validate_recommendation_eligibility_provider(provider)
     normalized_review_status = _validate_recommendation_eligibility_value("review_status", review_status, _REVIEW_STATUSES)
     normalized_catalog_status = _validate_recommendation_eligibility_value("catalog_status", catalog_status, _ELIGIBILITY_STATUSES)
-    normalized_english_dub_status = _validate_recommendation_eligibility_value("english_dub_status", english_dub_status, _ELIGIBILITY_STATUSES)
     if verification_outcome is None:
         if (
             normalized_review_status == "verified"
             and normalized_catalog_status == "present"
-            and normalized_english_dub_status == "present"
             and last_verified_at is not None
         ):
             verification_outcome = "positive"
-        elif normalized_review_status == "verified" and (
-            normalized_catalog_status == "absent" or normalized_english_dub_status == "absent"
-        ):
+        elif normalized_review_status == "verified" and normalized_catalog_status == "absent":
             verification_outcome = "negative"
         else:
             verification_outcome = "unknown"
@@ -6947,8 +6971,6 @@ def upsert_recommendation_provider_eligibility_evidence(
         match_confidence = existing.match_confidence
         normalized_review_status = existing.review_status
         normalized_catalog_status = existing.catalog_status
-        normalized_english_dub_status = existing.english_dub_status
-        explicit_dub_evidence_source = existing.explicit_dub_evidence_source
         audio_locales = existing.audio_locales
         source_evidence = existing.source_evidence
         fetched_at = existing.fetched_at
@@ -6999,13 +7021,13 @@ def upsert_recommendation_provider_eligibility_evidence(
             """
             INSERT INTO recommendation_provider_eligibility_evidence (
                 mal_anime_id, provider, provider_series_id, provider_title, provider_url,
-                identity_match_kind, match_confidence, review_status, catalog_status, english_dub_status,
-                explicit_dub_evidence_source, audio_locales_json, source_evidence_json,
+                identity_match_kind, match_confidence, review_status, catalog_status,
+                audio_locales_json, source_evidence_json,
                 fetched_at, expires_at, last_verified_at, refresh_status,
                 failure_count, next_retry_at, logic_version, verification_outcome,
                 refresh_due_at, refresh_schedule_version, refresh_schedule_key,
                 last_successful_positive_at, invalidated_at, invalidation_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mal_anime_id, provider, provider_series_id) DO UPDATE SET
                 provider_title = excluded.provider_title,
                 provider_url = excluded.provider_url,
@@ -7013,8 +7035,6 @@ def upsert_recommendation_provider_eligibility_evidence(
                 match_confidence = excluded.match_confidence,
                 review_status = excluded.review_status,
                 catalog_status = excluded.catalog_status,
-                english_dub_status = excluded.english_dub_status,
-                explicit_dub_evidence_source = excluded.explicit_dub_evidence_source,
                 audio_locales_json = excluded.audio_locales_json,
                 source_evidence_json = excluded.source_evidence_json,
                 fetched_at = excluded.fetched_at,
@@ -7036,8 +7056,7 @@ def upsert_recommendation_provider_eligibility_evidence(
             (
                 int(mal_anime_id), normalized_provider, provider_series_id, provider_title, provider_url,
                 str(identity_match_kind), None if match_confidence is None else float(match_confidence),
-                normalized_review_status, normalized_catalog_status, normalized_english_dub_status,
-                explicit_dub_evidence_source,
+                normalized_review_status, normalized_catalog_status,
                 json.dumps(audio_locales or [], ensure_ascii=False, sort_keys=True),
                 json.dumps(source_evidence or {}, ensure_ascii=False, sort_keys=True),
                 fetched_at, expires_at, last_verified_at, str(refresh_status),
@@ -7109,8 +7128,6 @@ def record_recommendation_provider_eligibility_lifecycle_result(
         match_confidence=existing.match_confidence,
         review_status=existing.review_status,
         catalog_status=existing.catalog_status,
-        english_dub_status=existing.english_dub_status,
-        explicit_dub_evidence_source=existing.explicit_dub_evidence_source,
         audio_locales=existing.audio_locales,
         source_evidence=existing.source_evidence,
         fetched_at=existing.fetched_at,
@@ -7164,18 +7181,17 @@ def record_recommendation_provider_eligibility_negative_scope(
             """
             INSERT INTO recommendation_provider_eligibility_evidence (
                 mal_anime_id, provider, provider_series_id, identity_match_kind,
-                review_status, catalog_status, english_dub_status, audio_locales_json,
+                review_status, catalog_status, audio_locales_json,
                 source_evidence_json, fetched_at, expires_at, last_verified_at,
                 refresh_status, failure_count, next_retry_at, logic_version,
                 verification_outcome, refresh_due_at, refresh_schedule_version,
                 refresh_schedule_key, invalidated_at, invalidation_reason
-            ) VALUES (?, ?, ?, 'provider_title_search_no_match', 'verified', 'absent', 'absent',
+            ) VALUES (?, ?, ?, 'provider_title_search_no_match', 'verified', 'absent',
                       '[]', ?, ?, ?, ?, 'ok', 0, NULL, ?, 'negative', ?, ?, ?, ?, ?)
             ON CONFLICT(mal_anime_id, provider, provider_series_id) DO UPDATE SET
                 identity_match_kind = excluded.identity_match_kind,
                 review_status = excluded.review_status,
                 catalog_status = excluded.catalog_status,
-                english_dub_status = excluded.english_dub_status,
                 audio_locales_json = excluded.audio_locales_json,
                 source_evidence_json = excluded.source_evidence_json,
                 fetched_at = excluded.fetched_at,
@@ -7326,7 +7342,6 @@ def list_recommendation_provider_eligibility_evidence_for_mal_ids(
         conditions.extend([
             "review_status = 'verified'",
             "catalog_status = 'present'",
-            "english_dub_status = 'present'",
             "last_successful_positive_at IS NOT NULL",
             "invalidated_at IS NULL",
         ])
@@ -7352,7 +7367,7 @@ def mark_stale_recommendation_provider_eligibility_evidence(
     conditions = [
         "expires_at <= ?",
         "(last_successful_positive_at IS NULL OR invalidated_at IS NOT NULL)",
-        "(catalog_status != 'stale' OR english_dub_status != 'stale' OR review_status != 'stale')",
+        "(catalog_status != 'stale' OR review_status != 'stale')",
     ]
     params: list[object] = [now]
     if mal_anime_id is not None:
@@ -7365,7 +7380,7 @@ def mark_stale_recommendation_provider_eligibility_evidence(
         cursor = conn.execute(
             f"""
             UPDATE recommendation_provider_eligibility_evidence
-            SET review_status = 'stale', catalog_status = 'stale', english_dub_status = 'stale', updated_at = CURRENT_TIMESTAMP
+            SET review_status = 'stale', catalog_status = 'stale', updated_at = CURRENT_TIMESTAMP
             WHERE {' AND '.join(conditions)}
             """,
             params,

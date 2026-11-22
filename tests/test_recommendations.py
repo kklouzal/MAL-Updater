@@ -78,7 +78,7 @@ class RecommendationTests(unittest.TestCase):
                     "priority": 42,
                     "reasons": ["because"],
                     "scorecard": {"total": 12.5},
-                    "context": {"mal_anime_id": 123, "availability_confidence": 0.75, "dub_signal": "dubbed"},
+                    "context": {"mal_anime_id": 123, "availability_confidence": 0.75},
                 },
                 {
                     "kind": "discovery_candidate",
@@ -89,7 +89,6 @@ class RecommendationTests(unittest.TestCase):
                     "context": {
                         "mal_anime_id": 456,
                         "available_via_providers": ["crunchyroll"],
-                        "english_dub_signal": "present",
                         "scorecard": {"total": 11.0},
                     },
                 },
@@ -110,7 +109,6 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(456, context_only.mal_anime_id)
         self.assertEqual(11.0, context_only.score)
         self.assertEqual(["crunchyroll"], context_only.availability_providers)
-        self.assertEqual("present", context_only.dub_signal)
 
     def test_cli_recommend_persist_snapshot_records_grouped_items(self) -> None:
         item = Recommendation(
@@ -195,7 +193,7 @@ class RecommendationTests(unittest.TestCase):
                 season_title=None,
                 provider="crunchyroll",
                 reasons=["provider availability"],
-                context={"mal_anime_id": 1000 + index, "available_via_providers": ["crunchyroll"], "english_dub_signal": "present"},
+                context={"mal_anime_id": 1000 + index, "available_via_providers": ["crunchyroll"]},
             )
             for index in range(1, 6)
         )
@@ -267,6 +265,7 @@ class RecommendationTests(unittest.TestCase):
         completion_ratio: float,
         last_watched_at: str,
         provider: str = "crunchyroll",
+        audio_locale: str | None = None,
     ) -> None:
         with connect(self.config.db_path) as conn:
             conn.execute(
@@ -278,10 +277,11 @@ class RecommendationTests(unittest.TestCase):
                     episode_number,
                     completion_ratio,
                     last_watched_at,
+                    audio_locale,
                     raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, '{}')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}')
                 """,
-                (provider, provider_episode_id, provider_series_id, episode_number, completion_ratio, last_watched_at),
+                (provider, provider_episode_id, provider_series_id, episode_number, completion_ratio, last_watched_at, audio_locale),
             )
             conn.commit()
 
@@ -388,7 +388,6 @@ class RecommendationTests(unittest.TestCase):
         identity_match_kind: str = "approved_mapping",
         review_status: str = "verified",
         catalog_status: str = "present",
-        english_dub_status: str = "present",
         audio_locales: list[str] | None = None,
         expires_at: str = "2099-01-01T00:00:00Z",
         last_verified_at: str | None = "2026-07-19T00:00:00Z",
@@ -404,8 +403,6 @@ class RecommendationTests(unittest.TestCase):
             match_confidence=0.99,
             review_status=review_status,
             catalog_status=catalog_status,
-            english_dub_status=english_dub_status,
-            explicit_dub_evidence_source="provider_audio_locale",
             audio_locales=audio_locales if audio_locales is not None else ["en-US", "ja-JP"],
             source_evidence={"test": "provider_eligibility"},
             fetched_at="2026-07-19T00:00:00Z",
@@ -427,7 +424,7 @@ class RecommendationTests(unittest.TestCase):
             prune_absent=False,
         )
 
-    def test_new_dubbed_episode_recommendation_detects_contiguous_tail_gap(self) -> None:
+    def test_new_episode_recommendation_detects_contiguous_tail_gap(self) -> None:
         self._insert_series(
             "series-1",
             title="Example Show",
@@ -449,7 +446,7 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(1, len(results))
         item = results[0]
-        self.assertEqual("new_dubbed_episode", item.kind)
+        self.assertEqual("new_episode", item.kind)
         self.assertEqual("series-1", item.provider_series_id)
         self.assertEqual(1, item.context["contiguous_tail_gap"])
 
@@ -605,7 +602,7 @@ class RecommendationTests(unittest.TestCase):
 
         item = build_recommendations(self.config, limit=0)[0]
 
-        self.assertEqual("new_dubbed_episode", item.kind)
+        self.assertEqual("new_episode", item.kind)
         self.assertEqual("watching", item.context["mal_watch_status"])
         self.assertEqual(2, item.context["mal_num_episodes_watched"])
 
@@ -625,7 +622,7 @@ class RecommendationTests(unittest.TestCase):
 
         item = build_recommendations(self.config, limit=0)[0]
 
-        self.assertEqual("new_dubbed_episode", item.kind)
+        self.assertEqual("new_episode", item.kind)
         self.assertTrue(item.context["mal_watch_metadata_uncertain"])
         self.assertIn("avoiding over-suppression", item.context["mal_inclusion_rationale"])
 
@@ -731,7 +728,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("crunchyroll", discovery[0].provider)
         self.assertEqual([7100], discovery[0].context["supporting_mal_anime_ids"])
 
-    def test_discovery_candidate_exports_scorecard_provider_tags_and_dub_signal(self) -> None:
+    def test_discovery_candidate_exports_scorecard_provider_tags_and_unverified_availability(self) -> None:
         self._insert_series(
             "seed-score",
             title="Seed Score",
@@ -766,8 +763,10 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("consensus", scorecard["components"])
         self.assertTrue(all(0 <= value <= 100 for value in scorecard["components"].values()))
         self.assertEqual({"crunchyroll": False, "hidive": True}, item.context["provider_availability_tags"])
-        self.assertEqual("unknown", item.context["english_dub_signal"])
-        self.assertEqual("unknown", scorecard["features"]["english_dub_signal"])
+        self.assertNotIn("dub_watchable", scorecard["components"])
+        self.assertFalse(item.context["provider_availability_verified"])
+        self.assertFalse(scorecard["features"]["provider_availability_verified"])
+        self.assertEqual([], item.context["audio_locales"])
         self.assertIn("Scorecard Discovery", item.title)
 
     def test_provider_required_discovery_hides_dormant_unavailable_candidates(self) -> None:
@@ -808,7 +807,8 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(dormant[0].context["availability_visible"])
         self.assertEqual([], dormant[0].context["available_via_providers"])
         self.assertEqual("none", dormant[0].context["availability_confidence"])
-        self.assertEqual("unknown", dormant[0].context["english_dub_signal"])
+        self.assertFalse(dormant[0].context["provider_availability_verified"])
+        self.assertEqual([], dormant[0].context["audio_locales"])
 
     def test_provider_required_discovery_uses_only_actionable_normalized_eligibility_evidence(self) -> None:
         self._insert_series("seed-actionable", title="Seed Actionable", season_title="Seed Actionable (English Dub)", watchlist_status="fully_watched")
@@ -816,11 +816,11 @@ class RecommendationTests(unittest.TestCase):
         self._map_series("seed-actionable", 100)
         self._cache_metadata(100, title="Seed Actionable", my_list_status={"status": "completed", "score": 9, "num_episodes_watched": 12})
         targets = {
-            301: "Verified Dubbed Candidate",
+            301: "Verified Candidate",
             302: "Review Needed Candidate",
             303: "Title Alias Candidate",
             304: "Expired Candidate",
-            305: "Non English Candidate",
+            305: "Sub Only Candidate",
             306: "Stale Candidate",
         }
         for mal_id, title in targets.items():
@@ -833,12 +833,12 @@ class RecommendationTests(unittest.TestCase):
             ],
             make_targets_available=False,
         )
-        self._cache_provider_eligibility(301, provider_title="Verified Dubbed Candidate")
-        self._cache_provider_eligibility(302, review_status="review-needed", catalog_status="unknown", english_dub_status="unknown")
+        self._cache_provider_eligibility(301, provider_title="Verified Candidate")
+        self._cache_provider_eligibility(302, review_status="review-needed", catalog_status="unknown")
         self._cache_provider_eligibility(303, identity_match_kind="title_alias")
         self._cache_provider_eligibility(304, expires_at="2000-01-01T00:00:00Z")
-        self._cache_provider_eligibility(305, audio_locales=["ja-JP"])
-        self._cache_provider_eligibility(306, review_status="stale", catalog_status="stale", english_dub_status="stale")
+        self._cache_provider_eligibility(305, provider_title="Sub Only Candidate", audio_locales=["ja-JP"])
+        self._cache_provider_eligibility(306, review_status="stale", catalog_status="stale")
 
         strict = [
             item
@@ -856,20 +856,26 @@ class RecommendationTests(unittest.TestCase):
             if item.kind == "discovery_candidate"
         ]
 
-        self.assertEqual([304, 301], [item.context["mal_anime_id"] for item in strict])
+        self.assertEqual([304, 305, 301], [item.context["mal_anime_id"] for item in strict])
         self.assertEqual(sorted(targets), sorted(item.context["mal_anime_id"] for item in internal))
         item = next(item for item in strict if item.context["mal_anime_id"] == 301)
         self.assertEqual("crunchyroll", item.provider)
-        self.assertEqual("present", item.context["english_dub_signal"])
+        self.assertTrue(item.context["provider_availability_verified"])
+        self.assertEqual(["en-US", "ja-JP"], item.context["audio_locales"])
         self.assertEqual("verified_provider_eligibility", item.context["availability_confidence"])
-        self.assertEqual("Verified Dubbed Candidate", item.title)
-        self.assertIn("watchable dubbed as Verified Dubbed Candidate", item.context["why_recommended"])
-        self.assertEqual("Verified Dubbed Candidate", item.context["available_provider_series"][0]["title"])
-        self.assertEqual("provider_audio_locale", item.context["provider_eligibility_evidence"][0]["explicit_dub_evidence_source"])
+        self.assertEqual("Verified Candidate", item.title)
+        self.assertIn("watchable as Verified Candidate on Crunchyroll", item.context["why_recommended"])
+        self.assertIn("verified provider availability: Crunchyroll", item.reasons)
+        self.assertEqual("Verified Candidate", item.context["available_provider_series"][0]["title"])
+        self.assertNotIn("english_dub_status", item.context["provider_eligibility_evidence"][0])
+        sub_only = next(item for item in strict if item.context["mal_anime_id"] == 305)
+        self.assertEqual("Sub Only Candidate", sub_only.title)
+        self.assertTrue(sub_only.context["provider_availability_verified"])
+        self.assertEqual(["ja-JP"], sub_only.context["audio_locales"])
         self.assertEqual("Seed Actionable", item.context["supporting_seed_details"][0]["title"])
         self.assertEqual(9, item.context["supporting_seed_details"][0]["user_score"])
 
-    def test_provider_required_discovery_matches_shared_strict_identity_locale_and_freshness_semantics(self) -> None:
+    def test_provider_required_discovery_matches_shared_strict_identity_and_freshness_semantics(self) -> None:
         self._insert_series("seed-strict-parity", title="Seed Strict Parity", season_title="Seed Strict Parity (English Dub)", watchlist_status="fully_watched")
         self._insert_progress("seed-strict-parity", "seed-strict-parity-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
         self._map_series("seed-strict-parity", 100)
@@ -881,13 +887,14 @@ class RecommendationTests(unittest.TestCase):
             904: ("Auto Exact", "auto_exact", ["en-CA"]),
             905: ("Title Search Exact", "provider_title_search_exact", ["en_AU"]),
             906: ("Franchise Shell Child", "provider_franchise_shell_child_match", ["ja-JP", "en_US"]),
+            907: ("Sub Only", "provider_title_search_exact", ["ja-JP"]),
+            908: ("Spanish Dub Only", "provider_title_search_exact", ["es-419", "ja-JP"]),
+            909: ("Title Marker Only (English Dub)", "provider_title_search_exact", []),
         }
         rejected = {
             920: ("Missing Verification Time", {"last_verified_at": None}),
-            921: ("Title Only English Dub", {"provider_title": "Title Only English Dub (English Dub)", "audio_locales": []}),
-            922: ("Review Needed", {"review_status": "review-needed", "catalog_status": "present", "english_dub_status": "present"}),
+            922: ("Review Needed", {"review_status": "review-needed", "catalog_status": "present"}),
             923: ("Catalog Absent", {"catalog_status": "absent"}),
-            924: ("Dub Absent", {"english_dub_status": "absent"}),
             925: ("Expired", {"expires_at": "2000-01-01T00:00:00Z"}),
             926: ("Legacy Identity", {"identity_match_kind": "provider_franchise_shell_metadata_match"}),
         }
@@ -944,8 +951,14 @@ class RecommendationTests(unittest.TestCase):
             {**{mal_id: data[1] for mal_id, data in accepted.items()}, 925: "provider_title_search_exact"},
             identities,
         )
+        # Audio locales are reported as the provider named them; a title marker
+        # such as "(English Dub)" is never language evidence.
+        self.assertEqual(
+            {mal_id: sorted(data[2]) for mal_id, data in accepted.items()},
+            {item.context["mal_anime_id"]: item.context["audio_locales"] for item in strict if item.context["mal_anime_id"] in accepted},
+        )
 
-    def test_diagnostic_discovery_carries_review_needed_provider_catalog_and_dub_evidence(self) -> None:
+    def test_diagnostic_discovery_carries_review_needed_provider_catalog_and_audio_evidence(self) -> None:
         self._insert_series("seed-review-evidence", title="Seed Review Evidence", season_title="Seed Review Evidence (English Dub)", watchlist_status="fully_watched")
         self._insert_progress("seed-review-evidence", "seed-review-evidence-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
         self._map_series("seed-review-evidence", 100)
@@ -963,7 +976,6 @@ class RecommendationTests(unittest.TestCase):
             identity_match_kind="provider_title_search",
             review_status="review-needed",
             catalog_status="present",
-            english_dub_status="present",
         )
 
         strict = [
@@ -989,7 +1001,8 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("provider_title_search", evidence[0]["identity_match_kind"])
         self.assertEqual("review-needed", evidence[0]["review_status"])
         self.assertEqual("present", evidence[0]["catalog_status"])
-        self.assertEqual("present", evidence[0]["english_dub_status"])
+        self.assertEqual(["en-US", "ja-JP"], evidence[0]["audio_locales"])
+        self.assertFalse(diagnostic[0].context["provider_availability_verified"])
 
     def test_provider_required_discovery_merges_multiple_actionable_providers(self) -> None:
         self._insert_series("seed-multi", title="Seed Multi", season_title="Seed Multi (English Dub)", watchlist_status="fully_watched")
@@ -998,32 +1011,34 @@ class RecommendationTests(unittest.TestCase):
         self._cache_metadata(100, title="Seed Multi")
         self._cache_metadata(330, title="Multi Provider Candidate", mean=8.4, popularity=200)
         self._cache_recommendations(100, [{"target_mal_anime_id": 330, "target_title": "Multi Provider Candidate", "num_recommendations": 20, "raw": {}}], make_targets_available=False)
-        self._cache_provider_eligibility(330, provider="crunchyroll", provider_series_id="cr-330", provider_title="Multi Provider Candidate")
-        self._cache_provider_eligibility(330, provider="hidive", provider_series_id="hi-330", provider_title="Multi Provider Candidate")
+        self._cache_provider_eligibility(330, provider="crunchyroll", provider_series_id="cr-330", provider_title="Multi Provider Candidate", audio_locales=["ja-JP", "es-419"])
+        self._cache_provider_eligibility(330, provider="hidive", provider_series_id="hi-330", provider_title="Multi Provider Candidate", audio_locales=["en-US", "ja-JP"])
 
         item = next(item for item in build_recommendations(self.config, limit=0, require_provider_availability=True) if item.kind == "discovery_candidate")
 
         self.assertEqual(["crunchyroll", "hidive"], item.context["available_via_providers"])
         self.assertEqual({"crunchyroll": True, "hidive": True}, item.context["provider_availability_tags"])
         self.assertEqual(2, len(item.context["provider_eligibility_evidence"]))
+        self.assertEqual(["en-US", "es-419", "ja-JP"], item.context["audio_locales"])
+        self.assertEqual(["en-US", "es-419", "ja-JP"], item.context["scorecard"]["features"]["audio_locales"])
 
-    def test_discovery_candidate_surfaces_provider_availability_when_dub_unknown(self) -> None:
+    def test_discovery_candidate_surfaces_unverified_mapped_provider_availability(self) -> None:
         self._insert_series(
-            "seed-unknown-dub",
-            title="Seed Unknown Dub",
-            season_title="Seed Unknown Dub (English Dub)",
+            "seed-unverified",
+            title="Seed Unverified",
+            season_title="Seed Unverified (English Dub)",
             watchlist_status="fully_watched",
         )
         self._insert_progress(
-            "seed-unknown-dub",
-            "seed-unknown-dub-1",
+            "seed-unverified",
+            "seed-unverified-1",
             episode_number=1,
             completion_ratio=1.0,
             last_watched_at="2026-03-01T01:00:00Z",
         )
-        self._map_series("seed-unknown-dub", 100)
+        self._map_series("seed-unverified", 100)
         self._insert_series(
-            "hidive-unknown-dub",
+            "hidive-unverified",
             title="Provider Visible Discovery",
             season_title="Provider Visible Discovery",
             watchlist_status="never_watched",
@@ -1032,14 +1047,14 @@ class RecommendationTests(unittest.TestCase):
         upsert_series_mapping(
             self.config.db_path,
             provider="hidive",
-            provider_series_id="hidive-unknown-dub",
+            provider_series_id="hidive-unverified",
             mal_anime_id=300,
             confidence=0.91,
             mapping_source="reverse_provider_title_search",
             approved_by_user=False,
             notes=None,
         )
-        self._cache_metadata(100, title="Seed Unknown Dub", genres=["Adventure"], mean=8.8)
+        self._cache_metadata(100, title="Seed Unverified", genres=["Adventure"], mean=8.8)
         self._cache_metadata(300, title="Provider Visible Discovery", genres=["Adventure"], mean=8.1, popularity=250)
         self._cache_recommendations(
             100,
@@ -1052,21 +1067,21 @@ class RecommendationTests(unittest.TestCase):
             for item in build_recommendations(self.config, limit=0, require_provider_availability=False)
             if item.kind == "discovery_candidate" and item.context["mal_anime_id"] == 300
         ]
-        require_dub = [
+        strict = [
             item
             for item in build_recommendations(self.config, limit=0, require_provider_availability=True)
             if item.kind == "discovery_candidate" and item.context["mal_anime_id"] == 300
         ]
 
-        self.assertEqual([], require_dub)
+        self.assertEqual([], strict)
         self.assertEqual(1, len(visible))
         item = visible[0]
         self.assertEqual("hidive", item.provider)
-        self.assertEqual("hidive-unknown-dub", item.provider_series_id)
+        self.assertEqual("hidive-unverified", item.provider_series_id)
         self.assertEqual(["hidive"], item.context["available_via_providers"])
         self.assertEqual({"crunchyroll": False, "hidive": True}, item.context["provider_availability_tags"])
-        self.assertEqual("unknown", item.context["english_dub_signal"])
-        self.assertFalse(item.context.get("english_dub", False))
+        self.assertFalse(item.context["provider_availability_verified"])
+        self.assertEqual([], item.context["audio_locales"])
         self.assertEqual("mapped", item.context["availability_confidence"])
         self.assertEqual(["mapped_mal"], item.context["availability_match_kinds"])
         self.assertEqual(1, len(item.context["available_provider_series"]))
@@ -1304,7 +1319,7 @@ class RecommendationTests(unittest.TestCase):
 
         recent = [item for item in results if item.provider_series_id == "recent-show"][0]
         stale = [item for item in results if item.provider_series_id == "stale-show"][0]
-        self.assertEqual("new_dubbed_episode", recent.kind)
+        self.assertEqual("new_episode", recent.kind)
         self.assertEqual("resume_backlog", stale.kind)
         self.assertGreater(recent.priority, stale.priority)
 
@@ -1382,7 +1397,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertGreater(results[0].context["support_balance_bonus"], results[1].context["support_balance_bonus"])
         self.assertGreater(results[0].priority, results[1].priority)
 
-    def test_discovery_candidate_can_come_from_harvested_dormant_edge_with_provider_dub_availability(self) -> None:
+    def test_discovery_candidate_can_come_from_harvested_dormant_edge_with_provider_availability(self) -> None:
         self._insert_series("dormant-seed", title="Dormant Seed")
         self._map_series("dormant-seed", 100)
         self._cache_metadata(100, title="Dormant Seed")
@@ -1412,7 +1427,6 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual([100], results[0].context["supporting_mal_anime_ids"])
         self.assertEqual("mapped", results[0].context["availability_confidence"])
         self.assertTrue(results[0].context["availability_visible"])
-        self.assertEqual("unknown", results[0].context["english_dub_signal"])
 
     def test_discovery_candidate_suppresses_mal_listed_harvested_target(self) -> None:
         self._insert_series("dormant-seed", title="Dormant Seed")
@@ -2801,7 +2815,8 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(1, len(visible))
         self.assertEqual("exact-search-target", visible[0].provider_series_id)
-        self.assertEqual("present", visible[0].context["english_dub_signal"])
+        self.assertTrue(visible[0].context["provider_availability_verified"])
+        self.assertEqual(["en-US", "ja-JP"], visible[0].context["audio_locales"])
         self.assertEqual("provider_title_search_exact", visible[0].context["provider_eligibility_evidence"][0]["identity_match_kind"])
 
     def test_provider_required_discovery_accepts_verified_franchise_shell_eligibility_evidence(self) -> None:
@@ -3485,7 +3500,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("backlog continuation", " ".join(item.reasons))
         self.assertEqual(1, item.context["contiguous_tail_gap"])
 
-    def test_tail_gap_within_fresh_window_stays_fresh_dubbed_episode(self) -> None:
+    def test_tail_gap_within_fresh_window_stays_fresh_episode(self) -> None:
         self._insert_series(
             "fresh-show",
             title="Fresh Show",
@@ -3507,23 +3522,27 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(1, len(results))
         item = results[0]
-        self.assertEqual("new_dubbed_episode", item.kind)
+        self.assertEqual("new_episode", item.kind)
         self.assertEqual(1, item.context["contiguous_tail_gap"])
 
-    def test_filters_out_non_english_dub_candidates(self) -> None:
-        self._insert_series(
-            "series-fr",
-            title="Foreign Dub Show",
-            season_title="Foreign Dub Show (French Dub)",
-            season_number=1,
-            watchlist_status="in_progress",
-        )
-        self._insert_progress("series-fr", "ep-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-10T01:00:00Z")
-        self._insert_progress("series-fr", "ep-2", episode_number=2, completion_ratio=0.1, last_watched_at="2026-03-10T02:00:00Z")
+    def test_foreign_dub_and_sub_only_series_get_new_episode_recommendations_with_watched_audio(self) -> None:
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        for series_id, title, season_title, locale in (
+            ("series-fr", "Foreign Dub Show", "Foreign Dub Show (French Dub)", "fr-FR"),
+            ("series-ja", "Sub Only Show", "Sub Only Show", "ja-JP"),
+        ):
+            self._insert_series(series_id, title=title, season_title=season_title, season_number=1, watchlist_status="in_progress")
+            self._insert_progress(series_id, f"{series_id}-1", episode_number=1, completion_ratio=1.0, last_watched_at=recent, audio_locale=locale)
+            self._insert_progress(series_id, f"{series_id}-2", episode_number=2, completion_ratio=0.1, last_watched_at=recent, audio_locale=locale)
 
-        results = build_recommendations(self.config, limit=0)
+        results = {item.provider_series_id: item for item in build_recommendations(self.config, limit=0)}
 
-        self.assertEqual([], results)
+        self.assertEqual({"series-fr", "series-ja"}, set(results))
+        self.assertEqual("new_episode", results["series-fr"].kind)
+        self.assertEqual(["fr-FR"], results["series-fr"].context["audio_locales"])
+        self.assertEqual("new_episode", results["series-ja"].kind)
+        self.assertEqual(["ja-JP"], results["series-ja"].context["audio_locales"])
+        self.assertFalse(any("English" in reason for item in results.values() for reason in item.reasons))
 
     def test_cross_provider_duplicate_new_season_recommendations_merge_by_mapped_mal_target(self) -> None:
         self._insert_series(
@@ -3649,7 +3668,7 @@ class RecommendationTests(unittest.TestCase):
                     season_title="Backlog Show (English Dub)",
                 ),
                 Recommendation(
-                    kind="new_dubbed_episode",
+                    kind="new_episode",
                     priority=60,
                     provider="crunchyroll",
                     provider_series_id="series-fresh",
@@ -3676,7 +3695,7 @@ class RecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["continue_next", "fresh_dubbed_episodes", "discovery_candidates", "resume_backlog"],
+            ["continue_next", "fresh_episodes", "discovery_candidates", "resume_backlog"],
             [section["key"] for section in grouped],
         )
         self.assertEqual("series-next", grouped[0]["items"][0]["provider_series_id"])
@@ -3857,6 +3876,7 @@ class RecommendationTests(unittest.TestCase):
             completion_ratio=1.0,
             last_watched_at=recent,
             provider="crunchyroll",
+            audio_locale="en-US",
         )
         self._insert_progress(
             "cr-fresh",
@@ -3880,6 +3900,7 @@ class RecommendationTests(unittest.TestCase):
             completion_ratio=1.0,
             last_watched_at=recent,
             provider="hidive",
+            audio_locale="ja-JP",
         )
         self._insert_progress(
             "hd-fresh",
@@ -3916,11 +3937,14 @@ class RecommendationTests(unittest.TestCase):
         self._map_series("cr-fresh", 8300, provider="crunchyroll")
         self._map_series("hd-fresh", 8300, provider="hidive")
 
-        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "new_dubbed_episode"]
+        results = [item for item in build_recommendations(self.config, limit=0) if item.kind == "new_episode"]
 
         self.assertEqual(["cr-fresh", "single-fresh"], [item.provider_series_id for item in results[:2]])
         self.assertEqual(3, results[0].context["availability_priority_bonus"])
         self.assertEqual(results[1].priority + 3, results[0].priority)
+        # The merged item carries the union of the watched versions' audio languages.
+        self.assertEqual(["en-US", "ja-JP"], results[0].context["audio_locales"])
+        self.assertEqual([], results[1].context["audio_locales"])
 
     def test_build_recommendations_limit_prefers_broader_availability_when_priorities_tie(self) -> None:
         self._insert_series(
@@ -4403,7 +4427,7 @@ class RecommendationTests(unittest.TestCase):
         per_kind = _snapshot_recommendation_rows(rows, 2, per_kind=True)
         self.assertEqual(["discovery_candidate", "discovery_candidate", "mal_sequel"], [row["kind"] for row in per_kind])
 
-    def test_recommend_cli_surfaces_provider_available_non_english_dub_discovery_as_unknown(self) -> None:
+    def test_recommend_cli_surfaces_title_alias_provider_discovery_as_unverified(self) -> None:
         self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")
         self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
         self._map_series("seed-a", 100)
@@ -4421,10 +4445,11 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(1, len(payload))
         self.assertEqual("Sub Only Candidate", payload[0]["title"])
         self.assertEqual(["crunchyroll"], payload[0]["context"]["available_via_providers"])
-        self.assertEqual("unknown", payload[0]["context"]["english_dub_signal"])
-        self.assertFalse(payload[0]["context"].get("english_dub", False))
+        self.assertFalse(payload[0]["context"]["provider_availability_verified"])
+        self.assertEqual([], payload[0]["context"]["audio_locales"])
+        self.assertIn("provider availability is not yet verified", payload[0]["context"]["why_recommended"])
 
-    def test_recommend_cli_diagnostic_title_marker_discovery_preserves_metadata_without_dub_proof(self) -> None:
+    def test_recommend_cli_diagnostic_title_marker_discovery_preserves_metadata_without_language_evidence(self) -> None:
         self._insert_series("seed-a", title="Seed A", season_title="Seed A (English Dub)", watchlist_status="fully_watched")
         self._insert_progress("seed-a", "seed-a-1", episode_number=1, completion_ratio=1.0, last_watched_at="2026-03-01T01:00:00Z")
         self._map_series("seed-a", 100)
@@ -4443,7 +4468,9 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual("dubbed", payload[0]["provider_series_id"])
         self.assertEqual("English Candidate", payload[0]["context"]["english_title"])
         self.assertEqual(["Comedy", "Fantasy"], payload[0]["context"]["genres"])
-        self.assertEqual("unknown", payload[0]["scorecard"]["features"]["english_dub_signal"])
+        # The "(English Dub)" title marker is not audio-language evidence.
+        self.assertEqual([], payload[0]["scorecard"]["features"]["audio_locales"])
+        self.assertFalse(payload[0]["scorecard"]["features"]["provider_availability_verified"])
 
     def test_recommend_cli_flat_flag_preserves_legacy_list_output(self) -> None:
         self._insert_series(
@@ -4483,7 +4510,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         payload = json.loads(stdout.getvalue())
         self.assertIsInstance(payload, list)
-        self.assertEqual("new_dubbed_episode", payload[0]["kind"])
+        self.assertEqual("new_episode", payload[0]["kind"])
         self.assertEqual("series-fresh", payload[0]["provider_series_id"])
 
 

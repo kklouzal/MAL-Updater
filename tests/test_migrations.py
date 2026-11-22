@@ -58,6 +58,7 @@ class MigrationCatalogTests(unittest.TestCase):
                 "035_provider_season_catalog.sql",
                 "036_provider_season_catalog_first_episode.sql",
                 "037_mal_metadata_target_failures.sql",
+                "038_language_neutral_eligibility.sql",
             ),
             db.MIGRATION_FILENAMES,
         )
@@ -123,6 +124,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "035_provider_season_catalog.sql",
                     "036_provider_season_catalog_first_episode.sql",
                     "037_mal_metadata_target_failures.sql",
+                    "038_language_neutral_eligibility.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -167,6 +169,7 @@ class MigrationCatalogTests(unittest.TestCase):
                     "035_provider_season_catalog.sql",
                     "036_provider_season_catalog_first_episode.sql",
                     "037_mal_metadata_target_failures.sql",
+                    "038_language_neutral_eligibility.sql",
                 ),
                 packaged_filenames=db.MIGRATION_FILENAMES,
             )
@@ -325,6 +328,99 @@ class MigrationCatalogTests(unittest.TestCase):
         self.assertEqual("", row["identity_key"])
         self.assertEqual(1, marker_count)
         self.assertEqual("ok", integrity)
+
+    def test_language_neutral_eligibility_upgrade_promotes_only_english_blocked_evidence(self) -> None:
+        from mal_updater.provider_eligibility_lifecycle import provider_eligibility_refresh_due_at
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "language-neutral-upgrade.sqlite3"
+            original = db.MIGRATIONS
+            try:
+                db.MIGRATIONS = original[: db.MIGRATION_FILENAMES.index(db.LANGUAGE_NEUTRAL_ELIGIBILITY_MIGRATION)]
+                bootstrap_database(db_path)
+            finally:
+                db.MIGRATIONS = original
+
+            fetched_at = "2026-10-01T00:00:00Z"
+            rows = [
+                # (mal id, series id, identity, catalog, english dub, outcome, invalidated_at, invalidation_reason, last_verified_at, refresh_due_at)
+                (501, "english-absent", "provider_title_search_exact", "present", "absent", "negative", fetched_at, None, None, None),
+                (502, "catalog-absent", "provider_title_search_exact", "absent", "absent", "negative", fetched_at, None, None, None),
+                (503, "no-match", "provider_title_search_exact", "present", "unknown", "negative", fetched_at, "provider_title_search_no_match", None, None),
+                (504, "loose-identity", "title_alias", "present", "absent", "unknown", None, None, None, None),
+                (505, "already-positive", "approved_mapping", "present", "present", "positive", None, None, fetched_at, "2027-01-15T00:00:00Z"),
+            ]
+            with connect(db_path) as conn:
+                for mal_id, series_id, identity, catalog, english, outcome, invalidated_at, reason, verified_at, due_at in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO recommendation_provider_eligibility_evidence (
+                            mal_anime_id, provider, provider_series_id, identity_match_kind, review_status,
+                            catalog_status, english_dub_status, audio_locales_json, fetched_at, expires_at,
+                            last_verified_at, verification_outcome, refresh_due_at, last_successful_positive_at,
+                            invalidated_at, invalidation_reason
+                        ) VALUES (?, 'crunchyroll', ?, ?, 'verified', ?, ?, '["ja-JP"]', ?, '2026-10-08T00:00:00Z', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (mal_id, series_id, identity, catalog, english, fetched_at, verified_at, outcome, due_at, verified_at, invalidated_at, reason),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO recommendation_score_snapshots (run_id, kind, provider, title, provider_series_id, dub_signal)
+                    VALUES ('run-legacy', 'new_dubbed_episode', 'crunchyroll', 'Legacy Episode', 'legacy-series', 'present')
+                    """
+                )
+                conn.commit()
+
+            bootstrap_database(db_path)
+            with connect(db_path) as conn:
+                evidence = {
+                    row["mal_anime_id"]: row
+                    for row in conn.execute("SELECT * FROM recommendation_provider_eligibility_evidence")
+                }
+                evidence_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_provider_eligibility_evidence)")}
+                snapshot_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendation_score_snapshots)")}
+                snapshot_kinds = [row["kind"] for row in conn.execute("SELECT kind FROM recommendation_score_snapshots")]
+                index_sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'idx_recommendation_provider_eligibility_actionable'"
+                ).fetchone()["sql"]
+                marker_count = conn.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                    (db.LANGUAGE_NEUTRAL_ELIGIBILITY_MIGRATION,),
+                ).fetchone()[0]
+
+        promoted = evidence[501]
+        self.assertEqual("positive", promoted["verification_outcome"])
+        self.assertEqual(fetched_at, promoted["last_verified_at"])
+        self.assertEqual(fetched_at, promoted["last_successful_positive_at"])
+        self.assertIsNone(promoted["invalidated_at"])
+        self.assertIsNone(promoted["invalidation_reason"])
+        self.assertEqual('["ja-JP"]', promoted["audio_locales_json"])
+        self.assertEqual(
+            provider_eligibility_refresh_due_at(
+                successful_verified_at=fetched_at,
+                mal_anime_id=501,
+                provider="crunchyroll",
+                provider_series_id="english-absent",
+                schedule_version=promoted["refresh_schedule_version"],
+            ),
+            promoted["refresh_due_at"],
+        )
+        self.assertIsNotNone(promoted["refresh_due_at"])
+        for mal_id in (502, 503, 504):
+            with self.subTest(mal_id=mal_id):
+                original_row = next(row for row in rows if row[0] == mal_id)
+                self.assertEqual(original_row[5], evidence[mal_id]["verification_outcome"])
+                self.assertIsNone(evidence[mal_id]["last_verified_at"])
+                self.assertIsNone(evidence[mal_id]["refresh_due_at"])
+                self.assertEqual(original_row[6], evidence[mal_id]["invalidated_at"])
+                self.assertEqual(original_row[7], evidence[mal_id]["invalidation_reason"])
+        self.assertEqual("positive", evidence[505]["verification_outcome"])
+        self.assertEqual("2027-01-15T00:00:00Z", evidence[505]["refresh_due_at"])
+        self.assertFalse({"english_dub_status", "explicit_dub_evidence_source"} & evidence_columns)
+        self.assertNotIn("dub_signal", snapshot_columns)
+        self.assertEqual(["new_episode"], snapshot_kinds)
+        self.assertNotIn("english_dub_status", index_sql)
+        self.assertEqual(1, marker_count)
 
     def test_provider_watchlist_membership_migration_preserves_fk_and_cascade(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

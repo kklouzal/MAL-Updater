@@ -106,7 +106,7 @@ class HidiveProvider:
 
     def fetch_search_result_detail(self, config: AppConfig, match):
         # HIDIVE Algolia VOD_SERIES hits already carry the explicit Audio|... tags
-        # used as conservative catalog/dub evidence; no broader detail crawl here.
+        # used as catalog and audio-language evidence; no broader detail crawl here.
         return match
 
 
@@ -115,13 +115,22 @@ register_provider(provider)
 
 
 
+# HIDIVE Algolia tags name audio tracks in English ("Audio|Japanese"). English
+# and Japanese keep the region-qualified codes stored by earlier releases; other
+# languages use the bare BCP 47 language code because HIDIVE names no region.
+_HIDIVE_AUDIO_LANGUAGE_CODES = {
+    "english": "en-US", "en": "en-US", "en-us": "en-US", "en-gb": "en-US",
+    "japanese": "ja-JP", "ja": "ja-JP", "ja-jp": "ja-JP",
+    "spanish": "es", "portuguese": "pt", "french": "fr", "german": "de", "italian": "it",
+    "korean": "ko", "chinese": "zh", "mandarin": "zh", "cantonese": "yue", "russian": "ru",
+    "arabic": "ar", "hindi": "hi", "tagalog": "tl", "filipino": "fil", "thai": "th",
+    "indonesian": "id", "vietnamese": "vi", "polish": "pl", "turkish": "tr", "dutch": "nl",
+}
+
+
 def _normalize_hidive_audio_tag_language(language: str) -> str | None:
     normalized = " ".join(language.strip().replace("_", "-").split()).lower()
-    if normalized in {"english", "en", "en-us", "en-gb"}:
-        return "en-US"
-    if normalized in {"japanese", "ja", "ja-jp"}:
-        return "ja-JP"
-    return None
+    return _HIDIVE_AUDIO_LANGUAGE_CODES.get(normalized)
 
 
 def _audio_locales_from_hidive_tags(tags: Any) -> list[str]:

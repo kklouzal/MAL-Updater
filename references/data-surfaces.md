@@ -54,7 +54,7 @@ PYTHONPATH=src python3 -m mal_updater.cli push-recommendations-webhook --limit 2
 
 Use this surface when the user wants:
 - recommended anime to resume/watch next
-- new season / dubbed-episode style recommendation output
+- new season / new episode recommendation output
 - dormant-but-cached discovery candidates for debugging / audit
 - recommendation metadata refresh
 - pushing a recommendation digest into OpenClaw's webhook ingress for chat delivery

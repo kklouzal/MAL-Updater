@@ -92,17 +92,22 @@ _PROVIDER_CONDITIONAL_LAUNCH_YEAR_FIELDS = ("series_launch_year", "launch_year")
 
 from .mal_client import MAL_ANIME_SEARCH_QUERY_MAX_CHARS, MAL_DETAIL_CACHE_LOGIC_VERSION, MalApiError, MalClient
 
-_TITLE_CLEANUPS = [
-    re.compile(r"\(english dub\)", re.IGNORECASE),
-    re.compile(r"\(dub\)", re.IGNORECASE),
-    re.compile(r"\benglish dub\b", re.IGNORECASE),
-    re.compile(r"\bfrench dub\b", re.IGNORECASE),
+# Version markers: providers list each dub as "(<Language> Dub)" / "(Dub)",
+# in any language. They name an audio version, never a different title.
+_QUERY_CLEANUPS = [
+    re.compile(r"[\[(]\s*[^\])()]{0,80}\bdub\s*[\])]", re.IGNORECASE),
+    re.compile(
+        r"\b(?:english|french|spanish|castilian|latin\s+american\s+spanish|german|portuguese|italian|russian|arabic|hindi|tamil|telugu|korean)\s+dub\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bbroadcast version\b", re.IGNORECASE),
     re.compile(r"\buncensored\b", re.IGNORECASE),
+]
+_TITLE_CLEANUPS = [
+    *_QUERY_CLEANUPS,
     re.compile(r"\bseason\s+\d+\b", re.IGNORECASE),
     re.compile(r"\bpart\s+\d+\b", re.IGNORECASE),
 ]
-_QUERY_CLEANUPS = _TITLE_CLEANUPS[:6]
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _ALPHA_DIGIT_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])")
 _SEARCH_SPACING_REWRITES = (

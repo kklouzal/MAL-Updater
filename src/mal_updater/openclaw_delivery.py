@@ -44,14 +44,14 @@ class OpenClawRecommendationDeliveryResult:
 
 
 _DELIVERY_MODE_SECTION_KEYS = {
-    "fresh": {"continue_next", "fresh_dubbed_episodes"},
+    "fresh": {"continue_next", "fresh_episodes"},
     "digest": {"continue_franchise", "discovery_candidates", "resume_backlog"},
     "all": None,
 }
 
 _SECTION_DELIVERY_TIERS = {
     "continue_next": "fresh",
-    "fresh_dubbed_episodes": "fresh",
+    "fresh_episodes": "fresh",
     "continue_franchise": "digest",
     "discovery_candidates": "digest",
     "resume_backlog": "digest",

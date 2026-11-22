@@ -62,7 +62,7 @@ DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_TIMEOUT_SECONDS = 20.0
 DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_DELIVERY_MODE = "fresh"
 DEFAULT_OPENCLAW_RECOMMENDATIONS_WEBHOOK_SECTION_LIMITS = {
     "continue_next": 5,
-    "fresh_dubbed_episodes": 5,
+    "fresh_episodes": 5,
     "continue_franchise": 3,
     "discovery_candidates": 3,
     "resume_backlog": 2,

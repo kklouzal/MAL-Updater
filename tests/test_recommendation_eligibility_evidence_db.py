@@ -34,9 +34,12 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
             migrations = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
 
         self.assertIn("mal_anime_id", columns)
-        self.assertIn("english_dub_status", columns)
+        self.assertIn("audio_locales_json", columns)
+        self.assertNotIn("english_dub_status", columns)
+        self.assertNotIn("explicit_dub_evidence_source", columns)
         self.assertIn("source_evidence_json", columns)
         self.assertIn("availability_confidence_label", snapshot_columns)
+        self.assertNotIn("dub_signal", snapshot_columns)
         self.assertIn("006_recommendation_eligibility_evidence.sql", migrations)
 
     def test_existing_schema_upgrade_is_idempotent(self) -> None:
@@ -86,15 +89,13 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
             match_confidence=0.72,
             review_status="review-needed",
             catalog_status="unknown",
-            english_dub_status="unknown",
-            explicit_dub_evidence_source=None,
             audio_locales=["ja-JP"],
             source_evidence={"query": "candidate", "matches": [{"title": "Candidate Title"}]},
             fetched_at="2026-07-19T00:00:00+00:00",
             expires_at="2026-07-20T00:00:00+00:00",
         )
         self.assertEqual("unknown", initial.catalog_status)
-        self.assertEqual("unknown", initial.english_dub_status)
+        self.assertEqual("unknown", initial.verification_outcome)
         self.assertEqual([], list_recommendation_provider_eligibility_evidence_for_mal_ids(
             self.db_path,
             [101],
@@ -113,19 +114,18 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
             match_confidence=0.98,
             review_status="verified",
             catalog_status="present",
-            english_dub_status="present",
-            explicit_dub_evidence_source="provider_audio_locale",
-            audio_locales=["en-US", "ja-JP"],
-            source_evidence={"provider_payload": {"audio_locales": ["en-US", "ja-JP"]}},
+            audio_locales=["es-419", "ja-JP"],
+            source_evidence={"provider_payload": {"audio_locales": ["es-419", "ja-JP"]}},
             fetched_at="2026-07-19T01:00:00+00:00",
             expires_at="2026-07-20T00:00:00+00:00",
             last_verified_at="2026-07-19T01:01:00+00:00",
         )
 
         self.assertEqual("Verified Title", updated.provider_title)
-        self.assertEqual(["en-US", "ja-JP"], updated.audio_locales)
-        self.assertEqual("provider_audio_locale", updated.explicit_dub_evidence_source)
-        self.assertEqual({"provider_payload": {"audio_locales": ["en-US", "ja-JP"]}}, updated.source_evidence)
+        self.assertEqual(["es-419", "ja-JP"], updated.audio_locales)
+        # Verified review + present catalog + verification time is positive whatever the audio languages.
+        self.assertEqual("positive", updated.verification_outcome)
+        self.assertEqual({"provider_payload": {"audio_locales": ["es-419", "ja-JP"]}}, updated.source_evidence)
         self.assertEqual(updated, get_recommendation_provider_eligibility_evidence(
             self.db_path,
             mal_anime_id=101,
@@ -161,7 +161,6 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
         assert stale is not None
         self.assertEqual("verified", stale.review_status)
         self.assertEqual("present", stale.catalog_status)
-        self.assertEqual("present", stale.english_dub_status)
         self.assertEqual(1, delete_recommendation_provider_eligibility_evidence(
             self.db_path,
             mal_anime_id=101,
@@ -206,7 +205,7 @@ class RecommendationEligibilityEvidenceDbTests(unittest.TestCase):
         )
         self.assertEqual("unknown", unknown.review_status)
         self.assertEqual("unknown", unknown.catalog_status)
-        self.assertEqual("unknown", unknown.english_dub_status)
+        self.assertEqual("unknown", unknown.verification_outcome)
         self.assertEqual([], list_recommendation_provider_eligibility_evidence_for_mal_ids(
             self.db_path,
             [1],

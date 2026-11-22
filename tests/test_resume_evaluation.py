@@ -171,7 +171,7 @@ class BundleValidationTests(unittest.TestCase):
                      "item_id": "x", "mal_anime_id": None, "provider_item_ids": ["x"], "eligible": True,
                      "eligibility_reasons": ["partial"], "sources": [{"source_type": "provider_watch_history", "source_item_id": "x",
                      "target_item_id": "x", "provider": "fixture", "weight": None, "votes": None,
-                     "as_of": "2026-03-14T00:00:00Z", "evidence_event_ids": ["e1"]}], "availability": [], "english_dub": [],
+                     "as_of": "2026-03-14T00:00:00Z", "evidence_event_ids": ["e1"]}], "availability": [],
                      "features": {"completion_ratio": .5}, "feature_version": "v1", "evidence_event_ids": ["e1"],
                      "max_observed_at": "2026-03-14T00:00:00Z"}
         prediction = {"schema_version": "mal-eval-prediction/v1", "query_id": "q", "objective": "resume", "item_id": "x",

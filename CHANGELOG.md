@@ -2,6 +2,18 @@
 
 All notable product releases are documented here. MAL-Updater follows Semantic Versioning while it remains in alpha.
 
+## [Unreleased]
+
+### Changed
+
+- Recommendations are language-neutral. The English-dub requirement is gone everywhere: Watchable now needs a verified provider match that is currently in the catalog, in any audio language; new-episode, new-season and backlog recommendations follow the version you watch (sub or any dub) instead of only series titled "(English Dub)"; the scorecard's English-dub component is removed (its weight moved to availability). Each recommendation lists its audio languages (provider-reported for discovery, the watched version for your shows), and the dashboard has an **Audio** filter that the browser remembers. Titles whose languages were not reported stay visible under a filter and say so.
+- The `new_dubbed_episode` recommendation kind is now `new_episode`, and the webhook section `fresh_dubbed_episodes` is now `fresh_episodes`; rename `fresh_dubbed_episodes` under `[openclaw.recommendations_webhook_section_limits]` if you set it. Recommendation JSON drops `english_dub_signal`, `provider_dub_verified`, `dub_signal`, `english_dub_status`, `explicit_dub_evidence_source` and the `dub_watchable` score component, and adds `audio_locales` and `provider_availability_verified`.
+- Title matching now ignores dub markers in any language ("(Spanish Dub)", "Hindi Dub", ...) the same way it ignored "(English Dub)", and HIDIVE audio tags are read for more languages than English and Japanese.
+
+### Migration
+
+- Migration 038 drops the stored English-dub fields, renames stored `new_dubbed_episode` snapshot rows, and turns provider evidence that was verified and in the catalog but rejected only for lacking English audio into current positive evidence as of its last fetch (scheduled for its normal 120-day refresh).
+
 ## [0.3.0] - 2026-11-21
 
 ### Removed
