@@ -142,7 +142,7 @@ cp .env.example .env        # optional: change the port or pin an image tag
 docker compose up -d
 ```
 
-Open **http://localhost/** (or `http://<lan-host>/`). The image is `ghcr.io/kklouzal/mal-updater:0.3.0` for `amd64` and `arm64`, signed with Sigstore and shipped with an SBOM.
+Open **http://localhost/** (or `http://<lan-host>/`). The image is `ghcr.io/kklouzal/mal-updater:0.4.0` for `amd64` and `arm64`, signed with Sigstore and shipped with an SBOM.
 
 <details>
 <summary><b>First-run setup in detail</b></summary>
